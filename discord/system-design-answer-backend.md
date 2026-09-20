@@ -67,24 +67,49 @@ room ownership. A cache and notification bus can accelerate delivery, but neithe
 replaces the source used to resolve acceptance and replay.
 
 ```
-┌──────────────────────┐       ┌─────────────────────────┐
-│ TCP / HTTP           │──────▶│ Room authority          │
-│ adapters             │       │ Policy / order          │
-└──────────────────────┘       └────────────┬────────────┘
-                                            │
-                                            ▼
-                               ┌─────────────────────────┐
-                               │ PostgreSQL              │
-                               │ Messages / receipts     │
-                               │ Outbox                  │
-                               └────────────┬────────────┘
-                                            │
-                                            ▼
-┌──────────────────────┐       ┌─────────────────────────┐
-│ Gateway replay       │◀──────│ Outbox publisher        │
-│ + live fan-out       │       │ Notification bus        │
-└──────────────────────┘       └─────────────────────────┘
+PROPOSED TEXT CHAT — command acceptance and live delivery are separate
+
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Browser / TCP clients    │send/result │ Transport adapters       │command/ACK │ Room authority           │
+│ Explicit room + intent   │◀──────────▶│ HTTP / TCP framing       │◀──────────▶│ Current access check     │
+│ Saved operation identity │            │ Auth + request limits    │            │ Serialize acceptance     │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+              ▲                                                                               ▲
+              │                                                                               │
+              │ resume / events                                                               │ commit / recover
+              │                                                                               │
+              ▼                                                                               ▼
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Delivery gateways        │wake        │ Outbox relay + bus       │work/status │ PostgreSQL authority     │
+│ Authorize subscriptions  │◀───────────│ Retry committed work     │◀──────────▶│ Room head / messages     │
+│ Replay / bounded queues  │            │ Wake interested nodes    │            │ ACL / receipts / outbox  │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+          ▲             ▲                                                                     ▲
+          │             │                                                                     │
+          │             │   authorized committed history / retained replay                    │
+          │             └─────────────────────────────────────────────────────────────────────┘
+          │
+          │ lease / renew
+          ▼
+┌──────────────────────────┐
+│ Connection leases        │
+│ Per-device presence      │            Presence is approximate. Membership and
+│ Expiry != room removal   │            message acceptance remain in durable authority.
+└──────────────────────────┘
 ```
+
+I would trace either transport into the same room authority and message transaction.
+The receipt acknowledges that commit. Separately, the outbox wakes delivery gateways,
+which fetch retained committed history and fan it out over SSE or TCP. That read-back
+path repairs missed notifications and reconnects; a bus delivery is not the conversation
+record. Gateways authorize subscriptions and bound each connection's output queue.
+
+The recovery path should remain drawable without the notification bus:
+
+1. Recover an uncertain command from the durable receipt before reporting acceptance or retrying a new effect.
+2. Read the committed room head and retained events directly; a missed wakeup only delays discovery.
+3. Recheck current access on subscriptions and replay, and bound slow-client queues so reconnect is a controlled recovery path.
+4. Renew each connection lease independently. A disconnected device changes approximate presence, not another device's membership.
 
 Adapters handle transport framing, credentials, connection lifetime, and backpressure.
 They pass structured intent to the domain layer: authenticated user, explicit room,

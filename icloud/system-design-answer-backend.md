@@ -1,350 +1,476 @@
-# iCloud Sync - System Design Answer (Backend Focus)
+# Design iCloud Sync — backend interview
 
-*45-minute system design interview format - Backend Engineer Position*
+> “I’ll design file synchronization and a private photo library. The hardest part
+> is deciding which revision became durable, preserving independent edits, and
+> making that decision discoverable after a device disconnects.”
 
-## 📋 Problem Statement
+This is a proposed 45-minute architecture, independent of Apple's implementation.
+The repository demonstrates a smaller online system; its limits are stated at the end.
 
-Design the backend for iCloud: a file and photo synchronization service that keeps data consistent across all of a user's Apple devices. The defining challenges are causality — knowing whether two edits to the same file were sequential or concurrent, across devices that spend hours offline — and bandwidth economics: at a billion users you cannot re-upload a 2GB file because one paragraph changed. I'll focus on the sync infrastructure: version vectors for conflict detection, content-addressed chunk storage with deduplication, and an idempotent sync protocol that survives flaky mobile networks.
+## 🎯 Requirements and estimates — 5 minutes
 
-## 🎯 Requirements Clarification
+I would clarify whether we need a backup service, a shared filesystem, or a sync
+service. I’ll assume authenticated users have several devices that can edit files
+independently, including while offline.
 
-Questions I would ask up front:
+The service must support upload, download, folder operations, deletion, and recovery
+of missed changes. It must preserve concurrent content revisions and support an
+explicit choice between them. Photos add thumbnail and preview generation.
 
-- **Latency or bandwidth first?** I'll optimize for bandwidth on transfer (chunking, dedup) and latency on notification (push within seconds).
-- **Conflict resolution UX?** Auto-merge where safe, "keep both" as the universal fallback — silently discarding a user's edit is the one unforgivable failure.
-- **Which data is end-to-end encrypted?** I'll design for per-file keys so E2E categories (passwords, health) can be layered on without re-architecting.
+I would defer collaborative text editing, arbitrary application databases, and
+cross-account sharing. They need additional merge and permission models.
 
-### Functional Requirements
+The main correctness requirement is that an acknowledged revision cannot silently
+lose its bytes or disappear behind a concurrent write. Devices may be temporarily
+behind, but they need a reliable way to catch up.
 
-- **File sync**: Bidirectional sync of files and folders across Mac, iPhone, iPad, Web
-- **Photo library**: Sync with storage optimization (thumbnails on device, full-res in cloud)
-- **Conflict resolution**: Detect concurrent edits; auto-merge or create conflict copies
-- **Offline support**: Full functionality offline; reconcile on reconnect
-- **Sharing**: Files and albums shared across accounts
-- **App data sync (CloudKit)**: third-party apps sync structured records through the same infrastructure
+“Synced” has several possible meanings. I would expose cloud commitment separately
+from delivery of a notification and from materialization of bytes on another device.
+No backend can promise that an offline phone has already downloaded a new file.
 
-Out of scope for this session: device backup/restore (a different workload — bulk, scheduled, cold), the Find My network, and mail/calendar sync (protocol-specific).
+For a planning workload, assume:
 
-### Non-Functional Requirements
+| Assumption | Consequence |
+|------------|-------------|
+| One million active accounts | Account ownership is a natural partition boundary |
+| Three devices per account | Several independent histories, not unlimited actors |
+| Ten mutations per account per day | About 116 writes/second average |
+| 10× mutation peak | About 1,160 writes/second peak |
+| 20 GiB retained logical content per account | About 19 PiB before replication and derivatives |
+| 1 MiB new bytes per mutation | About 9.5 TiB/day of ingress |
 
-- **Consistency**: Eventual consistency with *reliable* conflict detection — never silent data loss
-- **Sync propagation**: < 5 seconds from save on device A to notification on device B
-- **Durability**: 11 nines for stored content; petabytes of user data globally
-- **Availability**: 99.99% for the sync API — devices retry gracefully, but photo upload from a wedding must not fail permanently
+These are hypothetical inputs, not Apple statistics. Physical storage depends on
+retention, compression, replication, and actual reuse; I would not assume a large
+deduplication discount before measuring representative content.
 
-### Scale Estimates
+Proposed targets are 99.9% monthly metadata availability, p95 metadata reads below
+200 ms in the home region, and online hints within two seconds of commit. We prioritize
+correct publication over accepting conflicting writes during a metadata partition.
 
-- 1B+ Apple IDs, 3–5 devices per user
-- 50GB average per user (5GB free tier to 2TB paid) → hundreds of petabytes
-- Billions of sync events/day; writes are bursty (photo bursts, document saves)
-- Most files are small; most *bytes* are photos and video
+## 🏗️ High-level architecture — 6 minutes
 
-Working the numbers briefly:
-
-- 1B users × 50GB average = ~50 exabytes nominal; realistically hundreds of PB after dedup and the long tail of near-empty free-tier accounts
-- 5 billion sync events/day ≈ 60K/sec average, with peaks 5–10x during evenings and photo-heavy moments (holidays)
-- Each sync event is a small metadata write (~1KB) plus zero or more chunk transfers — so the metadata tier sees high QPS of tiny writes while the storage tier sees fewer, much larger transfers. These scale independently, which justifies splitting them architecturally
-- Fan-out multiplier: every accepted change must reach 2–4 other devices, so the read/notify side runs at roughly 3x the write rate
-
-## 🏗️ High-Level Architecture
-
-```
-┌──────────────────────────────────────────────────────────────┐
-│           Clients: iPhone │ iPad │ Mac │ Watch │ Web         │
-└──────────────────────────┬───────────────────────────────────┘
-                           │ HTTPS (sync API) + push channel
-                           ▼
-┌──────────────────────────────────────────────────────────────┐
-│            API Gateway (auth, rate limiting, routing)        │
-└─────────┬────────────────────┬────────────────────┬──────────┘
-          ▼                    ▼                    ▼
-┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐
-│  Sync Service   │  │  Photo Service  │  │    CloudKit     │
-│ metadata, delta │  │ derivatives,    │  │ app key-value + │
-│ detection,      │  │ shared albums   │  │ structured data │
-│ conflicts       │  │                 │  │                 │
-└────────┬────────┘  └────────┬────────┘  └────────┬────────┘
-         │                    │                    │
-         ▼                    ▼                    ▼
-┌──────────────────┬──────────────────────┬───────────────────┐
-│   PostgreSQL     │   Object Storage     │     Cassandra     │
-│ file metadata,   │ content-addressed    │ sync state,       │
-│ users, quotas    │ chunks + photo       │ version vectors,  │
-│                  │ derivatives          │ change feeds      │
-└──────────────────┴──────────────────────┴───────────────────┘
-```
-
-The structural split that matters: **metadata and content travel separately**. Metadata (names, paths, version vectors) flows through the sync service and relational storage; content flows as immutable, content-addressed chunks to object storage. A device can learn "file X changed" in milliseconds and pull the bytes lazily — this is what makes thumbnail-only photo libraries and selective sync possible.
-
-### The Sync Round
-
-The end-to-end flow from a save on device A to visibility on device B:
+> “I’ll separate the byte-transfer path from metadata admission. Large files should
+> not occupy a database transaction while they travel over a mobile connection.”
 
 ```
-Device A                      Sync Service                  Device B
-   │ 1. save file locally           │                           │
-   │ 2. chunk + hash locally        │                           │
-   │──3. POST manifest─────────────▶│                           │
-   │◀──4. "missing: h2, h7"─────────│                           │
-   │──5. PUT missing chunks────────▶│──▶ object storage         │
-   │──6. commit manifest───────────▶│                           │
-   │                                │ 7. append to change feed  │
-   │                                │──8. push "changes"───────▶│
-   │                                │◀──9. GET changes?cursor───│
-   │                                │──10. metadata + manifest─▶│
-   │                                │◀──11. GET needed chunks───│
-   │                                │──12. chunk bytes─────────▶│
+DEVICES AND AUTHENTICATED EDGE — commands, receipts, and catch-up pages
+
+┌────────────────────────────┐            ┌────────────────────────────┐            ┌────────────────────────────┐
+│ Device A                   │1 cmd/ACK   │ API gateway / sessions     │2 replay    │ Device B / other devices   │
+│ Local pending command      │◀──────────▶│ Account / device identity  │◀──────────▶│ Saved replay cursor        │
+│ Selected bytes + base      │            │ Request and quota bounds   │            │ Verified local revisions   │
+└────────────────────────────┘            └────────────────────────────┘            └────────────────────────────┘
+               ▲                                         ▲                                         ▲
+               │                                         │                                         │
+               │ 3 staged bytes                          │ authorized command                      │ 6 WS hints
+               │                                         │                                         │
+               ▼                                         ▼                                         ▼
+┌────────────────────────────┐            ┌────────────────────────────┐            ┌────────────────────────────┐
+│ Transfer service           │verify      │ Sync admission             │            │ Push gateway               │
+│ Upload sessions + leases   │◀──────────▶│ Ownership + base revision  │            │ Account subscriptions      │
+│ Verify digest and length   │            │ Verified manifest / quota  │            │ Hints trigger change pull  │
+└────────────────────────────┘            └────────────────────────────┘            └────────────────────────────┘
+               ▲                                         ▲                                         ▲
+               │                                         │                                         │
+               │ put / get                               │ 4 commit / read                         │ publish hints
+               │                                         │                                         │
+BYTE STORAGE   │                          COMMIT STORE   │                          ASYNC EVENTS   │
+               │                                         │                                         │
+               ▼                                         ▼                                         │
+┌────────────────────────────┐            ┌────────────────────────────┐            ┌────────────────────────────┐
+│ Private object storage     │            │ PostgreSQL account shard   │5 events    │ Outbox relay / job queue   │
+│ Verified immutable chunks  │            │ Heads, receipts, feed      │───────────▶│ Retry committed events     │
+│ Originals + derivatives    │            │ Outbox in same transaction │            │ Deduplicate event IDs      │
+└────────────────────────────┘            └────────────────────────────┘            └────────────────────────────┘
+               ▲                                         ▲                                         │
+               │                                         │                                         │
+               │                                         │ 7 readiness commit                      │
+               │                                         │                                         │
+               │ read / write                            │                                         │ jobs
+               │                                         │                                         │
+               │                          ┌────────────────────────────┐                           │
+               │7 derive                  │ Photo workers              │                           │
+               └◀────────────────────────▶│ Original / transform ID    │◀──────────────────────────┘
+                                          │ Commit derivative status   │
+                                          └────────────────────────────┘
 ```
 
-Steps 1–6 are the upload half; steps 3–5 transfer only what the server lacks. Steps 8–12 are the download half: the push (8) is a hint, and the cursor pull (9) is what guarantees delivery — a device that slept through the push gets identical results on its next pull. Device B applies metadata first, so the file appears in listings immediately with content streaming behind it.
+The gateway establishes account/device identity; sync admission owns namespace and
+revision decisions. The transfer service authorizes upload sessions and stages bytes.
+Object storage holds immutable blobs; the metadata shard determines which manifests
+are committed and who may read them.
 
-## 💾 Data Model
+I would walk three paths on this diagram:
 
-Described as prose tables rather than DDL:
+- **Write and acknowledgement (1, 3, 4):** stage bytes, verify the manifest, then commit
+  the revision, receipt, feed entry, and outbox together. The receipt returns through
+  the gateway; a lost response is recovered with the same command identity.
+- **Delivery and catch-up (5, 6, 2):** relay committed events, notify Device B, and let
+  it pull ordered changes through the gateway. Reconnect uses this same replay path.
+- **Photo processing (5, 7):** a durable job reads the original, writes derivatives,
+  and commits readiness back to metadata, producing another discoverable change.
 
-| Table | Key Columns | Indexes | Notes |
-|-------|-------------|---------|-------|
-| users | id (UUID PK), apple_id (unique), storage_quota, storage_used | apple_id | Quota checked before upload, reconciled async |
-| files | id (UUID PK), user_id, name, path, size, content_hash, version (JSON version vector), is_deleted | (user_id, path) | Soft delete — tombstones must sync too |
-| file_chunks | file_id, chunk_index, chunk_hash, chunk_size | PK (file_id, chunk_index) | The manifest: ordered list of chunks composing a file |
-| chunk_store | hash (SHA-256, PK), size, reference_count, storage_key | — | Global dedup table; chunk deleted only at refcount 0 |
-| device_sync_state | device_id, user_id, last_sync_token, sync_cursor | PK (device_id, user_id) | Where each device left off; enables incremental sync |
-| photos | id, user_id, hash, taken_at, location, metadata, is_deleted | (user_id, taken_at DESC) | Library queries are always time-ordered |
-| audit_log | event_type, user_id, device_id, resource, action, ip | (user_id, created_at DESC) | Append-only; sync bugs are debugged from this trail |
+The outbox is written in the same transaction as the metadata decision. Its relay
+schedules derivative jobs and emits push hints. Other devices pull the durable change
+feed; a missed hint therefore delays reconciliation without losing the change.
 
-Three deliberate choices here:
+The transaction boundary is the PostgreSQL box. Object transfers and background jobs
+sit outside it, protected by staged-object leases and repeatable worker operations.
 
-- **Version vectors live in the file row as a JSON map** of deviceId → sequence number. They're read and written together with the metadata they protect, so conflict detection never races against a separate store.
-- **Sync state is per-device, not per-user.** Each device carries its own cursor into the change stream. A device offline for a month resumes from its own cursor; other devices are unaffected. At production scale this table is the highest-write-rate relational data we have, which is why the ideal design puts it in Cassandra — it's partition-keyed by (user, device), never queried across users, and tolerates eventual consistency.
-- **The manifest (file_chunks) is separate from the file row.** A file's identity and its current byte composition change on different schedules and are read by different paths — listings never need the manifest, downloads always do. Separating them keeps the hot metadata rows small and lets manifest history double as version history for the three-way merge ancestor lookup.
+I would initially deploy these as a modest set of services, with clear modules inside
+the metadata service. The diagram describes responsibilities, not a requirement to
+create a microservice for every box.
+
+Follow one upload. A device creates an upload session, sends absent chunks, and waits
+for verified acknowledgements. It then submits a manifest, a base revision, and a
+stable command ID to the sync API.
+
+The API checks account ownership, staged-byte readiness, quota, and current heads.
+One transaction admits a new head or retained conflict sibling and writes the command
+receipt, feed record, and outbox entry. The response identifies that durable outcome.
+
+A second device receives a hint, pulls changes after its saved cursor, and fetches
+missing chunks from authorized manifests. It reports local availability only after
+verifying and retaining the bytes.
+
+Metadata and object storage have different ownership roles. An object existing in a
+bucket does not make a file visible. A metadata head must never point to an incomplete
+upload that cleanup can remove underneath it.
+
+## 💾 Data model and API contracts — 5 minutes
+
+I would draw stable file identity separately from path and revision. Renaming a file
+should not change its identity or invalidate every reference to it.
+
+| Entity | Key information | Why it exists |
+|--------|-----------------|---------------|
+| Account | Identity, logical quota, admission state | Ownership and partition boundary |
+| Device installation | Account, actor ID, epoch, acknowledged cursor | Causality and safe retirement |
+| Namespace entry | File ID, parent ID, name, current heads | Stable identity and live sibling-name uniqueness |
+| Revision | Revision ID, causal context, size, digest, immutable manifest | Preserve accepted content |
+| Revision chunks | Revision, index, verified blob identity, length | Reconstruct exact bytes |
+| Upload session | Account, staged chunks, expiry, quota reservation | Recover transfer without publishing early |
+| Command receipt | Account, command ID, payload digest, outcome | Resolve retries and lost responses |
+| Change feed | Account, ordered position, revision or tombstone | Durable device catch-up |
+| Outbox | Committed event and publication state | Recover external work after commit |
+| Photo derivative | Original revision, transform version, readiness | Retry image jobs deterministically |
+
+A revision manifest must preserve order, expected lengths, and the complete-file
+identity. A bag of hashes cannot reconstruct a file containing repeated chunks.
+History is useful only if it retains the manifests and bytes required to restore it.
+
+Proposed interfaces expose intent and outcomes rather than database internals:
+
+| Method | Endpoint | Contract |
+|--------|----------|----------|
+| POST | `/upload-sessions` | Reserve an authorized, expiring transfer |
+| PUT | `/upload-sessions/:id/chunks/:index` | Verify a chunk and acknowledge its identity |
+| GET | `/upload-sessions/:id` | Report durable transfer progress |
+| POST | `/files/:id/commands` | Admit a version-conditioned mutation |
+| GET | `/commands/:id` | Return the original durable outcome |
+| GET | `/files/:id/revisions/:revisionId` | Authorized immutable manifest |
+| GET | `/changes?cursor=...` | Ordered page or explicit reset requirement |
+| POST | `/conflicts/:id/resolve` | Resolve exactly the siblings the user observed |
+| GET | `/photos` | Stable photo page with derivative readiness |
+
+The same command ID with the same payload returns the same admitted outcome. Reusing
+it with another payload is an error. An ordinary transient failure before admission
+can remain retryable; a durable business rejection should be explicit.
+
+List queries can tolerate some staleness. Revision admission, quota changes, and receipt
+lookup after an ambiguous response need an authoritative view.
+
+## 🔧 Deep dive 1: Causality and atomic revision admission — 8 minutes
+
+> “I would preserve concurrent edits rather than infer intent from a wall clock.
+> But a correct vector comparison is only useful inside a correct write boundary.”
+
+### What the causal comparison tells us
+
+Imagine a laptop and phone both start from revision R. The laptop changes a paragraph
+while offline; the phone changes a different paragraph without seeing that edit.
+Their histories are concurrent even if one device's clock says its edit is newer.
+
+A version vector records observed progress for each actor. A history dominates another
+when it includes all of the other's progress and has advanced somewhere. If each has
+progress the other lacks, neither is a causal successor.
+
+| Relationship | Admission behavior |
+|--------------|--------------------|
+| Same known revision or repeated command | Return the known outcome; do not create another revision |
+| New edit based on the current accepted head | Advance the head atomically |
+| Edit based on an older branch | Preserve or reject according to the explicit branch policy |
+| Independent histories | Retain siblings and surface a conflict |
+
+The server validates the actor and submitted context; clients cannot impersonate another
+device's counter or submit unbounded vectors. A display name such as “Chrome on Mac”
+is not a stable installation identity.
+
+### The transaction is the actual decision point
+
+Two requests can each read the same current head and each conclude that their edit is
+acceptable. If both then perform an unguarded update, the later write destroys the
+first regardless of how accurate the comparison function was.
+
+I would lock the file's admission record or use a conditional update against the
+observed revision, then evaluate the causal relationship against the current state.
+Namespace uniqueness and quota must participate in that same decision.
+
+The transaction writes the immutable revision, changes current heads, records the
+receipt, appends a change, and creates the outbox entry. The response follows commit.
+Object transfer has already finished outside this transaction.
 
 ```
-files (metadata + vector) ──1:N──▶ file_chunks (manifest) ──N:1──▶ chunk_store ──▶ object storage
+┌──────────────────────────┐
+│ Verified staged manifest │
+└──────────────────────────┘
+              │ admission transaction
+              ▼
+┌──────────────────────────┐
+│ Head + receipt + change  │
+│ + outbox committed       │
+└──────────────────────────┘
+              │ durable outcome
+              ▼
+┌──────────────────────────┐
+│ Reply or receipt lookup  │
+└──────────────────────────┘
 ```
 
-## 🔌 API Design
+A timeout after commit is not a new mutation. The client retries or looks up the same
+command ID and receives its original revision. If the transaction did not commit,
+there is no partial head or successful receipt to confuse recovery.
 
-```
-POST   /api/v1/sync/changes         → Push local changes (batch, idempotency key required)
-GET    /api/v1/sync/changes?cursor= → Pull changes since cursor (incremental sync)
-POST   /api/v1/files/manifest       → Declare chunk list; server replies which chunks it lacks
-PUT    /api/v1/chunks/:hash         → Upload one chunk (content-addressed, idempotent by nature)
-GET    /api/v1/chunks/:hash         → Download one chunk
-GET    /api/v1/files/:id            → File metadata + manifest
-POST   /api/v1/conflicts/:id/resolve→ Apply resolution (merged | keep-both | pick-one)
-GET    /api/v1/photos?before=       → Time-paginated library listing
-WSS    /ws                          → Push notifications: "changes available", not payloads
-```
+### Resolution preserves real bytes
 
-The push channel carries only *invalidations* — "something changed, pull when ready." Payloads always go through the pull path, so a device that misses a push (asleep, offline) loses nothing: the next pull from its cursor returns everything. Push is an optimization; pull is the correctness mechanism.
+For binary files, I would retain both manifests and let the user choose. For a known
+text format, a three-way merge might use a shared base and produce a new revision,
+but that is a separate content algorithm with its own conflict cases.
 
-Design notes on the API surface:
+Taking the maximum vector component does not merge a document. “Keep both” must retain
+two complete byte histories, not copy current metadata into a second filename.
 
-- **Batching is first-class**: `/sync/changes` accepts and returns batches — a device reconnecting after a week has thousands of operations, and per-op round trips would make reconnect take minutes on mobile RTTs
-- **Manifest-before-chunks ordering** is enforced server-side: chunk PUTs for hashes not declared in any pending manifest are rejected, which stops clients from streaming orphan bytes and keeps the sweeper's workload bounded
-- **Conflict resolution is its own endpoint** rather than an overload of the update path — resolving a conflict must reference both competing versions explicitly, so a stale client can't accidentally resolve a conflict it hasn't seen
-- **Everything is cursor-paginated**; there is no "list all files" call at this scale, only "changes since" and bounded listings
+A resolution command names the observed siblings. If another sibling appears before
+resolution commits, the server rejects or expands the decision explicitly. It must
+not mark every conflict resolved based on a stale screen.
 
-## 🔧 Deep Dive 1: Version Vectors and Conflict Detection
+### Decision and cost
 
-This is the heart of the system. Two devices edit the same document while one is on a plane — when it lands, how do we know whether that's a conflict or just a stale copy?
+| Approach | Pros | Cons |
+|----------|------|------|
+| ✅ Causal siblings with transactional admission | Preserves independent accepted edits | More metadata, retained bytes, and conflict UX |
+| ❌ Wall-clock last-write-wins | Small state and simple reads | Clock skew and offline edits can silently destroy work |
 
-**The mechanism**: every file carries a version vector — a map of deviceId → sequence number. When a device edits a file, it increments its own entry. Comparing a local vector L and server vector S:
+For a personal file service, silent loss is worse than asking the user to resolve a
+conflict. I would accept the complexity while limiting actor count and offering a
+clear retention policy.
 
-1. For each device appearing in either vector, compare its sequence number (missing = 0)
-2. If L is ahead on some devices and behind on none → local strictly newer, upload wins
-3. If S is ahead on some and behind on none → server strictly newer, download wins
-4. If each is ahead on *different* devices → the edits were concurrent: a true conflict
-5. If equal everywhere → already in sync
+If the product were online-only with a single authoritative editor, a base revision
+and conditional update could be sufficient. Vectors are justified by independent
+histories, not by the general desire to sound distributed.
 
-The two situations, side by side:
+## 🔧 Deep dive 2: Chunk storage, publication, and reclamation — 8 minutes
 
-```
-Sequential edit (no conflict)          Concurrent edit (true conflict)
-──────────────────────────────         ────────────────────────────────
-local  {A:3, B:2}                      local  {A:3, B:2}
-server {A:2, B:2}                      server {A:2, B:3}
+> “Deduplication is an optimization. A committed manifest remaining readable is
+> the invariant. I would design upload and cleanup around that invariant together.”
 
-local ≥ server on every entry          local ahead on A, behind on B
-→ fast-forward: upload local           → neither dominates: CONFLICT
-```
+### Staging and verification
 
-In the left case, A edited after seeing everything B had done — a clean fast-forward. In the right case, A and B each edited without seeing the other's change. No timestamp comparison can distinguish these two situations; the vectors make it a mechanical check.
+Start with fixed 4 MiB chunks. The transfer service accepts bounded uploads, hashes
+the bytes, and checks expected length. It records which verified chunks belong to an
+authorized upload session before acknowledging them.
 
-**Why version vectors over timestamps?**
+A known hash can identify reusable content, but the server still checks whether the
+account is allowed to reference it. Arbitrary hash knowledge cannot grant read access
+or prove possession of private content.
 
-> "Last-write-wins by timestamp is the tempting answer, and it's wrong in a way users experience as data loss. Device clocks drift — an iPhone with a skewed clock 'wins' every conflict and silently overwrites a Mac's genuine edits. Worse, timestamps can't distinguish concurrent from sequential: if I edit on my Mac at 2:00 and on my phone at 2:05 *after syncing*, that's a clean update; if the phone was offline since 1:00, the same timestamps hide a real conflict. Version vectors encode causality directly — they answer 'did edit B happen with knowledge of edit A?' — which is the actual question. The cost is a vector that grows with device count, but users have 3–5 devices, so vectors stay tiny; I'd prune entries for devices unseen for 90+ days."
+The session pins staged blobs until publication or expiry. Publication transfers
+protection to immutable revision references. Cleanup observes those protections through
+a shared lifecycle protocol, so there is no unprotected gap between the two.
 
-**Resolution policy by file type** (steps, not code):
+An object-store timeout may leave an object written despite a failed response. Retrying
+an immutable, verified object identity can be safe; discovering that object does not
+by itself mean the user's file command committed.
 
-1. **Text/structured documents**: attempt a three-way merge using the common ancestor version (we keep recent version history per file). Clean merge → single merged result, vectors joined.
-2. **Photos and binaries**: no merge is meaningful — keep both, renaming the loser as a conflict copy: *"Report (Dana's iPad, 2026-07-11).pages"*. The name tells the user what happened and where.
-3. **Anything ambiguous**: keep both. The invariant across all policies is that no user byte is ever discarded without an explicit user decision.
+### Reconstructing the exact file
 
-**Deletes are edits too.** A delete is recorded as a tombstone (is_deleted flag) with its own version-vector bump, never a physical row removal. Otherwise a device offline during the delete would happily re-upload the file on reconnect and "resurrect" it — the classic sync bug. Delete-vs-edit conflicts follow the same comparison: if device A deleted while device B edited concurrently, that's a conflict, and the policy is to keep B's edit and surface the file as restored — deletion is the one operation where erring toward keeping data is always right. Tombstones are garbage-collected only after every registered device's cursor has passed them.
+A download authorizes the revision, reads its complete manifest, and streams chunks
+in order. It verifies expected indexes, lengths, and digests, and fails if the manifest
+is incomplete. A missing chunk is not permission to return a shorter successful file.
 
-**What we give up**: version vectors detect conflicts but don't resolve them — we still need per-type merge logic and conflict-copy plumbing, and users occasionally see duplicate files. Operational transform or CRDTs would merge automatically, but only for structured/text content, and they'd force every client (including third-party CloudKit apps) to adopt complex merge semantics. For a general file store, detection + honest conflict copies is the right layer.
+The client can cache verified chunks and request only missing ones. The manifest remains
+necessary because order and repeated chunks matter. Transfer concurrency is bounded
+so one large file cannot consume every connection or all process memory.
 
-## 🔧 Deep Dive 2: Content-Addressed Chunk Storage
+For large downloads, range support and backpressure matter more than concatenating
+all chunks into a single application buffer. Integrity failures should identify the
+revision and storage object for repair without exposing content in logs.
 
-A 2GB video with one metadata edit must not cost 2GB of upload. Files are split into 4MB chunks, each identified by the SHA-256 of its content.
+### Fixed versus content-defined boundaries
 
-**Upload protocol**:
+| Approach | Pros | Cons |
+|----------|------|------|
+| ✅ Fixed chunks initially | Simple offsets, bounded units, easy parallel transfer | Insertions can invalidate reuse across the remaining file |
+| ❌ Content-defined chunks initially | Better reuse when content shifts | More CPU, boundary metadata, and implementation complexity |
 
-1. Client chunks the file locally and hashes each chunk
-2. Client POSTs the manifest (ordered hash list) to the server
-3. Server checks each hash against the global chunk_store and replies with only the hashes it doesn't have
-4. Client uploads just those chunks, in parallel; each PUT is idempotent because the key *is* the content hash
-5. Client commits the manifest; server increments reference counts and flips the file's metadata atomically
+I would choose content-defined chunking later if edit workloads show that shifting
+boundaries dominates transfer cost. Already-compressed photos and videos may offer
+little reuse across different files; that must be measured.
 
-This one protocol buys four properties: **deduplication** (identical chunks across files and even across users stored once — enormous for photos synced to shared albums, common attachments, OS-generated files), **delta sync** (an edited document re-uploads only changed chunks), **resumability** (an interrupted upload resumes at step 3 — the server already tells you what's missing), and **parallelism** (chunks are independent).
+I would initially deduplicate within an account. Global deduplication can leak whether
+another account holds particular content and complicates ownership, encryption, and
+erasure. Randomized account encryption also limits global reuse.
 
-**Why 4MB?** The chunk size is a real tuning decision, not a default:
+That choice spends more physical storage in exchange for a clearer privacy boundary.
+I would not introduce convergent encryption without revisiting the threat model and
+product requirements.
 
-- **Smaller chunks** (256KB–1MB): better dedup granularity and finer delta sync, but the manifest and chunk_store row count balloon — a 4GB video becomes 16,000 rows instead of 1,000, and per-chunk request overhead (TLS, headers, refcount write) starts to dominate transfer time
-- **Larger chunks** (16–64MB): fewer rows and requests, but a one-byte edit re-uploads 64MB, resumability granularity worsens on cellular, and dedup hit rates fall because bigger chunks are less likely to repeat
-- 4MB sits where per-request overhead is amortized (~1–2% of transfer time on broadband) while a typical document edit still touches only one or two chunks. I'd keep it a per-file-class constant, not a global one — photos could use larger chunks since they're immutable
+### Safe deletion is part of storage design
 
-**Garbage collection via reference counting**: each chunk row carries a refcount; committing a manifest increments, deleting a file decrements, and a background sweeper removes chunks at zero — after a grace period, because a decrement racing a concurrent upload of the same hash must not delete a chunk something just referenced. The sweeper re-verifies refcount at delete time inside a transaction.
+Reference counts are useful accounting, but a collector cannot simply read zero,
+delete the object later, and assume no writer attached it in between.
 
-**Quota enforcement** rides on the same tables: manifest commit sums the *newly referenced* chunk sizes against the user's remaining quota, rejecting with a clear error before any state changes. Because dedup means a user's "usage" is ambiguous (do shared chunks count fully for everyone?), the accounting rule is: each user is charged the full logical size of their files, ignoring dedup. Simpler to explain, immune to gaming, and dedup savings accrue to the operator — which is the correct incentive, since the operator paid for the storage.
+I would use explicit blob lifecycle states. A collector claims an unreferenced candidate
+under the same coordination rule that writers use to attach references. Once claimed,
+new publication must retry or create a safely protected replacement.
 
-**Fixed-size vs content-defined chunking — the honest trade-off**:
+The collector rechecks staging leases and retained revisions, removes the object, and
+records completion. A crash leaves a recoverable state. Delayed and duplicate workers
+must not double-decrement or remove a newly live object.
 
-> "Fixed 4MB chunks have a real weakness: insert one byte at the front of a file and every chunk boundary shifts, so every hash changes and delta sync degrades to full upload. Content-defined chunking (Rabin fingerprinting) sets boundaries by content, so an insertion only disturbs neighboring chunks. I still start with fixed chunks, for two reasons. First, the dominant byte volume here is photos and video — append-only or immutable content where boundary-shift never happens and CDC buys nothing. Second, CDC's variable chunk sizes complicate quota accounting, range requests, and client implementations across four platforms. I'd add CDC later as a per-file-type policy for frequently edited documents, where it pays. What I give up meanwhile: poor delta efficiency on prepend-heavy edits — measurable, but rare in this workload."
+Periodic reconciliation compares counts with authoritative manifests. It must count
+repeated chunk occurrences consistently and include conflict siblings and historical
+versions. Otherwise a “cleanup optimization” can become data loss.
 
-**Encryption interaction**: chunks are encrypted before upload. Note the tension — encrypting with per-user keys destroys cross-user dedup, since identical plaintext yields different ciphertext. For standard-protection categories Apple's answer (and mine) is convergent-style encryption keyed by content for dedup-eligible data, and true per-user E2E keys for sensitive categories where we deliberately sacrifice dedup for privacy. That's a policy knob per data class, not a single global choice.
+This protocol costs additional state and operational work. It is justified because
+storage reclamation runs concurrently with normal usage and cannot rely on a quiet
+maintenance window at production scale.
 
-## 🔧 Deep Dive 3: The Idempotent Sync Protocol
+## 🔧 Deep dive 3: Durable change feeds and offline devices — 8 minutes
 
-Mobile clients retry constantly — a train tunnel mid-upload is the normal case, not the edge case. Every mutation in the sync API must be safe to replay.
+> “Push makes sync feel immediate. A durable feed makes it recoverable. I would
+> never use a live socket as the only record that a file changed.”
 
-**Layered idempotency**:
+### Choosing a cursor that cannot skip commits
 
-1. **Chunk uploads are naturally idempotent** — the key is the content hash; re-uploading is a no-op overwrite of identical bytes.
-2. **Metadata mutations carry an idempotency key** derived client-side from the operation's content. Server flow: check Redis for a cached result under that key → if present, return it; otherwise acquire a short lock on the key (SET NX, 5-minute TTL), perform the operation, cache the result for 24h, release the lock. A concurrent duplicate that fails to get the lock waits for the result rather than re-executing.
-3. **The database is the backstop**: unique constraints on (file_id, version) transitions mean that even if Redis is flushed, a replayed commit collides and returns the original outcome instead of double-applying.
+A query for files modified after a timestamp is not a complete change log. Multiple
+updates collapse into one current row; timestamps can tie; a transaction may commit
+after a later timestamp has already been returned to the client.
 
-> "Two layers because they fail differently — Redis is fast but ephemeral; the constraint is durable but catches the duplicate late. A client retry after a mid-flight timeout is indistinguishable from a first attempt at the network layer; idempotency keys make the distinction explicit at the application layer, which is the only place it can be made."
+I would append a change record in the same transaction as admission. For the initial
+scale, a locked per-account counter can serialize position assignment through commit.
+The next transaction cannot publish past an uncommitted earlier position.
 
-**Client retry discipline**: exponential backoff with jitter (1s base, doubling, ±20% jitter, capped attempts), retry only on 5xx/network errors — a 4xx means the request itself is wrong and retrying is abuse. Jitter matters at this scale: a regional outage recovering without jitter means a million devices retry in synchronized waves that re-kill the service.
+A global sequence allocated before commit does not provide that property by itself.
+At higher scale, a partitioned durable log can provide ordering, but its cursor and
+recovery semantics must be defined explicitly.
 
-**Circuit breakers on object storage**: sync metadata operations must not hang because MinIO/S3 is degraded. Storage calls run through per-operation breakers (reads trip and recover faster than writes; existence checks are cheapest and most tolerant). When the storage breaker is open, the sync service still serves metadata and accepts manifests — devices learn *what* changed and defer the byte transfer. That's graceful degradation shaped by the metadata/content split: the system stays conversational even when the heavy path is down.
+The client requests a bounded page after its cursor, applies the page, and saves the
+new cursor atomically with its local state. Replaying a page is safe because changes
+carry stable identities and revisions.
 
-**Failure ordering rule**: chunks are always durably stored *before* the manifest commit that references them, and the manifest commits *before* the change is announced on the push channel. Every observer therefore sees only fully-materialized states; a crash between steps leaves orphaned chunks (cleaned by the sweeper), never a file that references missing bytes.
+New devices need a snapshot paired with a feed boundary. I would create a consistent
+snapshot or a server-supported listing session tied to that boundary, then replay later
+changes. “List everything, then read the current cursor” can miss intervening writes.
 
-**The change feed and sync tokens.** The pull side deserves precision, because it's the correctness backbone:
+### Outbox and notification behavior
 
-1. Every committed metadata change appends an entry to a per-user, monotonically ordered change feed
-2. A device's sync token is an opaque cursor into that feed; `GET /sync/changes?cursor=` returns everything after it plus a new token
-3. Entries are compacted: if a file changed 40 times since the device's cursor, the device receives only the latest state — intermediate versions are unobservable and shipping them wastes bandwidth
-4. If a cursor is too old (feed truncated), the server returns a "reset" signal and the device falls back to a full-state comparison — expensive but always available, so feed retention is a cost/latency tuning knob rather than a correctness cliff
+The outbox relay can publish twice after a crash. Consumers deduplicate by event or
+revision identity. It marks progress only after the broker or downstream delivery
+boundary acknowledges the publication.
 
-**Failure modes and responses**:
+Gateways keep account-scoped subscriptions and send small hints. A disconnected client
+catches up on reconnect; a connected client periodically reconciles if necessary.
+Hints can be coalesced because the feed carries the complete ordered information.
 
-| Failure | Blast radius | Response |
-|---------|--------------|----------|
-| Object storage degraded | Content transfer only | Breaker opens; metadata sync continues; devices queue transfers |
-| Redis idempotency cache lost | Retry dedup slower | DB unique constraints backstop; no double-applies |
-| Push channel down | Latency only | Devices fall back to periodic pull; nothing is missed |
-| Change feed truncated past a cursor | One stale device | Explicit reset → full-state reconcile for that device only |
-| Metadata DB shard down | Users on that shard | Other shards unaffected; devices retry with backoff; reads from replica if available |
+If notification delivery fails, commits remain discoverable. If metadata admission is
+unavailable, clients retain local pending work instead of inventing a successful cloud
+acknowledgement.
 
-The theme: every degradation moves the system toward *slower*, never toward *wrong*. Sync can always be reconstructed from durable state plus idempotent replay.
+### Tombstones and device retirement
 
-## 🧩 CloudKit: Sync as a Platform
+Suppose a phone stays offline for months while a file is deleted elsewhere. Removing
+the tombstone too early can let the old phone reintroduce that file as apparently new.
 
-The same machinery generalizes to third-party app data, which is worth designing for because it constrains the core:
+I would retain deletion history until active devices acknowledge the relevant position,
+subject to a documented offline lease. A device beyond that lease is retired and must
+rebootstrap before sending old commands.
 
-- **Records instead of files**: CloudKit exposes typed records in per-app containers, but underneath it's the same primitives — per-record version tracking, per-device cursors into a change feed, push invalidations, pull-based delivery
-- **Zones as the consistency unit**: records group into zones; a zone is the atomic-commit and cursor boundary. This gives apps small-scale transactionality (save 5 records atomically in one zone) without the backend promising cross-zone transactions — the same "user-partitioned, no global coordination" property that makes the whole system shardable
-- **Why this matters for the core design**: once thousands of third-party apps depend on the sync semantics, the conflict model and cursor protocol become a public contract. That's a strong argument for the simplest semantics that work — version-per-record with explicit conflict surfacing — rather than clever merge behavior we'd have to support forever
+Retirement also changes actor epochs. Simply pruning an old vector component after
+90 days can erase causal information while an old installation still exists. The server
+must reject that retired epoch and provide an explicit recovery path for unsent work.
 
-### Consistency Model, Stated Precisely
+Users should be able to recover local unsent bytes as a new deliberate upload after
+rebootstrap. That is different from silently replaying stale mutations into the current
+namespace.
 
-- **Per-device read-your-writes**: a device always sees its own committed changes in its next pull
-- **Cross-device eventual consistency**: bounded in practice by push latency (< 5s target), unbounded in theory (offline devices), which is exactly why causality tracking exists
-- **Per-file linearizable commit point**: the metadata row update is the single serialization point per file; two racing commits on one file are ordered by the database, and the loser's commit triggers conflict handling rather than a lost update
-- **No cross-file transactions in file sync**: moving a folder of 100 files is 100 independent ops plus an ordering rule (parents before children). Simpler, shardable, and interruption leaves a visible-but-valid partial state that the next sync round completes
+### Decision and cost
 
-## 📷 The Photo Pipeline
+| Approach | Pros | Cons |
+|----------|------|------|
+| ✅ Durable feed plus lightweight hints | Recovers missed changes and supports bounded replay | Feed retention, cursor lifecycle, and snapshot protocol |
+| ❌ Push-only updates or mutable timestamp scans | Less persistent infrastructure | Disconnections, ties, and delayed commits can lose changes |
 
-Photos deserve their own treatment because they dominate byte volume and have a distinct access pattern: written once, never edited, browsed constantly through thumbnails.
+Polling the durable feed alone is a valid simpler option when freshness requirements
+are loose. For an interactive multi-device service, hints reduce latency and unnecessary
+polling while preserving the same recovery mechanism.
 
-**Ingest flow** when a photo is taken:
+The cost is retained history and explicit reset behavior. I would budget that storage
+and monitor the oldest active cursor rather than promising infinite offline replay.
 
-1. Device uploads the original through the same chunk protocol (originals dedup well — burst shots, re-imports, shared-album copies)
-2. Photo service enqueues a derivative job; workers generate a 200px thumbnail and a 1024px preview, stored as independent objects
-3. Metadata row (taken_at, location, EXIF) is written and the change feed notifies other devices
-4. Other devices pull *only the thumbnail* by default — a 50,000-photo library syncs as a few hundred MB of thumbnails, not 250GB of originals
+## 📈 Photos, security, and operating the system — 4 minutes
 
-**Storage optimization** is a contract between device and cloud: the device keeps thumbnails always, previews for recent/viewed items, and full-res only on demand or when space allows. The backend supports this with three-tier derivatives and range-friendly chunk downloads. The eviction decision is entirely client-side — the server just guarantees every tier is always fetchable.
+Photo processing runs after original publication. Workers generate a thumbnail and
+preview for a named original revision and transform version. They publish readiness
+only after both output objects exist, and retries target the same immutable result.
 
-> "The key judgment is that derivatives are *disposable* and originals are *sacred*. Derivatives live outside the refcount system and can be regenerated from originals at any time, so I can change thumbnail sizes or codecs fleet-wide with a backfill job, and losing a derivative bucket is an inconvenience, not data loss. Originals go through the full chunk/refcount/durability machinery. Mixing the two — refcounting thumbnails, or treating originals as regenerable — either bloats the GC system or risks the only copy of someone's wedding photos."
+CPU and memory limits protect the worker pool from unusually large decoded images.
+The user can see an original as uploaded while a preview is still processing or failed.
+Favorites and album membership are separate metadata commands.
 
-**Shared albums** are the first cross-user feature: an album is a membership list plus references into each contributor's photo space. Adding a photo to a shared album doesn't copy chunks — it adds references and bumps refcounts, so a 500-photo shared album costs metadata, not storage. Removal semantics follow from refcounting: a contributor leaving decrements their photos' refs, and content persists only if another member pinned a copy.
+Every media read must authorize the account and revision. A shared cache must perform
+that check on hits as well as misses; private content must not become publicly reusable
+merely because its URL is difficult to guess.
 
-## 🔐 Security and Auth
+Session caching has a bounded revocation and expiry policy. Existing sockets need
+reauthorization or explicit revocation, and album membership checks must authorize
+both the album and each photo being added.
 
-Authentication and authorization, briefly, since sync amplifies any auth mistake across a user's whole digital life:
+The first bottlenecks I expect are byte buffering, image CPU, hot-account admission,
+and notification fanout. I would stream transfers, isolate derivative workers, partition
+metadata by account, and use shared event delivery across gateways.
 
-- **Per-device tokens, not per-user sessions**: each device registers and gets its own credential. Revoking a stolen iPhone must not log out the Mac, and per-device tokens are also what make per-device sequence numbers in version vectors trustworthy — a device can only increment its own entry.
-- **Two-factor on new device registration**: adding a device is the sensitive operation (it gains access to everything), so approval flows through an existing trusted device.
-- **Chunk access is capability-based**: chunk GETs require a short-lived signed URL issued per manifest, so knowing a hash never grants access to content — important because hashes travel in metadata that support tooling can see.
-- **Rate limiting tiered by cost**: manifest posts and change pulls are cheap and generous; chunk bandwidth is metered per account; device registration attempts are aggressively limited (that's the account-takeover surface).
-- **Audit trail**: every sync mutation logs actor device, IP, and action — both for security forensics and because "which device deleted this folder" is a real support question.
+A single busy account can eventually outgrow serialized feed admission. Splitting its
+ordering domain requires a cursor and namespace strategy; adding random shards without
+that protocol only moves the correctness problem.
 
-## 📊 Observability
+I would monitor admission latency, replay lag, oldest upload session, derivative backlog,
+missing-object errors, and reference mismatches. Tests would lose commit responses,
+interleave two edits, expire a device, and race a collector with publication.
 
-The signals I'd instrument first, chosen because each one maps to a distinct failure story:
+Backups must restore metadata and retained objects consistently. A database-only restore
+that points to deleted blobs is not a usable recovery plan.
 
-| Signal | Why it matters |
-|--------|----------------|
-| Sync propagation latency p95 (save on A → notify B) | The headline SLO (< 5s); regressions here are what users call "sync is broken" |
-| Sync success rate per device platform | A drop isolated to one OS build catches client regressions early |
-| Conflict rate by file type | Baseline ~0.1%; a spike means a client is mishandling vectors, not that users got busier |
-| Dedup hit ratio | > 30% expected; a fall suggests chunking or hashing broke silently |
-| Chunk sweeper backlog + orphan age | Storage leak detector — refcount bugs show up here first |
-| Quota reconciliation drift | Nightly job: sum of chunk sizes per user vs storage_used; drift pages a human |
+## ⚖️ Trade-offs and implementation boundary — 1 minute
 
-Structured logs keyed by (userId, deviceId, syncToken) let me replay one device's entire sync conversation — with billions of events, per-device traceability is the only way to debug "my iPad won't sync."
+| Decision | Chosen | Cost accepted |
+|----------|--------|---------------|
+| Concurrent edits | Causal siblings and atomic admission | Retained versions and resolution workflow |
+| Bytes | Staged immutable manifests | Transfer and reclamation lifecycle |
+| Delivery | Commit-ordered feed plus hints | History retention and reset protocol |
+| Privacy | Account-scoped reuse initially | Less cross-account storage saving |
 
-Alerting philosophy: page on user-facing symptoms (propagation latency SLO, sync success rate), ticket on internal leading indicators (sweeper backlog, dedup ratio drift, feed truncation resets). The reconciliation jobs — quota drift, refcount audit — are the deepest safety net: they detect *correctness* bugs that no latency metric ever will, and any nonzero finding is treated as a sev-2 even if no user has noticed yet.
+The local app implements PostgreSQL metadata, server-side 4 MiB chunking, MinIO objects,
+vector-comparison helpers, synchronous photo derivatives, and in-process WebSockets.
+It does not implement the proposed transactional admission, immutable version manifests,
+resumable uploads, durable feed, safe reclamation, or device retirement protocol.
 
-## 📈 Scalability: What Breaks First
+Its current metadata writes can race, timestamp changes can be missed, and conflict
+copies do not preserve chunk manifests. The proposed guarantees therefore describe
+what I would build next, not what the demo already proves.
 
-1. **First: the file-metadata write path in PostgreSQL.** Billions of sync events funnel into metadata updates. Fix: shard by user_id — sync is perfectly user-partitioned; no query ever joins across users. Sharding here is almost mechanical, which is exactly why the schema was kept user-keyed from day one. The one cross-user table (chunk_store) is deliberately excluded from user sharding.
+> “The core design is one durable revision decision with recoverable bytes and a
+> replayable record. Everything else—push, caching, deduplication, and thumbnails—
+> improves cost or experience around that decision.”
 
-2. **Second: the device_sync_state / change-feed workload.** Every device polls or resumes its cursor; this is a huge, hot, simple-access-pattern dataset — the classic case for moving from relational storage to Cassandra, partition-keyed by (user_id, device_id), where writes scale linearly with nodes. The AP posture is fine because a device that reads a slightly stale cursor just re-fetches a few already-applied changes, and idempotency makes reapplication harmless.
-
-3. **Third: chunk_store dedup lookups.** A global hash → refcount table serving every upload's "which chunks do you have?" query becomes a read hotspot. Fix: it's a pure key-value workload on a uniformly distributed key (a hash) — shard by hash prefix and front with a cache; near-perfect distribution comes free because SHA-256 outputs are uniform by construction.
-
-4. **Fourth: derivative generation during photo bursts.** New Year's midnight produces a global spike of photo ingests all needing thumbnails. The queue absorbs it — derivatives are async and disposable, so the backlog stretches to minutes without any user-visible failure; originals were already durable at ingest.
-
-5. **Object storage itself scales horizontally by design** — content addressing means no rename/move traffic, and immutable chunks make CDN caching of popular shared-album content trivial.
-
-## ⚖️ Trade-offs Summary
-
-| Decision | Chosen | Alternative | Rationale |
-|----------|--------|-------------|-----------|
-| Conflict detection | ✅ Version vectors | ❌ Timestamps (LWW) | Detects true concurrency; immune to clock drift |
-| Conflict resolution | ✅ Merge + keep-both copies | ❌ OT/CRDT everywhere | Works for any file type; no silent data loss |
-| Chunking | ✅ Fixed 4MB | ❌ Content-defined (CDC) | Simple, right for photo/video-dominated bytes; CDC later per-type |
-| Content addressing | ✅ SHA-256, global dedup | ❌ Per-file opaque blobs | Dedup + delta + resumable + idempotent uploads from one design |
-| Sync state store | ✅ Cassandra (prod ideal) | ❌ PostgreSQL for everything | Highest-write, user-partitioned, AP-tolerant workload |
-| Change delivery | ✅ Push invalidations + pull payloads | ❌ Push full payloads | Missed pushes are harmless; pull cursor is the correctness path |
-| Mutation safety | ✅ Idempotency keys, Redis + DB constraint | ❌ Best-effort dedup | Mobile retries are the normal case; two layers fail differently |
-| Deletes | ✅ Tombstones with vector bump | ❌ Physical deletion | Offline devices would resurrect deleted files |
-| Quota accounting | ✅ Full logical size per user | ❌ Dedup-aware sharing of cost | Explainable, ungameable; dedup savings go to operator |
-| Derivatives | ✅ Disposable, outside refcount GC | ❌ Refcounted like originals | Regenerable assets shouldn't burden the durability machinery |
-
-## 🚀 Closing: What I'd Build Next
-
-With more time I'd go deeper on:
-
-- **End-to-end encryption key hierarchy**: per-file keys wrapped by device keys, the recovery-contact escrow problem, and the explicit dedup cost of E2E categories
-- **Content-defined chunking** as a per-file-type policy for frequently edited documents, measured against real edit traces before committing to the complexity
-- **Selective sync and shared folders**: permission models once folders span accounts, and what "the folder changed" means when members have different visibility
-- **Cross-region replication**: sync state is user-homed so region pinning is natural, but shared albums create the first genuinely cross-user, potentially cross-region edges in the data model — that's where the interesting consistency work begins
-
-The through-line of the design: metadata and content on separate paths, causality tracked explicitly rather than inferred from clocks, and every mutation replayable — so the system degrades toward slow, never toward wrong.
+[Implementation details](./architecture.md) · [Run the demo](./README.md)

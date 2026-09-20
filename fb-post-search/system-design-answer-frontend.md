@@ -41,19 +41,49 @@ avoid spending the first interview on a full social-network composer or video pl
 
 ```
 ┌────────────────────────────────────────────────────────────┐
-│ Query + filter drafts / accessible suggestions             │
-│ Committed route intent + account generation                │
-└─────────────────────────────┬──────────────────────────────┘
-                              ▼
-┌────────────────────────────────────────────────────────────┐
-│ Request controller: identity / pages / bounded cache       │
-│ Safe snippets + result list + reading anchor               │
-└─────────────────────────────┬──────────────────────────────┘
-                              ▼
-┌────────────────────────────────────────────────────────────┐
-│ Search API: fixed session / current access / ranking       │
+│ BROWSER / VIEWER AND QUERY GENERATION                      │
+│                                                            │
+│  ┌────────────────────────┐    ┌────────────────────────┐  │    ┌────────────────────────┐
+│  │ Query + filter drafts  │    │ Suggestion controller  │  │    │ Suggestion API         │
+│  │ Accessible combobox    │◀──▶│ Debounce / input ID    │◀─┼───▶│ Public-safe or private │
+│  │ Typing stays local     │    │ Scoped options         │  │    │ Explicit viewer scope  │
+│  └────────────────────────┘    └────────────────────────┘  │    └────────────────────────┘
+│               │                                            │
+│  commit query │                                            │
+│               │                                            │
+│               ▼                                            │
+│  ┌────────────────────────┐    ┌────────────────────────┐  │    ┌────────────────────────┐
+│  │ Committed route intent │    │ Result controller      │  │    │ Search API             │
+│  │ Enter / select / Apply │◀──▶│ Viewer/query/session   │◀─┼───▶│ Fixed query/session    │
+│  │ Shareable query only   │    │ Resume / reset / fetch │  │    │ Current access + match │
+│  └────────────────────────┘    └────────────────────────┘  │    └────────────────────────┘
+│                                             ▲              │
+│                                             │              │
+│                             pages / more    │              │
+│                                             │              │
+│                                             ▼              │
+│  ┌────────────────────────┐    ┌────────────────────────┐  │
+│  │ Safe result list       │    │ Query page cache       │  │
+│  │ Text match fragments   │◀──▶│ Scoped IDs + revisions │  │
+│  │ Anchor / page errors   │    │ Snippets tied to query │  │
+│  └────────────────────────┘    └────────────────────────┘  │
+│                                                            │
 └────────────────────────────────────────────────────────────┘
+Suggestions follow typing; result pages follow committed intent and the current viewer.
 ```
+
+I would follow typing through a bounded suggestion request, then commit one query through
+the URL into a result session. Accepted pages keep their query-specific snippets and
+post revisions; a late request cannot replace a newer intent. The result list preserves
+its reading anchor and existing pages when a later fetch fails. Suggestions and result
+responses both remain scoped to the current viewer rather than to a shareable URL alone.
+
+I would walk through Back navigation before adding more infrastructure:
+
+1. Restore committed query intent and the reading anchor; keep protected cached snippets hidden until revalidated.
+2. Resume a matching, unexpired server session. Apply returned pages only to the same viewer and query generation.
+3. If the session expired or its graph/index context is incompatible, preserve the query and explicitly restart results rather than reuse an old cursor.
+4. On an account change, clear private pages and suggestions and invalidate outstanding requests. A URL or remembered anchor carries no permission.
 
 I would use React and TypeScript with a router and a small store or query-cache layer. The
 framework choice matters less than identifying who owns draft input, committed intent,

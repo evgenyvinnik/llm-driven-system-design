@@ -58,27 +58,51 @@ The public catalog and developer console can share cards, media components, and
 form controls while keeping their data caches and permissions distinct.
 
 ```
-┌────────────────────────────────────────────────────────┐
-│ Routes: search, app detail, developer workspace        │
-└───────────┬───────────────────────────────┬────────────┘
-            │                               │
-            ▼                               ▼
-┌────────────────────────┐      ┌────────────────────────┐
-│ Query cache            │      │ Local drafts / UI      │
-│ Keyed server results   │      │ Dialogs, edit state    │
-└───────────┬────────────┘      └────────────────────────┘
-            │
-            ▼
-┌────────────────────────────────────────────────────────┐
-│ Typed API client: auth, errors, request identity       │
-└───────────┬────────────────────────────────────────────┘
-            │
-            ▼
-┌────────────────────────────────────────────────────────┐
-│ Catalog / reviews / publishing API                     │
-│ Authoritative revisions and operation status           │
-└────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────┐      direct authorized upload
+│ BROWSER / URL AND SESSION SCOPE                          │
+│                                                          │
+│  ┌───────────────────────┐     ┌──────────────────────┐  │      ┌────────────────────────┐
+│  │ Catalog + app detail  │     │ Developer workspace  │  │      │ Granted upload         │
+│  │ Review text draft     │     │ Draft + upload UI    │◀─┼─────▶│ Object storage         │
+│  └───────────────────────┘     └──────────────────────┘  │      │ Private staged bytes   │
+│              ▲                                      ▲    │      └────────────────────────┘
+│              │                                      │    │
+│              │ query / render   edit / progress     │    │
+│              │                                      │    │
+│              ▼                                      ▼    │
+│  ┌───────────────────────┐     ┌──────────────────────┐  │
+│  │ Scoped query cache    │     │ Draft + operation    │  │
+│  │ Public pages/details  │◀───▶│ Expected revision    │  │
+│  │ Saved review revision │     │ Saved operation ID   │  │
+│  └───────────────────────┘     └──────────────────────┘  │
+│              ▲                                      ▲    │
+│              │                                      │    │
+│              │ reads / refresh  save / recover      │    │
+│              │                                      │    │
+│              ▼                                      ▼    │
+│  ┌────────────────────────────────────────────────────┐  │      ┌────────────────────────┐
+│  │ Typed data access + reconciliation                 │  │      │ Marketplace APIs       │
+│  │ Identity, conflicts, canonical results             │◀─┼─────▶│ Catalog + reviews      │
+│  └────────────────────────────────────────────────────┘  │      │ Publishing + status    │
+│                                                          │      └────────────────────────┘
+│                                                          │
+│  Uploaded ≠ approved ≠ published ≠ indexed               │
+└──────────────────────────────────────────────────────────┘
+
+The accepted operation survives the tab; unsaved text stays a separate draft.
 ```
+
+I would trace discovery from URL-owned inputs into the scoped query cache and back
+to the catalog. Review and developer edits keep local text separate from saved
+revisions. Publication uses a stable operation identity through the API, while large
+uploads use a granted storage path. Upload progress and publication progress are
+different resources, so a completed byte transfer cannot turn the UI into “Published.”
+
+The upload arrow ends at private staged bytes. The client then uses the API path to
+report completion and observe validation of the fixed artifact/revision pair. I would
+save only the scoped operation reference needed to recover publication after a reload.
+An expired upload grant or lost response resumes that operation's workflow; neither
+case turns a revised local draft into the already submitted artifact.
 
 The URL owns shareable navigation state: query, category, price filter, sort,
 and the current page or continuation position when appropriate.

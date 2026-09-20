@@ -52,28 +52,53 @@ Use a few documents and two or three browser windows on one backend, with Postgr
 Proposed production topology; ports and Docker mappings belong in the README.
 
 ```
-┌──────────────────┐       ┌──────────────────────┐
-│ Browser editor   │──────▶│ Gateway / sessions   │
-└──────────────────┘       └──────────┬───────────┘
-                                      │ document routing
-                           ┌──────────▼───────────┐
-                           │ Document owner       │
-                           │ Serialized OT stream │
-                           └──────────┬───────────┘
-                                      │ atomic commit
-                           ┌──────────▼───────────┐
-                           │ PostgreSQL           │
-                           │ Head / log / receipt │
-                           │ Snapshot / outbox    │
-                           └──────────┬───────────┘
-                                      │ outbox relay
-                           ┌──────────▼───────────┐
-                           │ Fanout + workers     │
-                           │ Delivery / snapshots │
-                           └──────────────────────┘
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Editing clients        │       │ Connection/meta edge   │       │ Ephemeral presence     │
+│ Optimistic operations  │◀─────▶│ Auth, open, route      │◀─────▶│ Session + cursor ver   │
+│ Stable request IDs     │       │ HTTP + WebSocket       │       │ Expiry; not text state │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+                                              ▲
+                                              │
+submit / durable acknowledgement              │
+                                              │
+                                              ▼
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Verified snapshots     │       │ Fenced document owner  │       │ PostgreSQL authority   │
+│ Content + version      │◀─────▶│ Serial admission + OT  │◀─────▶│ Head, log, receipts    │
+│ Checksum + format      │       │ Committed memory       │       │ Access, epoch, outbox  │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+             ▲                                                                 │
+             │                                                                 │
+snapshot V   │                                ┌────────────────────────────────┘
+             │                                │
+             │                                │  committed events
+             ▼                                ▼
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Snapshot workers       │       │ Outbox relay           │       │ Delivery gateways      │
+│ Replay durable suffix  │◀──────│ Retry / deduplicate    │──────▶│ Authorized subscribers │
+│ Verify before publish  │       │ Ordered event identity │       │ Replay + queue limits  │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+                                                                               ▲
+                                                                               │
+                                             versions / replay request         │
+                                                                               │
+                                                                               ▼
+                                                                  ┌────────────────────────┐
+                                                                  │ Peer clients           │
+                                                                  │ Apply canonical edits  │
+                                                                  │ Observe peer freshness │
+                                                                  └────────────────────────┘
+Stores may share PostgreSQL; gateways and snapshots do not become writable document owners.
 ```
 
 The gateway authenticates connections and routes each document's edits to one logical owner. Gateways may distribute delivery, but do not independently transform edits. Redis holds disposable presence; object storage can hold verified archived history. Static assets can use a CDN. Neither cache nor broker is the authority for the current document head.
+
+The sender's acknowledgement follows the atomic head/log/receipt commit. Delivery
+gateways carry committed versions to peers and accept replay requests for gaps.
+Verified snapshots accelerate recovery but do not replace the retained canonical
+suffix. An owner reconstructs committed state before reopening admission; a client
+resolves its original receipt and reconciles pending operations, preserving a separate
+local draft when the available history cannot establish a safe reconciliation.
 
 ## Core Components / Request Flows
 

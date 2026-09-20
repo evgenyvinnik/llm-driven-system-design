@@ -49,27 +49,40 @@ The supplied fixture contains three users, five threads, nine messages, and one 
 Production proposal; the durable event path is an extension to the local code:
 
 ```
-┌─────────────────────────┐       ┌──────────────────────────────┐
-│ Browser + static CDN    │──────▶│ Authenticated mail API       │
-└─────────────────────────┘       │ Mailbox / draft / search     │
-                                  └──────────────┬───────────────┘
-                                                 │
-                                  ┌──────────────▼───────────────┐
-                                  │ Message and mailbox stores   │
-                                  │ Receipts + durable outbox    │
-                                  └──────────────┬───────────────┘
-                                                 │
-                                  ┌──────────────▼───────────────┐
-                                  │ Delivery + indexing workers  │
-                                  │ Retry, deduplicate, repair   │
-                                  └──────────────┬───────────────┘
-                                                 │
-                                  ┌──────────────▼───────────────┐
-                                  │ Mailbox search projections   │
-                                  └──────────────────────────────┘
+PROPOSED INTERNAL MAIL — acceptance and each mailbox delivery commit separately
+
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Internal mail clients    │HTTP/result │ Authenticated mail API   │accept/read │ Sender authority + SQL   │
+│ Read / organize / send   │◀──────────▶│ Account / owner routing  │◀──────────▶│ Draft / body / audience  │
+│ Saved operation IDs      │            │ Read / save / send       │            │ Send receipt + outbox    │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+              ▲                                       ▲                                       ▲
+              │                                       │                                       │
+              │ query / results                       │ read / mailbox state                  │ work / delivery status
+              │                                       │                                       │
+              ▼                                       ▼                                       ▼
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Authorized search API    │access/read │ Mailbox authority + SQL  │commit / ACK│ Recipient delivery       │
+│ Current entitlement      │◀──────────▶│ Effect + receipt commit  │◀──────────▶│ User/message identity    │
+│ Safe viewer snippets     │            │ Viewer state + outbox    │            │ Delivery outcome / retry │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+              ▲                                       ▲
+              │                                       │
+              │ query / candidates                    │ changes / progress
+              │                                       │
+              ▼                                       ▼
+┌──────────────────────────┐            ┌──────────────────────────┐
+│ Per-mailbox index        │apply / ACK │ Indexing workers         │
+│ Viewer-scoped fields     │◀──────────▶│ Replay mailbox changes   │
+│ Versioned / rebuildable  │            │ Upserts + tombstones     │
+└──────────────────────────┘            └──────────────────────────┘
+
+An index outage delays discovery; it neither undoes acceptance nor authorizes hidden mail.
 ```
 
 Redis holds revocable sessions, shared request limits, and bounded per-mailbox caches. Database ownership and an authenticated user context govern every API operation. The search API retrieves candidate IDs from its projection and verifies current entitlement before producing a response. Static CDN caching does not make private messages public.
+
+Read the return arrows as separate outcomes: the sender commits a frozen send, each recipient commits a mailbox effect and receipt, and index workers confirm versioned projection effects before advancing progress. Delivery retries resolve the original user/message identity; they do not add unread state twice. A bounded account-scoped browser journal can retain local draft revisions and operation IDs under an explicit privacy/retention policy. On return, the client reauthenticates and resolves save/send receipts before retrying; restored local text is not proof of a server save or accepted send.
 
 ## Core Components / Request Flows
 

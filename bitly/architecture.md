@@ -45,32 +45,53 @@ One API, one worker, PostgreSQL, Valkey, RabbitMQ, and Vite are sufficient to ex
 ## High-Level Architecture
 
 ```text
-┌────────────────┐       ┌────────────────┐
-│ Management UI  │──────▶│ Management API │
-└────────────────┘       └───────┬────────┘
-                                 ▼
-                         ┌────────────────┐
-                         │ Mapping store  │
-                         └───────┬────────┘
-                                 │ revisions / invalidation
-                                 ▼
-┌────────────────┐       ┌────────────────┐
-│ Short-link GET │──────▶│ Regional       │──────▶ Destination
-└────────────────┘       │ resolver/cache │         via 302
-                         └───────┬────────┘
-                                 │ request observations
-                                 ▼
-                         ┌────────────────┐
-                         │ Durable log    │
-                         └───────┬────────┘
-                                 ▼
-                         ┌────────────────┐
-                         │ Analytics      │──────▶ Management API
-                         │ workers/store  │
-                         └────────────────┘
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Owner / admin client   │       │ Management API         │       │ Mapping authority      │
+│ Create and deactivate  │◀─────▶│ Validate, auth, claim  │◀─────▶│ Atomic code + receipt  │
+└────────────────────────┘       │ Recover operation      │       │ Lifecycle rev + outbox │
+                                 └────────────────────────┘       └────────────────────────┘
+                                                                               ▲
+                                                                               │
+                                                 miss lookup / revision update │
+                                                                               │
+                                                                               ▼
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Recipient browser      │       │ Regional resolver      │       │ Cache + fill adapter   │
+│ GET short code         │◀─────▶│ Check eligibility      │◀─────▶│ Expiry, rev, deadline  │
+│ Receive 302 Location   │       │ Return redirect        │       │ Bounded freshness      │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+             ▲                                ▲
+             │                                │
+GET / page   │ admission / ACK                │
+             │                                │
+             ▼                                ▼
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Destination website    │       │ Admission + event log  │       │ Report workers         │
+│ Browser fetches target │       │ Stable event IDs       │──────▶│ Atomic dedup + effect  │
+│ No resolver fetch      │       │ Retained events only   │       │ Replay retained events │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+                                                                               ▲
+                                                                               │
+                                                 apply / read                  │
+                                                                               │
+                                                                               ▼
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Report viewer          │       │ Analytics API          │       │ Analytics store        │
+│ Scope + time window    │◀─────▶│ Auth + bounded query   │◀─────▶│ Buckets and watermarks │
+└────────────────────────┘       └────────────────────────┘       │ Coverage metadata      │
+                                                                  └────────────────────────┘
+
+When event admission fails, redirects continue and report coverage is incomplete.
 ```
 
 A CDN can serve management assets. Redirect response caching is a separate policy because it changes revocation and measurement. Logical services can begin in one application while retaining independent capacity limits; they need separate deployments when redirect traffic or analytics work interferes with management writes.
+
+Trace three return paths separately: creation returns the mapping authority's saved
+result, resolution returns a 302 for the recipient to follow, and analytics returns
+aggregates with coverage. A resolver cache miss reads authoritative lifecycle state;
+revision propagation follows the outbox. Analytics admission acknowledges only retained
+events, and worker effects commit with deduplication receipts. Failed admission can
+leave a gap even after every retained event has been processed successfully.
 
 ## Core Components / Request Flows
 

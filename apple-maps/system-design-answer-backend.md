@@ -59,24 +59,55 @@ an ordinary transactional table indefinitely is not a workable default.
 I would draw this much first and add detail around the two central paths:
 
 ```
-┌────────────────────────────────────────────────────────────┐
-│ Clients: search, routes, optional observations             │
-└──────────────────────────────┬─────────────────────────────┘
-                               ▼
-┌────────────────────────────────────────────────────────────┐
-│ API edge: validation, quotas, region selection             │
-└─────────┬────────────────────┬────────────────────┬────────┘
-          ▼                    ▼                    ▼
-┌──────────────────┐ ┌──────────────────┐ ┌──────────────────┐
-│ Place search     │ │ Route workers    │ │ Ingestion        │
-│ Regional index   │ │ Graph + weights  │ │ Durable log      │
-└──────────────────┘ └─────────▲────────┘ └─────────┬────────┘
-                               │                    ▼
-                     ┌─────────┴─────────────────────────────┐
-                     │ Map releases + traffic aggregates     │
-                     └───────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────┐       ┌────────────────────────┐
+│ Map clients                                             │       │ Tile service + CDN     │
+│ Search, route intent, optional observation batches      │◀─────▶│ Versioned basemap      │
+└─────────────────────────────────────────────────────────┘       │ Independent delivery   │
+                                              ▲                   └────────────────────────┘
+                                              │
+queries / consented observations              │
+                                              │
+                                              ▼
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│ API edge                                                                                 │
+│ Validation, bounded request cost, region selection; separate workload budgets            │
+└──────────────────────────────────────────────────────────────────────────────────────────┘
+             ▲                                ▲                                ▲
+             │                                │                                │
+places       │                   route query  │                   observations │
+             │                                │                                │
+             ▼                                ▼                                ▼
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Regional place search  │       │ Regional route workers │       │ Traffic ingestion      │
+│ Text + spatial index   │       │ Legal transitions      │       │ Validate, limit, admit │
+│ Stable place IDs       │       │ Pinned graph + weights │       │ Durable acceptance     │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+                                              ▲                                ▲
+                                              │                                │
+               pin serving snapshot           │                   commit / ACK │
+                                              │                                │
+                                              ▼                                ▼
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Map build pipeline     │       │ Versioned serving view │       │ Durable log + pipeline │
+│ Validate road graph    │──────▶│ Graph + legal turns    │◀──────│ Match / aggregate      │
+│ Retain prior releases  │       │ Compatible weight view │       │ Age and confidence     │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
 
+A query pins compatible graph and traffic versions; ingestion does not own route CPU.
 ```
+
+I would follow two independent workloads. A route query reaches a regional worker
+that pins a legal graph and compatible traffic view; it does not query another
+service for each road edge. Observation batches enter a durable traffic pipeline,
+which publishes estimates with age and confidence into the serving view. Map builds
+supply the separately versioned topology. The response returns one coherent route,
+while tile delivery and place retrieval remain independently scalable paths.
+
+The observation acknowledgement follows the durable log commit; it does not wait for
+new traffic weights or prove that a route already includes them. A serving release
+pins a validated topology and compatible weights. If a new build is incomplete or a
+traffic view is too old, routers retain an eligible prior release or use an explicit
+non-live fallback, rather than mixing edge identities across incompatible versions.
 
 Basemap tiles come from an independent tile service and CDN. They do not pass
 through the route worker. A slow tile download should not delay route computation,

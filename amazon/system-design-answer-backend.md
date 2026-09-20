@@ -37,31 +37,60 @@ Proposed targets are 99.99% browsing availability, 99.9% checkout availability a
 bounded search below 200 ms at p95. External payment authentication may take longer
 than an API response budget; acceptance and final confirmation are separate outcomes.
 
-## 🏗️ Draw ownership boundaries — 5 minutes
+## 🏗️ Draw ownership boundaries — 6 minutes
 
 ```
-┌──────────────────┐       ┌──────────────────┐
-│ Storefront/API GW│──────▶│ Catalog/search   │────▶ Search index
-│ Auth, admission  │       │ Read projections │────▶ Read cache
-└─────────┬────────┘       └────────▲─────────┘
-          │                        │
-          ▼                        │ Versioned events
-┌──────────────────┐       ┌───────┴──────────┐
-│ Cart + checkout  │──────▶│ Stock/order DB   │
-│ Quote, attempt ID│       │ Attempts, outbox │
-└─────────┬────────┘       └────────┬─────────┘
-          │                        │ Durable work
-          ▼                        ▼
-┌──────────────────┐       ┌──────────────────┐
-│ Payment workflow │◀─────▶│ Workers / replay │
-│ Provider calls   │       │ Index / recs     │
-└─────────┬────────┘       └──────────────────┘
-          ▼
-┌──────────────────┐
-│ Payment provider │
-│ API + callbacks  │
-└──────────────────┘
+PROPOSED PRODUCTION DESIGN — discovery is separate from purchase authority
+
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Shopper clients          │HTTP/result │ Storefront API           │query/result│ Catalog / search         │
+│ Browse, edit, purchase   │◀──────────▶│ Authenticate / scope     │◀──────────▶│ Public product queries   │
+│ Recover saved attempt    │            │ Route reads and commands │            │ Bounded result pages     │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+              ▲                                       ▲                                       ▲
+              │                                       │                                       │
+              │ GET / bytes                           │ purchase / status                     │ read
+              │                                       │                                       │
+              ▼                                       ▼                                       ▼
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Public assets            │            │ Cart + checkout          │            │ Search index + cache     │
+│ Object storage + CDN     │            │ Validate cart + quote    │            │ Versioned projections    │
+│ No private cart caching  │            │ Allocate exact units     │            │ May lag stock and price  │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+                                                      ▲                                       ▲
+                                                      │                                       │
+                                                      │ commit / recover                      │ refresh
+                                                      │                                       │
+                                                      ▼                                       │
+                                        ┌──────────────────────────┐            ┌──────────────────────────┐
+Only committed allocations              │ PostgreSQL authority     │events      │ Outbox relay + indexers  │
+become purchase state.                  │ Stock, orders, attempts  │───────────▶│ Versioned index updates  │
+                                        │ Allocate + outbox commit │            │ Consumer progress        │
+                                        └──────────────────────────┘            └──────────────────────────┘
+                                                      ▲
+                                                      │
+                                                      │ work / outcome
+                                                      │
+                                                      ▼
+                                        ┌──────────────────────────┐            ┌──────────────────────────┐
+Provider calls run outside              │ Payment coordinator      │call/result │ Payment provider         │
+the inventory transaction.              │ Stable payment operation │◀──────────▶│ External effects         │
+                                        │ Reconcile / compensate   │            │ API + callbacks          │
+                                        └──────────────────────────┘            └──────────────────────────┘
 ```
+
+The upper path serves discovery from read projections. The lower path validates a
+quote and commits an exact stock allocation with the attempt, order and outbox in a
+short transaction. Projection workers catch up after commit. The payment coordinator
+records progress around external calls, so a timeout leaves recoverable work rather
+than a new independent purchase. These are module boundaries, not a demand for a
+separate deployment for every box.
+
+I would trace the return path as carefully as allocation: the database result becomes
+the shopper's accepted attempt, then payment progress is recovered through that same
+identity. A provider callback is reconciled with durable operation state before a
+new order status is exposed. Indexing retries follow the outbox path and never decide
+whether stock was successfully allocated or payment completed.
 
 Initially, cart, stock and order modules can share a PostgreSQL transaction boundary.
 I would not introduce a distributed reservation saga merely to make the service
@@ -366,7 +395,7 @@ all relevant copies. A JSON archive table in the same PostgreSQL instance is not
 inherently cold storage or a smaller hot table. Requirements depend on the data and
 applicable obligations; there is no universal retention duration for every storefront.
 
-## ✅ Verify the invariants — 4 minutes
+## ✅ Verify the invariants — 3 minutes
 
 I would prioritize adversarial sequences rather than only happy-path route tests:
 

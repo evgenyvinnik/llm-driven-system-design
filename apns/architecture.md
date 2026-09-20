@@ -57,27 +57,56 @@ Run one to three API processes, one PostgreSQL instance, one Valkey instance, an
 Proposed production layout:
 
 ```
-┌──────────────────┐     ┌──────────────────┐     ┌──────────────────┐
-│   App provider   │────▶│Auth + acceptance │────▶│ Durable work log │
-└──────────────────┘     └─────────┬────────┘     └─────────┬────────┘
-                                   │                        ▼
-                         ┌─────────▼────────┐     ┌──────────────────┐
-                         │  Token registry  │     │ Delivery workers │
-                         │   Lookup cache   │     │  Retained work   │
-                         └──────────────────┘     └─────────┬────────┘
-                                                            │ route lookup
-                         ┌──────────────────┐     ┌─────────▼────────┐
-                         │Connection leases │◀───▶│  Gateway fleet   │
-                         └──────────────────┘     └─────────┬────────┘
-                                                            ▼
-                                                  ┌──────────────────┐
-                                                  │ Device transport │
-                                                  └──────────────────┘
+PROPOSED DELIVERY SERVICE — acceptance and device receipt are separate commits
 
-Lifecycle events ──▶ status/metrics projection ──▶ operator console
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ App providers            │submit/ACK  │ Acceptance API           │lookup      │ Destination registry     │
+│ Scoped request identity  │◀──────────▶│ Auth / quotas / validate │◀──────────▶│ Token + app/environment  │
+│ Retry same payload + ID  │            │ Recover accepted result  │            │ Registration generation  │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+                                                      ▲
+                                                      │
+                                                      │ commit / recover
+                                                      │
+                                                      ▼
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Status read projection   │evidence    │ Operation authority      │events      │ Outbox relay + broker    │
+│ Scoped API / timestamps  │◀───────────│ State + retained work    │───────────▶│ Durable scheduled work   │
+│ Observed lifecycle state │            │ Atomic result + outbox   │            │ Replayable delivery      │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+                                                      ▲                                       │
+                                                      │                                       │
+                                                      │ claim / state                         │
+                                                      │                                       │ work
+                                                      │                                       │
+                                                      ▼                                       │
+┌──────────────────────────┐            ┌──────────────────────────┐                          │
+│ Presence leases          │route lookup│ Delivery workers         │                          │
+│ Destination to gateway   │◀──────────▶│ Expiry, collapse, retry  │◀─────────────────────────┘
+│ Owner generation + TTL   │            │ Persist matching receipt │
+└──────────────────────────┘            └──────────────────────────┘
+              ▲                                       ▲
+              │                                       │
+              │                                       │ send / receipt
+renew lease   │                                       │
+              │                                       │
+              │                                       ▼
+              │                         ┌──────────────────────────┐            ┌──────────────────────────┐
+              │                         │ Connection gateways      │send/receipt│ Device transport         │
+              └────────────────────────▶│ Socket owner generation  │◀──────────▶│ Receive and acknowledge  │
+                                        │ Bounded output buffers   │            │ App handling separate    │
+                                        └──────────────────────────┘            └──────────────────────────┘
 ```
 
 Gateways own persistent connections. Acceptance servers can scale independently. The durable work log and retained-state owner establish recovery; connection presence only suggests a route. Operators read a projection so scanning notification history does not compete with live delivery.
+
+1. The acceptance API validates app/environment scope and registration generation,
+   then returns the operation authority's committed result to the provider.
+2. Relay/broker replay drives workers. Workers read current presence leases; gateways
+   renew those leases with an owner generation so obsolete owners can be fenced.
+3. Gateway handoff is an attempt. A matching device receipt travels back to the worker
+   and durable authority before a status projection reports it. Gateway loss leaves
+   retained work available for retry or expiry, independently of console polling.
 
 ## Core Components / Request Flows
 

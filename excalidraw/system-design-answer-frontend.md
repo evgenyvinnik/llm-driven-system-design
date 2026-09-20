@@ -57,21 +57,52 @@ state. React should not need to reconcile a component for every sampled point in
 stroke.
 
 ```
-┌──────────────────────┐      ┌──────────────────────┐
-│ Pointer / keyboard   │─────▶│ Gesture draft        │
-│ Local viewport       │      │ Frame invalidation   │
-└──────────────────────┘      └──────────┬───────────┘
-                                         ▼
-┌──────────────────────┐      ┌──────────────────────┐
-│ HTTP / WebSocket     │◀────▶│ Scene state          │
-│ Durable edit status  │      │ Committed + pending  │
-└──────────────────────┘      └──────────┬───────────┘
-                                         ▼
-                              ┌──────────────────────┐
-                              │ Canvas / DOM overlays│
-                              │ World-to-screen map  │
-                              └──────────────────────┘
+┌────────────────────────────────────────────────────────────┐
+│ BROWSER / DRAWING AND ACCOUNT GENERATION                   │
+│                                                            │
+│  ┌────────────────────────┐    ┌────────────────────────┐  │    ┌────────────────────────┐
+│  │ Tools / routes / input │    │ Drawing session        │  │    │ Session + metadata API │
+│  │ Mouse, touch, keyboard │◀──▶│ Gesture draft / focus  │◀─┼───▶│ Drawing ID / access    │
+│  └────────────────────────┘    │ Permission; generation │  │    │ Titles / membership    │
+│               ▲                └────────────────────────┘  │    └────────────────────────┘
+│               │                             ▲              │
+│               │                             │              │
+│  pan / zoom   │             gesture / state │              │
+│               │                             │              │
+│               ▼                             ▼              │
+│  ┌────────────────────────┐    ┌────────────────────────┐  │    ┌────────────────────────┐
+│  │ Canvas renderer        │    │ Scene sync + journal   │  │    │ Drawing authority      │
+│  │ Local pan / zoom       │◀──▶│ Committed / pending    │◀─┼───▶│ WS commands + outcomes │
+│  │ Dirty-frame scheduler  │    │ Saved ID; durable ACK  │  │    │ Baseline; event replay │
+│  └────────────────────────┘    └────────────────────────┘  │    └────────────────────────┘
+│               ▲                             │              │
+│               │                             │              │
+│  coordinates  │              scene context  │              │
+│               │                             │              │
+│               ▼                             ▼              │
+│  ┌────────────────────────┐    ┌────────────────────────┐  │    ┌────────────────────────┐
+│  │ Text / cursor overlays │    │ Ephemeral presence     │  │    │ Presence channel       │
+│  │ Accessible DOM inputs  │◀───│ World coords / expiry  │◀─┼───▶│ Disposable previews    │
+│  │ World/screen placement │    │ Separate from scene    │  │    │ Bounded presence data  │
+│  └────────────────────────┘    └────────────────────────┘  │    └────────────────────────┘
+│                                                            │
+└────────────────────────────────────────────────────────────┘
+
+A gesture can render in the next frame while its durable command is still pending.
 ```
+
+I would trace pointer input into a temporary gesture, then let the renderer draw that
+preview using the local viewport. Finishing the gesture creates one identified command;
+the scene coordinator reconciles its canonical outcome without treating a socket send as
+“Saved.” Presence and DOM overlays reuse the coordinate convention but have their own
+lifetimes. A peer's cursor or pan operation cannot replace the committed scene.
+
+I would use a reload to explain the journal's boundary:
+
+1. Persist bounded pending commands with their original IDs, drawing generation, and expected property revisions under the account's storage policy.
+2. Restore a canonical baseline and resolve original receipts before reapplying pending overlays; local persistence alone cannot justify a saved label.
+3. If retained history has expired, obtain a fresh snapshot and explicitly reconcile stale drafts. A deleted element cannot be recreated by replaying an old update.
+4. Reauthorize before resubmission and isolate unresolved drafts after revocation/account changes. Presence and current pointer previews may simply expire.
 
 The scene state and network adapter coordinate accepted commands and pending changes. The
 renderer consumes the resulting scene, including the active gesture draft; React owns

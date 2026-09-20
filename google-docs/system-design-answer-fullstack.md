@@ -1,466 +1,430 @@
-# Google Docs - System Design Interview Answer (Full-Stack Focus)
+# Google Docs: full-stack system design interview
 
-> **Role Focus**: Full-Stack Engineer - End-to-End Integration, Shared Types, API Design, Real-Time Sync, State Synchronization
+A proposed 45-minute design connecting a rich-text browser editor to an authoritative
+collaboration service. The final section distinguishes this design from the repository's
+incomplete teaching implementation.
 
-## Opening Statement
+## 🎯 Agree on the user journeys — 4 minutes
 
-"Today I'll design Google Docs, a real-time collaborative document editing platform. As a full-stack engineer, I'll focus on the end-to-end architecture connecting the rich text editor to the OT backend, shared type definitions for type-safe collaboration, WebSocket protocol design, and optimistic updates that provide instant feedback while ensuring eventual consistency."
+> “I would focus on three journeys: two people edit without losing each other's work, a comment stays connected to the text it discusses, and a user can recover a saved version without silently replacing newer work. That gives us a useful way to connect frontend state to backend guarantees.”
 
----
+The first release includes paragraphs, headings, lists, common formatting marks,
+small collaborative groups, comments, owner-managed sharing, and named history.
+I would set document-size and editor-count limits. Export, arbitrary embedded apps,
+full tracked-change suggestions, and unlimited offline merging are separate extensions.
 
-## Step 1: Requirements Clarification (3-5 minutes)
+Local typing should be immediate. A saved indication means the service committed
+an identified revision, not that a socket opened or a debounce timer expired. Presence
+is best effort; accepted content is durable within a stated replica-failure boundary.
 
-### Functional Requirements
+The service has one ordered committed history per document. Clients can temporarily
+lead that history with local unconfirmed work. Their job is to reconcile with it while
+preserving selection, composition, and authored intent.
 
-1. **Document creation and editing** - Rich text with formatting
-2. **Real-time collaboration** - Multiple users editing simultaneously
-3. **Cursor and selection sharing** - See where others are typing
-4. **Version history** - View and restore previous versions
-5. **Comments and suggestions** - Threaded comments, track changes
-6. **Sharing and permissions** - View, comment, edit access levels
+| Journey | Browser responsibility | Server responsibility |
+|---------|------------------------|-----------------------|
+| Edit together | Immediate input and mapped pending steps | Ordered admission and recoverable results |
+| Disconnect/reconnect | Preserve unresolved work and attempt identity | Receipt lookup and contiguous replay |
+| Comment on text | Keep draft and selected revision/range | Map or reject the anchor under current access |
+| Preview/restore | Isolate history preview and guard pending edits | New identified restore event at an expected head |
+| Change permissions | Show current capability and stop invalid actions | Enforce current access on reads and commands |
 
-### Non-Functional Requirements
+I would propose p95 input-to-paint below 50 ms on a specified modest device and peer
+visibility below 200 ms in a document's home region. Availability and latency targets
+need measurement; I would not promise arbitrary document sizes on every device.
 
-- **Latency**: < 50ms local response, < 100ms sync to collaborators
-- **Consistency**: Strong consistency via OT, eventual consistency for presence
-- **Offline**: Continue editing without network, sync on reconnect
-- **Type Safety**: Shared schemas between frontend and backend
+## 🏗️ Draw the complete path — 5 minutes
 
-### Full-Stack Challenges I'll Focus On
-
-1. **Shared Type Definitions**: Zod schemas for operations, documents, and messages
-2. **API Design**: REST for CRUD, WebSocket for real-time sync
-3. **Optimistic Updates**: Immediate UI feedback with server reconciliation
-4. **State Synchronization**: TanStack Query for server state, Zustand for UI state
-5. **Error Handling**: Graceful degradation across the stack
-
----
-
-## Step 2: System Architecture (5 minutes)
-
-```
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                                  Frontend                                        │
-├─────────────────────────────────────────────────────────────────────────────────┤
-│  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐                  │
-│  │   TipTap Editor │  │  Zustand Store  │  │ TanStack Query  │                  │
-│  │  (ProseMirror)  │  │   (UI State)    │  │ (Server State)  │                  │
-│  └────────┬────────┘  └────────┬────────┘  └────────┬────────┘                  │
-│           │                    │                    │                            │
-│           └────────────────────┼────────────────────┘                            │
-│                                │                                                 │
-│                    ┌───────────▼───────────┐                                     │
-│                    │   WebSocket Client    │ ◄──── Shared Types (Zod)           │
-│                    │   + API Client        │                                     │
-│                    └───────────┬───────────┘                                     │
-└────────────────────────────────┼────────────────────────────────────────────────┘
-                                 │
-                    WebSocket + REST (JSON)
-                                 │
-┌────────────────────────────────┼────────────────────────────────────────────────┐
-│                                │          Backend                                │
-├────────────────────────────────┼────────────────────────────────────────────────┤
-│                    ┌───────────▼───────────┐                                     │
-│                    │   Express + WS        │ ◄──── Shared Types (Zod)           │
-│                    │   Route Handlers      │                                     │
-│                    └───────────┬───────────┘                                     │
-│                                │                                                 │
-│           ┌────────────────────┼────────────────────┐                            │
-│           │                    │                    │                            │
-│  ┌────────▼────────┐  ┌────────▼────────┐  ┌───────▼───────┐                    │
-│  │    OT Engine    │  │   Services      │  │   Middleware  │                    │
-│  │  (transforms)   │  │  (docs, users)  │  │  (auth, rbac) │                    │
-│  └────────┬────────┘  └────────┬────────┘  └───────────────┘                    │
-│           │                    │                                                 │
-│           └────────────────────┼────────────────────┘                            │
-│                                │                                                 │
-│           ┌────────────────────┼────────────────────┐                            │
-│           │                    │                    │                            │
-│  ┌────────▼────────┐  ┌────────▼────────┐  ┌───────▼───────┐                    │
-│  │   PostgreSQL    │  │      Redis      │  │   Pub/Sub     │                    │
-│  │  (documents)    │  │   (sessions)    │  │  (broadcast)  │                    │
-│  └─────────────────┘  └─────────────────┘  └───────────────┘                    │
-└─────────────────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Step 3: Deep Dive - Shared Type Definitions (10 minutes)
-
-### Operation Types with Zod
-
-Operations use a discriminated union with three types:
+I would put the editor's local model above the network boundary and show the document
+owner, durable store, delivery, and presence beneath it. This makes the save boundary
+visible before discussing framework choices.
 
 ```
-┌───────────────────────────────────────────────────────────────────────────┐
-│                           Base Operation                                   │
-├───────────────────────────────────────────────────────────────────────────┤
-│  id: UUID, documentId: UUID, userId: UUID                                  │
-│  version: non-negative integer, timestamp: number                          │
-└───────────────────────────────────────────────────────────────────────────┘
-        │
-        ├──► InsertOperation: type='insert'
-        │    position: non-negative int, text: string (min 1)
-        │    attributes: Record<string, unknown> (optional, for formatting)
-        │
-        ├──► DeleteOperation: type='delete'
-        │    position: non-negative int, length: positive int
-        │
-        └──► FormatOperation: type='format'
-             position: non-negative int, length: positive int
-             attributes: Record<string, unknown>
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│ BROWSER / LOCAL INPUT, CONFIRMED HISTORY AND REVIEW CONTEXT                              │
+│                                                                                          │
+│  ┌────────────────────────┐    ┌────────────────────────┐    ┌────────────────────────┐  │
+│  │ Editor + review UI     │    │ Models + local journal │    │ Sync / API coordinator │  │
+│  │ Typing / focus / draft │◀──▶│ Pending editor steps   │◀──▶│ Saved attempt + digest │  │
+│  │ Pinned history preview │    │ Anchors / presence     │    │ Account/doc generation │  │
+│  └────────────────────────┘    └────────────────────────┘    └────────────────────────┘  │
+│                                                                           ▲              │
+│                                                                           │              │
+└───────────────────────────────────────────────────────────────────────────┼──────────────┘
+                                              ┌─────────────────────────────┘
+                                              ▼
+                                 ┌────────────────────────┐       ┌────────────────────────┐
+                                 │ Authenticated gateway  │       │ Presence routing       │
+                                 │ HTTP / WS owner route  │◀─────▶│ Connection-scoped      │
+                                 │ Replay/current access  │       │ Version / expiry       │
+                                 └────────────────────────┘       └────────────────────────┘
+                                              ▲
+                                              │ commands / outcomes
+                                              │
+                                              ▼
+                                 ┌────────────────────────┐       ┌────────────────────────┐
+                                 │ Fenced document owner  │       │ Document partition/SQL │
+                                 │ Edit/review/restore    │◀─────▶│ Head/epoch/grants      │
+                                 │ Committed working copy │       │ Steps/receipts/outbox  │
+                                 └────────────────────────┘       │                        │
+                                              ▲                   │                        │
+                                              │ replay / publish  │                        │
+                                              │                   │                        │
+                                              ▼                   │                        │
+┌────────────────────────┐       ┌────────────────────────┐       │ Committed range reads  │
+│ Verified snapshots     │       │ Replay/snapshot work   │       │ Claimable outbox work  │
+│ Revision/content hash  │◀─────▶│ Committed ranges       │◀─────▶│ Commit + work progress │
+│ History / recovery     │       │ Verify before publish  │       │                        │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+
+Local input is immediate; Saved follows durable admission. Preview never replaces the live editor.
 ```
 
-### Document and User Schemas
+Typing updates the editor model and produces unconfirmed steps. The client coordinator
+submits an immutable attempt; the document owner validates and commits an accepted
+range with its receipt. The accepted stream returns to clients for reconciliation.
+Snapshot and delivery workers consume committed history; presence remains disposable.
+
+I would explain reload recovery through those same owners:
+
+1. A bounded account/document/schema journal retains pending steps and the submitted attempt under a defined storage policy.
+2. After reauthorization, resolve that immutable attempt and recover a coherent committed prefix before rebasing anything uncertain.
+3. Acceptance removes the corresponding pending work; only a definitive no-effect result permits a newly identified rebased submission.
+4. Snapshot publication and progress follow verified bytes and a complete prefix. History preview and fresh presence stay separate from the recovered live editor.
+
+REST serves document lists, review panels, and history reads. WebSocket carries batches
+and presence. Content-changing REST commands, including restore, reach the same document
+owner as edits. Otherwise the two transports can create contradictory histories.
+
+I would use a schema-aware editor such as ProseMirror and a centralized step-rebase
+protocol. The authority accepts batches based on its current revision. Stale clients
+catch up and rebase unconfirmed steps using the editor's mapping model.
+
+That is one coherent choice. A Yjs/CRDT design could be appropriate for longer offline
+work, but its provider, identifiers, undo, and persistence form a different protocol.
+I would not mix its extensions with a custom position-based server and call the result OT.
+
+Initially, one process can contain the gateway, metadata API, and document owner.
+At scale, those responsibilities separate while each document retains a fenced
+admission authority and a colocated durable consistency boundary.
+
+## 💾 State and contracts across the boundary — 4 minutes
+
+| State | Owner | Identity that must survive a request |
+|-------|-------|-------------------------------------|
+| Displayed rich text and selection | Editor model | Account/document/schema and local transaction context |
+| Confirmed and pending steps | Collaboration adapter | Confirmed revision, client ID, immutable submitted attempt |
+| Comment draft | Review UI | Document, selected revision/range, draft/attempt ID |
+| Metadata and history pages | Server-state cache | Account/document/query generation and pinned revision |
+| Committed head and receipts | Document authority/store | Document epoch, step version, attempt digest/outcome |
+| Presence | Connection-scoped awareness | Document revision, connection ID, expiry |
+
+The editor owns content and undo; React owns shell controls and small derived views.
+Zustand can coordinate panel visibility and pending status. A query cache manages
+metadata and pages. The important decision is ownership, not whether every field lives
+in the same store library.
+
+A bootstrap response contains a verified snapshot and a contiguous suffix to a known
+head. A batch request contains base version, schema, immutable attempt ID, and ordered
+steps. Acceptance identifies the exact committed range; rejection explicitly says the
+attempt had no effect.
+
+Versioned numbers need a deliberate SQL/JSON representation. TypeScript interfaces
+cannot prevent a driver from returning BIGINT as a string, or validate malicious
+network messages. The runtime boundary checks shape, range, schema, and current access.
+
+| Method/channel | Proposed operation | Useful response |
+|----------------|--------------------|-----------------|
+| GET | Document list / bootstrap | Authorized page or coherent starting revision |
+| WS | Submit editor batch | Durable accepted range or terminal rejection |
+| WS or GET | Replay after version | Contiguous steps and originating batch identities |
+| GET | Resolve attempt | Known result or unresolved status |
+| POST/PATCH | Comment or grant command | Canonical authorized state and version |
+| GET/POST | History preview / restore | Pinned revision or new guarded reset result |
+
+The transport preserves structured errors and operation identities. Flattening a
+conflict or unknown write outcome into a generic string forces the UI to guess how
+to recover and can turn a retry into duplicate content.
+
+## 📊 Size the work that crosses those arrows — 3 minutes
+
+Assume five million daily active editors spending twenty minutes each. Six billion
+editor-seconds/day implies about 69,445 concurrent editors on average, with a fivefold
+peak of roughly 350,000.
+
+At 0.5 submitted batches per active editor per second, that is about 34,722 average
+batches/second and 175,000 at peak. At 500 bytes per batch, the daily log is about
+1.5 TB before replicas, indexes, receipts, and snapshots.
+
+For five other viewers in a room, each accepted batch creates roughly five content
+deliveries. Presence and reconnect traffic add work independently. Slow sockets can
+consume more memory than healthy ones because their queues accumulate.
+
+These are planning assumptions, not Google statistics. The frontend still opens one
+bounded document and a page of comments. The backend partitions documents, while one
+hot document's serialized processing and fan-out require their own budgets.
+
+## 🔧 Deep dive 1: from typing to a known saved outcome — 9 minutes
+
+### Keep immediate input independent of acceptance
+
+The editor applies a local transaction immediately. The collaboration adapter retains
+the confirmed revision and unconfirmed steps, so the displayed document can include
+work that is still pending. React observes a compact save state rather than replacing
+the entire document JSON after every response.
 
-**ProseMirrorNodeSchema** uses `z.lazy()` for recursive structure:
-- type: string
-- content: array of nodes (optional)
-- text: string (optional)
-- marks: array of `{ type, attrs }` (optional)
-- attrs: Record (optional)
+I would keep one unresolved wire batch per client/document and buffer later local
+transactions behind it. This does not stop typing; it makes the in-flight uncertainty
+manageable. Batching preserves ordered steps and has byte/step and time limits.
 
-**DocumentContentSchema**: `{ type: 'doc', content: ProseMirrorNode[] }`
+Freeze the submitted attempt's ID, base, schema, and payload. If the user types more
+while it is in flight, those steps remain separate. A network retry sends the same
+attempt; it cannot silently include newer text under the old ID.
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                       Document Schema                            │
-├─────────────────────────────────────────────────────────────────┤
-│  id: UUID                                                        │
-│  title: string (max 500)                                         │
-│  ownerId: UUID                                                   │
-│  currentVersion: non-negative int                                │
-│  content: DocumentContent                                        │
-│  createdAt, updatedAt: ISO datetime strings                      │
-└─────────────────────────────────────────────────────────────────┘
+### The server has an explicit commit point
 
-┌─────────────────────────────────────────────────────────────────┐
-│                   DocumentListItem Schema                        │
-├─────────────────────────────────────────────────────────────────┤
-│  id, title, ownerId, updatedAt (picked from Document)            │
-│  ownerName: string                                               │
-│  permission: 'owner' | 'edit' | 'comment' | 'view'               │
-└─────────────────────────────────────────────────────────────────┘
-```
+The document owner validates current edit capability, document state, schema, and
+resource bounds. It applies all proposed steps to a candidate document, rejecting the
+whole batch if the result is invalid.
 
-### WebSocket Message Schemas
-
-**Client to Server Messages** (discriminated on `type`):
-- `join`: documentId, version (to catch up from)
-- `leave`: documentId
-- `operation`: documentId, operationId (for idempotency), version, operation
-- `cursor`: documentId, position `{ from, to }`
+In a serialized database transaction, it checks its fencing epoch and the document
+head, resolves the attempt receipt, and either records a terminal no-effect rejection
+or appends the accepted steps with a receipt and outbox event. The head advances by
+the number of accepted steps.
 
-**Server to Client Messages**:
-- `joined`: documentId, version, operations (missed), users (with color, cursor)
-- `ack`: documentId, operationId, version
-- `operation`: documentId, version, operation, userId
-- `presence`: documentId, userId, action ('join'|'leave'|'cursor'), user
-- `error`: code, message, documentId (optional)
-
----
+An identical accepted attempt returns its original range. A changed payload under the
+same ID is a conflict. This guarantee comes from storage constraints and serialization,
+not a cache lookup followed by unprotected processing.
 
-## Step 4: Deep Dive - Validation Middleware (5 minutes)
-
-### Express Validation Middleware
-
-Three validation functions for different parts of the request:
-
-**validateBody(schema)**: Parses `req.body` with schema. On ZodError, returns 400 with error details as `{ path, message }` array.
-
-**validateQuery(schema)**: Parses `req.query`. Returns 400 on validation failure.
-
-**validateParams(schema)**: Parses `req.params`. Returns 400 on validation failure.
-
-All middleware call `next()` on success, passing parsed values through.
-
-### WebSocket Message Validation
-
-The message handler:
-1. Parses raw JSON from buffer
-2. Validates with `ClientMessageSchema.parse()`
-3. Routes to appropriate handler based on `message.type`
-4. On ZodError: sends `INVALID_MESSAGE` error
-5. On SyntaxError: sends `PARSE_ERROR` error
-6. On other errors: logs and sends `INTERNAL_ERROR`
+Only after commit does the owner expose the candidate as accepted state and acknowledge
+save durability. The browser can keep typing while that round trip takes place; local
+responsiveness does not require an in-memory acknowledgment to masquerade as a save.
 
-Error messages use the ServerMessage error format: `{ type: 'error', code, message }`.
+### Concurrent changes rebase through the editor model
 
----
+Alice and Bob start from revision 20. Alice's two-step batch commits at 21–22. Bob's
+attempt with base 20 receives an explicit no-effect rejection and the missing range.
+He integrates Alice's steps, maps his pending work, and submits a new attempt.
 
-## Step 5: Deep Dive - API Routes (7 minutes)
+The old attempt remains terminally rejected so a delayed retry cannot become a second
+accepted version of Bob's intent. A rebase changes the wire payload and therefore
+requires a fresh identity after the earlier outcome is known.
 
-### Document Routes
+A rich-text operation can change structure: splitting a paragraph or deleting a list
+item may invalidate another range. I would use a tested editor mapping model and
+preserve work requiring manual recovery rather than pretending raw string offsets
+are enough for every formatting and selection case.
 
-**GET /** - List documents (owned + shared):
-- Query params validated: page (default 1), limit (default 20, max 100), sort ('updated'|'title'|'created')
-- Returns documents with pagination: `{ documents, pagination: { page, limit, total, totalPages } }`
-- Response validated against `DocumentListItemSchema` array
-
-**GET /:id** - Get single document:
-- Params validated: id as UUID
-- Requires 'view' permission via middleware
-- Returns 404 if not found, otherwise `{ document }`
-
-**POST /** - Create document:
-- Body validated: title (optional, defaults to 'Untitled Document'), content (optional)
-- Initializes content as `{ type: 'doc', content: [{ type: 'paragraph' }] }` if not provided
-- Returns 201 with created document
-
-**PATCH /:id** - Update metadata:
-- Requires 'edit' permission
-- Body validated: title (optional)
-- Returns updated document
-
-**DELETE /:id** - Delete document:
-- Requires 'delete' permission
-- Returns 204 on success
+Accepted batches carry origin identity. Alice confirms her own matching local steps
+when they return in the canonical stream; she does not insert them again. Remote
+accepted steps are applied through the collaboration transaction path, which maps
+selection and compatible undo state along with pending edits.
 
-### Permission Routes
-
-**POST /:id/share** - Share document:
-- Body validated: email, permission ('view'|'comment'|'edit')
-- Requires 'share' permission
-- Returns `{ shared: true, user: {...} | null, pendingInvite: boolean }`
-
-**GET /:id/permissions** - List permissions:
-- Requires 'view' permission
-- Returns `{ permissions: [{ id, userId, email, permission, userName, createdAt }] }`
-
----
-
-## Step 6: Deep Dive - TanStack Query Hooks (8 minutes)
+### Reconnect resolves uncertainty before creating new intent
 
-### Document Queries and Mutations
-
-**Query Keys Factory:**
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  documentKeys = {                                                │
-│    all: ['documents']                                            │
-│    lists: () → [...all, 'list']                                  │
-│    list: (filters) → [...lists(), filters]                       │
-│    details: () → [...all, 'detail']                              │
-│    detail: (id) → [...details(), id]                             │
-│    versions: (id) → [...detail(id), 'versions']                  │
-│    comments: (id) → [...detail(id), 'comments']                  │
-│  }                                                               │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-**useDocuments(filters)**: Lists documents with 30-second staleTime.
-
-**useDocument(id)**: Gets single document, enabled when id is truthy.
-
-**useCreateDocument()**: Creates with optimistic update:
-1. Cancel outgoing refetches on lists
-2. Snapshot previous docs
-3. Add optimistic doc with temp ID to list
-4. On error: rollback to snapshot
-5. On settled: invalidate lists to refetch
-
-**useUpdateDocument()**: Updates with optimistic update:
-1. Cancel queries for detail
-2. Snapshot previous doc
-3. Merge new data optimistically
-4. On error: rollback
-5. On settled: invalidate detail and lists
+Suppose Alice's response is lost after commit. She still has an unresolved attempt,
+not a failed edit. The client asks for its outcome or retries the original frozen
+request through the authority. A missing receipt alone does not prove an in-flight
+request cannot still commit.
 
-**useDeleteDocument()**: Deletes with optimistic removal:
-1. Cancel queries on lists
-2. Snapshot previous docs
-3. Filter out deleted doc
-4. On error: rollback
-5. On settled: invalidate lists
-
-### Share Document Hook
-
-**useShareDocument(documentId)**: Mutation that invalidates permissions list on success.
-
-**useDocumentPermissions(documentId)**: Query for permissions, enabled when documentId is truthy.
-
----
-
-## Step 7: Deep Dive - WebSocket Sync Hook (8 minutes)
+If accepted, recover its range and retire the matching pending work. If definitely
+rejected, rebase and issue a new attempt. If unresolved, keep the pending state and
+continue outcome resolution. Never rebase an uncertain accepted insert and submit it
+under a new identity just because the socket changed.
 
-### WebSocket Client with Type Safety
-
-**useCollaborationSync** hook manages:
-- Connection state: 'connecting' | 'connected' | 'disconnected'
-- Local version tracking
-- Pending operations map (for deduplication)
+A short-lived local recovery copy can preserve the base and pending work across reload.
+It is account/document scoped, has a retention policy, and is not advertised as server
+durability. Unsupported schema or expired rebase history leads to explicit recovery,
+such as saving a separate copy, rather than silently clearing the queue.
 
-**Connection Flow:**
-1. Create WebSocket to `${VITE_WS_URL}/ws`
-2. On open: set status to 'connected', send join message with documentId and version
-3. On close: set status to 'disconnected'
-4. On message: parse as ServerMessage, route to handler
-5. On unmount: send leave message, close connection
+| Choice | Why it works here | What it costs |
+|--------|-------------------|---------------|
+| ✅ Immediate editor state + durable identified admission | Input is responsive while saved has a precise meaning | Reconciliation, receipts, and pending states |
+| ❌ Wait for network before showing input | Easy single-state client | Latency directly delays typing |
+| ❌ ACK in memory and persist only after inactivity | Fast apparent saves | A crash or discarded intermediate operation loses acknowledged work |
 
-**Server Message Handling:**
-- `joined`: Apply missed operations, update version, set presence
-- `ack`: Remove from pending, update version
-- `operation`: Apply if not in pending (from self), update version, invalidate cache
-- `presence`: Invalidate presence query on join/leave
-- `error`: Log to console
+> “I separate when the user sees an edit from when the service accepts it. That lets the interface stay responsive without weakening the meaning of Saved.”
 
-**Sending Operations:**
-1. Check WebSocket is open (queue for offline if not)
-2. Generate operationId
-3. Add to pending map
-4. Send operation message with documentId, operationId, version
-
-**Sending Cursor:**
-Sends cursor message with documentId and position `{ from, to }` when WebSocket is open.
-
-### Editor Integration with Sync
+## 🔧 Deep dive 2: review actions keep the context the person saw — 8 minutes
 
-The `CollaborativeEditor` component:
-1. Uses `useDocument()` to load initial document
-2. Creates TipTap editor instance
-3. Connects `useCollaborationSync` with document version
-4. Handles remote operations by applying to editor via `tr.insertText()` or `tr.delete()`
-5. Listens to editor transactions, converts to operations, sends via `sendOperation()`
-6. Listens to selection updates, sends cursor position via `sendCursor()`
-7. Displays connection status indicator
+### Map comments instead of treating offsets as permanent
 
----
+The user selects a phrase and writes a comment. The draft remembers its document,
+revision, range, and boundary affinity. It remains available even while remote edits
+change the displayed document.
 
-## Step 8: Deep Dive - Comments Integration (5 minutes)
+An insertion before the phrase should move the anchor, while a deletion of the phrase
+may detach it. The server and client apply the agreed mapping rules to accepted changes.
+A detached discussion retains its identity and authorized quoted context; it does not
+quietly attach to whatever sentence now occupies the old position.
 
-### Comments Schema
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                       Comment Schema                             │
-├─────────────────────────────────────────────────────────────────┤
-│  id, documentId, parentId (nullable for top-level)               │
-│  anchorStart, anchorEnd, anchorVersion (text range + version)    │
-│  content: string (1-10000 chars)                                 │
-│  authorId, authorName, authorColor                               │
-│  resolved: boolean                                               │
-│  createdAt: ISO datetime                                         │
-│  replies: Comment[] (recursive)                                  │
-└─────────────────────────────────────────────────────────────────┘
-```
+If the range includes unconfirmed local text, first establish a committed base or use
+a deliberately combined content/comment command. The server cannot interpret offsets
+from the speculative local document as if they referenced its earlier shared revision.
 
-### useComments Hook
+Submission has its own immutable attempt identity. On error, preserve the comment body
+and selection context. Clearing the input after a promise resolves is insufficient:
+the API wrapper may have returned a rejected result without throwing an exception.
 
-**commentsQuery**: Fetches comments for documentId using `documentKeys.comments()`.
+Replies belong to a parent in the same document. Resolve/reopen carries a desired state
+and expected version; a late response cannot overwrite a newer decision. Query pages
+contain canonical entities, while the UI overlays only its current pending intent.
 
-**addCommentMutation**:
-1. Optimistically adds comment with temp ID and current user info
-2. On error: rollback to previous
-3. On settled: invalidate comments
+### Preview should not replace the live editor
 
-**resolveCommentMutation**:
-1. Optimistically sets `resolved: true` on matching comment
-2. On error: rollback
+History loads a pinned snapshot into a separate read-only editor. The live editor,
+confirmed revision, pending batch, focus, and scroll anchor remain intact. A late
+preview response is checked against the selected document and history revision.
 
-Returns `{ comments, isLoading, addComment, resolveComment }`.
+The UI distinguishes a named checkpoint from the current head. The latest available
+snapshot can be older than accepted edits. Calling the first history item “Current”
+without comparing its revision gives users the wrong restore context.
 
----
+Restore is an identified command that pins both a target snapshot and the current
+head the person reviewed. It goes through the document authority, preserves the current
+revision, and appends a new replacement/reset event. The version never moves backward.
 
-## Step 9: Version History Integration (4 minutes)
+If intervening edits advanced the head, reject the stale restore intent and refresh
+the comparison. A new user decision creates a new attempt. Independent SQL overwrites
+around the owner would leave connected editors, snapshots, and the head disagreeing.
 
-### Version Schema
+Before local restore, resolve the pending batch or retain a recovery copy. Other
+participants can also have pending edits when the reset arrives. If the editor model
+cannot map those edits meaningfully, stop automatic submission and offer recovery.
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                       Version Schema                             │
-├─────────────────────────────────────────────────────────────────┤
-│  id, documentId, versionNumber                                   │
-│  createdBy, createdByName                                        │
-│  isNamed: boolean, name (nullable)                               │
-│  createdAt: ISO datetime                                         │
-└─────────────────────────────────────────────────────────────────┘
-```
+### Access is part of the current document context
 
-### Version Hooks
+Owners share and delete. Editors alter content. Commenters discuss without modifying
+the body, while viewers read. The UI exposes these capabilities, and every backend
+command checks them independently of which controls happened to be visible.
 
-**useVersions(documentId)**: Lists versions with 1-minute staleTime.
+A permission change participates in current admission and invalidates active
+subscriptions. A long-lived socket cannot keep using the role it had at connection
+time after the document is revoked or deleted.
 
-**useVersionContent(documentId, versionId)**: Gets version content, enabled when versionId is truthy.
+Current access also protects bootstrap, replay, version previews, comments, and presence.
+An old snapshot or query cache is not a lasting capability. Account/document generation
+checks prevent a slow response from restoring a previous user's document after logout.
 
-**useRestoreVersion()**: Mutation that:
-1. Calls `api.versions.restore(documentId, versionId)`
-2. On success: invalidates detail and versions queries
+There is a practical limit: the application cannot revoke text already copied by a
+reader. Its enforceable promise is to stop future protected delivery and mutations,
+while handling unresolved local work according to an explicit recovery policy.
 
----
+| Choice | Benefit | Cost or failure mode |
+|--------|---------|----------------------|
+| ✅ Versioned anchors, isolated preview, guarded restore | Review actions preserve their intended context | Mapping and recovery states across the stack |
+| ❌ Fixed offsets and direct content replacement | Small initial implementation | Comments drift and restore races with active edits |
+| ❌ Permission check only on join | Few steady-state checks | Revoked sessions retain effective access |
 
-## Step 10: Error Handling Across the Stack (3 minutes)
+> “Comments, history, and sharing are not independent decorations around the editor. They refer to the same changing document, so their commands must carry the version and permission context the user acted on.”
 
-### API Error Types
+## 🔧 Deep dive 3: recover and stay responsive under load — 7 minutes
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                      ApiError Schema                             │
-├─────────────────────────────────────────────────────────────────┤
-│  error: string                                                   │
-│  code: string (optional)                                         │
-│  details: { path, message }[] (optional)                         │
-└─────────────────────────────────────────────────────────────────┘
-```
+### Open one coherent revision
 
-**ApiClientError** class extends Error with:
-- status: HTTP status code
-- code: error code string
-- details: validation error details
+The server supplies snapshot S plus committed steps through H, and the client starts
+from exactly H. If a snapshot's body is old, the server must not label it with a newer
+in-memory counter. That would corrupt the base for every later edit.
 
-**apiRequest** function:
-1. Adds Content-Type and credentials headers
-2. On non-OK response: parse error, throw ApiClientError
-3. Validates error shape with ApiErrorSchema.safeParse()
+Live subscription and durable replay overlap safely by version. A message received
+out of order does not advance the confirmed version past a missing step. Reconnect,
+sequence checks, and periodic head reconciliation repair missed delivery, including
+the final lost event when no later edit arrives to reveal the gap.
 
-### Global Error Boundary
+Accepted steps and their receipts are the durable facts. The outbox closes the gap
+between committing those facts and publishing them. Delivery can repeat after a crash;
+clients/gateways recognize already integrated ranges.
 
-Uses `QueryErrorResetBoundary` from TanStack Query with `react-error-boundary`:
-- Shows error message (formatted for ApiClientError)
-- Provides "Try again" button that calls `resetErrorBoundary()`
-- Resets query error state via TanStack's reset function
+Snapshot workers reconstruct a committed revision, verify the content, and publish a
+manifest after storage succeeds. They can run independently of live typing. Compaction
+retains required replay and attempt-outcome evidence for the declared recovery window.
 
----
+### Failure changes status, not the meaning of Saved
 
-## Step 11: Trade-offs (2 minutes)
+If durable storage is unavailable, keep the local editor usable within a bounded pending
+budget but stop authoritative saved acknowledgments. If the owner crashes after commit,
+a replacement resolves the receipt and recovers committed state under a new epoch.
+Storage rejects an old owner's late writes.
 
-| Decision | Alternative | Trade-off |
-|----------|-------------|-----------|
-| **Zod shared schemas** | TypeScript interfaces only | Runtime validation + type inference, larger bundle |
-| **TanStack Query** | SWR, Redux | More features (optimistic updates), steeper learning curve |
-| **WebSocket + REST** | WebSocket only | REST better for CRUD, WS for real-time |
-| **Optimistic updates** | Wait for server | Better UX, more complex rollback logic |
-| **Separate presence** | Combine with ops | Presence can be lossy, ops must be reliable |
-| **Query key factory** | String keys | Type-safe, refactor-friendly, more boilerplate |
+If only live delivery fails, accepted content remains safe and clients catch up.
+If presence fails, hide or expire remote cursors while editing continues. Those failure
+modes deserve different status text and operational alerts.
 
----
+A circuit breaker can stop repeated dependency calls; it cannot make accepted data
+durable or cancel a SQL write that timed out. Outcome resolution and the durable log
+are required even when the breaker is working as designed.
 
-## Closing Summary
+### Bound work on both sides
 
-"I've designed a collaborative document editor with full-stack integration:
+The browser lets the editor own its DOM, composition, selection, and undo. React
+subscribes to small derived values for toolbar and save state. Replacing editor JSON
+on every response or global store update risks both jank and lost input context.
 
-1. **Shared Zod schemas** for type-safe operations, documents, and messages across frontend and backend
-2. **Validation middleware** that parses and validates all API requests and WebSocket messages
-3. **TanStack Query hooks** with optimistic updates for instant feedback and automatic cache invalidation
-4. **WebSocket sync hook** that handles operations, acknowledgments, and presence with proper error handling
-5. **End-to-end error handling** with typed errors, global boundaries, and graceful degradation
+Coalesce presence by connection and expire it. Use mapped editor decorations or a
+carefully measured overlay rather than rebuilding the document for each cursor.
+Long comment and history lists can be virtualized independently of editable text.
 
-The key insight is that shared type definitions eliminate an entire class of bugs (schema drift), while optimistic updates with proper rollback logic provide a responsive UX without sacrificing consistency. The separation of REST (for CRUD) and WebSocket (for real-time) allows each protocol to excel at what it does best."
+Arbitrarily unmounting paragraphs can break native selection, composition, and screen
+reader navigation. I would profile within a stated document budget before choosing
+editor-aware block rendering or section partitioning. Large paste and formatting
+changes belong in the performance scenarios, not only scrolling.
 
----
+The backend bounds submitted bytes/steps, document size, room membership, replay range,
+and per-connection output queues. A slow reader is disconnected with a resumable
+position before its buffer threatens the owner process. Content is replayable; cursor
+updates can be coalesced or dropped.
 
-## Potential Follow-up Questions
+Scale owners by document and gateways by connection/delivery work. One hot document
+still has serialized admission. Section sharding changes cross-section edits, comments,
+and undo, so it needs a separate product and model discussion.
 
-1. **How would you handle schema versioning?**
-   - Version schemas in URL path (/v1/, /v2/)
-   - Use discriminated unions for backward compatibility
-   - Transform old formats at API boundary
+| Choice | Why it fits | Cost |
+|--------|-------------|------|
+| ✅ Durable replay plus bounded live delivery | Recovers missing updates without unbounded socket buffers | Cursors, retained history, and gap detection |
+| ❌ Rely on every broadcast arriving | Short happy path | Disconnects leave clients permanently behind |
+| ❌ Virtualize arbitrary editable paragraphs | Fewer mounted nodes | Can break selection/composition and accessibility |
 
-2. **How would you test the WebSocket integration?**
-   - Mock WebSocket with fake-socket library
-   - Integration tests with real server
-   - E2E tests with Playwright
+> “I would use the durable history to make network delivery recoverable, then budget browser and server work separately. A correct protocol still needs a responsive editor, and a fast editor still needs a recoverable save.”
 
-3. **How would you handle very high latency connections?**
-   - Increase pending operation buffer
-   - Show sync status indicator
-   - Batch operations more aggressively
+## 🛡️ Verification and operations — 3 minutes
+
+I would verify the complete journey in two browser contexts, not infer collaboration
+from a green socket icon. Type, format, and comment concurrently; lose an acceptance
+response; restart the owner; reconnect and compare the committed document and identities.
+
+| Scenario | Expected result |
+|----------|-----------------|
+| Same attempt is submitted twice concurrently | One terminal outcome and one accepted range at most |
+| Connection drops after commit | Retry resolves without inserting the text twice |
+| Snapshot and replay disagree | Explicit recovery failure, not an invented current version |
+| Comment's selected text is removed | Draft/thread survives with detached context |
+| Restore races with new edits | Stale intent is rejected before replacing the head |
+| Account or document changes during a request | Old result cannot replace the new scope |
+| Permission is revoked on an open socket | Subsequent protected reads and commands stop |
+
+Frontend checks cover input-to-paint, composition with remote updates, keyboard focus,
+large paste, and navigation memory. Backend checks cover serialization, fencing,
+receipt retention, contiguous replay, and snapshot publication failures.
+
+Measure saved-ack latency and unresolved-work age separately from socket uptime and
+in-memory handler duration. Use body-free batch IDs for diagnosis, with bounded metric
+labels and no document content or credentials in logs.
+
+## ⚖️ Decisions and implementation boundary — 2 minutes
+
+The proposal connects immediate editor transactions to fenced durable admission,
+version-aware review, and recoverable delivery. It trades unrestricted offline merging
+for a clear online authority, and accepts explicit pending/recovery UI rather than
+claiming every network response is a successful save.
+
+The actual [Editor](./frontend/src/components/Editor.tsx) does not send operations,
+and [DocumentPage](./frontend/src/routes/DocumentPage.tsx) does not apply received edits.
+The backend has experimental transforms and presence, but its
+[persistence timer](./backend/src/services/collaboration/persist.ts) saves only the last
+operation of a burst and does not update content. Restore also has a BIGINT string
+concatenation bug and bypasses live collaboration state.
+
+The [architecture](./architecture.md#implementation-notes) records those limits and
+source evidence. A useful final whiteboard walkthrough is one edit: local transaction,
+immutable attempt, durable accepted range, canonical reconciliation, and the Saved
+state that follows. Each arrow has a reason and a defined recovery path.

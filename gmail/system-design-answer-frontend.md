@@ -47,14 +47,60 @@ destroy an active draft. On a narrow display it becomes a dedicated screen with 
 same editor state.
 
 ```
-┌─────────────────────────┐       ┌──────────────────────────────┐
-│ Mailbox / reader routes │──────▶│ Account-scoped query state   │
-└─────────────────────────┘       └──────────────┬───────────────┘
-                                                 │
-┌─────────────────────────┐       ┌──────────────▼───────────────┐
-│ Persistent draft editor │──────▶│ Typed mail API               │
-└─────────────────────────┘       └──────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│ BROWSER / ACCOUNT GENERATION; COMPOSE SURVIVES ROUTE CHANGES                             │
+│                                                                                          │
+│  ┌────────────────────────┐    ┌────────────────────────┐    ┌────────────────────────┐  │
+│  │ Mailbox + search UI    │    │ Conversation reader    │    │ Compose workspace      │  │
+│  │ Route / query scope    │    │ Visible messages only  │    │ Local text revision    │  │
+│  │ Bounded rows + anchor  │    │ Body/focus budget      │    │ Recipients + save UI   │  │
+│  └────────────────────────┘    └────────────────────────┘    └────────────────────────┘  │
+│               ▲                             ▲                             ▲              │
+│               │                             │                             │              │
+│ page / intent │              read / observe │                 type / save │              │
+│               │                             │                             │              │
+│               ▼                             ▼                             ▼              │
+│  ┌────────────────────────┐    ┌────────────────────────┐    ┌────────────────────────┐  │
+│  │ Query + mailbox state  │    │ Reader state           │    │ Draft/send coordinator │  │
+│  │ Ordered IDs / entities │◀──▶│ Visible sequence       │    │ One pending save       │  │
+│  │ Desired-state actions  │    │ Expanded message IDs   │    │ Frozen send / recovery │  │
+│  └────────────────────────┘    └────────────────────────┘    └────────────────────────┘  │
+│               ▲                             ▲                             ▲       ▲      │
+│               │                             │                             │       │      │
+│               └─────────────────────────────┼─────────────────────────────┘       │      │
+│                                             ▲                 save/restore        │      │
+│                                             ▼                                     ▼      │
+│                                ┌────────────────────────┐    ┌────────────────────────┐  │
+│                                │ Typed API transport    │    │ Local draft journal    │  │
+│                                │ Account/request scope  │    │ Text / saved op IDs    │  │
+│                                │ Errors / op receipts   │    │ Account-scoped policy  │  │
+│                                └────────────────────────┘    └────────────────────────┘  │
+│                                             ▲                                            │
+│                                             │                                            │
+└─────────────────────────────────────────────┼────────────────────────────────────────────┘
+                                              │
+  authorized reads and identified saves/sends │
+                                              ▼
+   ┌────────────────────────────────────────────────────────────────────────────────────┐
+   │ Mail / draft / search API (server boundary)                                        │
+   │ Viewer-specific mail; conditional drafts; acceptance and delivery status           │
+   └────────────────────────────────────────────────────────────────────────────────────┘
+
+Response identity prevents old requests from restoring another account's mail.
 ```
+
+I would follow typing into the persistent draft coordinator, then a versioned save or a
+frozen send through the shared transport. A response acknowledges only the revision or
+operation it identifies. Mailbox, reader and search requests have their own state and
+account generation; the reader reports the visible sequence it actually observed.
+The API returns authorized content, while the browser owns responsiveness and recovery UI.
+
+I would follow a reload during a save or Send through the journal:
+
+1. Retain bounded local draft text, its revision, and pending operation identity under an account-scoped storage policy; local recovery is distinct from server “Saved.”
+2. After reauthentication, fetch the draft's current state and resolve pending save/send receipts before retrying the same operation.
+3. Keep newer local typing when an older save completes. A version conflict preserves both copies; an accepted send cannot be undone by replaying a stale autosave.
+4. Restore mailbox navigation separately and revalidate private content. Account changes invalidate requests and apply the journal's logout/retention policy.
 
 The shell owns authentication status, navigation, and global notifications. The
 mailbox view owns its current filter, page, selection, and scroll anchor. The

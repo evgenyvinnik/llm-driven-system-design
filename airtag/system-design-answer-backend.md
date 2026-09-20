@@ -36,24 +36,53 @@ Time to find an item has no fixed bound: no nearby finder means no new observati
 Our backend latency target starts when a report reaches us, not when the owner
 first notices that the item is missing.
 
-## 🏗️ Architecture and responsibility — 4 minutes
+## 🏗️ Architecture and responsibility — 6 minutes
 
 ```
-┌─────────────────┐      ┌─────────────────┐      ┌─────────────────┐
-│ Finder devices  │─────▶│ Ingestion API   │─────▶│ Durable log     │
-│ Encrypted report│      │ Validate, admit │      │ Stable identity │
-└─────────────────┘      └─────────────────┘      └────────┬────────┘
-                                                           ▼
-                                                  ┌─────────────────┐
-                                                  │ Storage workers │
-                                                  │ Idempotent sink │
-                                                  └────────┬────────┘
-                                                           ▼
-┌─────────────────┐      ┌─────────────────┐      ┌─────────────────┐
-│ Owner device    │◀────▶│ Query API/cache │◀────▶│ Report store    │
-│ Derive, decrypt │      │ Bounded batches │      │ Token/time index│
-└─────────────────┘      └─────────────────┘      └─────────────────┘
+                              ┌────────────────────────────────────────────────────────────┐
+                              │ REPORT SERVICE: CIPHERTEXT ONLY                            │
+                              │                                                            │
+┌────────────────────────┐    │  ┌────────────────────────┐    ┌────────────────────────┐  │
+│ Finder devices         │    │  │ Ingestion API          │    │ Durable log            │  │
+│ Encrypt / retry ID     │◀───┼─▶│ Validate and admit     │◀──▶│ Commit before ACK      │  │
+└────────────────────────┘    │  └────────────────────────┘    └────────────────────────┘  │
+                              │                                             │              │
+ACK after log commit          │  at-least-once replay                       │              │
+                              │                                             │              │
+                              │                                             ▼              │
+                              │  ┌────────────────────────┐    ┌────────────────────────┐  │
+                              │  │ Account + pairing      │    │ Storage workers        │  │
+                              │  │ No decryption keys     │    │ IDs / write checkpoint │  │
+                              │  └────────────────────────┘    └────────────────────────┘  │
+                              │               ▲                             │              │
+                              │               │                             │              │
+                              │  metadata     │  persist, then checkpoint   │              │
+                              │               │                             │              │
+                              │               ▼                             ▼              │
+┌────────────────────────┐    │  ┌────────────────────────┐    ┌────────────────────────┐  │
+│ Owner device           │    │  │ Query API + cache      │    │ Opaque report store    │  │
+│ Derive lookup tokens   │◀───┼─▶│ Bound tokens and bytes │◀──▶│ Token / receipt time   │  │
+│ Decrypt locally        │    │  │ Auth / quotas          │    │ Expiry + report ID     │  │
+└────────────────────────┘    │  └────────────────────────┘    └────────────────────────┘  │
+                              │                                                            │
+                              └────────────────────────────────────────────────────────────┘
+
+Owner keys and plaintext observations remain on the owner device
+
+Nearby safety and notification delivery have separate lifecycles
 ```
+
+The finder receives an acceptance result only after the declared durable boundary.
+Workers persist replayed envelopes idempotently before advancing their progress. The
+owner's bounded query retrieves those envelopes and decrypts them on-device; account
+metadata and caches do not introduce server decryption keys. This drawing separates
+ingestion durability, query visibility, and the location knowledge held by each party.
+
+I would trace two retries separately. A finder resends the same report identity after
+a lost acceptance response; a worker replays committed envelopes after a crash and
+persists each report before advancing its checkpoint. Query lag between those steps
+does not mean the upload failed. The owner's query path can catch up later without
+giving the service a private key or treating receipt time as observation time.
 
 Account and pairing metadata can live in PostgreSQL. Report storage has a different
 access pattern: append opaque envelopes and retrieve them by rotating token and
@@ -101,7 +130,7 @@ linking a query batch to an account must be acknowledged.
 I would keep cryptographic envelope versioning explicit so validation and client
 support can evolve without accepting arbitrary unbounded JSON as a protocol.
 
-## 🔧 Deep dive: Protect contents without claiming complete anonymity — 9 minutes
+## 🔧 Deep dive: Protect contents without claiming complete anonymity — 8 minutes
 
 > “The privacy boundary is about who has decryption capability. A missing foreign
 > key is useful schema separation, but it is not a cryptographic guarantee.”
@@ -363,7 +392,7 @@ A report service also needs bounded admission and a trusted proxy policy. Authen
 per-client quotas and envelope limits should work together; accepting arbitrary
 forwarding headers as authoritative undermines IP-based controls.
 
-## 🧪 Validate guarantees and failure modes — 4 minutes
+## 🧪 Validate guarantees and failure modes — 3 minutes
 
 I would test the trust and durability boundaries with real components:
 

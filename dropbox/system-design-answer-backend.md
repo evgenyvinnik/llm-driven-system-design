@@ -54,21 +54,62 @@ may dominate network cost. The estimates mainly tell us to keep file bytes off t
 service's critical path.
 
 ```
-┌──────────────────┐     ┌──────────────────┐     ┌──────────────────┐
-│ Clients          │────▶│ Metadata API     │────▶│ SQL authority    │
-└──────────────────┘     └──────────────────┘     │ + durable changes│
-        │                         │               └──────────────────┘
-        ▼                         ▼                         │
-┌──────────────────┐     ┌──────────────────┐               ▼
-│ Upload service   │────▶│ Private objects  │     ┌──────────────────┐
-│ Verified staging │     │ Immutable chunks │     │ Change relay     │
-└──────────────────┘     └──────────────────┘     └──────────────────┘
-                                                            │
-                                                            ▼
-                                                  ┌──────────────────┐
-                                                  │ Socket gateways  │
-                                                  └──────────────────┘
+PROPOSED STORAGE — metadata publishes versions only after verified staging
+
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Uploading clients        │commit/read │ Metadata authority       │transaction │ Namespace SQL            │
+│ Namespace / base / ID    │◀──────────▶│ Access + hierarchy       │◀──────────▶│ Manifest, quota, receipt │◀─────┐
+│ Retain original manifest │            │ Conditional publication  │            │ Durable change sequence  │      │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘      │
+              ▲                                 ▲                                   ▲         ▲                   │
+              │                                 │                                   │         │                   │
+stage / ACK   │                                 │                                   │         │                   │
+              │           slot receipts         │                                   │         │                   │
+              │         ┌───────────────────────┘                         ┌─────────┘         │ outbox / progress │
+              │         │                                                 │                   │                   │
+              ▼         ▼                                                 │                   ▼                   │
+┌──────────────────────────┐            ┌──────────────────────────┐      │     ┌──────────────────────────┐      │
+│ Upload service           │store/read  │ Private chunk storage    │      │     │ Change relay             │      │
+│ Session / checked slots  │◀──────────▶│ Verified immutable bytes │      │     │ Committed obligations    │      │
+│ Scoped resumable staging │            │ Namespace-scoped reuse   │      │     │ Retry / record progress  │      │
+└──────────────────────────┘            └──────────────────────────┘      │     └──────────────────────────┘      │
+                                                      ▲                   │                   │                   │
+                                                      │                   │                   │                   │
+                                                      │                   │                   │           replay  │
+                                                      │ read / bytes      │ authorize/pin     │ hint              │
+                                                      │                   │                   │                   │
+                                                      ▼                   │                   ▼                   │
+┌──────────────────────────┐            ┌──────────────────────────┐      │     ┌──────────────────────────┐      │
+│ Downloading clients      │range/bytes │ Download admission       │      │     │ Change gateways          │      │
+│ Same version on resume   │◀──────────▶│ Recheck current access   │◀─────┘     │ Current namespace access │◀─────┘
+│ Bounded response buffers │            │ Pin immutable manifest   │            │ Retained change feed     │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+                                                                                              ▲
+                                                                                              │
+                                                                                              │ cursor / changes
+                                                                                              │
+Staging leases and retained-version references protect objects                                │
+from reclamation while publication or admitted reads use them.                                ▼
+                                                                                ┌──────────────────────────┐
+                                                                                │ Connected devices        │
+                                                                                │ Namespace revision       │
+                                                                                │ Catch up or resnapshot   │
+                                                                                └──────────────────────────┘
 ```
+
+I would separate byte staging from the transaction that publishes a namespace version.
+The metadata authority accepts a manifest only after checking verified slot receipts,
+quota and the expected base. Download admission checks current permission and pins that
+immutable manifest. The lower path distributes committed changes; gateways can recover
+from namespace history when a notification is missed. Garbage collection must preserve
+objects protected by active uploads, retained versions and the delivery policy.
+
+The recovery paths are deliberately independent:
+
+1. The upload service returns verified slot receipts; metadata publication rechecks those receipts, live quota reservation, access, and base version.
+2. A finalization retry resolves the same committed receipt. Reclamation cannot delete objects while their staging protection becomes a published reference.
+3. Download admission pins one manifest under current access and preserves the delivery/retention contract across bounded range requests.
+4. Gateways read durable namespace changes after a missed hint; an expired cursor causes a bounded resnapshot rather than silent loss.
 
 The metadata service owns namespace mutations and permissions. Upload services manage resumable
 staging and verify receipts. A relay moves committed changes to gateways. These are responsibility

@@ -22,10 +22,10 @@ but delayed analytics must not interrupt the current track.
 | Discussion | Minutes |
 |------------|---------|
 | Scope and targets | 4 |
-| Capacity and architecture | 5 |
+| Capacity and architecture | 6 |
 | Data and API contracts | 4 |
 | Deep dive: authorized media delivery | 10 |
-| Deep dive: complete and recoverable library sync | 11 |
+| Deep dive: complete and recoverable library sync | 10 |
 | Deep dive: listening events and recommendations | 8 |
 | Failure priorities and local boundary | 3 |
 | Total | 45 |
@@ -38,7 +38,7 @@ needs to include failures in both the API and media paths.
 An acknowledged library edit must be durable. Discovery can be eventually updated,
 but a sync cursor must never silently hide an earlier committed edit.
 
-## 🏗️ Capacity and architecture — 5 minutes
+## 🏗️ Capacity and architecture — 6 minutes
 
 Assume a 100-million-track catalog and ten million concurrent listeners.
 At 256 kbit/s, those listeners require 2.56 Tbit/s of media egress before overhead.
@@ -56,23 +56,63 @@ through the same transactional path as a library edit.
 My first diagram keeps media delivery independent of the control API:
 
 ```
-┌────────────────────────────┐    ┌────────────────────────────┐
-│ Clients                    │───▶│ CDN + private media origin │
-└──────────────┬─────────────┘    └────────────────────────────┘
-               ▼
-┌──────────────────────────────────────────────────────────────┐
-│ API edge: identity, validation, bounded admission            │
-└─────────┬─────────────────────┬─────────────────────┬────────┘
-          ▼                     ▼                     ▼
-┌──────────────────┐ ┌────────────────────┐ ┌──────────────────┐
-│ Playback grants  │ │ Library/playlist   │ │ Catalog/search   │
-│ Allowed assets   │ │ State + revisions  │ │ Discovery reads  │
-└──────────────────┘ └────────────────────┘ └─────────▲────────┘
-                                                      │
-┌─────────────────────────────────────────────────────┴────────┐
-│ Durable events → aggregates → recommendations                │
-└──────────────────────────────────────────────────────────────┘
+        ┌─────────────────────────────────────────────────────────┐       ┌────────────────────────┐
+        │ Music clients                                           │       │ CDN + private origin   │
+  ┌────▶│ Playback intents, library edits, listening events       │◀─────▶│ Grant-checked bytes    │
+  │     └─────────────────────────────────────────────────────────┘       │ Immutable media        │
+  │                                                   ▲                   └────────────────────────┘
+  │                                                   │
+  │       control requests / canonical results        │
+  │                                                   │
+  │                                                   ▼
+  │     ┌──────────────────────────────────────────────────────────────────────────────────────────┐
+  │     │ API edge                                                                                 │
+  │     │ Identity and bounded admission; media bytes bypass this request pool                     │
+  │     └──────────────────────────────────────────────────────────────────────────────────────────┘
+  │                     ▲                             ▲                             ▲
+  │                     │                             │                             │
+  │        authorize    │                edit / sync  │                browse       │
+  │                     │                             │                             │
+  │                     ▼                             ▼                             ▼
+  │        ┌────────────────────────┐    ┌────────────────────────┐    ┌────────────────────────┐
+  │        │ Playback grants        │    │ Library / playlist API │    │ Catalog / discovery    │
+  │        │ Entitlement + formats  │    │ Per-owner operations   │    │ Bounded search         │
+  │        │ Ready rendition only   │    │ Snapshot + delta pages │    │ Personalized sections  │
+  │        └────────────────────────┘    └────────────────────────┘    └────────────────────────┘
+  │                     ▲                             ▲                             ▲
+  │                     │                             │                             │
+  │                     ▼                             ▼                             ▼
+  │        ┌────────────────────────┐    ┌────────────────────────┐    ┌────────────────────────┐
+  │        │ Catalog authority      │    │ Owner-partitioned DB   │    │ Search / read views    │
+  │        │ Published renditions   │    │ Atomic state + log     │    │ History + candidates   │
+  │        │ Eligibility metadata   │    │ Durable edit receipts  │    │ Scoped cached results  │
+  │        └────────────────────────┘    └────────────────────────┘    └────────────────────────┘
+  │                     │                                                           ▲
+  │                     │  versioned catalog projection                             │
+  │                     └───────────────────────────────────────────────────────────┤
+  │ events / durable receipts          history / recommendation updates             │
+  │                                                                                 │
+  ▼                                                                                 │
+┌─────────────────────────────────────────────────────────┐       ┌────────────────────────────────┐
+│ Event ingress + durable log                             │       │ Projection / candidate workers │
+│ Scope; durable events + IDs; ACK after commit           │──────▶│ Deduplicate effects and replay │
+└─────────────────────────────────────────────────────────┘       │ Publish discovery views        │
+                                                                  └────────────────────────────────┘
 ```
+
+The client first asks the control path for an eligible rendition, then fetches
+bytes from private media delivery using the returned grant. Library edits instead
+commit against one owner's state, revision log and operation receipts. Listening
+batches enter a separate durable path; workers build history and recommendation
+views asynchronously; versioned catalog publication also refreshes public search
+views. I would use these arrows to explain three different scaling budgets: audio
+bandwidth, transactional edits, and event throughput.
+
+I would mark two acknowledgements on the return paths. An edit receipt follows the
+atomic owner-state/change-log transaction; an event receipt follows durable event
+acceptance. A worker may still be updating history or recommendations afterward.
+Lost responses reuse their original operation or event identity, while a playback
+grant refresh rechecks eligibility without creating another library mutation.
 
 Catalog metadata is shared and read-heavy. Personal libraries are partitioned by
 owner so their state and revisions remain together. Media objects are immutable
@@ -195,7 +235,7 @@ I would not increment a “currently listening” gauge for every URL request an
 clients to decrement it exactly once. Active-session estimates need leases or
 aggregation with defined expiry and duplicate handling.
 
-## 🔧 Deep dive 2: complete and recoverable library sync — 11 minutes
+## 🔧 Deep dive 2: complete and recoverable library sync — 10 minutes
 
 ### Put the state change and its receipt in one transaction
 

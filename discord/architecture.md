@@ -58,35 +58,54 @@ No application load test was run during this documentation audit. The code has c
 ### Proposed production text-chat system
 
 ```text
-┌────────────────────────┐       ┌──────────────────────────────┐
-│ Browser / TCP client   │──────▶│ Protocol gateways            │
-└────────────────────────┘       │ Auth / bounded connections   │
-                                 └───────────────┬──────────────┘
-                                                 │
-                                                 ▼
-                                 ┌──────────────────────────────┐
-                                 │ Room command authority       │
-                                 │ Order / permission / retry   │
-                                 └───────────────┬──────────────┘
-                                                 │
-                                                 ▼
-                                 ┌──────────────────────────────┐
-                                 │ PostgreSQL                   │
-                                 │ Messages / receipts / outbox │
-                                 └───────────────┬──────────────┘
-                                                 │
-                                                 ▼
-                                 ┌──────────────────────────────┐
-                                 │ Outbox publisher             │
-                                 │ Fan-out notification bus     │
-                                 └───────────────┬──────────────┘
-                                                 │
-                                                 ▼
-                                 ┌──────────────────────────────┐
-                                 │ Gateway delivery + replay    │
-                                 │ Read committed room log      │
-                                 └──────────────────────────────┘
+BROWSER: views, coordinator, recovery copy. SERVER: transport, authority, delivery.
+
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Composer + timeline      │intent/view │ Browser room coordinator │            │ Terminal client          │
+│ Draft / pending / scroll │◀──────────▶│ Normalize / reconcile    │            │ Framed TCP commands      │
+│ Render accepted identity │            │ Room + account epoch     │            │ Same room semantics      │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+              ▲                                       ▲                                       ▲
+              │                                       │ HTTP / SSE                            │
+              │                                       │                                       │ TCP
+              │                                       │     ┌─────────────────────────────────┘
+              │ save / restore                        │     │
+              │                                       │     │
+              ▼                                       ▼     ▼
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Browser recovery copy    │            │ Transport gateways       │command/ACK │ Room authority           │
+│ Draft + immutable sends  │            │ Auth / HTTP / TCP / SSE  │◀──────────▶│ Current permission       │
+│ Policy / account / room  │            │ Commands + subscriptions │            │ Serialize room sequence  │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+                                                      ▲                                       ▲
+                                                      │                                       │
+                                                      │ subscribe / events                    │ commit / recover
+                                                      │                                       │
+                                                      ▼                                       ▼
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Connection leases        │lease/state │ Delivery gateways        │read/replay │ PostgreSQL authority     │
+│ Per-device presence      │◀──────────▶│ Current read access      │◀──────────▶│ Message + head + receipt │
+│ Expiry != room removal   │            │ Read committed room log  │            │ Outbox in same commit    │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+                                                      ▲                                       ▲
+                                                      │                                       │
+                                                      │ wake                                  │
+                                                      │                                       │ outbox
+                                                      │                                       │ / progress
+                                                      │                                       │
+                                        ┌──────────────────────────┐                          │
+                                        │ Outbox relay + bus       │                          │
+                                        │ Retry committed work     │◀─────────────────────────┘
+                                        │ Hints wake delivery      │
+                                        └──────────────────────────┘
 ```
+
+Read the proposed overview as two paths with a shared authority:
+
+1. Browser and TCP commands reach the same permission/order boundary; the message, room head, receipt, and outbox commit atomically.
+2. The response resolves the original send identity. Policy-scoped browser storage retains drafts and immutable pending sends across an interrupted session.
+3. Outbox notifications wake delivery gateways, while their separate history read repairs missed notifications and serves retained replay under current access checks.
+4. A reloaded client restores both message state and cursor or obtains a fresh history boundary. Connection leases remain separate from durable membership.
 
 The gateway owns sockets and stream framing; the room authority owns accepted order and permission decisions. PostgreSQL is the initial durable source for configuration and messages. The outbox couples a committed message to an obligation to notify delivery gateways. The notification bus accelerates delivery, while ordered durable history is the source for catch-up.
 

@@ -52,23 +52,44 @@ Provisioning peaks around device launches; authorization peaks around shopping a
 The diagram separates wallet control from merchant payment processing. Lines describe logical responsibility, not the precise Apple protocol.
 
 ```
-┌──────────────────────────┐        ┌──────────────────────────┐
-│ Wallet + device          │───────▶│ Wallet control API       │
-│ Protected credential     │        │ Enrollment / lifecycle   │
-└────────────┬─────────────┘        └────────────┬─────────────┘
-             ▼                                   ▼
-┌──────────────────────────┐        ┌──────────────────────────┐
-│ Merchant / terminal      │        │ Token authority / TSP    │
-│ Checkout identity        │        │ Enroll / revoke          │
-└────────────┬─────────────┘        └──────────────────────────┘
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Wallet + device        │ops    │ Wallet control + DB    │status │ Token authority / TSP  │
+│ Protected credential   │◀─────▶│ Enroll / revoke ops    │◀─────▶│ Provision + enforce    │
+│ Display metadata only  │       │ Token refs + outbox    │       │ Issuer verification    │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+             │
+             │ permitted credential handoff
+             │
              ▼
-┌──────────────────────────┐        ┌──────────────────────────┐
-│ Merchant processor       │───────▶│ Network / issuer         │
-│ Durable payment attempts │        │ Authorization outcome    │
-└──────────────────────────┘        └──────────────────────────┘
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Merchant / checkout    │pay    │ Payment orchestrator   │auth   │ Network / issuer       │
+│ Order version + total  │◀─────▶│ Retry and reconcile    │◀─────▶│ Authorization outcome  │
+│ Intended attempt ID    │       │ Guarded transitions    │       │ Separate from capture  │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+                                              ▲                                ▲
+                                              │                                │
+claim / commit known outcome                  │  query / verify provider result│
+                                              │                                │
+                                              ▼                                ▼
+                                 ┌────────────────────────┐       ┌────────────────────────┐
+                                 │ Payment authority      │       │ Recovery workers       │
+                                 │ Attempts / uncertainty │◀─────▶│ Resume durable work    │
+                                 │ Refund reservations    │       │ Reconcile by reference │
+                                 │ Outbox/history         │       │ Publish scoped history │
+                                 └────────────────────────┘       └────────────────────────┘
+
+Wallet lifecycle authority and merchant payment authority remain separate.
+
+A timeout records uncertainty; only verified evidence resolves the operation.
 ```
 
 The wallet control API also integrates with the token service provider (TSP) for enrollment and lifecycle requests. Its database stores associations and operation status; the processor keeps authorization attempts, provider references, and reconciliation work. Durable outboxes feed notification/history consumers. Static browser assets can use a CDN; neither cached assets nor metadata authorize spending.
+
+The payment return path follows verified provider evidence into a guarded durable
+transition, then exposes that outcome to merchant status lookup. If the provider
+response is lost, recovery workers resume the same attempt and reference; the durable
+record remains unresolved until evidence permits a transition. Wallet enrollment or
+revocation uses its separate authority and cannot be inferred from merchant history.
 
 Apple documents an NFC path involving the device and terminal, while app/web credentials involve Apple servers and merchant-specific encryption. These are different edge protocols; a single wallet REST endpoint should not be drawn as a mandatory intermediary for every physical tap. [Apple's payment flows](https://support.apple.com/en-euro/guide/security/secfbd5c0e54/web).
 

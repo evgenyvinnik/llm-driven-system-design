@@ -53,31 +53,60 @@ estimates.
 
 ## 🏗️ Architecture and Data Model — 6 minutes
 
-I would draw the write authority, durable records, and fan-out path first. The browser and
-video service each get one box; this is a backend discussion.
+I would draw the write authority, durable records, and fan-out path first. The browser gets one box here; video remains the separate service scoped above.
 
 ```
-┌───────────────────┐       ┌───────────────────────┐
-│ Session / API edge│──────▶│ Comment + moderation  │
-└───────────────────┘       │ writer by stream      │
-                            └───────────┬───────────┘
-                                        ▼
-┌───────────────────┐       ┌───────────────────────┐
-│ Replay / history  │◀──────│ SQL shard             │
-│ visibility checks │       │ Comment, receipt,     │
-└─────────┬─────────┘       │ order, outbox         │
-          │                 └───────────┬───────────┘
-          │                             ▼
-          │                 ┌───────────────────────┐
-          │                 │ Feed + reaction       │
-          │                 │ aggregation services  │
-          │                 └───────────┬───────────┘
-          │                             ▼
-          │                 ┌───────────────────────┐
-          └────────────────▶│ WebSocket gateways    │
-                            │ Interested viewers    │
-                            └───────────────────────┘
+PROPOSED LIVE COMMENTS — durable acceptance and selected audience views are distinct
+
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Viewer / moderator       │post/result │ Session / API gateway    │command/ACK │ Comment + moderation     │
+│ Saved post ID + text     │◀──────────▶│ Authorize stream scope   │◀──────────▶│ Writer by stream         │
+│ Post, react, subscribe   │            │ Post / snapshot / resume │            │ Current access / policy  │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+              ▲                                       ▲                                       ▲
+              │                                       │                                       │
+              │ tap / admission                       │ view / resume                         │ commit / recover
+              │                                       │                                       │
+              ▼                                       ▼                                       ▼
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Reaction intake + totals │totals/read │ View / replay service    │read/replay │ SQL stream authority     │
+│ Auth / bounded admission │◀──────────▶│ Current visibility       │◀──────────▶│ Comment, order, receipt  │
+│ Identified intervals     │            │ Policy + cursor coverage │            │ Moderation + outbox      │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+              ▲                                       ▲                                       ▲
+              │                                       │                                       │
+              │ apply / recover                       │ view / updates                        │ outbox / progress
+              │                                       │                                       │
+              ▼                                       ▼                                       ▼
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Reaction recovery state  │            │ Feed / event workers     │work/ACK    │ Outbox relay             │
+│ Epoch, totals, progress  │            │ Select / batch / repair  │◀──────────▶│ Retry committed events   │
+│ Commit interval effects  │            │ Per-gateway copies       │            │ Stable IDs + progress    │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+                                                      ▲
+                                                      │
+                                                      │ view / resume
+                                                      │
+                                                      ▼                         Animations can be lost;
+┌──────────────────────────┐            ┌──────────────────────────┐            totals recover from a
+│ Audience clients         │feed/resume │ Subscriber gateways      │            versioned snapshot.
+│ Selected comment window  │◀──────────▶│ Current scope / leases   │
+│ Reaction epoch + totals  │            │ Bounded output queues    │
+└──────────────────────────┘            └──────────────────────────┘
 ```
+
+I would trace a post or moderation command to one stream writer and SQL commit before
+acknowledging it. The outbox then drives selection and per-gateway fan-out. Replay reads
+current visible history under an explicit cursor contract; reactions take a separate
+bounded aggregation path and publish replaceable totals. The audience receives a selected
+view, while the author can resolve the durable outcome of their own post independently.
+
+I would explain what survives each retry:
+
+1. A post receipt survives a lost reply, but its recovery response still honors current visibility and the supported retry horizon.
+2. Feed workers recover ordered changes and selection coverage; subscriber gateways request replay or a reset when their bounded queues fall behind.
+3. Reaction processing commits identified interval effects, aggregate totals, and progress together; restart resumes that state before publishing a newer absolute snapshot.
+4. Expired animations or unadmitted taps are not durable comments. Moderation changes still reach retained, selected, and historical views under the current policy.
 
 The writer owns permission checks, durable acceptance, and ordering within a stream.
 Gateways own connections and bounded outbound queues. The feed service decides which

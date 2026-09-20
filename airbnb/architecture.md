@@ -72,27 +72,56 @@ No local load test or resource benchmark was performed for this documentation re
 ## High-Level Architecture
 
 ```
-┌───────────────┐       ┌────────────────────┐       ┌─────────────────┐
-│ Web / Mobile  │──────▶│ CDN / API Gateway  │──────▶│ Search service  │
-└───────────────┘       └─────────┬──────────┘       └────────┬────────┘
-                                │                           ▼
-                    ┌───────────▼──────────┐       ┌─────────────────┐
-                    │ Listing / Booking   │       │ Search projection│
-                    │ services            │       │ + read caches   │
-                    └───────────┬──────────┘       └────────▲────────┘
-                                ▼                           │
-                    ┌──────────────────────┐       ┌────────┴────────┐
-                    │ PostgreSQL authority │──────▶│ Outbox relay /  │
-                    │ + transactional outbox│       │ event broker    │
-                    └──────────────────────┘       └────────┬────────┘
-                                                           ▼
-                                                  ┌─────────────────┐
-                                                  │ Notifications / │
-                                                  │ analytics       │
-                                                  └─────────────────┘
+PROPOSED DESIGN — one inventory authority per listing
+
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Guest / host clients     │HTTP/result │ API / authorization      │session     │ Shared sessions          │
+│ Search, reserve, recover │◀──────────▶│ Actor + resource scope   │◀──────────▶│ Current user identity    │
+│ Host calendar revisions  │            │ Read operation outcome   │            │ Expiry and revocation    │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+              ▲                                       ▲
+              │                                       │               search/results
+              │                                       ├───────────────────────────────────────┐
+              │ GET / bytes                           │ reserve/recover                       │
+              │                                       │                                       │
+              ▼                                       ▼                                       ▼
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Public listing images    │            │ Booking / inventory      │            │ Search service           │
+│ Object storage + CDN     │            │ Serialize listing writes │            │ Geo/filter retrieval     │
+│ Outside inventory locks  │            │ Recheck rules + quote    │            │ Rank candidate results   │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+                                                      ▲                                       ▲
+                                                      │                                       │
+                                                      │ commit / read                         │ candidates
+                                                      │                                       │
+                                                      ▼                                       ▼
+                                        ┌──────────────────────────┐            ┌──────────────────────────┐
+                                        │ PostgreSQL + outbox      │            │ Candidate read model     │
+                                        │ Occupancy + rules        │            │ PostGIS + read cache     │
+                                        │ Booking + retry result   │            │ May lag inventory        │
+                                        └──────────────────────────┘            └──────────────────────────┘
+                                                      │                                       ▲
+                                                      │                                       │
+                                                      │ committed work                        │
+                                                      │                                       │
+                                                      │                                       │ refresh
+                                                      ▼                                       │
+┌──────────────────────────┐            ┌──────────────────────────┐                          │
+│ Notification delivery    │deliver     │ Relay / broker / workers │                          │
+│ Booking ID + revision    │◀───────────│ Retry committed events   │──────────────────────────┘
+│ Retry provider delivery  │            │ Consumer-scoped progress │
+└──────────────────────────┘            └──────────────────────────┘
 ```
 
 Object storage supplies CDN images. Session storage supports authenticated APIs.
+
+Follow search through candidate retrieval, but follow reservation, cancellation,
+host calendar changes, and operation recovery through the inventory authority.
+The booking transaction commits occupancy, the operation result, and outbox work;
+its response can return while notification delivery or projection refresh is delayed.
+Workers retry committed events with consumer-specific progress. Browser recovery
+reads the existing operation result rather than assuming an interrupted request failed.
+
 Messaging and reviews can begin as modules with separate tables and later receive
 independent deployments. Logical ownership matters before deployment count.
 

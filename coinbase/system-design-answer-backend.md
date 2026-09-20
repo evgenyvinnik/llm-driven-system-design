@@ -12,11 +12,11 @@ is not Coinbase's private architecture.
 | Time | Discussion |
 |------|------------|
 | 4 minutes | Scope, invariants, and capacity |
-| 5 minutes | Architecture and data model |
+| 6 minutes | Architecture and data model |
 | 10 minutes | Deep dive: matching authority, commit, and recovery |
 | 9 minutes | Deep dive: amounts, reservations, and accounting |
 | 8 minutes | Deep dive: publication and stream consistency |
-| 6 minutes | Failure handling and growth |
+| 5 minutes | Failure handling and growth |
 | 3 minutes | Verification and implementation boundary |
 
 ## 🎯 Scope, invariants, and capacity — 4 minutes
@@ -55,28 +55,62 @@ I would target command acknowledgement p99 below 250 ms and 99.95% availability 
 primary region. Those targets justify a durable commit on the initial path; they do
 not require claiming an unmeasured microsecond matching guarantee.
 
-## 🏗️ Architecture and data model — 5 minutes
+## 🏗️ Architecture and data model — 6 minutes
 
 I would keep one logical command owner for each pair and one initial transactional
 accounting authority:
 
 ```
-┌────────────────┐       ┌────────────────┐
-│ Command API    │──────▶│ Pair owner     │
-│ Auth + routing │       │ Committed book │
-└────────────────┘       └───────┬────────┘
-                                 ▼
-                         ┌────────────────┐
-                         │ Orders + holds │
-                         │ Ledger/receipt │
-                         │ Outbox         │
-                         └───────┬────────┘
-                                 ▼
-                         ┌────────────────┐
-                         │ Market/account │──────▶ Gateways
-                         │ projections    │
-                         └────────────────┘
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Trading clients        │       │ Command + receipt API  │       │ Active pair owner      │
+│ Order / cancel intent  │◀─────▶│ Auth, limits, routing  │◀─────▶│ Epoch + pair sequence  │
+└────────────────────────┘       │ Scoped retry identity  │       │ Committed memory book  │
+                                 └────────────────────────┘       └────────────────────────┘
+                                              ▲                                ▲
+                                              │                                │
+               receipt lookup                 │  commit / recovery read        │
+                                              │                                │
+                                              ▼                                ▼
+┌────────────────────────┐       ┌─────────────────────────────────────────────────────────┐
+│ Recovery / checkpoints │       │ Transactional order and accounting authority            │
+│ Committed sequence     │◀─────▶│ Orders, holds, fills and balanced per-asset entries     │
+│ Replay + verify holds  │       │ Command decisions, receipts, fencing epoch and outbox   │
+└────────────────────────┘       └─────────────────────────────────────────────────────────┘
+                                              │
+committed events only                         │
+                                              │
+                                              ▼
+                                 ┌────────────────────────┐       ┌────────────────────────┐
+                                 │ Outbox relay           │       │ Projection workers     │
+                                 │ Retry publication      │──────▶│ Committed fills/events │
+                                 │ Stable event identity  │       │ Versioned state        │
+                                 └────────────────────────┘       └────────────────────────┘
+                                                                               ▲
+                                                                               │
+                                                 apply / checkpoint            │
+                                                                               │
+                                                                               ▼
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Read clients           │       │ Read/stream gateways   │       │ Market/account views   │
+│ Public / account views │◀─────▶│ Snapshots + streams    │◀─────▶│ Sequences + revisions  │
+└────────────────────────┘       │ Auth + replay limits   │       │ Snapshot/replay data   │
+                                 └────────────────────────┘       └────────────────────────┘
+
+Pair memory advances after commit. Unknown commit pauses matching until resolved.
 ```
+
+A command reaches the fenced owner for its pair, which plans against committed
+memory and commits funding, fills, accounting and the command result together.
+Only then does memory advance and an acknowledgement become durable. Outbox work
+builds public and private views for independent read/stream gateways. Recovery uses
+the same durable sequence and decisions; a fast projection or a leader lease cannot
+replace the transaction that made the order financially valid.
+
+The owner-to-authority return path also supports uncertain-commit recovery: pause
+matching, resolve the durable command decision, and restore the committed sequence
+before advancing memory. Projection recovery reads its applied sequence and retries
+ordered effects independently. Its checkpoint can describe a delayed read view, but
+cannot make an uncommitted fill or an unfunded order authoritative.
 
 Logical service boundaries do not force separate databases. Initially, orders, holds,
 fills, journal entries, receipts, and outbox records share a database transaction. The
@@ -310,7 +344,7 @@ freshness warrants them. Polling can be the right initial choice for a small boo
 its delay is acceptable. The protocol's correctness matters more than choosing
 WebSocket everywhere.
 
-## 📈 Failure handling and growth — 6 minutes
+## 📈 Failure handling and growth — 5 minutes
 
 API and public gateway processes can scale independently from pair owners. Pair
 assignment balances work, but the hottest individual pair still has one logical order

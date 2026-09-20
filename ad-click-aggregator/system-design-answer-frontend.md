@@ -3,7 +3,7 @@
 *A 45-minute interview discussion. This is a proposed frontend design; verified
 local behavior is documented in [architecture.md](./architecture.md).*
 
-## 🎯 Clarify the analyst's job — 5 minutes
+## 🎯 Clarify the analyst's job — 4 minutes
 
 > “The user is an analyst deciding whether a campaign is performing normally. They
 > need to see click volume, investigate a suspicious change, and understand how
@@ -42,27 +42,51 @@ I would keep invoice editing, custom dashboard builders, and offline mutation qu
 outside the first interview design. They do not help establish the core analytics
 read experience.
 
-## 🏗️ Draw the client boundaries — 5 minutes
+## 🏗️ Draw the client boundaries — 6 minutes
 
 ```
-┌────────────────────────────────────────────────┐
-│ Dashboard                                      │
-│ Draft filters ──▶ Applied query                 │
-│                         │                      │
-│                         ▼                      │
-│                 Query coordinator              │
-│                         │                      │
-│                 Results + freshness            │
-│                    │           │               │
-│                    ▼           ▼               │
-│                  Cards       Charts / table    │
-└─────────────────────────┬──────────────────────┘
-                          │ bounded analytics request
-                          ▼
-                 ┌──────────────────┐
-                 │ Reporting API    │
-                 └──────────────────┘
+BROWSER — a report keeps its own query, revision, and coverage
+
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Filter form              │apply       │ Applied query            │restore     │ URL / navigation         │
+│ Draft values / validate  │───────────▶│ Account / scope / zone   │◀──────────▶│ Validate shared settings │
+│ Apply explicitly         │            │ Complete query identity  │            │ Restore applied query    │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+                                                      │   ▲
+                                                      │   │                     drill-down
+                                                      │   └────────────────────────────────────────────────────┐
+                                                      │ query key                                              │
+                                                      │                                                        │
+                                                      ▼                                                        │
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐   │
+│ Refresh lifecycle        │schedule    │ Query coordinator        │match/cache │ Report cache / model     │   │
+│ Visible tab / reconnect  │───────────▶│ Request + account IDs    │◀──────────▶│ Query + report revision  │   │
+│ Manual retry / backoff   │            │ Cancel; drop stale reply │            │ Coverage / stale / error │   │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘   │
+                                                      ▲                                       │                │
+                                                      │                                       │                │
+                                                      │ HTTP / report                         │ render report  │
+                                                      │                                       │                │
+                                        SERVER API    │                         BROWSER VIEW  │                │
+                                                      ▼                                       ▼                │
+                                        ┌──────────────────────────┐            ┌──────────────────────────┐   │
+                                        │ Reporting API            │            │ Cards / chart / table    │   │
+                                        │ Authorize bounded scope  │            │ Render one scoped report │───┘
+                                        │ Report + coverage        │            │ Local hover / focus      │
+                                        └──────────────────────────┘            └──────────────────────────┘
 ```
+
+I would follow an Apply action through the drawing: the draft becomes an applied
+query, the coordinator requests that exact scope, and only a matching response enters
+its report cache. Cards, chart, table, and freshness labels read that same report. The
+HTTP return includes processing coverage; the browser's last-fetch clock does not
+replace it. This keeps the server a clear API boundary in the frontend discussion.
+
+The refresh lifecycle is a separate input to the coordinator: a timer, reconnect,
+or manual retry schedules the current query without changing its meaning. A failed
+refresh leaves the last matching report visible with its original coverage and stale
+status. Drill-down follows the return arrow to applied query state; it does not edit
+the cached metrics or reuse an old report under a new heading.
 
 I would build the interface with React and a router that can represent applied
 filters in the URL. A small store can hold shared query state and view preferences;

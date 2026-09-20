@@ -56,25 +56,54 @@ One React development server, one Express process, PostgreSQL, Valkey and MinIO 
 Proposed production topology; media and control requests take different paths.
 
 ```
-┌────────────────┐                  ┌────────────────┐
-│ Viewer apps    │─ media ─────────▶│ CDN + shield   │
-│                │                  │                │
-└────────────────┘                  └────────────────┘
-        │ control                           │ cache miss
-        ▼                                   ▼
-┌────────────────┐                  ┌────────────────┐
-│ Domain APIs    │                  │ Private origin │
-│ SQL / cache    │                  │                │
-└────────────────┘                  └────────────────┘
-                                            ▲ publish
-                                            │
-                                    ┌────────────────┐
-                                    │ Encode workers │
-                                    │ Queue / jobs   │
-                                    └────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│ VIEWER CLIENT / PROFILE-SCOPED STATE                                                     │
+│                                                                                          │
+│  ┌────────────────────────┐    ┌────────────────────────┐    ┌────────────────────────┐  │
+│  │ Browse + profile UI    │    │ Playback controller    │    │ Media engine           │  │
+│  │ Keyed personal results │◀──▶│ Intent + generation    │◀──▶│ Actual frames + events │  │
+│  └────────────────────────┘    │ Resume / progress IDs  │    │ Protected playback     │  │
+│                                └────────────────────────┘    └────────────────────────┘  │
+│                                   ▲                            ▲                     ▲   │
+│            ┌──────────────────────┘                            │                     │   │
+│            │                                        ┌──────────┘                     │   │
+└────────────┼────────────────────────────────────────┼────────────────────────────────┼───┘
+             ▼                                        ▼                                ▼
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Control APIs           │       │ Protected license API  │       │ CDN + shield           │
+│ Authorize + resume     │◀─────▶│ Platform integration   │       │ Manifests and segments │
+│ Profile + title scope  │       │ Session-scoped result  │       │ Versioned media bytes  │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+             ▲                                ▲                                ▲
+             │                                │                                │
+state        │                   keys         │                   cache miss   │
+             │                                │                                │
+             ▼                                ▼                                ▼
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Domain authority       │       │ Key management         │       │ Private origin         │
+│ Rights, profiles, jobs │       │ Restricted key access  │       │ Validated fixed assets │
+│ Progress + active rev  │       │ Never public objects   │       │ Pinned media revisions │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+             ▲                                                                 ▲
+             │                                                                 │
+             │ jobs / validation / active pointer                 media output │
+             │                                                                 │
+             ▼                                                                 │
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│ Admin ingestion and publication pipeline                                                 │
+│ Durable jobs + outbox; fenced workers; complete validated media revision                 │
+│ Advance the active revision only after required assets pass validation                   │
+└──────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 Domain APIs include catalog/profile services, playback authorization, progress and subscription state. A separate license service uses a protected key service. Neither clear content keys nor user-specific license responses belong in a shared public CDN cache. Workers receive source revisions through an ingestion service and publish versioned objects to origin.
+
+The pipeline first commits recoverable work, validates the complete required asset
+set, and conditionally advances the active revision. A partial or superseded job
+cannot make a title playable. At playback, control, license, and media responses each
+return to the captured viewer context; renewal preserves that context and media
+revision. Progress returns a separate durable receipt, with session/sequence rules
+that prevent late retries from replacing a newer session's resume state.
 
 ## Core Components / Request Flows
 

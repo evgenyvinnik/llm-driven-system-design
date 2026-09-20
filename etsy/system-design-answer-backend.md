@@ -62,22 +62,55 @@ protect hot inventory keys.
 responsibilities do not require a separate database for each module on day one.”
 
 ```
-┌──────────────────────┐      ┌──────────────────────┐
-│ Clients / API gateway│─────▶│ Catalog and search   │
-│ Session / rate limits│      │ Elasticsearch / cache│
-└──────────┬───────────┘      └──────────────────────┘
-           ▼
-┌──────────────────────┐      ┌──────────────────────┐
-│ Cart / checkout      │─────▶│ PostgreSQL           │
-│ Inventory / orders   │      │ State / receipts     │
-└──────────────────────┘      │ Outbox               │
-                              └──────────┬───────────┘
-                                         ▼
-┌──────────────────────┐      ┌──────────────────────┐
-│ Payment provider     │◀─────│ Durable workers      │
-│ Webhook / status API │─────▶│ Payment / projections│
-└──────────────────────┘      └──────────────────────┘
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Buyer / seller clients │       │ API + sessions         │       │ Discovery reads        │
+│ Search / saved intent  │◀─────▶│ Scope / request limits │◀─────▶│ Search index + cache   │◀───┐
+└────────────────────────┘       │ Catalog / cart access  │       │ Explicit freshness     │    │
+             ▲                   └────────────────────────┘       └────────────────────────┘    │
+             │                                ▲                                                 │
+             │                                │                                                 │
+public images│         accepted terms / edits │                                                 │
+             │                                │                                                 │
+             ▼                                ▼                                                 │
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐    │
+│ Image delivery         │       │ Catalog + checkout     │       │ PostgreSQL authority   │    │
+│ Object derivatives     │       │ All-line stock holds   │◀─────▶│ Stock / purchase state │    │
+│ Public CDN             │       │ Buyer / seller orders  │       │ Receipts / outbox      │    │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘    │
+                                              ▲                                ▲                │
+                                              │                                │                │
+                      payment state           │             committed work     │                │
+                                              │                                │                │
+                                              ▼                                ▼                │
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐    │
+│ Payment provider       │       │ Payment + refund work  │       │ Outbox + durable work  │    │
+│ Stable payment ref     │◀─────▶│ Attempt / recovery     │◀─────▶│ Retry named effects    │    │
+│ Status API / webhooks  │       │ Network outside SQL TX │       │ Catalog generations    │    │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘    │
+                                                                               ▲                │
+                                                                               │  apply / ACK   │
+                                                                               ▼                │
+                                                                  ┌────────────────────────┐    │
+                                                                  │ Index workers          │    │
+                                                                  │ Versioned updates      │◀───┘
+                                                                  │ Rebuildable projection │
+                                                                  └────────────────────────┘
+
+One purchase binds the agreed basket; each seller order can then be fulfilled independently.
 ```
+
+I would follow one basket through an all-line hold and a durable purchase/payment intent
+in PostgreSQL, then let the payment coordinator contact the provider using that identity.
+Reconciliation returns through the purchase authority before seller orders are confirmed.
+A separate versioned indexing path maintains discovery. Search and images can scale
+independently, while only the transactional stock authority can allocate the last unit.
+
+The return arrows also describe worker recovery:
+
+1. Resume the same durable payment/refund attempt and provider reference after a timeout; reconcile the external outcome before releasing protected stock.
+2. Hold expiry, payment claims, purchase confirmation, and compensation use the same guarded state. A timer cannot release a hold already claimed for payment processing.
+3. Record each worker result before advancing its work checkpoint; a replay reads the prior outcome or retries the same identifiable effect.
+4. Indexers acknowledge applied versions and retain tombstones across retries. Discovery freshness never becomes authority for a new inventory claim.
 
 Catalog owns listing content, current seller eligibility, and listing versions. Checkout
 coordinates the quote and stock hold. Orders preserve the buyer's purchase and per-seller

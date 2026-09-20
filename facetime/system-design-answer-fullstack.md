@@ -36,25 +36,65 @@ network round-trip time.
 ## 🏗️ Architecture and Shared Contract — 6 minutes
 
 ```
-┌──────────────────────┐     ┌──────────────────────┐
-│ React call interface │────▶│ Client call owner    │
-└──────────────────────┘     └──────────┬───────────┘
-                                        │ Control
-                                        ▼
-┌──────────────────────┐     ┌──────────────────────┐
-│ Device routing       │◀────│ Call authority       │
-└──────────────────────┘     └──────────┬───────────┘
-                                        ▼
-                             ┌──────────────────────┐
-                             │ SQL state + outbox   │
-                             │ Claims and receipts  │
-                             └──────────────────────┘
+   ┌────────────────────────┐
+   │ React call interface   │
+   │ Controls + UI state    │
+   │ Observe actual media   │
+   └────────────────────────┘
+                ▲
+                │
+   intent/state │
+                │
+                ▼
+   ┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+   │ Local call controller  │       │ Signaling gateways     │       │ Call authority         │
+┌─▶│ Tracks / peer / queues │◀─────▶│ Register / route       │◀─────▶│ One device / user slot │
+│  │ Call / saved cmd ID    │       │ SDP, ICE, call events  │       │ Conditional decisions  │
+│  └────────────────────────┘       │ Connection generation  │       └────────────────────────┘
+│               ▲                   │                        │                    ▲
+│               │                   │                        │                    │
+│               ▼                   │                        │                    ▼
+│  ┌────────────────────────┐       │                        │       ┌────────────────────────┐
+│  │ TURN relay             │       │                        │       │ PostgreSQL authority   │
+│  │ When selected by ICE   │       │                        │       │ Call claims + receipts │
+│  │ Opaque media relay     │       │                        │       │ Committed revision     │
+│  └────────────────────────┘       │                        │       └────────────────────────┘
+│               ▲                   │                        │                    ▲
+│               │                   │                        │                    │
+│               ▼                   │                        │                    ▼
+│  ┌────────────────────────┐       │                        │       ┌────────────────────────┐
+│  │ Remote call controller │       │                        │       │ Outbox + delivery      │
+└─▶│ Accepted endpoint      │◀─────▶│                        │◀─────▶│ Retry committed events │
+   │ Own capture / cleanup  │       │                        │       │ Recover control state  │
+   └────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+                                                 ▲                                ▲
+                                                 │                                │
+                                                 │ lease / renew                  │
+                                                 ▼                                │
+                                    ┌────────────────────────┐                    │
+                                    │ Connection leases      │ route / result     │
+                                    │ Device / gateway route │◀───────────────────┘
+                                    │ Independent expiry     │
+                                    └────────────────────────┘
 
-┌──────────────────────┐     ┌──────────────────────┐
-│ Browser A media      │◀───▶│ Browser B media      │
-└──────────────────────┘     └──────────────────────┘
-        Direct candidate pair or TURN relay
+Outer left: direct media. Middle relay: TURN. Right: durable call decisions and signaling.
+
+“Accepted” authorizes an endpoint; “active media” comes from the browser’s observed media path.
 ```
+
+I would follow the UI action into a controller-owned attempt, through one durable call
+decision and back to the winning device. The accepted endpoint then negotiates direct
+media or the selected TURN path. Each browser owns its tracks and peer lifetime, while
+the service owns invitation, busy-slot and terminal decisions. That split explains why
+signaling can reconnect while media still flows, and why ending a call must also clean up
+browser resources rather than merely change a server status.
+
+I would walk the same call through a dropped response and reconnect:
+
+1. A policy-permitted local command reference survives reload, while tracks, peer connections, SDP, and candidate queues belong only to the current browser attempt.
+2. Reauthentication and receipt lookup establish the current call/endpoint claim before the client negotiates or presents an actionable invitation.
+3. The delivery worker renews routing from per-connection leases and checks current deadlines; stale ring delivery cannot override an accepted or ended call.
+4. A signaling interruption can leave media flowing. A reload or replaced endpoint requires fresh resources and generation checks, with capture still tied to user action.
 
 The client call owner manages the peer connection, streams, negotiation queues, and attempt
 identity. React renders the call’s status and controls. The backend authenticates devices,

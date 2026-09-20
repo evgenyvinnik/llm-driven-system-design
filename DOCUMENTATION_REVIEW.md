@@ -6,7 +6,7 @@ Started 2026-09-09. Scope: all 92 projects, five documents per project (460 file
 
 - **README:** Explain the learning project, supported user flows, actual stack, setup commands, and limitations. Verify commands and defaults against source and configuration.
 - **Architecture:** Separate the proposed production design from the implementation. Trace important flows to source; distinguish wired behavior from unused helpers, simulations, and planned features. Treat capacity figures as assumptions unless measured.
-- **Interview answers:** Give a spoken, time-bounded explanation with a substantial but drawable high-level architecture, role-appropriate depth, and two or three substantive trade-offs. Each variant must include an early overview diagram with connected components, labeled data/command flows, clear boundaries, and a short walkthrough; frontend diagrams focus on views, state ownership, and data access, backend diagrams on services and storage, and fullstack diagrams on the complete user journey. Use prose, schema/API tables, and a few diagrams; remove implementation code disguised as diagrams and avoid exhaustive operational catalogs.
+- **Interview answers:** Give a spoken, time-bounded explanation with a substantial but drawable high-level architecture, role-appropriate depth, and two or three substantive trade-offs. Each variant must include an early overview diagram with connected components, named responsibilities, labeled request and return flows, clear boundaries, and a short walkthrough. Show authoritative storage, relevant local persistence, and the important recovery or background-work path. Frontend diagrams focus on views, state ownership, and data access; backend diagrams on admission, services, and storage; fullstack diagrams on the complete user journey. Use prose, schema/API tables, and a few diagrams; remove implementation code disguised as diagrams and avoid exhaustive operational catalogs.
 - **Verification:** Read all five documents plus relevant entry points, routes, data models, configuration, and frontend state. Record evidence and corrections below. Structural scans cannot establish semantic accuracy.
 
 The repository suggests 350–550 lines per interview answer. Use that as a pacing signal, not a reason to pad an answer. Explicitly proposed interview designs may differ from the teaching implementation.
@@ -15,7 +15,251 @@ The repository suggests 350–550 lines per interview answer. Use that as a paci
 
 User steering on 2026-09-10 makes high-level diagrams an explicit requirement. Apply the [GreatFrontEnd RADIO guide](https://www.greatfrontend.com/front-end-system-design-playbook/framework): show the major components and their relationships early, then explain data ownership and walk through the arrows before deep dives. Keep the frontend server boundary abstract unless the problem needs backend detail. Disconnected box rows or a generic browser-to-server chain are insufficient as the only overview.
 
-The 33 projects reviewed before this steering retain their completed source audits, but their 99 interview answers need a separate diagram quality pass. This follow-up is pending; Google Calendar is the first project being revised under the strengthened diagram standard. Preserve the four initially edited frontend files when revisiting them.
+The 33 projects reviewed before this steering retain their completed source audits, but their 99 interview answers need a separate diagram quality pass. Google Calendar has completed the strengthened diagram pass. Earlier-project diagram follow-up: **all 33 projects and 99 interview answers complete**. Google Calendar also has connected role-specific overviews. The source review continues with **imessage**; 40 of 92 projects have completed source audits. Existing frontend prose in the two revisited Facebook answers was preserved, and the hotel-booking frontend review preserved its core spoken reasoning while correcting source claims. The initial twitch edit remains for its source review.
+
+### More robust overviews — 2026-09-19 refinement
+
+The user requested slightly more robust high-level diagrams after the initial diagram
+pass. Apply these additional checks to all projects, including those already reviewed:
+
+- Draw the meaningful responsibilities and relationships, usually around 6–10 boxes
+  where the problem warrants them. Component count alone is not a quality measure.
+- Make client/server, account authorization, and durable-state boundaries visible.
+  Identify where a decision becomes authoritative or a transaction commits.
+- Show responses, acknowledgements, and state reconciliation as well as outgoing
+  requests. A reader should be able to follow a complete user journey on the diagram.
+- Include the relevant byte-transfer, event, worker, or reconnect path. Distinguish
+  asynchronous hints from durable records and show where background results return.
+- Label arrows with their payload or purpose. Use a short numbered walkthrough when
+  several paths coexist; keep implementation details in the deeper sections.
+- Check connections and ownership semantically. Additional boxes, unconnected rows,
+  long blank connectors, or prose describing absent arrows do not establish robustness.
+
+**Refinement coverage: all 40 previously audited projects complete: iCloud,
+20forms-20designs, ad-click-aggregator, ai-code-assistant, airbnb, airtag, amazon, apns,
+app-store, apple-maps, apple-music, apple-pay, apple-tv, bitly, calendly, coinbase,
+collaborative-editor, confluence, dashboarding, discord, distributed-cache, docusign,
+doordash, dropbox, etsy, excalidraw, facetime, fb-live-comments, fb-news-feed,
+fb-post-search, figma, gallery, github, gmail, google-calendar, google-docs,
+google-search, google-sheets, health-data-pipeline, and hotel-booking.** Their source
+audits remain complete. The next full source review is **imessage**.
+Future source reviews must satisfy the refinement before being marked reviewed. The
+earlier 33-project/99-answer completion above records the initial diagram pass, not this
+new refinement.
+
+iCloud's three answers and production architecture now show request/receipt return
+paths, local recovery, staged transfers, the metadata transaction, replay, event delivery,
+and photo-worker completion at role-appropriate depth. Updated lengths are 439/476/518
+lines (frontend/backend/fullstack); all retain 45-minute outlines and three deep dives.
+The refinement check passed 53 closed diagram rectangles, 39 relative links, exact SQL,
+six shell examples, interview structural checks, and whitespace checks. Manual flow
+inspection supplements those structural checks; the implementation was not changed.
+
+The next three projects also have refined production architecture diagrams and all
+nine interview overviews. 20forms-20designs makes whole-release promotion/rollback and
+per-frame retry ownership explicit. Ad-click aggregation distinguishes canonical
+acceptance from the processor's durable identity/measure/progress commit, then traces
+projection queries, response coverage, refresh failures, and browser drill-down.
+AI code assistant distinguishes untrusted model proposals from observed tool effects,
+adds the runtime journal to the frontend overview, and explains replay versus uncertain
+operation recovery. The diagrams remain proposed designs where the audited prototype
+lacks these guarantees.
+
+Current interview lengths (frontend/backend/fullstack): 20forms **405/388/411**,
+ad-click **391/404/417**, AI code assistant **396/388/394**. All nine retain 45-minute
+outlines and three deep dives. Checks passed for 110 overview rectangles (including
+boundary frames), 32 local links across the 12 edited documents, interview fences and
+pacing, the repository structural scan, and whitespace. Manual inspection checked
+arrow direction, meaningful returns, ownership, and correspondence with the prose.
+No application code or runtime behavior changed.
+
+Airbnb now exposes account-scoped browser operation recovery, the authoritative
+booking response, public image delivery, and delayed notification/projection work.
+Its architecture and backend overviews share the same inventory authority. AirTag's
+fullstack and architecture views distinguish nearby safety, the ciphertext service,
+and private owner state, with a visible log-commit acknowledgement and later report
+visibility. Frontend/backend refinements explain stable report retries, replay,
+locked keys, stale evidence, and account-scoped cancellation.
+
+Airbnb's final interview lengths are **409/440/461** and AirTag's are **418/423/440**
+(frontend/backend/fullstack). Their eight edited documents passed 78 overview-rectangle
+checks and 39 relative-link checks, with 45-minute pacing, three deep dives per answer,
+valid fences, repository structural scans, and whitespace checks. Manual flow review
+also checked the joins and return arrows. The five-project refinement in this pass
+changes 20 documents; prior README/source audits are retained. No runtime or hardware
+behavior is claimed to have been exercised by this diagram refinement.
+
+Amazon, APNs, App Store, and Apple Maps now have refined production architecture
+views and all twelve interview overviews. Amazon connects the reviewed cart snapshot
+to a saved purchase attempt and separates committed allocation, payment recovery,
+and delayed indexing. APNs shows gateway lease renewal, worker route lookup, and
+persisted device receipts separately from provider acceptance and console refresh.
+App Store distinguishes private staging, digest/revision validation, approved release
+pairs, current access grants, and stale projection recovery. Apple Maps makes graph
+publication and retained releases visible, returns an acknowledgement from the durable
+observation log, and explains compatible traffic views and trip-scoped route recovery.
+
+Final interview lengths (frontend/backend/fullstack): Amazon **416/422/448**, APNs
+**431/474/475**, App Store **390/419/468**, Apple Maps **403/408/444**. All twelve
+retain 45-minute outlines and three deep dives; App Store expresses its pacing in
+the existing discussion table. The 16 edited documents passed 147 overview-rectangle
+checks, 72 relative-link checks, fence and pacing checks, the repository structural
+scan, and whitespace checks. Manual inspection checked request/return paths, lease
+ownership, byte authorization, durable commits, and publication/recovery boundaries.
+These diagram changes retain the completed README/source audits and do not claim
+that proposed production guarantees are implemented or runtime-tested locally.
+
+Apple Music, Apple Pay, Apple TV, and Bitly now have refined architecture views and
+all twelve interview overviews. Music separates playback, committed library edits,
+and durable listening-event receipts, with recovery tied to each path. Pay gives
+reconciliation an explicit route through durable attempts and provider references,
+keeps wallet lifecycle separate, and returns scoped history to the checkout client.
+TV preserves the distinct control/license/media paths and makes publication gates,
+renewal context, and sequenced progress receipts explicit. Bitly adds retained-event
+admission acknowledgements, committed aggregate feedback, destination-page responses,
+and saved creation recovery without claiming complete analytics during admission gaps.
+
+Final interview lengths (frontend/backend/fullstack): Apple Music **422/406/423**,
+Apple Pay **426/449/496**, Apple TV **431/459/505**, Bitly **416/447/478**. All twelve
+retain 45-minute pacing and three deep dives. Across the 16 edited documents, checks
+passed for 159 overview rectangles, 94 relative-link references, fences, pacing,
+repository structural scans, and whitespace. The rectangle check distinguishes a
+connector bridge ending in arrows from an actual component or boundary frame;
+manual inspection also checked return paths and evidence ownership. These changes
+retain prior README/source audits and do not change or exercise application behavior.
+
+Calendly, Coinbase, Collaborative Editor, and Confluence now have refined architecture
+views and all twelve interview overviews. Calendly separates guest receipt recovery
+from revision-eligible reminder/provider work. Coinbase distinguishes unknown command
+commits, committed in-memory state, and independent projection checkpoints, while the
+client retains its original account-scoped command identity. Collaborative Editor now
+draws the local draft/operation recovery store and peer replay requests explicitly;
+server receipts and committed history remain distinct from local drafts and presence.
+Confluence adds a policy-scoped local recovery copy and index-result feedback while
+keeping current permissions and the permitted published revision authoritative.
+
+Final interview lengths (frontend/backend/fullstack): Calendly **412/438/444**,
+Coinbase **400/409/427**, Collaborative Editor **418/419/454**, Confluence **430/454/503**.
+All twelve retain 45-minute plans and three deep dives. The 16 edited documents passed
+152 overview-rectangle checks, 104 relative-link checks, fence/pacing checks, repository
+structural scans, and whitespace checks. Manual flow inspection covered local recovery
+connections, replay requests, committed outcomes, and the distinction between projection
+progress and authoritative decisions. Existing README/source audits are retained; no
+application code, runtime stack, browser flow, or live financial operation was changed
+or exercised by this refinement.
+
+
+Dashboarding, Discord, Distributed Cache, and DocuSign now have refined architecture
+views and all twelve interview overviews. Dashboarding exposes durable ingestion ACKs,
+worker checkpoints, independent incident refresh, and notification outcomes. Discord
+shows policy-scoped draft/send recovery and a direct history replay path separate from
+notification hints, with connection leases distinct from durable membership. Distributed
+Cache separates sampled observations, durable placement/operation records, fenced node
+transitions, and the application's budgeted origin refill. DocuSign shows private upload
+and document reads, browser PDF-worker results, action receipt recovery, generation-bound
+artifact publication, and independent notification delivery.
+
+Final interview lengths (frontend/backend/fullstack): Dashboarding **389/392/413**,
+Discord **379/382/399**, Distributed Cache **457/472/506**, DocuSign **408/435/440**.
+All twelve retain 45-minute plans and three deep dives. The 16 edited documents passed
+151 overview-rectangle checks and 86 relative-link checks, interview fence/pacing checks,
+the repository structural scan, and whitespace checks. The rectangle check recognizes
+arrow-ended fan-out branches as connectors; manual inspection checked drawn paths,
+return arrows, state ownership, and the recovery walkthroughs. Existing README/source
+audits remain complete. This refinement changes documentation only and does not claim
+that proposed production mechanisms were implemented or runtime-tested locally.
+
+DoorDash, Dropbox, Etsy, and Excalidraw now have refined architecture views and all
+twelve interview overviews. DoorDash connects retained dispatch work, exact expiring
+claims, saved client actions, and direct committed-history recovery, while location
+samples keep their own freshness path. Dropbox draws the local transfer journal,
+verified slot receipts, pinned downloads, and replay independent of delivery hints.
+Etsy makes saved buyer/seller operations and worker/projection acknowledgements visible,
+with unknown payment outcomes kept separate from eligible unpaid-hold expiry.
+Excalidraw shows its local command journal and bidirectional replay requests, and explains
+fenced owner reconstruction from a verified snapshot and committed suffix.
+
+Final interview lengths (frontend/backend/fullstack): DoorDash **423/429/447**,
+Dropbox **384/416/398**, Etsy **422/449/460**, Excalidraw **426/422/452**.
+All twelve retain 45-minute plans and three deep dives. The 16 edited documents passed
+160 overview-rectangle checks, 105 relative-link checks, interview fence/pacing checks,
+the repository structural scan, and whitespace checks. The checker accepts the existing
+capitalization variants of “Deep Dive”; the requirement remains three substantive sections.
+Manual inspection checked recovery arrows, journals, generation/claim ownership, and
+byte/projection paths. Exact SQL blocks and the prior audited READMEs are preserved;
+Implementation Notes remain explicit. These documentation changes do not alter or
+exercise local application behavior or establish proposed production guarantees.
+
+FaceTime, Facebook Live Comments, News Feed, and Post Search now have refined
+architecture views and all twelve interview overviews. FaceTime separates gateway
+route leases, recovered call commands, durable call authority, and independent media
+health. Live Comments shows recovered post receipts, versioned reaction totals, and
+worker progress. News Feed connects saved author intent, confirmed fan-out effects,
+stable reading sessions, and current audience checks for content and media. Post Search
+draws separate query-validation and accepted-mutation paths, with item-level indexing
+results and explicit session resume/reset. The original Facebook frontend reasoning
+is retained.
+
+Final interview lengths (frontend/backend/fullstack): FaceTime **386/405/403**,
+Live Comments **392/420/423**, News Feed **389/396/413**, Post Search **407/396/409**.
+All twelve retain 45-minute plans and three deep dives. The 16 edited documents passed
+151 overview-rectangle checks, 99 relative-link checks, interview fence/pacing checks,
+the repository structural scan, and whitespace checks. Manual inspection checked the
+return arrows, current-access boundaries, lease ownership, and worker recovery paths.
+The prior audited READMEs and exact SQL blocks are preserved; Implementation Notes
+remain explicit. This refinement changes documentation only and does not establish
+runtime guarantees for the local prototypes.
+
+Figma, Gallery, GitHub, and Gmail now have refined architecture views and all twelve
+interview overviews. Figma connects the file authority, snapshot publication, client
+journal, and replay return paths while keeping presence separate. Gallery separates
+metadata publication from upload/display bytes and connects the lightbox to its viewer
+controller. Its backend remains an explicitly proposed extension to the frontend-only
+demo. GitHub shows SQL intent, fenced Git publication, receipt reconciliation, and
+confirmed search effects. Gmail makes the draft journal, sender acceptance, recipient
+delivery receipt, and indexing progress distinct on the diagram and in the walkthrough.
+
+Final interview lengths (frontend/backend/fullstack): Figma **430/422/473**,
+Gallery **420/417/445**, GitHub **426/478/486**, Gmail **432/446/490**.
+All twelve retain 45-minute plans and three deep dives. The 16 edited documents passed
+152 overview-rectangle checks, 97 relative-link checks, interview fence/pacing checks,
+the repository structural scan, and whitespace checks. Manual review checked arrow
+endpoints, labels, journal ownership, publication/receipt boundaries, and the byte paths.
+Prior audited READMEs and SQL blocks are preserved, with explicit Implementation Notes.
+These are documentation refinements; no local application behavior was changed or
+exercised, and the diagrams do not establish implemented production guarantees.
+
+Google Calendar, Docs, Search, and Sheets now have refined architecture views and all
+twelve interview overviews. Calendar distinguishes committed saves, advisory warnings,
+and optional cache invalidation progress. Docs shows the scoped local journal and
+immutable attempt recovery before rebasing. Search connects confirmed crawl/build
+effects to publication and makes result-window expiry explicit. Sheets adds request
+and acknowledgement paths for ranges, replay, and calculation work while keeping raw
+edit revisions separate from complete formula results.
+
+Final interview lengths (frontend/backend/fullstack): Calendar **421/452/467**,
+Docs **411/396/430**, Search **412/406/420**, Sheets **398/385/394**.
+All twelve retain 45-minute plans and three deep dives. The 16 edited documents passed
+141 overview-rectangle checks, 135 relative-link checks, interview fence/pacing checks,
+the repository structural scan, and whitespace checks. Manual review checked journal
+connections, return arrows, snapshot/session expiry, publication, and calculation
+boundaries. The audited READMEs are retained, all local initialization SQL excerpts
+match their source files, and Implementation Notes remain explicit. No application
+code or runtime behavior was changed or exercised by this refinement.
+
+Health Data Pipeline now shows the sync journal, accepted batch receipts, guarded report
+publication, and worker completion separately. Hotel Booking connects saved intent recovery,
+protected processing inventory, provider reconciliation, and confirmed search-projection work.
+Its fullstack projection path now visibly passes through the worker. The existing frontend
+reasoning about discovery, quotes, and uncertain outcomes is preserved.
+
+Final interview lengths (frontend/backend/fullstack): Health Data Pipeline **370/366/392**,
+Hotel Booking **434/426/446**. All six retain 45-minute plans and three deep dives. The eight
+edited documents passed 71 overview-rectangle checks, 52 relative-link checks, interview
+fence/pacing checks, the repository structural scan, and whitespace checks. Manual review
+checked the upload/report distinction and booking/payment/projection return paths. Audited
+READMEs and SQL excerpts are preserved; local initialization SQL matches source. These
+refinements change documentation only and do not claim runtime verification.
 
 ## Coverage
 
@@ -60,13 +304,13 @@ Run `node scripts/audit-documentation.mjs` for structural findings, add a projec
 | [gallery](./gallery/README.md) | Reviewed | [Source audit and five revised documents](#gallery) |
 | [github](./github/README.md) | Reviewed | [Source audit and five revised documents](#github) |
 | [gmail](./gmail/README.md) | Reviewed | [Source audit and five revised documents](#gmail) |
-| [google-calendar](./google-calendar/README.md) | In progress | Reading source, setup, and all five documents |
-| [google-docs](./google-docs/README.md) | Pending | — |
-| [google-search](./google-search/README.md) | Pending | — |
-| [google-sheets](./google-sheets/README.md) | Pending | — |
-| [health-data-pipeline](./health-data-pipeline/README.md) | Pending | — |
-| [hotel-booking](./hotel-booking/README.md) | Pending | — |
-| [icloud](./icloud/README.md) | Pending | — |
+| [google-calendar](./google-calendar/README.md) | Reviewed | [Source audit and five revised documents](#google-calendar) |
+| [google-docs](./google-docs/README.md) | Reviewed | [Source audit and five revised documents](#google-docs) |
+| [google-search](./google-search/README.md) | Reviewed | [Source audit and five revised documents](#google-search) |
+| [google-sheets](./google-sheets/README.md) | Reviewed | [Source audit and five revised documents](#google-sheets) |
+| [health-data-pipeline](./health-data-pipeline/README.md) | Reviewed | [Source audit and five revised documents](#health-data-pipeline) |
+| [hotel-booking](./hotel-booking/README.md) | Reviewed | [Source audit and five revised documents](#hotel-booking) |
+| [icloud](./icloud/README.md) | Reviewed | [Source audit and five revised documents](#icloud) |
 | [imessage](./imessage/README.md) | Pending | — |
 | [instagram](./instagram/README.md) | Pending | — |
 | [jira](./jira/README.md) | Pending | — |
@@ -131,6 +375,8 @@ Reviewed all five documents against external source revision [`bc34aba76a4cabe9b
 - Rewrote all interview variants into timed spoken discussions with three deep trade-offs and at most two compact diagrams each. Removed implementation code and directory/configuration dumps disguised as diagrams, provider-price claims, fabricated measurements, and incorrect explanations of React context, iframe isolation, cache semantics, and build-time arithmetic.
 - Final interview lengths: frontend 369 lines, backend 363, fullstack 388. Read-only structural scan reports no findings for these five files. Relative documentation links resolve; `git diff --check` passes. Upstream build, deployment, and browser tests were **not run**; source defects are documented, not silently fixed outside this task.
 
+- Diagram follow-up (2026-09-12): replaced the three overviews with connected, role-specific diagrams showing shell state/catalog/preview lifecycle, build validation/promotion versus static serving, and the complete publication-to-iframe journey. Added arrow walkthroughs and adjusted time allocations to total 45 minutes (the previous fullstack headers totaled 44). Current lengths are 402/386/408 lines; relative links, 30 closed diagram rectangles, fence rules, pacing, structural scan, and whitespace pass. This pass changed the interview documents only.
+
 ### ad-click-aggregator
 
 Reviewed all five documents against the Express entry point, ingestion and fraud services, PostgreSQL/Redis/ClickHouse adapters, database schemas, analytics/admin routes, metrics wiring, frontend store/API/chart/test-click flows, package scripts, Docker Compose, seed SQL, and project history in `CLAUDE.md`.
@@ -139,6 +385,8 @@ Reviewed all five documents against the Express entry point, ingestion and fraud
 - Architecture separates a proposed replay-safe production pipeline from the implemented sequential writes. Documents the non-atomic Redis duplicate check, ignored PostgreSQL conflict result, asynchronous ClickHouse buffer acknowledgement, failure windows, missing tenant authorization, and unbounded active Redis hash history. Corrected distinct-user rollup claims: summing block-level distinct counts does not produce a distinct union, and the current SummingMergeTree columns introduce an additional merge problem.
 - All three interview answers now use a small drawable system and three timed deep dives. They connect durable acceptance, repeatable aggregate effects, metric definitions, late corrections, and honest dashboard freshness without implementation dumps or unqualified exactly-once claims.
 - Final interview lengths: frontend 367 lines, backend 378, fullstack 387. Structural scan and relative-link checks pass; `git diff --check` passes. Official ClickHouse documentation was consulted for engine and asynchronous-insert semantics. Application builds, database startup, and runtime tests were **not run** for this documentation-only change; implementation defects remain explicit limitations.
+
+- Diagram follow-up (2026-09-12): replaced all three overviews and added arrow walkthroughs. Frontend shows draft/applied filters, URL ownership, request coordination, the scoped report cache, and rendering. Backend separates authoritative event/outbox acceptance, replayable processing with durable state, absolute bucket snapshots, and scoped reporting. Fullstack connects those stages to the dashboard's query/revision/freshness model. Current lengths are 393/396/407 lines; all retain three deep dives and total 45 minutes. Checked relative links, 28 closed rectangles, fence rules, structural scan, and whitespace.
 
 ### ai-code-assistant
 
@@ -149,6 +397,8 @@ Reviewed all five documents against the CLI entry point/interface, complete agen
 - Interview answers now focus on terminal input/output ownership, identified revision-bound proposals, enforced resource access, context selection, and recovery by operation effect. Removed exaggerated framework/terminal comparisons, unsupported screen-reader behavior, exhaustive diagrams, and claims that model call IDs or caches make arbitrary commands idempotent.
 - Final interview lengths: frontend 355 lines, backend 353, fullstack 370. Structural scan, relative-link checks, and `git diff --check` pass. This was a source audit; builds, live API calls, and terminal/runtime tests were **not run**. Implementation issues are documented rather than changed.
 
+- Diagram follow-up (2026-09-12): replaced all three overviews with connected terminal/runtime designs. Frontend separates input ownership, task lifecycle, runtime commands/events, transcript state, and output ownership. Backend distinguishes the local coordinator, remote provider adapter, policy/scheduler, restricted execution, journal replay, and workspace effects. Fullstack now connects the previously isolated journal and traces the request-to-observed-outcome journey. Added concise walkthroughs, removed a duplicated explanation, and allocated six minutes to each overview while retaining 45-minute totals. Current lengths are 389/385/389 lines; links, 23 closed rectangles, pacing/fences, structural scan, and whitespace pass.
+
 ### airbnb
 
 Reviewed all five documents against every business route, database schema/functions/triggers, session and authorization logic, cache/breaker/queue helpers, all three workers, metrics/logging/audit wiring, seed data, frontend stores/API/calendar/booking/host/message flows, package scripts, Compose, and existing mocked route/page smoke tests. Compared historical claims in `CLAUDE.md` with actual call sites.
@@ -158,6 +408,7 @@ Reviewed all five documents against every business route, database schema/functi
 - Corrected search ranking/cache claims and exposed misnumbered count-query date parameters, empty HTTP-200 breaker fallbacks, colliding truncated Base64 cache keys, incomplete invalidation, session-expiry extension, upload authorization order and raw session IDs in audit context. Small isolated JavaScript checks confirmed the cache-key collision and Date/string comparison behavior; no database reproduction was claimed.
 - Worker review found no Redis connection in entry points, missing SQL tables, an invalid cancellation column, consumer-global deduplication, non-advancing retry headers, incomplete dead-letter routing, unrouted availability events, and unwired event/consumer paths. Durable queues and persistent messages are no longer described as an end-to-end delivery guarantee.
 - Interview variants each have one compact diagram, three substantive deep dives and 45 minutes of pacing. Frontend is 376 lines, backend 401 and fullstack 425. Structural scan, relative-link checks and `git diff --check` pass. Application builds, the Docker stack, browser flows and real concurrency/recovery tests were **not run**; this pass changes documentation only.
+- Diagram follow-up (2026-09-12): Replaced the three overviews with connected designs showing discovery, versioned booking intent, the inventory authority, and delayed projection work. Frontend separates routes, entity/query state and command reconciliation. Backend and fullstack distinguish potentially stale discovery from serialized inventory mutations and committed outbox work. Added walkthroughs and allocated six minutes to each overview while retaining 45-minute totals. Current lengths are 405/431/449 lines; links, 25 closed rectangles, pacing/fences, structural scan, and whitespace pass. This pass changed the interview documents only.
 
 ### Repository structural baseline
 
@@ -173,6 +424,7 @@ Reviewed all five documents against the API entry point, all routes and services
 - Corrected safety claims to the actual count plus distance-or-duration heuristic, with no cross-rotation linkage or native scanner. Documented frontend item/account races, stale lost-mode drafts, map recenter/empty-state issues, notification badge semantics and missing hardware/push/offline integrations.
 - Rewrote three interview variants into 45-minute spoken discussions, each with three deep trade-offs and one drawable diagram. They connect privacy to key custody and metadata, delivery guarantees to durable identity, late arrivals to bounded retrieval, map freshness to observation time, and safety to a distinct platform path.
 - Validation: structural scan, local link resolution, timing/diagram checks and `git diff --check` passed. Interview lengths are 383/394/408 lines. No application build, runtime stack, hardware test or cryptographic audit was performed; implementation findings remain unfixed code.
+- Diagram follow-up (2026-09-12): Replaced the three overviews with connected privacy and observation flows. Frontend separates item observations, local key access, data access, and native safety/action evidence. Backend distinguishes durable envelope acceptance, idempotent storage, bounded retrieval and account metadata without report-decryption keys. Fullstack shows the independent nearby safety path and owner-side decryption. Added walkthroughs and six-minute overviews within 45-minute answers. Current lengths are 414/421/431 lines; links, 29 closed rectangles, pacing/fences, structural scan, and whitespace pass. This pass changed the interview documents only.
 
 ### Amazon
 
@@ -185,6 +437,7 @@ Reviewed all five documents against the API entry point, database/Redis/Elastics
 - Documented seller ownership gaps, unguarded retention statistics, archival's NOT NULL conflict, mutable/best-effort audit records, mismatched correlation IDs and real health behavior. Frontend coverage distinguishes URL-driven pagination from unimplemented query caching/virtualization/offline support, records request/cart races, stale badge and cancellation response shape, and missing admin/review-authoring screens.
 - All three interview variants now have a 45-minute outline, three deep discussions and one compact diagram. They use prose/contracts instead of disguised SQL/configuration code and connect short checkout allocation, durable attempt/payment recovery and versioned search projections to user-visible behavior.
 - Validation: structural scan, relative links, timing/diagram checks and `git diff --check` passed. Interview lengths are 384/393/415 lines. No application build, database stack or browser suite was run; code findings are documented, not repaired.
+- Diagram follow-up (2026-09-12): Replaced all three overviews with connected discovery and purchase paths. Frontend assigns URL/public queries, cart versions and recoverable purchase attempts to distinct state owners. Backend and fullstack separate stale search projections from authoritative allocation, transactional outbox work and recoverable external payment operations. Added walkthroughs and six-minute overviews within 45-minute answers. Current lengths are 411/411/443 lines; links, 27 closed rectangles, pacing/fences, structural scan, and whitespace pass. This pass changed the interview documents only.
 
 ### APNs
 
@@ -196,6 +449,7 @@ Reviewed all five documents against the HTTP/WebSocket entry point, registry/pus
 - Most APIs—including admin writes—lack session enforcement; WebSocket identity and acknowledgement ownership are unchecked. Breaker/rate-limit/auth-audit helpers are uncalled, pending gauge is unwritten, send latency is not receipt latency, and raw request paths become metric labels. A pure Node check confirmed a 3,020-code-unit payload can be 6,020 UTF-8 bytes while passing the local size check.
 - Frontend coverage records 30-second polling, 20-row offset lists, missing context/version guards, dashboard state across logout, uncertain send results without operation recovery, mutable drafts during requests, and missing narrow-screen navigation. Removed invented Query/virtualization/chart/event-stream dependencies and native APNs transport claims.
 - All three interview variants use a 45-minute outline, three deep trade-offs, one compact aligned diagram, and spoken prose with schema/API tables. Structural scan, relative links, timing/diagram checks, and `git diff --check` passed. Interview lengths are 396/444/450 lines. No application build, live stack, browser suite, or concurrency reproduction was run; implementation findings are documented rather than repaired.
+- Diagram follow-up (2026-09-12): Replaced all three overviews and added arrow walkthroughs separating durable acceptance, retained work, gateway handoff, persisted device receipt and projected console status. Frontend shows editable drafts, frozen send identity, scoped resources and a bounded refresh scheduler; backend and fullstack connect broker replay, state authority, connection ownership and device acknowledgements. Six-minute overview sections retain 45-minute totals. Current lengths are 425/470/472 lines; links, 28 closed rectangles, pacing/fences, structural scan and whitespace pass. This pass changed the interview documents only.
 
 ### App Store
 
@@ -208,6 +462,7 @@ Reviewed all five documents against the complete API/router, auth/catalog/search
 - Outbox/idempotency/breaker helpers are unused. Queue publication is unconfirmed, the direct dead-letter exchange binds a literal `#`, retries can lose messages, and reconnect does not restore consumers. Metrics and health do not establish worker progress, actual downloads, or payments. Auth uses bcrypt/session UUIDs but password changes do not revoke sessions and Express 4 auth middleware has unwrapped async dependency calls.
 - Interview answers now each use one compact aligned diagram, three substantive deep dives, and 45 minutes of pacing. They connect query identity, publication recovery, immutable artifacts, moderation revisions, and repeatable rating effects to user-visible behavior. Lengths: frontend 366, backend 402, fullstack 444 lines.
 - Validation: structural scan, local links/anchors, timing/diagram checks, and `git diff --check` passed. No application build, runtime stack, browser suite, database reproduction, or password-hash verification was performed; code findings are recorded rather than repaired.
+- Diagram follow-up (2026-09-12): Replaced the three overviews and added walkthroughs for discovery, revisioned editing/publication, direct object transfer and approval of immutable bytes. Frontend separates local drafts, saved results, operation recovery and upload progress. Backend and fullstack show authoritative release/access checks, revision-aware workers and derived search views. Existing combined architecture/contract time allocations remain within 45 minutes. Current lengths are 386/417/465 lines; links, 24 closed rectangles, pacing tables/fences, structural scan and whitespace pass. This pass changed the interview documents only.
 
 ### apple-maps
 
@@ -219,6 +474,7 @@ Reviewed all five documents against every backend route/service, graph and heap 
 - Frontend findings include unguarded camera command/event feedback, unversioned search/route responses, stale routes after endpoint edits or clear, no stationary traffic refresh, search errors represented as empty results, and mismatched incident timestamp names. Start sets initial state only: no continuous position watch, maneuver advancement, rerouting, probe sender, or saved sessions.
 - Corrected claims about Redis-backed limits, shared quotas, automatic incidents, route caching, telemetry coverage, data freshness, privacy, and graceful shutdown. Limits use process memory and raw forwarded-IP trust; health does not prove a loaded navigable graph, and the staleness gauge does not age after updates stop.
 - Rewrote interview answers around explicit proposed designs, each with three deep trade-offs, a 45-minute plan, and one diagram no wider than 64 columns. Final lengths: frontend 370 lines, backend 377, fullstack 411. Structural scan, relative links/anchors, diagram checks, and `git diff --check` pass. Application stack, browser reproduction, and runtime tests were **not run**; implementation defects remain documented rather than changed outside scope.
+- Diagram follow-up (2026-09-12): Replaced the three overviews and added walks through route intent, accepted route bundles, independent tile delivery and traffic processing. Frontend distinguishes the renderer, viewport scheduling, guidance coordination and position quality. Backend and fullstack connect regional route workers to compatible graph/traffic views and show consented observation ingestion separately from local guidance. Existing architecture/contract pacing remains 45 minutes. Current lengths are 403/404/440 lines; links, 29 closed rectangles, pacing/fences, structural scan and whitespace pass. This pass changed the interview documents only.
 
 ### apple-music
 
@@ -230,7 +486,7 @@ Reviewed all five documents against every backend route, SQL schema and seed, au
 - History and progress trust completion flags, have no deduplication, and update derived counts separately. The player's one-shot timer checks position, not listened duration; prefetch/progress/end APIs have no playback callers. Documented late selection races, missing listener cleanup, hidden player errors, no persistence/query cache/virtualization, inert quality/admin/editor controls, unconsumed genre URLs, and stale sidebar lists.
 - Corrected catalog cache claims in project history: list caches do exist. Search is PostgreSQL LIKE, recommendations use 30-day history, 90-day releases and genre/popularity rules with 30-minute caching, and audio features/collaborative filtering are unused. Recently-played LIMIT precedes global time sorting; personal station shuffle ignores stored personal candidates. Recorded stale entitlement caches, Redis-error authentication failure, IP limits mounted before authentication, non-atomic counter expiry, inaccurate active-stream gauges, unscoped FLUSHDB, and incomplete readiness/draining.
 - Rewrote interview variants into proposed spoken designs with three deep trade-offs and a 45-minute plan. Final lengths: frontend 384 lines, backend 366, fullstack 388. Structural scan, relative links/anchors, diagram widths/alignment, and `git diff --check` pass. The application stack, audio playback, and concurrency tests were **not run**; the seed password was checked in isolation. No application code was changed.
-
+- Diagram follow-up (2026-09-12): Replaced all three overviews and added walks through persistent playback, direct authorized byte delivery, revisioned library synchronization and identified listening events. Frontend separates the player lifecycle from routed pages and library pending edits. Backend and fullstack connect authority, versioned public projections and asynchronous history/recommendation effects. Updated both pacing tables and headings to give six minutes to architecture while retaining 45-minute totals. Current lengths are 417/404/421 lines; links, 29 closed rectangles, pacing/fences, structural scan and whitespace pass. This pass changed the interview documents only.
 
 ### apple-pay
 
@@ -243,7 +499,7 @@ Reviewed all five documents against the backend entry point, every route/service
 - **Infrastructure:** Audited Redis NX lease and asynchronous response caching, router-relative/non-actor/non-method key scope, weak body hash, fail-open middleware, error cleanup, lease-expiry/ownership races, and biometric-before-replay ordering. Identified unused service idempotency helper, caches not read by list/history paths, partial audit coverage, mutable/best-effort audit records, redaction limitations/session IDs, hardcoded Visa/unknown metrics, unused DB/card instruments, unbounded health duration, and no HTTP drain or rate limiting.
 - **Architecture/interviews:** Separated proposed wallet/TSP responsibilities from merchant/processor attempts and issuer decisions. Replaced universal tap-to-approval timing, mandatory wallet proxy, precomputed cryptograms, write-through atomicity, Redis exactly-once, and timeout-as-decline claims. Proposed durable operation identity/provider reconciliation, fixed checkout version, acknowledged revocation, and refund reservations. Three spoken 45-minute answers use one small diagram each and three substantial trade-offs, with no code/schema dumps disguised as boxes. Checked payment-role descriptions against primary Apple/EMVCo documentation and invalid UPDATE syntax against PostgreSQL 16 documentation.
 - **Validation:** Structural audit, relative links/anchors, diagram bounds, three deep dives and 45-minute totals, and `git diff --check` passed. Source/configuration review plus isolated seed-password verification; no runtime stack, payment test, application code changes, or production-performance claim.
-
+- Diagram follow-up (2026-09-12): Replaced all three overviews and added walkthroughs distinguishing wallet lifecycle authority, protected platform confirmation, merchant order state and issuer decisions. Frontend gives wallet and merchant checkout separate client scopes and state owners. Backend shows durable payment authority and provider reconciliation; fullstack follows fixed intent, credential handoff, payment outcome and history without placing the wallet REST API in every contactless transaction. Current lengths are 422/449/483 lines with existing 45-minute plans; links, 26 closed rectangles, pacing tables/fences, structural scan and whitespace pass. This pass changed the interview documents only.
 
 ### apple-tv
 
@@ -256,6 +512,7 @@ Reviewed all five documents against every backend route, authentication/configur
 - **Operational boundaries:** Optional replay keys bind user-or-anonymous/key without method/path/profile/body, run before route guards, replay responses without session side effects, cache errors asynchronously and lack durable receipts/lease ownership. Active Opossum wrappers protect a SQL lookup and Redis demo counters, not real storage/CDN; fallback objects are not valid media. DRM/transcoding configs are unused. First-frame metric measures a SQL lookup, process-local stream keys collapse viewers while gauges grow, HTTP labels have collision/cardinality concerns, request logger precedes sessions, audit SQL is unwritten and redaction absent. Health checks only SQL/Redis, lack an overall deadline and do not prove playable media; shutdown does not drain HTTP.
 - **Interview/architecture rewrite:** Separates proposed complete media revisions, protected CDN/DRM boundaries, session sequencing/handoff, provider events and outbox recovery from the local application. Each interview has three substantial trade-offs, one aligned diagram under 64 columns and a 45-minute plan. Final lengths: frontend 396, backend 434, fullstack 470 lines. Removed disguised implementation/configuration blocks and unsupported claims of HLS.js, instant revocation, automatic offline sync and universal database throughput.
 - **Validation:** Structural scan, local links/anchors, fence/diagram alignment and timing checks, and git diff --check passed. Reviewed source/configuration and verified the SQL password in isolation; no live application stack, browser playback, concurrent database reproduction or app-code changes.
+- Diagram follow-up (2026-09-12): Replaced the three overviews and added walkthroughs that explicitly draw control, protected license and media-delivery paths. Removed the earlier suggestion to leave license-service connections verbal. Frontend connects profile-scoped resources, playback generation and actual engine events; backend and fullstack connect durable encoding jobs, validated revisions, active publication state, private origin and protected keys. Updated both pacing tables and headings for six-minute architecture sections and 45-minute totals. Current lengths are 430/459/501 lines; links, 29 closed rectangles, pacing/fences, structural scan and whitespace pass. This pass changed the interview documents only.
 
 ### bitly
 
@@ -269,6 +526,7 @@ Reviewed all five documents against every backend route/service, the entry point
 - Session-cache hits still check fresh user role/active status but bypass SQL session expiry/deletion; cache refill grants a full seven days. Redis authentication errors propagate or optional auth silently becomes anonymous. Analytics, including raw events, lacks ownership checks; anonymous details expose inactive/expired links. Frontend persisted user state, cross-account requests, shared loading state, mutable pending drafts, status-free soft-deleted rows, and report query races are documented.
 - Removed fabricated throughput guarantees, SQL/code/configuration dumps from interview answers, blanket counter/polling comparisons, and claims that 302 guarantees one recorded human click. All variants have one compact aligned diagram, three substantive trade-offs, and 45-minute pacing: frontend 375 lines, backend 414, fullstack 438.
 - Validation: structural scan, local links/anchors, diagram/timing checks, and git diff --check passed. Application builds, infrastructure, browser suite, and concurrency/recovery reproductions were not run; this pass changes documentation only. The existing admin smoke check uses Alice and can pass after redirection, so it is not an administrator-flow assertion.
+- Diagram follow-up (2026-09-12): Replaced all three overviews and added walkthroughs connecting recoverable creation, lifecycle-aware mapping reads, recipient navigation and retained analytics. Frontend separates draft/attempt, owned link state and scoped report queries. Backend and fullstack now show the recipient browser following the 302 response to the destination, with separate bounded event admission and duplicate-safe aggregation; coverage remains incomplete during admission failures. Updated headings and time-first pacing tables for six-minute overviews and 45-minute totals. Current lengths are 410/447/476 lines; links, 34 closed rectangles, pacing/fences, structural scan and whitespace pass. This pass changed the interview documents only.
 
 ### calendly
 
@@ -284,6 +542,7 @@ Reviewed all five documents against all backend routes, booking/availability/tim
 - Archival is manual, uses completed retention for both completed/cancelled, and lacks an automatic completed transition. Broad copy/delete cohorts can diverge under concurrent changes; deletion cascades email logs. Full maintenance queries missing calendar_events_cache, may partially mutate other data, and catches errors before exiting successfully. Health and metrics show limited dependency/process evidence, not end-to-end booking/delivery correctness; no circuit breaker is wired.
 - Architecture explicitly separates a proposed host authority, occupied-range backstop, civil-time policy, durable receipts/outbox, revision-aware reminders, and external-provider reconciliation from current implementation. Three interview answers use one compact aligned diagram each, three substantive trade-offs, no implementation code, and 45-minute pacing: frontend 371 lines, backend 402, fullstack 403.
 - Validation: structural scan, relative links/anchors, diagram bounds/alignment, timing, source cross-checks, and git diff --check passed. Only source/configuration and isolated helper/password/object checks were run; no application stack, browser suite, database concurrency test, production benchmark, or application-code change. Existing smoke tests mostly assert containers and can pass a booking-detail error page.
+- Diagram follow-up (2026-09-12): Replaced the three overviews and added walkthroughs separating display-zone availability, stable booking attempts, host policy state and delivery progress. Frontend shows candidate instants/coverage and separate guest/host scopes. Backend and fullstack connect advisory reads to the shared policy model, coordinate occupancy/policy writes at the host authority and defer notification/reminder work until commit. Updated headings and time-first plans for six-minute overviews and 45-minute totals. Current lengths are 407/437/439 lines; links, 28 closed rectangles, pacing/fences, structural scan and whitespace pass. This pass changed the interview documents only.
 
 ### coinbase
 
@@ -299,7 +558,7 @@ Reviewed all five documents against every backend route/service, order book and 
 - HTTP sessions have insecure cookies in every environment and no ID regeneration; CORS reflects origins, and verification is not enforced. WebSocket auth trusts supplied user IDs and arbitrary channel strings, but no private publisher is wired, so the docs do not invent an existing private-feed leak. Rate limits use default per-process IP stores despite the installed Redis-store dependency. Circuit-breaker code and depth metric are unused, trade counters include synthetic fills, health is constant, and shutdown does not explicitly drain streams/timers/dependencies.
 - Architecture separates a proposed committed pair book, shared order/hold/journal transaction, durable account-scoped receipt/outbox, exact asset units, fencing/replay, and coherent market projection from local behavior. It does not treat asynchronous settlement as funding admission or independently idempotent shard writes as atomic transfer. Corrected candle-rate and fan-out calculations and removed universal database latency/throughput claims. All interviews have one aligned diagram, three focused trade-offs, no implementation code, and 45-minute pacing: frontend 357 lines, backend 375, fullstack 390.
 - Validation: structural scan, relative links/anchors, current-schema comparison, diagram alignment/width, interview timing, and git diff --check passed. Isolated bcrypt, order-book, arithmetic, and fake-clock checks only; no application stack, SQL execution, browser suite, live settlement/concurrency test, benchmark, or application-code change. Existing HTTP/page tests do not prove accounting correctness.
-
+- Diagram follow-up (2026-09-12): Replaced all three overviews and added walkthroughs separating sequenced public data, identified private commands and canonical account revisions. Frontend distinguishes snapshot/stream synchronization from sampled rendering and recovery of one frozen order intent. Backend and fullstack connect fenced pair ownership, committed memory, transactional funding/accounting, receipts/outbox and independent read projections. Updated headings and time-first plans for six-minute overviews and 45-minute totals. Current lengths are 395/409/423 lines; links, 33 closed rectangles, pacing/fences, structural scan and whitespace pass. This pass changed the interview documents only.
 
 ## collaborative-editor
 
@@ -316,6 +575,7 @@ Reviewed all five documents against backend entry points, REST routes, TextOpera
 - Corrected browser recovery: no reconnect timer, receipt resolution, gap/duplicate validation, draft persistence, or socket-generation isolation; init/resync discard pending work, old callbacks can affect a new document, transform/message exceptions are uncaught. Local selection is numerically clamped rather than transformed, and IME submission deferral does not protect composition from remote replacement.
 - Architecture now separates proposed fenced document ownership, atomic head/log/receipt/outbox acceptance, replay and verified snapshots from actual code; reproduces the complete current five-table SQL schema exactly. Explains single-thread/async serialization, per-recipient deduplication, honest durability/failover boundaries, and scoped OT/CRDT alternatives. Checked primary RabbitMQ acknowledgement/Homebrew and Yjs offline/garbage-collection documentation; removed universal CRDT memory/tombstone claims.
 - Rewrote all three interviews as spoken 45-minute designs with three major trade-offs each and small aligned diagrams: frontend 377 lines/3,100 words, backend 384/3,151, fullstack 421/3,385. Their proposed functionality is clearly distinguished from local implementation. Verified local links/anchors, exact embedded schema, timing totals, three deep dives, fence restrictions, diagram alignment, structural scan, and git diff whitespace. Existing smoke test only checks page rendering. No infrastructure, full browser application, builds, or runtime stack were started.
+- Diagram follow-up (2026-09-12): Added three connected role-specific overviews and walkthroughs. The frontend separates editor input, pending operation state, durable acknowledgements and temporary presence. Backend/fullstack follow fenced document ownership into the committed log/receipt/outbox, then replay and verified snapshots; the sender retires its pending edit without applying text twice. All three answers retain three deep dives and 45-minute plans. Current lengths are 406/417/451 lines; local links, 31 closed rectangles, pacing/fences, structural scan and whitespace pass. This pass changed the interview documents only.
 
 ### Confluence
 
@@ -331,6 +591,7 @@ Reviewed all five documents against API composition and startup, all routes/serv
 - Corrected UI claims: one shared loading/current-page state permits cross-context races; no draft recovery, autosave, navigation guard, or explicit selection/IME preservation exists. The editor sends empty structured JSON. Templates are unwired, TOC is a placeholder, HTML diffs are unified rather than semantic/side-by-side, and restore refreshes only history. Comment/review components have pending/context gaps; storage permits discussion shapes the read API does not return.
 - Three interview answers now use one compact diagram each, 45 minutes of pacing, and three substantive deep dives. They connect expected revisions and durable receipts to retained drafts, revision-bound publication to reader state, ordered outbox effects to honest search freshness, and stable page identity to bounded hierarchy navigation. Full implementation/configuration dumps were removed.
 - Validation: exact SQL-schema comparison, local links/anchors, timing, diagram alignment, structural scan, and `git diff --check` passed. Fifteen README shell examples and the indexing JavaScript module parsed successfully without execution. The installed bcrypt library verified the seed password `password123` (cost 10; new registrations use 12). Interview lengths are 404/432/475 lines. Builds, full-stack/browser flows, real SQL concurrency, indexing/backfill execution, and broker recovery tests were **not run**; application code remains unchanged.
+- Diagram follow-up (2026-09-12): Added connected reading/editing/review paths in the frontend, an authoritative save path and asynchronous search path in the backend, and a full publication journey across both. Walkthroughs distinguish draft state, accepted revision, published pointer and authorized search visibility; current access checks remain outside the derived index. Current lengths are 423/450/500 lines. Local links, 23 closed diagram rectangles, 45-minute pacing, three deep dives, fence restrictions, structural scan and whitespace checks pass. This pass changed the interview documents only.
 
 ### Dashboarding
 
@@ -346,6 +607,7 @@ Reviewed all five documents against all application source, routes/services, sch
 - Both Zustand stores are unused. Actual chart mapping aligns by array index and replaces missing entries with zero; an isolated mapping check moved a 00:01 sample to 00:00 and invented a zero at 00:02. Gauge/stat/explorer choose the first series, and series colors/labels lack stable identity. Independent timers have no request generations/cancellation, manual dashboard Refresh updates metadata, errors may persist after successful fetches, and cards report zero panels. Alert forms send invalid null for empty description; banners retain stale state silently and show capped incident counts. There is no interactive panel editor/drag-resize/auth UI.
 - Architecture reproduces the complete seven-table SQL schema exactly and separates proposed durable batch receipts, typed/canonical series, bounded coverage-aware queries, mergeable aggregate states, coordinated refresh, and serialized alert/delivery state from implementation. Corrected capacity arithmetic and avoided obsolete TimescaleDB multi-node assumptions. All three interviews now present a 45-minute spoken design with one compact diagram and three substantive deep dives: frontend 362 lines/3,229 words, backend 356/3,118, fullstack 374/3,297.
 - Validation passed: structural scan, 31 local links/anchors, exact schema comparison, 30 diagram-box alignment checks, 14 shell examples parsed without execution, timing/deep-dive checks, and git diff whitespace. Isolated checks used actual transpiled modules/Opossum with mocked database/cache/metrics and a chart-formatting stub. No app code changed; builds, real database/queue concurrency, native installs, browser flows, or load tests were not run. Existing four Playwright checks assert headings rather than data/alert correctness.
+- Diagram follow-up (2026-09-12): Connected route/configuration state, one shared query coordinator, quality-aware chart rendering and separately scoped incident views. Backend/fullstack follow durable ingestion through sample/receipt storage, coverage-aware queries, independently budgeted rule evaluation, persisted incidents and actual notification attempts. Increased the fullstack overview to five minutes while retaining its 45-minute total. Current lengths are 384/378/404 lines. Local links, 31 closed diagram rectangles, 45-minute pacing, three deep dives, fence restrictions, structural scan and whitespace checks pass. This pass changed the interview documents only.
 
 ### Discord
 
@@ -362,6 +624,7 @@ Reviewed all five documents against every backend core/adapter/route, database o
 - Browser guards trust persisted session presence and never call the validation helper. Join-history-stream ordering has a gap; async joins lack generations/cancellation and can create stale views/orphan streams. Sends clear text and ignore results; there is no pending-send/retry/offline model. Home navigation leaves subscriptions active. Live arrays grow, use inconsistent keys, and always scroll to bottom. Placeholder member/attachment/emoji controls and fixed layouts are documented. Smoke tests use a nonexistent password field, stale general room and main selector; route tests mock the relevant delivery core.
 - Architecture now reproduces the exact four-table schema and separates a proposed transaction containing room head/message/receipt/outbox, explicit permission authority, replay/retention boundaries, structured transport events, and independent connection/session/membership state. Removed unsupported real-Discord claims, arbitrary vendor throughput limits, incorrect ordering/SFU arithmetic, and claims that SSE automatically supplies replay. Interviews each use one compact diagram, three deep trade-offs, and 45-minute pacing: frontend 353 lines/3,254 words, backend 357/3,152, fullstack 362/3,273.
 - Validation passed: source cross-checks, isolated actual-module checks, structural scan, 33 local links/anchors, 21 diagram boxes, exact SQL schema, 17 parsed shell examples, timing/deep-dive checks, and git diff whitespace. No application code changed. Builds, existing unit/browser suites, actual database/Redis concurrency, full network delivery, native installation, and production load tests were not run.
+- Diagram follow-up (2026-09-12): Replaced all three overviews with explicit command/receipt and history/live-delivery paths. Frontend state separates room lifecycle, frozen sends, replay/deduplication and timeline rendering. Backend connects both transport adapters to one room authority and shows gateways reading durable history after outbox wakeups. Fullstack closes the path back to browser/TCP clients and explains why acceptance and recipient delivery differ. Current lengths are 377/371/394 lines. Local links, 24 closed diagram rectangles, 45-minute pacing, three deep dives, fence restrictions, structural scan and whitespace checks pass. This pass changed the interview documents only.
 
 ### distributed-cache
 
@@ -373,7 +636,7 @@ Reviewed all five documents against every cache-node/coordinator route, hash rin
 - Recorded existing-value growth bypassing eviction, oversized new values disappearing despite success, stale currentSize/INCR byte accounting, accepted sentinel names capable of hanging eviction, full-key-array expiration sampling, regex-like unbounded scans, and weak runtime validation. Snapshots write directly to final filenames, load only the newest file, round/reset TTL and metadata, can resurrect deleted data, reverse recency under reduced capacity, and can skip the final write while another snapshot is active. A one-minute timer does not bound recovery loss.
 - Frontend findings include partial aggregates without coverage, unused key enumeration on each overview poll, overlapping requests/shared timestamps, per-keystroke search, selection races, no cursors/virtualization, sampled TTL labels, static cluster badges, sequential test writes, and unbounded logs. Rewrote all interview variants into 45-minute discussions with three deep trade-offs and one drawable architecture each. They distinguish observation envelopes from atomic global snapshots, accepted mutations from completed effects, hashing from safe transfer, and cache loss from origin overload.
 - Isolated checks of actual transpiled TypeScript reproduced the LRU/accounting/TTL/pattern, hash distribution, removal, stale-copy overwrite, analyzer mutation, snapshot recovery, and health-state behaviors using mocked adapters and temporary snapshot files. All five documents pass structural checks, 33 relative links/anchors, 26 aligned diagram boxes, 12 shell-syntax checks, and `git diff --check`. Interview lengths: frontend 436 lines, backend 447, fullstack 471. No application servers, images, builds, or existing test suites were run; implementation defects remain documented rather than changed.
-
+- Diagram follow-up (2026-09-12): Added role-specific diagrams separating operator observations and tracked controls from application cache traffic. Backend now shows accepted placement, ownership transitions, separate node partitions and application-owned origin refill. Frontend/fullstack show scoped query/operation state, partial observations and sample age, without delegating authoritative hashing to the browser. Current lengths are 454/466/486 lines. Local links, 26 closed diagram rectangles, 45-minute pacing, three deep dives, fence restrictions, structural scan and whitespace checks pass. This pass changed the interview documents only.
 
 ## docusign
 
@@ -390,7 +653,7 @@ RabbitMQ publisher wraps payloads that the worker interprets as bare messages; t
 Frontend findings: fixed 700-pixel viewers with container-relative coordinates, numeric-string conversion only, hidden text/annotation layers, non-keyboard field divs, no drag/resize/zoom/upload progress, response-generation guards, polling, shared schemas, React Query, offline persistence, or stable operation IDs. Completed overlays show checkmarks instead of actual input/images. Selected document/page can become stale, lists discard pagination, failed fetches can leave spinners/stale content, and admin View links use sender-only detail routes. Draw/type are the only UI signature modes. The login screen's “any password” text is false; fresh seeded passwords are password123. Four admin-owned one-page fixtures/eight fields do not prove runtime signing; the completed fixture has no captured signature rows.
 
 README now distinguishes infrastructure-only Compose from host API/frontend commands, first-volume SQL initialization from nonexistent migrations, actual TypeScript seed from the missing db-seed/seed.sql comment, dev port 3001 from bare start default 3000, exported variables from unsupported automatic .env loading, native service installation, anonymous Compose buckets versus private native buckets, queue credential/contract defects, and original downloads versus missing final artifacts. Checked primary React-PDF/PDF.js, PostgreSQL JSONB, RabbitMQ DLX, and Homebrew/MinIO installation references. Verification: root structural audit has no findings; 37 relative links/anchors, 27 diagram boxes, 11 shell snippets, exact SQL reproduction, and all three timing/length/deep-dive checks pass; `git diff --check` passes. Isolated source checks used temporary files with mocked SQL/Redis/storage and did not run a full stack, browser ceremony, build, benchmark, or legal certification. Application source was not changed.
-
+- Diagram follow-up (2026-09-12): Added sender/signer browser paths through shared PDF geometry and separately scoped action state. Backend/fullstack show invitation authority, immutable object delivery, the envelope transaction, committed jobs, artifact publication and independent notification outcomes. Walkthroughs bind the displayed revision to accepted input and distinguish completed signing from ready output; the backend now allocates five minutes to capacity/architecture and four to records/APIs. Current lengths are 392/429/431 lines. Local links, 25 closed diagram rectangles, 45-minute pacing, three deep dives, fence restrictions, structural scan and whitespace checks pass. This pass changed the interview documents only.
 
 ## doordash
 
@@ -409,6 +672,7 @@ Reviewed all five documents, project history in `CLAUDE.md`, backend entry point
 - **Fixtures and tests:** Seed bcrypt matches password123 for customer/restaurant/driver/admin accounts. Its PREPARING order is a display fixture with incompatible address shape, totals not matching lines, no ETA, and a driver still available. Existing smoke tests use unseeded alice@example.com and broad visibility checks; screenshots use correct persona accounts. Removed stale SLOC totals and unverified inspiration links rather than presenting them as implementation evidence.
 
 Verification: isolated execution of actual TypeScript with mocked dependencies reproduced partial writes at a closed restaurant, cached-error reuse across actors, unauthorized completion, assignment to cancelled orders, and reuse of one candidate for two orders; checked the installed Redis argument transformer and seed bcrypt hash. Documentation QA checked 44 local links/anchors, 30 diagram boxes, 11 shell examples, exact nine-table SQL, all three 45-minute outlines with three deep dives, 350–550-line pacing, structural audit, and whitespace. No application code changed; no live stack, build/typecheck, throughput benchmark, or complete end-to-end test was run or claimed.
+- Diagram follow-up (2026-09-12): Expanded the three persona views and their separate cart/queue/assignment state, connected through shared contract and transport ownership. Backend/fullstack distinguish authenticated location ingestion and coalesced position push from durable order/claim transactions and replayable lifecycle events. Dispatch obtains candidates from geo observations and claims through the same order authority. Walkthroughs retain the foreground-driver scope and separate order acceptance from assignment. Current lengths are 417/421/442 lines. Local links, 30 closed diagram rectangles, 45-minute pacing, three deep dives, fence restrictions, structural scan and whitespace checks pass. This pass changed the interview documents only.
 
 ### dropbox
 
@@ -423,7 +687,7 @@ Reviewed all five documents against the Express/WS entry point, every route, fil
 - Rewrote three interviews with separate frontend/backend/fullstack emphasis, three substantive trade-offs each, 45-minute pacing, and one drawable diagram per answer. Common proposed guarantees are verified scoped staging, SQL publication/receipt/outbox, explicit version conflicts, retained logical quota with reservations, private authorized bytes, durable cursor recovery, and coordinated reachability-based reclamation. Capacity estimates are assumptions, not measurements.
 - Isolated execution of actual source with mocked dependencies passed: default pg BIGINT parsing and quota comparisons, post-commit metric failure, two completion attempts creating two versions/charges with absent hashes, expired/completed-session repeated invalid-index uploads, empty seeded download, numeric breaker state versus gauge, four retry attempts, Express token-route precedence, and bcrypt seed credentials. No application source, dependency files, or runtime data were changed. Full stacks, builds, and browser tests were not run.
 - Final interview lengths: frontend 356 lines, backend 375, fullstack 372. Structural scan reports no findings; 45 relative links/anchors, 31 diagram boxes, eleven shell examples, exact ten-table SQL, and all three 45-minute outlines passed focused checks. `git diff --check` passes, and only the five requested Dropbox documents changed in that project.
-
+- Diagram follow-up (2026-09-12): Connected metadata/change synchronization, persistent upload ownership and pinned download paths in the frontend. Backend/fullstack show verified staging feeding namespace finalization, separate immutable object transfer, quota/receipt authority and committed change propagation to other devices. Walkthroughs distinguish transfer progress from a published file version and preserve permission, conflict and retention boundaries. Current lengths are 380/398/396 lines. Local links, 29 closed diagram rectangles, 45-minute pacing, three deep dives, fence restrictions, structural scan and whitespace checks pass. This pass changed the interview documents only.
 
 ### etsy
 
@@ -440,7 +704,7 @@ Reviewed all five documents, project history in `CLAUDE.md`, every backend route
 - All three interview answers now have 45-minute pacing, three substantive trade-offs, a small drawable architecture, and role-specific emphasis. The common proposed design uses explicit all-basket consent, short guarded checkout holds, buyer-scoped SQL receipts, durable payment/reconciliation, per-seller fulfillment, versioned indexing, and honest UI recovery. Removed implementation/config/JSON blocks, invented APIs presented as actual, unsupported performance figures, and guarantees inferred from helper names.
 - Isolated actual-source checks with mocked dependencies reproduced the missing-column failure after payment, conditional schema-compatible overselling, concurrent duplicate buyer restock, seller cancellation without restock, cross-actor idempotency replay, invalidation-key mismatches, Redis lock error propagation, and dropped fallback filters. Verified SQL seed password hashes separately. No application code/data changed, and no full stack, build, browser test, or benchmark was run.
 - Final checks passed: all five files present, 31 relative links/anchors, 46 aligned diagram boxes, eight shell examples, syntax of the one-off ESM indexing example, exact ten-table SQL, three deep dives and 45-minute totals per interview, structural audit, and whitespace. Interview lengths are 396/416/430 lines. Only the five requested Etsy documents changed in the project.
-
+- Diagram follow-up (2026-09-12): Added distinct public discovery, buyer purchase and seller-workspace paths. Backend/fullstack connect all-line holds and purchase authority to durable payment recovery, per-seller orders, versioned index maintenance and image delivery. The walkthrough follows one agreed basket while separating discovery freshness, cart intent, held inventory and payment outcome. Current lengths are 421/444/456 lines. Local links, 48 closed diagram rectangles, 45-minute pacing, three deep dives, fence restrictions, structural scan and whitespace checks pass. This pass changed the interview documents only.
 
 ## excalidraw
 
@@ -454,7 +718,7 @@ Reviewed all five documents against all backend/frontend source, initialization 
 - **Operational boundaries:** distinguished wired sessions, fixed-window Redis rate limits, Pino, Prometheus counters, and PG/Redis probes from unused Opossum/query-timing helpers. Recorded unbounded client event metric labels, approximate session gauge, absent socket admission/backpressure/heartbeat limits, fail-through cache/limiter errors, and missing room draining. Existing tests mock dependencies and do not establish SQL/socket correctness; browser smoke tests cover login/listing, with screenshots additionally opening seed canvases.
 - **Revised design and interview scope:** all three role-specific 45-minute answers have three substantive deep dives and no implementation code. The proposal uses one storage-fenced drawing authority, conditional geometry/style/text groups, actor-scoped operation receipts, canonical events including the author, snapshot-plus-tail recovery, scoped pending local drafts, and explicit conflicts. It separates ephemeral previews from completed durable gestures and explains lifecycle/retention, permissions, coordinates, and accessible rendering without claiming unrestricted offline convergence. Architecture reproduces the exact five-table initialization SQL and separates every proposed mechanism from local behavior.
 - **Verification:** 13 isolated source-execution checks passed with mocked services, sockets, clock, stores, and canvas; no live service or application data was changed. All five documents passed relative-link/anchor checks (36), rectangular diagram checks (36 boxes), shell parsing (7 examples), exact SQL comparison, the repository structural audit, and `git diff --check`. Interviews are 395/400/417 lines. No full-stack runtime, build, or benchmark was run; application defects were documented rather than edited.
-
+- Diagram follow-up (2026-09-12): Expanded gesture/session, scene synchronization, local rendering and ephemeral presence into explicit frontend ownership. Backend/fullstack connect both metadata and editing transports to the drawing authority, its atomic accepted log/receipt state, peer delivery and verified snapshots. Walkthroughs follow one move across preview, acceptance and replay while preserving geometry/style conflict boundaries and local viewport ownership. Current lengths are 420/416/445 lines. Local links, 41 closed diagram rectangles, 45-minute pacing, three deep dives, fence restrictions, structural scan and whitespace checks pass. This pass changed the interview documents only.
 
 ## facetime
 
@@ -470,7 +734,7 @@ Reviewed all five documents, the project collaboration history, all backend/fron
 - **Presence and observability:** registration races two TTL writers on the same user hash (60 seconds and one hour); ping updates only local lastPing and never refreshes Redis. Whole-hash expiry cannot independently expire devices. Heartbeat timeout and close both run cleanup, while unregistered sockets are outside the heartbeat map. Call setup metrics measure human ringing through acceptance, not first media; ICE metrics are declared but unwired. `/stats` resets a gauge using a different connection population. Group-label mismatches, races, TTL expiry, restarts, and arbitrary metric labels weaken aggregate counts. Shutdown requests closes and exits after five seconds without awaited dependency/call reconciliation.
 - **Revised architecture and interviews:** exact five-table/seven-index local SQL; proposed transactional call/receipt/outbox, independent invitation seats, account-wide busy claims, durable deadlines, connection leases, endpoint/negotiation generations, and distinct media/control recovery. Corrected mesh arithmetic, relay ingress/egress accounting, unsupported latency/cost/codec claims, WebSocket-is-mandatory language, and SFU encryption/traffic assumptions. Three role-specific answers each have three substantive deep dives and a 45-minute outline, without implementation code or oversized component diagrams.
 - **Verification:** eight isolated source-execution checks passed with mocked services/media/sockets and actual Opossum. All five documents passed exact SQL comparison, 30 relative links/anchors, 26 rectangular diagram boxes, eight shell-example syntax checks, the repository structural audit, and `git diff --check`. Interviews are 356/370/363 lines. Existing smoke coverage only renders the login container; screenshots additionally open contacts. No full stack, browser media session, build, network benchmark, or application-source change was performed.
-
+- Diagram follow-up (2026-09-12): Replaced control-only or disconnected media sketches with explicit direct WebRTC and selected TURN paths. Frontend separates React status, the call controller, capture/peer ownership and native playback. Backend/fullstack connect the same device endpoints to one gateway fleet and durable call/claim/outbox authority while keeping media outside signaling. Walkthroughs distinguish accepted endpoints, observed media health and controller cleanup. Current lengths are 381/394/393 lines. Local links, 23 closed diagram rectangles, 45-minute pacing, three deep dives, fence restrictions, structural scan and whitespace checks pass. This pass changed the interview documents only.
 
 ## fb-live-comments
 
@@ -486,6 +750,7 @@ Reviewed all five documents, collaboration history, all backend/frontend source,
 - **Observability:** the stable shared query is correctly wrapped in Opossum (5-second timeout, 50%/five-request threshold, 10-second retry), unlike the previous project's captured-action defect. Direct pool/transaction/probe queries bypass it; Redis breaker factory is unused and SQL timeout does not cancel work. Pino, Prometheus, and PostgreSQL/command-Redis health probes are wired. Comment latency ends before batching/rendering; outgoing size records character length per publication rather than byte fan-out. Stream/user cardinality, local connection populations, duplicate close/error counting, and retained peak entries limit metric interpretation. Fixed-window limiter INCR/EXPIRE is non-atomic; budgets are not adaptive or sliding.
 - **Design/interview corrections:** preserved the user's frontend structure while correcting delta-versus-total replacement, unbounded paused eviction, unsafe Snowflake assumptions, scrollback/cache conflation, unconditional accessibility announcements, input remount claims, and the assertion that bandwidth is negligible. A 1,000-comment/second stream at 200 bytes is 12 MB/minute per viewer; batching preserves payload volume. All proposals align on durable actor-scoped receipts/outbox, ordered snapshot-plus-tail with selection coverage, bounded reading/live views, versioned absolute reaction snapshots, and durable moderation. Backend/full-stack answers are spoken 45-minute designs with three substantive deep dives and no implementation code. Architecture reproduces the exact five-table/eight-index SQL and puts source-mapped local limitations in the final section.
 - **Verification:** eight isolated actual-source checks passed with mocked dependencies/timers/clock; no live service or application data was used. Five documents passed 31 relative link/anchor checks, 23 rectangular diagram checks, eight shell syntax checks, exact SQL comparison, structural audit, and git diff whitespace checks. Interviews are 363/391/391 lines. Existing browser coverage uses a broad potentially multi-match selector and does not verify posting, replay, moderation, or load. No full-stack runtime, build, or benchmark was run.
+- Diagram follow-up (2026-09-12): Added independent video delivery, pending-post acceptance, bounded comment rendering and replaceable reaction totals. Backend/fullstack show the stream writer/SQL/outbox, selected-feed fan-out to every interested gateway, visibility-aware replay and a separate reaction input path. Existing frontend prose is unchanged outside the overview and its added walkthrough, verified against the committed source-review checkpoint. Current lengths are 386/413/416 lines. Local links, 28 closed diagram rectangles, 45-minute pacing, three deep dives, fence restrictions, structural scan and whitespace checks pass. This pass changed the interview documents only.
 
 ### fb-news-feed
 
@@ -496,6 +761,7 @@ Reviewed all five documents against the Express entry point, feed/ranking/fan-ou
 - Recorded actual bearer-session storage, unclamped cache refill lifetime, partial logout, incomplete Friends enforcement on hydration/detail/comments/likes, and stale follow-cache behavior. Distinguished partial idempotency caching and independent engagement writes from transactions. Explained same-database breaker fallback, dependency readiness gaps, unused metrics, and absent rate limits/shutdown/socket recovery.
 - Interview answers each provide a 45-minute proposal with three substantive deep dives. The shared design uses bounded hybrid fan-out, durable receipts/outbox, a short-lived fixed ranked order with current permission checks, and desired-state/versioned optimistic reconciliation. Frontend/full-stack discussions address normalized home/profile entities, account/request generations, bounded pages and media, draft revisions, stable measurement keys, anchors, and accessible virtualization. No implementation code or SQL appears in the interview answers.
 - Eight isolated checks executing source with mocked dependencies confirmed the key ranking/cursor/privacy, premature-exhaustion, session-TTL, profile-like/late-rollback, reset-overwrite, and pipeline/author-cache findings. Final interview lengths: frontend 363, backend 366, fullstack 379 lines. Verified 26 relative links/anchors, 20 diagram boxes, seven shell examples, exact embedded SQL, pacing, structural scan, and whitespace. No application code changed; builds, full-stack tests, and load benchmarks were not run. The smoke helper's unseeded Alice account remains documented rather than repaired outside scope.
+- Diagram follow-up (2026-09-12): Connected pushed candidate IDs and pulled author timelines to merged ranking, stable reading sessions and current canonical hydration. Frontend/fullstack separate ordered pages, normalized entities, per-action recovery, explicit refresh hints and bounded media delivery. Existing frontend prose is unchanged outside the overview and added walkthrough, verified against the committed source-review checkpoint. Current lengths are 387/396/410 lines. Local links, 31 closed diagram rectangles, 45-minute pacing, three deep dives, fence restrictions, structural scan and whitespace checks pass. This pass changed the interview documents only.
 
 ### fb-post-search
 
@@ -506,7 +772,7 @@ Reviewed all five documents against every backend service/controller/route, conf
 - Traced raw-HTML snippet rendering, unfiltered/mismatched hashtag aggregation, authentication/limit-blind suggestion caches, global cumulative query trends, invalid recent-search SQL, NaN parameter defaults, filter drafts sharing pagination state, stale responses/account retention, missing debounce/virtualization/URL state, and admin health schema mismatch. The production design covers authoritative bounded hydration, current privacy despite PITs, versioned outbox/tombstones, safe snippets, scoped suggestions, query generations, and bounded navigation state.
 - Rewrote all three interview answers as 45-minute conversations with three deep trade-offs each. Replaced implementation/configuration catalogs and seven shallow frontend dives with concrete decisions and failure examples. Kept API/data contracts concise and distinguished proposed features from the demo; corrected cursor stability, cached privacy, reindex ordering, aggregate disclosure, and retry/idempotency reasoning.
 - Ten isolated source checks passed, covering query/snippet/total behavior, suggestion scoping/prefix bugs, bulk/delete failure handling, SQL/index split outcomes and private likes, request/filter races, NaN defaults, fixture hashes/cached roles, actual breaker recovery starvation, and ignored timeout cancellation. No browser payload or live service was exercised. Final interview lengths: frontend 377, backend 363, fullstack 372 lines. Checked 33 relative links/anchors, 15 diagram boxes, eight shell examples, exact embedded SQL, 45-minute pacing, structural scan, and whitespace. Only the five Markdown documents changed under this project; builds/full-stack tests/load benchmarks were not run. Smoke/screenshot authorization/setup gaps remain documented, not repaired outside scope.
-
+- Diagram follow-up (2026-09-12): Expanded draft suggestions, committed route intent, request/session coordination and query-scoped safe result rendering. Backend/fullstack now draw the current source validation step explicitly between index candidates and returned snippets, alongside transactional source/outbox changes and versioned index repair. Stable continuation remains separate from current permission and content-revision checks. Current lengths are 402/389/404 lines. Local links, 26 closed diagram rectangles, 45-minute pacing, three deep dives, fence restrictions, structural scan and whitespace checks pass. This pass changed the interview documents only.
 
 ## figma
 
@@ -518,6 +784,7 @@ Reviewed all five documents, project history, backend/frontend services and comp
 - **Operational accuracy:** exact nine-table/17-index SQL replaces the incomplete schema. Only the sync Opossum circuit is active; PG/Redis circuits and transaction helper are unwired. Retry loops continue even on non-retryable errors. Metrics do not measure peer delivery, health does not validate editing, shutdown does not drain collaboration, and per-process cleanup has no replay watermarks or autosave producer. Current access/deletion gaps are distinguished from proposed authorization.
 - **Interview design:** each role now has 45-minute pacing, three substantial trade-offs, small diagrams, concise schema/API tables, and no implementation code. The common proposal uses local gesture previews, a fenced file owner, atomic durable receipts, canonical reconciliation, snapshot/stream barriers, conditional inverse undo, and ordered restore generations. It acknowledges offline, renderer, accessibility, retention, and hot-file costs without promising a universal CRDT.
 - **Verification:** 11 isolated source checks passed with mocked dependencies; no application data/services changed. Covered concurrent lost writes, ignored timestamps, omitted idempotency/zero values, duplicate creates, history errors, identity/schema mismatch, in-progress claims, retries, seed visibility, nested mutation, and soft-delete reads. Checked 31 relative links/anchors, 26 rectangular boxes, seven shell examples, exact SQL, interview pacing, structural audit, and whitespace. Interviews are 387/387/427 lines; no full-stack, build, or performance run was claimed.
+- Diagram follow-up (2026-09-12): Connected tools, normalized scene state, displayed previews, retained rendering, sync/undo and presence in the frontend. Backend/fullstack now explicitly connect the file owner to atomic log/receipt storage, canonical gateway delivery and snapshot workers; verified snapshots also feed owner recovery. The disconnected-row explanation was updated to match the new topology. Walkthroughs preserve semantic property/tree edits and ordered undo/restore. Current lengths are 427/415/466 lines. Local links, 32 closed diagram rectangles, 45-minute pacing, three deep dives, fence restrictions, structural scan and whitespace checks pass. This pass changed the interview documents only.
 
 ### gallery
 
@@ -528,6 +795,7 @@ Reviewed all five documents, project history, all frontend source and configurat
 - The production proposal covers finite responsive variants, orientation and dimensions, immutable verified input versions, quota reservations, durable upload receipts/outbox, bounded decoding, generation-guarded publication and deletion, and authorization before private-media cache hits. Explicitly separates upload completion from processing readiness and distinguishes revocable media from permanently public immutable caching. The six-table schema is labeled proposed, not implemented.
 - Rewrote three interview answers as 45-minute conversations with three deep trade-offs each. They address image cost, ordered navigation and stable viewport/focus, upload publication and recovery, and privacy/cache boundaries with small drawable diagrams. Consulted primary Picsum, React, MDN, and WAI-ARIA documentation for the relevant claims.
 - Six isolated checks executing actual source with mocked dependencies passed, confirming image/count behavior, missing dimensions/lazy-loading differences, shared key events, body overflow cleanup, and the TypeScript project-reference issue. Final interview lengths: frontend 384, backend 381, fullstack 400 lines. Verified 35 relative links/anchors, 26 diagram boxes, two shell examples, pacing, structural scan, and whitespace. No application build, browser flow, external-image availability test, or backend schema execution was claimed.
+- Diagram follow-up (2026-09-12): Connected collection metadata, shared layouts, viewer/focus control and per-image resource ownership in the frontend. Backend/fullstack now show scoped direct staging, durable processing jobs, verified output publication and delivery authorization before CDN cache access. Walkthroughs separate upload progress, ready metadata and decoded pixels, and obsolete disconnected-row descriptions now match the diagrams. Current lengths are 416/408/440 lines. Local links, 29 closed diagram rectangles, 45-minute pacing, three deep dives, fence restrictions, structural scan and whitespace checks pass. This pass changed the interview documents only.
 
 ### github
 
@@ -539,6 +807,7 @@ Reviewed all five documents, project history, every backend/frontend route and s
 - Corrected search indexing/highlight/size-limit claims, full-file rendering and first-line-only syntax highlighting, patch-row numbering, missing pagination and request/account guards, post-response star updates, stale sessions, unused helpers/metrics, and breaker timeouts that do not cancel work. Probes and shutdown are described according to their actual dependency and drain behavior.
 - Rewrote all three interview answers as 45-minute conversations with three substantial deep dives. Each balances concrete API/data contracts with drawable diagrams and role-specific reasoning about review identity, merge recovery, search privacy, bounded rendering, and optimistic reconciliation; no implementation code appears in them.
 - Nine isolated source checks passed with mocked dependencies, covering cache invalidation, duplicate/replayed requests, private reads, route ordering, search documents, renderer behavior, route composition, merge/path handling, and breaker timeout behavior. Verified 41 relative links/anchors, 17 diagram boxes, seven shell examples, exact SQL, pacing, structural scan, and whitespace. Interviews are 391/446/447 lines. No full-stack, build, real Git workflow, or performance test was claimed.
+- Diagram follow-up (2026-09-12): Replaced the three overviews with connected repository browsing, review and publication flows. The frontend carries immutable commit/comparison identity and pending operations through authorized APIs. Backend and fullstack distinguish Git publication from SQL collaboration state, with durable receipts, reconciliation and versioned search projections. Current lengths are 420/471/483 lines. Local links, 30 closed diagram rectangles, 45-minute pacing, three deep dives, fence restrictions, structural scan and whitespace checks pass. This pass changed the interview documents only.
 
 ### gmail
 
@@ -550,3 +819,85 @@ Reviewed all five documents, project history, every backend route/service and th
 - Checked search operator semantics, BCC exclusion from searchable recipient fields, discarded total-hit relation, absent current-state hydration, and timestamp-only indexer recovery. Installed pg/ioredis conversions turn Date checkpoints into strings without fractional seconds; a mocked 101-message batch repeats the first 100. Equal timestamps and late commits also undermine watermark completeness. Worker metrics are process-local without a scrape endpoint, and declared breaker/DB metrics lack active producers.
 - Rewrote frontend/backend/full-stack interviews as spoken 45-minute proposals with three substantial deep dives each, small diagrams, bounded contracts, and no implementation code. Removed invented Gmail capacity facts and incorrect claims that JSONB cannot be indexed or PostgreSQL cannot perform private full-text search. Primary PostgreSQL and Elastic documentation supports the relevant technical corrections.
 - Six isolated source checks with mocked dependencies passed, covering literal cache deletion, archive filtering, send duplicates/unknown recipients/post-commit failures, draft version conflicts, checkpoint precision/BCC fields, unsanitized search/degraded results, and stale client responses/detail reconciliation. Verified 34 relative links/anchors, 17 diagram boxes, seven shell examples, exact SQL, structural scan, and whitespace. Interview lengths are 386/411/450 lines. No application build, live datastore mutation, browser flow, or performance run was claimed.
+- Diagram follow-up (2026-09-12): Added connected role-specific overviews showing persistent draft ownership, account-scoped reads, identified save/send operations, local sender acceptance and independently committed recipient delivery. Search is a versioned per-mailbox projection checked against current entitlement; saved, accepted, delivered and searchable remain distinct states. Current lengths are 425/439/487 lines. Local links, 27 closed diagram rectangles, 45-minute pacing, three deep dives, fence restrictions, structural scan and whitespace checks pass. This pass changed the interview documents only.
+
+### google-calendar
+
+Reviewed all five documents against all backend routes, auth/pool configuration, exact SQL and seed, frontend views/editor/stores/date helpers/API, package scripts, Compose, project history, and smoke/screenshot configuration. Rewrote the five requested documents and kept application behavior unchanged.
+
+- README now distinguishes UI features from API-only account/calendar management, PostgreSQL sessions from unused Valkey, and actual overlap responses from the immediately hidden editor warning. Added native PostgreSQL setup, explicit environment loading, fresh-seed caveats, valid build/typecheck commands, and the limits of the existing smoke tests.
+- Architecture reproduces the exact four-table/three-index schema and separates a proposed versioned, retry-safe service from the local sequential SQL calls. Corrected recurrence/sharing claims, index-use claims, session cleanup/retry claims, unsupported observability patterns, and capacity arithmetic. Update can commit before a failing advisory lookup returns 500; registration and seed can leave partial state.
+- Traced timezone-less form writes interpreted independently by browser, Node, and PostgreSQL; unused user zone preferences; inclusive midnight membership; overstated overnight height; fixed 1,440-minute DST positioning; missing all-day lanes; full-width overlaps; clicked-hour reset; stale range responses; nullable edit-field behavior; and editor/account lifecycle gaps. These remain documented source limitations, not fixes hidden in a documentation task.
+- Rewrote all three interviews as 45-minute proposals with three substantive deep dives. Following the user's diagram steering and the GreatFrontEnd RADIO guide, each starts with a connected role-specific high-level overview, labeled data/command paths, ownership boundaries, and a verbal journey. Frontend emphasizes browser state/layout/data access; backend shows authoritative writes and optional cache/outbox work; fullstack connects the visible interaction to persistence and reconciliation.
+- Six isolated checks against actual source with mocked dependencies passed, covering month/date mutation, midnight/overnight/DST geometry, modal defaults/naive time/warning closure, post-update advisory failure, partial seed assumptions, and installed session expiry/pruning. Verified 34 relative links/anchors, 35 diagram boxes, six shell examples, exact SQL, pacing, structural scan, and whitespace. Interview lengths are 416/450/464 lines. No live database, application build, browser rendering, or full-stack runtime test was claimed.
+
+### google-docs
+
+Reviewed all five documents, project history, backend entry point/routes/collaboration modules/transform helpers/auth/receipts/metrics/breakers, frontend editor/page/stores/API/WebSocket/review components, exact SQL and seed, configuration, package scripts, and smoke tests. Rewrote only the five requested project documents.
+
+- **Actual editing boundary:** the TipTap update callback sends no edit, DocumentPage ignores incoming operations and SYNC content/version, and REST PATCH changes only title. The browser therefore does not save/synchronize typed body content. Presence names are displayed, but no remote caret overlay, anchored review UI, suggestion application, or durable offline queue is wired. This contradicts some project-history completion claims, which were left unchanged as historical notes.
+- **Backend correctness:** live state contains no edited body; the one-second inactivity debounce retains only the last operation and updates SQL version without applying content. Absolute-version slicing of a relative/truncated log has no base offset. Redis messages only forward to peers. Optional receipt caching is not atomic with SQL; concurrent duplicate WebSocket attempts both advance state. Subscription checks read access, but operations do not check edit capability/revocation/deletion. Recorded auxiliary-route soft-delete gaps and user-keyed multi-tab presence limits.
+- **History/setup:** restore reads only exact snapshots, performs separate writes, bypasses the live owner, and concatenates the default pg BIGINT string (`5` becomes `51`). Corrected Docker schema versus separate seed initialization, native schema path/role setup, Node >=20, actual Valkey stack, absence of dotenv/migration scripts, 3001 dev versus 3000 start defaults, five seed accounts, and missing admin features. Confirmed frontend lint fails at argument parsing because `--ext` is unsupported with its flat config.
+- **Architecture:** separated a complete proposed schema-aware centralized step-rebase service from the current custom OT scaffolding. Documented fenced admission, immutable attempt outcomes, contiguous durable replay, verified snapshots, current grants, mapped anchors, and guarded restore. Included the exact local eight-table/nine-index SQL and source links for the actual partial RBAC/receipt/breaker/metrics/auth paths.
+- **Interview diagrams and pacing:** early connected frontend, backend, and fullstack overviews show local editor ownership, identified attempts, durable admission, replay/snapshot paths, and disposable presence, with short walkthroughs. Answers are 404/392/425 lines, three dives and 45 minutes each; no implementation code. Removed the prior mixture of Yjs/custom OT and API/type-definition catalogs.
+- **Verification:** eight isolated actual-source checks passed for no-op editor updates, ignored content messages, symmetric transform divergence, log-offset/admission behavior, duplicate attempts, last-only debounce/no content update, BIGINT restore, and the seed bcrypt hash. Dependencies were mocked for behavior checks; no app/database/browser was started. All 53 relative links/anchors, 40 diagram rectangles, five shell examples, exact SQL, interview structure, repository structural scan, and whitespace checks pass. Consulted primary ProseMirror collaboration, node-pg-types, and Redis pub/sub references for protocol/driver/delivery semantics.
+
+
+### google-search
+
+Reviewed all five documents against backend entry point/routes, crawler/frontier, indexer, PageRank, Elasticsearch mappings/query builder, PostgreSQL/Valkey models, shared rate/idempotency/breaker/health/logging/metrics modules, frontend routes/components/store/autocomplete/API, exact schema and seed, scripts/environment/Compose, project history, and smoke/screenshot configuration. Rewrote only the five requested project documents.
+
+- **README/setup:** replaced distributed-production completion claims with actual local capabilities and limits; added Docker and native PostgreSQL/Valkey plus pinned Elasticsearch archive setup. Documented that seed writes ten `completed` pages while indexing selects `crawled`, and that explicit seed IDs leave sequences unaligned. Added a narrow fresh-demo data preparation step, corrected ports and CLI/admin build differences, and removed nonexistent `npm test` claims. Build/runtime commands are documented, not claimed as executed.
+- **Crawling:** source and isolated checks confirm unsigned hash overflow (`https://example.com/1` → `17508157248070013214`), missing unique constraint for document upsert, separate frontier selection/update, no leased recovery, early exit on delayed hosts, robots scheme/port/cache/error gaps, absent egress/byte limits, and lost graph edges to existing targets. No production crawler fixes were made in this documentation task.
+- **Index/search:** documented first-1,000-character receipt hashes omitting other indexed fields/generations, successful whole-batch receipts after individual Elasticsearch failures, no deletion/publication pipeline, full in-memory graph computation and separate SQL/ES rank commits. Replaced imaginary weighted/CTR/two-stage ranking with actual multiplicative factors and zero-score behavior. Corrected post-pagination site/exclusion filtering, flattened phrases, invalid related-query SQL, incomplete cache identities, cache-hit analytics omissions, and Redis/ES fallback overclaims.
+- **UI/operations:** documented stale search/suggestion responses, duplicate Enter submission risk, missing composition/combobox support, unsafe snippet/title HTML, unguarded localStorage, unavailable offline/prefetch/virtualization features, unauthenticated admin actions, non-durable job acknowledgments, unused general breakers, time-limited locks without ownership/renewal, spoofable endpoint rate-limit keys, probe false readiness, and incomplete metrics wiring.
+- **Architecture and interviews:** proposed bounded document-sharded search, origin-aware leased crawling, versioned content, per-item indexing checks, validated corpus publication, bounded stable result windows, safe excerpts, and current-request browser guards. Architecture includes the exact six-table/ten-secondary-index local SQL. Three connected role-specific overview diagrams and walkthroughs address the user's RADIO/whiteboard steering. Interviews are 409/405/418 lines, three substantive deep dives and 45 minutes each, with no implementation code.
+- **Verification:** eight isolated actual-source checks passed for hash range, missing upsert constraint, seed/index eligibility, cache page-size collision, post-page filtering/counts, related-query SQL, incomplete index receipt hash, and missing existing-target graph edges. Validated 44 local links/anchors, 54 closed diagram rectangles, seven shell examples, exact SQL, structural scan, and whitespace. No live services, crawler requests, application build, browser run, or performance measurement. Consulted primary Elastic installation/shard-routing/pagination, PostgreSQL numeric/conflict, RFC 9309, and WAI-ARIA combobox references.
+
+
+### google-sheets
+
+Reviewed all five documents against every backend API/WebSocket handler, shared database/cache/receipt/breaker/metrics/logging modules, the full frontend store and components, exact SQL, migration/seed scripts, package and Vite/Compose configuration, project history, and smoke/screenshot setup. Rewrote only the five requested project documents.
+
+- **README/setup:** corrected migration/seed defaults (`postgres:postgres`) versus runtime/Compose (`sheets:sheets123`), separate runtime `PG*` settings, absence of dotenv, and development versus compiled-server ports. Added Docker and native PostgreSQL/Valkey instructions and first-sheet-only seed navigation. Distinguished working cell editing/cursors from absent sheet tabs, formatting/resize controls, undo, export UI, and accounts. Formatting scripts were checked and are valid recursive globs.
+- **Edit correctness:** isolated source execution reproduces SQL order A/B with broadcast order B/A when A waits on cache work. Optional Redis receipts have no atomic claim or transaction with SQL, actor/payload binding, or browser request IDs. Incoming arbitrary sheet IDs are not checked against the joined workbook. REST cell writes bypass formula evaluation and live publication; creation and sheet-index allocation have separate-statement races.
+- **Browser/collaboration:** documented socket-open before synchronization, ignored ACK/errors and incoming sheet IDs, no reconnect/pending journal, stale socket cleanup, format loss, whole-Map updates, first-sheet full loading, inline editor lifetime, missing accessible grid/IME handling, unbounded keyboard movement, and memoized style changes. Drag selection stays local, resize/rename handlers lack complete UI paths, and Redis publication has no subscriber wiring.
+- **Calculation/cache/operations:** literal parser returns 0 for `SUM(A1:A10)`, parses `SUM(1+2,3)` as 4, and yields `Infinity` for arithmetic division by zero. General-expression fallback executes JavaScript on the server; there is no dependency graph or recalculation. Recorded stale/partial cell hash races, missing TTL after expiry-and-HSET, cached orphan cells after deletion, incomplete CSV scope/size/formula-prefix handling, inactive SQL history/session scaffolding, misleading probe/pool/latency metrics, and non-idempotent socket teardown.
+- **Architecture/interviews:** explicit production proposal uses workbook-scoped fenced ordering, atomic raw edits/receipts/history/outbox, immutable checkpoints with retained replay, bounded revisioned formula batches, conditional undo, and a browser confirmed-state/pending-overlay model. Architecture includes exact eight-table/six-secondary-index local SQL. Early connected role-specific diagrams and walkthroughs show frontend ownership, backend authority and recovery, and the end-to-end edit journey. Interviews are 391/384/388 lines with three deep dives and 45 minutes each.
+- **Verification:** 12 isolated actual-source checks passed with mocked infrastructure, confirming formula behavior, duplicate execution, cache TTL gaps, edit/broadcast ordering, missing sheet checks, browser readiness/request-ID/format/ACK/error behavior, cross-sheet updates, old-socket races, and repeated gauge decrement. All 37 relative links/anchors, 45 closed diagram rectangles, six shell examples, exact SQL, interview pacing/fences, structural scan, and whitespace pass. No application build, live database/Redis, browser collaboration run, or production benchmark was performed. Consulted primary WAI-ARIA, PostgreSQL locking, Homebrew, and the user's GreatFrontEnd RADIO guide.
+
+
+### health-data-pipeline
+
+Reviewed all five documents against all backend routes, models, services and shared helpers, frontend routes/stores/components/API, exact schema, seed/generator, environment/package/Compose configuration, project history, and smoke/screenshot setup. Rewrote only the five requested project documents.
+
+- **README/setup:** separated the actual synchronous prototype from device integrations, background processing, sharing, and clinical claims. Corrected Timescale initialization, mutable image tag, composite keys, ignored configuration, actual route/port/scripts, invalid seed UUIDs, generator conflict target, and unpopulated type table. Added Docker and native PostgreSQL/Valkey alternatives; the native schema and seed workarounds use temporary copies and leave source fixtures unchanged. Confirmed the inserted seed password as `password123` and documented actual fixture counts.
+- **Acceptance/aggregation:** documented missing sync device ownership, global explicit receipt keys, incomplete rolling-hash identities, non-atomic cache receipts, partial SQL/aggregation outcomes, invalid unit relabeling, missing interval/finite-value validation, and discarded source-app metadata. Isolated source checks reproduce containing/multiple-overlap errors, duration-scaled heart rates, priority-ordered “latest” values, start-bucket assignment, and narrow-range replacement of complete daily totals.
+- **Queries/insights/auth:** traced mismatched invalidation prefixes, five-minute stale summaries, unbounded/start-only raw queries, unweighted weekly metrics, history field-name mismatch, observation-index trends, partial-period comparisons, generated insight responses missing persisted IDs, and unscheduled retention/sharing scaffolding. Auth uses separately written SQL/Redis Bearer sessions; cache errors and logout deletion failures do not establish graceful fallback or immediate revocation. Removed the unsupported claim that seven-year raw retention is a HIPAA requirement, using the primary HHS FAQ.
+- **Frontend/operations:** recorded fresh-Promise route components, absent account/range response guards, retained health state after logout, shared loading state, misleading gaps/zero displays, missing accessibility/table/mobile-navigation behavior, UI-only versus API-only boundaries, unused metric helpers, shallow readiness, and incomplete dependency shutdown. Browser navigation, builds, and runtime setup were not claimed as verified.
+- **Architecture/interviews:** architecture includes the exact 11-table/14-secondary-index SQL and a separate proposed durable receipt/outbox, source identity registry, metric-specific fusion, complete bucket recomputation, guarded publication, and account-scoped reporting model. Each interview starts with a connected role-specific overview and walkthrough, following the user's diagram steering. Answers are 363/362/391 lines, 45 minutes and three substantive deep dives each, without implementation code.
+- **Verification:** 18 isolated actual-source checks passed with mocked infrastructure (15 backend/fixture, three frontend). Documentation QA passed for 42 relative links/anchors, 39 closed diagram rectangles, six shell examples, exact schema, pacing/fences, repository structural scan, and whitespace. Verified that the temporary native copy removes exactly two hypertable calls and that the seed transformation replaces all seven invalid device UUIDs and references. No SQL recipe, migration, live service, complete build, browser flow, or load test was executed. Consulted primary Timescale Docker initialization, React/TanStack routing, Homebrew, and HHS references.
+
+
+### hotel-booking
+
+Reviewed all five documents against the backend routes, booking lifecycle/availability/receipts/locking, catalog/search/auth/operational helpers, frontend routes/stores/components/API, exact schema, both seeds, scripts/configuration/Compose, project history, and smoke/screenshot setup. Changed only the five requested project documents and this review record.
+
+- **README/setup:** documented the actual guest/owner flows and known search-to-card integration defect. Corrected PostgreSQL credentials and initialization path, ignored DATABASE_URL/SESSION_SECRET settings, port/script behavior, missing setup-es target, and the two distinct seeds. Added Docker and native PostgreSQL/Valkey plus pinned Elasticsearch archive setup. Verified TypeScript seed accounts and SQL fixture password hashes; counted five users, five hotels, seventeen room types, nine bookings, twenty-two overrides, and five reviews in the SQL fixture. SQL fixtures do not index Elasticsearch, and neither seed is a clean reset.
+- **Inventory and lifecycle:** PostgreSQL's room-type row lock before the nightly occupancy query provides cross-API serialization for creation; exact-range Redis leases do not serialize every overlapping stay. Owner capacity reductions omit obligation checks. Pricing uses a second pool connection outside the transaction. The minute-based expiry sweep is present, contrary to old documentation/history, but confirmation does not enforce the hold deadline and only stores a fabricated/unverified payment reference. Cache failures can report failure after SQL has committed.
+- **Receipts, dates, and discovery:** parameter hashes conflate intentions and omit party/contact details; pre-lock lookup races and camelCase-to-snake_case replay corrupt duplicate responses. Availability cache keys omit requested quantity; invalidation misses overlapping ranges and touched months, while owner edits omit invalidation. Actual-source checks reproduce a four-entry price for three nights across Los Angeles spring DST and a shifted Tokyo month boundary. Dated search already filters availability but returns index field names incompatible with cards, uses base prices, and mixes filtered page totals with unfiltered page counts. Index updates have no durable/versioned delivery or review-rating refresh.
+- **Frontend and operations:** preserved the frontend answer's date-picker/query-builder, advisory evidence, and frozen-submit reasoning while correcting its factual claims. Documented missing URL restoration, stale request/room selection, endpoint-only calendar checks, invalid same-day/departure/today handling, absent intent/quote recovery, misleading “Total Paid,” and limited owner tooling. Session cache expiry/revocation, public inactive detail reads, unused circuit breakers, misleading revenue/idempotency metrics, shallow health aggregation, and immediate shutdown are explicitly bounded.
+- **Architecture/interviews:** architecture separates the production proposal from local behavior and reproduces the exact seven-table/fifteen-secondary-index schema. Early connected role-specific diagrams and walkthroughs show browser ownership, advisory discovery, authoritative inventory/receipts, and external payment reconciliation. Interviews are 429/421/441 lines (frontend/backend/fullstack), each 45 minutes with three substantive deep dives and no implementation code.
+- **Verification:** nine isolated actual-source checks passed with mocked dependencies, covering quantity-cache collision, incomplete invalidation, replay shape, incomplete intent identity, DST pricing, month timezone shift, search DTO/counts, confirmation predicate, and TypeScript source inclusion. Fixture hashes/counts were checked separately. All 32 relative links/anchors, 40 diagram rectangles, seven shell examples, exact SQL, pacing/fences, structural scan, and whitespace pass. No live services, browser flow, database concurrency test, full build, or payment integration was run. Consulted primary PostgreSQL 16 locking/isolation and Elastic archive references.
+
+
+### icloud
+
+Reviewed all five documents against the backend entry point, every route and service, shared helpers, authentication, exact schema, both seed layers, frontend routing/state/API/components, package and Compose configuration, Playwright smoke tests, screenshot configuration, and project history.
+
+- **README/setup:** replaced claims of completed bidirectional/offline/resumable sync with the actual online Drive, photo library, and admin flows. Corrected TypeScript paths, Node requirement, environment variables, ports, and history link; supplied Docker/native setup and explicit schema/seed steps. Both seed commands run the photo seeder, which applies base SQL and fetches up to twelve remote images. Drive fixtures have no content manifests, photo fixture metadata is synthetic, and partial photo seeding can prevent subsequent completion. The shared demo hash matches `password123`, not the UI/SQL-comment passwords. Smoke-test identities and admin assumptions differ from seeded data. MinIO's archived/source-only upstream status and Homebrew deprecation are disclosed without claiming image pulls were tested.
+- **Admission and history:** vector comparison works for valid vectors, but writes lack a transaction or conditional revision check. The create-by-path fallback authorizes one row and updates a caller-supplied ID without an owner predicate; stale deletion is accepted. Keep-both copies metadata without a chunk manifest, use-local does not install content, and resolution clears conflicts without conditioning on the reviewed versions. File-version hashes do not make old bytes restorable.
+- **Storage and recovery:** uploads buffer the whole file before server-side chunking. Publication, manifests, reference counts, and quota accounting can diverge; overwrites leak references and storage counters. Assembly checks fetched chunks but not complete manifest length/order/hash. Cleanup races new references and purge lacks device acknowledgements. Timestamp scans are not a durable feed; push can report unapplied items as applied and emits event names the browser does not consume. Optional Redis receipts lack account/payload scope and are not atomically committed with mutations.
+- **Photos/frontend/operations:** documented synchronous derivatives, missing real EXIF parsing, public caching on private media, pre-stream device download flags, album membership/cover-route gaps, and absent photo cleanup. Browser stores are memory-only; request generations, account resets, subscription cleanup, reload/reconnect recovery, stable viewer identity, responsive virtualization, and keyboard/focus semantics remain incomplete. Photo grid virtualization is implemented, but no frame-rate claim is established. Active chunk breakers differ from health's instance; photos bypass them. Cache helpers are unused by routes; health, metrics, shutdown, and session/socket revocation have explicit limits.
+- **Architecture/interviews:** separated the proposed production design from actual behavior and reproduced the exact thirteen-table/sixteen-secondary-index schema. Early connected role-specific diagrams and walkthroughs show client ownership, staging, metadata admission, durable replay, and the photo journey. Answers are 439/476/518 lines (frontend/backend/fullstack), each with a 45-minute outline, three substantive deep dives, and no implementation code. Production proposals cover immutable manifests, payload-bound receipts, commit-ordered feeds, device epochs, safe reclamation, and truthful client acknowledgements without attributing proprietary Apple designs.
+- **Verification:** seven isolated checks executed the current SyncService/ChunkService source with mocked infrastructure: four-way comparison, create-path target mismatch, stale deletion, metadata-only conflict copies, empty assembly, reference leakage after a failed manifest insert, and deletion without a concurrent-reference recheck. Fixture password verification used a calibrated local bcrypt verifier with a compatible prefix for its older implementation; `password123` passed and the advertised alternatives failed. All 39 relative links, 53 closed diagram rectangles, six shell examples, exact SQL, pacing/fences, structural scan, and whitespace checks pass. No live services, browser run, full build, SQL concurrency execution, image pull, or throughput benchmark was performed. Consulted primary PostgreSQL UPDATE semantics, MDN cache guidance, Homebrew/MinIO status, and the user's RADIO guide.

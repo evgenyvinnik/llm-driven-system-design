@@ -55,25 +55,40 @@ One browser, one backend, PostgreSQL, Valkey, and a single Elasticsearch node ar
 Production proposal; Git transport and the browser API share authorization and repository routing:
 
 ```text
-┌────────────────────────────────────┐
-│ Browser / Git CLI                  │
-│ Web API and Git transport          │
-└────────────────────────────────────┘
-                   │
-                   ▼
-┌────────────────────────────────────┐     ┌────────────────────────────────────┐
-│ Gateway + repository/review API    │────▶│ Git storage service                │
-│ Authentication, policy, intents    │     │ Fenced writer, objects, refs       │
-└────────────────────────────────────┘     └────────────────────────────────────┘
-                   │                                          │
-                   ▼                                          ▼
-┌────────────────────────────────────┐     ┌────────────────────────────────────┐
-│ PostgreSQL                         │────▶│ Durable event processing           │
-│ Metadata, receipts, outbox         │     │ Reconciliation, indexing, search   │
-└────────────────────────────────────┘     └────────────────────────────────────┘
+PROPOSED DESIGN — SQL accepts intent; Git durably publishes code
+
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Browser / Git clients    │request/ACK │ API + repo routing       │Git/browse  │ Fenced Git authority     │
+│ Repository + commit      │◀──────────▶│ Current authorization    │◀──────────▶│ Objects; conditional ref │◀────┐
+│ Saved operation ID       │            │ Browse / Git transport   │            │ Publication journal      │     │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘     │
+              ▲                                       ▲                                       ▲                  │
+              │                                       │                                       │                  │
+              │ query / results                       │ command / outcome                     │ publish/receipt  │
+              │                                       │                                       │                  │
+              ▼                                       ▼                                       ▼                  │
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐     │
+│ Authorized search API    │access/read │ Collaboration + SQL      │intent/state│ Merge coordinator        │     │
+│ Query / indexed commit   │◀──────────▶│ PRs / access / receipts  │◀──────────▶│ Fixed head/base/policy   │     │ read/replay
+│ Current access check     │            │ Merge intents + outbox   │            │ Publish / resolve op     │     │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘     │
+              ▲                                       ▲                                                          │
+              │                                       │                                                          │
+              │ query / hits                          │ work / outcome                                           │
+              │                                       │                                                          │
+              ▼                                       ▼                                                          │
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐     │
+│ Search projection        │apply / ACK │ Reconcile/index workers  │event / ACK │ Git event replay         │     │
+│ Commit-bound documents   │◀──────────▶│ SQL + Git outcomes       │◀──────────▶│ Durable ref changes      │◀────┘
+│ Rebuildable index        │            │ Effects and checkpoints  │            │ Resume journal cursor    │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+
+A lost merge reply is resolved by its stored operation receipt, not today's branch tip.
 ```
 
 The storage service maintains replicated Git objects and an authoritative durable command history for ref publication and operation receipts. Filesystem refs are managed behind that boundary. SQL holds collaboration state; a reconciler projects storage results back to pending merge intents. Redis accelerates metadata and content lookup but does not decide access or merge outcomes. CDN delivery of private content must also enforce authorization before a cache hit.
+
+The return paths distinguish three results: SQL accepted an intent, Git published its admitted comparison, and derived views caught up. A retry recovers the same Git operation receipt before SQL closes the intent. Index workers checkpoint only confirmed versioned effects and use retained ref events to catch up after failure. Browser recovery retains bounded account/repository-scoped draft and operation identity under a local-storage policy; it must reauthorize private content and preserve the originally reviewed comparison.
 
 ## Core Components / Request Flows
 

@@ -45,30 +45,59 @@ I would draw the sender and signer experiences separately because their interact
 while sharing a tested document geometry and field-rendering layer.
 
 ```
-┌──────────────────┐     ┌───────────────────┐
-│ Sender workspace │     │ Signer ceremony   │
-│ Draft and stages │     │ Review and action │
-└──────────────────┘     └───────────────────┘
-          │                        │
-          ▼                        ▼
-┌───────────────────────────────────────────┐
-│ Shared viewer and geometry contract       │
-│ PDF page, accessible fields, input panels │
-└───────────────────────────────────────────┘
-                       │
-                       ▼
-             ┌────────────────────┐
-             │ Typed API boundary │
-             │ Auth, revisions,   │
-             │ operation receipts │
-             └────────────────────┘
-                       │
-                       ▼
-             ┌────────────────────┐
-             │ Server authority   │
-             │ State and objects  │
-             └────────────────────┘
+BROWSER — distinct sender/signer state, shared document geometry
+
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Sender workspace         │edit/state  │ Revision + resource data │view/input  │ Signer ceremony          │
+│ Draft / fields / stages  │◀──────────▶│ Scope, geometry, rights  │◀──────────▶│ Review / input / consent │
+│ Local placement preview  │            │ Recorded / ready states  │            │ Pending input in memory  │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+              ▲                                       ▲         ▲                             ▲
+              │                                       │         │                             │
+              │                                       │         │ revision/geometry           │
+              │ file / progress                       │         └───────────────────┐         │ render / input
+              │                                       │ intent / receipt            │         │
+              │                                       │                             │         │
+              ▼                                       ▼                             ▼         ▼
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Upload + preparation     │            │ Action + recovery        │            │ Shared document viewer   │
+│ Byte transfer progress   │            │ Frozen intent / saved ID │            │ Immutable revision       │◀─────┐
+│ Wait for validation      │            │ Receipt / unknown result │            │ Accessible field overlay │      │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘      │
+              ▲                                       ▲                                       ▲                   │
+              │                                       │                                       │                   │
+              │ upload / processing                   │                                       │                   │
+              └─────────────────────────────────┐     │ action / outcome                      │ grant / PDF bytes │
+                                                │     │                                       │                   │
+                                                ▼     ▼                                       ▼                   │
+                                        ┌──────────────────────────┐            ┌──────────────────────────┐      │
+                                        │ Envelope API — server    │grant/meta  │ Private byte gateway     │      │
+                                        │ Live scope / stage guard │◀──────────▶│ Scoped version access    │      │
+                                        │ Commit / recover receipt │            │ Staging + immutable PDFs │      │
+                                        └──────────────────────────┘            └──────────────────────────┘      │
+                                                                                                                  │
+                                                                                parse task / result               │
+                                                                                                                  │
+Saved recovery IDs do not authorize a signature.                                ┌──────────────────────────┐      │
+Retain sensitive input only under an explicit policy.                           │ Browser PDF worker       │      │
+                                                                                │ Bound parsing + render   │◀─────┘
+                                                                                │ Revision / task identity │
+                                                                                └──────────────────────────┘
 ```
+
+I would trace a sender's field placement and a signer's completed field through the
+same page geometry, while keeping their permissions and interaction state separate.
+The viewer loads the authorized immutable document revision. Submission captures that
+revision and one operation identity; the receipt updates recorded state without losing
+newer input. A finished signing action and a ready final download have separate UI states.
+
+I would explain a reload or timeout using the separate return paths:
+
+1. Byte-transfer completion leads to processing status; only a validated immutable revision can enter the ceremony.
+2. Viewer/worker tasks carry revision and task identity so an older render cannot replace the newly selected page.
+3. Retain an opaque operation reference under the applicable storage policy; keep signature input in memory unless persistence is explicitly allowed.
+4. After reauthentication, resolve that operation before offering a new action. If unrecorded input was lost, ask for review and input again; a receipt is not permission to sign another revision.
+5. Fetch artifact status separately and obtain a grant for the exact ready object before enabling its download.
 
 The signer route should load its viewer and input controls without requiring the full
 preparation editor. I would measure the generated bundle before asserting that route files

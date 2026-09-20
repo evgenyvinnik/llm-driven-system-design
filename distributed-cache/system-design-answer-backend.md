@@ -70,22 +70,47 @@ capacity assumptions.
 ## 🏗️ Architecture, data model, and API — 6 minutes
 
 ```
-┌────────────────────────┐       ┌──────────────────────┐
-│ Application services   │──────▶│ Durable origin       │
-│ Refill + freshness     │       │ Application-owned    │
-└────────────────────────┘       └──────────────────────┘
-             │ cache operations
-             ▼
-┌────────────────────────┐       ┌──────────────────────┐
-│ Regional router pool   │◀──────│ Membership authority │
-│ Admission + deadlines  │       │ Placement versions   │
-└────────────────────────┘       └──────────────────────┘
-             │ current owner and generation
-             ▼
-┌──────────────────────────────────────────────────────┐
-│ Cache nodes: bounded memory, LRU, TTL, fencing       │
-└──────────────────────────────────────────────────────┘
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Application services   │op/ACK │ Regional router pool   │watch  │ Membership authority   │
+│ Cache-aside refill     │◀─────▶│ Admission / deadlines  │◀─────▶│ Durable placement/ops  │
+│ Freshness / refill cap │       │ Route accepted version │       │ One current owner/key  │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+             ▲                                ▲                                ▲
+             │                                │                                │
+miss/refill  │                                │ key / reply                    │ commit / recover
+             │                                │                                │
+             ▼                                ▼                                ▼
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Durable origin         │       │ Placement + routing    │fence  │ Transition controller  │
+│ Application-owned data │       │ Key -> owner/version   │◀─────▶│ Fence, resume, switch  │
+│ Bounded refill access  │       │ Send owner generation  │       │ Health is evidence     │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+                                              ▲
+                                              │ op / outcome
+             ┌────────────────────────────────┼────────────────────────────────┐
+             │                                │                                │
+             ▼                                ▼                                ▼
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Cache node A           │       │ Cache node B           │       │ Cache node C           │
+│ Bounded memory         │       │ Bounded memory         │       │ Bounded memory         │
+│ Epoch check; LRU/TTL   │       │ Epoch check; LRU/TTL   │       │ Epoch check; LRU/TTL   │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+
+The router selects one node per key. These nodes are partitions, not three durable replicas.
 ```
+
+I would trace a key through the router's accepted placement version to exactly one
+current owner. A miss returns to the application, which budgets the origin read and
+refill; the cache does not own the durable value. The control path changes placement
+through an explicit transition and fences obsolete owners. More nodes distribute keys,
+while TTL, eviction and per-node memory limits still allow cached entries to disappear.
+
+I would use an owner failure to walk the control arrows:
+
+1. Recover the recorded transition and current placement from durable control metadata; a probe timeout alone cannot appoint an owner.
+2. Fence the old generation at nodes before publishing the next one, or wait for an enforceable lease to expire.
+3. Routers refresh placement and retry only operations whose semantics permit it; a node still rejects stale-generation requests.
+4. Cold owners refill through the application's bounded origin path. Recovery can temporarily lower hit rate without weakening the ownership rule.
 
 I would initially route through a small pool of proxies. That gives heterogeneous clients
 one place for deadline handling, authorization, and routing. The cost is another network

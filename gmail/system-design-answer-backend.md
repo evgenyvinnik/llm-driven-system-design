@@ -66,14 +66,49 @@ boundaries as ownership moves to shards.
 ## 🏗️ Draw ownership and the asynchronous path — 4 minutes
 
 ```
-┌─────────────────────────┐       ┌──────────────────────────────┐
-│ Authenticated mail API  │──────▶│ Message authority + outbox   │
-└─────────────────────────┘       └──────────────┬───────────────┘
-                                                 │
-┌─────────────────────────┐       ┌──────────────▼───────────────┐
-│ Mailbox + search views  │◀──────│ Delivery / indexing workers  │
-└─────────────────────────┘       └──────────────────────────────┘
+PROPOSED INTERNAL MAIL — acceptance and each mailbox delivery commit separately
+
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Internal mail clients    │HTTP/result │ Authenticated mail API   │accept/read │ Sender authority + SQL   │
+│ Read / organize / send   │◀──────────▶│ Account / owner routing  │◀──────────▶│ Draft / body / audience  │
+│ Saved operation IDs      │            │ Read / save / send       │            │ Send receipt + outbox    │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+              ▲                                       ▲                                       ▲
+              │                                       │                                       │
+              │ query / results                       │ read / mailbox state                  │ work / delivery status
+              │                                       │                                       │
+              ▼                                       ▼                                       ▼
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Authorized search API    │access/read │ Mailbox authority + SQL  │commit / ACK│ Recipient delivery       │
+│ Current entitlement      │◀──────────▶│ Effect + receipt commit  │◀──────────▶│ User/message identity    │
+│ Safe viewer snippets     │            │ Viewer state + outbox    │            │ Delivery outcome / retry │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+              ▲                                       ▲
+              │                                       │
+              │ query / candidates                    │ changes / progress
+              │                                       │
+              ▼                                       ▼
+┌──────────────────────────┐            ┌──────────────────────────┐
+│ Per-mailbox index        │apply / ACK │ Indexing workers         │
+│ Viewer-scoped fields     │◀──────────▶│ Replay mailbox changes   │
+│ Versioned / rebuildable  │            │ Upserts + tombstones     │
+└──────────────────────────┘            └──────────────────────────┘
+
+An index outage delays discovery; it neither undoes acceptance nor authorizes hidden mail.
 ```
+
+I would start with the sender's local transaction: draft finalization, immutable content,
+audience, receipt and delivery outbox. Recipient workers then commit one mailbox effect
+per user/message identity. Mailbox changes feed the versioned search projection, while
+search still checks current entitlement before returning text. The arrows between
+sender and recipient partitions represent recoverable work, not one cross-shard transaction.
+
+I would trace one delivery retry to make those boundaries concrete:
+
+1. A lost send response resolves to the sender's existing acceptance receipt; its frozen audience and content remain unchanged.
+2. The delivery worker retries the same user/message identity. The recipient commits the mailbox effect, unread contribution, and processed receipt together.
+3. Only that outcome advances delivery progress. Retrying after a lost worker acknowledgement does not add another entry or unread increment.
+4. Index workers confirm versioned effects before checkpointing, while every search response still checks current message entitlement. Search progress is not delivery progress.
 
 The API establishes account identity and routes requests to the correct authority.
 Message acceptance stores immutable content, audience, and a durable receipt together.

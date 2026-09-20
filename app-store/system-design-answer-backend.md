@@ -67,32 +67,49 @@ API deployment. Separate services become useful when traffic, ownership, or fail
 isolation justifies the operational cost.
 
 ```
-┌──────────────────────────┐      ┌────────────────────────────┐
-│ Browser / installer      │─────▶│ CDN + object storage       │
-└────────────┬─────────────┘      │ Approved artifact bytes    │
-             │                    └────────────────────────────┘
-             │
-             │
-             ▼
-┌──────────────────────────────────────────────────────────────┐
-│ API: catalog, reviews, publishing, download access           │
-└────────────┬───────────────────────────────────┬─────────────┘
-             │                                   │
-             │                                   │
-             │                                   │
-             ▼                                   ▼
-┌──────────────────────────┐      ┌────────────────────────────┐
-│ Search + read cache      │      │ PostgreSQL                 │
-│ Derived public views     │      │ Authority + outbox         │
-└──────────────────────────┘      └──────────────┬─────────────┘
-             ▲                                   │
-             │                                   │
-             │                                   ▼
-             │                    ┌────────────────────────────┐
-             └────────────────────┤ Relay + queue + workers    │
-                                  │ Indexing / moderation      │
-                                  └────────────────────────────┘
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Browser / installer    │HTTP   │ Marketplace API        │query  │ Search + public cache  │
+│ Discovery and access   │◀─────▶│ Catalog / review / pub │◀─────▶│ Versioned candidates   │
+│ Developer uploads      │       │ Auth + access grants   │       │ Never grants access    │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+             ▲                                ▲                                ▲
+             │                                │                                │
+grant + bytes│                   read / commit│                   index updates│
+             │                                │                                │
+             ▼                                ▼                                │
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Object storage + CDN   │       │ PostgreSQL authority   │work   │ Relay + workers        │
+│ Staged / release bytes │       │ Approved release pair  │◀─────▶│ Index / moderate       │
+│ Upload / range reads   │       │ Reviews, ops, outbox   │       │ Fence stale revisions  │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+             ▲                                                                 ▲
+             │                                                                 │
+             │  object bytes     scan / review a fixed revision                │
+             │                                                                 │
+             │                                                                 ▼
+             │                                                    ┌────────────────────────┐
+             │                                                    │ Artifact validation    │
+             └───────────────────────────────────────────────────▶│ Verify uploaded digest │
+                                                                  │ Approval input         │
+                                                                  └────────────────────────┘
+
+Publication commits the approved metadata/artifact pair and an outbox event.
+
+Access checks current release eligibility before issuing a short-lived grant.
 ```
+
+The API separates discovery from authority: search returns candidates, while the
+database decides the current public revision and eligibility for an access grant.
+Developers upload bytes directly, then validation binds approval to a fixed digest
+and metadata revision. Publication commits that pair with outbox work. Workers can
+update projections or apply revision-checked moderation results without allowing an
+old event to restore withdrawn content or change the approved bytes.
+
+The validation arrow is a storage read of the staged object identified by its digest,
+not permission to serve arbitrary uploaded bytes. The resulting decision returns
+through revision-aware work to the authority. After a crash, the worker can repeat
+that check, while publication and access still use the approved immutable pair and
+current release eligibility. Delayed index updates cannot authorize a download.
 
 PostgreSQL owns accounts, app revisions, release state, reviews, and mutation
 results. Elasticsearch serves text retrieval; Redis caches public reads and holds

@@ -53,19 +53,54 @@ selected-candidate measurements.
 > independently decide who won a call.”
 
 ```
-┌──────────────────────┐     ┌──────────────────────┐
-│ Device connections   │────▶│ Authenticated gateway│
-└──────────────────────┘     └──────────┬───────────┘
-                                        ▼
-┌──────────────────────┐     ┌──────────────────────┐
-│ Presence / routing   │◀────│ Call authority       │
-└──────────────────────┘     └──────────┬───────────┘
-                                        ▼
-                             ┌──────────────────────┐
-                             │ PostgreSQL + outbox  │
-                             │ Claims and receipts  │
-                             └──────────────────────┘
+   ┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+   │ Caller device          │       │ Device gateway fleet   │       │ Call authority         │
+┌─▶│ Call control + media   │◀─────▶│ Auth / live routes     │◀─────▶│ Invitation / busy slot │
+│  │ Endpoint / saved op ID │       │ Call commands + events │       │ One winning device     │
+│  └────────────────────────┘       │ SDP / ICE / leases     │       └────────────────────────┘
+│               ▲                   │                        │                    ▲
+│               │                   │                        │                    │
+│               ▼                   │                        │                    ▼
+│  ┌────────────────────────┐       │                        │       ┌────────────────────────┐
+│  │ TURN relay             │       │                        │       │ PostgreSQL authority   │
+│  │ Selected ICE relay     │       │                        │       │ Call/claims/receipts   │
+│  │ Encrypted media        │       │                        │       │ Revision + outbox      │
+│  └────────────────────────┘       │                        │       └────────────────────────┘
+│               ▲                   │                        │                    ▲
+│               │                   │                        │                    │
+│               ▼                   │                        │                    ▼
+│  ┌────────────────────────┐       │                        │       ┌────────────────────────┐
+│  │ Callee endpoint        │       │                        │       │ Outbox + delivery      │
+└─▶│ Winning device only    │◀─────▶│                        │◀─────▶│ Retained call events   │
+   │ One accepted endpoint  │       │                        │       │ Deadline / resume      │
+   └────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+                                                 ▲                                ▲
+                                                 │                                │
+                                                 │ lease / renew                  │
+                                                 ▼                                │
+                                    ┌────────────────────────┐                    │
+                                    │ Connection leases      │ route / result     │
+                                    │ Device / gateway route │◀───────────────────┘
+                                    │ Independent expiry     │
+                                    └────────────────────────┘
+
+Outer left path: direct peer media. The TURN path is used only when ICE selects a relay.
+
+Call control stays in gateways and SQL; group SFU topology is a separate extension.
 ```
+
+I would trace a call command through a device gateway to the transactional authority,
+then deliver its committed revision back through the gateway fleet to the invited devices.
+Only one accepted endpoint wins the seat. The left side shows the same devices exchanging
+media directly or through TURN; neither path carries the SQL decision. SDP and ICE stay
+on the signaling path, and gateway leases help routing without independently awarding a call.
+
+I would use a gateway restart to follow the control-plane return paths:
+
+1. The device reauthenticates, registers a new connection generation, and resolves its saved command against the durable receipt and current call revision.
+2. Delivery workers look up current connection leases and recheck invitation eligibility/deadlines before retrying an old ring or dismiss event.
+3. Worker delivery progress is separate from acceptance. The same conditional authority decides the winning device and any timeout/end transition.
+4. Losing a route lease does not rewrite a committed seat claim; media health and any disconnect-grace policy are evaluated separately.
 
 The media path is direct between browsers, through TURN as an opaque relay, or through an
 SFU for a group. Signaling carries session descriptions, candidates, and control decisions.

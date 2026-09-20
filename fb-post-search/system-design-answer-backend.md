@@ -38,16 +38,49 @@ measurements or a benchmark of this repository.
 ## 🏗️ Architecture and Records — 5 minutes
 
 ```
-┌────────────────────────────┐       ┌────────────────────────────┐
-│ Search API + auth          │       │ Post / graph authority     │
-│ Rank / current validation  │       │ SQL + receipts + outbox    │
-└─────────────┬──────────────┘       └─────────────┬──────────────┘
-              ▼                                    ▼
-┌────────────────────────────┐       ┌────────────────────────────┐
-│ ES retrieval projection    │◀──────│ Versioned index workers    │
-│ PIT + visibility tokens    │       │ Bulk / retries / repair    │
-└────────────────────────────┘       └────────────────────────────┘
+PROPOSED DESIGN — current authority validates every returned result
+
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Search clients           │HTTP / page │ Search coordinator       │query/hits  │ ES retrieval projection  │
+│ Query / opaque cursor    │◀──────────▶│ Fixed query / rank / PIT │◀──────────▶│ PIT / index generation   │
+│ Viewer-scoped results    │            │ Bound candidate work     │            │ Audience tokens; hits    │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+                                                      ▲                                       ▲
+                                                      │                                       │
+                                                      │ scope / checked hits                  │ bulk / item results
+                                                      │                                       │
+                                                      ▼                                       ▼
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Authors / actors         │            │ Current validator        │            │ Index workers            │
+│ Post / audience / graph  │            │ Viewer scope + revisions │            │ Version / tombstone      │
+│ Saved operation ID       │            │ Only safe text/snippets  │            │ Per-item retry / repair  │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+              ▲                                       ▲                                       ▲
+              │                                       │                                       │
+              │ change / receipt                      │ read / current state                  │ event / progress
+              │                                       │                                       │
+              ▼                                       ▼                                       ▼
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Mutation API             │commit/read │ Canonical SQL authority  │work / ACK  │ Outbox relay             │
+│ Authorize; commit once   │◀──────────▶│ Posts / graph / receipts │◀──────────▶│ Retained revision events │
+│ Return saved receipt     │            │ Revision + outbox        │            │ Checkpoint / replay      │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+
+Canonical acceptance, index progress, and safe query results are separate outcomes.
 ```
+
+I would trace a submitted query through a fixed retrieval session into candidate IDs,
+then through current access and content-revision validation before returning any snippet.
+The write side commits source changes and indexing obligations together; versioned workers
+maintain the search projection asynchronously. This gives indexing a repair path without
+letting a stale audience token or old indexed text grant access to a new response.
+
+I would trace the read and write paths separately:
+
+1. The coordinator obtains viewer scope through the current validator, retrieves a bounded candidate window, then validates current access and matching revisions before returning text.
+2. An author's identified mutation commits source state, its receipt, and the indexing obligation together. A lost reply resolves to that same receipt.
+3. Workers inspect individual bulk results before advancing durable progress. Retries retain post revisions and tombstones, so delayed work cannot resurrect old content.
+4. A rebuild catches a new generation up to a defined source boundary before publication. Existing sessions either retain their supported generation or receive an explicit reset.
 
 The source database owns post content, audience, revisions, relationships, and operation
 results. An asynchronous pipeline maintains Elasticsearch as a retrieval projection. Redis

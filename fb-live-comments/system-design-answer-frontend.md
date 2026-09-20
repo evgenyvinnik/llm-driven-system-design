@@ -61,23 +61,52 @@ I'd also note that there's no authentication in the local build: identity is sel
 ## 🏗️ Architecture
 
 ```
-┌───────────────────────┐       ┌───────────────────────┐
-│ Composer + pending    │       │ Comments + reactions  │
-│ Local text and focus  │       │ Bounded subscriptions │
-└───────────┬───────────┘       └───────────▲───────────┘
-            │                               │
-            ▼                               │
-┌──────────────────────────────────────────────────────┐
-│ Connection controller + scoped store                 │
-│ Batch ingest / snapshot + tail / reading intent      │
-└───────────────────────────┬──────────────────────────┘
-                            │ one authorized socket
-                            ▼
-┌──────────────────────────────────────────────────────┐
-│ Gateway: comment batches + versioned reaction totals │
-│ Durable replay / selected feed / posting receipts    │
-└──────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────┐
+│ BROWSER / STREAM, ACCOUNT AND SUBSCRIPTION GENERATION      │
+│                                                            │
+│  ┌────────────────────────┐    ┌────────────────────────┐  │    ┌────────────────────────┐
+│  │ Composer + reactions   │    │ Video player           │  │    │ Video service / CDN    │
+│  │ Draft / saved post ID  │    │ Independent playback   │◀─┼───▶│ Separate media service │
+│  │ Actions preserve focus │    │ Media loading / errors │  │    │ Video bytes            │
+│  └────────────────────────┘    └────────────────────────┘  │    └────────────────────────┘
+│               ▲                                            │
+│               │                                            │
+│  post/receipt │                                            │
+│               │                                            │
+│               ▼                                            │
+│  ┌──────────────────────────────────────────────────────┐  │    ┌────────────────────────┐
+│  │ Connection controller + scoped stream state          │  │    │ Authorized gateway     │
+│  │ Snapshot/tail, batches, saved post IDs and receipts  │◀─┼───▶│ Batch / post receipts  │
+│  │ Reaction version, bounded windows and reading intent │  │    │ Reaction totals/epoch  │
+│  └──────────────────────────────────────────────────────┘  │    └────────────────────────┘
+│               ▲                             │              │
+│               │                             │              │
+│  read/follow  │              replace totals │              │
+│               │                             │              │
+│               ▼                             ▼              │
+│  ┌────────────────────────┐    ┌────────────────────────┐  │
+│  │ Bounded comment list   │    │ Aggregate reaction UI  │  │
+│  │ Anchor / follow mode   │    │ Versioned totals       │  │
+│  │ Measured virtualizer   │    │ Bounded animations     │  │
+│  └────────────────────────┘    └────────────────────────┘  │
+│                                                            │
+└────────────────────────────────────────────────────────────┘
+
+The store absorbs batches; comment rows and reaction animations subscribe independently.
 ```
+
+I would follow a post into one pending operation and its matching receipt, while batches
+enter the stream-scoped store through the same connection owner. The list reads a bounded
+comment window and preserves the reader's anchor; reaction UI replaces versioned totals
+and caps its animations. Video has an independent delivery path. A selected comment feed
+and a fast virtualizer still do not imply that the viewer received the whole transcript.
+
+I would use a foreground return to explain the recovery paths:
+
+1. Recover at most one policy-permitted account/stream-scoped pending post with its original ID and text; resolve its receipt before offering another Send.
+2. Restore a feed cursor only with matching window state and selection policy. Otherwise request a fresh snapshot and explain any omitted interval.
+3. Reapply current moderation before displaying recovered text; an old acceptance receipt cannot make a hidden comment visible again.
+4. Replace reaction totals from a newer epoch/version snapshot. Lost decorative animations and stale unsent taps need no replay.
 
 **One connection, two message shapes.** Comments carry stable IDs for merge/deduplication. In my proposed protocol, reactions carry versioned absolute totals to replace. In the actual demo, reaction batches reset their counters after each flush and contain **deltas to add**. After a total of 10, a delta of 3 means 13; replacing with 3 would be wrong. Aggregation alone does not tell the client which operation to use.
 

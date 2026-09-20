@@ -12,12 +12,12 @@ behavior and gaps are documented in
 | Time | Discussion |
 |------|------------|
 | 5 minutes | Product scope, scale, and promises |
-| 5 minutes | Architecture and browser/server contracts |
+| 6 minutes | Architecture and browser/server contracts |
 | 9 minutes | Deep dive: one creation result across failures |
 | 7 minutes | Deep dive: expiration and deactivation end to end |
 | 8 minutes | Deep dive: from redirect observation to useful report |
 | 7 minutes | Account state, performance, and failure isolation |
-| 4 minutes | Verification and evolution |
+| 3 minutes | Verification and evolution |
 
 ## 🎯 Product scope, scale, and promises — 5 minutes
 
@@ -59,25 +59,65 @@ the backend only updates one database row.
 > “I would agree on those promises before choosing a cache TTL or writing a success
 > toast. They determine what both sides of the application have to implement.”
 
-## 🏗️ Architecture and browser/server contracts — 5 minutes
+## 🏗️ Architecture and browser/server contracts — 6 minutes
 
 I would use one diagram to keep the discussion connected:
 
 ```
-┌────────────────┐       ┌────────────────┐
-│ Owner UI       │──────▶│ Management API │──────▶ Mapping store
-│ Form + reports │◀──────│ and reports    │
-└────────────────┘       └───────▲────────┘
-                                 │ summaries
-                         ┌────────────────┐
-                         │ Analytics      │
-                         │ workers/store  │
-                         └───────▲────────┘
-                                 │ retained observations
-┌────────────────┐       ┌────────────────┐
-│ Visitor        │──────▶│ Resolver/cache │──────▶ Destination
-└────────────────┘       └────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│ OWNER BROWSER / LOCAL DRAFTS AND SCOPED SERVER RESULTS                                   │
+│                                                                                          │
+│  ┌────────────────────────┐    ┌────────────────────────┐    ┌────────────────────────┐  │
+│  │ Create form            │    │ Attempt + link state   │    │ Report view + queries  │  │
+│  │ Submitted draft stays  │◀──▶│ Saved ID + revision    │    │ Code, range, time zone │  │
+│  │ Separate from new text │    │ Account-scoped cache   │    │ Freshness and gaps     │  │
+│  └────────────────────────┘    └────────────────────────┘    └────────────────────────┘  │
+│                                   ▲                                                  ▲   │
+│            ┌──────────────────────┘                                                  │   │
+└────────────┼─────────────────────────────────────────────────────────────────────────┼───┘
+             │                                                                         │
+             │                                                    report queries       │
+             ▼                                                                         ▼
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Management API         │       │ Mapping authority      │       │ Report API             │
+│ Create / recover       │◀─────▶│ Code + receipt         │       │ Scope and coverage     │
+│ Authorized lifecycle   │       │ Revision + outbox      │       │ Bounded aggregates     │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+                                              ▲                                ▲
+                                              │                                │
+               read / propagate revision      │                   summaries    │
+                                              │                                │
+                                              ▼                                ▼
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Recipient browser      │       │ Resolver + cache       │       │ Report projection      │
+│ GET short code         │◀─────▶│ Expiry and freshness   │       │ Buckets and watermark  │
+│ Follow 302 Location    │       │ Budgeted store reads   │       │ Known coverage gaps    │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+             ▲                                ▲                                ▲
+             │                                │                                │
+GET/page     │ admission / ACK                │                   apply / ACK  │
+             │                                │                                │
+             ▼                                ▼                                ▼
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Destination website    │       │ Admission + event log  │       │ Aggregate workers      │
+│ Recipient fetches it   │       │ Retained identities    │──────▶│ Atomic dedup + update  │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+
+Creation commits once; redirects stay fast; reports disclose admission gaps and lag.
 ```
+
+I would trace one owner attempt to the committed mapping, then switch actors: a
+recipient obtains a redirect from the resolver and navigates to the destination.
+The resolver separately admits an identified observation when that path is available.
+Workers build a report projection, and the owner's scoped query renders its coverage
+and freshness. This keeps creation recovery, redirect enforcement and analytics
+completeness connected without treating any one response as proof of all three.
+
+On recovery, the owner queries the saved creation operation; a recipient starts a new
+navigation; and a worker replays only retained event IDs. Those are distinct actions.
+The admission acknowledgement and aggregate receipt identify where retries are safe,
+while lifecycle revisions bound how long a resolver may serve stale eligibility.
+Report coverage remains separate from both successful creation and a fast redirect.
 
 The management API validates and commits link ownership. The resolver reads an
 eligible cached mapping or asks the authoritative store. A retained event pipeline
@@ -402,7 +442,7 @@ exposing the system broadly. Syntactic URL validation does not establish a safe
 destination. Logs should avoid raw tokens and sensitive query parameters, and raw
 analytics should have a defined retention policy.
 
-## 🧪 Verification and evolution — 4 minutes
+## 🧪 Verification and evolution — 3 minutes
 
 I would verify the complete creation journey under response loss: commit the link,
 interrupt the response, recover the attempt, and confirm that the user receives the

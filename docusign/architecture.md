@@ -54,32 +54,55 @@ One API and one browser are enough for fixture inspection. Compose supplies four
 Production proposal: one home region owns mutations for each envelope. Boxes represent responsibilities that can begin as modules; drawing a box does not require an independently deployed service.
 
 ```
-┌───────────────────┐     ┌────────────────────┐
-│ Sender and signer │────▶│ Edge / API gateway │
-│ browser clients   │     │ Auth, admission    │
-└───────────────────┘     └────────────────────┘
-                                   │
-                                   ▼
-                          ┌────────────────────┐
-                          │ Envelope authority │
-                          │ Fields and stages  │
-                          └────────────────────┘
-                              │           │
-                              ▼           ▼
-                    ┌──────────────┐  ┌──────────────┐
-                    │ PostgreSQL   │  │ Private      │
-                    │ State, audit │  │ object store │
-                    │ Receipts,    │  │ Immutable    │
-                    │ outbox       │  │ versions     │
-                    └──────────────┘  └──────────────┘
-                           │                  ▲
-                           ▼                  │
-                    ┌──────────────┐  ┌───────────────┐
-                    │ Outbox relay │─▶│ Queue workers │
-                    │ Confirmed    │  │ PDF/evidence  │
-                    │ publication  │  │ Notifications │
-                    └──────────────┘  └───────────────┘
+BROWSER: sender, revision/action state, signer. SERVER: bytes, workflow, jobs.
+
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Sender workspace         │edit/state  │ Revision + action state  │view/input  │ Signer ceremony          │
+│ PDF / fields / stages    │◀──────────▶│ Geometry / saved ID      │◀──────────▶│ Viewer / input / consent │
+│ Draft preview + progress │            │ Receipt / ready status   │            │ Review frozen revision   │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+              ▲                             ▲         ▲
+upload/bytes  │                             │         │
+              │                             │         │
+              │         ┌───────────────────┘         │ action / outcome
+              │         │                             │
+              │         │ GET / bytes                 │
+              ▼         ▼                             ▼
+┌──────────────────────────┐            ┌──────────────────────────┐
+│ Private byte gateway     │grant/meta  │ Envelope API             │
+│ Scoped revision access   │◀──────────▶│ Live account/sign scope  │
+│ Staged / immutable bytes │            │ Revision / stage guard   │
+└──────────────────────────┘            └──────────────────────────┘
+              ▲                                       ▲
+              │                                       │
+              │ read / stage output                   │ commit / recover
+              │                                       │
+              ▼                                       ▼
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Artifact job pipeline    │work/ready  │ PostgreSQL authority     │work/status │ Notification pipeline    │
+│ Outbox relay + worker    │◀──────────▶│ State / actions / audit  │◀──────────▶│ Outbox relay + worker    │
+│ Frozen input generation  │            │ Receipt + outbox commit  │            │ Revision check / retry   │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+                                                                                              ▲
+                                                                                              │
+An artifact is published only for its frozen inputs and generation.                           │ attempt / result
+Work pipelines group the relay, retained queue, and retrying worker.                          │
+                                                                                              │
+                                                                                              ▼
+                                                                                ┌──────────────────────────┐
+Original action receipts remain distinct from current workflow                  │ Notification provider    │
+state, artifact readiness, and notification delivery.                           │ Invitation / reminders   │
+                                                                                │ Independent delivery     │
+                                                                                └──────────────────────────┘
 ```
+
+The proposed overview separates four user-visible results:
+
+1. Private upload/read paths transfer version-bound bytes; validation determines whether a staged PDF becomes a usable immutable revision.
+2. The envelope transaction records an action, receipt, audit event, and required jobs together after checking current scope and stage.
+3. An opaque, policy-permitted browser operation reference supports receipt lookup after reauthentication; it neither preserves all sensitive input nor authorizes another action.
+4. Artifact workers stage immutable output and conditionally publish readiness for the matching input generation. Retry and orphan cleanup preserve referenced objects.
+5. Notification workers record provider outcomes independently. A receipt, workflow completion, a ready artifact, and actual delivery are distinct facts.
 
 Static application assets can use a CDN. Document bytes require authorized, version-bound delivery through a private storage gateway or narrowly scoped signed URLs. Email delivery and artifact generation are asynchronous; neither sits inside a workflow database lock. A protected evidence archive receives canonical records and signed checkpoints through retryable jobs.
 

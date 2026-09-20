@@ -46,26 +46,62 @@ I would not promise that a thousand active frames will perform well. Twenty form
 across fifty entries produce a thousand possible previews, so controlling how much
 of that matrix is alive is part of the design.
 
-## 🏗️ Draw the architecture — 5 minutes
+## 🏗️ Draw the architecture — 6 minutes
 
 I would draw the shell and two representative previews. More library boxes would
 repeat the same boundary without explaining another decision.
 
 ```
-┌──────────────────────────────────────────┐
-│ Shell                                    │
-│ Controls ──▶ Comparison state ──▶ Cards  │
-│                    ▲                     │
-│                    │ URL + preferences   │
-└───────────┬──────────────────┬───────────┘
-            │                  │
-            ▼                  ▼
-    ┌──────────────┐   ┌──────────────┐
-    │ Library A    │   │ Library B    │
-    │ Own document │   │ Own document │
-    │ Native forms │   │ Native forms │
-    └──────────────┘   └──────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│ BROWSER SHELL                                                                            │
+│                                                                                          │
+│  ┌────────────────────────┐    ┌────────────────────────┐    ┌────────────────────────┐  │
+│  │ Controls + cards       │    │ Comparison model       │    │ URL + preferences      │  │
+│  │ Select, group, compare │◀──▶│ IDs, theme, grouping   │◀──▶│ Validate / serialize   │  │
+│  └────────────────────────┘    └────────────────────────┘    └────────────────────────┘  │
+│                                             ▲                                            │
+│  Selections update model                    │ preview descriptors                        │
+│                                             │                                            │
+│                                             ▼                                            │
+│  ┌─────────────────────────────────────────────────────┐     ┌────────────────────────┐  │
+│  │ Preview manager                                     │     │ Static catalog         │  │
+│  │ Frame IDs / readiness / retry / focus / eviction    │◀────│ Paths + capabilities   │  │
+│  └─────────────────────────────────────────────────────┘     └────────────────────────┘  │
+│                          ▲                            ▲                                  │
+│                          │                            │                                  │
+│  form + theme / ready    │                            │   form + theme / ready           │
+│                          │                            │                                  │
+│                          │                            └────────────────┐                 │
+│                          │                                             │                 │
+└──────────────────────────┼─────────────────────────────────────────────┼─────────────────┘
+                           │                                             │
+                           ▼                                             ▼
+   ┌──────────────────────────────────────┐         ┌──────────────────────────────────────┐
+   │ Library A iframe                     │         │ Library B iframe                     │
+   │ Native form + theme provider         │         │ Native form + theme provider         │
+   │ Input and validation stay here       │         │ Input and validation stay here       │
+   └──────────────────────────────────────┘         └──────────────────────────────────────┘
+                      ▲                                                  ▲
+                      │                                                  │
+                      │      GET entry + assets                          │
+                      ▼                                                  ▼
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│ Static delivery (server boundary)                                                        │
+│ Shell/catalog and independent preview documents; no form submission API                  │
+└──────────────────────────────────────────────────────────────────────────────────────────┘
 ```
+
+I would trace the arrows with one example: choosing a library updates the comparison
+model, which combines stable IDs with catalog paths to produce preview descriptors.
+The preview manager starts eligible documents within its budget; the cards display
+readiness and errors from that same manager. Each frame gets form/theme configuration
+and reports readiness, while typed fields remain inside the frame. The URL adapter
+serializes comparison settings and restores them without collecting form input.
+
+I would also trace a failed preview: the manager times out that frame, displays its
+retry action, and creates a new instance identity when retrying. Late readiness from
+the old frame cannot mark the replacement ready. Reloading a share link restores the
+comparison through the URL adapter; transient values inside the old frames are gone.
 
 The shell is responsible for selection, grouping, navigation, and preview lifecycle.
 Each library app owns its form components, theme provider, styles, and input state.
@@ -340,7 +376,7 @@ A failed frame should display its library/form identity and a recovery action.
 An empty selection should explain how to add a preview. A storage failure should
 not make the whole shell fail to initialize.
 
-## 📊 Validation and closing discussion — 5 minutes
+## 📊 Validation and closing discussion — 4 minutes
 
 I would verify a small set of user journeys before adding more optimizations:
 

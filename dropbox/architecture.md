@@ -56,21 +56,56 @@ Local development uses one API, one frontend, PostgreSQL, Valkey, and MinIO. Sta
 Proposed production responsibilities; these boxes need not begin as separate deployments:
 
 ```
-┌──────────────────┐     ┌──────────────────┐     ┌──────────────────┐
-│ Browser clients  │────▶│ API gateway      │────▶│ Metadata service │
-└──────────────────┘     └──────────────────┘     └──────────────────┘
-        │                         │                         │
-        ▼                         ▼                         ▼
-┌──────────────────┐     ┌──────────────────┐     ┌──────────────────┐
-│ Private objects  │     │ Upload service   │────▶│ SQL + outbox     │
-│ Scoped URLs      │◀────│ Verify staging   │     │ Namespace owner  │
-└──────────────────┘     └──────────────────┘     └──────────────────┘
-                                                            │
-                                                            ▼
-┌──────────────────┐     ┌──────────────────┐     ┌──────────────────┐
-│ Other devices    │◀────│ Sync gateways    │◀────│ Change relay     │
-└──────────────────┘     └──────────────────┘     └──────────────────┘
+PROPOSED STORAGE — metadata publishes versions only after verified staging
+
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Uploading clients        │commit/read │ Metadata authority       │transaction │ Namespace SQL            │
+│ Namespace / base / ID    │◀──────────▶│ Access + hierarchy       │◀──────────▶│ Manifest, quota, receipt │◀─────┐
+│ Retain original manifest │            │ Conditional publication  │            │ Durable change sequence  │      │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘      │
+              ▲                                 ▲                                   ▲         ▲                   │
+              │                                 │                                   │         │                   │
+stage / ACK   │                                 │                                   │         │                   │
+              │           slot receipts         │                                   │         │                   │
+              │         ┌───────────────────────┘                         ┌─────────┘         │ outbox / progress │
+              │         │                                                 │                   │                   │
+              ▼         ▼                                                 │                   ▼                   │
+┌──────────────────────────┐            ┌──────────────────────────┐      │     ┌──────────────────────────┐      │
+│ Upload service           │store/read  │ Private chunk storage    │      │     │ Change relay             │      │
+│ Session / checked slots  │◀──────────▶│ Verified immutable bytes │      │     │ Committed obligations    │      │
+│ Scoped resumable staging │            │ Namespace-scoped reuse   │      │     │ Retry / record progress  │      │
+└──────────────────────────┘            └──────────────────────────┘      │     └──────────────────────────┘      │
+                                                      ▲                   │                   │                   │
+                                                      │                   │                   │                   │
+                                                      │                   │                   │           replay  │
+                                                      │ read / bytes      │ authorize/pin     │ hint              │
+                                                      │                   │                   │                   │
+                                                      ▼                   │                   ▼                   │
+┌──────────────────────────┐            ┌──────────────────────────┐      │     ┌──────────────────────────┐      │
+│ Downloading clients      │range/bytes │ Download admission       │      │     │ Change gateways          │      │
+│ Same version on resume   │◀──────────▶│ Recheck current access   │◀─────┘     │ Current namespace access │◀─────┘
+│ Bounded response buffers │            │ Pin immutable manifest   │            │ Retained change feed     │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+                                                                                              ▲
+                                                                                              │
+                                                                                              │ cursor / changes
+                                                                                              │
+Staging leases and retained-version references protect objects                                │
+from reclamation while publication or admitted reads use them.                                ▼
+                                                                                ┌──────────────────────────┐
+                                                                                │ Connected devices        │
+                                                                                │ Namespace revision       │
+                                                                                │ Catch up or resnapshot   │
+                                                                                └──────────────────────────┘
 ```
+
+The proposed overview has four distinct return paths:
+
+1. Uploads receive verified, session-bound slot receipts; a browser journal retains task/manifest identity but may still require verified file reselection after reload.
+2. Metadata publication checks those receipts and commits the version, quota effect, operation result, and durable change together.
+3. Download admission authorizes and pins one immutable manifest; resumed ranges preserve that version and the defined retention/grant contract.
+4. The relay records delivery progress, while gateways read namespace changes directly after missed hints. Cursor expiry requires a fresh snapshot boundary.
+5. Staging leases and retained/delivery references coordinate reclamation with publication; unknown finalization is resolved before reclaiming or restarting the operation.
 
 The browser transfers bytes using bounded requests to private object storage or an upload proxy. The upload service verifies durable staging receipts; the metadata service alone publishes the current file version. The SQL transaction also records a durable change. Notification delivery is an optimization over a replayable namespace change feed. A CDN may cache immutable bytes only behind an authorization-aware delivery boundary.
 

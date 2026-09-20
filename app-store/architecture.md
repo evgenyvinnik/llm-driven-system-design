@@ -74,47 +74,47 @@ No load test or memory measurement accompanies this document.
 Proposed production boundaries; the API can initially deploy as a modular service.
 
 ```text
-┌──────────────────────────┐      ┌────────────────────────────┐
-│ User / developer UI      │─────▶│ CDN: media and packages    │
-└────────────┬─────────────┘      └────────────────────────────┘
-             │                                   ▲
-             │                                   │
-             ▼                                   │
-┌──────────────────────────┐      ┌────────────────────────────┐
-│ API gateway + auth       │      │ Object storage             │
-└────────────┬─────────────┘      │ Immutable artifacts        │
-             │                    └────────────────────────────┘
-             │                                   ▲
-             ▼                                   │
-┌──────────────────────────┐                     │
-│ Catalog / publishing     │─────────────────────┘
-│ Reviews / access         ├─────────────────────┐
-└────────────┬─────────────┘                     │
-             │                                   │
-             │                                   │
-             ▼                                   ▼
-┌──────────────────────────┐      ┌────────────────────────────┐
-│ PostgreSQL               │      │ Read cache                 │
-│ Revisions + event outbox │      │ Public metadata            │
-└────────────┬─────────────┘      └────────────────────────────┘
-             │
-             │
-             ▼
-┌──────────────────────────┐
-│ Relay + message queue    │
-└────────────┬─────────────┘
-             │
-             │
-             ▼
-┌──────────────────────────┐
-│ Review/index workers     │
-│ Search + rating views    │
-└──────────────────────────┘
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Browser / installer    │HTTP   │ Marketplace API        │query  │ Search + public cache  │
+│ Discovery and access   │◀─────▶│ Catalog / review / pub │◀─────▶│ Versioned candidates   │
+│ Developer uploads      │       │ Auth + access grants   │       │ Never grants access    │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+             ▲                                ▲                                ▲
+             │                                │                                │
+grant + bytes│                   read / commit│                   index updates│
+             │                                │                                │
+             ▼                                ▼                                │
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Object storage + CDN   │       │ PostgreSQL authority   │work   │ Relay + workers        │
+│ Staged / release bytes │       │ Approved release pair  │◀─────▶│ Index / moderate       │
+│ Upload / range reads   │       │ Reviews, ops, outbox   │       │ Fence stale revisions  │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+             ▲                                                                 ▲
+             │                                                                 │
+             │  object bytes     scan / review a fixed revision                │
+             │                                                                 │
+             │                                                                 ▼
+             │                                                    ┌────────────────────────┐
+             │                                                    │ Artifact validation    │
+             └───────────────────────────────────────────────────▶│ Verify uploaded digest │
+                                                                  │ Approval input         │
+                                                                  └────────────────────────┘
+
+Publication commits the approved metadata/artifact pair and an outbox event.
+
+Access checks current release eligibility before issuing a short-lived grant.
 ```
 
 Search serves a derived retrieval index. Publication and access decisions remain
 with authoritative records. The CDN serves immutable bytes after an access grant;
 it does not decide which app revision is approved.
+
+The byte path begins with a scoped upload grant and private staged storage. Validation
+reads that fixed object, binds its digest to the reviewed metadata revision, and returns
+the result to the authority. Publication commits the approved release pair and outbox;
+workers then update derived views. The client recovers the saved publication operation
+after a lost response. Download grants recheck current eligibility even if discovery
+still displays an older cached candidate.
 
 ## Core Components / Request Flows
 

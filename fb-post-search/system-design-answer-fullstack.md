@@ -37,20 +37,57 @@ may run the same query and legitimately see different posts.
 ## 🏗️ Architecture and Scale — 5 minutes
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│ Browser: drafts / committed intent / safe snippets              │
-│ Account + request identity / bounded result pages               │
-└────────────────────────────────┬────────────────────────────────┘
-                                 ▼
-┌─────────────────────────────────────────────────────────────────┐
-│ Search API: PIT context / current access / ranking              │
-└─────────────┬────────────────────────────────────┬──────────────┘
-              ▼                                    ▼
-┌────────────────────────────┐       ┌────────────────────────────┐
-│ Elasticsearch projection   │◀──────│ Canonical SQL + outbox     │
-│ PIT + audience tokens      │       │ Versioned index workers    │
-└────────────────────────────┘       └────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│ BROWSER / DRAFT, COMMITTED INTENT AND QUERY-SCOPED RESULTS                               │
+│                                                                                          │
+│  ┌────────────────────────┐    ┌────────────────────────┐    ┌────────────────────────┐  │
+│  │ Draft + suggestion UI  │    │ Query/page coordinator │    │ Safe result rendering  │  │
+│  │ Local text / filters   │◀──▶│ Account / request ID   │◀──▶│ Query-bound snippets   │  │
+│  │ Explicit submit action │    │ Session / resume/reset │    │ Read anchor / retry    │  │
+│  └────────────────────────┘    └────────────────────────┘    └────────────────────────┘  │
+│                       ▲                     ▲                                            │
+│                       │                     │                                            │
+└───────────────────────┼─────────────────────┼────────────────────────────────────────────┘
+suggestions             │   query / page      │
+                        ▼                     ▼
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Suggestion API         │       │ Search API             │       │ Canonical authority    │
+│ Public-safe corpus     │       │ Query/PIT/current ACL  │◀─────▶│ Posts / accepted graph │
+│ Private scope if used  │       │ Revision + match check │       │ SQL / receipt / outbox │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+                                              ▲                                ▲
+                                              │                                │
+                      candidate retrieval     │           events / progress    │
+                                              │                                │
+                                              ▼                                ▼
+                                 ┌────────────────────────┐       ┌────────────────────────┐
+                                 │ Search projection      │       │ Outbox relay           │
+                                 │ PIT / audience tokens  │       │ Replay indexing work   │
+                                 │ Ranking inputs         │       │ Versioned events       │
+                                 └────────────────────────┘       └────────────────────────┘
+                                              ▲                                ▲
+                                              │ bulk / item results            │ event / progress
+                                              │                                ▼
+                                              │                   ┌────────────────────────┐
+                                              │                   │ Index workers          │
+                                              └──────────────────▶│ Item results / repair  │
+                                                                  │ Safe generation switch │
+                                                                  └────────────────────────┘
+Search sessions preserve continuation; current permissions can still remove a result.
 ```
+
+I would follow one committed search through candidate retrieval and current source
+validation, then keep the returned snippets under that query's page identity in the
+browser. Suggestions use their own input generation and disclosure scope. Source edits
+travel through the outbox and versioned index workers, so an indexing delay affects
+freshness without authorizing private content. Expiry or removal has an explicit UI outcome.
+
+For recovery, I would follow the arrows back as well:
+
+1. The browser restores query intent and asks to resume its bounded session; current authorization still governs every returned snippet.
+2. An expired or incompatible session restarts with a visible reset. The same URL preserves the question, not the old result order or access.
+3. Workers return item-level outcomes and checkpoint confirmed revision effects. A successful bulk transport response alone does not complete indexing work.
+4. A replacement index is published only after backfill and change catch-up; old sessions retain their generation for a bounded overlap or explicitly expire.
 
 The browser owns draft input, committed query state, request generations, safe rendering,
 and a bounded result cache. The server owns query semantics, ranking, current access, and

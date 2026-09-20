@@ -12,12 +12,12 @@ these guarantees.
 | Time | Discussion |
 |------|------------|
 | 5 minutes | Requirements and capacity |
-| 5 minutes | Architecture, data, and API |
+| 6 minutes | Architecture, data, and API |
 | 8 minutes | Deep dive: namespace ownership and creation recovery |
 | 8 minutes | Deep dive: cached redirects and revocation |
 | 9 minutes | Deep dive: retained analytics and repeated delivery |
 | 6 minutes | Failure isolation, security, and growth |
-| 4 minutes | Verification and design boundaries |
+| 3 minutes | Verification and design boundaries |
 
 ## 🎯 Requirements and capacity — 5 minutes
 
@@ -59,29 +59,62 @@ are part of the design.
 > than on inventing a complicated identifier scheme. Those are more likely to
 > determine whether this service behaves correctly.”
 
-## 🏗️ Architecture, data, and API — 5 minutes
+## 🏗️ Architecture, data, and API — 6 minutes
 
 I would draw the redirect path separately from management and analytics:
 
 ```
-┌────────────────┐       ┌────────────────┐
-│ Management API │──────▶│ Mapping store  │
-└────────────────┘       └───────┬────────┘
-                                 │ revisions
-                                 ▼
-┌────────────────┐       ┌────────────────┐
-│ Link request   │──────▶│ Resolver/cache │──────▶ Destination
-└────────────────┘       └───────┬────────┘
-                                 ▼
-                         ┌────────────────┐
-                         │ Event log      │
-                         └───────┬────────┘
-                                 ▼
-                         ┌────────────────┐
-                         │ Report workers │──────▶ Analytics API
-                         │ and store      │
-                         └────────────────┘
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Owner / admin client   │       │ Management API         │       │ Mapping authority      │
+│ Create and deactivate  │◀─────▶│ Validate, auth, claim  │◀─────▶│ Atomic code + receipt  │
+└────────────────────────┘       │ Recover operation      │       │ Lifecycle rev + outbox │
+                                 └────────────────────────┘       └────────────────────────┘
+                                                                               ▲
+                                                                               │
+                                                 miss lookup / revision update │
+                                                                               │
+                                                                               ▼
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Recipient browser      │       │ Regional resolver      │       │ Cache + fill adapter   │
+│ GET short code         │◀─────▶│ Check eligibility      │◀─────▶│ Expiry, rev, deadline  │
+│ Receive 302 Location   │       │ Return redirect        │       │ Bounded freshness      │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+             ▲                                ▲
+             │                                │
+GET / page   │ admission / ACK                │
+             │                                │
+             ▼                                ▼
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Destination website    │       │ Admission + event log  │       │ Report workers         │
+│ Browser fetches target │       │ Stable event IDs       │──────▶│ Atomic dedup + effect  │
+│ No resolver fetch      │       │ Retained events only   │       │ Replay retained events │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+                                                                               ▲
+                                                                               │
+                                                 apply / read                  │
+                                                                               │
+                                                                               ▼
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Report viewer          │       │ Analytics API          │       │ Analytics store        │
+│ Scope + time window    │◀─────▶│ Auth + bounded query   │◀─────▶│ Buckets and watermarks │
+└────────────────────────┘       └────────────────────────┘       │ Coverage metadata      │
+                                                                  └────────────────────────┘
+
+When event admission fails, redirects continue and report coverage is incomplete.
 ```
+
+Management commits mapping ownership and a recoverable result. The resolver reads
+lifecycle-aware cache entries, falls back within a budget and returns a redirect to
+the recipient; the recipient fetches the destination. A separate budget admits
+observations to retained analytics work. Workers apply duplicate-safe effects, and
+reports expose watermark and coverage. Durable processing protects retained events;
+it cannot reconstruct an observation that failed admission before retention.
+
+The analytics return arrows identify the two recovery boundaries: admission reports
+whether an event was retained, and the aggregate store confirms the committed effect.
+Workers can replay retained IDs and read existing receipts after a crash. Redirects
+still return within their own budget when admission fails; reports must disclose that
+coverage gap instead of treating worker catch-up as proof that every visit was captured.
 
 The mapping store is authoritative for ownership and lifecycle. Regional caches hold
 read representations. A retained event pipeline feeds an analytics store so report
@@ -385,7 +418,7 @@ period and longer-lived aggregates where useful. Provision enough consumer capac
 catch up after an outage; matching average arrival rate exactly leaves no recovery
 headroom.
 
-## 🧪 Verification and design boundaries — 4 minutes
+## 🧪 Verification and design boundaries — 3 minutes
 
 I would test concurrent custom-alias claims and response loss immediately after
 creation commit. Exactly one namespace owner should win, and retrying a committed

@@ -13,12 +13,12 @@ Notes](./architecture.md#implementation-notes) document that boundary.
 | Time | Discussion |
 |------|------------|
 | 4 minutes | Scope and user-visible guarantees |
-| 5 minutes | Browser architecture and contracts |
+| 6 minutes | Browser architecture and contracts |
 | 9 minutes | Deep dive: responsive input and concurrent operations |
 | 9 minutes | Deep dive: lost acknowledgements and reconnect |
 | 8 minutes | Deep dive: selection, composition, and presence |
 | 6 minutes | Performance, accessibility, and permissions |
-| 4 minutes | Verification and local implementation boundary |
+| 3 minutes | Verification and local implementation boundary |
 
 ## 🎯 Scope and user-visible guarantees — 4 minutes
 
@@ -57,23 +57,64 @@ determines the header's status text.
 “Saved” must not be inferred merely from a live socket. A connection can remain open
 while an operation is rejected, delayed, or lost in an application queue.
 
-## 🏗️ Browser architecture and contracts — 5 minutes
+## 🏗️ Browser architecture and contracts — 6 minutes
 
 I would draw four browser responsibilities and two service interfaces:
 
 ```
-┌──────────────────┐       ┌──────────────────┐
-│ Document list    │──────▶│ Metadata API     │
-└──────────────────┘       └──────────────────┘
-┌──────────────────┐       ┌──────────────────┐
-│ Editor adapter   │◀─────▶│ Sync controller  │
-│ Text / selection │       │ Base + pending   │
-└──────────────────┘       └────────┬─────────┘
-                                    │ WebSocket
-                           ┌────────▼─────────┐
-                           │ Document service │
-                           └──────────────────┘
+BROWSER — account/document identity owns pending work                           SERVER CONTRACTS
+
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Document list + header   │intent/UI   │ Navigation + context     │HTTP/result │ Metadata / access API    │
+│ Title and permissions    │◀──────────▶│ Account / document IDs   │◀──────────▶│ List / title / roles     │
+│ Document navigation      │            │ Open baseline boundary   │            │ Current permissions      │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+                                                      ▲
+                                                      │
+                                                      │ open / generation
+                                                      │
+                                                      ▼
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Editor adapter           │input/edits │ Sync controller          │WS/replay   │ Document sync service    │
+│ Text, selection, IME     │◀──────────▶│ Base / sent / buffer     │◀──────────▶│ Baseline / edits / ACK   │
+│ Apply local input once   │            │ Match durable ACKs       │            │ Durable ACK + replay     │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+                                                  ▲   │
+save draft / restore                              │   │
+                                                  │   │
+              ┌───────────────────────────────────┘   │
+              │                                       │ position version
+              │                                       │
+              ▼                                       ▼
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Local recovery draft     │            │ Presence model           │latest/TTL  │ Presence channel         │
+│ Text + ops + base IDs    │            │ Session + position ver   │◀──────────▶│ Same WS; no edit log     │
+│ Account / document scope │            │ Freshness + expiry       │            │ Expiring observations    │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+                                                      │
+                                                      │ render cursor
+Draft recovery is local.                              │
+Saved status needs a server ACK.                      │
+                                                      ▼
+                                        ┌──────────────────────────┐
+                                        │ Presence overlays        │
+                                        │ Mapped cursor ranges     │
+                                        │ Separate from text       │
+                                        └──────────────────────────┘
 ```
+
+I would follow typing from the editor adapter into the sync controller's local
+operation state, then to the document service. A matching durable acknowledgement
+retires the submitted edit; a remote edit is reconciled with pending work before
+rendering. Navigation changes the document/account generation and open boundary.
+Presence uses that version context to place approximate cursors, while metadata and
+cursor updates remain separate from the shared text model.
+
+The local recovery store preserves draft text, operation identity, and base context
+under the document/account scope. Reopening first resolves the original in-flight
+receipt, then replays retained history before reconciling pending work. If that history
+is unavailable, the draft remains separate for explicit recovery. Writing this local
+record cannot produce a server-saved label or turn presence into committed content.
 
 The editor adapter translates browser input into document operations and maps model
 positions to rendered selection. The synchronization controller owns operation
@@ -342,7 +383,7 @@ size, time awaiting acknowledgement, reconnect outcomes, and draft-recovery
 frequency. Those measurements explain user experience more directly than counting
 open sockets alone.
 
-## 🧪 Verification and local implementation boundary — 4 minutes
+## 🧪 Verification and local implementation boundary — 3 minutes
 
 I would start with deterministic transform and composition examples, including
 same-position insertion, overlapping deletion, emoji offsets, and unequal retain

@@ -77,19 +77,55 @@ metadata rows.
 ## 🏗️ Architecture and responsibility — 5 minutes
 
 ```
-┌────────────────────────┐     ┌────────────────────────┐     ┌────────────────────────┐
-│        Browser         │ ──▶ │ Metadata / upload API  │ ──▶ │      SQL + outbox      │
-└────────────────────────┘     └────────────────────────┘     └────────────────────────┘
+    PROPOSED UPLOAD-BACKED GALLERY — the local demo is frontend-only
 
-┌────────────────────────┐     ┌────────────────────────┐     ┌────────────────────────┐
-│     Object staging     │ ──▶ │   Processing workers   │ ──▶ │     Variants / CDN     │
-└────────────────────────┘     └────────────────────────┘     └────────────────────────┘
+    ┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+    │ Gallery browser          │HTTP/status │ Metadata / upload API    │commit/read │ SQL authority            │
+┌──▶│ Browse / upload / resume │◀──────────▶│ Owner / quota / state    │◀──────────▶│ Images / sessions        │
+│   │ Saved session + image ID │            │ Guarded ready manifest   │            │ Manifests + outbox       │
+│   └──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+│                 ▲                                       ▲                                       ▲
+│                 │                                       │                                       │
+│ GET / bytes     │                                       │                                       │
+│                 │                                       │                                       │
+│                 │ upload / receipt                      │ publish / outcome                     │ work / progress
+│                 │                                       │                                       │
+│                 ▼                                       ▼                                       ▼
+│   ┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│   │ Private input staging    │read / bytes│ Processing workers       │job / ACK   │ Outbox + work queue      │
+│   │ Scoped upload / receipt  │◀──────────▶│ Bound decode / profiles  │◀──────────▶│ Committed generation     │
+│   │ Verified immutable input │            │ Verify; publish manifest │            │ Retry / durable progress │
+│   └──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+│                                                         ▲
+│                                                         │
+│                                                         │ write / verify
+│                                                         │
+│                                                         ▼
+│   ┌──────────────────────────┐            ┌──────────────────────────┐
+│   │ Authorized CDN delivery  │GET / bytes │ Private variant origin   │
+└──▶│ Grant before cache hit   │◀──────────▶│ Immutable output bytes   │
+    │ Scoped private origin    │            │ Verified profiles        │
+    └──────────────────────────┘            └──────────────────────────┘
+
+    Only a verified manifest becomes ready; delivery checks access before using cached bytes.
 ```
 
+I would trace upload admission into a durable session, then send bytes directly to scoped
+staging. A committed job drives bounded processing; the worker stores and verifies output
+bytes before conditionally publishing the ready manifest. Readers receive that manifest
+and pass delivery authorization before cache access. A stale worker or failed codec can
+leave recoverable work or cleanup objects, but cannot publish a partial ready generation.
+
+I would use a lost finalization response to follow recovery:
+
+1. Read the original upload session and its bound immutable input; resolve its existing result before allocating another image or quota reservation.
+2. Retry the same generation's processing work. Verify required outputs, then conditionally publish the manifest and settle quota once.
+3. Acknowledge work after the durable outcome. A deleted or superseded generation cannot become ready when a late worker finishes.
+4. Readers fetch metadata/status through the API and image bytes through delivery. A ready response is not evidence that the browser decoded the image.
+
 The top row handles metadata and durable coordination. The API creates upload sessions in
-SQL; an outbox dispatcher sends committed processing work to a queue. The bottom row
-handles image bytes: direct staging upload, worker transformations, and verified variants
-served through a CDN.
+SQL; an outbox dispatcher sends committed processing work to a queue. The byte path follows direct staging upload, worker transformations, and verified
+variants served through an authorized CDN edge.
 
 Original and output objects live in private storage. The browser receives scoped upload
 authority after the API authenticates the owner and reserves quota. The worker receives a

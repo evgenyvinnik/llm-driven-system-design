@@ -1,808 +1,620 @@
-# Google Docs - Collaborative Editing - Architecture Design
+# Google Docs: architecture and implementation
 
 ## System Overview
 
-A real-time collaborative document editing platform enabling multiple users to simultaneously edit rich-text documents with conflict resolution, presence awareness, comments, and version history.
+This project studies shared rich-text documents: responsive local editing, ordered
+collaboration, recoverable saves, comments, history, and document-level permissions.
+The **proposed production design** below defines a complete service. The final
+[Implementation Notes](#implementation-notes) describe the current local demo, whose
+editor does not yet send or apply document operations. These are different layers;
+the proposal is not a claim about Google's infrastructure or this repository's runtime.
 
----
+The central learning question is where an edit becomes authoritative. A character
+appearing locally, a WebSocket sending successfully, a durable operation commit,
+and another user's screen updating are separate events.
 
 ## Requirements
 
-### Functional Requirements
+### Functional requirements — proposed
 
-- **Document editing**: Rich text formatting (bold, italic, headings, lists, links)
-- **Real-time collaboration**: Multiple users editing simultaneously with live cursor positions
-- **Version history**: Automatic snapshots with named versions and restore capability
-- **Commenting**: Threaded comments with text anchoring and resolution workflow
-- **Suggestions**: Track changes mode with accept/reject workflow
-- **Sharing**: Granular permissions (view, comment, edit) per user or email
+Support authenticated document creation, basic rich text (paragraphs, headings,
+lists, and marks), concurrent editing, temporary presence, comments with anchored
+ranges, named history, and restore. Owners grant view, comment, or edit capability.
 
-### Non-Functional Requirements
+Start with bounded documents and small editing groups. Include recovery from short
+network interruptions; unlimited offline merging, spreadsheets, arbitrary embeds,
+printing/export, and tracked-change suggestions are extensions. A CRDT-based product
+could be a better fit if long independent offline sessions become a core requirement.
 
-- **Availability**: 99.99% uptime for document editing and collaboration
-- **Latency**:
-  - Document load: p95 < 300ms
-  - Operation sync: p95 < 100ms (keystroke to other users' screens)
-  - API responses: p95 < 200ms
-- **Consistency**: Strong consistency for document state via Operational Transformation; eventual consistency acceptable for presence and read replicas
-- **Scalability**: Support 10M+ documents, 500K+ concurrent editors, 50K+ concurrent documents
+### Non-functional requirements — proposed
 
----
+| Concern | Initial target or contract |
+|---------|----------------------------|
+| Local interaction | p95 input-to-paint below 50 ms on a specified modest device |
+| Collaboration | p95 committed edit-to-peer visibility below 200 ms within the home region |
+| Opening | p95 usable editor below 1 second for a bounded 100 KB document on a defined network |
+| Availability | 99.99% target for document access; edits pause when durable commit is unavailable |
+| Durability | Acknowledged edits survive an owner-process crash; replica-loss guarantees depend on the configured synchronous durability boundary |
+| Consistency | One ordered committed revision stream per document; temporary local state can lead it |
+| Access | Current document capability governs reads, commands, replay, snapshots, and presence |
+
+These are planning targets, not measurements. Presence may be dropped or coalesced;
+accepted content may not. A disconnected client must retain its work without calling
+that work saved to the service.
 
 ## Capacity Estimation
 
-### Production Scale
+Assume 5 million daily active users, each editing for 20 minutes. That is 6 billion
+editor-seconds/day, about 69,445 concurrent editors on average. A fivefold peak is
+roughly 350,000 connected editors. These figures are illustrative, not usage data from Google.
 
-| Metric | Target |
-|--------|--------|
-| Registered users | 50M |
-| Daily active users | 5M |
-| Concurrent editors | 500K |
-| Active documents | 50K simultaneously |
-| Peak API RPS | 200K |
-| Peak WebSocket messages/sec | 2M |
-| Average document size | 50KB |
-| Operations per document/sec | 5-50 |
+At 0.5 submitted batches per active editor per second, the average is about 34,722
+batches/second and the peak about 175,000. A batch contains ordered editor steps;
+operation rate and WebSocket frame rate are therefore not interchangeable.
 
-### Storage Growth (Production)
+If each batch averages 500 bytes, three billion daily batches add about 1.5 TB/day
+before replication, indexes, receipts, and snapshot storage. At five other viewers
+per editing room, content delivery has roughly five times the accepted-batch fan-out,
+plus acknowledgments, presence, and reconnect replay.
 
-| Data Type | Size/Unit | Daily Growth | 1 Year Projection |
-|-----------|-----------|--------------|-------------------|
-| Documents (content) | 50KB avg | 500K new docs/day | 9TB |
-| Document versions | 50KB each | 5M snapshots/day | 90TB |
-| Operations log | 200 bytes/op | 500M ops/day | 36TB |
-| Comments | 500 bytes avg | 2M/day | 365GB |
-
-### Local Development Scale
-
-| Metric | Target | Rationale |
-|--------|--------|-----------|
-| Concurrent users | 10-50 | Testing collaboration scenarios |
-| Active documents | 5-20 | Documents being edited simultaneously |
-| Peak RPS (API) | 50-100 | Document CRUD, comments, auth |
-| Peak WebSocket messages/sec | 200-500 | Operations, presence, cursor updates |
-| Total storage (1 year) | ~3GB | Well within single PostgreSQL instance |
-
----
+The hottest document's step-processing time and queue are separate constraints from
+total fleet capacity. Benchmark realistic large pastes and formatting changes, not
+only single-character inserts. Local setup sizes should come from measurements;
+no local concurrency or memory benchmark is claimed here.
 
 ## High-Level Architecture
 
-```
-┌──────────────────────────────────────────────────────────────────────┐
-│                        Client Layer                                   │
-│     React 19 + TipTap/ProseMirror + WebSocket + Zustand              │
-└────────────────────────────────┬─────────────────────────────────────┘
-                                 │
-                    HTTP REST + WebSocket (wss://)
-                                 │
-                                 ▼
-┌──────────────────────────────────────────────────────────────────────┐
-│                        CDN / Edge Layer                               │
-│              Static assets, SSL termination, DDoS protection         │
-└────────────────────────────────┬─────────────────────────────────────┘
-                                 │
-                                 ▼
-┌──────────────────────────────────────────────────────────────────────┐
-│                     API Gateway / Load Balancer                       │
-│         Sticky sessions by document_id, rate limiting, routing       │
-└──────┬───────┬───────┬───────┬───────┬───────────────────────────────┘
-       │       │       │       │       │
-       ▼       ▼       ▼       ▼       ▼
-┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐
-│  API-1   │ │  API-2   │ │  API-3   │ │  API-4   │ │  API-N   │
-│ REST +   │ │ REST +   │ │ REST +   │ │ REST +   │ │ REST +   │
-│ WebSocket│ │ WebSocket│ │ WebSocket│ │ WebSocket│ │ WebSocket│
-└────┬─────┘ └────┬─────┘ └────┬─────┘ └────┬─────┘ └────┬─────┘
-     │             │            │             │            │
-     └─────────────┴────────────┴─────────────┴────────────┘
-                    │                         │
-     ┌──────────────▼──────────┐  ┌──────────▼────────────────┐
-     │     Redis Cluster       │  │   PostgreSQL (Primary)     │
-     │  ┌───────────────────┐  │  │   + Read Replicas          │
-     │  │ Sessions, Pub/Sub │  │  │                            │
-     │  │ Presence, OT Ops  │  │  │  Documents, Users,         │
-     │  │ Version Counters  │  │  │  Permissions, Versions,    │
-     │  └───────────────────┘  │  │  Operations, Comments      │
-     └─────────────────────────┘  └────────────────────────────┘
-```
-
-### Core Components
-
-| Component | Responsibility | Technology |
-|-----------|---------------|------------|
-| **Web Client** | Rich text editor, local OT, presence UI | React 19, TipTap/ProseMirror, WebSocket |
-| **CDN** | Static asset delivery, edge caching | CloudFront / Cloudflare |
-| **API Gateway** | Request routing, sticky sessions, SSL termination, rate limiting | nginx / AWS ALB |
-| **API Server** | REST API + WebSocket server, OT processing | Node.js, Express, ws library |
-| **Session Store** | User sessions, WebSocket connection tracking | Redis with 24h TTL |
-| **Pub/Sub Bus** | Cross-server operation broadcast, presence sync | Redis pub/sub |
-| **Primary Database** | Documents, users, permissions, versions, ops | PostgreSQL 16 |
-| **Read Replicas** | Document listing, version history, search | PostgreSQL streaming replication |
-
----
-
-## Request Flow
-
-### 1. Document Load Flow
+The following is the production proposal. Boxes identify ownership, and arrows show
+request, commit, replay, or temporary presence traffic.
 
 ```
-Browser                    API Server                 Redis              PostgreSQL
-   │                           │                        │                     │
-   │── GET /api/docs/:id ─────▶│                        │                     │
-   │                           │── Check session ──────▶│                     │
-   │                           │◀── Session valid ──────│                     │
-   │                           │                        │                     │
-   │                           │── Query document, permissions, comments ────▶│
-   │                           │◀── Document data, user's permission ────────│
-   │                           │                        │                     │
-   │◀── 200 {doc, permission} ─│                        │                     │
-   │                           │                        │                     │
-   │══ WebSocket upgrade ═════▶│                        │                     │
-   │                           │── SUBSCRIBE doc:{id} ─▶│                     │
-   │                           │── SADD presence:{id} ─▶│                     │
-   │◀═ WS: presence update ═══│                        │                     │
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Browser clients        │       │ Authenticated gateways │       │ Presence routing       │
+│ Batches / reads/cursor │◀─────▶│ Session + doc routing  │◀─────▶│ Connection + revision  │
+└────────────────────────┘       │ Ordered replay channel │       │ Coalesce / expire      │
+             ▲                   └────────────────────────┘       └────────────────────────┘
+             │                                ▲
+             │ review / result                │ commands / outcomes
+             │                                │
+             ▼                                ▼
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Authorized review API  │       │ Fenced document owner  │       │ Document partition/SQL │
+│ Lists/comments/history │◀─────▶│ Validate / admit steps │◀─────▶│ Head / grants / epoch  │
+│ Current access checks  │       │ Restore/grant commands │       │ Steps/receipts/outbox  │
+└────────────────────────┘       └────────────────────────┘       │                        │
+             ▲                                ▲                   │                        │
+             │ read / version                 │ replay / publish  │                        │
+             │                                │                   │                        │
+             ▼                                ▼                   │                        │
+┌────────────────────────┐       ┌────────────────────────┐       │ Contiguous step reads  │
+│ Verified snapshots     │       │ Replay/snapshot work   │       │ Claim committed work   │
+│ Pinned revision/schema │◀─────▶│ Read committed history │◀─────▶│ Commit + work progress │
+│ Immutable content hash │       │ Build/verify snapshot  │       │                        │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+
+The owner streams accepted history to gateways. Missing live delivery is repaired by replay.
+Saved ACK follows the SQL commit; snapshots and expiring presence have different lifetimes.
 ```
 
-### 2. Operation Sync Flow (Real-time Editing)
+A browser reaches a gateway, which routes a document's commands to its current owner.
+The owner serializes admission and commits through the document's database partition.
+The database enforces ownership fencing and stores accepted steps and receipts.
+Committed events feed live delivery and snapshot work; missed live delivery is repaired
+from retained history. Presence follows an independent, disposable path.
 
-```
-Browser A       API Server 1        Redis Pub/Sub      API Server 2       Browser B
-    │                │                    │                  │                │
-    │══ WS: op A ═══▶│                    │                  │                │
-    │                │── Transform op ────│                  │                │
-    │                │── ACK + version ──▶│                  │                │
-    │                │                    │                  │                │
-    │                │── PUBLISH op ─────▶│                  │                │
-    │                │                    │── op broadcast ─▶│                │
-    │                │                    │                  │══ WS: op A ═══▶│
-    │                │                    │                  │                │
-    │                │── INSERT ops ──────│──────────────────│───────────────▶│
-    │                │                    │                  │          PostgreSQL
-```
+A bounded account/document/schema-scoped browser journal can retain pending steps and immutable submitted attempts for reload recovery under a defined storage policy. Recovery first reauthorizes and resolves the original attempt. Only a definitive no-effect result permits rebasing that work into a new attempt; a timeout does not. Snapshot workers publish a verified complete prefix before recording progress, and retained history supplies the suffix. The arrows distinguish these durable outcomes from disposable presence.
 
-### 3. Version Snapshot Flow
+Static application assets can use a CDN. Private document content and snapshots stay
+behind current authorization. A CDN, Redis pub/sub, or a load-balancer hash is not the
+source of truth for accepted document revisions.
 
-```
-API Server                    PostgreSQL
-     │                            │
-     │── Every 50 ops OR 5 min ──▶│
-     │                            │
-     │── BEGIN TRANSACTION ──────▶│
-     │── INSERT document_versions │
-     │── UPDATE documents.version │
-     │── COMMIT ─────────────────▶│
-```
+## Core Components / Request Flows
 
----
+### Editor and collaboration model
+
+Use a schema-aware editor such as ProseMirror rather than treating rich text as a
+flat string. Paragraph boundaries, marks, list changes, selections, and undo depend
+on its document model. Client and server agree on a schema and step format.
+
+For the proposal, choose centralized step rebasing: the authority accepts a batch
+only at its current base version, while a stale client receives the intervening steps
+and rebases its unconfirmed work. This follows the model described in the
+[ProseMirror collaboration guide](https://raw.githubusercontent.com/ProseMirror/website/master/markdown/guide/collab.md).
+It replaces the demo's custom server-side position transforms; it is not a claim that
+TipTap's Yjs collaboration extension implements the same protocol.
+
+The browser keeps the editor's displayed state, confirmed version, unconfirmed steps,
+and immutable in-flight request identity distinct. React owns the surrounding shell,
+side panels, and small status projections. It does not replace the full editor JSON
+on every network response or presence update.
+
+### Open and catch up
+
+1. Authorize the account/document pair and obtain the active owner and protocol schema.
+2. Load a verified snapshot at revision S and a contiguous committed suffix through H.
+3. Reconstruct exactly H; subscribe/replay from H so changes during load are not lost.
+4. Apply later committed batches in order, identifying the client's own accepted steps.
+5. Send version-relative presence only after the editor has a valid shared context.
+
+The snapshot's revision describes its actual content. An unrelated current head must
+not be attached to an older JSON body. Reconnect uses the same durable replay path;
+live notifications are only a latency optimization.
+
+### Admit, acknowledge, and publish an edit
+
+Each wire attempt has account/document/client scope, a unique batch ID, base version,
+schema version, and a digest of its immutable steps. Keep at most one unresolved
+submitted batch per client/document while buffering newer local transactions.
+
+The owner validates limits and schema, then serializes the request against the current
+head. A database transaction checks its fencing epoch, current access, and batch
+receipt. An already committed identical attempt returns its original version range.
+A changed payload under that ID is a conflict.
+
+If the base is stale, record a terminal no-effect outcome for this attempt and return
+a bounded suffix or a resync requirement. After that outcome is known, the client can
+rebase and create a new attempt. It must not change the payload of an uncertain attempt.
+
+For a current-base batch, apply every step to a candidate document; if any step is
+invalid, reject the entire batch. Atomically append the steps, advance the head by the
+number of steps, and store the acceptance receipt and outbox event. Only after commit
+does the owner publish this state or acknowledge durability.
+
+The owner's memory is a working copy of committed state. If a database outcome is
+unknown, resolve the receipt before admitting another conflicting write. During failover,
+a newly acquired epoch prevents an old owner from committing later.
+
+### Comments, history, and restore
+
+Comment text and discussion state have their own identities, while anchors identify
+an exact document revision and range with defined boundary affinity. Map anchors
+through accepted steps. If their text disappears, preserve the discussion as detached
+rather than attaching it to an unrelated sentence.
+
+Route comment anchoring, permission changes, and restore through the same document
+admission boundary where they depend on content or access. Simple list/read services
+can scale independently without becoming a second content writer.
+
+A history worker reconstructs a committed target revision, verifies its content hash,
+and publishes a snapshot manifest only after storage is durable. Compaction preserves
+all history needed by published manifests, active recovery windows, and retained
+operation receipts. Named historical revisions have an explicit retention policy.
+
+Restore is a new identified command, not a decrement of the head. It pins the selected
+snapshot and expected current head, preserves the current revision, and appends an
+explicit replacement/reset event. Clients with pending work keep a recovery copy when
+that structural replacement cannot be safely rebased. Preview uses a separate editor.
 
 ## Database Schema
 
+### Production ownership model — proposed additions
+
+Begin with PostgreSQL and colocate all correctness-critical rows for a document.
+The actual eight-table teaching schema is reproduced in Implementation Notes; it
+lacks the durable admission model described here.
+
+| Record | Key and important fields | Required invariant |
+|--------|--------------------------|--------------------|
+| Document head | Document ID, owner epoch, step version, schema version, access revision, deleted state | One conditional advancement of the authoritative head |
+| Accepted steps | Document ID + step version; batch ID, actor, step payload | Unique, contiguous committed history; no partial batch |
+| Attempt receipt | Document + actor + client + batch ID; digest, outcome, accepted range | Duplicate admission cannot repeat effects; rejected attempts stay rejected |
+| Access grant | Document + principal; capability, access revision | Revocation participates in current admission checks |
+| Outbox event | Durable event ID, document, committed range, publication state | Recoverable delivery after commit |
+| Snapshot manifest | Document + revision; schema, content hash, immutable object reference | Advertised revision matches verified content |
+| Comment / anchor | Document + comment; parent, author, body, resolved version, mapped range or detached state | Reply belongs to same document; anchor position has a version |
+
+Version fields cross JSON boundaries as validated decimal strings or checked safe
+integers. Do not let an unchecked database BIGINT silently become string concatenation.
+Index document lists by authorized user and activity with stable pagination; index
+steps by document/version and pending outbox work by claimable state. Enforce account
+and document bounds in queries, not only in frontend routing.
+
+## API Design
+
+### Proposed contracts
+
+Use REST for document discovery and review panels, WebSocket for editing and presence.
+Both transports call the same authoritative command service when a command changes
+content, permissions, or content-dependent anchors.
+
+| Method/channel | Proposed operation | Contract |
+|----------------|--------------------|----------|
+| GET | `/api/documents` | Authorized bounded list with stable cursor |
+| GET | `/api/documents/:id/bootstrap` | Schema, snapshot revision, committed suffix, current capability |
+| WS | Submit batch | Immutable batch ID/digest/base and bounded editor steps |
+| WS or GET | Changes after revision | Contiguous committed range, own batch identities, resync if history expired |
+| GET | `/api/documents/:id/attempts/:batchId` | Resolve an uncertain attempt under current authorization |
+| POST/PATCH | Comments and desired resolution state | Current capability, expected version, identified command |
+| GET | Versions / pinned version content | Authorized history; explicit reconstruction failure |
+| POST | Restore pinned revision | Expected head + operation ID; new committed reset event |
+| POST/DELETE | Grants | Owner authorization and access revision update |
+| WS | Presence update | Connection identity, referenced revision, cursor/selection, short expiry |
+
+A sample contract might accept batch `b7` at base 20 containing two steps and return
+accepted range 21–22. A repeat of that immutable attempt returns the same result.
+Receiving version 24 while confirmed at 22 triggers recovery of step 23; it does not
+justify advancing the confirmed version past a gap.
+
+## Key Design Decisions
+
+### Centralized rebasing and document ownership
+
+A single ordering authority fits an online document with bounded editing groups and
+makes the accepted history inspectable. Client-side step mapping handles concurrent
+changes using the editor's model. A hand-written insert/delete table cannot cover
+rich-text structure, composition, undo, and every overlapping range case.
+
+A CRDT is a legitimate alternative for independent offline work. It still needs
+server authorization, durable storage, abuse controls, and product conflict semantics.
+Its storage and garbage-collection costs depend on the implementation and workload;
+there is no justified universal “3–5× memory” claim. The centralized choice gives up
+unrestricted offline acceptance and requires explicit failover fencing.
+
+### Durable admission with asynchronous snapshots
+
+Persist small accepted batches before a saved acknowledgment; build full snapshots
+later. Short group commits can amortize storage work while each contained edit still
+waits for the commit. Debouncing the snapshot is different from discarding intermediate
+operations. The cost is database latency in acknowledgment, while local input remains
+responsive through unconfirmed state.
+
+### Ephemeral delivery with durable recovery
+
+Live fan-out and presence benefit from a fast routing layer. Content delivery must
+have a recoverable source. [Redis pub/sub](https://redis.io/docs/latest/develop/pubsub/)
+does not retain a disconnected subscriber's messages. Use sequence checking, replay,
+and periodic head reconciliation; do not rely on a later message to reveal every gap.
+
+If a durable broker is added, distinguish worker distribution from broadcasting to
+all interested gateways. One shared consumer group does not deliver each event to
+every gateway with subscribers. Partition queues, routing, and per-gateway cursors
+need an explicit design.
+
+## Consistency and Idempotency
+
+The atomic unit is one document's accepted batch, receipt, and outbox record. Database
+constraints and fencing enforce it across duplicate requests and owner replacement.
+A session cache or an expiring lock alone is insufficient.
+
+Receipt retention and reconnect support are declared product limits. Once an old
+attempt cannot be resolved, preserve local work and offer recovery; do not assume
+it failed and resend transformed content under a fresh identity. Snapshot compaction
+must not silently remove the only evidence of whether an uncertain write committed.
+
+## Security / Auth
+
+Authorize read, comment, edit, share, and delete separately. Check the active session
+and current document capability at admission, including long-lived sockets. A grant
+revocation must invalidate ongoing subscriptions and stop subsequent reads/commands;
+an already delivered copy cannot be recalled.
+
+Validate WebSocket origin, message bytes, batch size, schema version, nesting, positions,
+and permitted marks/URLs. TypeScript types do not validate network data. Keep private
+content and tokens out of logs and shared caches. Scope local recovery storage to the
+account/document, explain its retention, and clear it according to sign-out policy.
+
+## Observability
+
+Measure local input-to-paint, owner admission queue, durable commit latency, oldest
+unresolved attempt, peer visibility, replay gaps, snapshot lag, and disconnect reasons.
+These distinguish a fast in-memory ACK from a recoverable saved edit. Track aggregate
+room-size and document-size distributions without unbounded document-ID metric labels.
+
+Use structured request/batch IDs for debugging and preserve a body-free audit trail
+for restore and grant changes. Dependency health, protocol readiness, and end-to-end
+collaboration checks answer different questions.
+
+## Failure Handling
+
+| Failure | Proposed response |
+|---------|-------------------|
+| Database cannot commit | Keep local changes pending; stop saved ACKs and authoritative publication |
+| Owner crashes after commit | Resolve receipt and recover committed state under a new fenced epoch |
+| Live bus loses messages | Detect sequence/head mismatch; replay retained committed steps |
+| Slow browser | Bound its queue, coalesce presence, disconnect with resumable cursor if needed |
+| Schema mismatch or expired rebase history | Preserve work; require compatible reload or explicit recovery copy |
+| Snapshot worker fails | Retain the log; retry from the same revision; never publish incomplete content |
+| Restore races with editing | Reject stale expected head; user reviews current state before a new attempt |
+
+## Scalability Considerations
+
+Scale many documents by partitioning their owners and data. Scale connections and
+readers separately from the single-document write authority. A hot document may need
+editor admission limits, batched steps, bounded presence, and more delivery capacity;
+more stateless gateways do not increase its serialized mutation throughput.
+
+Section partitioning is a product/model change: moving a paragraph across sections,
+whole-document undo, and range comments cross the new boundaries. Introduce it only
+when measurements justify that complexity. Prefer one home region for document writes
+initially; explain failover and replica durability before promising multi-region saves.
+
+## Trade-offs Summary
+
+| Decision | Chosen | Alternative | Rationale |
+|----------|--------|-------------|-----------|
+| Collaboration | Centralized schema-aware step rebasing | CRDT | Fits bounded online editing and explicit ordered history |
+| Durability | Commit batch before saved ACK | Memory ACK plus debounce | Preserves acknowledged work after owner failure |
+| Recovery | Verified snapshots + contiguous steps | Snapshot-only overwrite | Retains accepted changes and identifies gaps |
+| Presence | Expiring connection state | Durable per-cursor history | Current intent matters more than every mouse movement |
+| Restore | New guarded history event | Direct snapshot overwrite | One mutation authority and recoverable user intent |
+| Rendering | Editor owns content; React owns shell | Global JSON replacement | Preserves composition, selection, and undo context |
+
+## Implementation Notes
+
+### What actually runs
+
+```
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ React / TipTap browser │       │ Express + ws :3001     │       │ Valkey :6379           │
+│ Stored body/local edit │◀─────▶│ REST title/review      │◀─────▶│ Sessions / receipts    │
+│ No content sync        │       │ WS presence + OT stub  │       │ Global pub/sub         │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+                                              ▲
+                                              │
+   REST reads/writes                          ├────────────────────────────────┐
+                                              │                                ▲
+                                              │                                │
+                                              ▼                                ▼
+                                 ┌────────────────────────┐       ┌────────────────────────┐
+                                 │ PostgreSQL :5432       │       │ Per-process maps       │
+                                 │ Content / review rows  │◀──────│ Version / log / users  │
+                                 │ Operations / versions  │       │ No edited content      │
+                                 └────────────────────────┘       └────────────────────────┘
+
+
+WS operations are ACKed in memory; only the last debounced operation is written to SQL.
+
+That writer advances version but does not apply content. Redis peers only forward messages.
+
+
+Vite :5173 proxies /api and /ws to :3001. No owner election, replay or multi-writer safety.
+```
+
+[Compose](./docker-compose.yml) runs PostgreSQL 16 and Valkey 7. It mounts only the
+schema, not the [seed](./backend/db-seed/seed.sql). [Backend scripts](./backend/package.json)
+start one Express/`ws` process on 3001; alternate dev scripts use 3002 and 3003, with
+no owner routing or fencing. [Vite](./frontend/vite.config.ts) proxies both transports
+to 3001. The [README](./README.md) gives Docker/native setup and actual defaults.
+
+The [frontend](./frontend/package.json) uses React 18, React Router v6, Zustand,
+Tailwind, and TipTap 2. Installed collaboration extensions are not configured in
+[Editor.tsx](./frontend/src/components/Editor.tsx); its `onUpdate` sends nothing.
+It emits selection messages and displays presence names, but no remote caret layer.
+[DocumentPage](./frontend/src/routes/DocumentPage.tsx) processes presence and errors,
+ignores incoming operations, and ignores SYNC content/version. REST PATCH updates
+only title, so local body edits have no alternative save path.
+
+### Database Schema — exact local definition
+
+The following is [backend/src/db/init.sql](./backend/src/db/init.sql), including its
+actual defaults, constraints, and indexes. It is a fresh-database initialization file,
+not the proposed production schema or a repeatable migration.
+
 ```sql
--- Users: Authentication and profile
+-- Google Docs Database Schema
+-- UUID extension
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+-- Users table
 CREATE TABLE users (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     email VARCHAR(255) UNIQUE NOT NULL,
     name VARCHAR(255) NOT NULL,
-    password_hash VARCHAR(255) NOT NULL,        -- bcrypt, cost=10
-    avatar_color VARCHAR(7) DEFAULT '#3B82F6',  -- Hex color for presence
+    password_hash VARCHAR(255) NOT NULL,
+    avatar_color VARCHAR(7) DEFAULT '#3B82F6',
     role VARCHAR(20) DEFAULT 'user' CHECK (role IN ('user', 'admin')),
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    updated_at TIMESTAMPTZ DEFAULT NOW()
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
--- Documents: Rich text content as ProseMirror JSON
+-- Sessions table for Redis-backed auth
+CREATE TABLE sessions (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    token VARCHAR(255) UNIQUE NOT NULL,
+    expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Documents table
 CREATE TABLE documents (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     title VARCHAR(500) NOT NULL DEFAULT 'Untitled Document',
     owner_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    current_version BIGINT DEFAULT 0,           -- OT version counter
-    content JSONB NOT NULL,                     -- ProseMirror document JSON
-    is_deleted BOOLEAN DEFAULT FALSE,           -- Soft delete
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    updated_at TIMESTAMPTZ DEFAULT NOW()
+    current_version BIGINT DEFAULT 0,
+    content JSONB DEFAULT '{"type":"doc","content":[{"type":"paragraph","content":[]}]}',
+    is_deleted BOOLEAN DEFAULT FALSE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
--- Permissions: Sharing with granular access levels
+-- Document permissions
 CREATE TABLE document_permissions (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     document_id UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
     user_id UUID REFERENCES users(id) ON DELETE CASCADE,
-    email VARCHAR(255),                         -- For invite-by-email before signup
-    permission_level VARCHAR(20) NOT NULL
-        CHECK (permission_level IN ('view', 'comment', 'edit')),
-    created_at TIMESTAMPTZ DEFAULT NOW(),
+    email VARCHAR(255),
+    permission_level VARCHAR(20) NOT NULL CHECK (permission_level IN ('view', 'comment', 'edit')),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     UNIQUE(document_id, user_id),
     UNIQUE(document_id, email)
 );
 
--- Operations: Append-only log for OT replay and debugging
-CREATE TABLE operations (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    document_id UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
-    version_number BIGINT NOT NULL,
-    operation JSONB NOT NULL,                   -- {type, position, text/length, attrs}
-    user_id UUID REFERENCES users(id),
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    UNIQUE(document_id, version_number)
-);
-
--- Versions: Periodic snapshots for history and recovery
+-- Document versions (snapshots)
 CREATE TABLE document_versions (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     document_id UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
     version_number BIGINT NOT NULL,
-    content JSONB NOT NULL,                     -- Full document snapshot
+    content JSONB NOT NULL,
     created_by UUID REFERENCES users(id),
-    is_named BOOLEAN DEFAULT FALSE,             -- User-named versions
+    is_named BOOLEAN DEFAULT FALSE,
     name VARCHAR(255),
-    created_at TIMESTAMPTZ DEFAULT NOW(),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     UNIQUE(document_id, version_number)
 );
 
--- Comments: Threaded comments anchored to text ranges
+-- Operations log for OT
+CREATE TABLE operations (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    document_id UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    version_number BIGINT NOT NULL,
+    operation JSONB NOT NULL,
+    user_id UUID REFERENCES users(id),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    UNIQUE(document_id, version_number)
+);
+
+-- Comments
 CREATE TABLE comments (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     document_id UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
     parent_id UUID REFERENCES comments(id) ON DELETE CASCADE,
-    anchor_start INTEGER,                       -- Character offset
+    anchor_start INTEGER,
     anchor_end INTEGER,
-    anchor_version BIGINT,                      -- Version when anchor was created
+    anchor_version BIGINT,
     content TEXT NOT NULL,
     author_id UUID NOT NULL REFERENCES users(id),
     resolved BOOLEAN DEFAULT FALSE,
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    updated_at TIMESTAMPTZ DEFAULT NOW()
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
--- Suggestions: Track changes for review workflow
+-- Suggestions (tracked changes)
 CREATE TABLE suggestions (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     document_id UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
-    suggestion_type VARCHAR(20) NOT NULL
-        CHECK (suggestion_type IN ('insert', 'delete', 'replace')),
+    suggestion_type VARCHAR(20) NOT NULL CHECK (suggestion_type IN ('insert', 'delete', 'replace')),
     anchor_start INTEGER NOT NULL,
     anchor_end INTEGER NOT NULL,
     anchor_version BIGINT NOT NULL,
     original_text TEXT,
     suggested_text TEXT,
     author_id UUID NOT NULL REFERENCES users(id),
-    status VARCHAR(20) DEFAULT 'pending'
-        CHECK (status IN ('pending', 'accepted', 'rejected')),
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    updated_at TIMESTAMPTZ DEFAULT NOW()
+    status VARCHAR(20) DEFAULT 'pending' CHECK (status IN ('pending', 'accepted', 'rejected')),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
--- Sessions: Server-side session storage (backup to Redis)
-CREATE TABLE sessions (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    token VARCHAR(255) UNIQUE NOT NULL,
-    expires_at TIMESTAMPTZ NOT NULL,
-    created_at TIMESTAMPTZ DEFAULT NOW()
-);
-```
-
-### Key Indexes
-
-```sql
-CREATE INDEX idx_documents_owner ON documents(owner_id) WHERE NOT is_deleted;
+-- Indexes
+CREATE INDEX idx_documents_owner ON documents(owner_id);
 CREATE INDEX idx_documents_updated ON documents(updated_at DESC);
 CREATE INDEX idx_document_permissions_user ON document_permissions(user_id);
-CREATE INDEX idx_operations_doc ON operations(document_id, version_number);
 CREATE INDEX idx_document_versions_doc ON document_versions(document_id, version_number DESC);
+CREATE INDEX idx_operations_doc ON operations(document_id, version_number);
 CREATE INDEX idx_comments_doc ON comments(document_id);
 CREATE INDEX idx_suggestions_doc ON suggestions(document_id);
 CREATE INDEX idx_sessions_token ON sessions(token);
+CREATE INDEX idx_sessions_user ON sessions(user_id);
+
+-- Seed data is in db-seed/seed.sql
 ```
 
-### Redis Data Structures
+This schema has no owner epoch, durable operation ID/digest, accepted-batch receipt,
+or outbox. JSONB columns are not validated against an editor schema in PostgreSQL.
+Permission rows do not require exactly one of user/email, comment parents are not
+constrained to the same document, and nullable/default fields differ from the older
+architecture's stronger schema claims.
 
-| Key Pattern | Type | TTL | Purpose |
-|-------------|------|-----|---------|
-| `session:{token}` | String (JSON) | 24h | User session data |
-| `doc:{id}:version` | String (int) | None | Current OT version for document |
-| `doc:{id}:ops` | List | 1h | Recent ops buffer for late joiners |
-| `presence:{docId}` | Set | None | User IDs currently in document |
-| `user:{userId}:cursor:{docId}` | Hash | 30s | Cursor position {line, col, selection} |
-| `channel:doc:{id}` | Pub/Sub | N/A | Operation broadcast channel |
-| `channel:presence:{id}` | Pub/Sub | N/A | Presence update channel |
+### Source-traced behavior and gaps
 
----
+| Path | Observed implementation and consequence |
+|------|-----------------------------------------|
+| [Document routes](./backend/src/routes/documents.ts) | Authorized list/open, create plus initial snapshot, title-only PATCH, soft-delete, owner share/remove grant. List is unpaginated and ordered primarily by UUID. Create uses separate SQL writes. |
+| [Collaboration state](./backend/src/services/collaboration/state.ts) and [types](./backend/src/services/collaboration/types.ts) | Each process holds version, operation arrays, and user-keyed presence; it holds no edited content. |
+| [Subscribe](./backend/src/services/collaboration/sync.ts) | Reads SQL content and combines it with the in-memory version. Initializes an empty log even for a nonzero database version; no snapshot-plus-suffix reconstruction. |
+| [Operation handling](./backend/src/services/collaboration/ot.ts) | Accepts any subscribed client's operation without checking edit capability, current grant, deletion, valid base, or schema. Uses `operationLog.slice(clientVersion)` although the array has no absolute version origin. |
+| [OT helpers](./backend/src/services/ot.ts) | Flat insert/delete examples, format pass-through, no general rich-text step model. Equal-position inserts always shift the first operand; symmetric application can diverge without a coordinated protocol. Apply/anchor helpers are not called by collaboration persistence. |
+| [Persistence](./backend/src/services/collaboration/persist.ts) | A one-second inactivity timer retains only its last operation, not a batch. Continuous edits can postpone writes indefinitely. Separate statements append that operation and update the version; they never update document content. |
+| [Snapshot persistence](./backend/src/services/collaboration/persist.ts) | Only a persisted version divisible by 100 copies the existing SQL content. Skipped versions and stale content prevent the claimed bounded replay guarantee. |
+| [Cross-server handlers](./backend/src/services/collaboration/index.ts) | Global `doc:operations`/`doc:presence` subscriptions forward messages but do not update peer process version/log/presence state. There is no durable replay. |
+| [Presence](./backend/src/services/collaboration/presence.ts) | User-keyed local map conflates multiple tabs. One tab leaving can remove the user's presence and even the document state while another tab remains. Leave messages are not published to Redis. |
+| [Version routes](./backend/src/routes/versions.ts) | Read only exact stored snapshots, list up to 100, name the current SQL snapshot, restore via separate writes. No operation replay, owner coordination, or broadcast accompanies restore. |
+| [Comments](./backend/src/routes/comments.ts) and [suggestions](./backend/src/routes/suggestions.ts) | REST discussion/status records; comments are not mapped through edits and accepting a suggestion does not modify content. Auxiliary access queries omit `is_deleted`; author mutation checks do not recheck current membership. |
 
-## Storage Strategy
+`documents.current_version` is BIGINT. The [default pg parser](https://github.com/brianc/node-pg-types)
+returns it as a string; no local parser override exists. The restore handler's
+`current_version + 1` therefore turns `5` into `51`. Creating a snapshot does not
+capture unsent browser text, despite the history panel's reassuring restore prompt.
 
-### Write Path
+The [document store](./frontend/src/stores/documentStore.ts) updates after successful
+requests, not before them. It shares one current document, comments array, history
+array, and loading/error state without account/document request generations. Late
+responses can replace a newer route's data. Comment/version actions swallow failures;
+[CommentsPanel](./frontend/src/components/CommentsPanel.tsx) then clears authored input.
 
-1. Operation arrives via WebSocket
-2. Transform against pending ops (OT algorithm)
-3. Assign version number (Redis INCR)
-4. Append to Redis ops buffer
-5. Broadcast via Redis pub/sub
-6. Async batch insert to PostgreSQL operations table
-7. Periodic snapshot to document_versions + update documents.content
+[WebSocketService](./frontend/src/services/websocket.ts) reconnects with linear delays
+of 1–5 seconds and resubscribes. It does not replay its pending operation array or
+attach operation IDs, and deliberate close can still schedule reconnect. The page's
+connection flag is not updated on later transport close. Idle sockets are closed after
+60 seconds of inactivity by a 30-second server scan, with no client heartbeat.
 
-### Read Path
+### Production patterns actually wired
 
-1. Load document.content from PostgreSQL (full snapshot)
-2. Fetch ops from Redis buffer since last snapshot version
-3. Apply ops to bring client up to current state
-4. Subscribe to pub/sub for live updates
+[HTTP authentication](./backend/src/middleware/auth.ts) checks the cookie or bearer
+session token in Valkey, falling back to PostgreSQL only on a cache miss. A Redis
+error fails authentication; it is not an outage fallback. [Login/register](./backend/src/routes/auth.ts)
+create UUID tokens and seven-day database/cache sessions; a SQL fallback fills a
+one-hour cache entry without clamping it to remaining session lifetime.
 
-### Caching Strategy
+The browser also persists the token in localStorage and puts it in the WebSocket URL.
+WebSocket admission checks only Redis. Neither session revocation nor document grant
+changes evict existing sockets, and the server does not validate WebSocket origin.
+These details differ from the old “instant revocation” and cookie-only claims.
 
-| Data | Strategy | TTL | Invalidation |
-|------|----------|-----|--------------|
-| Document content | Cache-aside | 5 minutes | On any edit operation |
-| User profile | Cache-aside | 1 hour | On profile update |
-| Permission | Cache-aside | 10 minutes | On share/unshare |
-| Session | Write-through | 24 hours | On logout or expiry |
+[RBAC middleware](./backend/src/shared/rbac.ts) is wired to document title/share/delete
+routes, with owner-only sharing/deletion. Other routes perform their own SQL checks;
+WebSocket edits do not use that middleware. No admin-management or transfer-ownership
+route is mounted. Email-only grants are not converted on registration.
 
----
+[HTTP idempotency middleware](./backend/src/middleware/idempotency.ts) is optional on
+create/title/share. It uses a 30-second Redis lock and one-hour result cache; keys
+omit method/path and payload digest, storage follows the response, and failures fail
+open. The browser sends no idempotency header. [WebSocket receipt caching](./backend/src/shared/idempotency.ts)
+is also optional and uses a lookup followed by processing without a claim lock.
+Concurrent duplicates can both advance state; neither path is atomic with SQL.
 
-## API Design
+The following actual wrapper illustrates dependency isolation, not durable retry:
 
-### REST Endpoints
-
-```
-Authentication:
-POST   /api/auth/register     - Create account
-POST   /api/auth/login        - Create session
-POST   /api/auth/logout       - Destroy session
-GET    /api/auth/me           - Get current user
-
-Documents:
-GET    /api/docs              - List user's documents (owned + shared)
-POST   /api/docs              - Create document
-GET    /api/docs/:id          - Get document with content
-PUT    /api/docs/:id          - Update document metadata (title)
-DELETE /api/docs/:id          - Soft delete document
-
-Sharing:
-GET    /api/docs/:id/permissions        - List permissions
-POST   /api/docs/:id/permissions        - Add permission
-DELETE /api/docs/:id/permissions/:pid   - Remove permission
-
-Comments:
-GET    /api/docs/:id/comments           - List comments
-POST   /api/docs/:id/comments           - Create comment
-PUT    /api/docs/:id/comments/:cid      - Update/resolve comment
-DELETE /api/docs/:id/comments/:cid      - Delete comment
-
-Versions:
-GET    /api/docs/:id/versions           - List versions
-GET    /api/docs/:id/versions/:vid      - Get version content
-POST   /api/docs/:id/versions/:vid/restore - Restore to version
-
-Admin (role=admin only):
-GET    /api/admin/users                 - List users
-GET    /api/admin/stats                 - System statistics
+```typescript
+export const persistCircuitBreaker = createCircuitBreaker(
+  'db-persist',
+  persistOperationToDb,
+  OT_SYNC_OPTIONS
+);
 ```
 
-### WebSocket Protocol
-
-```
-Client -> Server:
-{ type: 'join', docId, version }
-{ type: 'leave', docId }
-{ type: 'operation', docId, version, op }
-{ type: 'cursor', docId, position }
-{ type: 'ping' }
-
-Server -> Client:
-{ type: 'joined', docId, version, ops, users }
-{ type: 'operation', docId, version, op, userId }
-{ type: 'ack', docId, version }
-{ type: 'cursor', docId, userId, position }
-{ type: 'presence', docId, users }
-{ type: 'error', code, message }
-{ type: 'pong' }
-```
-
----
-
-## Key Design Decisions
-
-### Operational Transformation (OT) vs CRDT
-
-**Decision**: Use OT for collaborative editing.
-
-OT requires a central authority (the server) to order operations, which fits our architecture where each document is routed to a specific server via sticky sessions. CRDTs would eliminate this central authority requirement, enabling true peer-to-peer and offline-first editing, but they carry per-character metadata that increases memory usage by 3-5x for text-heavy documents. For a 50KB document, CRDT metadata could add 150-250KB of overhead per client.
-
-The trade-off is that OT makes offline editing harder -- queued operations must be carefully transformed against the server's accepted operations on reconnect. For a document editor where users are almost always online, this is acceptable. If we needed robust offline support (like a mobile-first editor), CRDTs would be the better choice despite the memory cost.
-
-### Sticky Sessions by Document
-
-**Decision**: Route all WebSocket connections for a document to the same server via consistent hashing on document_id.
-
-This means a single server holds the authoritative OT state for each document, eliminating distributed coordination for operation ordering. Without sticky sessions, every operation would require a distributed lock or consensus protocol to determine ordering, adding 10-50ms of latency per keystroke -- users would perceive this as laggy.
-
-The trade-off is hot-spot risk: a viral document with 200 concurrent editors concentrates all load on one server. We mitigate this with Redis pub/sub for cross-server presence updates, and at extreme scale, document sectioning (splitting a document into independently editable regions).
-
-### Session-based Auth (not JWT)
-
-**Decision**: Cookie-based sessions stored in Redis.
-
-For a collaborative editor, immediate session revocation is critical -- if a user is removed from a shared document, their WebSocket connection should be terminated within seconds, not wait for a JWT to expire. Redis session lookup adds ~1ms per request, but enables instant revocation with a single `DEL` command. JWTs would require maintaining a blocklist, negating their stateless advantage. Cookies are also sent automatically with WebSocket upgrade requests, simplifying the auth flow.
-
----
-
-## Consistency and Idempotency
-
-### Idempotency for OT Operations
-
-Network connections are unreliable. Clients must retry operations when they do not receive acknowledgments, but without idempotency, retries corrupt document state:
-- User types "hello" at position 10; network drops before ACK; client retries; without idempotency, "hellohello" appears.
-- OT version vectors depend on exact operation counts; duplicate operations corrupt ordering across all clients.
-
-Each WebSocket message includes a unique `operationId`. The server checks Redis for an existing result before processing. If found, it returns the cached ACK without re-applying the operation. Key format: `op:{userId}:{documentId}:{operationId}` with 1-hour TTL.
-
-For HTTP requests, clients include an `Idempotency-Key` header on POST/PUT/PATCH/DELETE. The server caches the response and returns it for duplicate requests.
-
----
-
-## Security
-
-### Authentication
-
-- **Password hashing**: bcrypt with cost factor 10
-- **Session tokens**: Cryptographically random 32-byte tokens
-- **Session storage**: Redis primary, PostgreSQL backup
-- **Session expiry**: 24 hours, sliding window on activity
-
-### Authorization (RBAC)
-
-| Role | Permissions |
-|------|-------------|
-| **Owner** | Full control: edit, share, delete, transfer ownership |
-| **Editor** | Edit content, add comments, view history |
-| **Commenter** | Add comments and suggestions, view content |
-| **Viewer** | Read-only access to content and comments |
-| **Admin** | System-wide: user management, all documents access |
-
-Enforcement occurs at three layers: REST middleware checks permission before handlers; WebSocket operations are validated against permission level stored in connection state; database queries include permission joins.
-
-### Rate Limiting
-
-| Endpoint | Limit | Window |
-|----------|-------|--------|
-| POST /api/auth/login | 5 attempts | 15 minutes |
-| POST /api/auth/register | 3 accounts | 1 hour (per IP) |
-| WebSocket operations | 100 ops | 1 second (per user per doc) |
-| API requests | 100 requests | 1 minute (per user) |
-
----
-
-## Observability
-
-### Metrics (Prometheus)
-
-| Metric | Type | Purpose |
-|--------|------|---------|
-| `http_requests_total{method,path,status}` | Counter | Request volume by endpoint |
-| `http_request_duration_seconds{method,path}` | Histogram | API latency SLI |
-| `websocket_connections_active{server}` | Gauge | WebSocket load per server |
-| `ot_operations_total{type}` | Counter | OT operations by type (insert/delete) |
-| `ot_operation_latency_ms` | Histogram | Sync latency SLI |
-| `documents_active_total` | Gauge | Documents with active editors |
-| `cache_requests_total{cache,result}` | Counter | Cache hit/miss ratio |
-| `circuit_breaker_state{name}` | Gauge | Circuit breaker health |
-
-### Key SLIs and Alerts
-
-| SLI | Target | Alert Threshold |
-|-----|--------|-----------------|
-| API availability | 99.99% | < 99.9% over 5 min |
-| API p95 latency | < 200ms | > 500ms over 5 min |
-| WebSocket sync latency | < 100ms p95 | > 250ms over 5 min |
-| OT conflict rate | < 5% | > 10% over 5 min |
-| Error rate (5xx) | < 0.1% | > 1% |
-
-### Structured Logging
-
-JSON-formatted logs with correlation via trace IDs propagated through HTTP headers, WebSocket messages, and Redis pub/sub. Spans track: client keystroke, WebSocket receive, OT transform, Redis publish, PostgreSQL insert, and broadcast to clients.
-
----
-
-## Failure Handling
-
-### Circuit Breaker
-
-| Dependency | Open After | Half-Open After | Fallback |
-|------------|-----------|-----------------|----------|
-| PostgreSQL | 5 consecutive failures | 30 seconds | Serve from Redis cache, queue writes |
-| Redis | 10 consecutive failures | 10 seconds | Sessions from PostgreSQL, no presence |
-
-### Graceful Degradation
-
-| Failure | Degradation | User Impact |
-|---------|-------------|-------------|
-| Redis down | Sessions from PostgreSQL, no presence | Slower auth, no cursors |
-| PostgreSQL readonly | Disable saves, show banner | View-only mode |
-| Single API server down | LB routes to others | Brief reconnection |
-| WebSocket disconnect | Auto-reconnect with backoff | 1-5s interruption |
-
-### Retry Strategy
-
-| Operation | Retries | Backoff | Idempotency |
-|-----------|---------|---------|-------------|
-| PostgreSQL query | 3 | Exponential (100ms, 200ms, 400ms) | Read-only safe |
-| PostgreSQL write | 3 | Exponential | Idempotency key in request |
-| Redis operation | 3 | Exponential (50ms base) | Safe (atomic ops) |
-| OT broadcast | 2 | Fixed 100ms | Message ID dedup |
-
----
-
-## Scalability Considerations
-
-### Horizontal Scaling
-
-1. **API Servers**: Add instances behind load balancer. Sticky sessions by document_id ensure OT consistency. Redis pub/sub synchronizes across instances.
-2. **Read Replicas**: PostgreSQL streaming replication. Route read queries (document list, version history) to replicas. Writes always to primary.
-3. **Redis Cluster**: Partition presence data by document_id hash. Dedicated pub/sub nodes.
-
-### Vertical Limits
-
-| Component | Limit | Mitigation |
-|-----------|-------|------------|
-| Document size | 10MB content JSONB | Split into chapters/sections |
-| Concurrent editors | ~50 per document | Shard by document section |
-| Operations/second | 1000 per document | Batch operations client-side |
-| WebSocket connections | ~10K per server | Add servers, connection pooling |
-
-### What Breaks First
-
-At 100K concurrent editors, Redis pub/sub becomes the bottleneck -- each operation is published once but delivered to all subscribers on the channel. Moving to Kafka with consumer groups and partitioning by document_id would provide ordered delivery at higher throughput. At 1M documents, PostgreSQL needs sharding by document_id hash or range. The operations table grows fastest and should be the first candidate for time-based partitioning with automatic old-partition archival.
-
----
-
-## Trade-offs Summary
-
-| Decision | Chosen | Alternative | Rationale |
-|----------|--------|-------------|-----------|
-| Conflict resolution | OT | CRDT | Lower memory overhead, simpler with central server |
-| Document storage | PostgreSQL JSONB | MongoDB/CouchDB | Fewer moving parts, JSONB handles it well |
-| Cross-server sync | Redis pub/sub | RabbitMQ/Kafka | Simpler for ephemeral messages, no persistence needed |
-| Editor framework | TipTap/ProseMirror | Slate.js, Quill | Best collaborative editing support |
-| Session routing | Sticky sessions | Distributed OT | Avoids distributed consensus per keystroke |
-| Auth mechanism | Session cookies | JWT | Instant revocation, simpler WebSocket auth |
-| Real-time transport | WebSocket | SSE | Bidirectional needed for operations and acks |
-
----
-
-## Frontend Architecture
-
-This section describes the actual frontend implementation: component hierarchy, state management, routing, data fetching, real-time collaboration integration, rich text editing, and key UI patterns.
-
-### Component Hierarchy
-
-```
-App.tsx (BrowserRouter)
-├── LoginPage / RegisterPage              (public routes)
-├── HomePage                              (document list)
-│   ├── Header                            (app bar, user info)
-│   └── DocumentList                      (grid of document cards)
-└── DocumentPage                          (collaborative editor)
-    ├── DocumentHeader                    (title, presence dots, panel toggles)
-    ├── Editor                            (TipTap rich text editor)
-    │   ├── EditorToolbar                 (bold, italic, headings, lists, etc.)
-    │   └── EditorContent (TipTap)        (ProseMirror-rendered document)
-    ├── CommentsPanel                     (threaded comments sidebar)
-    ├── VersionHistoryPanel               (version list, restore, create)
-    └── ShareModal                        (permission management)
-```
-
-The top-level `App.tsx` uses React Router (`BrowserRouter`) with `ProtectedRoute` and `PublicRoute` wrappers that check `useAuthStore` for authentication state. Unauthenticated users are redirected to `/login`; authenticated users are redirected away from auth pages to `/`.
-
-### Zustand Stores
-
-The frontend uses two Zustand stores that separate concerns between authentication and document-level state.
-
-**`authStore.ts` -- Authentication State**
-
-Manages user session, token persistence, and WebSocket token synchronization. Uses Zustand's `persist` middleware to save the session token to `localStorage`, enabling session restoration across page reloads. On login or registration, the store calls `wsService.setToken(token)` to prepare the WebSocket service for authenticated connections. On logout, it calls `wsService.disconnect()` to tear down real-time connections.
-
-Key state: `user`, `token`, `isLoading`, `error`. Actions: `login`, `register`, `logout`, `checkAuth`.
-
-**`documentStore.ts` -- Document, Presence, Comments, and Versions**
-
-A single store managing all document-related state: the document list, the currently open document, presence (active collaborators), comments with threading, and version history. All async actions handle loading and error states internally, and operations that modify lists (create, delete, update) perform optimistic in-memory updates.
-
-Key state: `documents` (list view), `currentDocument` (editor view), `presence` (collaborator cursors), `comments`, `versions`. Actions include CRUD for documents, presence management (`setPresence`, `updatePresence`, `removePresence`), comment operations (create, reply, resolve, delete), and version operations (create, restore).
-
-### Routing
-
-The application uses React Router v6 with four routes:
-
-| Route | Component | Auth | Purpose |
-|-------|-----------|------|---------|
-| `/login` | `LoginPage` | Public only | Email/password login form |
-| `/register` | `RegisterPage` | Public only | Account creation form |
-| `/` | `HomePage` | Protected | Document list with create button |
-| `/document/:id` | `DocumentPage` | Protected | Collaborative editor |
-
-### Data Fetching
-
-All API calls go through a centralized `services/api.ts` module that provides typed functions for each endpoint (`authApi`, `documentsApi`, `commentsApi`, `versionsApi`). Each function wraps `fetch()` with the auth token header and returns a typed response object with `{ success, data, error }`. The Zustand stores call these functions in their async actions, updating store state on success and setting error messages on failure.
-
-### Real-Time Collaboration and WebSocket Integration
-
-The WebSocket service (`services/websocket.ts`) is a singleton class (`WebSocketService`) that manages the entire real-time lifecycle:
-
-1. **Connection**: Connects to `ws://host/ws?token=<sessionToken>` when the user opens a document. The token is passed as a query parameter for authentication during the upgrade handshake.
-
-2. **Document subscription**: `DocumentPage` calls `wsService.subscribe(docId)` on mount and `wsService.unsubscribe()` on unmount. The server responds with a `SYNC` message containing the current presence list.
-
-3. **Operation sending**: When the TipTap editor detects a document change (`onUpdate`), the client would calculate OT operations from ProseMirror transaction steps and send them via `wsService.sendOperation(operations, version)`. Operations are queued in `pendingOperations` until the server sends an `ACK` with the confirmed version number.
-
-4. **Cursor sync**: On `onSelectionUpdate`, the editor sends cursor position (`sendCursor`) or selection range (`sendSelection`) to other collaborators. These arrive as `CURSOR` messages and are stored in the document store's `presence` array.
-
-5. **Reconnection**: On WebSocket close, the service automatically reconnects with exponential backoff (base 1s, up to 5 attempts). On reconnect, it re-subscribes to the current document.
-
-6. **Message handling**: `DocumentPage` registers a message handler via `wsService.addMessageHandler()` that processes `SYNC`, `PRESENCE`, `CURSOR`, and `ERROR` messages, updating the document store accordingly.
-
-### Rich Text Editing
-
-The editor uses TipTap (a wrapper around ProseMirror) with the following extensions:
-
-| Extension | Purpose |
-|-----------|---------|
-| `StarterKit` | Bold, italic, strike, headings (1-6), bullet/ordered lists, blockquotes, code blocks, horizontal rules, undo/redo (depth=100) |
-| `Underline` | Underline formatting |
-| `Highlight` | Multi-color text highlighting |
-| `TextStyle` + `Color` | Text color changes |
-| `Placeholder` | "Start typing..." placeholder in empty documents |
-
-The `EditorToolbar` component provides formatting buttons that call TipTap commands (e.g., `editor.chain().focus().toggleBold().run()`). The toolbar renders above the editor and shows active formatting states.
-
-Document content is stored as ProseMirror JSON in the database. When the document loads, `editor.commands.setContent(document.content)` hydrates the editor. Content changes are detected via the `onUpdate` callback, which checks `transaction.docChanged`.
-
-### Key UI Patterns
-
-- **Permission-based read-only mode**: The `Editor` component accepts a `readOnly` prop derived from `currentDocument.permission_level === 'view'`. When read-only, the toolbar is hidden and a "View only" banner appears at the bottom.
-- **Presence indicators**: Active collaborators appear as colored dots with names in the top-right corner of the editor. Each user has a unique `avatar_color` stored in the database.
-- **Side panels**: Comments and version history render as slide-in panels to the right of the editor, toggled by header buttons. Both panels fetch their data independently via the document store.
-- **Google Docs-style document page**: The editor is rendered inside a fixed-width container (816px, matching US Letter width) with a white background and shadow, centered on a gray background, mimicking the appearance of a printed page.
-- **Loading states**: Spinner components appear during async operations (auth check, document load). Error states show a message with a "Go back to home" link.
-
----
-
-## Deep Pattern Explanations
-
-This section explains each production-grade pattern implemented in the backend, written for readers encountering these patterns for the first time.
-
-### RBAC (Role-Based Access Control)
-
-**What it is**: RBAC is a method of restricting system access based on the roles assigned to individual users, rather than granting permissions directly to each user. Instead of saying "Alice can edit document X," you say "Alice has the Editor role on document X, and Editors can edit."
-
-**Why it matters**: Without RBAC, permission checks become a tangled web of per-user, per-resource rules that are impossible to audit or modify at scale. When a team lead leaves and a new person takes over, you change one role assignment instead of updating hundreds of individual permissions.
-
-**How it works in this project**: The system defines five roles -- Owner, Editor, Commenter, Viewer, and Admin -- each with a specific set of capabilities. The `document_permissions` table maps a user to a document with a permission level (`view`, `comment`, `edit`). Ownership is tracked via `documents.owner_id`. The RBAC middleware (`backend/src/shared/rbac.ts`) intercepts every REST request and WebSocket operation, looks up the user's role for the target document, and rejects the request if the role lacks the required capability. For example, a Viewer can call `GET /api/docs/:id` but receives a 403 if they attempt `PUT /api/docs/:id`. WebSocket connections store the permission level in connection state, so operation messages are validated without a database query on every keystroke.
-
-**The enforcement layers**: Permissions are checked at three points: (1) REST middleware before route handlers, (2) WebSocket operation handlers before processing, and (3) database queries that include permission joins as a safety net.
-
-### Redis Cache-Aside
-
-**What it is**: Cache-aside (also called "lazy loading") is a caching strategy where the application checks the cache first for requested data. On a cache miss, the application reads from the database, stores the result in the cache, and returns it. On a cache hit, the database is skipped entirely.
-
-**Why it matters**: Database queries are expensive -- they require network round-trips, disk I/O, and query planning. For data that is read far more often than written (like user profiles, document metadata, and permissions), caching eliminates most database load. In a collaborative editor, the same document metadata might be requested hundreds of times per minute by different collaborators.
-
-**How it works in this project**: When a request needs document content, the server first checks Redis for a cached copy under the key pattern (e.g., `doc:{id}:content`). If found, it returns the cached data immediately (~1ms). If not found, it queries PostgreSQL (~5-20ms), stores the result in Redis with a TTL (5 minutes for content, 1 hour for user profiles, 10 minutes for permissions), and returns the data. When a document is edited, the cache entry is explicitly deleted (invalidated) so the next read fetches fresh data from the database.
-
-**Cache invalidation**: This is the hard part. The project uses explicit invalidation: when a write operation occurs, the corresponding cache key is deleted. Session data uses a different strategy -- write-through -- where both Redis and PostgreSQL are updated simultaneously, because session validity is critical and cannot tolerate staleness.
-
-### Circuit Breaker
-
-**What it is**: A circuit breaker is a stability pattern borrowed from electrical engineering. It wraps calls to external dependencies (databases, caches, APIs) and monitors their failure rate. When failures exceed a threshold, the circuit "opens" and subsequent calls fail immediately without attempting the operation, preventing cascading failures. After a timeout, the circuit enters "half-open" state and allows a test request through. If it succeeds, the circuit closes and normal operation resumes.
-
-**Why it matters**: Without a circuit breaker, when PostgreSQL becomes slow or unresponsive, every API request blocks waiting for a database timeout (typically 10-30 seconds). This exhausts the server's connection pool and thread/event loop capacity, causing the entire application to become unresponsive -- even for operations that do not need the database. The circuit breaker detects the failure pattern and fails fast, allowing the server to serve degraded responses (e.g., cached data from Redis) rather than hanging.
-
-**How it works in this project**: The implementation uses the Opossum library (`backend/src/shared/circuitBreaker.ts`). Two circuit breakers are configured: one for PostgreSQL (opens after 5 consecutive failures, tries again after 30 seconds) and one for Redis (opens after 10 failures, tries again after 10 seconds). When the PostgreSQL circuit opens, the server serves documents from Redis cache and queues writes for later. When the Redis circuit opens, session validation falls back to PostgreSQL. Circuit breaker state transitions are logged and tracked via a Prometheus gauge metric (`circuit_breaker_state`), enabling alerts when a dependency is unhealthy.
-
-### Structured Logging
-
-**What it is**: Structured logging means emitting log entries as machine-parseable data (typically JSON) rather than free-form text strings. Instead of `"User alice loaded document 123 in 45ms"`, a structured log entry is `{"level":"info","userId":"alice","action":"document_load","documentId":"123","duration_ms":45,"timestamp":"2024-01-15T10:30:00Z"}`.
-
-**Why it matters**: Free-form text logs are easy to read in a terminal but impossible to query at scale. When you have 10 servers producing thousands of log lines per second, finding all requests from a specific user that took longer than 200ms requires parsing every log line with regex. Structured logs can be ingested into log aggregation systems (Elasticsearch, Datadog, CloudWatch Logs) and queried like a database: `SELECT * WHERE userId = 'alice' AND duration_ms > 200`.
-
-**How it works in this project**: The project uses Pino (`backend/src/shared/logger.ts`), a high-performance JSON logger for Node.js. Every log entry includes a base context: service name, environment, and timestamp. Request-scoped context is added via child loggers that attach `requestId`, `userId`, `method`, and `path` to every log entry within that request. Trace IDs are propagated through HTTP headers, WebSocket messages, and Redis pub/sub messages, enabling end-to-end tracing of a single operation across all components. Log levels follow standard severity: `info` for normal operations, `warn` for degraded states (cache misses, circuit breaker transitions), `error` for failures, and `fatal` for unrecoverable errors that trigger shutdown.
-
-### Prometheus Metrics
-
-**What it is**: Prometheus is a time-series monitoring system where applications expose numeric metrics at an HTTP endpoint (`/metrics`), and a Prometheus server periodically scrapes (fetches) these metrics. Each metric has a name, a type, and optional labels. The three core metric types are: **Counter** (monotonically increasing value, like total requests), **Histogram** (distribution of values, like request latency buckets), and **Gauge** (point-in-time value that can go up or down, like active connections).
-
-**Why it matters**: Without metrics, you cannot answer basic operational questions: "What is the p95 API latency?" "How many cache misses are we seeing?" "Is the WebSocket connection count growing?" Metrics enable dashboards (Grafana), alerting (PagerDuty), and capacity planning. They are the foundation of SLI/SLO-based reliability management.
-
-**How it works in this project**: The implementation uses prom-client (`backend/src/shared/metrics.ts`). Key metrics include: `http_request_duration_seconds` (histogram, tracks API latency by method/path), `websocket_connections_active` (gauge, tracks concurrent connections per server), `ot_operations_total` (counter, tracks insert/delete operations), `ot_operation_latency_ms` (histogram, tracks time from operation receipt to broadcast), `cache_requests_total` (counter with `hit`/`miss` labels, tracks cache effectiveness), and `circuit_breaker_state` (gauge, 0=closed/1=open/2=half-open). These metrics are scraped by Prometheus and visualized in Grafana dashboards, with alerts configured for SLI violations (e.g., p95 latency > 500ms for 5 minutes).
-
-### Rate Limiting
-
-**What it is**: Rate limiting restricts how many requests a client can make within a time window. It protects the server from abuse (intentional or accidental), ensures fair resource sharing among users, and prevents a single misbehaving client from degrading service for everyone.
-
-**Why it matters**: Without rate limiting, a single user running a script that polls the API every 10ms could generate 6,000 requests per minute -- enough to saturate a database connection pool and slow down the entire application. In a collaborative editor, a buggy client extension could flood the WebSocket with operations, overwhelming the OT engine.
-
-**How it works in this project**: Rate limits are enforced per-user (identified by session) and per-IP (for unauthenticated endpoints). The limits vary by endpoint sensitivity: login attempts are limited to 5 per 15 minutes to prevent brute-force attacks, registration is limited to 3 accounts per hour per IP to prevent spam, WebSocket operations are limited to 100 per second per user per document (far above human typing speed but catches runaway scripts), and general API requests are limited to 100 per minute per user. Limits are tracked in Redis using a sliding window counter pattern: each request increments a counter key with a TTL matching the window duration.
-
-### Idempotency
-
-**What it is**: An operation is idempotent if performing it multiple times has the same effect as performing it once. In the context of an API, idempotency means that retrying a failed request (because the client did not receive a response) will not create duplicate side effects -- no double-creating a document, no double-applying an edit.
-
-**Why it matters**: Network failures are common. A client sends a POST request to create a document, the server processes it successfully, but the response is lost due to a network hiccup. The client retries. Without idempotency, the server creates a second document. In a collaborative editor, this problem is amplified: if a user types "hello" and the ACK is lost, retrying without idempotency inserts "hellohello."
-
-**How it works in this project**: The project implements idempotency at two levels. For HTTP requests (`backend/src/middleware/idempotency.ts`), clients include an `Idempotency-Key` header on POST/PUT/PATCH/DELETE requests. The server checks Redis for a cached response under that key. If found, it returns the cached response without re-processing. If not found, it processes the request, caches the response with a 1-hour TTL, and returns it. For WebSocket operations (`backend/src/services/collaboration/sync.ts`), each operation includes a unique `operationId`. The server checks Redis (`SET NX` with 1-hour TTL, key pattern `op:{userId}:{documentId}:{operationId}`) before applying the operation. If the key already exists, the operation is a duplicate and the server returns the cached ACK.
-
-### Health Checks
-
-**What it is**: Health checks are HTTP endpoints that report whether the application and its dependencies are functioning correctly. They are used by load balancers to route traffic away from unhealthy instances and by orchestration systems (Kubernetes) to restart failed containers.
-
-**Why it matters**: Without health checks, a load balancer continues sending traffic to a server whose database connection pool is exhausted, causing errors for users. With health checks, the load balancer detects the unhealthy instance within seconds and stops routing traffic to it, while the remaining instances absorb the load.
-
-**How it works in this project**: The `/health` endpoint (`backend/src/index.ts`) performs a lightweight check on each dependency: `SELECT 1` for PostgreSQL and `PING` for Redis. Each check has a timeout (e.g., 5 seconds) and reports per-dependency status and latency. The response includes an overall status (`healthy` or `degraded`), the uptime of the process, and the state of each circuit breaker. The load balancer polls this endpoint every 10 seconds and removes instances that return non-200 responses. A degraded response (one dependency down but others working) may keep the instance in rotation for read-only traffic while alerting operators.
-
----
-
-## Implementation Notes
-
-This section documents the actual local implementation: what was built, what was simplified, and what was omitted.
-
-### Local Setup Diagram
-
-```
-┌───────────────────┐
-│   React Frontend  │
-│   (Vite :5173)    │
-│   TipTap Editor   │
-└────────┬──────────┘
-         │ HTTP + WebSocket
-         ▼
-┌───────────────────┐
-│  Express + ws     │
-│  (Port 3000)      │
-│  REST API + WS    │
-└──┬─────────────┬──┘
-   │             │
-   ▼             ▼
-┌────────┐  ┌────────────┐
-│ Valkey │  │ PostgreSQL │
-│ :6379  │  │   :5432    │
-└────────┘  └────────────┘
-```
-
-Multiple API instances can be run on ports 3001-3003 via `PORT=300x npm run dev`.
-
-### Production Patterns Actually Implemented
-
-| Pattern | File Path | Description |
-|---------|-----------|-------------|
-| Idempotency (HTTP) | `backend/src/middleware/idempotency.ts`, `backend/src/shared/idempotency.ts` | `Idempotency-Key` header support for POST/PUT/PATCH/DELETE; caches responses in Redis |
-| Idempotency (WebSocket) | `backend/src/services/collaboration/sync.ts` | Unique `operationId` per OT operation; dedup via Redis before processing |
-| Circuit breakers | `backend/src/shared/circuitBreaker.ts` | Opossum-based circuit breakers for DB and Redis with Prometheus state gauge |
-| RBAC | `backend/src/shared/rbac.ts` | Capability-based permissions (owner/edit/comment/view) enforced at REST + WebSocket layers |
-| Prometheus metrics | `backend/src/shared/metrics.ts` | Active documents, collaborators, sync latency histogram, HTTP duration, cache hit/miss, circuit breaker state |
-| Structured logging | `backend/src/shared/logger.ts` | Pino JSON logger with request correlation, trace IDs |
-| Health checks | `backend/src/index.ts` `/health` endpoint | PostgreSQL SELECT 1, Redis PING with per-dependency status and latency |
-| OT engine | `backend/src/services/collaboration/ot.ts` | Transform functions for insert/delete with version ordering |
-| Presence tracking | `backend/src/services/collaboration/presence.ts` | Redis sets for user presence per document, pub/sub for cross-server updates |
-
-### What Was Simplified or Substituted
-
-| Production Design | Local Implementation | Rationale |
-|-------------------|---------------------|-----------|
-| Redis Cluster | Single Valkey instance | Sufficient for local dev; same API |
-| PostgreSQL primary + read replicas | Single PostgreSQL instance | No read replica routing needed at local scale |
-| API Gateway (nginx) with sticky sessions | Direct connection to single server | No load balancing needed with 1-3 instances |
-| CDN for static assets | Vite dev server | Development convenience |
-| CouchDB for offline sync | Not implemented | OT via WebSocket only; no offline queue |
-| OAuth / SSO | Session-based auth with bcrypt | Simpler, appropriate for learning |
-
-### What Was Omitted
-
-- **CDN** and edge caching for static assets
-- **Multi-region** deployment and cross-region replication
-- **Kubernetes** orchestration and auto-scaling
-- **Full offline editing** with operation queuing and sync-on-reconnect
-- **Operation batching** (combining rapid keystrokes into single ops)
-- **Delta compression** for content transfers
-- **Full-text search** across documents (Elasticsearch)
-- **Export** to PDF/DOCX via worker queue
-- **Distributed tracing** (OpenTelemetry / Jaeger)
-- **Database sharding** for operations table
+[Both persistence and operation publishing](./backend/src/services/collaboration/persist.ts)
+use `OT_SYNC_OPTIONS`: a two-second timeout, 50% failure threshold, minimum volume 3,
+and five-second reset in [circuitBreaker.ts](./backend/src/shared/circuitBreaker.ts).
+Presence publishing bypasses the breakers. Persistence retries an open-circuit error
+through another in-memory timer after 15 seconds; other failures are logged. There
+is no durable queue, cached-document fallback, or read-only mode. A timeout does not
+cancel the underlying SQL operation or undo its possible effects.
+
+[Metrics](./backend/src/shared/metrics.ts) and [entry-point middleware](./backend/src/index.ts)
+record HTTP duration/count, active document/connection gauges, operation counts,
+cache outcomes, and breaker state/events. `google_docs_sync_latency_ms` measures
+handler time through ACK/cache storage, before publishing/persistence; it is not
+peer-render or durable-save latency. The database-query histogram is declared but
+unused. No Prometheus/Grafana services or alert rules are deployed in Compose.
+
+[Pino](./backend/src/shared/logger.ts) supplies structured logs and child context,
+with pretty output in development. There is no propagated distributed tracing
+implementation. `/health` executes PostgreSQL `SELECT 1` and Redis `PING` sequentially,
+returns 200/503 plus local collaboration counts, and has no explicit overall deadline.
+No rate-limiting middleware is mounted.
+
+### Simplified, substituted, and omitted
+
+Valkey stands in for Redis; one PostgreSQL instance and in-process maps replace
+partitioned ownership. Vite replaces static hosting, and local account sessions replace
+federated identity. The demo has no durable editor integration, verified snapshot
+reconstruction, safe offline queue, supported multi-writer deployment, protocol schema
+validation, anchored review UI, export, full-text search, or working suggestion application.
+
+The proposed design supplies those missing boundaries conceptually; this documentation
+review does not implement them. Eight isolated source checks reproduced the editor,
+transform, receipt, debounce, and BIGINT behaviors and verified the seed password hash.
+The app, databases, and browser were not started, and no convergence or load benchmark
+is claimed. [The interview answers](./system-design-answer-fullstack.md) use a smaller
+whiteboard narrative rather than this implementation inventory.

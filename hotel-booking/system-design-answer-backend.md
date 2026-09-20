@@ -1,269 +1,426 @@
-# Hotel Booking System - System Design Answer (Backend Focus)
+# Hotel Booking — System Design Answer (Backend Focus)
 
-*45-minute system design interview format - Backend Engineer Position*
+*45-minute interview walkthrough. Production choices below are proposed; the final section
+distinguishes the local implementation.*
 
-## Opening Statement
+## 🎯 Scope and constraints — 4 minutes
 
-"Today I'll design a hotel booking system like Booking.com or Expedia. The core backend challenges are preventing double bookings through pessimistic locking, building a two-phase search combining Elasticsearch with real-time PostgreSQL availability checks, implementing dynamic pricing with date-specific overrides, and ensuring idempotency for payment retries. I'll focus on the database schema, concurrency control, and distributed locking patterns."
+> "I would start with the invariant: for one room type on any occupied night, active
+> allocations must not exceed sellable capacity. Search can be stale. That inventory decision
+> cannot."
 
----
+I would clarify whether we sell a specific physical room or a quantity of a room type. I'll
+choose the latter: a guest books two double rooms for three nights in one hotel. Physical room
+assignment, intentional overbooking, and bookings spanning several hotels are out of scope.
 
-## Step 1: Requirements Clarification (3-5 minutes)
+The service supports discovery, dated quotes, temporary holds, payment confirmation,
+cancellation, and owner changes to inventory and prices. Reviews are useful, but I would defer
+their details until the booking path is sound.
 
-### Functional Requirements
+I would also ask who owns inventory when a property sells through other channels. Here this
+service owns its configured allotment. Synchronizing an external property-management system
+introduces another authority and requires a separate contract.
 
-1. **Hotel and room inventory** - Hotels list properties with room types and availability counts
-2. **Search with availability** - Two-phase search: Elasticsearch for filtering, PostgreSQL for real-time availability
-3. **Booking with reservation holds** - Create reserved booking, confirm after payment, expire if abandoned
-4. **Dynamic pricing** - Base price with date-specific overrides for seasonality/demand
-5. **Review system** - Post-stay reviews linked to confirmed bookings
+### Working assumptions
 
-### Non-Functional Requirements
+| Dimension | Interview assumption |
+|---|---|
+| Catalog | 100,000 hotels, five room types each |
+| Traffic | Ten million searches and 100,000 bookings daily |
+| Peak | About ten times average traffic |
+| Stay model | Date-only check-in inclusive, checkout exclusive |
+| Payment | External provider with retry identity and verified status |
+| Correctness | One durable result per purchase intent; no overselling |
 
-- **Availability**: 99.99% uptime for booking-critical paths
-- **Consistency**: Strong consistency for bookings - zero double-booking tolerance
-- **Latency**: Search p95 < 500ms, booking confirmation p95 < 1s
-- **Scale**: 100M searches/day, 1M bookings/day, 1M hotels
+That is roughly 1,200 searches and twelve bookings per second at the assumed peak. These are
+not measurements of this repository. A popular hotel can be hot even when the overall booking
+rate is modest, so I would budget for skew rather than size everything from the average.
 
-### Backend Focus Areas
+For latency, I would target search p95 under 500 ms and an inventory transaction under 300 ms,
+excluding provider time. During a primary outage, reject authoritative booking writes while
+allowing clearly stale catalog browsing where possible.
 
-- PostgreSQL schema design with proper locking strategies
-- Distributed locking for concurrent booking prevention
-- Idempotency for payment retry safety
-- Availability caching with intelligent invalidation
-- Background workers for reservation expiry
-
----
-
-## Step 2: Scale Estimation (2-3 minutes)
-
-**Traffic Analysis:**
-- 100M searches/day = 1,150 QPS (peak 3x = 3,500 QPS)
-- 1M bookings/day = 12 bookings/second (peak = 50/second)
-- Read:Write ratio = 100:1 (search-heavy)
-
-**Storage Calculations:**
-- Hotels: 1M * 2KB = 2 GB
-- Room types: 50M * 1KB = 50 GB
-- Bookings: 365M/year * 500B = 180 GB/year
-- Availability cache: 1M hotels * 365 days * 100B = 36 GB Redis
-
-**Key Insight:** Search is the hot path requiring aggressive caching, but bookings require strong consistency with pessimistic locking. The 100:1 ratio means lock contention is rare.
-
----
-
-## Step 3: High-Level Architecture (8 minutes)
+## 🏗️ Architecture and data contracts — 6 minutes
 
 ```
-                                 ┌───────────────────────────────────┐
-                                 │            API Gateway            │
-                                 │   (Rate limiting, Auth, Routing)  │
-                                 └───────────────────┬───────────────┘
-                                                     │
-                    ┌────────────────────────────────┼────────────────────────────────┐
-                    │                                │                                │
-          ┌─────────▼─────────┐           ┌─────────▼─────────┐           ┌─────────▼─────────┐
-          │   Search Service  │           │  Booking Service  │           │  Pricing Service  │
-          │                   │           │                   │           │                   │
-          │ - ES Query Build  │           │ - Pessimistic Lock│           │ - Base + Override │
-          │ - Avail. Filter   │           │ - Idempotency     │           │ - Demand Scoring  │
-          │ - Price Enrich    │           │ - Payment Coord.  │           │ - Seasonal Factor │
-          └─────────┬─────────┘           └─────────┬─────────┘           └───────────────────┘
-                    │                               │
-    ┌───────────────┴───────────────┐               │
-    │               │               │               │
-┌───▼────┐    ┌─────▼─────┐   ┌─────▼─────┐   ┌─────▼─────┐
-│Elastic │    │   Redis   │   │ PostgreSQL│   │  RabbitMQ │
-│search  │    │  (Cache + │   │ (Primary) │   │  (Jobs)   │
-│        │    │   Locks)  │   │           │   │           │
-└────────┘    └───────────┘   └───────────┘   └───────────┘
-                                    │
-                              ┌─────▼─────┐
-                              │ Background│
-                              │  Workers  │
-                              │           │
-                              │- Expiry   │
-                              │- ES Sync  │
-                              │- Cleanup  │
-                              └───────────┘
+┌────────────────────────┐ HTTPS  ┌──────────────────────────────────────────────────────────┐
+│ Guest / hotel owner    │        │ API boundary                                             │
+│ Saved intent / command │◀──────▶│ Authentication, ownership, bounds, intent identity       │
+└────────────────────────┘        └──────────────────────────────────────────────────────────┘
+                                              ▲                  ▲
+                                              │                  │
+             ┌────────────────────────────────┘                  │
+             │                       quote / hold / owner edits  │
+search reads │                                                   │
+             ▼                                                   ▼
+┌────────────────────────┐        ┌──────────────────────────────────────────────────────────┐
+│ Search service         │        │ Booking + inventory service                              │
+│ Bounded candidates     │◀──────▶│ Hotel-owned transactions; conditional state changes      │
+│ Advisory enrichment    │        │ Quote, receipt, booking and outbox commit together       │
+└────────────────────────┘        └──────────────────────────────────────────────────────────┘
+             ▲                                                  ▲
+             │                                                  │
+match / rank │                      authoritative transactions  │
+             │                                                  │
+             ▼                                                  ▼
+┌────────────────────────┐        ┌──────────────────────────────────────────────────────────┐
+│ Elasticsearch + cache  │        │ PostgreSQL primary, partitioned by hotel at scale        │
+│ Catalog projection     │        │ Rooms, nightly inventory, quotes, holds, receipts        │
+│ Disposable snapshots   │        │ Payment attempts, provider receipts, inbox and outbox    │
+└────────────────────────┘        └──────────────────────────────────────────────────────────┘
+             ▲                                                  ▲
+index jobs   │                                                  │
+             │                      jobs / state transitions    │
+             ▼                                                  ▼
+┌────────────────────────────────────────────────────────────────────────────────────────────┐
+│ Workers: projection, expiry, payment reconciliation                                        │
+│ Retry committed work; verify provider events; reconcile uncertain outcomes                 │
+└────────────────────────────────────────────────────────────────────────────────────────────┘
+                                               ▲
+                                               │  idempotent authorization / settlement
+                                               ▼
+┌────────────────────────────────────────────────────────────────────────────────────────────┐
+│ External payment provider — separate failure domain                                        │
+└────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
----
+I'd draw a read path on the left and a transactional path on the right. The database under
+booking is authoritative. Elasticsearch and availability caches are projections that help
+guests choose; they cannot allocate rooms.
+
+Follow a command: the API authenticates the user, validates bounded inputs, and routes to the
+hotel's owner partition. Booking commits the reservation and operation receipt together.
+Durable work then drives indexing and payment activity outside that transaction.
+
+Follow a search: the service matches a bounded set of candidates, asks for advisory dated
+enrichment, and returns a coherent page. It never takes booking locks for all search results.
+The worker row shows where retries and external uncertainty are handled.
+
+For a lost payment response, the worker resolves the existing provider attempt and records
+its verified outcome before advancing the booking transition. Processing inventory remains
+protected while that outcome is unknown; ordinary hold expiry cannot release it underneath
+reconciliation. Index workers follow a separate progress path and confirm versioned effects
+before acknowledging their work. Neither an index update nor a client timer confirms a stay.
+
+These are logical components. I would initially deploy a modular booking/catalog API with
+separate workers. Independent services become useful when traffic or ownership requires them,
+not because every box must be a separate process.
+
+### Data model
+
+| Entity | Key fields | Access pattern |
+|---|---|---|
+| Hotel / room type | Hotel owner, room type, capacity, base price, active state | Property details and inventory ownership |
+| Booking | Hotel, type, dates, quantity, owner, state, deadline | Active occupancy and own booking history |
+| Quote | Quote ID, scope, nightly amounts, currency, policy, deadline | Immutable terms accepted by the guest |
+| Operation receipt | Account + intent key, request digest, booking ID | Recover the same result after retry |
+| Payment attempt | Booking + attempt, provider identity, state, amount | Reconcile external money movement |
+| Inbox / outbox | Unique event ID, entity version, processing state | Deduplicate events and retry committed work |
 
-## Step 4: Database Schema Deep Dive (10 minutes)
+Index active booking ranges by hotel and room type, and expired-hold candidates by deadline. A
+unique account/intent receipt is a correctness constraint, not merely a speed optimization.
+Keep guest identity and authorization in every lookup.
 
-### Core Tables
+I would store money in an exact representation with an explicit currency. The quote retains
+its nightly breakdown and cancellation terms; later owner price edits must not silently
+rewrite an accepted purchase.
 
-| Table | Key Columns | Indexes | Notes |
-|-------|-------------|---------|-------|
-| **room_types** | id (UUID PK), hotel_id (FK cascade), name, base_price (decimal), max_guests, total_rooms (inventory count), amenities (JSONB) | — | Room categories with inventory tracking |
-| **bookings** | id (UUID PK), user_id (FK), hotel_id (FK), room_type_id (FK), check_in (date), check_out (date), room_count (default 1), total_price (decimal), status (reserved/confirmed/cancelled/expired), guest_name, guest_email, expires_at (for 15-min hold), idempotency_key (unique) | idx_bookings_availability (room_type_id, check_in, check_out, partial: WHERE status IN reserved/confirmed), idx_bookings_expires (expires_at, partial: WHERE status = reserved) | Range-based bookings with reservation hold pattern; CHECK constraint ensures check_out > check_in |
-| **price_overrides** | id (UUID PK), room_type_id (FK cascade), date, price (decimal), reason (weekend/holiday/high_demand/promotion) | idx_price_overrides_lookup (room_type_id, date) | Date-specific pricing overrides; unique on (room_type_id, date) |
+### Essential API surface
 
-### Availability Query with generate_series
+| Method | Proposed path | Meaning |
+|---|---|---|
+| GET | `/hotels/search` | Catalog match with bounded dated enrichment |
+| GET | `/hotels/:id/availability` | Advisory capacity for a range or month |
+| POST | `/quotes` | Produce complete, expiring purchase terms |
+| POST | `/bookings` | Allocate hold under a purchase intent |
+| GET | `/booking-intents/:key` | Recover a lost creation response |
+| POST | `/bookings/:id/payment-attempts` | Begin payment while hold is valid |
+| GET | `/bookings/:id` | Current canonical state |
+| POST | `/bookings/:id/cancel` | Apply policy and initiate any required refund |
+
+Request and response bodies are less useful on the board than the guarantees: bounded
+dates/counts, ownership, accepted quote, stable intent, canonical result, and distinct
+conflict versus unknown outcomes.
 
-The availability query uses PostgreSQL's generate_series to expand each booking into individual nights, then calculates the maximum rooms booked on any single night within the requested date range. This handles the case where different nights have different occupancy levels.
+## 🔧 Deep dive 1: Allocating a range of nights — 10 minutes
 
-The query works by: (1) expanding each active booking (reserved or confirmed) into per-night rows using generate_series from check_in to check_out minus one day, (2) summing room_count per night for the target room type, (3) taking the maximum across all nights in the range, and (4) subtracting from total_rooms to get available inventory. This ensures we never show more availability than the most constrained night in the range.
+The hard case is two guests competing for overlapping stays, not necessarily identical dates.
+A guest staying the 17th–19th competes on the 18th with a guest staying the 18th–20th.
 
----
+### A simple enforceable transaction
 
-## Step 5: Pessimistic Locking for Bookings (8 minutes)
+1. Validate the hotel, room type, guest capacity, positive quantity, real dates, and maximum stay length.
+2. Lock the room-type row in the hotel's PostgreSQL primary.
+3. Read active occupancy for each occupied night after obtaining that lock.
+4. Reject if any night's remaining capacity is below the requested quantity.
+5. Persist the hold, accepted quote snapshot, receipt, and outbox work, then commit.
 
-### The Double-Booking Problem
+For a capacity of ten rooms, nightly active counts of six, nine, and seven leave only one room
+available for the whole three-night stay. Summing all bookings that overlap any part of the
+range would overcount stays that occupy different nights. The range must fit on each night.
 
-```
-Time T0: Server A receives booking for Room 101, Jan 15
-Time T0: Server B receives booking for Room 101, Jan 15
-Time T1: Server A checks availability → 1 room available
-Time T1: Server B checks availability → 1 room available
-Time T2: Server A creates booking (success)
-Time T2: Server B creates booking (success - OVERSOLD!)
-```
+At PostgreSQL's default Read Committed isolation, a statement issued after obtaining the
+contested row lock sees preceding commits. Different API processes share the same database
+lock. The rule holds only if every operation that increases allocations or reduces capacity
+follows the same protocol.
 
-### Solution: SELECT FOR UPDATE with Transaction
+A concurrent capacity edit also obtains a row lock through its update, but that alone is
+insufficient. It must check existing obligations before reducing capacity. “All writes lock
+something” is not the invariant; “all writes validate the invariant while serialized” is.
+
+### Comparing approaches
+
+| Approach | Benefit | Cost or failure mode |
+|---|---|---|
+| ✅ Room-type lock + nightly range check initially | Simple authority and rollback boundary | Serializes unrelated dates for a popular type |
+| ✅ Per-night inventory rows after measured need | Nonoverlapping nights can proceed independently | More rows and multi-row allocation logic |
+| ❌ Redis lease keyed only by exact range | Reduces identical-range contention | Different overlapping ranges get different leases |
+| ❌ Optimistic retry as an automatic speed fix | Avoids waiting on lightly contended data | Hot sold-out inventory can create retry storms |
 
-The booking service creates reservations through a transactional process:
+The Redis lease is not what makes a shared PostgreSQL transaction work across API instances.
+Lease expiry and failover require their own reasoning, while the database already serializes
+this resource. I would not make a cached availability boolean authoritative either.
 
-1. **Lock the room_type row** - Use `SELECT ... FOR UPDATE` on the room_types table to serialize concurrent bookings for the same room type. This prevents the race condition where two servers simultaneously read "1 room available" and both create bookings.
+### When to change the model
 
-2. **Check availability within the lock** - Run the availability query inside the transaction to get an accurate count.
+If room-type lock wait dominates, represent each room type/night as capacity, held count, and
+confirmed count. Lock the requested nights in increasing date order, verify all counters, and
+adjust them in one transaction. A failed night rolls back the whole allocation.
 
-3. **Reject if insufficient inventory** - If available rooms are fewer than requested, throw an error with the actual availability count.
+This is a valid counter model because the counter is per night. It is very different from
+decrementing one hotel-wide number. One year across the assumed catalog is about 182.5 million
+nightly rows, so the storage and maintenance cost is real.
 
-4. **Calculate total price** - Sum per-night prices using base price and any date-specific overrides.
+Limit stay length and room quantity before locks are acquired. A malicious or mistaken
+multiyear request must not become an unbounded lock set. Admission control for a hot hotel is
+often more useful than blindly adding API replicas.
 
-5. **Generate idempotency key** - Create a SHA-256 hash of the booking parameters (user ID, hotel ID, room type ID, dates, room count) to prevent duplicate bookings from retries.
+### Deadline semantics
 
-6. **Check for existing booking** - Query by idempotency key. If a matching booking exists, return it as a deduplicated result.
+A hold has a server deadline. Reads can conservatively count overdue holds until their state
+changes, causing temporary underselling. But an overdue hold must not be allowed to begin
+confirmation just because the sweeper has not visited it yet.
 
-7. **Create the reservation** - Insert the booking with status "reserved" and a 15-minute expiration. This hold prevents the inventory from being sold while the user completes payment.
+Command validation checks the deadline using the database clock. Background expiry releases
+abandoned inventory and repairs derived views; it is not the sole enforcement of expiration.
 
-8. **Invalidate availability cache** - Delete cached availability for the affected hotel, room type, and date range.
+> "I'd prefer one short transaction whose invariant I can explain. I would introduce per-night
+> counters when measured contention justifies the extra write model."
 
-### Distributed Locking for High-Contention Scenarios
+## 🔧 Deep dive 2: Purchase identity and payment uncertainty — 10 minutes
 
-For flash sales or extremely popular hotels, add Redis distributed lock:
+Locks prevent conflicting allocations. They do not tell whether two serialized requests
+represent one purchase repeated or two purchases intentionally made.
 
-The distributed lock service uses Redis Redlock with 3 retry attempts, 200ms retry delay, and 100ms jitter. Before entering the PostgreSQL transaction, the service acquires a lock keyed by `lock:room:{hotelId}:{roomTypeId}:{checkIn}:{checkOut}` with a 30-second TTL. The booking operation runs inside the lock, and the lock is always released in a finally block regardless of success or failure.
+### A receipt tied to intention
 
-This adds an extra layer of serialization above the database-level `SELECT FOR UPDATE`, reducing contention on the database during extreme traffic spikes.
+The client creates an intent when the guest accepts a quote. The server scopes it to the
+account and stores a digest of the frozen request. Same key and same payload returns the same
+result; same key and different payload is a conflict.
 
----
+A digest of dates and room quantity alone cannot identify intention. A guest may deliberately
+book another room with identical details, or rebook after cancelling. A new intent
+distinguishes that from replaying the original purchase.
 
-## Step 6: Dynamic Pricing Service (5 minutes)
+The operation receipt and booking commit together. On simultaneous retries, a unique
+constraint elects the winner; the losing request reads the committed result after resolving
+its transaction. A preflight lookup alone has a race between “not found” and creation.
 
-The pricing service calculates the total price for a stay by summing per-night prices:
+| Decision | Why it works here | Cost |
+|---|---|---|
+| ✅ Durable account/intent receipt | Same purchase can be recovered across retries | Retention and payload-version policy |
+| ❌ Parameter hash as identity | Easy to generate | Conflates separate intentions and can omit meaningful fields |
+| ❌ Cache-only deduplication | Fast lookup | Cache loss or expiration changes business behavior |
 
-1. **Retrieve the base price** from the room_types table.
-2. **Query price overrides** for the date range from the price_overrides table to build a date-to-price lookup map.
-3. **Iterate each night** from check_in to check_out (exclusive). For each night, use the override price if one exists, otherwise use the base price. Multiply by room count.
-4. **Sum all nightly totals** to produce the final price.
+Use one canonical response representation for stored/replayed results. Storing a camelCase API
+object and later treating it as a snake_case SQL row is a protocol defect, even if the booking
+row itself is unique.
 
-**Advanced dynamic pricing** layers additional factors when no manual override exists:
+### Crossing the payment boundary
 
-| Factor | Calculation | Impact |
-|--------|------------|--------|
-| Demand multiplier | Based on booking velocity for the hotel on that date | Up to +30% |
-| Seasonality | Month-based factor (e.g., July/August = 1.3x, December = 1.4x) plus weekend premium (Friday/Saturday = 1.15x) | 0.8x to 1.5x |
-| Scarcity | If availability drops below 20%, apply 1.2x multiplier | +20% when nearly sold out |
+A database transaction cannot atomically commit at an external payment provider. I would use a
+durable state machine with an idempotent provider attempt and reconciliation.
 
-The final dynamic price is: base_price * demand * seasonality * scarcity.
+The initial hold consumes inventory. Before its deadline, a conditional transaction moves it
+to payment processing and records durable work. That state continues consuming inventory while
+the provider authorization is unresolved, under a separate bounded reconciliation policy.
 
----
+No provider request runs while the room-type row lock is held. The worker uses a stable
+attempt identity, sends the accepted amount and currency, and verifies the resulting event or
+queried status. Duplicate provider events are ignored through the inbox's unique event
+identity.
 
-## Step 7: Background Worker for Reservation Expiry (4 minutes)
+### The expiry race
 
-The reservation expiry worker polls every 60 seconds and performs these steps:
+Consider a payment authorization arriving just as inventory is being released. Both paths must
+use conditional state transitions on the same authoritative booking. An old event is not
+allowed to change an already expired/cancelled booking directly to confirmed.
 
-1. **Atomically expire stale reservations** - Run a single UPDATE query that sets status to "expired" for all bookings where status is "reserved" and expires_at is in the past. The RETURNING clause provides the affected booking details.
+If the payment was authorized after the inventory was released, void it or enter a
+refund/reconciliation path. Reacquiring inventory is a fresh allocation decision, not a status
+flip. Otherwise the service can oversell despite having correct creation locks.
 
-2. **Invalidate availability cache** - For each expired booking, delete all cached availability entries for that hotel/room type combination using a Redis key pattern match. This ensures search results immediately reflect the freed-up inventory.
+| Situation | Resolution |
+|---|---|
+| Response lost after hold commit | Recover the same intent/booking |
+| Payment request timed out | Query or retry the same provider attempt |
+| Duplicate payment event | Return the already-applied event result |
+| Expiry wins before processing begins | Reject payment start and release inventory |
+| Late authorization after release | Void/refund or explicitly reacquire; never silently resurrect |
+| Cancellation during payment uncertainty | Record intent to cancel and reconcile the outstanding attempt |
 
-3. **Track metrics** - Increment a Prometheus counter for expired bookings and log the count and processing duration.
+“Confirmed,” “authorized,” and “settled” should not collapse into one boolean. State history
+and metrics must explain what the service knows about inventory and money separately.
 
-4. **Error handling** - Catch and log any errors without crashing the worker, incrementing a worker error metric for monitoring.
+### Why I accept the complexity
 
----
+A synchronous provider call followed by an ordinary booking update looks simpler, but a
+timeout leaves ambiguity about whether money moved. Retrying with a new identity risks another
+payment; abandoning it can leave a paid guest without a booking.
 
-## Step 8: Availability Caching Strategy (4 minutes)
+An outbox, event inbox, and reconciliation worker add operational work. They make that
+ambiguity recoverable and auditable. I would describe effectively-once business effects under
+retry, rather than promise exactly-once message delivery.
 
-The availability cache sits in Redis with a 5-minute TTL. Cache keys follow the pattern `availability:{hotelId}:{roomTypeId}:{checkIn}:{checkOut}`.
+> "My success criterion is not that the first request always returns quickly. It is that a
+> guest can recover one accurate booking and payment outcome after the request fails halfway
+> through."
 
-**Read path:** Check Redis for cached availability. On hit, increment a cache hit metric and return the result. On miss, increment a cache miss metric and fall through to the database query, then cache the result.
+## 🔧 Deep dive 3: Useful search without overwhelming inventory — 8 minutes
 
-**Write path (invalidation):** When a booking is created, confirmed, cancelled, or expired, invalidate all cache entries that might overlap with the affected date range. For simplicity, a Redis key pattern match on the year-month prefix is used (e.g., `availability:{hotelId}:{roomTypeId}:2025-07*`), which may invalidate slightly more keys than necessary but ensures correctness.
+Discovery is much busier than reservation. At the assumed peak, twenty candidates times two
+room types per candidate can produce roughly 48,000 availability checks each second. This is
+why search needs its own read budget.
 
-> "The 5-minute TTL is acceptable because search results showing slightly stale availability is fine -- the booking service always checks real-time availability with pessimistic locking before confirming. This means search might occasionally show 'available' when the last room was just booked, but the booking attempt will correctly fail."
+### Separate matching from allocation
 
----
+Elasticsearch handles location, amenities, stars, and catalog text. The search service
+enriches a bounded candidate set with advisory date availability and pricing. Batch by
+hotel/type instead of opening an independent query for every card.
 
-## Step 9: Search Service with Two-Phase Query (4 minutes)
+A result can honestly say it was available when checked, provided its dates, quantity, and
+freshness are clear. It is still not a hold. The reservation transaction rechecks the primary
+before allocating anything.
 
-The search service uses a two-phase approach:
+| Approach | Benefit | Trade-off |
+|---|---|---|
+| ✅ Bounded enrichment plus cache | Relevant dated results within a load budget | Some stale or partially checked candidates |
+| ❌ Synchronous enrichment of every match | More exhaustive result set | Search fan-out can exhaust database connections |
+| ❌ Never enrich discovery | Cheap reads | Guests repeatedly open hotels that cannot fit the stay |
 
-**Phase 1 - Elasticsearch filtering:** Build an Elasticsearch query combining geo-distance queries (within 50km of location), city text matching, amenity term filters, star rating range filters, and max price range filters. Retrieve up to 100 candidate hotels.
+I would not hide a dependency failure as sold out. If a batch cannot be checked, return an
+explicit partial/unknown state or a retryable error according to the product contract.
 
-**Phase 2 - Real-time availability check:** For each candidate hotel, run the PostgreSQL availability query in parallel (using Promise.all). Filter to only hotels with available rooms for the requested date range and room count. Enrich results with the lowest available price and available room type details.
+### Cache semantics
 
-**Ranking:** The available hotels are ranked based on the search parameters (relevance, price, rating, distance) and the top results are returned (default limit of 20).
+Cache a snapshot with hotel, room type, date range, and all relevant request inputs. If the
+result contains an `available` boolean, room count must be part of its identity. Alternatively
+cache capacity counts and derive the boolean for each request.
 
-> "This two-phase approach lets us leverage Elasticsearch's speed for filtering millions of hotels down to hundreds of candidates, then use PostgreSQL's ACID guarantees for the accuracy-critical availability check. The parallelized availability checks keep latency manageable even with 100 candidate hotels."
+Invalidating only the exact booked date range leaves all overlapping cached queries behind. A
+room-type generation can invalidate every range logically, or month-key invalidation can cover
+all occupied months. Owner price/capacity edits and expiry need the same refresh path.
 
----
+A TTL bounds stale reads when invalidation is delayed. It does not make those reads
+authoritative. Hold creation uses current inventory inside the transaction even when Redis is
+down or wrong, provided the service's dependency policy allows proceeding safely.
 
-## Step 10: Trade-offs Discussion (3 minutes)
+### Pagination and price coherence
 
-### Backend Trade-offs Table
+An Elasticsearch page is a candidate page, not necessarily a page of available hotels. If
+enrichment removes candidates, the service may expand within its budget and return a
+continuation token. Do not report the remaining page length as a global total while retaining
+an unrelated page count.
 
-| Decision | Approach | Trade-off | Rationale |
-|----------|----------|-----------|-----------|
-| Booking consistency | Pessimistic locking | Lower throughput vs. correctness | Double-booking has severe financial/trust impact |
-| Availability storage | Range-based bookings | Complex queries vs. flexibility | One row per booking, easy date modifications |
-| Reservation hold | 15-minute expiry | Blocked inventory vs. conversion | Gives users time to pay without permanent blocks |
-| Availability cache | 5-min TTL + invalidation | Stale reads vs. DB load | Search tolerates staleness; booking checks fresh |
-| Idempotency | SHA-256 of booking params | Storage overhead vs. safety | Prevents double-charges from retries |
-| Distributed locks | Redis Redlock | Added complexity vs. safety | Only for flash sales/high-contention scenarios |
+Prices and capacity must refer to the same room option. A hotel's cheapest room and its
+largest room may be different types. A search asking for four guests cannot assume the
+cheapest one accommodates four simply because the hotel has another large room.
 
-### Why Pessimistic Over Optimistic Locking
+Dated totals incorporate nightly overrides and room quantity. The client should receive a
+stable hotel DTO, not the internal index document. That representation boundary prevents index
+field names from leaking into broken navigation.
 
-Optimistic locking (version columns with retry) would provide higher throughput but:
-1. Requires complex retry logic with exponential backoff
-2. May frustrate users with "room no longer available" after filling forms
-3. At 100:1 read:write ratio, lock contention is already rare
+### Keeping the projection current
 
-Pessimistic locking is simpler and provides better UX for a booking system.
+Owner edits commit SQL and a versioned outbox event together. A worker retries indexing and
+prevents an older snapshot from replacing a newer one. Reviews that change aggregate ratings
+also schedule projection updates.
 
----
+A periodic reconciliation/rebuild process handles historical drift. This costs worker
+operations and delayed visibility, but avoids coupling a successful catalog edit to the
+availability of Elasticsearch at that moment.
 
-## Closing Summary
+> "I am willing to show a stale search hint. I am not willing to use that hint as the decision
+> to sell a room, or to describe a failed check as proof the hotel is full."
 
-"I've designed a hotel booking backend with:
+## 🧪 Failure tests, growth, and implementation boundary — 7 minutes
 
-1. **PostgreSQL schema** using range-based bookings with generate_series for availability
-2. **Pessimistic locking** via SELECT FOR UPDATE to prevent double bookings
-3. **Distributed locks** using Redis Redlock for high-contention flash sales
-4. **Idempotency keys** generated from booking parameters to prevent duplicate charges
-5. **Two-phase search** combining Elasticsearch speed with PostgreSQL accuracy
-6. **Background workers** for reservation expiry and cache invalidation
+### What I would verify
 
-The key insight is separating the eventually-consistent search path from the strongly-consistent booking path, with intelligent caching bridging the performance gap. Happy to dive deeper into any component."
+| Test | Invariant or contract |
+|---|---|
+| Many overlapping reservations through multiple API instances | Active nightly allocations never exceed capacity |
+| Capacity reduced while bookings arrive | Owner edits cannot violate future obligations |
+| Same intent submitted concurrently | One canonical result, including duplicate response shape |
+| Commit succeeds and response/cache write fails | Existing booking remains recoverable |
+| Expiry races with payment start/event | One valid state transition; no resurrected inventory |
+| Date ranges cross DST, month end, and leap day | Correct night count and exact quote total |
+| Old indexing job finishes last | Newer catalog projection remains visible |
 
----
+These require real database concurrency and fault-injection tests, not just mocked route
+responses. Separately measure lock wait, pool wait, expired-hold lag, payment reconciliation
+age, and search projection delay.
 
-## Potential Follow-up Questions
+### Scaling order
 
-1. **How would you handle payment gateway failures?**
-   - Use circuit breaker pattern with Opossum library
-   - Queue failed payments for retry with exponential backoff
-   - Keep booking in 'reserved' state with extended expiry
+First control fan-out, inputs, query plans, and connection usage. A transaction holding one
+pool connection while pricing checks out a second can starve the pool under load, even with a
+modest number of bookings.
 
-2. **How would you implement overbooking?**
-   - Add `soft_limit` column to room_types (typically 105% of total_rooms)
-   - Use soft_limit for booking creation, total_rooms for hard stop
-   - Automatic rebooking workflow when oversold
+Then isolate workers, add tolerant read replicas and caches, and move to nightly inventory if
+room-type lock contention is measured. Partition writes by hotel so one reservation remains
+local to one authoritative shard.
 
-3. **How would you handle database failover?**
-   - PostgreSQL streaming replication with automatic failover
-   - PgBouncer for connection pooling and routing
-   - Application retries with exponential backoff on connection errors
+Multi-region operation needs an owner region and fenced failover for each hotel's inventory. I
+would keep writes unavailable during an uncertain ownership transition rather than accept two
+independent authorities selling the same rooms.
+
+Guest and owner authorization remains on the server at every stage. Use current ownership,
+bounded query and booking inputs, safe session handling, and redacted audit records. Neither a
+hidden management tab nor a caller-supplied payment reference is authorization.
+
+### Local implementation boundary
+
+The demo has Express, PostgreSQL, Valkey, and Elasticsearch. Booking creation locks a
+room-type row before querying nightly occupancy, and each API instance runs an expiry sweep
+every minute. Redis exact-range leases are additional contention control, not the
+cross-process correctness guarantee.
+
+Several gaps are material: confirmation accepts a still-reserved row without checking its
+deadline, payments are simulated, and owner capacity reductions do not check existing
+obligations. Price reads use a separate connection and host-timezone date iteration can
+produce incorrect totals.
+
+Idempotency hashes parameters, checks before the lock, and mishandles the cached response
+shape. Availability cache keys omit requested quantity and invalidation misses overlapping
+ranges. Search filters dated candidates but returns incompatible hotel fields and inconsistent
+pagination totals.
+
+Circuit-breaker factories are not connected to request paths. There is no durable
+payment/outbox workflow or versioned indexing worker. Nine isolated source checks reproduced
+selected defects, but no live database race or payment integration was exercised by this
+documentation review. See [architecture.md](./architecture.md#implementation-notes) for the
+complete source mapping.
+
+### Decisions to leave on the board
+
+| Decision | Chosen | Alternative | Rationale |
+|---|---|---|---|
+| Inventory authority | ✅ Short PostgreSQL transaction | ❌ Cached counts or exact-range leases | One serialization rule for all overlapping stays |
+| Retry safety | ✅ Durable intent and canonical receipt | ❌ Payload coincidence | Distinguish repetition from a second purchase |
+| Payment | ✅ Durable state machine and reconciliation | ❌ Long transaction across provider call | Recover partial failures without holding inventory locks |
+| Discovery | ✅ Bounded advisory projection | ❌ Exhaustive authoritative reads | Preserve the booking database's capacity |
+
+> "The system is safe when every path respects the same inventory authority and every purchase
+> can be recovered by identity. Search speed and extra replicas come after those two
+> properties."

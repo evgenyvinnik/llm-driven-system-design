@@ -22,11 +22,11 @@ recommendation request fails or a library edit is still awaiting confirmation.
 | Discussion | Minutes |
 |------------|---------|
 | Scope and targets | 4 |
-| Architecture and shared contracts | 5 |
+| Architecture and shared contracts | 6 |
 | Deep dive: Play to audible audio | 10 |
 | Deep dive: Save to cross-device convergence | 10 |
 | Deep dive: Listening to discovery | 8 |
-| Failure handling and validation | 5 |
+| Failure handling and validation | 4 |
 | Trade-offs and local boundary | 3 |
 | Total | 45 |
 
@@ -39,25 +39,60 @@ retries. Recommendation freshness can be bounded rather than instantaneous.
 For playback availability, I would propose 99.99% successful authorized starts
 and measure the entire media path rather than only API uptime.
 
-## 🏗️ Architecture and shared contracts — 5 minutes
+## 🏗️ Architecture and shared contracts — 6 minutes
 
 My first diagram separates media delivery, user state, and event processing:
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│ Browser: persistent player, routed pages, library state      │
-└─────────┬─────────────────────┬─────────────────────┬────────┘
-          ▼                     ▼                     ▼
-┌───────────────────┐ ┌───────────────────┐ ┌──────────────────┐
-│ Playback grants   │ │ Catalog/library   │ │ Listening        │
-│ Available assets  │ │ Queries + edits   │ │ Event ingestion  │
-└─────────┬─────────┘ └─────────┬─────────┘ └─────────┬────────┘
-          ▼                     ▼                     ▼
-┌───────────────────┐ ┌───────────────────┐ ┌──────────────────┐
-│ CDN/media origin  │ │ State + revisions │ │ History +        │
-│ Client gets bytes │ │ Edit receipts     │ │ Recommendations  │
-└───────────────────┘ └───────────────────┘ └──────────────────┘
+        ┌──────────────────────────────────────────────────────────────────────────────────────────┐
+        │ BROWSER / PERSISTENT PLAYBACK AND ACCOUNT-SCOPED DATA                                    │
+        │                                                                                          │
+        │  ┌────────────────────────┐    ┌────────────────────────┐    ┌────────────────────────┐  │
+        │  │ Player + queue         │    │ Shared control client  │    │ Library + discovery UI │  │
+  ┌─────┼─▶│ Media lifecycle        │◀──▶│ Grants, edits, queries │◀──▶│ Confirmed base + edits │  │
+  │     │  │ Playback-instance ID   │    │ Independent of routes  │    │ Keyed query results    │  │
+  │     │  └────────────────────────┘    └────────────────────────┘    └────────────────────────┘  │
+  │     │               ▲                             ▲                                            │
+  │     │               │                             │                                            │
+  │     └───────────────┼─────────────────────────────┼────────────────────────────────────────────┘
+  │                     │                             │
+  │        media bytes  │                             │  control / canonical results
+  │                     ▼                             ▼
+  │        ┌────────────────────────┐    ┌─────────────────────────────────────────────────────────┐
+  │        │ CDN + private origin   │    │ Music control APIs                                      │
+  │        │ Immutable media        │    │ Playback grants | revisioned library sync | discovery   │
+  │        │ Authorized delivery    │    │ Read authority or eligible projections per operation    │
+  │        └────────────────────────┘    └─────────────────────────────────────────────────────────┘
+  │                                                   ▲                             ▲
+  │                                                   │                             │
+  │ events / ACK                  edit / sync         │             discovery       │
+  │                                                   │                             │
+  ▼                                                   ▼                             ▼
+┌───────────────────────────────┐        ┌────────────────────────┐    ┌────────────────────────┐
+│ Listening event pipeline      │        │ State authority        │    │ Read projections       │
+│ Auth + durable acceptance     │        │ Catalog + owner state  │───▶│ History + candidates   │
+│ Replay and identified effects │        │ Atomic log + receipts  │    │ Freshness can lag      │
+└───────────────────────────────┘        └────────────────────────┘    └────────────────────────┘
+                │                                                                   ▲
+                │                                                                   │
+                │  asynchronous history and recommendation updates                  │
+                │                                                                   │
+                └───────────────────────────────────────────────────────────────────┘
+
+Observed playback progress drives player state; grant issuance is separate.
 ```
+
+I would follow Play through the control client to a grant, then along the direct
+byte path into the persistent player. Save follows a different arrow to committed
+owner state and a recoverable revision. Identified listening events later update
+history and discovery projections. Each path returns different evidence to the UI:
+media progress, an edit receipt, or a potentially delayed recommendation snapshot.
+
+If a grant expires, the player refreshes authorization for its current playback
+instance before continuing the byte path. If an edit response is lost, the library
+resolves its saved operation and resumes sync without replacing the queue. Listening
+events retain their own identities across retries, and their durable acceptance can
+precede the history projection becoming visible. These recoveries have separate state.
 
 The browser's playback controller lives outside routed page content. It owns
 one active playback instance and the media lifecycle. A small store exposes
@@ -324,7 +359,7 @@ Large library pages need both pagination and virtualization. Paging bounds trans
 virtualization bounds rendered rows. A small discovery shelf does not need those
 extra mechanics simply because a large library does.
 
-## 🛠️ Failure handling and validation — 5 minutes
+## 🛠️ Failure handling and validation — 4 minutes
 
 ### Make cross-layer recovery observable
 

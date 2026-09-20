@@ -42,28 +42,56 @@ editor draft. Behind the API, PostgreSQL owns page revisions and permissions. Se
 derived asynchronously so an index outage does not decide whether an edit was saved.
 
 ```
-          ┌─────────────────────────────────┐
-          │ Browser                         │
-          │ Reader / tree / editor draft    │
-          └────────────────┬────────────────┘
-                           ▼
-          ┌─────────────────────────────────┐
-          │ API: sessions and permission    │
-          │ Pages / versions / search       │
-          └────────────────┬────────────────┘
-                           │
-           ┌───────────────┴───────────────┐
-           ▼                               ▼
-┌──────────────────────┐        ┌──────────────────────┐
-│ PostgreSQL           │        │ Search index         │
-│ Revisions / outbox   │        │ Derived documents    │
-└──────────┬───────────┘        └──────────▲───────────┘
-           │                               │
-           ▼                               │
-┌──────────────────────────────────────────┴───────────┐
-│ Outbox publisher → queue → index worker              │
-└──────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│ BROWSER / ONE PAGE JOURNEY                                                               │
+│                                                                                          │
+│  ┌────────────────────────┐    ┌────────────────────────┐    ┌────────────────────────┐  │
+│  │ Reader / tree / search │    │ Editor + save state    │    │ History + review UI    │  │
+│  │ Scoped resource state  │◀──▶│ Draft / base / save ID │◀──▶│ Exact target revision  │  │
+│  └────────────────────────┘    └────────────────────────┘    └────────────────────────┘  │
+│                       ▲                             ▲                             ▲      │
+│                       │                             │                             │      │
+└───────────────────────┼─────────────────────────────┼─────────────────────────────┼──────┘
+                        │                             │                             │
+                        ▼                             ▼                             ▼
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│ WIKI API / SESSION AND CURRENT SPACE PERMISSIONS                                         │
+│ Read permitted revisions; accept identified saves; validate review and hierarchy changes │
+└──────────────────────────────────────────────────────────────────────────────────────────┘
+                        ▲                                                      ▲
+                        │                                                      │
+  state / commit        │                          query + access filtering    │
+                        │                                                      │
+                        ▼                                                      ▼
+┌─────────────────────────────────────────┐        ┌───────────────────────────────────────┐
+│ PostgreSQL authority                    │        │ Search coordinator + index            │
+│ Heads / published revisions / receipts  │        │ Derived candidates / freshness status │
+│ Membership / history / outbox           │        │ Check access before returning         │
+└─────────────────────────────────────────┘        └───────────────────────────────────────┘
+                        │                                                      ▲
+                        │                                                      │
+committed changes       │                                                      │
+                        │                                                      │
+                        ▼                                                      │
+┌─────────────────────────────────────────┐                                    │
+│ Outbox relay / queue / index workers    │                                    │
+│ Retry versioned updates and tombstones  │◀───────────────────────────────────┘
+└─────────────────────────────────────────┘
+
+Readers follow the published pointer; authors can retain newer saved or unsaved work.
 ```
+
+I would walk from a local draft to one accepted revision, then to review and publication.
+The browser keeps newer typing separate from the receipt for that save. PostgreSQL owns
+the published pointer as well as the authoring head, while the outbox carries derived
+changes to search. The return path provides authorized content and explicit freshness,
+so the interface can distinguish saved, reader-visible and searchable content.
+
+For recovery, the browser retains the submitted save identity and any permitted local
+draft copy, resolves the original receipt, and reconciles against the current head.
+Index workers retry by generation, including tombstones, and observe the resulting
+projection state. A reader still passes current authorization and publication checks;
+a restored connection or a freshly indexed document does not replace those decisions.
 
 The API's modules can share one deployment initially. Redis supports sessions and
 immutable content caching, and a CDN serves the application bundle. Adding a network

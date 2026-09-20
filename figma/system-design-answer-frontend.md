@@ -49,14 +49,57 @@ boundary. Each component has a distinct state owner, so renderer objects never b
 only copy of the document.
 
 ```
-┌────────────────────────┐     ┌────────────────────────┐     ┌────────────────────────┐
-│ React controls / tools │ ──▶ │ Scene + pending state  │ ──▶ │   Retained renderer    │
-└────────────────────────┘     └────────────────────────┘     └────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│ BROWSER / FILE, PAGE AND ACCOUNT GENERATION                                              │
+│                                                                                          │
+│  ┌────────────────────────┐    ┌────────────────────────┐    ┌────────────────────────┐  │
+│  │ React controls/layers  │    │ Tool controller        │    │ Local viewport         │  │
+│  │ Select by object ID    │◀──▶│ Gesture draft / intent │    │ Pan / zoom / scale     │  │
+│  │ Properties / forms     │    │ Drag / resize / text   │    │ No document mutation   │  │
+│  └────────────────────────┘    └────────────────────────┘    └────────────────────────┘  │
+│               ▲                             ▲                                ▲           │
+│               │                             │                                │           │
+│               ▼                             ▼                                ▼           │
+│  ┌────────────────────────┐    ┌────────────────────────┐    ┌────────────────────────┐  │
+│  │ Normalized scene store │    │ Displayed scene model  │    │ Retained renderer      │  │
+│  │ Committed object IDs   │◀──▶│ Base, pending, preview │───▶│ Dirty objects; culling │  │
+│  │ Tree / property groups │    │ Derived changes        │    │ Disposable graphics    │  │
+│  └────────────────────────┘    └────────────────────────┘    └────────────────────────┘  │
+│               ▲                                                              ▲           │
+│               │                                                              │           │
+│               ▼                                                              ▼           │
+│  ┌────────────────────────┐    ┌────────────────────────┐    ┌────────────────────────┐  │
+│  │ Sync + local journal   │    │ Scoped undo history    │    │ Presence overlay state │  │
+│  │ Saved ID; ACK / replay │◀──▶│ Accepted gesture       │    │ Page / cursor / expiry │  │
+│  │ Applied sequence       │    │ Conditional inverse    │    │ Narrow subscriptions   │  │
+│  └────────────────────────┘    └────────────────────────┘    └────────────────────────┘  │
+│               ▲                                                              ▲           │
+│               │                                                              │           │
+└───────────────┼──────────────────────────────────────────────────────────────┼───────────┘
+                │                                                              │
+                │  commands / receipts                     presence / session  │
+                ▼                                                              ▼
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│ FILE COLLABORATION API                                                                   │
+│ Authorized bootstrap, semantic edits, canonical outcomes, replay and expiring presence   │
+└──────────────────────────────────────────────────────────────────────────────────────────┘
 
-┌────────────────────────┐     ┌────────────────────────┐
-│    Sync coordinator    │ ──▶ │ File collaboration API │
-└────────────────────────┘     └────────────────────────┘
+Stable document IDs connect canvas, layers, properties and undo; graphics are disposable.
 ```
+
+I would follow a drag from the tool's preview into the displayed scene and retained
+renderer without waiting for a network round trip. The sync coordinator sends a fixed
+semantic operation and reconciles its accepted effect into normalized document state.
+Undo targets accepted gesture effects rather than a renderer snapshot. Viewport transforms
+and cursor presence have separate owners, so zooming or a peer cursor cannot rewrite the
+shared object tree or invalidate every properties control.
+
+I would demonstrate recovery with one drag whose acknowledgement was lost:
+
+1. Keep its fixed operation ID and intent in the bounded account/file journal if reload recovery is enabled; a preview is still not a saved edit.
+2. Reauthorize, recover the committed prefix, and resolve that same operation's receipt before deciding whether it needs another send.
+3. Apply the canonical result to both scene and undo history. A new document generation pauses old pending edits for review.
+4. Restore viewport and presence independently. Neither cursor updates nor renderer objects are recovery records.
 
 React owns the file route, toolbar, dialogs, layer navigation, and properties forms. A
 scene store owns normalized objects and their canonical revisions. A tool controller

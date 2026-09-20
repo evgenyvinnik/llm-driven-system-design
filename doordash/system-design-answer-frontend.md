@@ -43,22 +43,55 @@ thirty-second threshold. Socket connectivity and point freshness are separate si
 This is the diagram I would draw, leaving backend service decomposition for follow-up:
 
 ```
-┌──────────────────────────────────────────────────────┐
-│ Customer routes │ Restaurant queue │ Driver delivery │
-└──────────────────────────┬───────────────────────────┘
-                           ▼
-┌──────────────────────────────────────────────────────┐
-│ View state + server snapshots + pending operations   │
-└───────────────────┬────────────────────┬─────────────┘
-                    ▼                    ▼
-          ┌──────────────────┐  ┌──────────────────┐
-          │ HTTP API client  │  │ Socket lifecycle │
-          └─────────┬────────┘  └─────────┬────────┘
-                    ▼                    ▼
-          ┌────────────────────────────────────────┐
-          │ Authorized API and event gateway       │
-          └────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│ WEB CLIENTS / CUSTOMER, RESTAURANT AND FOREGROUND DRIVER                                 │
+│                                                                                          │
+│  ┌────────────────────────┐    ┌────────────────────────┐    ┌────────────────────────┐  │
+│  │ Customer routes        │    │ Restaurant workspace   │    │ Driver delivery UI     │  │
+│  │ Browse / checkout      │    │ Queue / preparation    │    │ Offer, pickup, dropoff │  │
+│  │ Order tracking         │    │ Next permitted action  │    │ Foreground location    │  │
+│  └────────────────────────┘    └────────────────────────┘    └────────────────────────┘  │
+│                       ▲                             ▲                             ▲      │
+│                       │                             │                             │      │
+│                       ▼                             ▼                             ▼      │
+│  ┌────────────────────────┐    ┌────────────────────────┐    ┌────────────────────────┐  │
+│  │ Cart + checkout state  │    │ Queue + action state   │    │ Assignment + telemetry │  │
+│  │ Saved cart / quote     │    │ Versioned snapshots    │    │ Exact claim / progress │  │
+│  │ Saved operation ID     │    │ Saved transition IDs   │    │ Position age; sequence │  │
+│  └────────────────────────┘    └────────────────────────┘    └────────────────────────┘  │
+│                       ▲                             ▲                             ▲      │
+│                       │                             │                             │      │
+│                       ▼                             ▼                             ▼      │
+│  ┌────────────────────────────────────────────────────────────────────────────────────┐  │
+│  │ Shared contract + transport layer                                                  │  │
+│  │ HTTP commands and receipts; socket lifetime, revision checks and recovery          │  │
+│  │ Account/resource generations prevent late work from changing a different context   │  │
+│  └────────────────────────────────────────────────────────────────────────────────────┘  │
+│                                             ▲                                            │
+│                                             │                                            │
+│                                             │  commands / snapshots / scoped events      │
+└─────────────────────────────────────────────┼────────────────────────────────────────────┘
+                                              │
+                                              ▼
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│ AUTHORIZED API AND EVENT GATEWAY                                                         │
+│ Order state, assignment decisions and fresh positions have distinct contracts            │
+└──────────────────────────────────────────────────────────────────────────────────────────┘
 ```
+
+I would follow an accepted quote from the customer's cart into one identified checkout,
+then use the returned order revision across the customer, kitchen and driver views.
+Each role keeps its own pending actions while sharing contract parsing and connection
+recovery. Position samples have their own age and sequence, so a connected socket cannot
+make an old point look current. The driver's browser reports only within its stated
+foreground tracking capability.
+
+I would walk through reconnect for each persona:
+
+1. Restore only the account-scoped cart and frozen pending operation; resolve an unknown checkout before creating another order.
+2. A kitchen action recovers its original receipt, then refreshes the current order revision before offering the next transition.
+3. A driver refreshes the exact claim and deadline before acceptance; a retained screen cannot extend an expired offer.
+4. Refresh the authorized order snapshot and latest position separately. Old GPS samples stay visibly stale even after socket recovery.
 
 The server owns order state, current catalog facts, assignment authority, and permissions.
 The client owns unsubmitted choices, navigation, presentation, and the record of an

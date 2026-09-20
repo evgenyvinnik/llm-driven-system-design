@@ -47,26 +47,61 @@ An unavailable backend should not destroy an unsent draft.
 > "I would agree on these interaction goals before promising a live feed.
 > Thousands of events per second can be technically current and practically unreadable."
 
-## 🏗️ Architecture and ownership — 5 minutes
+## 🏗️ Architecture and ownership — 6 minutes
 
 I would draw this once and refer back to it:
 
 ```
-┌─────────────────────┐     ┌──────────────────────┐
-│    Console routes   │────▶│ Session + API client │
-│  Overview/list/test │     │ Request cancellation │
-└──────────┬──────────┘     └───────────┬──────────┘
-           │                            ▼
-┌──────────▼──────────┐     ┌──────────────────────┐
-│  Draft + view state │     │ Authorized read API  │
-│ Selection + filters │     │ Status + aggregates  │
-└─────────────────────┘     └───────────┬──────────┘
-                                        ▼
-                            ┌──────────────────────┐
-                            │    Delivery state    │
-                            │ Acceptance/attempts  │
-                            └──────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│ OPERATOR CONSOLE / BROWSER                                                               │
+│                                                                                          │
+│  ┌────────────────────────┐    ┌────────────────────────┐    ┌────────────────────────┐  │
+│  │ Test composer          │    │ Devices + operations   │    │ Fleet overview         │  │
+│  │ Draft + target         │    │ List and detail views  │    │ Counters + freshness   │  │
+│  └────────────────────────┘    └────────────────────────┘    └────────────────────────┘  │
+│                          ▲                             ▲                             ▲   │
+│                          │                             │                             │   │
+│   submit / outcome       │      select / render        │      render freshness       │   │
+│                          │                             │                             │   │
+│                          ▼                             ▼                             ▼   │
+│  ┌────────────────────────┐    ┌──────────────────────────────────────────────────────┐  │
+│  │ Submission controller  │    │ Scoped resource cache                                │  │
+│  │ Saved ID / frozen data │◀──▶│ Operation revisions, pages and aggregate snapshots   │  │
+│  │ Resume unknown outcome │    │ Explicit observation time, completeness and errors   │  │
+│  └────────────────────────┘    └──────────────────────────────────────────────────────┘  │
+│                          ▲                                                           ▲   │
+│                          │                                                           │   │
+│   accept / recover       │                                    poll snapshots         │   │
+│                          │                                                           │   │
+│                          ▼                                                           ▼   │
+│  ┌────────────────────────────────────────────────────────────────────────────────────┐  │
+│  │ API layer + refresh scheduler                                                      │  │
+│  │ Identity, cancellation, typed errors; visible-page polling and bounded retry       │  │
+│  └────────────────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                      ▲   │
+│                                                                                      │   │
+│  Shell owns session + URL scope; resource cache owns read results                    │   │
+└──────────────────────────────────────────────────────────────────────────────────────┼───┘
+   HTTP: test commands, scoped status, bounded history and aggregates                  │
+                                                                                       │
+                                                                                       ▼
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│ Authorized console APIs (server boundary)                                                │
+│ Accept an operation | read delivery evidence and projection observation time             │
+└──────────────────────────────────────────────────────────────────────────────────────────┘
 ```
+
+I would follow Submit from the editable composer into a frozen operation identity,
+then through the API layer to acceptance or status recovery. Lists and result panels
+render scoped server resources with observation times, while URL/session state owns
+the investigation context. The refresh scheduler polls that bounded view; neither a
+healthy browser connection nor a newly fetched projection proves device receipt.
+
+I would retain the opaque operation reference under the operator's account and app
+scope before sending. After a reload, the submission controller recovers that same
+operation; it does not automatically resubmit a mutable draft. Polling can then show
+newer persisted evidence, while a failed refresh leaves the previous observation time
+visible. Sensitive message bodies do not need broad browser persistence for this flow.
 
 The browser reads a bounded projection of the service.
 It does not subscribe directly to the internal delivery broker or infer delivery from
@@ -343,7 +378,7 @@ queries, stable focus, and useful detail. Those properties fit troubleshooting b
 | ✅ Server-filtered cursor pages | Bounded load and stable investigation | Requires cursor/query semantics |
 | ❌ Download-and-filter live feed | Simple small demo | Incomplete searches, moving rows, unbounded memory |
 
-## 🧪 Failure handling and validation — 5 minutes
+## 🧪 Failure handling and validation — 4 minutes
 
 I would validate user-visible invariants, not just whether the page renders.
 The key tests are about when one response is allowed to change another view.

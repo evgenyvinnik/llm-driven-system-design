@@ -6,7 +6,7 @@ This is a proposed design. The repository implements a simpler readline CLI with
 complete-response output; streaming, diff approval, and task cancellation below
 are design choices to explain, not claims about existing features.
 
-## 📋 Clarify the workflow — 5 minutes
+## 📋 Clarify the workflow — 4 minutes
 
 > “I would start with a developer asking the assistant to fix a failing test.
 > They need to understand what it is doing, inspect proposed changes, and regain
@@ -42,20 +42,61 @@ For accessibility, text labels carry status even without color. We need a usable
 plain-output mode and testing with actual terminal/screen-reader combinations.
 Terminal title escape sequences are not a general accessibility announcement API.
 
-## 🏗️ Draw the interface boundary — 5 minutes
+## 🏗️ Draw the interface boundary — 6 minutes
 
-I would draw one small diagram:
+I would draw the input, state, rendering, and execution boundaries, then trace the
+commands and events between them:
 
 ```
-┌──────────────┐       ┌──────────────────┐       ┌─────────────────┐
-│ Input owner  │──────▶│ Task controller  │──────▶│ Agent runtime   │
-└──────────────┘       └────────┬─────────┘       └────────┬────────┘
-                               │                          │ events
-                               ▼                          ▼
-                      ┌──────────────────────────────────────────┐
-                      │ Transcript state + terminal renderer     │
-                      └──────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│ TERMINAL CLIENT                                                                          │
+│                                                                                          │
+│  ┌────────────────────────┐    ┌────────────────────────┐    ┌──────────────────────┐    │
+│  │ Input owner            │    │ Task controller        │    │ Runtime bridge       │    │
+│  │ Composer / approval    │◀──▶│ Identity + lifecycle   │◀──▶│ Commands / decisions │──┐ │
+│  └────────────────────────┘    └────────────────────────┘    └──────────────────────┘  ▲ │
+│                                             │                                          │ │
+│  Requests, approvals, cancel                │  ordered events / replay                 │ │
+│                                             │                                          │ │
+│                                             ▼                                          │ │
+│  ┌─────────────────────────────────────────────────────┐     ┌──────────────────────┐  │ │
+│  │ Transcript model                                    │     │ Output owner         │  │ │
+│  │ Task IDs, text, tool outcomes, proposal revisions   │────▶│ Renderer + buffer    │  │ │
+│  │ Confirmed facts / partial text / unknown outcomes   │     │ stdout / plain mode  │  │ │
+│  └─────────────────────────────────────────────────────┘     └──────────────────────┘  │ │
+│                                                                                        │ │
+│  One owner for stdin; one for stdout; workers publish events instead of printing       │ │
+│                                                                                        │ │
+│  Decisions identify the operation and proposal revision; output retains task identity  │ │
+│                                                                                        │ │
+└────────────────────────────────────────────────────────────────────────────────────────┼─┘
+                                                                                         │
+                                                                                         ▼
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│ Agent runtime (execution boundary)                                                       │
+│ Authoritative task/operation state, identified proposals, ordered outcomes               │
+│ UI sends commands and decisions; runtime events establish what actually happened         │
+└──────────────────────────────────────────────────────────────────────────────────────────┘
+                                              ▲
+                                              │ save / replay
+                                              ▼
+                             ┌────────────────────────────────┐
+                             │ Durable task journal           │
+                             │ Requests / intent / outcomes   │
+                             │ Event sequence / artifact refs │
+                             └────────────────────────────────┘
 ```
+
+I would trace a tool approval through these boxes: input ownership switches from the
+composer to the identified proposal, the controller sends that revision's decision,
+and runtime events report what executed. Those events update the transcript before
+the output owner renders them. On resume, ordered replay rebuilds the same task view;
+a late event from another task cannot steal the new prompt or change its status.
+
+The journal sits behind the runtime boundary because it owns durable requests and
+observed outcomes. On restart, the runtime reconciles unfinished operations and emits
+replay events; the frontend rebuilds its transcript from those events. A partial output
+buffer or generated “done” message cannot resolve an operation whose effect is unknown.
 
 The runtime decides what has happened. The frontend turns its events into a
 transcript and sends user decisions back. Neither a renderer nor an approval

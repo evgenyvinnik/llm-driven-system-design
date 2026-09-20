@@ -41,29 +41,52 @@ The schema creates thirteen currencies and twelve pairs. The optional fixture ad
 ## High-Level Architecture
 
 ```text
-┌────────────────┐       ┌────────────────┐
-│ Browser        │──────▶│ API / gateway  │
-│ CDN assets     │◀──────│ Auth + queries │
-└────────────────┘       └───────┬────────┘
-                                 ▼
-                         ┌────────────────┐
-                         │ Pair command   │
-                         │ owner / book   │
-                         └───────┬────────┘
-                                 ▼
-                         ┌────────────────┐
-                         │ Durable store  │
-                         │ Orders/ledger  │
-                         │ Receipt/outbox │
-                         └───────┬────────┘
-                                 ▼
-                         ┌────────────────┐
-                         │ Event relay    │──────▶ Market views
-                         │ Stream workers │──────▶ Account views
-                         └────────────────┘
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Trading clients        │       │ Command + receipt API  │       │ Active pair owner      │
+│ Order / cancel intent  │◀─────▶│ Auth, limits, routing  │◀─────▶│ Epoch + pair sequence  │
+└────────────────────────┘       │ Scoped retry identity  │       │ Committed memory book  │
+                                 └────────────────────────┘       └────────────────────────┘
+                                              ▲                                ▲
+                                              │                                │
+               receipt lookup                 │  commit / recovery read        │
+                                              │                                │
+                                              ▼                                ▼
+┌────────────────────────┐       ┌─────────────────────────────────────────────────────────┐
+│ Recovery / checkpoints │       │ Transactional order and accounting authority            │
+│ Committed sequence     │◀─────▶│ Orders, holds, fills and balanced per-asset entries     │
+│ Replay + verify holds  │       │ Command decisions, receipts, fencing epoch and outbox   │
+└────────────────────────┘       └─────────────────────────────────────────────────────────┘
+                                              │
+committed events only                         │
+                                              │
+                                              ▼
+                                 ┌────────────────────────┐       ┌────────────────────────┐
+                                 │ Outbox relay           │       │ Projection workers     │
+                                 │ Retry publication      │──────▶│ Committed fills/events │
+                                 │ Stable event identity  │       │ Versioned state        │
+                                 └────────────────────────┘       └────────────────────────┘
+                                                                               ▲
+                                                                               │
+                                                 apply / checkpoint            │
+                                                                               │
+                                                                               ▼
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Read clients           │       │ Read/stream gateways   │       │ Market/account views   │
+│ Public / account views │◀─────▶│ Snapshots + streams    │◀─────▶│ Sequences + revisions  │
+└────────────────────────┘       │ Auth + replay limits   │       │ Snapshot/replay data   │
+                                 └────────────────────────┘       └────────────────────────┘
+
+Pair memory advances after commit. Unknown commit pauses matching until resolved.
 ```
 
 Logical ownership does not require a different database for every box. The first production design keeps orders, reservations, fills, journal entries, receipts, and outbox records in a common transactional store. Pair owners keep committed active books in memory to avoid repeated database comparisons, but do not publish speculative fills as durable facts.
+
+The command response returns only the authority's durable decision. If that decision
+is uncertain to the owner, matching pauses while receipt lookup and committed replay
+resolve the sequence. Outbox publication and read-model checkpoints have separate
+progress: they may lag without changing the validity of an already committed order.
+Clients recover a command by its scoped identity and recover missing market/account
+updates by the corresponding snapshot and sequence contract.
 
 ## Core Components / Request Flows
 

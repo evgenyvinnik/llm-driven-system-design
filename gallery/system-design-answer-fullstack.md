@@ -45,14 +45,59 @@ responses without creating another gallery entry or charging quota twice.
 ## 🏗️ Architecture and ownership — 5 minutes
 
 ```
-┌────────────────────────┐     ┌────────────────────────┐     ┌────────────────────────┐
-│    Gallery + viewer    │ ──▶ │ Metadata / upload API  │ ──▶ │      SQL + outbox      │
-└────────────────────────┘     └────────────────────────┘     └────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│ BROWSER / ONE COLLECTION AND EXPLICIT UPLOAD / VIEWER STATE                              │
+│                                                                                          │
+│  ┌────────────────────────┐    ┌────────────────────────┐    ┌────────────────────────┐  │
+│  │ Gallery + viewer UI    │    │ Collection/upload IDs  │    │ Image loader / decode  │  │
+│  │ Layout/selection/focus │◀──▶│ Metadata / generation  │◀──▶│ Actual rendition size  │◀─┼────┐
+│  │ Scoped direct upload   │    │ Transfer vs ready      │    │ Grant / decode state   │  │    │
+│  └────────────────────────┘    └────────────────────────┘    └────────────────────────┘  │    │
+│            ▲                                ▲                                            │    │
+│            │                                │                                            │    │
+└────────────┼────────────────────────────────┼────────────────────────────────────────────┘    │
+upload / ACK │     metadata / upload status   │                                                 │
+             ▼                                ▼                                                 │
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐    │
+│ Private staging        │       │ Metadata API           │       │ SQL authority          │    │
+│ Authorized input       │       │ Access / quota / state │◀─────▶│ Images / sessions      │    │
+│ Bounded upload         │       │ Guarded publish        │       │ Manifests + outbox     │    │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘    │
+             ▲                                           ▲                     ▲                │
+             │  read / bytes                             │                     │                │
+             └────────────────────────────────┐          │ publish / result    │                │
+                                              │          │                     │                │
+                                              ▼          ▼                     ▼                │
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐    │
+│ Private variant store  │       │ Processing workers     │       │ Outbox + queue         │    │
+│ Versioned profiles     │◀─────▶│ Decode/orient/resize   │◀─────▶│ Committed work         │    │
+│ Verified dimensions    │       │ Verify before ready    │       │ Retry / cleanup        │    │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘    │
+             ▲                                                                                  │
+             │                                                                                  │
+             │  private origin                                                                  │
+             │                                                                                  │
+             ▼                                                                                  │
+┌──────────────────────────────────────────────────────────────────────────────────────────┐    │
+│ AUTHORIZED IMAGE DELIVERY / CDN                                                          │    │
+│ Check delivery authority before cache access; serve the requested immutable rendition    │◀───┘
+└──────────────────────────────────────────────────────────────────────────────────────────┘
 
-┌────────────────────────┐     ┌────────────────────────┐     ┌────────────────────────┐
-│     Direct upload      │ ──▶ │   Processing workers   │ ──▶ │  Responsive variants   │
-└────────────────────────┘     └────────────────────────┘     └────────────────────────┘
+Transfer, processing, ready metadata and displayed pixels are separate observable stages.
 ```
+
+I would follow a photo from a scoped upload to a durable processing job, verified
+renditions and a conditionally published manifest. Metadata reserves the browser's image
+slot before pixels arrive; the loader obtains the right immutable rendition through the
+authorized delivery edge. Viewer selection and focus stay tied to stable image identity.
+The interface can therefore distinguish transferred, processing, ready and decoded content.
+
+I would explain recovery by returning to the same upload and selected image:
+
+1. Retain bounded account-scoped session references when reload recovery is desired, then ask for current upload status after reauthentication.
+2. Reselect a file when browser access was lost and verify that it matches the intended input; a stored session ID is not stored file data.
+3. Resolve the original finalization and let workers resume its generation. They acknowledge a verified durable result, including a rejected stale publication.
+4. Restore gallery/selection intent separately. Current listing and delivery checks precede showing protected content, and the loader still reports decode failures independently.
 
 The browser's gallery route owns collection context. A metadata layer owns fetched pages,
 status, and request generations. UI state owns layout choice and selected image ID.
@@ -64,7 +109,7 @@ and outbox events. It issues scoped upload authority, while the browser sends by
 directly to staging storage. Workers consume durable jobs and generate a small set of
 display variants.
 
-The bottom row is the image-byte path. Outputs are stored under versioned keys and served
+The image-byte path uses staging, workers, and versioned output keys. Renditions are served
 through a CDN with the authorization policy appropriate to the gallery. The metadata API
 does not proxy every image byte, and the worker does not receive arbitrary user-selected
 URLs to download.

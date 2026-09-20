@@ -54,29 +54,58 @@ A source-level sample of 100,000 keys named `key:0` through `key:99999`, using n
 Proposed production components:
 
 ```
-┌───────────────────────┐       ┌──────────────────────────┐
-│ Application services  │──────▶│ Durable origin           │
-│ Cache-aside + budgets │       │ Owned by the application │
-└───────────────────────┘       └──────────────────────────┘
-            │ cache requests
-            ▼
-┌───────────────────────┐       ┌─────────────────────────┐
-│ Regional router pool  │◀──────│ Membership authority    │
-│ Deadlines + admission │       │ Versioned placement     │
-└───────────────────────┘       └─────────────────────────┘
-            │ one current owner
-            ▼
-┌────────────────────────────────────────────────────────┐
-│ Cache nodes: bounded storage, TTL, owner-generation    │
-│ checks, eviction, capacity and health reporting        │
-└────────────────────────────────────────────────────────┘
-            │ sampled observations
-            ▼
-┌───────────────────────┐       ┌─────────────────────────┐
-│ Observation service   │──────▶│ Authenticated console   │
-│ Per-node age/coverage │       │ Inspect + scoped admin  │
-└───────────────────────┘       └─────────────────────────┘
+OPERATOR PATH — browser views/state at left; authenticated console at right
+
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Operator views           │view/input  │ Browser state            │HTTP/result │ Console API              │
+│ Overview / keys / admin  │◀──────────▶│ Scoped query / preview   │◀──────────▶│ Auth / scope / action    │
+│ Sample age and coverage  │            │ Saved operation ID       │            │ Read / submit / status   │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+                                                                                    ▲         ▲
+                sample / coverage                                                   │         │
+              ┌─────────────────────────────────────────────────────────────────────┘         │
+              │                                                                               │
+              │                                         scoped command / status               │
+              │                                       ┌───────────────────────────────────────┘
+              │                                       │
+              ▼                                       ▼
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Observation service      │            │ Transition controller    │commit/read │ Membership authority     │
+│ Shared bounded samples   │            │ Drain / fence / recover  │◀──────────▶│ Durable placement + ops  │
+│ Age / errors / epoch     │            │ Advance recorded phases  │            │ One accepted generation  │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+              ▲                                       ▲                                       ▲
+              │                                       │                                       │
+              │                                       │ fence / result                        │
+              │                                       │             placement / refresh       │
+              │ sample / result                       │     ┌─────────────────────────────────┘
+              │                                       │     │
+              ▼                                       ▼     ▼
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Cache node partitions    │op/result   │ Regional router pool     │cache/reply │ Application services     │
+│ Owner epoch checks       │◀──────────▶│ Namespace / admission    │◀──────────▶│ Cache-aside read + fill  │
+│ Disposable memory / TTL  │            │ Route accepted version   │            │ Freshness / refill cap   │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+                                                                                              ▲
+                                                                                              │
+                                                                                              │ MISS / fallback read
+Controllers send bounded fencing work through routers to nodes.                               │
+A new placement is published only after fencing is established.                               │
+                                                                                              ▼
+                                                                                ┌──────────────────────────┐
+Cache acceptance is disposable; durable origin state belongs                    │ Durable origin           │
+to the application. Observations never establish ownership.                     │ Application-owned data   │
+                                                                                │ Budgeted refill reads    │
+                                                                                └──────────────────────────┘
 ```
+
+The proposed control metadata is durable even though cached values are disposable:
+
+1. Console requests carry current authorization and exact scope; shared sampling returns age, errors, and placement context.
+2. A membership operation records its identity and phase. The controller sends bounded fencing work through routers to the affected nodes and records outcomes.
+3. Only after fencing is established does the membership authority publish the next accepted generation. A replacement controller resumes this record.
+4. Routers serve application requests independently of console polling; nodes check the generation and return HIT, MISS, or an explicit failure.
+5. The application owns budgeted origin reads and freshness-bounded refills. Browser recovery stores operation references, not cached values or a second placement authority.
 
 The origin is outside the cache service. The membership authority is responsible for accepted placement versions; individual routers do not independently reshape the ring whenever a probe fails. The observation service protects the data path from per-viewer fan-out and does not become a prerequisite for ordinary cache reads.
 

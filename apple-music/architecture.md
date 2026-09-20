@@ -77,23 +77,42 @@ streaming throughput, synchronization, or recommendation quality.
 The media and API paths separate at the client:
 
 ```text
-┌────────────────────────────┐    ┌────────────────────────────┐
-│ Browser / native player    │───▶│ CDN: media and artwork     │
-└──────────────┬─────────────┘    └──────────────▲─────────────┘
-               ▼                                 │
-┌────────────────────────────┐    ┌──────────────┴─────────────┐
-│ API edge + identity        │    │ Private object origin      │
-└──────────────┬─────────────┘    │ Verified media publication │
-               ▼                  └────────────────────────────┘
-┌────────────────────────────┐    ┌────────────────────────────┐
-│ Playback authorization     │    │ Catalog + search           │
-│ Library / playlist service │───▶│ Metadata + search index    │
-└──────────────┬─────────────┘    └──────────────▲─────────────┘
-               ▼                                 │
-┌────────────────────────────┐    ┌──────────────┴─────────────┐
-│ User database + change log │    │ Durable listening events   │
-│ Operation receipts         │    │ Aggregates/recommendations │
-└────────────────────────────┘    └────────────────────────────┘
+        ┌──────────────────────────────────────────────────────────────────────────────────────────┐
+        │ BROWSER / PERSISTENT PLAYBACK AND ACCOUNT-SCOPED DATA                                    │
+        │                                                                                          │
+        │  ┌────────────────────────┐    ┌────────────────────────┐    ┌────────────────────────┐  │
+        │  │ Player + queue         │    │ Shared control client  │    │ Library + discovery UI │  │
+  ┌─────┼─▶│ Media lifecycle        │◀──▶│ Grants, edits, queries │◀──▶│ Confirmed base + edits │  │
+  │     │  │ Playback-instance ID   │    │ Independent of routes  │    │ Keyed query results    │  │
+  │     │  └────────────────────────┘    └────────────────────────┘    └────────────────────────┘  │
+  │     │               ▲                             ▲                                            │
+  │     │               │                             │                                            │
+  │     └───────────────┼─────────────────────────────┼────────────────────────────────────────────┘
+  │                     │                             │
+  │        media bytes  │                             │  control / canonical results
+  │                     ▼                             ▼
+  │        ┌────────────────────────┐    ┌─────────────────────────────────────────────────────────┐
+  │        │ CDN + private origin   │    │ Music control APIs                                      │
+  │        │ Immutable media        │    │ Playback grants | revisioned library sync | discovery   │
+  │        │ Authorized delivery    │    │ Read authority or eligible projections per operation    │
+  │        └────────────────────────┘    └─────────────────────────────────────────────────────────┘
+  │                                                   ▲                             ▲
+  │                                                   │                             │
+  │ events / ACK                  edit / sync         │             discovery       │
+  │                                                   │                             │
+  ▼                                                   ▼                             ▼
+┌───────────────────────────────┐        ┌────────────────────────┐    ┌────────────────────────┐
+│ Listening event pipeline      │        │ State authority        │    │ Read projections       │
+│ Auth + durable acceptance     │        │ Catalog + owner state  │───▶│ History + candidates   │
+│ Replay and identified effects │        │ Atomic log + receipts  │    │ Freshness can lag      │
+└───────────────────────────────┘        └────────────────────────┘    └────────────────────────┘
+                │                                                                   ▲
+                │                                                                   │
+                │  asynchronous history and recommendation updates                  │
+                │                                                                   │
+                └───────────────────────────────────────────────────────────────────┘
+
+Observed playback progress drives player state; grant issuance is separate.
 ```
 
 The listener fetches bytes from the delivery tier after authorization. Audio does
@@ -102,6 +121,13 @@ format, and metadata before exposing a rendition as available.
 
 A listening-event pipeline feeds discovery and analytics independently. A failure
 to refresh recommendations should not stop an already authorized track.
+
+The three return paths carry different evidence: grant-checked media produces
+observed playback, a committed owner mutation produces a revision and operation
+receipt, and durable event ingestion produces an acceptance receipt. Projection
+workers may lag either metadata publication or listening activity. On recovery,
+the client refreshes an eligible grant, reconciles the same edit, or retries the same
+event identity according to which path failed; it does not reset every subsystem.
 
 ## Core Components / Request Flows
 

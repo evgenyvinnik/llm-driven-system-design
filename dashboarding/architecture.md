@@ -60,40 +60,55 @@ The SQL seed creates 18 series and 6,498 observations across the previous hour o
 ### Proposed production system
 
 ```text
-┌──────────────────────┐       ┌───────────────────────────┐
-│ Metric producers     │──────▶│ Authenticated ingest      │
-└──────────────────────┘       │ Validate / quota          │
-                               └─────────────┬─────────────┘
-                                             │
-                                             ▼
-                               ┌───────────────────────────┐
-                               │ Durable log               │
-                               │ Identified batches        │
-                               └─────────────┬─────────────┘
-                                             │
-                                             ▼
-┌──────────────────────┐       ┌───────────────────────────┐
-│ Browser              │       │ Storage workers           │
-│ Refresh + charts     │       │ Samples + receipts        │
-└───────────┬──────────┘       └─────────────┬─────────────┘
-            │                                │
-            ▼                                ▼
-┌──────────────────────┐       ┌───────────────────────────┐
-│ Query API            │◀─────▶│ Time-series storage       │
-│ Plan / authorize     │       │ Raw + aggregate states    │
-└──────────────────────┘       └─────────────┬─────────────┘
-                                             │
-                                             ▼
-                               ┌───────────────────────────┐
-                               │ Alert evaluators          │
-                               │ State + delivery log      │
-                               └─────────────┬─────────────┘
-                                             │
-                                             ▼
-                               ┌───────────────────────────┐
-                               │ Notification workers      │
-                               └───────────────────────────┘
+BROWSER: upper-left two boxes. SERVER: APIs, authorities, and workers.
+
+┌──────────────────────────┐            ┌──────────────────────────┐
+│ Refresh + config state   │HTTP/result │ Authorized APIs          │query / result
+│ Window / generation      │◀──────────▶│ Bound queries + results  │◀────────────────────────┐
+│ Saved draft + operation  │      ┌────▶│ Revisioned config saves  │                         │
+└──────────────────────────┘      │     └──────────────────────────┘                         │
+              ▲                   │                   ▲                                      │
+              │                   │                   │                                      │
+              │                   │ config            │                                      │
+              │ render / input    │ read/             │ query / evidence                     │
+              │                   │ save              │                                      │
+              │                   │                   │                                      │
+              ▼                   │                   ▼                                      ▼
+┌──────────────────────────┐      │     ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Panels + incident views  │      │     │ Rule evaluation          │            │ Time-series authority    │
+│ Values / gaps / evidence │      │     │ Independent work budget  │            │ Samples + batch receipts │
+│ Controls and stale state │      │     │ Missing is not healthy   │            │ Rollups + coverage       │
+└──────────────────────────┘      │     └──────────────────────────┘            └──────────────────────────┘
+                                  │                   ▲                                       ▲
+                                  │                   │                                       │
+                                  │                   │ transition / evidence                 │ commit / recover
+                                  └─────────────┐     │                                       │
+                                                │     │                                       │
+                                                ▼     ▼                                       ▼
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Notification workers     │work/status │ Relational authority     │            │ Storage workers          │
+│ Lease / retry obligation │◀──────────▶│ Config, rules, incidents │            │ Samples + receipt commit │
+│ Persist delivery outcome │            │ Receipts + delivery work │            │ Checkpoint after commit  │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+              ▲                                                                               ▲
+              │                                                                               │
+              │ attempt / result                                                              │ replay / checkpoint
+              │                                                                               │
+              ▼                                                                               ▼
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ External destinations    │            │ Metric producers         │batch/ACK   │ Ingest + durable log     │
+│ Webhook / email          │            │ Saved immutable batch    │◀──────────▶│ Auth / quota / append    │
+│ Independent delivery     │            │ Retry same identity      │            │ ACK after durable append │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
 ```
+
+Follow the numbered paths when presenting this proposed overview:
+
+1. The producer retains an immutable batch; ingestion returns acceptance only after the durable append.
+2. Storage workers commit samples and a processed-batch receipt before checkpointing, so replay can recover an uncertain write.
+3. Authorized queries return measurements with coverage to the browser's current refresh generation; config and incident reads use relational authority.
+4. Conditional config saves commit an operation receipt. A permitted, account-scoped local draft helps recover an interrupted edit but cannot prove it was saved.
+5. A fenced rule evaluator commits incident state and delivery work; notification workers record external outcomes separately.
 
 PostgreSQL stores dashboard, rule, tenant, and access metadata. TimescaleDB initially supplies time-series storage within the relational deployment; separate pools and resource budgets protect ingestion from analytical reads. Redis caches reusable query results and sessions. A CDN serves the browser assets. These supporting components need not occupy most of an interview whiteboard.
 

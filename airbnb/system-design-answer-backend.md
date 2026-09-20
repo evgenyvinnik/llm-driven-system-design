@@ -38,22 +38,61 @@ Traffic and contention will be concentrated in popular destinations and properti
 I would target search p95 below 500 ms and a database booking decision below one
 second at p99. Payment-provider and host-response time are separate measurements.
 
-## 🏗️ Architecture and ownership — 5 minutes
+## 🏗️ Architecture and ownership — 6 minutes
 
 ```
-┌──────────────┐       ┌──────────────────────┐       ┌─────────────────┐
-│ Web / Mobile │──────▶│ API / authentication │──────▶│ Search service  │
-└──────────────┘       └──────────┬───────────┘       └────────┬────────┘
-                                 │                            ▼
-                       ┌─────────▼───────────┐       ┌─────────────────┐
-                       │ Booking / inventory │       │ Search views    │
-                       │ authority           │       │ and caches      │
-                       └─────────┬───────────┘       └────────▲────────┘
-                                 ▼                            │
-                       ┌─────────────────────┐       ┌────────┴────────┐
-                       │ Database + outbox   │──────▶│ Broker / workers│
-                       └─────────────────────┘       └─────────────────┘
+PROPOSED DESIGN — one inventory authority per listing
+
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Guest / host clients     │HTTP/result │ API / authorization      │session     │ Shared sessions          │
+│ Search, reserve, recover │◀──────────▶│ Actor + resource scope   │◀──────────▶│ Current user identity    │
+│ Host calendar revisions  │            │ Read operation outcome   │            │ Expiry and revocation    │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+              ▲                                       ▲
+              │                                       │               search/results
+              │                                       ├───────────────────────────────────────┐
+              │ GET / bytes                           │ reserve/recover                       │
+              │                                       │                                       │
+              ▼                                       ▼                                       ▼
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Public listing images    │            │ Booking / inventory      │            │ Search service           │
+│ Object storage + CDN     │            │ Serialize listing writes │            │ Geo/filter retrieval     │
+│ Outside inventory locks  │            │ Recheck rules + quote    │            │ Rank candidate results   │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+                                                      ▲                                       ▲
+                                                      │                                       │
+                                                      │ commit / read                         │ candidates
+                                                      │                                       │
+                                                      ▼                                       ▼
+                                        ┌──────────────────────────┐            ┌──────────────────────────┐
+                                        │ PostgreSQL + outbox      │            │ Candidate read model     │
+                                        │ Occupancy + rules        │            │ PostGIS + read cache     │
+                                        │ Booking + retry result   │            │ May lag inventory        │
+                                        └──────────────────────────┘            └──────────────────────────┘
+                                                      │                                       ▲
+                                                      │                                       │
+                                                      │ committed work                        │
+                                                      │                                       │
+                                                      │                                       │ refresh
+                                                      ▼                                       │
+┌──────────────────────────┐            ┌──────────────────────────┐                          │
+│ Notification delivery    │deliver     │ Relay / broker / workers │                          │
+│ Booking ID + revision    │◀───────────│ Retry committed events   │──────────────────────────┘
+│ Retry provider delivery  │            │ Consumer-scoped progress │
+└──────────────────────────┘            └──────────────────────────┘
 ```
+
+A search follows the right-hand read path and returns candidates that may be stale.
+A reservation follows the booking path, rechecks authoritative rules and occupancy,
+and commits the booking, retry result, and outbox together. The result returns before
+notification delivery; the lower worker path later refreshes discovery projections.
+Public image delivery is a separate client path and never holds an inventory lock.
+
+For a lost response, I would trace the same client/API/booking/database path using
+the retained operation identity. Reading that result does not create a second stay.
+For a worker failure, I would trace the committed outbox instead: retry delivery and
+refresh projections by booking revision, without rolling back a committed booking.
+These recovery paths answer different questions and have separate progress records.
 
 The booking authority owns occupied intervals and booking transitions. Search owns
 retrieval and ranking, but it does not own the decision that dates are still free.
@@ -365,7 +404,7 @@ Monitor lock waits, conflicts, stale-state rejections, operation recovery, outbo
 and dead letters. Booking value is not collected revenue; monetary metrics must
 state exactly which lifecycle event they represent.
 
-## 📈 Scale and validate the design — 4 minutes
+## 📈 Scale and validate the design — 3 minutes
 
 I would scale public reads and image delivery before splitting inventory ownership.
 At larger write volume, partition bookings and occupied intervals together by listing

@@ -41,27 +41,52 @@ One API, one notification worker, PostgreSQL, Valkey, and RabbitMQ are sufficien
 ## High-Level Architecture
 
 ```text
-┌────────────────┐       ┌────────────────┐
-│ Guest / host UI│──────▶│ Scheduling API │
-└────────────────┘       └───────┬────────┘
-                                 ▼
-                         ┌────────────────┐
-                         │ Booking store  │
-                         │ Rules + outbox │
-                         └───────┬────────┘
-                                 │ committed changes
-                 ┌───────────────┴──────────────┐
-                 ▼                              ▼
-         ┌────────────────┐             ┌────────────────┐
-         │ Availability   │             │ Notification   │
-         │ cache          │             │ jobs / workers │
-         └────────────────┘             └───────┬────────┘
-                                                ▼
-                                        Email / calendar
-                                        providers
+┌────────────────────────┐       ┌─────────────────────────────────────────────────────────┐
+│ Guest / host clients   │       │ Scheduling API entry                                    │
+│ Scoped booking access  │◀─────▶│ Validate input, capabilities and host session scope     │
+└────────────────────────┘       └─────────────────────────────────────────────────────────┘
+                                              ▲
+                                              │
+             ┌────────────────────────────────┴────────────────────────────────┐
+             │                                │                                │
+             ▼                                ▼                                ▼
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Availability queries   │       │ Booking commands       │       │ Host policy commands   │
+│ Expand local rules     │       │ Create / cancel / move │       │ Versioned rule changes │
+│ Covered instants       │       │ Recover operation      │       │ Coordinate occupancy   │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+             ▲                                ▲                                ▲
+             │                                │                                │
+cached view  │                   host lock    │                   same lock    │
+             │                                │                                │
+             ▼                                ▼                                ▼
+┌────────────────────────┐       ┌─────────────────────────────────────────────────────────┐
+│ Availability cache     │       │ PostgreSQL reservation authority                        │
+│ Range + policy version │◀─────▶│ Hosts, rules, bookings, accepted occupied intervals     │
+│ Miss read, bounded age │       │ Operation receipts, history, outbox and delivery jobs   │
+└────────────────────────┘       └─────────────────────────────────────────────────────────┘
+                                              ▲
+                                              │
+committed work / recorded outcome             │
+                                              │
+                                              ▼
+┌────────────────────────┐       ┌─────────────────────────────────────────────────────────┐
+│ Email / integrations   │       │ Outbox, reminder and delivery workers                   │
+│ External outcomes      │◀─────▶│ Durable jobs, lease/revision checks, provider receipts  │
+│ May be delayed         │       │ Provider calls happen after booking commit              │
+└────────────────────────┘       └─────────────────────────────────────────────────────────┘
+
+Availability proposes a time; one host transaction decides whether it can be reserved.
 ```
 
 A CDN serves static assets and public page metadata with appropriate cache policy. Guest availability and private management data have separate keys and access rules. Logical availability, booking, and integration services can begin in one application; scale their capacity independently as their workloads diverge.
+
+The host transaction commits the accepted occupied interval, operation receipt, and
+outbox work together. Its result returns to the guest independently of provider
+delivery. Recovery reads the same receipt; reminder recovery reads the current booking
+revision and durable job state before another provider attempt. Host policy changes
+use the same coordination boundary as booking mutations, while cached availability
+remains an advisory view of those rules and reservations.
 
 ## Core Components / Request Flows
 

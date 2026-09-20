@@ -7,12 +7,12 @@ catalog and timer-player demo; production additions are intentional.
 | Discussion | Minutes |
 |------------|---------|
 | Clarify the viewing experience | 4 |
-| Draw the client and its contracts | 5 |
+| Draw the client and its contracts | 6 |
 | Deep dive: reliable playback | 10 |
 | Deep dive: account and profile context | 8 |
 | Deep dive: resume across devices | 8 |
 | Performance and accessibility | 6 |
-| Failures, validation and local comparison | 4 |
+| Failures, validation and local comparison | 3 |
 | Total | 45 |
 
 ## 🎯 Clarify the viewing experience — 4 minutes
@@ -56,27 +56,62 @@ A small set of concrete acceptance cases keeps the discussion grounded:
 | Close and reopen | Resume from acknowledged progress, with bounded possible loss |
 | Session expires | Explain the access problem and preserve recoverable context |
 
-## 🏗️ Draw the client and its contracts — 5 minutes
+## 🏗️ Draw the client and its contracts — 6 minutes
 
 > “I would draw the interface, the media engine and the two server paths. The
 > interface manages intent; the media engine manages actual playback.”
 
 ```
-┌────────────────┐                  ┌────────────────┐
-│ Routes + UI    │─ control ───────▶│ Account APIs   │
-│                │                  │ Catalog / sync │
-└────────────────┘                  └────────────────┘
-        │ intent
-        ▼
-┌────────────────┐                  ┌────────────────┐
-│ Media engine   │─ media ─────────▶│ CDN + origin   │
-│ Video surface  │                  │                │
-└────────────────┘                  └────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│ BROWSER / ACCOUNT, PROFILE AND PLAYBACK GENERATION                                       │
+│                                                                                          │
+│  ┌────────────────────────┐    ┌────────────────────────┐    ┌────────────────────────┐  │
+│  │ Browse + personal UI   │    │ Scoped data + context  │    │ Player controls        │  │
+│  │ Title, lists, resume   │◀──▶│ Account / profile      │    │ Current intent         │  │
+│  └────────────────────────┘    │ Query keys + freshness │    │ Observed playing state │  │
+│                                └────────────────────────┘    └────────────────────────┘  │
+│                                   ▲                                       ▲              │
+│                                   │                                       │              │
+│               ┌───────────────────┘         ┌─────────────────────────────┘              │
+│               │                             │                                            │
+│  read/context │                             │  intent / result                           │
+│               ▼                             ▼                                            │
+│  ┌────────────────────────┐    ┌────────────────────────┐    ┌────────────────────────┐  │
+│  │ Control API client     │    │ Playback controller    │    │ Media engine adapter   │  │
+│  │ Authorize + resume     │◀──▶│ One active generation  │◀──▶│ Buffer / decode / ABR  │  │
+│  │ Sequenced progress     │    │ Renew / retry / save   │  ┌▶│ Media events           │  │
+│  └────────────────────────┘    └────────────────────────┘  │ └────────────────────────┘  │
+│               ▲                                            │              ▲              │
+│               │                                            │              │              │
+└───────────────┼────────────────────────────────────────────┼──────────────┼──────────────┘
+                │                                            │              │
+                │ context / progress               license   │              │  media
+                │                                            │              │
+                ▼                                            │              ▼
+┌────────────────────────┐       ┌────────────────────────┐  │    ┌────────────────────────┐
+│ Account / catalog APIs │       │ Protected license API  │  │    │ CDN + private origin   │
+│ Playback sessions      │       │ Platform DRM workflow  │◀─┘    │ Manifest + segments    │
+│ Progress + receipts    │       │ Personalized response  │       │ Fixed media revision   │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+
+Control, license and media requests have separate failure and recovery states.
 ```
 
-The media engine reports local playback events back to application state. A separate
-protected license request accompanies media startup where required. I would add that
-arrow verbally instead of crowding the first drawing.
+I would trace Play through the controller, authorization and resume lookup, then
+into the media engine. The engine follows separate license and media paths and sends
+actual playback events back to the controls. Profile-scoped resources own browse and
+personal results, while the controller captures one context for the active generation.
+Progress saves can lag briefly without stalling decode or causing the browse UI to
+rerender on every time update.
+
+For a transient segment failure, the engine retries the fixed media revision within
+its playback budget. An expired grant or license instead follows the appropriate
+renewal path for the same captured account/profile/generation. Progress retries retain
+their session and sequence until acknowledged; a profile switch invalidates old work
+before it can repaint the player or replace the new profile's resume state.
+
+The media engine reports local playback events back to application state. Its license
+adapter handles the protected startup exchange where the platform requires it.
 
 The route identifies the title and browse filters. A server-data cache holds catalog
 pages and personal lists. A small client store holds account/profile context and
@@ -359,7 +394,7 @@ I would test screen-reader announcements for major state changes, not announce t
 clock every second. Reduced-motion preferences should disable decorative movement
 while preserving useful playback feedback.
 
-## 🧪 Failures, validation and local comparison — 4 minutes
+## 🧪 Failures, validation and local comparison — 3 minutes
 
 My tests would emphasize races and user outcomes. Start title A, immediately select B,
 then delay A's responses. B must remain selected. Switch profiles during a watchlist

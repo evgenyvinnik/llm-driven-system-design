@@ -48,27 +48,51 @@ Use a few browser sessions against one PostgreSQL/Valkey pair. The seed's 150/32
 Proposed production services; static assets and processed public media use a separate CDN. Personalized responses and private media require audience-aware access, not a shared public edge cache.
 
 ```
-┌──────────────────────────┐       ┌──────────────────────────┐
-│ Feed API + session check │       │ Post / graph / like API  │
-│ Candidate hydration      │       │ Authorized operations    │
-└────────────┬─────────────┘       └────────────┬─────────────┘
-             │                                  │
-             ▼                                  ▼
-┌──────────────────────────┐       ┌──────────────────────────┐
-│ Ranked feed sessions     │       │ SQL shards               │
-│ Ordered IDs + cursors    │       │ Records/receipts/outbox  │
-└────────────▲─────────────┘       └────────────┬─────────────┘
-             │                                  ▼
-┌──────────────────────────┐       ┌──────────────────────────┐
-│ Candidate aggregation    │◀──────│ Durable fan-out workers  │
-│ Pushed + pull timelines  │       │ Bounded recipient chunks │
-└──────────────────────────┘       └────────────┬─────────────┘
-                                                ▼
-                                   ┌──────────────────────────┐
-                                   │ Notification gateways    │
-                                   │ Authorized refresh hints │
-                                   └──────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│ BROWSER / AUTHOR INTENT AND STABLE READER CONTEXT                                        │
+│                                                                                          │
+│  ┌────────────────────────┐    ┌────────────────────────┐    ┌────────────────────────┐  │
+│  │ Composer / actions     │    │ Entities / page order  │    │ Virtual feed + media   │  │
+│  │ Draft + saved intent   │◀──▶│ Session/cursor/anchor  │◀──▶│ DOM + buffer budgets   │  │
+│  └────────────────────────┘    │ Refresh hints          │    │ Return-to-feed context │  │
+│                                └────────────────────────┘    └────────────────────────┘  │
+│                                             ▲                                ▲           │
+│                                             │                                │           │
+└─────────────────────────────────────────────┼────────────────────────────────┼───────────┘
+                   pages / commands / hints   │                  images        │
+                                              ▼                                ▼
+┌─────────────────────────────────────────────────────────┐       ┌────────────────────────┐
+│ Session-aware command and feed API                      │       │ Media service / CDN    │
+│ Current access; ranked sessions; mutation receipts      │       │ Image derivatives      │
+└─────────────────────────────────────────────────────────┘       │ Current audience grant │
+             ▲                                ▲                   └────────────────────────┘
+             │                                │
+source state │           session candidates   │
+             │                                │
+             ▼                                ▼
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Canonical SQL          │       │ Merge / rank / session │       │ Candidate projections  │
+│ Posts / graph / likes  │       │ Push and pull union    │◀─────▶│ Push IDs / hot authors │
+│ Receipts + outbox      │       │ Stable candidate order │       │ Coverage and identity  │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+             ▲                                                                 ▲
+             │                                                                 │
+             ▼                                                                 │
+┌─────────────────────────────────────────────────────────┐                    │
+│ Outbox relay + fan-out workers                          │                    │
+│ Retry bounded recipient work; maintain author timelines │◀───────────────────┘
+└─────────────────────────────────────────────────────────┘
+
+Posting, candidate propagation and reader refresh are separate steps.
 ```
+
+Follow one post and one returning reader through the proposed overview:
+
+1. The author keeps its original operation identity; SQL commits source state, receipt, and distribution work together before acknowledgement.
+2. Workers apply identified recipient chunks or author-timeline updates, then record progress. Retry and policy-overlap handling preserve candidate coverage.
+3. The serving path freezes a bounded candidate order, while every hydrated page and media admission still checks current access.
+4. The browser restores bounded drafts and a still-valid reading session separately. An expired session, revoked post, or expired media grant has its own recovery response.
+5. Refresh hints invite a new session; they do not reorder the existing reading position or establish permission to display content.
 
 Post and relationship authorities persist source records and outbox work. Candidate workers materialize pushed IDs; followed high-fan-out authors contribute their author timelines at read time. Feed serving batches those sources, filters authorization, ranks once for a short-lived session, and pages its ordered IDs. Hydration still checks current deletion/access state on every page.
 

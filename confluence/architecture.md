@@ -57,30 +57,43 @@ The seed contains nine pages across two spaces. Compose runs one PostgreSQL, one
 ### Proposed production system
 
 ```text
-┌─────────────────────┐       ┌────────────────────────────┐
-│ Browser editor      │──────▶│ Gateway + session auth     │
-│ Reader / search     │       └──────────────┬─────────────┘
-└─────────────────────┘                      │
-                                 ┌───────────┴──────────────────────┐
-                                 ▼                                  ▼
-                    ┌─────────────────────────┐        ┌─────────────────────────┐
-                    │ Wiki API                │        │ Search API              │
-                    │ Pages / policy          │◀───────│ Candidate checks        │
-                    └────────────┬────────────┘        └────────────┬────────────┘
-                                 │                                  │
-                                 ▼                                  ▼
-                    ┌─────────────────────────┐        ┌─────────────────────────┐
-                    │ PostgreSQL              │        │ Search index            │
-                    │ Revisions / outbox      │        │ Derived documents       │
-                    └────────────┬────────────┘        └────────────▲────────────┘
-                                 │                                  │
-                                 ▼                                  │
-                    ┌─────────────────────────┐        ┌────────────┴────────────┐
-                    │ Outbox publisher        │───────▶│ Queue + indexers        │
-                    └─────────────────────────┘        └─────────────────────────┘
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Browser / clients      │       │ Wiki API modules       │       │ PostgreSQL authority   │
+│ Page or search request │◀─────▶│ Session + permission   │◀─────▶│ Pages / revisions      │
+└────────────────────────┘       │ Revision/tree commands │       │ Receipts, ACL, outbox  │
+                                 └────────────────────────┘       └────────────────────────┘
+                                              ▲                                │
+                                              │                                │
+                              search request  │             committed events   │
+                                              │                                │
+                                              ▼                                ▼
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Derived search index   │       │ Search coordinator     │       │ Outbox relay + queue   │
+│ Versioned documents    │◀─────▶│ Bounded candidates     │       │ Retained obligations   │
+│ No access authority    │       │ Current access check   │       │ Retries and event IDs  │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+             ▲                                                                 │
+             │                                                                 │
+             │                                               indexing work     │
+             │                                                                 │
+             │                                                                 ▼
+             │                                                    ┌────────────────────────┐
+             │                                                    │ Index workers          │
+             └───────────────────────────────────────────────────▶│ Ordered generations    │
+                                                                  │ Updates + tombstones   │
+                                                                  └────────────────────────┘
+
+Save/publication commit first; index visibility follows. Logical modules can share one API.
 ```
 
 A CDN serves versioned application assets. Redis can hold sessions and reusable revision payloads; neither decides the authoritative revision or access policy. The logical Wiki and Search APIs may begin in one deployable application. Separating every feature into a service would add transactions and failure modes without improving the initial workload.
+
+A save returns the committed revision receipt even if derived search work is delayed.
+The outbox retains that obligation; workers repeat ordered updates or tombstones and
+check projection results without creating another page revision. Search narrows the
+candidate set, then validates current access and the allowed published revision before
+returning content. Client recovery likewise resolves the existing receipt and keeps
+newer local text separate from the accepted or published server snapshot.
 
 ## Core Components / Request Flows
 

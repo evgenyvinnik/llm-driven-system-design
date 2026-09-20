@@ -67,19 +67,54 @@ devices instead of inferring responsiveness from a fast server request.
 ## 🏗️ Architecture and ownership
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│ Wallet / checkout UI: cards, review, pending, result         │
-└──────────────────────────────┬───────────────────────────────┘
-                               ▼
-┌──────────────────────────────────────────────────────────────┐
-│ Interaction controller: fixed intent + operation ID          │
-└────────────┬───────────────────────────────────┬─────────────┘
-             ▼                                   ▼
-┌──────────────────────────┐        ┌──────────────────────────┐
-│ Platform payment API     │        │ Application API          │
-│ Authorize credential     │        │ Order / operation status │
-└──────────────────────────┘        └──────────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│ WALLET CLIENT / PRIVATE ACCOUNT SCOPE                    │
+│                                                          │
+│  ┌───────────────────────┐     ┌──────────────────────┐  │      ┌────────────────────────┐
+│  │ Wallet views          │     │ Wallet data model    │  │      │ Wallet APIs            │
+│  │ Cards + history       │◀───▶│ Safe metadata        │◀─┼─────▶│ Enroll / suspend       │
+│  └───────────────────────┘     │ Lifecycle + op IDs   │  │      │ Versioned display data │
+│                                └──────────────────────┘  │      └────────────────────────┘
+│                                                          │
+└──────────────────────────────────────────────────────────┘
+
+The merchant does not receive the wallet card list.
+
+┌──────────────────────────────────────────────────────────┐
+│ MERCHANT CHECKOUT CLIENT / ORDER SCOPE                   │
+│                                                          │
+│  ┌───────────────────────┐     ┌──────────────────────┐  │      ┌────────────────────────┐
+│  │ Review + result UI    │     │ Attempt controller   │  │      │ Merchant APIs          │
+│  │ Amount, currency      │◀───▶│ Frozen checkout      │◀─┼─────▶│ Order version + total  │
+│  │ Pending / final       │     │ Saved operation ID   │  │      │ Durable attempt status │
+│  └───────────────────────┘     └──────────────────────┘  │      └────────────────────────┘
+│                                             ▲            │
+│                                             │            │
+└─────────────────────────────────────────────┼────────────┘
+                                              │
+authorize / permitted credential              │
+                                              │
+                                              ▼
+                                 ┌─────────────────────────────────────────────────────────┐
+                                 │ Supported payment platform                              │
+                                 │ Device confirmation and protected credential handoff    │
+                                 │ Credentials stay outside ordinary UI caches             │
+                                 └─────────────────────────────────────────────────────────┘
+
+Platform authorization and merchant payment outcome are separate states.
 ```
+
+I would walk the two surfaces separately. Wallet views render account-scoped metadata
+and tracked lifecycle requests. Checkout freezes a merchant-owned order version,
+uses the supported platform for confirmation and credential handoff, then submits
+and recovers one merchant attempt. The result screen follows that durable outcome;
+a platform success or a closed modal cannot by itself establish approval or cancellation.
+
+Before submission, I would retain the opaque attempt reference within the merchant
+and account scope, while keeping payment credentials outside ordinary persisted UI
+state. After a reload or a lost response, the controller queries that same attempt.
+Wallet suspension has its own tracked lifecycle operation; a local card badge changes
+only according to that operation's evidence, independently of a merchant's payment.
 
 The interaction controller coordinates asynchronous steps and owns the
 current checkout identity. A card component only renders metadata and

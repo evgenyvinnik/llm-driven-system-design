@@ -61,26 +61,23 @@ Draw the authenticated request path first, then the optional cache path. Static 
 └──────────────────────────────────────────────────────────────────────────────────────────┘
                                                    ▲                                     ▲
                                                    │                                     │
-                                                   │                                     │
   canonical reads / atomic writes                  │           optional range cache      │
-                                                   │                                     │
                                                    │                                     │
                                                    ▼                                     ▼
 ┌──────────────────────────────────────────────────────┐       ┌───────────────────────────┐
 │ PostgreSQL primary / owner partition                 │       │ Private range cache       │
 │ Users, calendars, events, range indexes              │       │ Owner + range + zone      │
-│ Event versions + operation receipts + outbox         │       │ Bounded TTL, disposable   │
+│ Event versions + operation receipts + outbox         │       │ Snapshot revision + TTL   │
 └──────────────────────────────────────────────────────┘       └───────────────────────────┘
-                                                   │                          ▲
-                                                   │                          │
+                                                   ▲                          ▲
                                                    │                          │
   committed outbox records                         │                          │
                                                    │                          │
                                                    │       evict ranges       │
                                                    ▼                          │
 ┌──────────────────────────────────────────────────────┐                      │
-│ Outbox worker (if caching is added)                  │──────────────────────▶
-│ Retry changed-range invalidation after commit        │
+│ Outbox worker (if caching is added)                  │◀─────────────────────┘
+│ Retry invalidation; confirm progress after effect    │
 └──────────────────────────────────────────────────────┘
 ```
 
@@ -88,6 +85,8 @@ Draw the authenticated request path first, then the optional cache path. Static 
 2. The Calendar service authorizes the owner and calendar, then either reads a range or validates and commits an event mutation. The overlap check is advisory; it never reserves the interval.
 3. PostgreSQL commits the event, its version, an operation receipt, and an outbox entry when downstream work is needed. The canonical result returns through the service and updates the browser's event model.
 4. If profiling justifies range caching, cache entries contain a snapshot revision. An outbox worker invalidates affected old and new ranges after writes. A writer's minimum revision forces a current read when a cached snapshot is too old.
+
+The worker records progress after the invalidation effect is confirmed; an interrupted attempt can repeat the same invalidation. This return path does not redefine the save result. The browser resolves an ambiguous save using the original operation ID and reconciles the canonical event/version before refreshing affected ranges. Warning failure is reported separately from successful persistence.
 
 The cache and outbox worker are optional scaling additions. They do not appear in the local application. A session store may initially use PostgreSQL, with its workload measured separately; adding another database is not justified by a user-count threshold alone.
 

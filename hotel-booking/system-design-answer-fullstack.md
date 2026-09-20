@@ -1,533 +1,446 @@
-# Hotel Booking System - System Design Answer (Full-Stack Focus)
+# Hotel Booking — System Design Answer (Fullstack Focus)
 
-*45-minute system design interview format - Full-Stack Engineer Position*
+*45-minute interview walkthrough. This is a proposed end-to-end design; the local demo's
+boundary is called out at the end.*
 
-## Opening Statement
+## 🎯 Scope and user promise — 4 minutes
 
-"Today I'll design a hotel booking system like Booking.com or Expedia. As a full-stack engineer, I'll focus on the integration points between frontend and backend: the API contract for search and booking, shared TypeScript types for type safety, the booking flow with reservation holds and payment coordination, and real-time availability updates. I'll demonstrate how the React frontend and Node.js backend work together to prevent double bookings while maintaining a responsive user experience."
+> "I'd design around a guest planning a stay, accepting a price, and obtaining one reliable
+> booking. Search helps them choose. A hold allocates rooms. Payment and confirmation make the
+> final promise. Those are separate stages."
 
----
+I would first clarify whether we book a specific physical room or a quantity of a room type.
+I'll support the latter, in one hotel, for one continuous date range. Multi-hotel baskets,
+intentional overbooking, and external hotel-channel synchronization are out of scope.
 
-## 📋 Step 1: Requirements Clarification (3-5 minutes)
+The guest can search, compare nightly prices, reserve, pay, inspect status, and cancel under
+agreed terms. A property owner can manage room types, capacity, and date-specific prices. The
+initial architecture can be a modular application plus workers; each logical box need not be a
+microservice.
 
-### Functional Requirements
+### Requirements to agree on
 
-1. **Search with real-time availability** - Frontend displays results, backend combines ES + PostgreSQL
-2. **Booking with reservation holds** - 15-minute hold while user completes payment
-3. **Dynamic pricing** - Base prices with date-specific overrides from admin UI
-4. **Admin dashboard** - Hotel owners manage rooms and pricing via API
-5. **User bookings** - View, confirm, cancel with proper state transitions
+| Concern | Contract |
+|---|---|
+| Inventory | Active allocations cannot exceed capacity on any occupied night |
+| Dates | Check-in inclusive, checkout exclusive, using hotel calendar dates |
+| Money | The accepted quote defines amount, currency, and cancellation terms |
+| Retries | One purchase intent has one recoverable result |
+| Interaction | Search is responsive; unavailable and unknown outcomes are distinct |
+| Accessibility | Planning and checkout work without pointer-only interactions |
 
-### Non-Functional Requirements
+I would ask how long checkout holds last and what happens when payment is unresolved at
+expiry. The UI cannot truthfully show a timer until the server has a clear deadline contract.
 
-- **Consistency**: Zero double-bookings through pessimistic locking
-- **Responsiveness**: Optimistic UI updates with proper error handling
-- **Type Safety**: Shared types between frontend and backend
-- **API Design**: RESTful with clear error responses
+For a sizing exercise, assume ten million searches and 100,000 bookings daily, with a tenfold
+peak. That is roughly 1,200 searches and twelve bookings per second at peak, but hot
+properties can concentrate the writes. These are assumptions, not benchmark results.
 
-### Full-Stack Focus Areas
+I'd target sub-500 ms p95 discovery and short inventory transactions. A provider may take
+longer, so the frontend must support pending and recoverable outcomes instead of waiting
+behind an unexplained spinner.
 
-- API contract design with TypeScript interfaces
-- Booking flow coordination (reserve → payment → confirm)
-- Error handling across the stack
-- Availability cache and real-time updates
-- Admin API for hotel management
-
----
-
-## 🏗️ Step 2: API Contract Design (8 minutes)
-
-### Shared TypeScript Types
-
-"I'm choosing shared TypeScript interfaces for the API contract because it provides compile-time type safety and serves as living documentation for both frontend and backend developers."
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    SHARED TYPES (shared/types.ts)               │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │                    CORE ENTITIES                         │   │
-│  ├─────────────────────────────────────────────────────────┤   │
-│  │  Hotel: id, name, description, address, city, country,  │   │
-│  │         latitude, longitude, starRating, amenities,     │   │
-│  │         images, status, createdAt                        │   │
-│  │                                                          │   │
-│  │  RoomType: id, hotelId, name, description, basePrice,   │   │
-│  │            maxGuests, totalRooms, amenities, images     │   │
-│  │                                                          │   │
-│  │  Booking: id, userId, hotelId, roomTypeId, checkIn,     │   │
-│  │           checkOut, roomCount, totalPrice, status,      │   │
-│  │           guestName, guestEmail, specialRequests,       │   │
-│  │           expiresAt, createdAt                          │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                 │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │                    STATUS ENUMS                          │   │
-│  ├─────────────────────────────────────────────────────────┤   │
-│  │  BookingStatus: 'reserved' | 'confirmed' | 'cancelled'  │   │
-│  │                 | 'completed' | 'expired'               │   │
-│  │                                                          │   │
-│  │  HotelStatus: 'active' | 'inactive' | 'pending'         │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                 │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │                    REQUEST/RESPONSE TYPES                │   │
-│  ├─────────────────────────────────────────────────────────┤   │
-│  │  SearchParams: location, city, lat/lng, checkIn,        │   │
-│  │                checkOut, guests, rooms, priceMin/Max,   │   │
-│  │                starRating[], amenities[]                │   │
-│  │                                                          │   │
-│  │  SearchResult: hotels[], total, page, pageSize          │   │
-│  │                                                          │   │
-│  │  CreateBookingRequest: hotelId, roomTypeId, checkIn,    │   │
-│  │                        checkOut, roomCount, guestName,  │   │
-│  │                        guestEmail, specialRequests?     │   │
-│  │                                                          │   │
-│  │  CreateBookingResponse: booking, deduplicated, expiresIn│   │
-│  │                                                          │   │
-│  │  ApiError: error, code, details?                        │   │
-│  └─────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### API Endpoints Summary
-
-| Category | Endpoint | Method | Purpose |
-|----------|----------|--------|---------|
-| **Search** | /api/v1/search | POST | Search hotels with filters |
-| **Hotels** | /api/v1/hotels/:id | GET | Get hotel with room types |
-| **Hotels** | /api/v1/hotels/:id/availability | GET | Get room availability |
-| **Bookings** | /api/v1/bookings | POST | Create reservation |
-| **Bookings** | /api/v1/bookings/:id/confirm | POST | Confirm after payment |
-| **Bookings** | /api/v1/bookings/:id/cancel | POST | Cancel booking |
-| **Admin** | /api/v1/admin/hotels | POST | Create hotel |
-| **Admin** | /api/v1/admin/rooms/:id/pricing | PUT | Set price overrides |
-
----
-
-## 🎯 Step 3: Booking Flow Integration (10 minutes)
-
-### Frontend: Booking Hook
+## 🏗️ Architecture and one booking journey — 6 minutes
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                    BOOKING FLOW (Frontend)                      │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  useBooking() hook provides:                                    │
-│  ├─ createReservation(request) → CreateBookingResponse         │
-│  ├─ confirmBooking(bookingId) → void                           │
-│  ├─ cancelBooking(bookingId) → void                            │
-│  ├─ isLoading: boolean                                         │
-│  ├─ error: ApiError | null                                     │
-│  └─ expiryCountdown: number | null (seconds remaining)         │
-│                                                                 │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │  Step 1: CREATE RESERVATION                              │   │
-│  │  ┌─────────────────────────────────────────────────────┐ │   │
-│  │  │  1. Generate idempotency key from request params    │ │   │
-│  │  │  2. POST /api/v1/bookings with X-Idempotency-Key    │ │   │
-│  │  │  3. Handle ROOM_UNAVAILABLE error → show message    │ │   │
-│  │  │  4. Start expiry countdown timer                    │ │   │
-│  │  │  5. Move to payment step                            │ │   │
-│  │  └─────────────────────────────────────────────────────┘ │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                              │                                  │
-│                              ▼                                  │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │  Step 2: CONFIRM BOOKING (after payment)                 │   │
-│  │  ┌─────────────────────────────────────────────────────┐ │   │
-│  │  │  1. POST /api/v1/bookings/:id/confirm               │ │   │
-│  │  │  2. Handle RESERVATION_EXPIRED → restart flow       │ │   │
-│  │  │  3. Clear countdown timer                           │ │   │
-│  │  │  4. Move to confirmation step                       │ │   │
-│  │  └─────────────────────────────────────────────────────┘ │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                 │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │  IDEMPOTENCY KEY GENERATION                              │   │
-│  │  ┌─────────────────────────────────────────────────────┐ │   │
-│  │  │  Hash of: hotelId + roomTypeId + checkIn + checkOut │ │   │
-│  │  │           + roomCount + timestamp (rounded to min)  │ │   │
-│  │  │  Result: "client-abc123def"                         │ │   │
-│  │  └─────────────────────────────────────────────────────┘ │   │
-│  └─────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────────────────────────┐
+│ BROWSER                                                                                    │
+│                             pick                                                           │
+│  ┌────────────────────────┐     ┌────────────────────────┐     ┌────────────────────────┐  │
+│  │ Search + calendar      │     │ Checkout attempt       │     │ Booking status         │  │
+│  │ URL + draft range      │────▶│ Quote + saved intent   │◀───▶│ Held / confirmed       │  │
+│  └────────────────────────┘     └────────────────────────┘     │ Unknown / expired      │  │
+│                         ▲                                      └────────────────────────┘  │
+│                         │                                                             ▲    │
+│                         │                                                             │    │
+│  advisory reads         │        hold / payment command / status recovery             │    │
+│                         │                                                             │    │
+└─────────────────────────┼─────────────────────────────────────────────────────────────┼────┘
+                          │     dated checks                                            │
+                          ▼                                                             ▼
+┌───────────────────────────┐      ┌─────────────────────────────────────────────────────────┐
+│ Discovery API             │      │ Booking API                                             │
+│ Catalog + dated results   │◀────▶│ Auth + ownership + canonical amount                     │
+└───────────────────────────┘      │ Inventory and payment state machine                     │
+                          ▲        └─────────────────────────────────────────────────────────┘
+                          │                                                             ▲
+                          │                                                             │
+match / enrich            │         atomic booking + receipt + outbox                   │
+                          │                                                             │
+                          ▼                                                             ▼
+┌───────────────────────────┐      ┌─────────────────────────────────────────────────────────┐
+│ Search index / read cache │      │ PostgreSQL primary                                      │
+│ Eventually updated        │◀──┐  │ Inventory, quote, hold, operation receipt               │
+└───────────────────────────┘   │  │ Payment attempts + inbox/outbox                         │
+                                │  └─────────────────────────────────────────────────────────┘
+                                │                                                       ▲
+index / progress                │                                                       │
+                                │  expiry / reconciliation / delivery                   │
+                                │                                                       │
+                                │                                                       ▼
+┌───────────────────────────┐   │  ┌─────────────────────────────────────────────────────────┐
+│ Payment provider          │   └─▶│ Workers                                                 │
+│ Verified events           │◀────▶│ Guard deadlines; retry and reconcile provider calls     │
+│ Idempotent operations     │      └─────────────────────────────────────────────────────────┘
+└───────────────────────────┘
 ```
 
-### Backend: Booking Service
+I would draw the browser row first because it makes the product flow concrete. Search and
+calendar data help select a stay. Checkout owns a frozen attempt. The status view shows what
+the server currently knows, including uncertainty.
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    BOOKING SERVICE (Backend)                    │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  createBooking(request, userId):                                │
-│                                                                 │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │  1. IDEMPOTENCY CHECK                                    │   │
-│  │  ┌─────────────────────────────────────────────────────┐ │   │
-│  │  │  Generate key from userId + request params          │ │   │
-│  │  │  Check existing booking with same key               │ │   │
-│  │  │  If found → return existing, deduplicated: true     │ │   │
-│  │  └─────────────────────────────────────────────────────┘ │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                              │                                  │
-│                              ▼                                  │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │  2. DISTRIBUTED LOCK (for high-contention rooms)         │   │
-│  │  ┌─────────────────────────────────────────────────────┐ │   │
-│  │  │  Lock resource: hotelId:roomTypeId:checkIn:checkOut │ │   │
-│  │  │  withLock(resource, async () => { ... })            │ │   │
-│  │  └─────────────────────────────────────────────────────┘ │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                              │                                  │
-│                              ▼                                  │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │  3. TRANSACTION WITH PESSIMISTIC LOCKING                 │   │
-│  │  ┌─────────────────────────────────────────────────────┐ │   │
-│  │  │  BEGIN TRANSACTION                                  │ │   │
-│  │  │                                                      │ │   │
-│  │  │  a) SELECT room_type FOR UPDATE ← locks row         │ │   │
-│  │  │                                                      │ │   │
-│  │  │  b) Check availability within lock:                 │ │   │
-│  │  │     - Count bookings per night (reserved/confirmed) │ │   │
-│  │  │     - Compare max against total_rooms               │ │   │
-│  │  │     - If insufficient → throw ROOM_UNAVAILABLE      │ │   │
-│  │  │                                                      │ │   │
-│  │  │  c) Calculate total price:                          │ │   │
-│  │  │     - Get base_price from room_type                 │ │   │
-│  │  │     - Apply price_overrides per date                │ │   │
-│  │  │     - Sum all nights × room_count                   │ │   │
-│  │  │                                                      │ │   │
-│  │  │  d) INSERT booking with status='reserved'           │ │   │
-│  │  │     - Set expires_at = NOW() + 15 minutes           │ │   │
-│  │  │     - Store idempotency_key                         │ │   │
-│  │  │                                                      │ │   │
-│  │  │  COMMIT                                              │ │   │
-│  │  └─────────────────────────────────────────────────────┘ │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                              │                                  │
-│                              ▼                                  │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │  4. POST-COMMIT ACTIONS                                  │   │
-│  │  ┌─────────────────────────────────────────────────────┐ │   │
-│  │  │  - Invalidate availability cache for hotel/room     │ │   │
-│  │  │  - Track metrics (bookings created, duration)       │ │   │
-│  │  │  - Return booking with expiresIn = 900 seconds      │ │   │
-│  │  └─────────────────────────────────────────────────────┘ │   │
-│  └─────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────┘
-```
+Underneath, the left side is advisory discovery and the right side is authoritative booking.
+PostgreSQL owns inventory, accepted quotes, and receipts. The search index is updated through
+durable projection work. The payment provider is a separate failure domain reached through
+retryable workers.
 
-### Booking Status Transitions
+### Walk through the arrows
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    BOOKING STATE MACHINE                        │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│                    ┌───────────┐                               │
-│                    │ reserved  │ ← Initial state (15-min hold) │
-│                    └─────┬─────┘                               │
-│                          │                                      │
-│         ┌────────────────┼────────────────┐                    │
-│         │                │                │                    │
-│         ▼                ▼                ▼                    │
-│   ┌───────────┐   ┌───────────┐   ┌───────────┐              │
-│   │ confirmed │   │  expired  │   │ cancelled │              │
-│   └─────┬─────┘   └───────────┘   └───────────┘              │
-│         │         (auto after     (user action)              │
-│         │          15 minutes)                                  │
-│         ▼                                                       │
-│   ┌───────────┐                                                │
-│   │ completed │ ← After checkout date passes                   │
-│   └───────────┘                                                │
-│                                                                 │
-│  Transitions:                                                   │
-│  ├─ reserved → confirmed: User completes payment               │
-│  ├─ reserved → expired: Background job after 15 min            │
-│  ├─ reserved → cancelled: User cancels before paying           │
-│  ├─ confirmed → cancelled: User cancels (may have fee)         │
-│  └─ confirmed → completed: checkout_date < NOW()               │
-└─────────────────────────────────────────────────────────────────┘
-```
+1. The guest commits destination, dates, guests, and room count; these become URL criteria and the discovery query identity.
+2. Discovery matches hotels and enriches a bounded candidate set with dated availability and price hints.
+3. Selecting a room requests a quote; the server returns exact terms and their deadline.
+4. Accepting the quote freezes a purchase intent. Booking allocates a hold and commits its receipt in one transaction.
+5. A valid hold enters payment processing. Durable work calls the provider using a stable attempt identity.
+6. Verified payment status drives a guarded booking transition. The browser fetches canonical status after completion, reconnect, or uncertainty.
 
-### Availability Check Query
+On reload, recover the bounded account-scoped intent reference and resolve the same booking
+and payment attempt after reauthentication. An unknown provider outcome keeps the relevant
+processing allocation protected until reconciliation. The left worker branch updates the
+search projection and records confirmed effects independently; its freshness does not decide
+whether the guest has a confirmed booking.
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    AVAILABILITY CALCULATION                     │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  Goal: Find max rooms booked on any single night in range      │
-│                                                                 │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │  FOR EACH NIGHT in [checkIn, checkOut):                  │   │
-│  │    - Count room_count from all overlapping bookings      │   │
-│  │    - Where status IN ('reserved', 'confirmed')           │   │
-│  │                                                          │   │
-│  │  TAKE MAX across all nights                              │   │
-│  │                                                          │   │
-│  │  available_rooms = total_rooms - max_booked              │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                 │
-│  Example: Room type with 10 total rooms, 3-night stay         │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │  Night 1: 6 rooms booked → 4 available                  │   │
-│  │  Night 2: 8 rooms booked → 2 available                  │   │
-│  │  Night 3: 5 rooms booked → 5 available                  │   │
-│  │  ─────────────────────────────────                       │   │
-│  │  Max booked = 8 → Available for full stay = 2            │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                 │
-│  Uses PostgreSQL generate_series() for date expansion          │
-└─────────────────────────────────────────────────────────────────┘
-```
+The quote-to-hold boundary is where advisory planning becomes inventory allocation. The
+provider boundary is where a single database transaction stops being sufficient. Those are the
+two places I would circle on the board.
 
----
+### State and contracts
 
-## 🔍 Step 4: Search Integration (8 minutes)
+| Data | Authority | Frontend representation |
+|---|---|---|
+| Committed search criteria | URL | Shareable state restored by navigation |
+| Incomplete date range | Local picker | Draft until valid |
+| Calendar/results | Server snapshots | Cache with scope, freshness, loading and error state |
+| Quote | Server | Display-only terms tied to room/date/count scope |
+| Purchase intent | Client identity, server receipt | Frozen key and payload for retries |
+| Booking/payment status | Server state machine | Held, processing, confirmed, expired, cancelled, unknown |
 
-### Two-Phase Search Architecture
+Authentication scopes private queries and commands. I would use a secure session cookie for
+this proposal and clear private client state on account changes. The local implementation uses
+an opaque bearer token in localStorage instead.
 
-"I'm choosing a two-phase search (Elasticsearch for filtering, PostgreSQL for availability) because ES excels at full-text and geo queries, while PostgreSQL provides ACID guarantees for accurate availability counts."
+## 🔍 Deep dive 1: Making date-based discovery trustworthy — 9 minutes
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    TWO-PHASE SEARCH                             │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  ┌──────────────────────────────────────────────────────────┐  │
-│  │  PHASE 1: Elasticsearch Query                             │  │
-│  │  ┌────────────────────────────────────────────────────┐  │  │
-│  │  │  Filters:                                           │  │  │
-│  │  │  ├─ Location: geo_distance (50km radius)           │  │  │
-│  │  │  │           OR city match OR multi_match          │  │  │
-│  │  │  ├─ Price range: range query on min_price          │  │  │
-│  │  │  ├─ Star rating: terms query                       │  │  │
-│  │  │  ├─ Amenities: terms query                         │  │  │
-│  │  │  └─ Status: term = 'active'                        │  │  │
-│  │  │                                                     │  │  │
-│  │  │  Returns: Up to 100 candidate hotels               │  │  │
-│  │  └────────────────────────────────────────────────────┘  │  │
-│  └──────────────────────────────────────────────────────────┘  │
-│                              │                                  │
-│                              ▼                                  │
-│  ┌──────────────────────────────────────────────────────────┐  │
-│  │  PHASE 2: PostgreSQL Availability                         │  │
-│  │  ┌────────────────────────────────────────────────────┐  │  │
-│  │  │  For each candidate hotel (in parallel):           │  │  │
-│  │  │  ├─ Check cache: availability:{hotelId}:{dates}    │  │  │
-│  │  │  ├─ If cache miss → query PostgreSQL               │  │  │
-│  │  │  ├─ Calculate available rooms per room type        │  │  │
-│  │  │  ├─ Calculate pricing with overrides               │  │  │
-│  │  │  └─ Cache result with 5-min TTL                    │  │  │
-│  │  │                                                     │  │  │
-│  │  │  Filter: availableRooms >= requiredRooms           │  │  │
-│  │  └────────────────────────────────────────────────────┘  │  │
-│  └──────────────────────────────────────────────────────────┘  │
-│                              │                                  │
-│                              ▼                                  │
-│  ┌──────────────────────────────────────────────────────────┐  │
-│  │  PHASE 3: Ranking                                         │  │
-│  │  ┌────────────────────────────────────────────────────┐  │  │
-│  │  │  Score = 0.3 × (rating/5)                          │  │  │
-│  │  │        + 0.2 × (reviewCount/1000)                  │  │  │
-│  │  │        + 0.3 × (1 - lowestPrice/500)               │  │  │
-│  │  │        + 0.2 × (starRating/5)                      │  │  │
-│  │  │                                                     │  │  │
-│  │  │  Sort by score descending                          │  │  │
-│  │  └────────────────────────────────────────────────────┘  │  │
-│  └──────────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────┘
-```
+A hotel search is a planning tool. Guests change dates repeatedly and compare prices across
+nights. The frontend needs fast local interaction without implying that a read reserved a
+room.
 
-### Frontend: Search Page Structure
+### Calendar as a query builder
 
-| Component | Purpose |
-|-----------|---------|
-| SearchBar | Location, dates, guests input |
-| FiltersPanel | Price range, star rating, amenities sidebar |
-| HotelCard | Hotel summary with lowest price and thumbnail |
-| LoadingState | Skeleton placeholders during search |
-| EmptyState | "No hotels found" with suggestions |
-| ErrorState | Error message with retry option |
+Keep an incomplete selection local. Only commit a range when both dates are valid and checkout
+is strictly after check-in. Two independent inputs that fetch after every change send
+intermediate nonsense and invite late-response races.
 
----
+Fetch month snapshots for the calendar and cache them under the room/date scope. Prefetch at
+most nearby months. Hovering over a date should not trigger another inventory query. A final
+quote or hold still checks the complete requested stay.
 
-## 📊 Step 5: Real-Time Availability Updates (5 minutes)
+Half-open nights matter across the whole stack. The 17th–19th occupies two nights; a guest may
+check out on the 19th even when the night of the 19th is sold out. Validate all occupied
+nights, not just the selected endpoints.
 
-### Frontend: Polling Hook
+Use date-only operations for hotel dates. Host-local timestamp iteration can duplicate or skip
+labels around daylight-saving changes, while UTC conversion can shift a local midnight to the
+previous date. One shared convention should govern API validation, price breakdowns, and UI
+summaries.
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    AVAILABILITY POLLING                         │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  useAvailability({ hotelId, checkIn, checkOut, pollInterval })  │
-│                                                                 │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │  State:                                                  │   │
-│  │  ├─ availability: RoomTypeAvailability[]                │   │
-│  │  ├─ isLoading: boolean                                  │   │
-│  │  ├─ error: string | null                                │   │
-│  │  └─ lastUpdated: Date | null                            │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                 │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │  Behavior:                                               │   │
-│  │  ├─ Initial fetch on mount                              │   │
-│  │  ├─ Poll every 60s (configurable)                       │   │
-│  │  ├─ Compare response to detect changes                  │   │
-│  │  ├─ Only update state if availability changed           │   │
-│  │  └─ Expose refresh() for manual refetch                 │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                 │
-│  Why polling vs WebSocket:                                      │
-│  ├─ Simpler to implement and debug                             │
-│  ├─ Works through proxies/firewalls                            │
-│  ├─ 60s polling is acceptable for hotel booking                │
-│  └─ WebSocket can be added later for real-time updates         │
-└─────────────────────────────────────────────────────────────────┘
-```
+### Discovery budget and freshness
 
-### Backend: Availability Caching
+The server first matches catalog candidates, then batches dated availability and prices for a
+bounded set. It is reasonable to filter search by availability. It is not reasonable to treat
+a successful check as a hold.
 
-| Layer | TTL | Invalidation |
-|-------|-----|--------------|
-| Redis cache | 5 minutes | On booking create/cancel |
-| HTTP Cache-Control | 1 minute | Header: max-age=60 |
-| X-Cache header | - | HIT/MISS for debugging |
+At twenty candidate hotels and two room types per candidate, naive enrichment multiplies the
+assumed peak into roughly 48,000 availability checks per second. Caching and batching are
+therefore an end-to-end concern, not just a backend optimization.
 
----
+| Choice | Why it fits | Cost |
+|---|---|---|
+| ✅ Valid committed range + month snapshots | Responsive planning with controlled request volume | Draft state and cache freshness rules |
+| ✅ Bounded dated enrichment | Avoids repeated sold-out detail visits | Some stale hints and a finite candidate budget |
+| ❌ Fetch on every interaction | Easy event wiring | Invalid queries, waste, and response races |
+| ❌ Check every candidate authoritatively | Appears exhaustive | Can overwhelm the inventory database |
 
-## ⚠️ Step 6: Error Handling Across the Stack (4 minutes)
+A cache key must include requested room count if it caches an availability boolean.
+Alternatively cache nightly counts and derive the comparison for the current quantity.
+Invalidation must cover overlapping ranges and owner edits, not just the exact dates of one
+new booking.
 
-### Error Codes and HTTP Status Mapping
+### Keeping the UI and API aligned
 
-| Error Code | HTTP Status | Frontend Action |
-|------------|-------------|-----------------|
-| ROOM_NOT_FOUND | 404 | Show "Room no longer available" |
-| ROOM_UNAVAILABLE | 409 | Show "Sold out", refresh availability |
-| BOOKING_NOT_FOUND | 404 | Redirect to bookings list |
-| RESERVATION_EXPIRED | 410 | Show "Expired", restart booking |
-| INVALID_STATUS | 400 | Show generic error |
-| CANNOT_CANCEL | 400 | Show cancellation policy |
-| VALIDATION_ERROR | 400 | Highlight invalid fields |
-| INTERNAL_ERROR | 500 | Show "Something went wrong" |
+Return an explicit hotel DTO with stable field names and a coherent continuation contract. If
+enrichment removes half a candidate page, its remaining length is not the total number of
+available hotels. The frontend should not combine that value with an unfiltered page count.
 
-### Frontend: API Service Pattern
+A hotel's minimum base price also may belong to a different room type from the one that fits
+the guest's party. Dated offers must pair capacity and price for the same option. An accepted
+quote includes nightly overrides and quantity, not a client extrapolation from “from $180.”
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    API SERVICE (Frontend)                       │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  class ApiService {                                             │
-│    private async request(endpoint, options):                    │
-│      ├─ Base URL: /api/v1                                      │
-│      ├─ Headers: Content-Type: application/json                │
-│      ├─ Credentials: include (for session cookies)             │
-│      └─ Return raw Response (let caller handle status)         │
-│                                                                 │
-│    createBooking(data, idempotencyKey):                         │
-│      ├─ POST /bookings                                         │
-│      └─ Header: X-Idempotency-Key                              │
-│                                                                 │
-│    confirmBooking(id): POST /bookings/:id/confirm              │
-│    cancelBooking(id): POST /bookings/:id/cancel                │
-│    search(params): POST /search                                 │
-│    getHotelAvailability(id, checkIn, checkOut):                │
-│      └─ GET /hotels/:id/availability?checkIn=...&checkOut=...  │
-│  }                                                              │
-└─────────────────────────────────────────────────────────────────┘
-```
+Every read response is tied to its query identity. Abort obsolete reads and reject late
+results if their criteria or account no longer match. Changing dates clears or revalidates the
+selected room and quote, rather than leaving a stale room object next to new dates.
 
-### Backend: Error Handler Middleware
+### Honest presentation
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    ERROR HANDLER MIDDLEWARE                     │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  errorHandler(err, req, res, next):                             │
-│                                                                 │
-│  1. Log error with context:                                     │
-│     ├─ error.message, error.stack                              │
-│     ├─ req.path, req.method                                    │
-│     └─ req.traceId (for distributed tracing)                   │
-│                                                                 │
-│  2. Handle known error types:                                   │
-│     ├─ BookingError → map code to status (404, 409, 410, 400)  │
-│     ├─ ZodError → 400 with validation details                  │
-│     └─ Unknown → 500 INTERNAL_ERROR                            │
-│                                                                 │
-│  3. Return consistent ApiError shape:                           │
-│     { error: string, code: string, details?: object }          │
-└─────────────────────────────────────────────────────────────────┘
-```
+| Evidence | Appropriate UI |
+|---|---|
+| Catalog match | Typical price and hotel attributes |
+| Dated check | Available when checked for this range and quantity |
+| Read failure | Unable to check right now |
+| Hold created | Allocated until the server deadline |
+| Verified confirmation | Durable booking reference and accurate payment state |
 
----
+“Sold out” and “could not check” need separate views. A reservation rejection preserves guest
+input and offers alternatives. A network timeout goes into recovery because the server might
+already have committed.
 
-## ⚖️ Step 7: Trade-offs Discussion (3 minutes)
+Calendar accessibility belongs in this design: labeled dates, keyboard navigation, announced
+ranges/night counts, and text entry as an alternative. A sold-out night, a past date, and a
+loading cell need different explanations, not just different shades.
 
-### Full-Stack Trade-offs Table
+> "The client can make planning feel immediate by caching hints. It earns trust by showing
+> exactly when those hints have become a quote, a hold, or a confirmed booking."
 
-| Decision | Approach | Trade-off |
-|----------|----------|-----------|
-| ✅ Shared types | TypeScript interfaces | Build complexity vs. type safety |
-| ❌ Alternative | OpenAPI codegen | More tooling, less flexible |
-| ✅ Idempotency | Client key + server validation | Extra header vs. safe retries |
-| ❌ Alternative | No idempotency | Simpler but duplicate bookings possible |
-| ✅ Reservation hold | 15-min expiry with background cleanup | Blocked inventory vs. conversion |
-| ❌ Alternative | Instant booking | No hold time but payment must be instant |
-| ✅ Availability cache | 5-min TTL + invalidation | Stale data vs. performance |
-| ❌ Alternative | Always fresh | Accurate but higher DB load |
-| ✅ Polling | 60s interval | Latency vs. simplicity |
-| ❌ Alternative | WebSocket | Real-time but complex |
-| ✅ Error codes | Typed codes in response | More code vs. better UX |
-| ❌ Alternative | Generic errors | Simple but poor user feedback |
+## 🔧 Deep dive 2: A purchase attempt that survives retry — 9 minutes
 
-### Integration Considerations
+The key failure is a reservation committed on the server while its response is lost. An
+ordinary retry button can either create another booking or misleadingly report failure for a
+purchase that already exists.
 
-| Concern | Approach |
-|---------|----------|
-| API Versioning | `/api/v1/` prefix for backward compatibility |
-| CORS | Configure for frontend domain in production |
-| Rate Limiting | High for search, low for booking |
-| Session Management | HttpOnly cookies for security |
+### Define the attempt across both sides
 
----
+When the guest accepts a quote, create an intent key and freeze the quote ID,
+hotel/room/date/count scope, and guest details. All retries use that same identity and
+request. A deliberate second purchase gets a new identity even when dates match.
 
-## 📝 Closing Summary
+The server scopes the receipt to the authenticated account and binds it to a request digest.
+Same key and same payload recovers the same booking. Same key and changed terms is a conflict,
+not permission to silently return an unrelated result.
 
-"I've designed a full-stack hotel booking system with:
+| Mechanism | What it solves | What it cannot solve alone |
+|---|---|---|
+| Disabled submit + synchronous action guard | Accidental repeated UI actions | Another tab or an HTTP retry |
+| Frozen attempt and stable key | Consistent identity across retries | Server atomicity |
+| Receipt committed with booking | Durable one-result protocol | Inventory allocation correctness |
+| Inventory transaction | Conflicting scarce-resource writes | Whether a repeated purchase is intentional |
 
-1. **Shared TypeScript types** ensuring type safety across frontend and backend
-2. **Booking flow integration** with reservation holds, idempotency, and expiry countdown
-3. **Two-phase search** combining Elasticsearch speed with PostgreSQL availability accuracy
-4. **Real-time availability** via polling with cache headers for efficiency
-5. **Error handling** with typed error codes for specific frontend responses
+A hash of booking parameters is not a substitute for an intent. It cannot distinguish booking
+another identical room from retrying the first one, and omitting guest details can replay a
+booking for a changed request.
 
-The key insight is maintaining strong consistency for bookings while allowing eventual consistency for search, with the API contract clearly defining the boundary between these two models. Happy to dive deeper into any aspect of the integration."
+### Allocate inside a short transaction
 
----
+The server validates activity, party capacity, dates, bounds, and quote eligibility. It then
+locks the room type in PostgreSQL, reads fresh nightly occupancy, and checks capacity on every
+occupied night.
 
-## 🚀 Potential Follow-up Questions
+For ten rooms with nightly occupancy six, nine, and seven, a three-night request can allocate
+at most one more room. A range-wide sum of all overlapping stays would answer a different
+question and may overcount guests staying on different nights.
 
-1. **How would you migrate to WebSocket for real-time updates?**
-   - Add Socket.io for availability change notifications
-   - Backend publishes events when bookings change
-   - Frontend subscribes to hotel-specific rooms
+Persist the hold, accepted monetary snapshot, operation receipt, and durable work together.
+Simultaneous retries contend on a unique account/intent constraint; the loser returns the
+winner's canonical result after transaction resolution. A precheck before locking leaves a
+race.
 
-2. **How would you handle offline booking attempts?**
-   - Queue booking request in IndexedDB
-   - Show "pending" state with sync indicator
-   - Retry when connection restored with idempotency key
+| Allocation choice | Benefit | Cost |
+|---|---|---|
+| ✅ Room-type lock initially | Simple enforceable rule across API instances | Unrelated dates for the same type serialize |
+| ✅ Per-night inventory rows when needed | Independent nonoverlapping dates | More rows and ordered multi-row locking |
+| ❌ Exact-range Redis lease as authority | Reduces identical-range contention | Overlapping different ranges use different keys |
 
-3. **How would you test the full booking flow?**
-   - Unit tests for booking service with mocked DB
-   - Integration tests with test database
-   - E2E tests with Playwright for full flow
+The database row lock works across API processes sharing that primary. Owner capacity
+reductions must validate existing obligations under the same serialization rule; otherwise the
+owner path can violate an invariant the booking path preserves.
+
+### Price acceptance and response handling
+
+The quote includes total, currency, nightly prices, policy version, and deadline. If it is no
+longer valid, return an explicit new-quote requirement. The UI displays changed terms and
+obtains renewed acceptance before starting another attempt.
+
+Return one canonical booking representation on first response and replay. The client validates
+the representation and renders the actual status, never an optimistic confirmation. A
+malformed or missing receipt is uncertainty and should trigger recovery, not invented price or
+payment data.
+
+Keep enough non-sensitive identity to recover after a reload without persisting guest contact
+details unnecessarily. Fetch current status before enabling another purchase action. A
+cancelled or expired receipt remains useful history; a fresh intended booking receives a fresh
+intent.
+
+### The trade-off
+
+This is more work than a form post and a spinner. It requires receipt retention,
+payload-binding rules, and an unknown-state UI. The simpler alternative fails when a
+successful write and failed response straddle the network boundary, which is exactly when
+guests are most likely to click again.
+
+> "I want one intention to survive a flaky network. The client preserves the identity; the
+> server preserves the result; neither side can provide that guarantee by itself."
+
+## 🔧 Deep dive 3: Hold expiry and payment reconciliation — 9 minutes
+
+A held room is not paid, and a provider timeout is not proof of payment failure. The client
+and server need a common state model that acknowledges both facts.
+
+### Agree on the transitions
+
+| Current state | Event / guard | Result |
+|---|---|---|
+| Held | User starts payment before server deadline | Payment processing, inventory still allocated |
+| Held | Deadline reached before processing begins | Expired and inventory released |
+| Payment processing | Verified matching authorization | Advance according to confirmation/settlement policy |
+| Payment processing | Decline or bounded reconciliation decision | Release or cancel with explicit money outcome |
+| Released/cancelled | Late provider success | Void/refund or explicitly reacquire inventory |
+| Confirmed | Valid cancellation request | Apply accepted policy and track refund separately |
+
+I would keep authorized, settled, and refunded money states distinct from inventory state. The
+UI can show a confirmed booking with payment details only as strongly as the server has
+verified them.
+
+### The server side
+
+Starting payment is a conditional database transition that checks the hold deadline. It
+creates durable work for an external call, then commits. No inventory row lock stays open
+during provider latency.
+
+A worker sends a stable payment-attempt identity with the accepted amount and currency.
+Verified callbacks or status queries enter a deduplicated inbox and drive another conditional
+transition. A lost response is reconciled against the same attempt, not replaced with a new
+charge.
+
+The expiry worker and payment transition compete on the same booking state. If expiry wins, an
+old provider event cannot simply mark it confirmed after inventory has been sold elsewhere.
+Void the authorization or track a refund; reacquiring rooms requires another inventory check
+and explicit terms.
+
+A delayed expiry sweep does not extend a hold's right to begin payment. Commands check the
+database deadline themselves. The worker releases abandoned capacity and updates projections,
+but its scheduling interval is not the business clock.
+
+### The frontend side
+
+Show the canonical deadline and use the server's time reference to estimate remaining time.
+The countdown informs the guest; reaching zero prompts a status refresh rather than locally
+inventing a final state.
+
+| UI state | Behavior |
+|---|---|
+| Held | Explain deadline and next action |
+| Processing | Disable competing commands and show progress/recovery |
+| Outcome unknown | “Checking your booking”; query the existing attempt |
+| Expired | Explain release and offer a new quote |
+| Confirmed | Show reference, stay dates, terms, and verified money details |
+| Cancelled / refund pending | Preserve history and distinguish pending refund from completed refund |
+
+Refresh on reconnect and focus. Poll briefly while a payment is genuinely pending, with
+bounded backoff; do not poll every historical booking forever. Announce meaningful status
+changes for assistive technology without reading out every countdown second.
+
+### Alternatives and costs
+
+| Approach | Benefit | Why I would not rely on it here |
+|---|---|---|
+| ✅ Outbox + provider identity + reconciliation | Recoverable external effects | Adds worker operations and visible pending states |
+| ❌ Keep the SQL transaction open during payment | Superficially linear code | Slow provider calls hold scarce locks and still cannot make two systems atomic |
+| ❌ Trust a browser-supplied payment ID | Easy local demo | A string is not evidence of authorization or amount |
+| ❌ Countdown alone enforces expiry | Simple presentation | A closed or modified tab cannot release inventory reliably |
+
+The important operational signal is how long attempts remain uncertain, not just how many
+payment calls return an error. A worker can retry delivery while the business result has
+already happened, so counting calls is not counting purchases.
+
+> "Expiry and payment form one recovery problem. The system must know who still owns the room
+> and what happened to the money, even when the guest has closed the tab."
+
+## 🧪 Validation, scaling, and implementation boundary — 8 minutes
+
+### End-to-end tests
+
+| Scenario | Expected result |
+|---|---|
+| Change dates quickly; old result arrives last | UI keeps the active criteria and corresponding data |
+| Select across a sold-out middle night | Invalid range is explained before purchase |
+| Cross DST, leap day, or month boundary | Correct hotel-night count and quote breakdown |
+| Submit the same intent through two API instances | One canonical booking result |
+| Lose response after SQL commit | Recover existing booking without another purchase |
+| Owner reduces capacity during allocation | Future obligations remain within capacity |
+| Expiry races with a provider event | One valid inventory transition and reconciled money state |
+| Switch account while a private request is pending | No cross-account response contamination |
+
+Frontend simulations cover rendering, request identity, and accessible recovery. Database
+integration tests cover actual locks and constraints. Provider sandbox/fault tests cover
+retries and event ordering. A page-render smoke test is not a booking-correctness test.
+
+### What breaks first
+
+Availability enrichment and image bytes dominate the discovery journey before a long list
+needs virtualization. Bound candidate expansion, batch reads, size images responsively,
+reserve their layout space, and lazy-load below the fold. Public hotel pages may benefit from
+server-rendered content and CDN delivery; private checkout requires current account state.
+
+Measure room-type lock wait, connection pool wait, hold success, expiry lag, and payment
+reconciliation age. A transaction that holds one connection while its pricing helper requests
+another can exhaust the pool without extraordinary traffic.
+
+When coarse room-type locking becomes the bottleneck, introduce per-night inventory rows and
+deterministic lock ordering. Partition authoritative data by hotel so one reservation stays
+local. Search projections and tolerant reads can scale separately.
+
+Property tools should eventually support bounded date-range price edits with a preview of
+affected nights. Capacity changes require server validation against bookings. Client optimism
+is appropriate for a local editing draft; a committed inventory change needs an authoritative
+result.
+
+Secure sessions, current ownership checks, request limits, and provider verification belong on
+the server. Private caches clear on account changes, and logs should avoid guest/payment
+details. UI role checks only improve navigation; they do not authorize writes.
+
+### What the local project actually implements
+
+The demo supplies React routes and stores, Express APIs, PostgreSQL booking-range checks,
+Valkey caches/leases, and Elasticsearch discovery. Booking creation does take a room-type row
+lock before its nightly occupancy query. A real minute-based sweep expires abandoned
+reservations in each API process.
+
+The production contracts in this answer are not all present. Confirmation accepts a
+still-reserved row without comparing its deadline, takes a fabricated payment reference, and
+does not contact a provider. There is no durable outbox, verified payment inbox, immutable
+quote, or client intent-recovery protocol.
+
+Search already filters dated candidates, but returns snake_case index fields to camelCase
+cards and mixes filtered page totals with unfiltered page counts. The browser loses search URL
+criteria and can retain stale room selection. Calendar range handling misses interior-night
+and departure rules.
+
+Cached replay formatting, incomplete availability cache keys/invalidation, and host-timezone
+pricing loops are additional verified gaps. Owner capacity reductions can undercut existing
+bookings. The booking screen's “Total Paid” label is not proof that money moved.
+
+The documentation review used isolated source checks and inspection, not a live end-to-end
+run. [architecture.md](./architecture.md#implementation-notes) records the precise
+implementation and evidence. I would explain those gaps separately from the proposed
+whiteboard design.
+
+### Decisions to leave on the board
+
+| Decision | Chosen | Alternative | Accepted cost |
+|---|---|---|---|
+| Planning | ✅ URL criteria and scoped advisory cache | ❌ Uncoordinated request-per-control state | Freshness and response identity |
+| Purchase | ✅ Frozen quote and durable intent receipt | ❌ Parameter hash and blind retries | Recovery protocol and retention |
+| Allocation | ✅ One database serialization rule | ❌ Cached availability as authority | Contention that must be measured |
+| Payment | ✅ Guarded states and reconciliation | ❌ Browser success or a long SQL transaction | Worker operations and pending UI |
+
+> "I'd finish by walking the same booking through one success and one lost response. If the
+> diagram explains both without inventing a second purchase or promising an unallocated room,
+> the design has earned its complexity."

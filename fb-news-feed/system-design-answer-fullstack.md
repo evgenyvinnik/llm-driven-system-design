@@ -36,22 +36,56 @@ budgets.
 ## 🏗️ Architecture and Scale — 5 minutes
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│ Browser: composer / virtual feed / profile                  │
-│ Entity store + ordered pages + pending intent               │
-└──────────────────────────────┬──────────────────────────────┘
-                               │ HTTP + refresh hints
-                               ▼
-┌─────────────────────────────────────────────────────────────┐
-│ Session-aware API                                           │
-│ Ranked feed sessions / current access / mutations           │
-└────────────┬──────────────────────────────────▲─────────────┘
-             ▼                                  │
-┌──────────────────────────┐       ┌──────────────────────────┐
-│ SQL records + receipts   │──────▶│ Outbox / fan-out workers │
-│ Graph and engagement     │       │ Pushed + pulled IDs      │
-└──────────────────────────┘       └──────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│ BROWSER / AUTHOR INTENT AND STABLE READER CONTEXT                                        │
+│                                                                                          │
+│  ┌────────────────────────┐    ┌────────────────────────┐    ┌────────────────────────┐  │
+│  │ Composer / actions     │    │ Entities / page order  │    │ Virtual feed + media   │  │
+│  │ Draft + saved intent   │◀──▶│ Session/cursor/anchor  │◀──▶│ DOM + buffer budgets   │  │
+│  └────────────────────────┘    │ Refresh hints          │    │ Return-to-feed context │  │
+│                                └────────────────────────┘    └────────────────────────┘  │
+│                                             ▲                                ▲           │
+│                                             │                                │           │
+└─────────────────────────────────────────────┼────────────────────────────────┼───────────┘
+                   pages / commands / hints   │                  images        │
+                                              ▼                                ▼
+┌─────────────────────────────────────────────────────────┐       ┌────────────────────────┐
+│ Session-aware command and feed API                      │       │ Media service / CDN    │
+│ Current access; ranked sessions; mutation receipts      │       │ Image derivatives      │
+└─────────────────────────────────────────────────────────┘       │ Current audience grant │
+             ▲                                ▲                   └────────────────────────┘
+             │                                │
+source state │           session candidates   │
+             │                                │
+             ▼                                ▼
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Canonical SQL          │       │ Merge / rank / session │       │ Candidate projections  │
+│ Posts / graph / likes  │       │ Push and pull union    │◀─────▶│ Push IDs / hot authors │
+│ Receipts + outbox      │       │ Stable candidate order │       │ Coverage and identity  │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+             ▲                                                                 ▲
+             │                                                                 │
+             ▼                                                                 │
+┌─────────────────────────────────────────────────────────┐                    │
+│ Outbox relay + fan-out workers                          │                    │
+│ Retry bounded recipient work; maintain author timelines │◀───────────────────┘
+└─────────────────────────────────────────────────────────┘
+
+Posting, candidate propagation and reader refresh are separate steps.
 ```
+
+I would follow an author's identified post into SQL, then through retryable fan-out into
+pushed and pulled candidate sources. A reader starts a ranked session from their merged
+order and pages it through current authorization. The browser retains page membership,
+entity revisions and its scroll anchor separately. Media loads on its own path, and a
+refresh hint invites new content without moving the post the reader is currently viewing.
+
+I would use a lost post response and an expired reading session as separate cases:
+
+1. The author's saved operation resolves against its durable receipt, independently of whether fan-out has reached every follower.
+2. Workers recover the same recipient chunk and record effect progress; the next session merges push/pull candidates with known coverage.
+3. A returning reader restores an unexpired session and anchor after current access checks, or explicitly starts a new session when continuity has expired.
+4. Image grants follow current audience policy. Neither candidate membership nor old page state authorizes private media.
 
 The browser uses normalized post entities, separate page membership, a bounded draft store,
 and per-post pending intent. A measured virtualizer limits mounted rows; it does not limit

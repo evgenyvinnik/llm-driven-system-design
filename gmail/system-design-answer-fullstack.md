@@ -40,15 +40,55 @@ prevent a large message body or list render from blocking input.
 ## 🏗️ Draw the full path — 4 minutes
 
 ```
-┌─────────────────────────┐       ┌──────────────────────────────┐
-│ Browser: inbox + editor │──────▶│ Mail / draft / search API    │
-└─────────────────────────┘       └──────────────┬───────────────┘
-                                                 │
-┌─────────────────────────┐       ┌──────────────▼───────────────┐
-│ Mailbox + search views  │◀──────│ Durable writes + outbox      │
-│ Updated by workers      │       │ Accepted send receipts       │
-└─────────────────────────┘       └──────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│ BROWSER / ACCOUNT-SCOPED MAIL, PRESERVED DRAFT AND IDENTIFIED OPERATIONS                 │
+│                                                                                          │
+│  ┌────────────────────────┐    ┌────────────────────────┐    ┌────────────────────────┐  │
+│  │ Inbox / reader / draft │    │ Request coordination   │    │ Cache + draft journal  │  │
+│  │ Focus / query / text   │◀──▶│ Account + generation   │◀──▶│ Pages / desired state  │  │
+│  │ Visible read sequence  │    │ Saved save/send IDs    │    │ Draft ACK / local text │  │
+│  └────────────────────────┘    └────────────────────────┘    └────────────────────────┘  │
+│                                             ▲                                            │
+│                                             │                                            │
+└─────────────────────────────────────────────┼────────────────────────────────────────────┘
+  mail reads / commands / known outcomes      │
+                                              ▼
+                                 ┌────────────────────────┐       ┌────────────────────────┐
+                                 │ Authenticated mail API │       │ Sender authority/SQL   │
+             ┌──────────────────▶│ Owner routing + access │◀─────▶│ Draft + frozen message │
+             ▲                   │ Authorized hydration   │       │ Audience/receipt/work  │
+             │                   └────────────────────────┘       └────────────────────────┘
+             │                                ▲                                ▲
+             │                                │ read / state                   │ delivery / status
+             │                                ▼                                ▼
+             │                   ┌────────────────────────┐       ┌────────────────────────┐
+             │                   │ Mailbox authority/SQL  │       │ Recipient delivery     │
+             │                   │ Viewer-specific state  │◀─────▶│ Durable retries        │
+             │                   │ Receipt/change outbox  │       │ User/message receipt   │
+             │                   └────────────────────────┘       └────────────────────────┘
+             │                                ▲
+             │ query/hits                     │ changes / progress
+             ▼                                ▼
+┌────────────────────────┐       ┌────────────────────────┐
+│ Per-mailbox search     │       │ Index workers          │
+│ Viewer-safe fields     │◀─────▶│ Versioned changes      │
+│ No access authority    │       │ Replay / tombstones    │
+└────────────────────────┘       └────────────────────────┘
+Saved revision, accepted send, recipient delivery and search visibility are distinct user states.
 ```
+
+I would trace one Send from preserved editor state to the sender's durable acceptance
+receipt, then through recipient delivery into a private mailbox and its search projection.
+A lost response is resolved with the original operation identity. Reads return through
+the API's current entitlement checks, and the browser reconciles each result into the
+correct account and state owner. Acceptance does not wait for every search document.
+
+I would demonstrate a reload after Send with the same diagram:
+
+1. Recover the bounded account-scoped draft journal and saved operation reference under its storage policy, then reauthenticate and resolve the original send.
+2. An accepted receipt identifies the frozen message. Preserve later local text separately, and do not let an old save resurrect the sent draft.
+3. Recipient workers commit each mailbox effect with its receipt before reporting progress; a retry cannot add another unread contribution.
+4. The browser refreshes authoritative mailbox state while indexing catches up independently. Current message entitlement still filters every returned body or snippet.
 
 The browser shell contains mailbox navigation, conversation reading, and an editor
 that survives ordinary route changes. The API establishes identity and routes work to

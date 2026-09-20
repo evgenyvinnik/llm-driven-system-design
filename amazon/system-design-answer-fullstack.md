@@ -36,29 +36,62 @@ I would exclude a full shipping network, tax engine and new payment gateway from
 this interview. We define their contracts and show where their status enters the
 customer journey. The demo substitutes simple rules and a payment simulation.
 
-## 🏗️ Draw a small end-to-end architecture — 5 minutes
+## 🏗️ Draw a small end-to-end architecture — 6 minutes
 
 ```
-┌───────────────────────────────────────────────────────────────────┐
-│ Storefront: discovery → product → cart → checkout → order status  │
-│ URL state     public results    private snapshot    attempt ID    │
-└───────────────┬──────────────────────┬────────────────────────────┘
-                │                      │
-        ┌───────▼────────┐     ┌───────▼──────────┐
-        │ Catalog/search │     │ Cart/checkout API │
-        │ Public caching │     │ Quote and recovery│
-        └───────┬────────┘     └───────┬──────────┘
-                ▼                      ▼
-        ┌────────────────┐     ┌──────────────────┐
-        │ Search index   │◀────│ Catalog/stock/   │
-        │ and read cache │     │ order DB + outbox│
-        └────────────────┘     └───────┬──────────┘
-                                        │ Durable jobs/events
-                               ┌────────▼─────────┐
-                               │ Payment worker   │────▶ Provider
-                               │ Index / recs     │
-                               └──────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│ BROWSER / STOREFRONT                                                                     │
+│                                                                                          │
+│  ┌────────────────────────┐    ┌────────────────────────┐    ┌────────────────────────┐  │
+│  │ Discovery              │    │ Scoped data layer      │    │ Checkout + status      │  │
+│  │ URL-driven browsing    │◀──▶│ Cart + saved attempt   │◀──▶│ Drafts, recovery UI    │  │
+│  └────────────────────────┘    └────────────────────────┘    └────────────────────────┘  │
+│                                             ▲                                            │
+│                                             │                                            │
+│               ┌─────────────────────────────┴─────────────────────────────┐              │
+└───────────────┼───────────────────────────────────────────────────────────┼──────────────┘
+                │                                                           │
+public queries  │                  private commands / results               │
+                ▼                                                           ▼
+┌────────────────────────┐       ┌─────────────────────────────────────────────────────────┐
+│ Catalog / search API   │       │ Cart / checkout API                                     │
+│ Public caching         │       │ Authorize, validate quote, allocate, recover attempt    │
+│ Bounded discovery      │       │ Private canonical snapshot and lifecycle status         │
+└────────────────────────┘       └─────────────────────────────────────────────────────────┘
+             ▲                                                              ▲
+query        │                    read / short transaction                  │
+             │                                                              │
+             ▼                                                              ▼
+┌────────────────────────┐       ┌─────────────────────────────────────────────────────────┐
+│ Search index + cache   │       │ PostgreSQL authority                                    │
+│ Versioned projections  │       │ Cart, stock, reservations, attempts, orders             │
+│ Read-only stock view   │       │ Outbox and payment-operation progress                   │
+└────────────────────────┘       └─────────────────────────────────────────────────────────┘
+             ▲                                ▲
+             │                                │
+index updates│                                │  durable work / observed outcome
+             │                                │
+             │                                ▼
+             │                   ┌────────────────────────┐       ┌────────────────────────┐
+             │                   │ Outbox + payment work  │       │ Payment provider       │
+             └───────────────────│ Project catalog        │◀─────▶│ API + callbacks        │
+                                 │ Coordinate payments    │       │ External authority     │
+                                 └────────────────────────┘       └────────────────────────┘
+
+Browse from a projection → allocate at authority → recover payment → render status
 ```
+
+I would walk a shopper through three arrows: browse a possibly stale projection,
+submit one accepted purchase intent to the stock authority, then recover its status
+until the payment outcome is known. Committed outbox work updates discovery and
+advances external payment operations. The browser shows that lifecycle through its
+scoped data layer; a local checkout step cannot establish a server-side purchase.
+
+The saved attempt reference is private account-scoped recovery state. It survives a
+reload so the browser can recover the existing purchase through the same API path.
+Meanwhile, workers persist payment outcomes and refresh search projections separately.
+A slow projection or missing callback therefore produces a specific stale or pending
+state rather than a new checkout attempt or an optimistic order confirmation.
 
 The browser owns interaction state and rendering. The purchase API owns accepted
 quotes, stock allocation and order identity. The search index is a read projection,
@@ -387,7 +420,7 @@ possible; offline stock allocation or payment confirmation is not established by
 local cache. Clear private state on account changes and preserve only intentional
 recovery references within the relevant account boundary.
 
-## ✅ Validate the whole journey — 4 minutes
+## ✅ Validate the whole journey — 3 minutes
 
 I would test the cases where two individually reasonable components can disagree:
 

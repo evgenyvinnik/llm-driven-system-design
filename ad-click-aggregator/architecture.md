@@ -65,36 +65,52 @@ is no measured 10,000-RPS capacity result or queue-backed burst buffer in the so
 ## High-Level Architecture
 
 ```
-┌───────────────────┐      ┌───────────────────┐
-│ Trusted click SDK │─────▶│ Edge + collectors │
-└───────────────────┘      └─────────┬─────────┘
-                                    │ durable acceptance transaction
-                                    ▼
-                          ┌─────────────────────┐
-                          │ Event records       │
-                          │ + transactional outbox│
-                          └──────────┬──────────┘
-                                     │ relay; retries allowed
-                                     ▼
-                          ┌─────────────────────┐
-                          │ Durable event stream│
-                          └──────────┬──────────┘
-                            ┌────────┴────────┐
-                            ▼                 ▼
-                  ┌─────────────────┐ ┌─────────────────┐
-                  │ Fraud + rollups │ │ Raw archive     │
-                  │ durable progress│ │ replay evidence │
-                  └────────┬────────┘ └─────────────────┘
-                           │ versioned aggregate snapshots
-                           ▼
-                  ┌─────────────────┐   ┌─────────────────┐
-                  │ ClickHouse      │──▶│ Query service   │
-                  │ read projection │   └────────┬────────┘
-                  └─────────────────┘            ▼
-                                        ┌─────────────────┐
-                                        │ Dashboard       │
-                                        └─────────────────┘
+PROPOSED PRODUCTION DESIGN — two durable commits before report visibility
+
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Click source             │event/ACK   │ Edge + collectors        │commit/read │ Canonical DB + outbox    │
+│ Stable event ID, payload │◀──────────▶│ Validate / authorize ad  │◀──────────▶│ Unique ID + payload      │
+│ Retry ambiguous response │            │ Return saved acceptance  │            │ One atomic acceptance    │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+                                                                                              │
+                                                                                              │ committed only
+                                                                                              │
+                                                                                              ▼
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Raw archive              │archive     │ Durable event stream     │publish     │ Outbox relay             │
+│ Immutable accepted input │◀───────────│ Partitioned ordered work │◀───────────│ Publish committed events │
+│ Evidence for rebuilds    │            │ Consumer checkpoints     │            │ Retry uncertain delivery │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+                                                      │
+                                                      │ replay
+              ┌───────────────────────────────────────┘
+              │
+              ▼
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Fraud / rollup processor │apply/load  │ Durable processor state  │snapshots   │ ClickHouse projection    │
+│ Apply events/corrections │◀──────────▶│ Identity + measures      │───────────▶│ Absolute bucket versions │
+│ Version rule decisions   │            │ Progress committed here  │            │ One published generation │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+                                                                                              ▲
+                                                                                              │
+                                                                                              │ query / result
+                                                                                              │
+┌──────────────────────────┐            ┌──────────────────────────┐                          │
+│ Analyst dashboard        │HTTP/report │ Reporting API            │                          │
+│ Scoped report + coverage │◀──────────▶│ Authorize bounded scope  │◀─────────────────────────┘
+│ Stale on refresh failure │            │ Return coherent revision │
+└──────────────────────────┘            └──────────────────────────┘
 ```
+
+1. The collector acknowledges only the canonical event/outbox transaction. Lost
+   responses can be retried with the same event identity and payload.
+2. The relay feeds the stream; the archive retains accepted input for controlled
+   rebuilds. The processor atomically saves applied identity, measures, and progress
+   before exporting a versioned snapshot, so replay cannot add the same contribution.
+3. Reporting reads the published projection generation and returns values with
+   coverage. Acceptance, projection progress, and report freshness are separate facts.
+   Rebuilds populate a separate generation before publication; they do not append
+   historical counts into the current one.
 
 PostgreSQL is a candidate for authoritative event acceptance and metadata. At the
 planning volume, partitioning, batching, retention, and potentially sharding need

@@ -1,519 +1,406 @@
-# Google Search - System Design Answer (Backend Focus)
+# Google Search: backend system design interview
 
-*45-minute system design interview format - Backend Engineer Position*
+A 45-minute spoken outline for a proposed public-web search service.
+The local implementation is compared with the proposal at the end.
 
----
+## 🎯 Requirements and estimates — 5 minutes
 
-## 📋 Introduction
+> “I would separate acquiring the web from answering a query.
+> A user's search should read an existing index, not wait for a crawler.
+> The difficult boundaries are deciding what to crawl, publishing a trustworthy index,
+> and keeping query latency predictable as the corpus grows.”
 
-"Thank you for this opportunity. I'll be designing the backend infrastructure for a web search engine. This is one of the most challenging distributed systems problems because it touches on web crawling at scale, inverted index construction, graph algorithms for ranking, and real-time query processing with strict latency requirements.
+I would narrow the first design to a selected corpus of public text pages.
+It includes terms, phrases, exclusions, site filters, ranked snippets, and suggestions.
+Ads, image search, generated answers, and personal ranking are outside this discussion.
 
-Let me start by clarifying requirements, then walk through the high-level architecture, and finally deep dive into the key backend components with explicit trade-off discussions for each decision."
+Public search can be anonymous.
+Crawl administration and index publication require authenticated operators.
+A successful search may be slightly stale; a failed search must not masquerade as empty.
 
----
+| Assumption | Estimate | Design implication |
+|---|---|---|
+| Selected corpus | 100M pages | Large enough to require partitioned storage |
+| Retained text | 50 KB/page, about 5 TB | Store versions outside query processes |
+| Search volume | 100M/day, about 1,157 QPS average | Plan for 10,000 QPS peak, then measure |
+| Crawl budget | 10M/day, about 116 fetches/s | Only a subset can meet a daily freshness goal |
+| Query latency | p95 below 200 ms at the API | Bound fan-out, candidates, retries, and cache waits |
+| Availability | 99.9% successful searches | Keep ingestion failures off the serving path |
 
-## 🎯 Requirements
+Ten million daily fetches do not refresh a hundred-million-page corpus every day.
+I would prioritize a selected daily tier and give the tail a longer schedule.
+That arithmetic prevents an impossible freshness promise from entering the design.
 
-### Functional Requirements
+The index-size multiplier depends on field mappings and compression.
+For planning, 100 KB indexed storage per page means roughly 10 TB before replicas.
+Two replicas would bring that to roughly 30 TB, before retained generations.
 
-1. **Web Crawling** - Discover and fetch web pages while respecting robots.txt
-2. **Indexing** - Build and maintain an inverted index for fast keyword lookups
-3. **PageRank** - Calculate link-based authority scores for ranking
-4. **Query Processing** - Parse, expand, and execute search queries
-5. **Ranking** - Combine multiple signals (text relevance, authority, freshness) for result ordering
+## 🏗️ High-level architecture — 6 minutes
 
-### Non-Functional Requirements
-
-1. **Scale** - Index 100B+ pages across petabytes of data
-2. **Latency** - Less than 200ms p99 query response time
-3. **Freshness** - Update popular pages daily, news content hourly
-4. **Availability** - 99.99% uptime for query serving
-
-### Scale Estimates
-
-| Metric | Value | Implication |
-|--------|-------|-------------|
-| Total pages | 100 billion | Petabyte-scale storage |
-| Average page size | 50 KB | 5 PB raw content |
-| Inverted index size | ~500 TB | Compressed with posting lists |
-| Daily queries | 8 billion | ~100K QPS at peak |
-| Daily crawl target | 1 billion pages | Freshness maintenance |
-
----
-
-## 🏗️ High-Level Design
-
-"Let me draw the three main subsystems: the Crawl System, the Indexing Pipeline, and the Serving Layer."
+> “I would draw the query path across the top and the ingestion path underneath.
+> They meet at a published index, which is the key boundary in this system.”
 
 ```
-+------------------------------------------------------------------+
-|                       CRAWL SYSTEM                                |
-|                                                                   |
-|   +-------------+     +-------------+     +-------------+         |
-|   |    URL      |---->|   Fetcher   |---->|   Parser    |         |
-|   |  Frontier   |     |   Workers   |     |  (Extract)  |         |
-|   | (Priority Q)|     |             |     |             |         |
-|   +-------------+     +-------------+     +------+------+         |
-|         ^                                        |                |
-|         |                                        v                |
-|         |                                 +-------------+         |
-|         +<--------------------------------|   Deduper   |         |
-|              (new URLs discovered)        |  (SimHash)  |         |
-|                                           +-------------+         |
-+------------------------------------------------------------------+
-                              |
-                              | (raw documents)
-                              v
-+------------------------------------------------------------------+
-|                     INDEXING PIPELINE                             |
-|                                                                   |
-|   +-------------+     +-------------+     +-------------+         |
-|   | Tokenizer   |---->|   Index     |---->|  Sharder    |         |
-|   | (Stemming)  |     |  Builder    |     | (Term Hash) |         |
-|   +-------------+     +-------------+     +------+------+         |
-|                                                  |                |
-|   +-------------+                                |                |
-|   | PageRank    |<-------------------------------+                |
-|   |   (Batch)   |     (link graph extracted)                      |
-|   +-------------+                                                 |
-+------------------------------------------------------------------+
-                              |
-                              | (indexed shards)
-                              v
-+------------------------------------------------------------------+
-|                      SERVING LAYER                                |
-|                                                                   |
-|   +-------------+     +-------------+     +-------------+         |
-|   |   Query     |---->|   Index     |---->|   Ranker    |         |
-|   |   Parser    |     |   Servers   |     | (Two-Phase) |         |
-|   | (Expansion) |     |  (Sharded)  |     |             |         |
-|   +-------------+     +-------------+     +------+------+         |
-|                                                  |                |
-|                                           +------v------+         |
-|                                           |   Result    |         |
-|                                           |   Cache     |         |
-|                                           +-------------+         |
-+------------------------------------------------------------------+
-                              |
-                              v
-+------------------------------------------------------------------+
-|                       DATA LAYER                                  |
-|                                                                   |
-|   +----------------+  +----------------+  +----------------+      |
-|   |   PostgreSQL   |  |  Elasticsearch |  |     Redis      |      |
-|   |  (URL State,   |  | (Inverted      |  |  (Query Cache, |      |
-|   |   Link Graph)  |  |  Index)        |  |   Rate Limits) |      |
-|   +----------------+  +----------------+  +----------------+      |
-+------------------------------------------------------------------+
+┌────────────────────────┐        ┌────────────────────────┐        ┌────────────────────────┐
+│ Browser / clients      │        │ Query coordinator      │        │ Query / window cache   │
+│ Query + page           │◀──────▶│ Parse, rank, snippets  │◀──────▶│ Query/rank/corpus key  │
+└────────────────────────┘        └────────────────────────┘        └────────────────────────┘
+                                              ▲
+                                              │
+                                              │  candidates / retrieval
+                                              │
+                                              ▼
+┌────────────────────────┐        ┌────────────────────────┐        ┌────────────────────────┐
+│ Crawl frontier         │        │ Published index        │        │ Index publisher        │
+│ Host leases + due URLs │        │ Document shards        │◀──────▶│ Validate + activate    │
+└────────────────────────┘        │ Replicated generations │        └────────────────────────┘
+            ▲                     └────────────────────────┘                    ▲
+            │                                                                   │
+            │  work / links                                                     │
+            │                                          build / acknowledge      │
+            │                                                                   │
+            ▼                                                                   ▼
+┌────────────────────────┐        ┌────────────────────────┐        ┌────────────────────────┐
+│ Fetch + parse          │        │ Durable pages + graph  │        │ Index + rank builders  │
+│ Robots / egress checks │◀──────▶│ Versioned crawl output │◀──────▶│ Effects / checkpoints  │
+└────────────────────────┘        └────────────────────────┘        └────────────────────────┘
+
+Ingestion publishes asynchronously; queries never fetch the live web.
+
+Publisher exposes only a validated generation; old generations expire after use.
 ```
 
----
+The query coordinator parses intent, checks the cache, retrieves candidates,
+combines ranking signals, and formats snippets.
+It can be replicated independently from crawling and index construction.
 
-## 🔍 Deep Dive
+On ingestion, a frontier assigns eligible URLs to fetchers.
+Fetchers return discovered links and durable versioned content.
+Builders transform that content into an index and link-score snapshot.
+Publication exposes only a validated generation to queries.
 
-### Trade-off 1: Priority-Based URL Frontier vs FIFO or Random
+I would follow one interrupted build through the return paths:
 
-"The URL frontier is the brain of the crawler. I'm choosing a priority-based approach over simpler alternatives."
+1. A fetch attempt completes only after its versioned artifact and processing obligation are durable; discovered links still follow the frontier's host budget.
+2. Builders resume retained versions and checkpoint confirmed item effects, including removals. A successful bulk request is not proof every item succeeded.
+3. The publisher validates the complete corpus/rank generation, records activation, and retains the previous good generation under a bounded rollback/session policy.
+4. Queries and cached windows identify their generation. If a window expired or its generation is unavailable, return an explicit restart rather than mix result orders.
 
-| Approach | ✅ Chosen / ❌ Alternative | Pros | Cons |
-|----------|--------------------------|------|------|
-| **Priority Queue** | ✅ Chosen | Crawls important pages first; maximizes value from limited bandwidth | Complex priority computation; requires maintaining priority signals |
-| FIFO Queue | ❌ Alternative | Simple implementation; easy to distribute | Wastes resources on low-value pages; ignores page importance |
-| Random Sampling | ❌ Alternative | Even coverage across web; simple to implement | Misses time-sensitive content; no control over crawl quality |
+For suggestions, I would use a separately budgeted prefix index.
+It is a side path from the coordinator, not a requirement for a search to succeed.
+Its source is reviewed aggregate query data, not every raw search immediately published.
 
-> "I'm choosing priority-based scheduling because with 100 billion pages and a budget to crawl 1 billion per day, we can only refresh 1% daily. We need to ensure that 1% includes the most important and frequently-changing pages. Priority signals include inbound link count, PageRank score from previous iteration, historical change frequency, and content type. News sites get higher priority than static documentation."
+I would start with Elasticsearch document shards for retrieval,
+PostgreSQL for a bounded frontier and job metadata,
+object storage for retained artifacts, and a disposable distributed query cache.
+Those choices fit the initial scope; they are not a claim about Google's stack.
 
-**Politeness Architecture:**
+## 💾 Data model and APIs — 5 minutes
 
-```
-+-------------------+
-|   Global Queue    |
-| (sorted by host   |
-|   priority)       |
-+--------+----------+
-         |
-         v
-+--------+----------+      +------------------+
-|   Host Router     |----->|  Per-Host Queue  |----> host-a.com
-+--------+----------+      +------------------+
-         |
-         +---------------->+------------------+
-                           |  Per-Host Queue  |----> host-b.com
-                           +------------------+
+### Records that matter
 
-Each host queue enforces:
-- Minimum delay between requests (from robots.txt or default 1s)
-- Maximum concurrent connections
-- Exponential backoff on errors
-```
+| Record | Key data | Access pattern |
+|---|---|---|
+| URL | Canonical identity, origin, due time, priority, attempt lease | Claim eligible work within an origin budget |
+| Crawl version | URL ID, monotonic version, artifact reference, fetch outcome | Recover and rebuild without refetching the web |
+| Link edge | Source content version, target URL, optional anchor text | Construct a named graph snapshot |
+| Processing event | Event ID, URL/version, stage status | Retry unfinished work with bounded duplicate effects |
+| Index manifest | Generation, corpus checkpoint, rank version, validation result | Activate only complete builds |
+| Search window | Query context, ordered results, expiry | Stable bounded pagination |
+| Operator job | Actor, command identity, state, failure details | Distinguish acceptance from completion |
 
----
+URL identity and edge identity are different.
+If a new page links to an already-known target, that edge still belongs in the graph.
+A content hash helps identify duplicates; it does not replace version ordering.
 
-### Trade-off 2: Shard Inverted Index by Term vs by Document
+Large identifiers should cross the API as strings.
+The physical hash representation must match its database type's range.
+Neither a TypeScript annotation nor a shortened digest proves correctness.
 
-"For the inverted index, I need to decide how to partition data across index servers."
+### API surface
 
-| Strategy | ✅ Chosen / ❌ Alternative | Query Pattern | Pros | Cons |
-|----------|--------------------------|---------------|------|------|
-| **Shard by Term** | ✅ Chosen | Query only term-relevant shards | All posting lists for a term co-located; efficient single-term lookups | Multi-term queries require cross-shard coordination |
-| Shard by Document | ❌ Alternative | Scatter-gather to all shards | Simple partitioning; each shard is self-contained | Every query hits ALL shards regardless of query complexity |
+| Method | Proposed endpoint | Purpose |
+|---|---|---|
+| GET | `/api/search` | Query and bounded page/window; return ranked results and status |
+| GET | `/api/search/autocomplete` | Prefix suggestions with an independent limit |
+| POST | `/api/admin/crawl/jobs` | Accept an authenticated, bounded crawl command |
+| POST | `/api/admin/index/jobs` | Accept an index-build command |
+| GET | `/api/admin/jobs/:id` | Read durable accepted/running/completed/failed status |
 
-> "I'm choosing term-based sharding because of the query pattern. Most queries have 2-5 terms. With 256 shards, a 3-term query only needs to contact 3 shards instead of all 256. This reduces query fan-out by roughly 50x on average, which directly impacts latency and infrastructure cost.
+Search responses carry count value and relation, freshness timestamp,
+corpus/ranking versions, and a navigation handle.
+Unsupported syntax and invalid limits are validation errors.
+A timed-out retrieval is a service error, not a successful zero-result response.
 
-The trade-off is that multi-term queries require a coordination layer to merge results. But this is a solved problem with scatter-gather patterns, and the latency savings from reduced fan-out far outweigh the coordination overhead."
+The operator job endpoints are proposed contracts.
+The local project's existing admin paths are listed in its architecture document.
 
-**Index Shard Architecture:**
+## 🔧 Deep dive: a polite, recoverable crawler — 8 minutes
 
-```
-Query: "machine learning tutorial"
-              |
-              v
-    +---------+---------+
-    |  Query Coordinator |
-    +---------+---------+
-              |
-    +---------+---------+---------+
-    |         |         |         |
-    v         v         v         v
-+-------+ +-------+ +-------+ +-------+
-|Shard  | |Shard  | |Shard  | | ...   |
-|  12   | |  47   | | 183   | |       |
-|"learn"| |"mach" | |"tutor"| |       |
-+-------+ +-------+ +-------+ +-------+
-    |         |         |
-    +---------+---------+
-              |
-              v
-    +---------+---------+
-    |   Merge & Rank    |
-    +-------------------+
-```
+### Decision
 
----
+> “I would schedule within per-origin budgets and use leased attempts.
+> Priority decides which eligible page is valuable; a lease decides who may fetch it.
+> Those are different decisions.”
 
-### Trade-off 3: Batch Weekly PageRank vs Incremental or Real-Time
+A global priority queue alone can overload a popular host.
+A FIFO queue can spend the entire budget on stale, low-value duplicates.
+I would select an eligible origin, then a due URL within that origin.
 
-"PageRank computation is the core ranking signal. I need to decide update frequency."
+### Claim-to-commit flow
 
-| Strategy | ✅ Chosen / ❌ Alternative | Update Cycle | Pros | Cons |
-|----------|--------------------------|--------------|------|------|
-| **Batch Weekly** | ✅ Chosen | Full recompute every 7 days | Stable rankings; predictable compute cost; simple implementation | New pages wait up to a week for authority scores |
-| Incremental | ❌ Alternative | After each crawl batch | Fresh ranks for new content | Complex implementation; potential oscillation; higher compute cost |
-| Real-Time | ❌ Alternative | Continuous stream processing | Immediate authority updates | Very expensive; unstable rankings; may enable gaming |
+1. Normalize the URL conservatively and check its canonical identity.
+2. Atomically claim a due URL with an attempt ID and expiry.
+3. Reserve capacity under the origin's politeness budget.
+4. Check robots policy, destination safety, and fetch limits.
+5. Fetch and store a bounded artifact with its content version.
+6. Commit metadata and a processing event only if the attempt is still current.
+7. Record the next eligible fetch based on outcome and observed change frequency.
 
-> "I'm choosing weekly batch computation because PageRank is fundamentally stable. The web's link structure changes slowly relative to content. A page that has 10,000 inbound links today will have roughly 10,000 next week too.
+A worker crash leaves an expiring lease, not a permanently stranded row.
+Another worker may retry after expiry.
+If the old worker later finishes, its stale attempt cannot overwrite newer content.
 
-For truly new pages, I use a hybrid approach: they get a provisional PageRank based on the authority of pages linking to them, which is refined in the next full batch run. This prevents new quality content from being completely invisible."
+### Scheduling trade-off
 
-**PageRank Computation Flow:**
+| Approach | Benefit | Cost |
+|---|---|---|
+| ✅ Priority within origin budgets | Spend fetch capacity usefully while limiting each origin | More scheduling state and ownership coordination |
+| ❌ Global priority only | Simple ranking of work | Busy origins dominate and can be fetched concurrently |
+| ❌ Unbounded FIFO | Easy queue mechanics | No explicit freshness policy or protection from crawl traps |
 
-```
-+------------------+
-|   Link Graph     |
-|   (PostgreSQL)   |
-+--------+---------+
-         |
-         | Export to distributed
-         | processing cluster
-         v
-+------------------+     +------------------+
-|   PageRank       |---->|   Convergence    |
-|   Iteration 1    |     |   Check          |
-+--------+---------+     +--------+---------+
-         ^                        |
-         |                        | Not converged
-         +------------------------+
-                                  |
-                                  | Converged (typically 50-100 iterations)
-                                  v
-                        +------------------+
-                        |   Write Scores   |
-                        |   to Index       |
-                        +------------------+
-```
+The chosen design gives up maximum raw throughput against any single origin.
+That is intentional: adding machines does not give us permission to hit a site faster.
+We scale by covering more eligible origins concurrently.
 
----
+Priority also needs aging or a maximum wait.
+Otherwise low-ranked pages never get revisited and cannot become important later.
+If all currently inspected hosts are delayed, wait for eligibility rather than declare completion.
 
-### Trade-off 4: Two-Phase Ranking (BM25 + Re-ranking) vs Single-Phase
+### Content and graph correctness
 
-"Query latency is critical. I'm using a two-phase ranking approach."
+A parser extracts text and all usable outgoing edges.
+When a source page changes, its current graph edges replace the older version's edges.
+Otherwise removed links continue contributing authority forever.
 
-| Approach | ✅ Chosen / ❌ Alternative | Latency Budget | Pros | Cons |
-|----------|--------------------------|----------------|------|------|
-| **Two-Phase** | ✅ Chosen | 100ms + 50ms | Fast first phase; expensive signals only on top candidates | May miss relevant docs in first phase |
-| Single-Phase | ❌ Alternative | Full budget on all docs | Considers all signals for all documents | Cannot meet latency SLA at scale |
-| Three-Phase | ❌ Alternative | 50ms + 50ms + 50ms | More refinement opportunities | Increased coordination overhead; complexity |
+Exact content hashes catch byte-identical duplicates.
+Near-duplicate pages require a separate similarity policy,
+with careful canonical selection so useful distinct pages are not suppressed.
+I would start simple and measure duplication before introducing that machinery.
 
-> "I'm choosing two-phase ranking because applying all ranking signals to millions of candidate documents is impossible within 200ms.
+The raw artifact is stored before committing its database reference.
+An orphaned artifact can be collected later if the metadata transaction fails.
+The transaction includes a durable processing event so indexing can resume after a crash.
 
-Phase 1 uses BM25 text matching to retrieve the top 1,000 candidates in about 50-100ms. This is purely lexical matching optimized for speed.
+### Host failures and egress
 
-Phase 2 applies expensive signals to just these 1,000 documents: PageRank lookup, freshness decay calculation, click-through rate adjustment, and field boosts for title matches. This takes another 50-100ms but now we're only scoring 1,000 documents, not millions."
+Robots requests use the correct origin, including scheme and port.
+A server/network failure is different from a valid allow response.
+I would defer or use an eligible cached policy according to the protocol.
 
-**Two-Phase Query Flow:**
+Validate every resolved destination and redirect before connecting.
+Do not allow a public seed URL to redirect the crawler into internal services.
+Bound redirects, bytes, decompression, parse time, and discovered-link expansion.
 
-```
-Query enters
-     |
-     v
-+-----------+
-|  Parse &  |
-|  Tokenize |  (5ms)
-+-----------+
-     |
-     v
-+-----------+
-|  Phase 1  |
-|   BM25    |  (50-100ms)
-|  Top 1000 |
-+-----------+
-     |
-     v
-+-----------+
-|  Phase 2  |
-| Re-rank   |  (50-100ms)
-| + PageRank|
-| + Fresh   |
-| + Clicks  |
-+-----------+
-     |
-     v
-+-----------+
-| Return    |
-| Top 10    |
-+-----------+
+This work runs away from query servers.
+A malicious or slow page should consume a bounded fetch slot,
+not block someone trying to search already-indexed documents.
 
-Total: < 200ms
-```
+## 🔧 Deep dive: index placement, versions, and publication — 8 minutes
 
----
+### Decision
 
-### Trade-off 5: Elasticsearch for Inverted Index vs Custom Implementation
+> “I would shard documents, retain versioned crawl output,
+> and publish validated index generations.
+> Fewer RPCs are not automatically cheaper if each RPC moves a huge posting list.”
 
-"For the core inverted index, I need to decide between using existing infrastructure or building custom."
+An inverted index maps terms to matching document IDs and positions.
+With document sharding, each shard can evaluate all terms and phrase constraints
+against the documents it owns before returning a small candidate set.
 
-| Approach | ✅ Chosen / ❌ Alternative | Development Time | Pros | Cons |
-|----------|--------------------------|------------------|------|------|
-| **Elasticsearch** | ✅ Chosen | Days to weeks | Battle-tested; built-in BM25; sharding included; active community | Less control over storage format; potential overhead |
-| Custom Inverted Index | ❌ Alternative | Months to years | Full control; optimized for specific access patterns | Massive engineering investment; operational burden |
-| Apache Solr | ❌ Alternative | Days to weeks | Similar capabilities to ES; strong for faceting | Smaller ecosystem; less momentum |
+A query fans out across the selected collection's shards.
+The coordinator merges candidates and accounts for score comparability.
+Replica-aware routing helps distribute reads, while shard sizing controls coordination cost.
 
-> "I'm choosing Elasticsearch because building a custom inverted index is a multi-year engineering effort for questionable benefit. Elasticsearch provides distributed sharding, replication, BM25 scoring, and query DSL out of the box.
+### Sharding trade-off
 
-At Google scale, yes, you'd build custom. But for 99% of search applications, Elasticsearch's overhead is negligible compared to the development time saved. The key is understanding what Elasticsearch is doing under the hood so we can configure it properly."
+| Approach | Benefit | Cost |
+|---|---|---|
+| ✅ Document shards | Local multi-term/phrase matching and bounded candidate replies | Scatter/gather and score calibration |
+| ❌ Term shards | Fewer term owners contacted | Posting-list transfer, distributed intersections, frequent-term hot spots |
+| ❌ One enormous shard | No merge layer | Storage, recovery, and query capacity become a single bottleneck |
 
----
+For a common two-word query, term sharding may require intersecting very large lists.
+Counting two servers versus many document shards hides that data movement.
+Term placement can be valid for specialized workloads, but I would not claim
+Elasticsearch implements it simply because I drew term names inside boxes.
 
-### Trade-off 6: PostgreSQL for URL State vs Cassandra or DynamoDB
+### Versioned writes
 
-"The URL frontier and link graph need persistent storage. I need to choose the right database."
+Each processing event identifies a URL and content version.
+Repeated delivery must converge on the same indexed version.
+A late event must not overwrite a newer document, even if its network call succeeds later.
 
-| Database | ✅ Chosen / ❌ Alternative | Access Pattern | Pros | Cons |
-|----------|--------------------------|----------------|------|------|
-| **PostgreSQL** | ✅ Chosen | Complex queries on URL metadata | ACID transactions; rich query language; efficient for PageRank graph queries | Scaling requires sharding strategy |
-| Cassandra | ❌ Alternative | High-volume writes | Linear write scaling; no single point of failure | Poor for PageRank (cross-partition reads); eventual consistency |
-| DynamoDB | ❌ Alternative | Key-value lookups | Managed scaling; predictable performance | Expensive at scale; limited query flexibility |
+A deterministic ID prevents duplicate document identities.
+It does not by itself prevent stale content from replacing fresh content.
+That requires a version check or a build process pinned to a consistent checkpoint.
 
-> "I'm choosing PostgreSQL for URL state because the access patterns are read-heavy and require complex queries. Finding the next URLs to crawl means filtering by host, sorting by priority, and respecting crawl delay constraints. PageRank computation requires traversing the link graph which benefits from SQL joins.
+A bulk response can succeed at the HTTP level while individual items fail.
+The builder inspects every item and records only confirmed successes.
+Transient failures are retried individually; permanent failures remain visible to operators.
 
-Cassandra would be better if we were doing simple key-value lookups at massive write scale, but our write pattern is relatively modest (1 billion URL updates per day is easily handled by sharded PostgreSQL) and our read pattern requires relational queries."
-
----
-
-### Trade-off 7: Redis for Query Caching vs In-Memory Application Cache
-
-"Query results need caching to reduce index server load. I need to choose the caching strategy."
-
-| Approach | ✅ Chosen / ❌ Alternative | Consistency | Pros | Cons |
-|----------|--------------------------|-------------|------|------|
-| **Redis (Distributed)** | ✅ Chosen | Shared across instances | Single source of truth; warm cache persists across deploys; built-in TTL | Network hop for every cache check; additional infrastructure |
-| In-Memory (Per-Instance) | ❌ Alternative | Local only | Zero network latency; simple implementation | Cold cache on restart; duplicated storage across instances |
-| Memcached | ❌ Alternative | Shared | Battle-tested; simple protocol | Less feature-rich than Redis; no persistence option |
-
-> "I'm choosing Redis for distributed caching because query servers are stateless and horizontally scaled. If each instance had its own cache, a popular query hitting 10 different instances would execute 10 times before all caches are warm.
-
-With Redis, the first query execution populates the cache for all query servers. The network hop adds maybe 1-2ms but saves 100ms+ of index query time on cache hits. At 100K QPS, even a 30% cache hit rate means 30K fewer index queries per second."
-
----
-
-### Trade-off 8: Adaptive TTL for Cache vs Fixed TTL
-
-"Cache TTL strategy affects both freshness and hit rate."
-
-| Strategy | ✅ Chosen / ❌ Alternative | Cache Hit Rate | Pros | Cons |
-|----------|--------------------------|----------------|------|------|
-| **Adaptive TTL** | ✅ Chosen | Higher for stable queries | Fresh results for trending topics; long cache for stable queries | Implementation complexity; requires query classification |
-| Fixed TTL | ❌ Alternative | Uniform | Simple implementation; predictable behavior | Either too stale for news or too aggressive invalidation for stable queries |
-| No Cache | ❌ Alternative | 0% | Always fresh | Cannot meet latency SLA at scale |
-
-> "I'm choosing adaptive TTL because query types have vastly different freshness requirements. A query for 'today's news' needs results refreshed every 60 seconds. A query for 'python tutorial' can be cached for 10 minutes without issue.
-
-I classify queries based on keywords (news, today, live, breaking -> short TTL) and query patterns (site: filters -> longer TTL since they're searching a specific stable site). This maximizes cache hit rate while maintaining appropriate freshness per query type."
-
----
-
-## 📊 Data Flow
-
-### End-to-End Query Path
+### Publication flow to add under the overview
 
 ```
-User types: "machine learning python"
-                    |
-                    v
-            +---------------+
-            | Load Balancer |
-            +-------+-------+
-                    |
-                    v
-            +---------------+
-            | Query Server  |
-            +-------+-------+
-                    |
-        +-----------+-----------+
-        |                       |
-        v                       v
-+---------------+       +---------------+
-| Redis Cache   |       | (cache miss)  |
-| Check         |       |               |
-+-------+-------+       +-------+-------+
-        |                       |
-   (hit)|                       v
-        |               +---------------+
-        |               | Query Parser  |
-        |               | - Tokenize    |
-        |               | - Stem        |
-        |               | - Expand      |
-        |               +-------+-------+
-        |                       |
-        |                       v
-        |               +---------------+
-        |               | Term Shards   |
-        |               | (parallel)    |
-        |               +-------+-------+
-        |                       |
-        |                       v
-        |               +---------------+
-        |               | Merge + BM25  |
-        |               | (top 1000)    |
-        |               +-------+-------+
-        |                       |
-        |                       v
-        |               +---------------+
-        |               | Re-Rank       |
-        |               | + PageRank    |
-        |               | + Freshness   |
-        |               +-------+-------+
-        |                       |
-        |                       v
-        |               +---------------+
-        |               | Store in      |
-        |               | Redis Cache   |
-        |               +-------+-------+
-        |                       |
-        +-----------+-----------+
-                    |
-                    v
-            +---------------+
-            | Return Top 10 |
-            | Results       |
-            +---------------+
+┌────────────────────────┐          ┌────────────────────────┐
+│ Crawl checkpoint       │          │ Build generation G     │
+│ + graph version        │─────────▶│ Inspect every item     │
+└────────────────────────┘          └────────────────────────┘
+                                                │
+                                                │
+                                                │
+                                                │
+                                                │
+                                                ▼
+┌────────────────────────┐          ┌────────────────────────┐
+│ Keep serving G - 1     │          │ Validate G             │
+│ if build fails         │◀─────────│ Coverage + relevance   │
+└────────────────────────┘          └────────────────────────┘
+                            fail                │
+                                                │
+                                                │
+                                                │  pass
+                                                │
+                                                │
+                                                ▼
+                                    ┌────────────────────────┐
+                                    │ Activate manifest G    │
+                                    │ Retain old sessions    │
+                                    └────────────────────────┘
 ```
 
-### Crawl-to-Index Pipeline
+The cost is extra disk, build time, and temporary retention of old generations.
+I accept that for a first design because an interrupted rebuild cannot replace
+our last working index with a half-built corpus.
 
-```
-Seed URLs
-    |
-    v
-+----------+     +----------+     +----------+
-|   URL    |---->| Fetcher  |---->|  Parser  |
-| Frontier |     | (HTTP)   |     | (HTML)   |
-+----------+     +----------+     +----+-----+
-    ^                                  |
-    |                           +------+------+
-    |                           |             |
-    |                           v             v
-    |                    +----------+   +----------+
-    |                    |  Links   |   | Content  |
-    |                    | Extracted|   | Cleaned  |
-    |                    +----+-----+   +----+-----+
-    |                         |              |
-    +-------------------------+              |
-         (new URLs added)                    v
-                                      +----------+
-                                      | Tokenize |
-                                      |  + Stem  |
-                                      +----+-----+
-                                           |
-                                           v
-                                      +----------+
-                                      |  Index   |
-                                      |  Build   |
-                                      +----+-----+
-                                           |
-                                           v
-                                      +----------+
-                                      | Write to |
-                                      |   ES     |
-                                      +----------+
-```
+Incremental publication is a reasonable next step when freshness demands it.
+It still needs versioned updates, deletion propagation, and stable query snapshots.
+I would not add that complexity before measuring the full-generation bottleneck.
 
----
+## 🔧 Deep dive: relevant results within a latency budget — 8 minutes
 
-## ⚖️ Trade-offs Summary
+### Decision
 
-| Decision | What I Chose | Why | What I Gave Up |
-|----------|--------------|-----|----------------|
-| URL Frontier | Priority Queue | Maximize value from limited crawl budget | Simplicity of FIFO |
-| Index Sharding | Shard by Term | 50x reduction in query fan-out | Simple document partitioning |
-| PageRank Update | Weekly Batch | Stable rankings, predictable costs | Instant authority for new pages |
-| Ranking | Two-Phase | Meet latency SLA while using rich signals | May miss some relevant docs in phase 1 |
-| Inverted Index | Elasticsearch | Time-to-market, battle-tested | Full control over storage format |
-| URL Storage | PostgreSQL | Rich queries for frontier and PageRank | Cassandra's write throughput |
-| Query Cache | Redis | Shared cache across instances | In-memory speed |
-| Cache TTL | Adaptive | Balance freshness and hit rate | Implementation simplicity |
+> “I would apply semantic constraints during retrieval,
+> bound ranking work, and cache a coherent result window.
+> I would spend expensive ranking effort only where it improves measured relevance.”
 
----
+The parser produces a structured representation of terms and operators.
+Quoted phrases require positional matches.
+Exclusions remove candidates, and site constraints use explicit host boundaries.
+All those predicates run before selecting the page.
 
-## 🚀 Future Enhancements
+Filtering ten retrieved results in application memory is not equivalent.
+It can leave one result on page one while eligible matches exist farther down,
+and the unfiltered count becomes misleading.
 
-1. **Real-Time Indexing Pipeline**
-   - Add Kafka streaming for breaking news and social content
-   - Bypass batch indexing for time-sensitive content
-   - Target sub-minute indexing latency for news
+### Candidate retrieval and rank signals
 
-2. **Learning to Rank**
-   - Train ML models on click-through data
-   - Move from hand-tuned weights to learned ranking functions
-   - A/B test ranking changes systematically
+Begin with lexical relevance, field boosts, and cheap stored quality signals.
+If a richer ranker is justified, retrieve a bounded candidate pool
+and apply the expensive model only to that pool.
 
-3. **Query Understanding**
-   - Add entity recognition (people, places, organizations)
-   - Intent classification (navigational vs informational vs transactional)
-   - Query rewriting and expansion using NLP
+Measure recall at the candidate cutoff using judged queries.
+A reranker cannot recover a relevant page that retrieval never returned.
+Navigational and rare-term queries may need different candidate strategies.
 
-4. **Personalization Layer**
-   - Incorporate user search history
-   - Geographic and language preferences
-   - Privacy-preserving personalization techniques
+Link authority is computed offline against a named graph snapshot.
+PageRank distributes rank through outgoing links and redistributes dangling-node mass.
+Its convergence threshold and schedule must be tested against corpus size and change.
 
-5. **Incremental PageRank**
-   - Move toward streaming PageRank updates
-   - Process link graph changes incrementally
-   - Reduce authority update lag for new pages
+Do not multiply by an unguarded zero authority value.
+New documents need a neutral prior so lexical relevance can make them discoverable.
+Fetch time is also not publication time: repeatedly recrawling old content
+must not make it appear newly written.
 
----
+### Ranking trade-off
 
-## 📝 Summary
+| Approach | Benefit | Cost |
+|---|---|---|
+| ✅ Bounded candidates + justified reranking | Predictable CPU budget and richer scoring where useful | Candidate cutoff can lose relevant results |
+| ❌ Expensive scoring on every match | Broadest use of features | Latency and cost grow with common-query match sets |
+| ❌ Lexical score alone forever | Simple, explainable baseline | Misses quality signals when they are demonstrably useful |
 
-"To summarize my design for the Google Search backend:
+The alternative is not inherently wrong at small scale.
+I would keep a lexical baseline for evaluation and fallback,
+and only retain a ranker that improves quality within the budget.
 
-I've architected three main subsystems. The **Crawl System** uses a priority-based URL frontier to maximize value from our crawl budget, with per-host politeness queues to respect robots.txt.
+### Cache and navigation consistency
 
-The **Indexing Pipeline** builds term-sharded inverted indexes using Elasticsearch, with weekly batch PageRank computation for authority scores. I chose term sharding over document sharding to reduce query fan-out by 50x.
+The cache key includes the query structure, locale, safety policy, page size,
+corpus generation, rank version, and freshness-time bucket.
+Leaving out page size can return the wrong shape even without any index changes.
 
-The **Serving Layer** uses two-phase ranking to meet the 200ms latency SLA: fast BM25 retrieval for candidates, then expensive re-ranking with PageRank and freshness signals. Redis caching with adaptive TTL reduces load on index servers.
+Materialize a bounded ordered window, for example the first 100 results,
+and let a short-lived session refer to it.
+Next/Previous uses that ordering while the window is available.
+Expiry or eviction asks the client to restart explicitly.
 
-Key infrastructure decisions include PostgreSQL for URL state and link graph, Elasticsearch for the inverted index, and Redis for distributed caching. Each choice involved explicit trade-offs between simplicity, performance, and operational complexity.
+This trades memory for stable browsing.
+For example, 100,000 windows at about 100 KB each already need roughly 10 GB,
+before replication and object overhead.
+The product should cap depth and retention rather than expose unlimited page jumps.
 
-The system scales horizontally at each layer: crawl workers, index shards, query servers, and cache nodes can all be independently scaled based on load. With this architecture, we can meet our targets of 100B indexed pages and 100K QPS with sub-200ms latency."
+A shared query URL can recreate search intent without preserving a temporary window.
+For deeper snapshot traversal, we could later use a point-in-time index view
+and deterministic continuation sort values, with explicit resource expiry.
+
+### Degradation
+
+The cache is optional: use a bounded timeout and bypass it if possible.
+Coalesce popular misses and shed excess work so bypass does not overload the index.
+Try a healthy shard replica within the remaining deadline.
+
+Return a clear unavailable or partial status when retrieval cannot complete.
+Do not cache a failure as a successful empty result.
+Analytics and suggestion learning happen asynchronously after response preparation.
+
+## 📈 Scaling, observability, and verification — 3 minutes
+
+The first serving bottleneck is likely index work or fan-out tail latency.
+Measure query CPU, shard queues, retrieval completeness, and merge cost.
+Add replicas for read capacity and isolate indexing resources from serving.
+
+The frontier and graph eventually outgrow a single PostgreSQL node.
+Partition by origin ownership and export graph snapshots to batch workers.
+The whole graph must not remain a required in-memory object in a Node.js API process.
+
+I would track crawl due-age, expired leases, bulk-item failures,
+publication lag, cache misses, query latency, partial results, and judged relevance.
+A document count alone does not establish freshness or correctness.
+
+| Failure experiment | Invariant to verify |
+|---|---|
+| Worker dies after fetching | Lease recovery resumes work; late output cannot overwrite newer content |
+| One bulk item fails | Failed item remains retryable; generation is not falsely complete |
+| New index generation is bad | Last good generation continues serving |
+| Cache is unavailable | Bounded bypass or explicit overload response |
+| Rank version changes mid-session | Existing window retains its original order |
+
+## 🧭 Close and local comparison — 2 minutes
+
+> “My design keeps the crawl pipeline recoverable and the query path bounded.
+> The main decisions are origin-aware scheduling, document-sharded retrieval,
+> and explicit publication and navigation versions.”
+
+The repository demonstrates PostgreSQL frontier/content tables, Elasticsearch retrieval,
+manual crawl/index/PageRank jobs, a Valkey cache, and indexing circuit breakers.
+It runs a small local corpus, not the distributed system drawn above.
+
+Its crawler lacks atomic claims and recovery, can overflow signed hash columns,
+and writes an upsert without the needed unique constraint.
+Its indexer can mark failed bulk items complete; ranking and PostgreSQL/ES updates
+are not published as one generation. Query operators and cache keys also have gaps.
+
+Those limitations are documented with source references in [architecture.md](./architecture.md).
+[README.md](./README.md) contains the sample-data preparation and actual commands.

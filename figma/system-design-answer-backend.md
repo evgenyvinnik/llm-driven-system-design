@@ -71,17 +71,52 @@ measured hot-file limit justifies the coordination cost.
 ## 🏗️ Architecture and flows — 5 minutes
 
 ```
-┌────────────────────────┐     ┌────────────────────────┐     ┌────────────────────────┐
-│     Editor clients     │ ──▶ │     Gateway / auth     │ ──▶ │       File owner       │
-└────────────────────────┘     └────────────────────────┘     └────────────────────────┘
+PROPOSED DESIGN — accepted edits share one durable order per file
 
-┌────────────────────────┐     ┌────────────────────────┐     ┌────────────────────────┐
-│ Durable operation log  │ ──▶ │    Snapshot worker     │ ──▶ │    Snapshot storage    │
-└────────────────────────┘     └────────────────────────┘     └────────────────────────┘
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Editor clients           │edit / ACK  │ Gateway + access         │presence    │ Ephemeral presence       │
+│ Saved edit ID / file     │◀──────────▶│ Auth / join / route      │◀──────────▶│ Page / cursor / expiry   │
+│ Preview; reconcile ACK   │            │ Current file access      │            │ Replaceable updates      │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+                                                      ▲
+                                                      │
+                                                      │ edit / bootstrap
+                                                      │
+                                                      ▼
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Delivery gateways        │hint/replay │ Fenced file owner        │commit/read │ SQL file authority       │
+│ Authorized subscribers   │◀──────────▶│ Validate / order / ACK   │◀──────────▶│ Head / log / receipts    │
+│ Hint / resume / reset    │            │ Recover committed state  │            │ Epoch checked at commit  │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+              ▲                                       ▲                                       ▲
+              │                                       │                                       │
+              │ events / resume                       │ recover / version                     │ prefix / progress
+              │                                       │                                       │
+              ▼                                       ▼                                       ▼
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Receiving peers          │            │ Verified version store   │bytes/ready │ Snapshot workers         │
+│ Apply canonical effects  │            │ Scene / schema / hash    │◀──────────▶│ Read committed prefix    │
+│ Own viewport + preview   │            │ Verified named versions  │            │ Verify; publish manifest │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+
+Hints can be lost; recovery uses a verified snapshot and the retained committed suffix.
 ```
 
-The first row is the interactive path. The file owner commits to the durable log shown
-below it; snapshot workers later materialize that log into immutable versions. A broker
+I would trace an edit from the authenticated gateway to one fenced file owner and its
+atomic log/receipt commit. That committed prefix drives both peer notifications and
+snapshot materialization. On recovery, the owner combines a verified snapshot with retained
+operations, while clients reconcile by accepted sequence. Presence takes a separate path;
+restore and undo remain ordered mutations rather than replacing another writer's memory.
+
+I would then follow a crash across the same diagram:
+
+1. Storage rejects commits from an obsolete owner epoch. Its replacement reconstructs a verified snapshot and contiguous committed suffix before accepting edits.
+2. A retried operation resolves to the original receipt; delivery gateways independently resume from their last applied sequence.
+3. Snapshot workers publish only verified complete prefixes and record progress after publication. Retention keeps the suffix required by usable snapshots and the supported reconnect window.
+4. A restored document advances its generation, so delayed old-generation edits require review even when their transport reconnects successfully.
+
+The file owner commits to the durable log beside it; snapshot workers later materialize
+that log into immutable versions. A broker
 notifies subscribed gateways of accepted sequences. Presence uses a separate ephemeral
 topic and does not pass through the durable operation log.
 

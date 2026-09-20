@@ -13,12 +13,12 @@ behavior and simulations.
 | Time | Discussion |
 |------|------------|
 | 4 minutes | Product scope and guarantees |
-| 5 minutes | Browser architecture and API contracts |
+| 6 minutes | Browser architecture and API contracts |
 | 9 minutes | Deep dive: market snapshots, streams, and rendering |
 | 8 minutes | Deep dive: precise amounts and instrument context |
 | 9 minutes | Deep dive: order recovery and account state |
 | 6 minutes | Accessibility, performance, and delivery |
-| 4 minutes | Verification and implementation boundary |
+| 3 minutes | Verification and implementation boundary |
 
 ## 🎯 Product scope and guarantees — 4 minutes
 
@@ -55,20 +55,63 @@ within 100 ms.
 > to know whether they are waiting for new information or resolving an action that may
 > already have happened.”
 
-## 🏗️ Browser architecture and API contracts — 5 minutes
+## 🏗️ Browser architecture and API contracts — 6 minutes
 
 I would draw the public data path beside the private command path:
 
 ```
-┌────────────────┐       ┌────────────────┐
-│ Chart / depth  │◀──────│ Market API and │
-│ Market list    │       │ stream gateway │
-└────────────────┘       └────────────────┘
-┌────────────────┐       ┌────────────────┐
-│ Order form     │──────▶│ Command API    │
-│ Orders/balance │◀──────│ Account state  │
-└────────────────┘       └────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│ BROWSER / INSTRUMENT AND ACCOUNT IDENTITIES                                              │
+│                                                                                          │
+│  ┌────────────────────────┐    ┌────────────────────────┐    ┌────────────────────────┐  │
+│  │ Chart + depth adapters │    │ Order draft            │    │ Orders + balances UI   │  │
+│  │ Bounded visible data   │    │ Exact decimal strings  │    │ Canonical quantities   │  │
+│  │ Frame-batched paint    │    │ Pair/tick/step labels  │    │ Pending / stale states │  │
+│  └────────────────────────┘    └────────────────────────┘    └────────────────────────┘  │
+│                          ▲                             ▲                             ▲   │
+│                          │                             │                             │   │
+│   valid state / paint    │      submit / outcome       │      render / refresh       │   │
+│                          │                             │                             │   │
+│                          ▼                             ▼                             ▼   │
+│  ┌────────────────────────┐    ┌────────────────────────┐    ┌────────────────────────┐  │
+│  │ Sequenced market state │    │ Order operation        │    │ Account read model     │  │
+│  │ Book + candle baseline │    │ Saved ID / frozen data │───▶│ Orders + balances      │  │
+│  │ Current / stale / gaps │    │ Pinned pair rules      │    │ Revision and freshness │  │
+│  └────────────────────────┘    └────────────────────────┘    └────────────────────────┘  │
+│                          ▲                             ▲                             ▲   │
+│                          │                             │                             │   │
+│   snapshot + deltas      │      same command ID        │      canonical recovery     │   │
+│                          │                             │                             │   │
+│                          ▼                             ▼                             ▼   │
+│  ┌────────────────────────┐    ┌────────────────────────┐    ┌────────────────────────┐  │
+│  │ Public feed service    │    │ HTTP command client    │    │ Private data service   │  │
+│  │ Snapshot + delta join  │    │ Submit / cancel        │    │ Snapshot / stream      │  │
+│  │ Gap → resnapshot       │    │ Recover receipt        │    │ Account generation     │  │
+│  └────────────────────────┘    └────────────────────────┘    └────────────────────────┘  │
+│                       ▲                                ▲                             ▲   │
+│                       │                                │                             │   │
+└───────────────────────┼────────────────────────────────┼─────────────────────────────┼───┘
+                        │                                │                             │
+                        ▼                                ▼                             ▼
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Market data gateway    │       │ Command API            │       │ Account data gateway   │
+│ HTTP + WebSocket       │       │ Authorized operations  │       │ Authorized snapshots   │
+│ Sequence and coverage  │       │ Durable outcome        │       │ Versioned updates      │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
 ```
+
+I would trace public data through snapshot/stream synchronization into a correct
+market state before sampling chart and depth rendering. Order submission follows a
+separate frozen command identity. Its receipt triggers canonical account refresh;
+it does not let the form invent a new balance or assume a full fill. Private updates
+also recover by account and revision, so a reconnect or pair change cannot mix old
+market data with the current draft.
+
+After a timeout or reload, I would recover the saved command under its original
+account before deciding whether another submission is appropriate. A market sequence
+gap instead pauses that view and rejoins a fresh snapshot with later deltas. Neither
+recovery infers a fill from a price tick. The order receipt and current account
+revision remain separate evidence, even when their responses arrive out of order.
 
 React owns composition, controls, focus, and local drafts. A query layer owns
 instrument metadata, account snapshots, history pages, and bounded candle ranges. A
@@ -331,7 +374,7 @@ Client telemetry measures input delay, update-to-paint delay, resynchronization 
 unknown-command recovery, and long-session memory. It records safe identifiers and
 aggregate timings rather than balances, credentials, or raw order drafts.
 
-## 🧪 Verification and implementation boundary — 4 minutes
+## 🧪 Verification and implementation boundary — 3 minutes
 
 I would test a snapshot arriving while deltas are buffered, a missing sequence,
 duplicate updates, a slow socket, and a reconnect with a changed symbol. The expected

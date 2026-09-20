@@ -13,12 +13,12 @@ partial implementations, and correctness gaps.
 | Time | Discussion |
 |------|------------|
 | 5 minutes | Scope, user promises, and capacity |
-| 5 minutes | Architecture and shared contracts |
+| 6 minutes | Architecture and shared contracts |
 | 9 minutes | Deep dive: one recoverable order |
 | 8 minutes | Deep dive: precise amounts and account meaning |
 | 8 minutes | Deep dive: coherent market data and rendering |
 | 6 minutes | Failure handling, security, and growth |
-| 4 minutes | Verification and implementation boundary |
+| 3 minutes | Verification and implementation boundary |
 
 ## 🎯 Scope, user promises, and capacity — 5 minutes
 
@@ -58,29 +58,66 @@ availability in the primary region. Client input responsiveness and update-to-pa
 delay are separate targets to measure under bursts. These are planning assumptions,
 not measured results from the repository.
 
-## 🏗️ Architecture and shared contracts — 5 minutes
+## 🏗️ Architecture and shared contracts — 6 minutes
 
 I would use a compact diagram and keep the order path visible:
 
 ```
-┌────────────────┐       ┌────────────────┐
-│ Browser        │──────▶│ Command API    │
-│ Draft / views  │◀──────│ Query gateway  │
-└────────────────┘       └───────┬────────┘
-                                 ▼
-                         ┌────────────────┐
-                         │ Pair owner     │
-                         │ Committed book │
-                         └───────┬────────┘
-                                 ▼
-                         ┌────────────────┐
-                         │ Orders + holds │
-                         │ Ledger/receipt │
-                         │ Outbox         │
-                         └───────┬────────┘
-                                 ▼
-                         Market/account views
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│ BROWSER / EXACT DRAFTS, IDENTIFIED COMMANDS AND COHERENT VIEWS                           │
+│                                                                                          │
+│  ┌────────────────────────┐    ┌────────────────────────┐    ┌────────────────────────┐  │
+│  │ Order entry            │    │ Command controller     │    │ Market/account UI      │  │
+│  │ Pair and exact amounts │◀──▶│ Saved ID / frozen data │───▶│ Sequence-aware data    │  │
+│  │ Local editable draft   │    │ Lookup unknown result  │    │ Account revisions      │  │
+│  └────────────────────────┘    └────────────────────────┘    └────────────────────────┘  │
+│                                   ▲                                                  ▲   │
+│            ┌──────────────────────┘                                                  │   │
+└────────────┼─────────────────────────────────────────────────────────────────────────┼───┘
+             │                                                                         │
+             ▼                                                                         ▼
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Command / receipt API  │       │ Fenced pair owner      │       │ Read/stream gateways   │
+│ Authorize + route      │◀─────▶│ Ordered commands       │       │ Snapshots and deltas   │
+│ Resolve same attempt   │       │ Committed memory book  │       │ Auth + bounded replay  │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+             ▲                                ▲                                ▲
+             │                                │                                │
+receipt      │         plan / commit          │                   read view    │
+             │                                │                                │
+             ▼                                ▼                                ▼
+┌─────────────────────────────────────────────────────────┐       ┌────────────────────────┐
+│ Transactional authority                                 │       │ Market/account views   │
+│ Orders + holds + fills + balanced accounting            │       │ Sequence and revision  │
+│ Command result and outbox commit with the decision      │       │ May lag durable state  │
+└─────────────────────────────────────────────────────────┘       └────────────────────────┘
+                                              ▲                                ▲
+                                              │                                │
+outbox / progress                             │                                │
+                                              │  publish coherent views        │
+                                              │                                │
+                                              ▼                                │
+                                 ┌────────────────────────┐                    │
+                                 │ Relay + projectors     │                    │
+                                 │ Retry / deduplicate    │◀───────────────────┘
+                                 │ Versioned effects      │
+                                 └────────────────────────┘
+
+A receipt identifies submitted intent; current orders and balances carry their own revision.
 ```
+
+I would follow an exact draft into one command ID, through its pair owner and the
+shared funding/accounting transaction, then back as a recoverable receipt. A separate
+path publishes committed decisions into coherent market and account views. The UI
+uses those snapshots or ordered updates for current state, while retaining the receipt
+as the answer to the original submission. Acceptance, current fill state and the
+freshness of the displayed book therefore remain separate facts.
+
+On a lost response, the browser uses the saved account-scoped command reference;
+the pair owner resolves any uncertain commit before matching again. Relay/projector
+return arrows record publication and projection progress, not a second financial
+decision. If the client misses a sequence, it resnapshots the appropriate view while
+retaining the original receipt and distinguishing acceptance from current fill state.
 
 The browser owns local drafts, navigation, focus, and rendering. The pair owner orders
 commands and compares compatible interest. The initial transactional store owns
@@ -358,7 +395,7 @@ replay time, outbox age, stream recovery, and input/update-to-paint delay. A cou
 of attempted or simulated trades is not proof of settled volume, and a healthy process
 is not a healthy exchange.
 
-## 🧪 Verification and implementation boundary — 4 minutes
+## 🧪 Verification and implementation boundary — 3 minutes
 
 The first end-to-end test submits an order, loses the response after commit, reloads,
 and recovers exactly that command. It checks the order reference, quantities, holds,

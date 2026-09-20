@@ -43,28 +43,52 @@ Run a few browser windows and optionally two or three server processes against o
 Production proposal; static assets and video use separate CDN paths.
 
 ```
-┌────────────────────┐       ┌──────────────────────┐
-│ Browser + video UI │──────▶│ Edge / session check │
-└────────────────────┘       └──────────┬───────────┘
-                                       │
-             ┌─────────────────────────┴─────────────────────┐
-             ▼                                               ▼
-┌────────────────────────┐                    ┌────────────────────────┐
-│ Comment / moderation   │                    │ WebSocket gateways     │
-│ writer, stream shards  │                    │ Bounded socket queues  │
-└────────────┬───────────┘                    └────────────▲───────────┘
-             ▼                                            │
-┌────────────────────────┐       ┌────────────────────────┴───┐
-│ PostgreSQL shards      │──────▶│ Outbox relay / feed service│
-│ Comments + receipts    │       │ Sampling + cursor coverage │
-│ Stream order + outbox  │       └────────────┬───────────────┘
-└────────────┬───────────┘                    │
-             │                                ▼
-             │                  ┌────────────────────────────┐
-             └─────────────────▶│ Recent-view cache + replay │
-                                │ Reaction snapshots         │
-                                └────────────────────────────┘
+PROPOSED LIVE COMMENTS — durable acceptance and selected audience views are distinct
+
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Viewer / moderator       │post/result │ Session / API gateway    │command/ACK │ Comment + moderation     │
+│ Saved post ID + text     │◀──────────▶│ Authorize stream scope   │◀──────────▶│ Writer by stream         │
+│ Post, react, subscribe   │            │ Post / snapshot / resume │            │ Current access / policy  │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+              ▲                                       ▲                                       ▲
+              │                                       │                                       │
+              │ tap / admission                       │ view / resume                         │ commit / recover
+              │                                       │                                       │
+              ▼                                       ▼                                       ▼
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Reaction intake + totals │totals/read │ View / replay service    │read/replay │ SQL stream authority     │
+│ Auth / bounded admission │◀──────────▶│ Current visibility       │◀──────────▶│ Comment, order, receipt  │
+│ Identified intervals     │            │ Policy + cursor coverage │            │ Moderation + outbox      │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+              ▲                                       ▲                                       ▲
+              │                                       │                                       │
+              │ apply / recover                       │ view / updates                        │ outbox / progress
+              │                                       │                                       │
+              ▼                                       ▼                                       ▼
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Reaction recovery state  │            │ Feed / event workers     │work/ACK    │ Outbox relay             │
+│ Epoch, totals, progress  │            │ Select / batch / repair  │◀──────────▶│ Retry committed events   │
+│ Commit interval effects  │            │ Per-gateway copies       │            │ Stable IDs + progress    │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+                                                      ▲
+                                                      │
+                                                      │ view / resume
+                                                      │
+                                                      ▼                         Animations can be lost;
+┌──────────────────────────┐            ┌──────────────────────────┐            totals recover from a
+│ Audience clients         │feed/resume │ Subscriber gateways      │            versioned snapshot.
+│ Selected comment window  │◀──────────▶│ Current scope / leases   │
+│ Reaction epoch + totals  │            │ Bounded output queues    │
+└──────────────────────────┘            └──────────────────────────┘
 ```
+
+Follow the proposed diagram through acceptance and recovery:
+
+1. The author retains one scoped pending post; its command receipt follows the comment/order/outbox commit and remains distinct from audience delivery.
+2. The view service reads current visible history and supplies selection-policy coverage. Workers and gateways recover a bounded tail or issue an explicit reset.
+3. Reaction processing commits identified interval effects, totals, and progress together. Consumers recover newer absolute snapshots rather than replaying animations.
+4. Delivery progress flows back through retained work; a current authorization/moderation check still governs recovered or historical content.
+5. Video bytes take a separate service/CDN path, and the frontend keeps rendering, reading intent, and reaction animation within independent budgets.
 
 The feed service fans each selected stream update to **every gateway with interested viewers**. A competing-consumer group alone would deliver it to only one member and strand other viewers. Redis Pub/Sub can distribute the fast path, while durable ordered events and a bounded replay API establish recovery. The diagram's durable outbox/replay layer is absent locally.
 

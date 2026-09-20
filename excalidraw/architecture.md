@@ -59,26 +59,42 @@ The fixture has two users, four drawings, 36 total elements, and two edit grants
 Production proposal; these are responsibilities rather than a requirement to deploy one service per box.
 
 ```
-┌──────────────────────┐      ┌──────────────────────┐
-│ Browser              │─────▶│ CDN / static assets  │
-│ Scene + local drafts │      └──────────────────────┘
-└──────────┬───────────┘
-           ▼
-┌──────────────────────┐      ┌──────────────────────┐
-│ HTTP / WS gateway    │─────▶│ Session / access     │
-│ Limits / room routing│      │ PostgreSQL metadata  │
-└──────────┬───────────┘      └──────────────────────┘
-           ▼
-┌──────────────────────┐      ┌──────────────────────┐
-│ Drawing authority    │─────▶│ Durable command log  │
-│ Fenced room owner    │      │ Receipts / sequence  │
-└──────────┬───────────┘      └──────────┬───────────┘
-           ▼                             ▼
-┌──────────────────────┐      ┌──────────────────────┐
-│ Fan-out / presence   │      │ Snapshot / export    │
-│ Ephemeral delivery   │      │ Background workers   │
-└──────────────────────┘      └──────────────────────┘
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Browser collaborators  │       │ Access API / WS edge   │       │ Presence distribution  │
+│ Saved command identity │◀─────▶│ Auth / route / join    │◀─────▶│ Expiring observations  │
+└────────────────────────┘       │ Connection lifecycle   │       │ No durable edit status │
+                                 └────────────────────────┘       └────────────────────────┘
+                                              ▲
+                                              │
+                 command / durable outcome    │
+                                              │
+                                              ▼
+                                 ┌────────────────────────┐       ┌────────────────────────┐
+                                 │ Fenced drawing owner   │       │ PostgreSQL authority   │
+                                 │ Serialize group edits  │◀─────▶│ Scene / accepted log   │
+                                 │ Commit before ACK      │       │ Receipt, access, epoch │
+                                 └────────────────────────┘       └────────────────────────┘
+                                              ▲                                ▲
+                                              │                                │
+                         events / replay      │           snapshot + suffix    │
+                                              │                                │
+                                              ▼                                ▼
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Peer collaborators     │       │ Accepted event stream  │       │ Snapshot workers       │
+│ Canonical scene events │◀─────▶│ Retained log / replay  │       │ Exact covered sequence │
+│ Replay missing events  │       │ Bounded subscriber IO  │       │ Verified recovery base │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+
+One accepted order per drawing; geometry, style and text have explicit conflict boundaries.
 ```
+
+The proposed overview exposes the acceptance and recovery loop:
+
+1. Browsers retain bounded commands with original identity, expected revisions, and account/drawing scope; accepted status still requires a server receipt.
+2. The fenced owner commits the canonical effect, receipt, and sequence together. Both the author and peers can recover that accepted order.
+3. Replay requests return through the owner to durable history; presence uses an independent disposable channel.
+4. A replacement owner restores a verified snapshot and committed suffix under a new epoch before admitting commands.
+5. Snapshot publication identifies the exact covered sequence. Log retirement, stale-draft handling, and tombstone compaction must preserve the stated recovery window.
 
 One authority serializes accepted changes for each drawing. Durable storage checks the current owner epoch so a former owner cannot continue committing after failover. Metadata and access changes that affect editing pass through a compatible ordering/version protocol; a separate HTTP full-scene replacement must not race the room writer.
 

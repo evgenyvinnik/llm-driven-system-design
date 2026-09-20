@@ -42,25 +42,60 @@ optimizations without changing the collaboration contract.
 ## 🏗️ Architecture and State — 6 minutes
 
 ```
-┌──────────────────────┐     ┌──────────────────────┐
-│ React tools / routes │────▶│ Scene + pending edits│
-└──────────────────────┘     └──────────┬───────────┘
-                                        │
-                                        ▼
-┌──────────────────────┐     ┌──────────────────────┐
-│ Canvas / DOM overlays│◀────│ Client coordinator   │
-└──────────────────────┘     └──────────┬───────────┘
-                                        │ HTTP / WebSocket
-                                        ▼
-                             ┌──────────────────────┐
-                             │ Drawing authority    │
-                             └──────────┬───────────┘
-                                        │
-                                        ▼
-                             ┌──────────────────────┐
-                             │ PostgreSQL log/state │
-                             └──────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│ BROWSER / LOCAL GESTURE, CANONICAL SCENE AND VIEWPORT                                    │
+│                                                                                          │
+│  ┌────────────────────────┐    ┌────────────────────────┐    ┌────────────────────────┐  │
+│  │ React tools + input    │    │ Scene + coordinator    │    │ Canvas + DOM overlays  │  │
+│  │ Gesture / selection    │◀──▶│ Scene / local journal  │───▶│ Local pan / zoom       │  │
+│  └────────────────────────┘    │ Account/drawing scope  │    │ Frame-based rendering  │  │
+│            ▲                   └────────────────────────┘    └────────────────────────┘  │
+│            │                                ▲                                            │
+│            │                                │                                            │
+└────────────┼────────────────────────────────┼────────────────────────────────────────────┘
+metadata     │                                │  durable command / canonical event
+             ▼                                ▼
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Session + metadata API │       │ WebSocket gateway      │       │ Ephemeral presence     │
+│ Titles / permissions   │       │ Auth + join boundary   │◀─────▶│ Cursors / previews     │
+│ Same drawing authority │       │ Reconnect / subscribe  │       │ Expiry and coalescing  │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+             ▲                                ▲
+             │                                │
+             │   identified editing intent    │
+             │                                │
+             │                                ▼
+             │                   ┌────────────────────────┐       ┌────────────────────────┐
+             │                   │ Fenced drawing owner   │       │ PostgreSQL authority   │
+             └──────────────────▶│ Property conflicts     │◀─────▶│ Scene/events/receipts  │
+                                 │ One accepted order     │       │ Snapshot metadata      │
+                                 └────────────────────────┘       └────────────────────────┘
+                                              ▲                                ▲
+                                              │                                │
+                                              │ events / replay                │
+                                              │                                │
+                                              ▼                                ▼
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Other collaborators    │       │ Delivery + replay      │       │ Snapshot workers       │
+│ Apply accepted changes │◀─────▶│ Committed event stream │       │ Verify exact sequence  │
+│ Recover missed events  │       │ Bounded subscriber IO  │       │ Replay retained suffix │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+
+Local preview need not wait for a server; accepted edits follow a durable drawing order.
 ```
+
+I would follow one rectangle move from the gesture draft into a pending command, through
+the drawing owner and SQL commit, then back as a canonical event and out to peers.
+The renderer can preview the movement before that round trip, but save status waits for
+the receipt. Presence remains disposable; replay and a verified snapshot rebuild accepted
+scene state. Viewport changes stay local and do not become edits to another person's view.
+
+I would use a disconnected collaborator to test the whole drawing:
+
+1. The local journal retains original command IDs, bases, and drawing/account scope; unsent gestures stay visibly separate from accepted state.
+2. A replacement owner reconstructs a verified snapshot plus committed suffix under a new fenced epoch before accepting work.
+3. The client retrieves the canonical baseline, resolves old receipts, and reconciles pending overlays without submitting them as another account.
+4. Peer replay uses the same retained order. Expired history or revoked editing access requires explicit draft recovery, while obsolete presence is discarded.
 
 React owns navigation, tool controls, dialogs, and accessible object controls. The renderer
 consumes scene state and a temporary gesture draft. A client coordinator owns joining,

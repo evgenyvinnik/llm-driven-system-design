@@ -63,22 +63,48 @@ and express intent; they do not each open streams or independently reconcile HTT
 results.
 
 ```
-┌──────────────────────┐       ┌────────────────────────┐
-│ Route + composer     │──────▶│ Room coordinator       │
-└──────────────────────┘       │ Session / generation   │
-                               └────────────┬───────────┘
-                                            │
-                                            ▼
-┌──────────────────────┐       ┌────────────────────────┐
-│ HTTP + SSE API       │◀─────▶│ Normalized timeline    │
-└──────────────────────┘       │ Pending + committed    │
-                               └────────────┬───────────┘
-                                            │
-                                            ▼
-                               ┌────────────────────────┐
-                               │ Message list + status  │
-                               └────────────────────────┘
+BROWSER — first two columns; SERVER CONTRACTS — right column
+
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Room navigation          │intent/view │ Room coordinator         │HTTP/state  │ Session + room API       │
+│ Account + intended room  │◀──────────▶│ One lifecycle owner      │◀──────────▶│ Validate identity/access │
+│ Connection status        │            │ Generation + cleanup     │            │ Authorized room list     │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+                                                      │
+                                                      │ room context
+                                                      │
+                                                      ▼
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Composer + draft         │send/status │ Pending sends            │send/result │ Send API                 │
+│ Scoped local draft       │◀──────────▶│ Saved ID / frozen data   │◀──────────▶│ Authorize intended room  │
+│ Preserve failed text     │            │ Accepted / unknown       │            │ Commit / receipt lookup  │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+                                                      ▲
+                                                      │
+                                                      │ match receipts
+                                                      │
+                                                      ▼
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Timeline + status        │render/UI   │ Merge + replay state     │resume/data │ History + live API       │
+│ Scroll anchor / window   │◀──────────▶│ IDs / applied cursor     │◀──────────▶│ Authorize room + cursor  │
+│ Pending and committed    │            │ Normalize / deduplicate  │            │ HTTP page / SSE replay   │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+
+Restore pending sends by original ID; reload a history boundary before resuming live data.
 ```
+
+I would follow a draft into a frozen send operation and show the HTTP response separately
+from the live echo. Both meet at the merge boundary, so their arrival order cannot add
+the message twice or clear newer text. The room coordinator owns request and stream
+lifetimes. History and SSE advance only the validated applied cursor, while the timeline
+keeps pending feedback, scroll position and connection quality visible.
+
+I would explain the recovery arrows with one reconnect:
+
+1. Save a bounded account/room-scoped draft and immutable pending operations when local policy permits; a storage failure must remain visible.
+2. Resolve each unknown send using its original ID and payload, without redirecting it to the newly selected room.
+3. After reload, fetch a fresh history page and boundary unless the matching local message state and cursor were restored together.
+4. Resume retained events, merge overlaps, and advance the applied cursor only after validation; expired retention requires an explicit reset.
 
 The route identifies the selected room. The coordinator validates the session, acquires
 the room context, fetches history, owns the stream, and applies events. It also owns a

@@ -40,28 +40,54 @@ These are proposed targets, not measurements from the demo.
 I would start with this diagram and expand a single flow at a time:
 
 ```
-┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐
-│ Customer app    │  │ Restaurant app  │  │ Driver app      │
-└────────┬────────┘  └────────┬────────┘  └────────┬────────┘
-         └───────────────────┼───────────────────┘
-                             ▼
-           ┌──────────────────────────────────┐
-           │ Authenticated HTTP + socket edge │
-           └───────────────┬──────────────────┘
-                           ▼
-           ┌──────────────────────────────────┐
-           │ Catalog │ Orders │ Dispatch/ETA  │
-           └─────────┬────────────────┬───────┘
-                     ▼                ▼
-        ┌────────────────────┐  ┌────────────────────┐
-        │ Market SQL         │  │ Fresh geo index    │
-        │ Orders + outbox    │  │ Latest observations│
-        └─────────┬──────────┘  └────────────────────┘
-                  ▼
-        ┌────────────────────────────────────────────┐
-        │ Relay + event bus → gateways/notifications │
-        └────────────────────────────────────────────┘
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Customer app           │       │ Restaurant app         │       │ Driver app             │
+│ Saved cart / operation │       │ Versioned queue        │       │ Exact offer / progress │
+│ Accepted order version │       │ Saved action IDs       │       │ Foreground position    │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+             ▲                                ▲                                ▲
+             │                                │                                │
+             ▼                                ▼                                ▼
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│ AUTHENTICATED HTTP + EVENT EDGE                                                          │
+│ Commands / receipts, authorized snapshots, subscription lifecycle and recovery           │◀───┐
+└──────────────────────────────────────────────────────────────────────────────────────────┘    │
+             ▲                                                                 ▲                │
+             │                                                                 │                │
+             │  commands/read                          report / latest point   │                │
+             │                                                                 │                │
+             ▼                                                                 ▼                │
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐    │
+│ Catalog + order module │       │ Dispatch + ETA         │       │ Location + geo module  │    │
+│ Quote / state / claims │◀─────▶│ Fresh candidates       │◀─────▶│ Latest valid positions │    │
+└────────────────────────┘       │ Exclusive claim        │       │ Age, sequence, expiry  │    │
+             ▲                   └────────────────────────┘       └────────────────────────┘    │
+             │                                                                                  │
+             │  one market transaction                                                          │
+             │                                                                                  │
+             ▼                                                                                  │
+┌────────────────────────┐       ┌─────────────────────────────────────────────────────────┐    │
+│ Market SQL authority   │       │ Outbox relay + event delivery                           │    │
+│ Order/claim + receipt  │◀─────▶│ Outbox progress, committed events, authorized delivery  │────┘
+│ Lifecycle outbox       │       │ Positions use the separate coalescing location path     │
+└────────────────────────┘       └─────────────────────────────────────────────────────────┘
+
+All three screens reconcile accepted state; a nearby driver is only a candidate until claimed.
 ```
+
+I would follow one customer checkout into the order/claim authority, then return its
+committed lifecycle to all three role-specific screens through the outbox path.
+Dispatch asks that same authority to reserve a candidate driver found in the geo index.
+Foreground location updates travel through a separate, replaceable observation path.
+The UI can therefore distinguish pending checkout, accepted order, live assignment and
+an approximate position without deriving business state from a socket or map marker.
+
+I would test this drawing with a dropped checkout reply and an expired offer:
+
+1. The customer restores the original operation and agreed payload, then resolves its receipt and current order state.
+2. The restaurant and driver reconcile their own saved actions against current revisions; an old offer is accepted only if its exact claim is still live.
+3. Background workers reload claim identity/deadlines before retrying or notifying, so old work cannot release or advertise a replacement claim.
+4. The edge refreshes authorized snapshots after event gaps; latest position and order revision remain independent recovery paths.
 
 Driver position ingestion updates the geo index through an authenticated path; at scale it
 can be deployed separately from order writes. Dispatch uses the index to discover

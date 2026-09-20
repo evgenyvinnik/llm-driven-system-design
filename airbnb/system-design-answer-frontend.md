@@ -6,7 +6,7 @@ This answer proposes a production frontend. The checked-in React application is 
 smaller teaching implementation; [architecture.md](./architecture.md) distinguishes
 its working flows, missing screens and correctness gaps.
 
-## 📋 Clarify the experience — 5 minutes
+## 📋 Clarify the experience — 4 minutes
 
 > “I would focus on a guest finding a place, understanding whether the dates work,
 > and making a reservation without losing their choices. I would also cover the
@@ -37,24 +37,57 @@ I would target immediate feedback for local interactions and useful results with
 roughly a second under normal conditions. Those are experience goals to validate on
 real devices, not a promise that every network request takes the same time.
 
-## 🏗️ Draw the frontend boundaries — 5 minutes
+## 🏗️ Draw the frontend boundaries — 6 minutes
 
 ```
-┌────────────────────┐        ┌───────────────────────────┐
-│ Search route       │───────▶│ Query/data layer          │
-│ Filters, cards, map│◀───────│ Identity, cache, requests │
-└────────────────────┘        └─────────────┬─────────────┘
-                                          │
-┌────────────────────┐                    ▼
-│ Listing / booking  │◀──────────▶┌───────────────────────┐
-│ Calendar, quote    │            │ Marketplace APIs      │
-└────────────────────┘            └───────────────────────┘
-                                          ▲
-┌────────────────────┐                    │
-│ Host workspace     │────────────────────┘
-│ Drafts, calendar   │
-└────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│ BROWSER / MARKETPLACE CLIENT                                                             │
+│                                                                                          │
+│  ┌────────────────────────┐    ┌────────────────────────┐    ┌────────────────────────┐  │
+│  │ Search route           │    │ Listing + booking      │    │ Host workspace         │  │
+│  │ Filters, cards, map    │    │ Calendar, quote, trips │    │ Drafts and calendar    │  │
+│  └────────────────────────┘    └────────────────────────┘    └────────────────────────┘  │
+│                          ▲                             ▲                             ▲   │
+│                          │                             │                             │   │
+│  query / candidates      │     details / quote         │     draft / revision        │   │
+│                          │                             │                             │   │
+│                          ▼                             ▼                             ▼   │
+│  ┌────────────────────────────────────────────────────────────────────────────────────┐  │
+│  │ Entity + query model                                                               │  │
+│  │ Listing entities; scoped calendar/quote revisions; loading and errors              │  │
+│  │ Booking attempt: operation ID; pending / confirmed / unknown outcome               │  │
+│  └────────────────────────────────────────────────────────────────────────────────────┘  │
+│                          ▲                                                 ▲             │
+│                          │                                                 │             │
+│  navigation / intent     │                      fetch / mutation results   │             │
+│                          │                                                 │             │
+│                          ▼                                                 ▼             │
+│  ┌────────────────────────┐    ┌──────────────────────────────────────────────────────┐  │
+│  │ URL + recovery storage │    │ Data access + mutation coordinator                   │  │
+│  │ Query / draft / op ID  │    │ Account + query IDs; recover the same operation      │  │
+│  └────────────────────────┘    └──────────────────────────────────────────────────────┘  │
+│                                                                                      ▲   │
+│                                                                                      │   │
+└──────────────────────────────────────────────────────────────────────────────────────┼───┘
+   HTTP: candidates / quote / identified reservation / host revision                   │
+                                                                                       ▼
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│ Marketplace API (server boundary)                                                        │
+│ Candidate search, authoritative quotes/reservations, host updates and conflicts          │
+└──────────────────────────────────────────────────────────────────────────────────────────┘
 ```
+
+I would trace a date change through the client model: it retires the old quote,
+loads calendar/price data for the new input identity, and updates the booking view
+only from matching results. Search cards and map markers share listing identities;
+reservation attempts retain their own operation identity until the server outcome is
+resolved. Host edits use the same data boundary with versioned interval changes.
+
+Before submitting a reservation, I would retain its operation ID in account-scoped
+browser storage so a reload can resume lookup. Public filters belong in the URL;
+private recovery references do not. After reconnecting, the coordinator asks for the
+same operation's outcome and replaces “unknown” only with an authoritative result.
+Switching accounts clears private cached views and changes the recovery namespace.
 
 The router owns navigable identity: destination, applied filters, listing ID and
 booking ID. Components own temporary interaction details. A shared data layer owns

@@ -13,12 +13,12 @@ Notes](./architecture.md#implementation-notes) trace the checked-in behavior.
 | Time | Discussion |
 |------|------------|
 | 4 minutes | Requirements and capacity |
-| 5 minutes | Architecture and data model |
+| 6 minutes | Architecture and data model |
 | 9 minutes | Deep dive: document ordering and OT |
 | 9 minutes | Deep dive: durable acceptance and delivery |
 | 8 minutes | Deep dive: snapshots and reconnect recovery |
 | 6 minutes | Scaling, access control, and operations |
-| 4 minutes | Verification and implementation boundary |
+| 3 minutes | Verification and implementation boundary |
 
 ## 🎯 Requirements and capacity — 4 minutes
 
@@ -61,26 +61,61 @@ These figures are assumptions for discussion, not a capacity claim for the
 repository. I would validate workload distributions, document size, paste behavior,
 and writer/viewer ratios before final sizing.
 
-## 🏗️ Architecture and data model — 5 minutes
+## 🏗️ Architecture and data model — 6 minutes
 
 I would draw a document owner between connection handling and durable storage:
 
 ```
-┌──────────────────┐       ┌──────────────────┐
-│ WebSocket        │──────▶│ Document owner   │
-│ gateways         │◀──────│ Ordered commands │
-└──────────────────┘       └────────┬─────────┘
-                                    │ atomic append
-                           ┌────────▼─────────┐
-                           │ PostgreSQL       │
-                           │ Head/log/receipt │
-                           │ Snapshot/outbox  │
-                           └────────┬─────────┘
-                                    │ committed events
-                           ┌────────▼─────────┐
-                           │ Fanout / workers │
-                           └──────────────────┘
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Editing clients        │       │ Connection/meta edge   │       │ Ephemeral presence     │
+│ Optimistic operations  │◀─────▶│ Auth, open, route      │◀─────▶│ Session + cursor ver   │
+│ Stable request IDs     │       │ HTTP + WebSocket       │       │ Expiry; not text state │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+                                              ▲
+                                              │
+submit / durable acknowledgement              │
+                                              │
+                                              ▼
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Verified snapshots     │       │ Fenced document owner  │       │ PostgreSQL authority   │
+│ Content + version      │◀─────▶│ Serial admission + OT  │◀─────▶│ Head, log, receipts    │
+│ Checksum + format      │       │ Committed memory       │       │ Access, epoch, outbox  │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+             ▲                                                                 │
+             │                                                                 │
+snapshot V   │                                ┌────────────────────────────────┘
+             │                                │
+             │                                │  committed events
+             ▼                                ▼
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Snapshot workers       │       │ Outbox relay           │       │ Delivery gateways      │
+│ Replay durable suffix  │◀──────│ Retry / deduplicate    │──────▶│ Authorized subscribers │
+│ Verify before publish  │       │ Ordered event identity │       │ Replay + queue limits  │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+                                                                               ▲
+                                                                               │
+                                             versions / replay request         │
+                                                                               │
+                                                                               ▼
+                                                                  ┌────────────────────────┐
+                                                                  │ Peer clients           │
+                                                                  │ Apply canonical edits  │
+                                                                  │ Observe peer freshness │
+                                                                  └────────────────────────┘
+Stores may share PostgreSQL; gateways and snapshots do not become writable document owners.
 ```
+
+An editing client reaches one fenced document owner through a gateway. The owner
+validates and transforms the command, commits the next history entry and receipt,
+then acknowledges it. Outbox delivery and verified snapshots follow committed state;
+peers can replay missing versions without creating another authority. Presence takes
+a separate expiring path and cannot make a text edit durable or rebuild document history.
+
+A peer's return arrow requests a baseline or missing suffix after a gap; gateway
+delivery alone cannot certify that the peer applied a version. Snapshot workers use
+committed history and publish only a verified baseline. Owner recovery combines that
+baseline with the durable suffix before accepting new edits, while duplicate submit
+requests resolve the original receipt instead of transforming and committing twice.
 
 Gateways authenticate and hold connections. They route edits to a single logical
 owner per document. The owner validates and transforms operations, coordinates
@@ -350,7 +385,7 @@ process that can query PostgreSQL but has lost its document consumer or authorit
 not ready for the same traffic as a fully functioning owner. Shutdown should stop
 admission, settle or preserve pending commands, and then close dependencies.
 
-## 🧪 Verification and implementation boundary — 4 minutes
+## 🧪 Verification and implementation boundary — 3 minutes
 
 I would verify operation algebra first, then the protocol: two clients editing the
 same position, overlapping deletes, buffered edits, duplicate delivery, and a lost

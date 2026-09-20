@@ -49,16 +49,42 @@ There are 50 image IDs, 10–59. Tiles/masonry each mount all 50 image buttons. 
 The proposed API authenticates users, returns authorized metadata, and creates durable upload sessions. Browsers upload directly to staging storage. Finalization binds a verified immutable input version and records processing work in a transactional outbox. Workers decode and transform the input, publish a variant manifest, and expose ready images through authorized CDN delivery.
 
 ```
-┌─────────────────────────┐     ┌─────────────────────────┐     ┌─────────────────────────┐
-│     Browser gallery     │ ──▶ │  Metadata / upload API  │ ──▶ │   PostgreSQL + outbox   │
-└─────────────────────────┘     └─────────────────────────┘     └─────────────────────────┘
+    PROPOSED UPLOAD-BACKED GALLERY — the local demo is frontend-only
 
-┌─────────────────────────┐     ┌─────────────────────────┐     ┌─────────────────────────┐
-│  Staged object storage  │ ──▶ │    Processing workers   │ ──▶ │      Variants + CDN     │
-└─────────────────────────┘     └─────────────────────────┘     └─────────────────────────┘
+    ┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+    │ Gallery browser          │HTTP/status │ Metadata / upload API    │commit/read │ SQL authority            │
+┌──▶│ Browse / upload / resume │◀──────────▶│ Owner / quota / state    │◀──────────▶│ Images / sessions        │
+│   │ Saved session + image ID │            │ Guarded ready manifest   │            │ Manifests + outbox       │
+│   └──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+│                 ▲                                       ▲                                       ▲
+│                 │                                       │                                       │
+│ GET / bytes     │                                       │                                       │
+│                 │                                       │                                       │
+│                 │ upload / receipt                      │ publish / outcome                     │ work / progress
+│                 │                                       │                                       │
+│                 ▼                                       ▼                                       ▼
+│   ┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│   │ Private input staging    │read / bytes│ Processing workers       │job / ACK   │ Outbox + work queue      │
+│   │ Scoped upload / receipt  │◀──────────▶│ Bound decode / profiles  │◀──────────▶│ Committed generation     │
+│   │ Verified immutable input │            │ Verify; publish manifest │            │ Retry / durable progress │
+│   └──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+│                                                         ▲
+│                                                         │
+│                                                         │ write / verify
+│                                                         │
+│                                                         ▼
+│   ┌──────────────────────────┐            ┌──────────────────────────┐
+│   │ Authorized CDN delivery  │GET / bytes │ Private variant origin   │
+└──▶│ Grant before cache hit   │◀──────────▶│ Immutable output bytes   │
+    │ Scoped private origin    │            │ Verified profiles        │
+    └──────────────────────────┘            └──────────────────────────┘
+
+    Only a verified manifest becomes ready; delivery checks access before using cached bytes.
 ```
 
-The upper row is the metadata/coordination path; the lower row is the image-byte path. An outbox dispatcher feeds the processing queue from committed SQL rows. The browser obtains upload authority from the API and sends bytes to staging storage directly. Display requests travel to the CDN, which retrieves verified variants from private origin storage.
+The upper row handles metadata and coordination. Upload bytes travel directly to staging; a committed job tells the worker which immutable input to read. Workers verify output bytes before conditionally publishing a ready manifest through the API's state authority, then acknowledge completed work. The outer path shows the same browser obtaining display bytes through the authorized CDN and private variant origin. Upload receipts, processing completion, and display/decode success are separate outcomes.
+
+A returning uploader can recover a bounded account-scoped session reference and ask for its canonical status. Browser file access may require reselection; the retained session does not itself preserve file bytes or prove the replacement file matches. Reuse valid session/input identity and resolve finalization before creating new work. Cleanup checks current session/generation state before releasing reservations or deleting abandoned objects.
 
 ## Core Components / Request Flows
 

@@ -66,23 +66,60 @@ transports reach it. The browser coordinator handles presentation state; it does
 decide the order of committed room messages.
 
 ```
-┌────────────────────────┐       ┌─────────────────────────┐
-│ Browser coordinator    │──────▶│ HTTP/TCP adapters       │
-│ Pending / timeline     │       │ Auth + framing          │
-└────────────────────────┘       └────────────┬────────────┘
-                                              │
-                                              ▼
-                                 ┌─────────────────────────┐
-                                 │ Room authority          │
-                                 │ Order / permissions     │
-                                 └────────────┬────────────┘
-                                              │
-                                              ▼
-┌────────────────────────┐       ┌─────────────────────────┐
-│ Gateway replay         │◀──────│ Durable messages        │
-│ + live delivery        │       │ Receipts + outbox       │
-└────────────────────────┘       └─────────────────────────┘
+BROWSER: views, coordinator, recovery copy. SERVER: transport, authority, delivery.
+
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Composer + timeline      │intent/view │ Browser room coordinator │            │ Terminal client          │
+│ Draft / pending / scroll │◀──────────▶│ Normalize / reconcile    │            │ Framed TCP commands      │
+│ Render accepted identity │            │ Room + account epoch     │            │ Same room semantics      │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+              ▲                                       ▲                                       ▲
+              │                                       │ HTTP / SSE                            │
+              │                                       │                                       │ TCP
+              │                                       │     ┌─────────────────────────────────┘
+              │ save / restore                        │     │
+              │                                       │     │
+              ▼                                       ▼     ▼
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Browser recovery copy    │            │ Transport gateways       │command/ACK │ Room authority           │
+│ Draft + immutable sends  │            │ Auth / HTTP / TCP / SSE  │◀──────────▶│ Current permission       │
+│ Policy / account / room  │            │ Commands + subscriptions │            │ Serialize room sequence  │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+                                                      ▲                                       ▲
+                                                      │                                       │
+                                                      │ subscribe / events                    │ commit / recover
+                                                      │                                       │
+                                                      ▼                                       ▼
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Connection leases        │lease/state │ Delivery gateways        │read/replay │ PostgreSQL authority     │
+│ Per-device presence      │◀──────────▶│ Current read access      │◀──────────▶│ Message + head + receipt │
+│ Expiry != room removal   │            │ Read committed room log  │            │ Outbox in same commit    │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+                                                      ▲                                       ▲
+                                                      │                                       │
+                                                      │ wake                                  │
+                                                      │                                       │ outbox
+                                                      │                                       │ / progress
+                                                      │                                       │
+                                        ┌──────────────────────────┐                          │
+                                        │ Outbox relay + bus       │                          │
+                                        │ Retry committed work     │◀─────────────────────────┘
+                                        │ Hints wake delivery      │
+                                        └──────────────────────────┘
 ```
+
+I would start with one browser send and one terminal send reaching the same room order.
+The database commit determines acceptance; the outbox starts a separate delivery path.
+Gateways resume from durable history after a gap and return structured events to the
+browser coordinator. It merges acknowledgement, history and echo by identity before
+rendering, with room/account generations preventing an old stream from changing a new view.
+
+I would point out four recovery steps on this overview:
+
+1. Keep a policy-scoped local draft and immutable pending sends, including their original room and operation identity.
+2. Resolve an unknown send through the authority; HTTP acceptance and a stream echo reconcile the same item.
+3. The delivery gateway reads retained history directly from durable authority after a missed bus notification or reconnect.
+4. Restore a cursor only with its matching local message state; otherwise reload a history boundary, then resume with current access checks.
 
 The terminal reaches the TCP adapter, while the browser posts commands and receives SSE
 events. Adapters translate transport-specific input into structured domain operations

@@ -47,36 +47,61 @@ I would draw one frontend-to-backend path, with a separate asynchronous path for
 should not hold up recording the recipient's decision.
 
 ```
-┌───────────────────┐    ┌──────────────────┐
-│ Sender workspace  │    │ Signer ceremony  │
-│ Draft preparation │    │ Review and input │
-└───────────────────┘    └──────────────────┘
-          │                       │
-          ▼                       ▼
-┌──────────────────────────────────────────┐
-│ Shared geometry and API contracts        │
-│ Revision IDs, fields, operation receipts │
-└──────────────────────────────────────────┘
-                       │
-                       ▼
-              ┌───────────────────┐
-              │ Envelope API      │
-              │ Auth and workflow │
-              └───────────────────┘
-                   │         │
-                   ▼         ▼
-         ┌──────────────┐ ┌───────────────┐
-         │ PostgreSQL   │ │ Private       │
-         │ State, audit │ │ object store  │
-         │ outbox       │ │ Versioned PDF │
-         └──────────────┘ └───────────────┘
-                │                 ▲
-                ▼                 │
-         ┌───────────────┐ ┌───────────────┐
-         │ Relay / queue │▶│ Workers       │
-         │               │ │ PDF and email │
-         └───────────────┘ └───────────────┘
+BROWSER: sender, revision/action state, signer. SERVER: bytes, workflow, jobs.
+
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Sender workspace         │edit/state  │ Revision + action state  │view/input  │ Signer ceremony          │
+│ PDF / fields / stages    │◀──────────▶│ Geometry / saved ID      │◀──────────▶│ Viewer / input / consent │
+│ Draft preview + progress │            │ Receipt / ready status   │            │ Review frozen revision   │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+              ▲                             ▲         ▲
+upload/bytes  │                             │         │
+              │                             │         │
+              │         ┌───────────────────┘         │ action / outcome
+              │         │                             │
+              │         │ GET / bytes                 │
+              ▼         ▼                             ▼
+┌──────────────────────────┐            ┌──────────────────────────┐
+│ Private byte gateway     │grant/meta  │ Envelope API             │
+│ Scoped revision access   │◀──────────▶│ Live account/sign scope  │
+│ Staged / immutable bytes │            │ Revision / stage guard   │
+└──────────────────────────┘            └──────────────────────────┘
+              ▲                                       ▲
+              │                                       │
+              │ read / stage output                   │ commit / recover
+              │                                       │
+              ▼                                       ▼
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Artifact job pipeline    │work/ready  │ PostgreSQL authority     │work/status │ Notification pipeline    │
+│ Outbox relay + worker    │◀──────────▶│ State / actions / audit  │◀──────────▶│ Outbox relay + worker    │
+│ Frozen input generation  │            │ Receipt + outbox commit  │            │ Revision check / retry   │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+                                                                                              ▲
+                                                                                              │
+An artifact is published only for its frozen inputs and generation.                           │ attempt / result
+Work pipelines group the relay, retained queue, and retrying worker.                          │
+                                                                                              │
+                                                                                              ▼
+                                                                                ┌──────────────────────────┐
+Original action receipts remain distinct from current workflow                  │ Notification provider    │
+state, artifact readiness, and notification delivery.                           │ Invitation / reminders   │
+                                                                                │ Independent delivery     │
+                                                                                └──────────────────────────┘
 ```
+
+I would trace one field from the sender's page coordinates into the signer's viewer,
+then bind its submitted value to the same frozen revision. The envelope transaction
+returns a durable action receipt. Its outbox separately drives artifact generation and
+notifications, with readiness published only for the intended inputs. The browser can
+therefore explain what was recorded, who is still waiting, and whether a download is ready.
+
+I would walk through recovery without merging these outcomes:
+
+1. Sender uploads and signer reads use scoped byte access; validation and immutable revision identity precede an accepted action.
+2. The browser retains a policy-permitted opaque operation reference, then reauthenticates to resolve a lost reply and refresh current workflow state.
+3. Unrecorded signature input stays in memory by default. Reloading must not silently turn retained metadata into a new signing action.
+4. Workers stage output and publish readiness for the matching generation; only then does the API offer an authorized download.
+5. Notification retries keep separate delivery evidence and never make a failed artifact look ready.
 
 I would start with a modular API backed by one regional SQL authority. Separate modules
 clarify ownership without immediately requiring distributed transactions. Object storage

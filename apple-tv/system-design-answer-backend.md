@@ -8,12 +8,12 @@ deliberately extends them.
 | Discussion | Minutes |
 |------------|---------|
 | Scope and scale | 4 |
-| Architecture and data ownership | 5 |
+| Architecture and data ownership | 6 |
 | Deep dive: publish complete media | 10 |
 | Deep dive: authorize scalable playback | 9 |
 | Deep dive: progress and viewing history | 8 |
 | Catalog, operations and scaling | 5 |
-| Validation and implementation comparison | 4 |
+| Validation and implementation comparison | 3 |
 | Total | 45 |
 
 ## 🎯 Scope and scale — 4 minutes
@@ -56,34 +56,59 @@ The segment estimate excludes separate audio, retries and startup requests. I wo
 keep units explicit and refine assumptions with traffic data rather than quoting a
 database's universal writes-per-second capacity.
 
-## 🏗️ Architecture and data ownership — 5 minutes
+## 🏗️ Architecture and data ownership — 6 minutes
 
 > “I would separate the control path from the media path. The account service decides
 > whether someone can play; the CDN delivers the bytes.”
 
 ```
-┌────────────────┐                  ┌────────────────┐
-│ Viewer apps    │─ media ─────────▶│ CDN + shield   │
-│                │                  │                │
-└────────────────┘                  └────────────────┘
-        │ control                           │ cache miss
-        ▼                                   ▼
-┌────────────────┐                  ┌────────────────┐
-│ Domain APIs    │                  │ Private origin │
-│ SQL / cache    │                  │                │
-└────────────────┘                  └────────────────┘
-                                            ▲ publish
-                                            │
-                                    ┌────────────────┐
-                                    │ Encode workers │
-                                    │ Queue / jobs   │
-                                    └────────────────┘
+┌─────────────────────────────────────────────────────────┐       ┌────────────────────────┐
+│ Viewer apps                                             │       │ CDN + shield           │
+│ Playback context, resume, license and media requests    │◀─────▶│ Authorized byte cache  │
+└─────────────────────────────────────────────────────────┘       │ Immutable revisions    │
+             ▲                                ▲                   └────────────────────────┘
+             │                                │                                ▲
+             │                                │                                │
+license      │                   session      │                   cache miss   │
+             │                                │                                │
+             ▼                                ▼                                ▼
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Protected license API  │       │ Domain / playback APIs │       │ Private media origin   │
+│ Check playback scope   │◀─────▶│ Rights and entitlement │       │ Validated fixed assets │
+│ Personalized response  │       │ Catalog / profile sync │       │ No public bypass       │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+             ▲                                ▲                                ▲
+             │                                │                                │
+key access   │                   authority    │                   publish      │
+             │                                │                                │
+             ▼                                ▼                                │
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Key management         │       │ Domain authority / DB  │       │ Encoding + publication │
+│ Protected content keys │       │ Rights + profile state │◀─────▶│ Leased jobs / retries  │
+│ Restricted access      │       │ Jobs + active revision │       │ Gate complete revision │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+
+Jobs and dispatch records commit together; publication advances only a validated revision.
+
+Existing sessions keep their revision; new sessions use current eligibility.
 ```
+
+A viewer obtains a playback session from the control API, a protected license where
+required, and bytes from the CDN. These are different requests with different
+failure budgets. The publishing path works before that viewer arrives: durable jobs
+produce validated immutable assets, then advance the authoritative active revision.
+The license service accesses protected keys and checks playback scope; neither its
+responses nor the keys become public media-cache objects.
+
+I would trace a failed encoding job back to its durable claim and retry state. It may
+leave staged objects, but cannot advance the active revision until the required set
+passes validation. Playback recovery then stays within its pinned revision, renewing
+authorization where required. Progress acknowledgements follow a separate durable
+profile/session update; serving another segment does not prove that resume was saved.
 
 The domain APIs own catalog, accounts/profiles, entitlement, progress and subscription
 state. The license service is a separate protected dependency of playback, with access
-to key management. I would draw its connection when discussing authorization rather
-than add every dependency to the opening picture.
+to key management and explicit validation of the playback scope.
 
 Catalog metadata changes infrequently compared with media requests. PostgreSQL is a
 reasonable authority for title revisions, rights and subscription references. Redis
@@ -396,7 +421,7 @@ For multiple regions, choose ownership for mutable profile and subscription stat
 define failover. Media replicas and a global CDN help reads, but do not automatically
 preserve write ordering during a partition.
 
-## 🧪 Validation and implementation comparison — 4 minutes
+## 🧪 Validation and implementation comparison — 3 minutes
 
 I would verify failure windows rather than only endpoint responses. Kill a worker
 after upload but before recording completion, then redeliver the job. Exactly one

@@ -39,26 +39,60 @@ The experience should distinguish four situations:
 These are not interchangeable “offline” states. In particular, no report does not
 prove that the item is unreachable or that an unknown tracker is absent.
 
-## 🏗️ Draw the client boundaries — 5 minutes
+## 🏗️ Draw the client boundaries — 6 minutes
 
 ```
-┌─────────────────────┐       ┌────────────────────────────┐
-│ Item list / map     │◀─────▶│ Observation data layer     │
-│ Time, accuracy,     │       │ Identity, merge, freshness │
-│ selected item       │       └────────────┬───────────────┘
-└─────────────────────┘                    │
-                                  ┌───────▼──────────────┐
-┌─────────────────────┐           │ Owner key / decrypt  │
-│ Lost mode / alerts  │           │ boundary             │
-└──────────┬──────────┘           └───────┬───────────────┘
-           │                             ▼
-           └───────────────────▶┌────────────────────────┐
-                                │ Auth / report APIs    │
-┌─────────────────────┐         └────────────────────────┘
-│ Native capability   │
-│ adapter / safety UI │
-└─────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│ ITEM-FINDING CLIENT / LOCAL STATE                                                        │
+│                                                                                          │
+│  ┌────────────────────────┐    ┌────────────────────────┐    ┌────────────────────────┐  │
+│  │ Item list + map        │    │ Observation model      │    │ Owner key boundary     │  │
+│  │ Selection and status   │◀──▶│ Item, time, accuracy   │    │ Locked / ready / lost  │  │
+│  └────────────────────────┘    └────────────────────────┘    └────────────────────────┘  │
+│               ▲                             ▲                              │             │
+│               │                             │                              │             │
+│  platform     │       observations          │     local key access         │             │
+│               │                             │                              │             │
+│               ▼                             ▼                              ▼             │
+│  ┌────────────────────────┐    ┌──────────────────────────────────────────────────────┐  │
+│  │ Native adapter         │    │ Report coordinator + local decrypt                   │  │
+│  │ Capabilities, progress │    │ Cache IDs / decrypt budget / per-report failures     │  │
+│  │ Nearby safety state    │    └──────────────────────────────────────────────────────┘  │
+│  └────────────────────────┘                  ▲                                           │
+│               ▲                              │                                           │
+│               │                              │                                           │
+│  safety       │                              │  opaque envelopes                         │
+│               │                              │                                           │
+│               ▼                              ▼                                           │
+│  ┌────────────────────────┐    ┌──────────────────────────────────────────────────────┐  │
+│  │ Safety / action UI     │    │ Data access layer                                    │  │
+│  │ Evidence and outcomes  │    │ Account/item IDs; query cursor; reconnect/retry      │  │
+│  └────────────────────────┘    └──────────────────────────────────────────────────────┘  │
+│                                                                                      ▲   │
+│                                                                                      │   │
+│  Owner observations and nearby safety evidence remain separate                       │   │
+└──────────────────────────────────────────────────────────────────────────────────────┼───┘
+                                                                                       │
+   HTTP: token batches + ciphertext; account/lost-mode metadata                        │
+                                                                                       │
+                                                                                       ▼
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│ Report and account APIs (server boundary)                                                │
+│ Return opaque envelopes; the report service has no location decryption keys              │
+└──────────────────────────────────────────────────────────────────────────────────────────┘
 ```
+
+I would trace a refresh from data access to opaque envelopes, through local decryption,
+then into the observation model and map. The key boundary supplies local access without
+sending private keys to the report API. In parallel, the native adapter supplies
+capabilities and nearby safety evidence to its own UI; an owner's selected-item map
+cannot substitute for that separate safety state or invent a successful hardware action.
+
+On reconnect, I would resume a bounded history query and merge envelopes by report ID
+before choosing the latest credible observation. A locked key boundary is a distinct
+state from an empty report result. Failed refreshes preserve only the correctly scoped
+cached evidence and its original observation age; account changes invalidate both
+in-flight network responses and decryption work before either can update the map.
 
 I would use React and TypeScript for the web UI. A small store can hold selected
 item identity and shared UI state. A data layer handles request keys, cancellation,
@@ -76,8 +110,9 @@ For the web map, Leaflet is a reasonable starting point for markers and simple
 history. Native clients may use platform maps. I would choose each based on actual
 platform requirements rather than assume one web library supplies native radio access.
 
-I would draw only these boundaries initially. The interview should focus on where
-truth and authority come from, not an exhaustive component tree.
+These boundaries make the source of each fact explicit: the API supplies ciphertext,
+the owner device supplies valid decrypted observations, and the platform supplies
+nearby capability and safety outcomes.
 
 ## 💾 Own state and request identity — 4 minutes
 
@@ -327,7 +362,7 @@ I would keep language calm and direct while making the significance and next ste
 clear. The design goal is informed action, not reducing concern by minimizing what
 the system observed.
 
-## ⚡ Performance, privacy and accessible controls — 4 minutes
+## ⚡ Performance, privacy and accessible controls — 3 minutes
 
 Most owners have a small item list, so I would first bound network fan-out and report
 history. Bulk latest summaries or bounded concurrency avoid launching hundreds of

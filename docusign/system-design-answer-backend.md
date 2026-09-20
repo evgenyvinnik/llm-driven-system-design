@@ -40,7 +40,7 @@ One distinction matters throughout: a recipient finishing their fields, all reci
 finishing, and the final artifact becoming available are three separate facts. Combining
 them into one status hides failure and makes recovery harder.
 
-## 📏 Capacity and architecture — 4 minutes
+## 📏 Capacity and architecture — 5 minutes
 
 Assume 100,000 envelopes per day, three recipients per envelope, two 2 MiB PDFs per
 envelope, and three field actions per recipient. A tenfold daily-average peak is an initial
@@ -55,30 +55,58 @@ before replicas, signatures, output artifacts, and retained versions. I would se
 transfer and parsing capacity from the small-request API budget.
 
 ```
-┌─────────────────┐     ┌──────────────────┐
-│ Sender / signer │────▶│ Gateway and auth │
-└─────────────────┘     └──────────────────┘
-                                 │
-                                 ▼
-                        ┌──────────────────┐
-                        │ Envelope service │
-                        │ State authority  │
-                        └──────────────────┘
-                            │         │
-                            ▼         ▼
-                  ┌──────────────┐ ┌───────────────┐
-                  │ PostgreSQL   │ │ Private       │
-                  │ State, audit │ │ object store  │
-                  │ receipts,    │ │ Originals and │
-                  │ outbox       │ │ artifacts     │
-                  └──────────────┘ └───────────────┘
-                         │                 ▲
-                         ▼                 │
-                  ┌───────────────┐ ┌───────────────┐
-                  │ Relay / queue │▶│ Workers       │
-                  │ Durable jobs  │ │ PDF and email │
-                  └───────────────┘ └───────────────┘
+PRODUCTION PROPOSAL — accepted action, private bytes, and jobs have separate outcomes
+
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Sender + signer clients  │HTTP/result │ Gateway + session auth   │exchange    │ Invitation exchange      │
+│ Revision / action / ID   │◀──────────▶│ Account / signer scope   │◀──────────▶│ Scoped signer session    │
+│ Resolve unknown receipt  │            │ Bound requests / uploads │            │ Expiry / revocation      │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+              ▲                                       ▲
+              │                                       │
+              │ grant / upload / bytes                │ action / result
+              │                                       │
+              ▼                                       ▼
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Private byte gateway     │grant/meta  │ Envelope authority       │commit/read │ PostgreSQL authority     │
+│ Scoped immutable version │◀──────────▶│ Current stage + revision │◀──────────▶│ State / actions / audit  │
+│ Staging / artifacts      │            │ Serialize decisions      │            │ Receipt + outbox commit  │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+              ▲                                       ▲                                       ▲
+              │                                       │                                       │
+              │                                       │ publish / outcome                     │ jobs / progress
+              │ read / stage output                   │                                       │
+              │                                       │                                       │
+              │                                       ▼                                       ▼
+              │                         ┌──────────────────────────┐            ┌──────────────────────────┐
+              │                         │ PDF + delivery workers   │work/ACK    │ Outbox relay + queue     │
+              └────────────────────────▶│ Validate frozen inputs   │◀──────────▶│ Retained jobs / leases   │
+                                        │ Publish matching output  │            │ Stable IDs / retry       │
+                                        └──────────────────────────┘            └──────────────────────────┘
+                                                      ▲
+                                                      │
+                                                      │ attempt / result
+                                                      │
+                                                      │                         ┌──────────────────────────┐
+                                                      │                         │ Notification provider    │
+                                                      └────────────────────────▶│ Invitation / reminders   │
+                                                                                │ Independent outcomes     │
+                                                                                └──────────────────────────┘
 ```
+
+I would follow an authenticated action into the envelope's serialized decision and SQL
+commit, which records the action, audit event, receipt and required jobs together.
+Object storage supplies immutable bytes referenced by those decisions. Workers consume
+committed jobs, use frozen inputs, and publish a matching artifact generation through
+the authority. Notification attempts have their own outcome; an email failure cannot
+undo a recorded signature action.
+
+I would test the arrows with a worker crash and a lost action response:
+
+1. The original scoped operation ID resolves the committed receipt; recovery also reads current workflow state.
+2. A leased job retries against the same frozen inputs, stages immutable output, and conditionally publishes the intended generation.
+3. Record that result before acknowledging the job. An orphaned staged object is eligible for delayed cleanup, not immediate deletion of a potentially attached object.
+4. A notification worker rechecks revision eligibility and records the provider outcome separately; retries do not repeat the signing transaction.
 
 I would begin with one regional envelope authority and modular services, not a transaction
 scattered across several databases. Stateless API replicas share that authority. Object
@@ -88,7 +116,7 @@ A CDN can serve application assets. Document delivery must remain authorized and
 version-bound, through a private gateway or a narrowly scoped signed URL. A public bucket is
 not made private by adding authentication to the metadata API.
 
-## 💾 Data model and API — 5 minutes
+## 💾 Data model and API — 4 minutes
 
 The envelope is the concurrency boundary. Documents, field definitions, recipients, and
 their accepted actions all identify the frozen revision. A mutable draft and an active

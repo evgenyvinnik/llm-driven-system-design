@@ -46,21 +46,51 @@ person never answers.
 > from that controller and sends it user actions.”
 
 ```
-┌──────────────────────┐     ┌──────────────────────┐
-│ React views/controls │────▶│ Call controller      │
-└──────────────────────┘     └──────────┬───────────┘
-                                        │
-              ┌─────────────────────────┤
-              ▼                         ▼
-┌──────────────────────┐     ┌──────────────────────┐
-│ Signaling adapter    │     │ Media / peer owner   │
-│ Session + call events│     │ Tracks + negotiation │
-└──────────────────────┘     └──────────┬───────────┘
-                                        ▼
-                             ┌──────────────────────┐
-                             │ Native video/audio   │
-                             └──────────────────────┘
+┌────────────────────────────────────────────────────────────┐
+│ LOCAL BROWSER / ACCOUNT, CALL AND ATTEMPT GENERATION       │
+│                                                            │
+│  ┌────────────────────────┐    ┌────────────────────────┐  │    ┌────────────────────────┐
+│  │ React views + controls │    │ Call controller        │  │    │ Signaling gateway      │
+│  │ Ring / connect / media │◀──▶│ Revision / saved op ID │◀─┼───▶│ ICE config / commands  │
+│  │ User actions + status  │    │ One resource lifetime  │  │    │ Scoped SDP + ICE       │
+│  └────────────────────────┘    └────────────────────────┘  │    └────────────────────────┘
+│                                             ▲              │                 ▲
+│                                             │              │                 │
+│                             attempt / phase │              │   signaling     │
+│                                             │              │                 │
+│                                             ▼              │                 ▼
+│  ┌────────────────────────┐    ┌────────────────────────┐  │    ┌────────────────────────┐
+│  │ Native media elements  │    │ Capture + peer owner   │  │    │ Remote WebRTC peer     │
+│  │ Local / remote streams │◀───│ Tracks, ICE, queues    │◀─┼───▶│ Authorized endpoint    │
+│  │ Observed playback      │    │ Cleanup on replacement │  │    │ Same call attempt      │
+│  └────────────────────────┘    └────────────────────────┘  │    └────────────────────────┘
+│                                             ▲              │                 ▲
+│                                             │              │                 │
+└─────────────────────────────────────────────┼──────────────┘                 │
+                                              │                                │
+                       selected relay path    │                                │
+                                              │                                │
+                                              ▼                                ▼
+                                 ┌─────────────────────────────────────────────────────────┐
+                                 │ TURN relay (when ICE selects a relayed path)            │
+                                 │ Opaque encrypted media; short-lived relay credentials   │
+                                 └─────────────────────────────────────────────────────────┘
+
+Middle path: direct media. Signaling and observed media health have separate states.
 ```
+
+I would trace Call or Accept through the controller and signaling adapter, then let the
+media owner negotiate only for the accepted endpoint generation. The middle connection
+carries direct media; the lower path uses TURN when selected. Native elements render
+actual streams rather than a server's “accepted” flag. The same controller releases
+tracks, peer connections and late permission results when this attempt ends.
+
+I would explain recovery with a lost Accept reply:
+
+1. Retain only a bounded account/device-scoped command reference when local storage policy permits; resolve its receipt and the current endpoint claim after reauthentication.
+2. A signaling reconnect can reuse still-live media after reconciling the call revision. A page reload creates new browser resources and cannot restore a peer connection from storage.
+3. Negotiate only for the current endpoint and attempt generation; discard old SDP/candidates and renew ICE configuration when required.
+4. An ended call or a losing device releases its tracks immediately. Recovering a command reference never automatically reacquires the camera or microphone.
 
 The signaling adapter handles authenticated connection setup, registration acknowledgment,
 typed commands, and reconnection. The media owner manages capture, the peer connection,

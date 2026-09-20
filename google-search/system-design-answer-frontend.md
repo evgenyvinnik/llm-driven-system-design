@@ -1,418 +1,412 @@
-# Google Search - System Design Answer (Frontend Focus)
+# Google Search: frontend system design interview
 
-*45-minute system design interview format - Frontend Engineer Position*
+A 45-minute spoken outline for a proposed web-search frontend.
+The implementation comparison at the end describes this repository separately.
 
----
+## 🎯 Requirements and scope — 4 minutes
 
-## 📋 Introduction
+> “I would design the experience around two actions: refining a query and reading its results.
+> Typing should remain responsive even when the network is slow.
+> A submitted query should have a shareable URL, and the results must belong to that query.”
 
-"Today I'll walk through the frontend architecture for a web search engine. The key challenge is delivering instant search results with minimal perceived latency while providing autocomplete suggestions, rendering results with highlighted snippets, and supporting advanced search syntax. I'll focus on the critical frontend decisions that impact user experience and performance."
+I would first agree on ordinary text search rather than add image search,
+voice input, personalized ranking, or generated answers to the initial scope.
+The main screens are a home search box and a results page.
 
----
+The supported query language includes quoted phrases, excluded terms, and a site filter.
+The server owns interpretation of those operators.
+The browser can explain them without implementing a second search engine.
 
-## 🎯 Requirements
+| Requirement | User-visible behavior |
+|---|---|
+| Autocomplete | Suggestions while typing; accepting one is an explicit action |
+| Results | Ranked links with readable titles, excerpts, and honest count labels |
+| Navigation | Next/Previous, bounded page jumps, Back, Forward, and shareable query URLs |
+| Accessibility | Keyboard, screen reader, touch, zoom, and composition input |
+| Slow network | Input stays usable; loading, error, and stale results remain distinguishable |
+| History | Optional bounded recent searches with a clear removal control |
 
-### Functional Requirements
+I would target result paint within 500 ms on a representative connection,
+with API latency measured separately from network and rendering.
+For suggestions, I would start with a 200 ms debounce and measure the complete delay.
+These are proposed budgets, not guarantees that a particular library provides.
 
-1. **Search Box**: Autocomplete with query suggestions as users type
-2. **Results Page**: Display ranked results with titles, URLs, and snippets
-3. **Query Highlighting**: Bold matched terms in titles and snippets
-4. **Advanced Search**: Support for phrases, exclusions, site filters
-5. **Pagination**: Navigate through result pages efficiently
+The corpus could contain 100 million pages while a result page contains ten items.
+That distinction keeps backend scale from unnecessarily complicating the DOM.
 
-### Non-Functional Requirements
+## 🏗️ High-level architecture — 6 minutes
 
-1. **Perceived Performance**: Results visible within 500ms of query submission
-2. **Responsiveness**: Desktop, tablet, and mobile layouts
-3. **Accessibility**: Screen reader support, full keyboard navigation
-4. **Offline Resilience**: Show cached results when connectivity is poor
-
-### UI/UX Requirements
-
-- Clean, distraction-free interface
-- Instant feedback on user actions
-- Clear visual hierarchy for results
-- Meaningful error states for failed searches
-
----
-
-## 🏗️ High-Level Design
-
-```
-+------------------------------------------------------------------+
-|                      BROWSER                                      |
-|                                                                   |
-|  +-------------------------------------------------------------+  |
-|  |                    TANSTACK ROUTER                          |  |
-|  |   /           ---->  Home Page (Search Box)                 |  |
-|  |   /search?q= ---->  Search Results Page                     |  |
-|  |   /advanced  ---->  Advanced Search Form                    |  |
-|  +-------------------------------------------------------------+  |
-|                              |                                    |
-|                              v                                    |
-|  +-------------------------------------------------------------+  |
-|  |                    VIEW LAYER                               |  |
-|  |  +---------------+  +---------------+  +---------------+    |  |
-|  |  |  Search Box   |  | Results List  |  |  Pagination   |    |  |
-|  |  |  + Input      |  | + Result Card |  |  + Page Nav   |    |  |
-|  |  |  + Dropdown   |  | + Snippet     |  |  + Prefetch   |    |  |
-|  |  |  + History    |  | + Highlights  |  |               |    |  |
-|  |  +---------------+  +---------------+  +---------------+    |  |
-|  +-------------------------------------------------------------+  |
-|                              |                                    |
-|                              v                                    |
-|  +-------------------------------------------------------------+  |
-|  |                    ZUSTAND STORE                            |  |
-|  |  query | results[] | suggestions[] | isLoading | error      |  |
-|  +-------------------------------------------------------------+  |
-|                              |                                    |
-|                              v                                    |
-|  +-------------------------------------------------------------+  |
-|  |                    API LAYER                                |  |
-|  |  + Debounced fetching    + Request deduplication            |  |
-|  |  + Response caching      + Error handling                   |  |
-|  +-------------------------------------------------------------+  |
-|                              |                                    |
-+------------------------------------------------------------------+
-                               |
-                               v
-                    +--------------------+
-                    |   SEARCH BACKEND   |
-                    |   /api/search      |
-                    |   /api/suggest     |
-                    +--------------------+
-```
-
----
-
-## 🔍 Deep Dive: Search Box with Autocomplete
-
-### Interaction Flow
+> “I would draw the visible components first, then the state each one owns,
+> and finally the boundary through which they request server data.”
 
 ```
-USER TYPES                    FRONTEND                        BACKEND
-    |                            |                               |
-    | keystroke                  |                               |
-    +--------------------------->|                               |
-    |                            |                               |
-    |          [150ms debounce window]                           |
-    |                            |                               |
-    |                            | GET /api/suggest?q=...        |
-    |                            +------------------------------>|
-    |                            |                               |
-    |                            |       suggestions[]           |
-    |                            |<------------------------------+
-    |     dropdown appears       |                               |
-    |<---------------------------+                               |
-    |                            |                               |
-    | arrow down / up            |                               |
-    +--------------------------->|                               |
-    |     highlight moves        |                               |
-    |<---------------------------+                               |
-    |                            |                               |
-    | Enter key                  |                               |
-    +--------------------------->|                               |
-    |                            | navigate to /search?q=...     |
-    |                            +------------------------------>|
+┌────────────────────────────────────────────────────────────────────────────────────────────┐
+│ BROWSER                                                                                    │
+│                                                                                            │
+│  ┌────────────────────────┐     ┌────────────────────────┐     ┌────────────────────────┐  │
+│  │ Search box + popup     │     │ Results + pagination   │     │ History controls       │  │
+│  │ Keyboard / touch       │     │ Safe text / links      │     │ Clear / opt out        │  │
+│  └────────────────────────┘     └────────────────────────┘     └────────────────────────┘  │
+│                        ▲                              ▲                              ▲     │
+│  type / suggest        │        navigate / render     │        read / clear          │     │
+│                        │                              │                              │     │
+│                        ▼                              ▼                              ▼     │
+│  ┌────────────────────────┐     ┌────────────────────────┐     ┌────────────────────────┐  │
+│  │ Input state            │     │ Search model           │     │ Local preferences      │  │
+│  │ Draft, selection, IME  │◀───▶│ URL + active request   │◀───▶│ Bounded recent queries │  │
+│  └────────────────────────┘     │ Window / page / expiry │     └────────────────────────┘  │
+│                        ▲        └────────────────────────┘                                 │
+│                        │                              ▲                                    │
+│                        │                              │                                    │
+│                        ▼                              ▼                                    │
+│  ┌──────────────────────────────────────────────────────────────────────────────────────┐  │
+│  │ Data access coordinator                                                              │  │
+│  │ Separate suggestion/search keys, cancellation, response guard, bounded cache         │  │
+│  └──────────────────────────────────────────────────────────────────────────────────────┘  │
+│                                              ▲                                             │
+│                                              │                                             │
+└──────────────────────────────────────────────┼─────────────────────────────────────────────┘
+                                               │
+                                               │  HTTPS requests / typed responses
+                                               │
+                                               ▼
+   ┌──────────────────────────────────────────────────────────────────────────────────────┐
+   │ SEARCH API (server boundary)                                                         │
+   │ Search: ranked page + freshness/status | Suggestions: prefix + version               │
+   └──────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Trade-off 1: Debounce Timing
+I would walk through a single interaction before discussing libraries:
 
-| Approach | Request Volume | User Experience | Network Load |
-|----------|---------------|-----------------|--------------|
-| ❌ 50ms debounce | Very High | Feels instant | Excessive API calls |
-| ✅ **150ms debounce** | Moderate | Responsive feel | ~80% fewer calls |
-| ❌ 300ms debounce | Low | Noticeable lag | Minimal load |
+1. Typing changes input state and schedules a suggestion request.
+2. Enter or a suggestion click commits a query to the URL and resets the page.
+3. Navigation derives a new search key and starts a request through data access.
+4. Only a response matching the active key can update the result model.
+5. The results view renders safe text and exposes navigation for that response.
 
-**"I'm choosing 150ms because it hits the sweet spot. At 50ms, we're making an API call for nearly every keystroke, which wastes bandwidth and server resources. At 300ms, users notice the delay and the interface feels sluggish. 150ms reduces API calls by roughly 80% compared to no debouncing while still feeling responsive. Users typically type at 200-300ms between characters, so 150ms captures most complete keystrokes."**
+On Back or a later page, I would reuse a matching, unexpired result window.
+If that window is gone, preserve the query and explicitly restart its results rather
+than append a different ranking generation. A shared URL preserves search intent;
+it does not promise the same results forever. Suggestions and optional local history
+keep their own lifetimes and cannot overwrite the submitted search.
 
-### Trade-off 2: State Management Library
+The two vertical request paths are intentionally separate.
+Suggestion failure should not prevent a submitted search.
+History is also separate: it is a browser preference, not authoritative server data.
 
-| Approach | Bundle Size | Boilerplate | DevTools | Async Handling |
-|----------|------------|-------------|----------|----------------|
-| ❌ Redux + RTK | ~12KB | High | Excellent | Built-in RTK Query |
-| ✅ **Zustand** | ~2KB | Minimal | Good | Manual but simple |
-| ❌ React Context | 0KB | Medium | Limited | Manual |
+I would use React components for views, a router for navigation state,
+and a small shared store only where state crosses component boundaries.
+A server-data library could provide caching and cancellation,
+but the state ownership and response guard must be correct regardless of library.
 
-**"I'm choosing Zustand over Redux because for a search application, we don't need Redux's elaborate action/reducer pattern. Our state shape is simple: query, results, loading, error. Zustand gives us a 2KB bundle versus Redux's 12KB, and the API is much simpler. Context would work but causes unnecessary re-renders when any part of state changes. Zustand's selector pattern prevents this."**
+The server side is deliberately one boundary on this whiteboard.
+It is responsible for query semantics, ranking, counts, and freshness metadata.
+The frontend does not need to know the crawler's partition scheme.
 
----
+## 💾 State and interface contracts — 5 minutes
 
-## 🔍 Deep Dive: Search Results Rendering
+### State ownership
 
-### Component Hierarchy
+| State | Owner | Persistence |
+|---|---|---|
+| Text being edited | Search input | Local to the active interaction |
+| Highlighted suggestion | Popup state | Reset when suggestion context changes |
+| Submitted query and requested page | Router | URL / browser history |
+| Current results and status | Search model | Memory, keyed by full request context |
+| Result window handle | Navigation session | Short-lived; not a permanent bookmark |
+| Recent searches | User preference | Optional bounded local storage |
+| Crawl progress | Admin feature | Server-owned job status in a production extension |
 
-```
-+----------------------------------------------------------+
-|                    RESULTS PAGE                           |
-|                                                           |
-|  +-----------------------------------------------------+  |
-|  |  SEARCH HEADER (sticky)                             |  |
-|  |  [Logo]  [================Search Box==============] |  |
-|  +-----------------------------------------------------+  |
-|                                                           |
-|  +-----------------------------------------------------+  |
-|  |  RESULTS METADATA                                   |  |
-|  |  "About 1,230,000 results (0.42 seconds)"           |  |
-|  +-----------------------------------------------------+  |
-|                                                           |
-|  +-----------------------------------------------------+  |
-|  |  RESULT CARD #1                                     |  |
-|  |  [favicon] example.com > path > page                |  |
-|  |  Title with **highlighted** terms                   |  |
-|  |  Snippet text with **matched** words in bold...     |  |
-|  +-----------------------------------------------------+  |
-|                                                           |
-|  +-----------------------------------------------------+  |
-|  |  RESULT CARD #2                                     |  |
-|  |  ...                                                |  |
-|  +-----------------------------------------------------+  |
-|                                                           |
-|  +-----------------------------------------------------+  |
-|  |  PAGINATION                                         |  |
-|  |  [< Prev]  Page 1 of 100  [Next >]                  |  |
-|  +-----------------------------------------------------+  |
-+----------------------------------------------------------+
-```
+I would not mirror every keystroke into the URL.
+That would fill history with unfinished queries and make Back behave unexpectedly.
+The URL changes on submit or page navigation.
 
-### Trade-off 3: URL-Driven vs Component State
+A result cache key includes the interpreted search context, page size, and page/window.
+If locale or safety filters exist, they belong in that key too.
+The server supplies the corpus and ranking version used for a response.
 
-| Approach | Shareability | Back Button | Complexity | SSR Ready |
-|----------|--------------|-------------|------------|-----------|
-| ✅ **URL-driven state** | Full | Native | Higher | Yes |
-| ❌ Component state | None | Broken | Lower | No |
+### API contract
 
-**"I'm choosing URL-driven search state because search results must be shareable. When a user finds what they need, they should be able to copy the URL and send it to someone else. This also means the browser back button works correctly, which users expect. The trade-off is slightly more complex state synchronization between the URL and our store, but TanStack Router handles this elegantly with its search param validation."**
+| Method | Proposed endpoint | Purpose |
+|---|---|---|
+| GET | `/api/search` | Query, page size, optional window/page; return one ranked page |
+| GET | `/api/search/autocomplete` | Prefix and locale; return bounded suggestion text |
 
-### Trade-off 4: Client-Side vs Server-Side Highlighting
+The result response includes safe text fields, destination URLs,
+highlight spans, count value and relation, and navigation expiry.
+It also distinguishes a complete result from a partial retrieval or service failure.
 
-| Approach | Latency | Consistency | Flexibility |
-|----------|---------|-------------|-------------|
-| ❌ Server-only | Higher | Guaranteed | Limited |
-| ✅ **Client-side highlighting** | Lower | May differ slightly | High |
-| ❌ Hybrid | Medium | Good | Medium |
+I would validate response shape at the network boundary.
+TypeScript types document expectations but do not validate received JSON.
+A malformed response should produce a recoverable error rather than corrupt the store.
 
-**"I'm choosing client-side highlighting because it reduces the payload size and rendering latency. The server returns plain text snippets, and the client highlights based on the query terms. This could theoretically differ from what the server would highlight, but in practice the difference is negligible. The flexibility gain is significant: we can change highlight styles without backend changes, and we can highlight dynamically as users refine their query."**
+For shared links, the guarantee is “run this search.”
+The same URL tomorrow may show different documents.
+A temporary window handle preserves a browsing session, not permanent search history.
 
----
+## 🔧 Deep dive: responsive, accessible autocomplete — 8 minutes
 
-## 🔍 Deep Dive: Loading States
+### Decision
 
-### Trade-off 5: Skeleton Loading vs Spinner
+> “I would keep typing synchronous and make suggestions advisory.
+> Debouncing controls work; request identity controls correctness.
+> I need both.”
 
-| Approach | Perceived Performance | Implementation | Layout Shift |
-|----------|----------------------|----------------|--------------|
-| ✅ **Skeleton screens** | Excellent | More complex | None |
-| ❌ Spinner | Poor | Simple | Significant |
-| ❌ No indicator | Worst | None | Jarring |
+Consider the user typing “java,” then “javascript.”
+The second request can finish first.
+If the older response arrives later, it must not replace the current suggestions.
 
-**"I'm choosing skeleton loading because it dramatically improves perceived performance. Studies show users perceive skeleton screens as 10-20% faster than spinners showing the same actual load time. The skeleton mimics the shape of the final content: a gray rectangle where the title will be, shorter rectangles for the snippet lines. This eliminates layout shift when results arrive, which is critical for Core Web Vitals. The trade-off is more UI code, but it's worth it for search where speed perception is everything."**
+### Interaction sequence
 
-### Skeleton Structure
+1. Update the input text immediately.
+2. Clear the selected option when the text or suggestion context changes.
+3. Wait for a brief pause before requesting suggestions for a sufficiently long prefix.
+4. Associate the request with a generation and normalized prefix.
+5. Abort superseded requests where possible.
+6. Accept a response only if its generation and prefix remain current.
+7. Close the popup on submit or dismissal and invalidate outstanding popup work.
 
-```
-LOADING STATE:
-+----------------------------------------------------+
-|  [====]  [================]                         |  <-- favicon + breadcrumb
-|  [================================]                 |  <-- title
-|  [==========================================]       |  <-- snippet line 1
-|  [============================]                     |  <-- snippet line 2
-+----------------------------------------------------+
-           |
-           | results arrive
-           v
-LOADED STATE:
-+----------------------------------------------------+
-|  [G]  example.com > docs > api                      |
-|  Getting Started with the API                       |
-|  Learn how to integrate with our **API** using...   |
-+----------------------------------------------------+
-```
+Aborting saves resources but is not proof that a response cannot arrive.
+The generation check is the final protection against a stale update.
+A late failure must not clear a newer successful suggestion list either.
 
----
+### Trade-off
 
-## 🔍 Deep Dive: Search History
+| Approach | Benefit | Cost |
+|---|---|---|
+| ✅ Debounce + response guard | Responsive typing with bounded work and correct suggestions | Timer, cancellation, and lifecycle state |
+| ❌ Fetch after every keystroke | Earliest possible request | Many intermediate requests; still needs race protection |
+| ❌ Debounce alone | Easy implementation | Already-sent requests can arrive out of order |
 
-### Trade-off 6: localStorage vs Server-Side Storage
+I would start at 200 ms, not claim an universal optimal delay.
+A pause longer than the debounce interval can still trigger one request per character.
+Savings depend on typing rhythm, cache reuse, and network behavior.
+I would tune against measured request volume and time to a useful suggestion.
 
-| Approach | Privacy | Cross-Device | Persistence | Implementation |
-|----------|---------|--------------|-------------|----------------|
-| ✅ **localStorage** | High | None | Per-browser | Simple |
-| ❌ Server-side | Lower | Yes | Account-tied | Complex |
-| ❌ sessionStorage | Highest | None | Tab only | Simplest |
+### Keyboard and composition
 
-**"I'm choosing localStorage for search history because privacy matters in search. Users may not want their searches stored on a server, especially for sensitive queries. localStorage keeps data on their device under their control. The trade-off is no cross-device sync, but that's actually a feature for privacy-conscious users. We limit history to 10 items and provide a clear 'Clear History' button. If we later add user accounts, server-side sync can be opt-in."**
+The input remains the focus owner while a listbox exposes suggestions.
+A programmatically associated active option communicates the current selection.
+Arrow keys change that option; Enter accepts it or submits the typed query.
+Escape dismisses the popup without destroying the user's text.
+Tab preserves ordinary navigation to the next control.
 
----
+This follows the [WAI-ARIA combobox pattern](https://www.w3.org/WAI/ARIA/apg/patterns/combobox/).
+I would test the implementation with keyboard and screen reader combinations,
+not equate a few ARIA attributes with conformance.
 
-## 🔍 Deep Dive: Performance Optimizations
+Composition matters for users entering text through an input method editor.
+Enter during composition should confirm the composed text, not submit the form.
+Only the completed composition participates in our normal search action.
 
-### Trade-off 7: Virtualized List vs Simple Pagination
+Mouse, touch, recent-history, and server-suggestion selection should use one action.
+That avoids a click selecting a different value from keyboard Enter.
+The form also has one submission owner to avoid duplicate requests.
 
-| Approach | Memory Usage | Scroll UX | DOM Nodes | Use Case |
-|----------|-------------|-----------|-----------|----------|
-| ✅ **Virtualized list** | Constant | Smooth infinite | ~20-30 | Image search, long lists |
-| ❌ Pagination only | Per-page | Page jumps | 10-20 | Standard web results |
-| ❌ Load all | High | Janky | 100s+ | Never for search |
+### Failure behavior
 
-**"I'm choosing virtualization for image search and infinite scroll scenarios, but keeping traditional pagination for standard web results. For 10 results per page, virtualization is overkill. But for image search where users might scroll through hundreds of thumbnails, virtualization is essential. It keeps only 20-30 DOM nodes regardless of result count, maintaining smooth 60fps scrolling. We use TanStack Virtual with an overscan of 5 items to prevent flashing during fast scrolls."**
+If suggestions are unavailable, the user can still type and submit.
+I would avoid a large error banner for every failed prefix request.
+A small status message or simply closing the unavailable suggestion section is enough.
 
-### Virtualization Concept
+I would announce meaningful suggestion availability without reading every keystroke.
+Loading should not move focus or repeatedly steal the active option.
+If history appears, label it as local history rather than server recommendations.
 
-```
-VIEWPORT (what user sees):
-+----------------------------------+
-|  Result 47                       |  <-- rendered
-|  Result 48                       |  <-- rendered
-|  Result 49                       |  <-- rendered (overscan)
-+----------------------------------+
-     ^
-     | Only these ~20-30 items exist in DOM
-     | Results 1-44 and 52+ are not rendered
-     v
-VIRTUAL LIST (logical):
-  Result 1    (not in DOM)
-  Result 2    (not in DOM)
-  ...
-  Result 45   (not in DOM)
-  Result 46   (overscan, in DOM)
-  Result 47   (visible, in DOM)
-  Result 48   (visible, in DOM)
-  Result 49   (visible, in DOM)
-  Result 50   (overscan, in DOM)
-  Result 51   (not in DOM)
-  ...
-```
+## 🔧 Deep dive: navigation, request races, and expiry — 8 minutes
 
-### Trade-off 8: Prefetching Strategy
+### Decision
 
-| Approach | Network Usage | Latency | Wasted Requests |
-|----------|--------------|---------|-----------------|
-| ✅ **Prefetch on hover** | Moderate | Very low | Some |
-| ❌ Prefetch always | High | Lowest | Many |
-| ❌ On-demand only | Minimal | Higher | None |
+> “The URL owns submitted search intent.
+> The result model owns a response for a particular request.
+> I would never display an older response as if it answered a newer URL.”
 
-**"I'm choosing to prefetch the next page when users hover over the 'Next' button. This gives us near-instant page transitions without prefetching pages the user will never visit. The hover event gives us 200-400ms of warning before the click, which is enough time to start the request. Some requests will be wasted if users hover but don't click, but that's an acceptable trade-off for the dramatic improvement in perceived speed when they do click."**
+The request key includes query, page/window, page size, and relevant filters.
+Every navigation receives a monotonically increasing request generation.
+The result, loading flag, and error are committed only for that generation.
 
-### Prefetch Flow
+This also covers a subtle case: request A fails after request B succeeds.
+Ignoring only stale successful responses would still let A overwrite B's status.
+The guard applies to every completion path.
+
+### A concrete race to draw
 
 ```
-USER                           FRONTEND                      CACHE
-  |                                |                           |
-  | mouse enters "Next" button     |                           |
-  +------------------------------->|                           |
-  |                                |                           |
-  |                                | prefetch page 2           |
-  |                                +-------------------------->|
-  |                                |                           |
-  |         (user reads results)   |     page 2 cached         |
-  |                                |<--------------------------+
-  |                                |                           |
-  | clicks "Next" button           |                           |
-  +------------------------------->|                           |
-  |                                | check cache               |
-  |                                +-------------------------->|
-  |                                |                           |
-  |                                |  CACHE HIT! instant       |
-  |      page 2 appears instantly  |<--------------------------+
-  |<-------------------------------+                           |
+┌────────────────────────┐          ┌────────────────────────┐
+│ Search A: java         │          │ Search B: python       │
+│ generation 41          │          │ generation 42          │
+└────────────────────────┘          └────────────────────────┘
+            │                                   │
+            │                                   │
+            │  late                             │  first
+            │                                   │
+            ▼                                   ▼
+┌────────────────────────┐          ┌────────────────────────┐
+│ Response arrives       │          │ Response arrives       │
+│ 41 is no longer live   │          │ 42 is still current    │
+└────────────────────────┘          └────────────────────────┘
+            │                                   │
+            │                                   │
+            │                                   │
+            │                                   │
+            ▼                                   ▼
+┌────────────────────────┐          ┌────────────────────────┐
+│ Ignore result / error  │          │ Commit B + status      │
+│ Keep B visible         │          │ Render Python page     │
+└────────────────────────┘          └────────────────────────┘
 ```
 
----
+### Stable pages
 
-## 📊 Data Flow
+The proposed backend returns a short-lived ordered result window.
+Next and Previous refer to that window, avoiding repeated or skipped results
+when the underlying index changes during navigation.
 
-### Complete Search Flow
+The frontend can retain visited pages and their scroll positions in a bounded cache.
+Back restores the matching page if still valid.
+A fresh URL without a valid window asks the server to run the search again.
 
-```
-+-------+     +------------+     +----------+     +---------+     +--------+
-| User  |     | SearchBox  |     |  Router  |     |  Store  |     |  API   |
-+---+---+     +-----+------+     +----+-----+     +----+----+     +---+----+
-    |               |                 |                |              |
-    | types query   |                 |                |              |
-    +-------------->|                 |                |              |
-    |               |                 |                |              |
-    |        [debounce 150ms]         |                |              |
-    |               |                 |                |              |
-    |               | update URL      |                |              |
-    |               +---------------->|                |              |
-    |               |                 |                |              |
-    |               |                 | sync to store  |              |
-    |               |                 +--------------->|              |
-    |               |                 |                |              |
-    |               |                 |                | search()     |
-    |               |                 |                +------------->|
-    |               |                 |                |              |
-    |               |                 |                |   results    |
-    |               |                 |                |<-------------+
-    |               |                 |                |              |
-    |               |                 |   re-render    |              |
-    |               |<----------------+----------------+              |
-    |               |                 |                |              |
-    | sees results  |                 |                |              |
-    |<--------------+                 |                |              |
-```
+| Approach | Benefit | Cost |
+|---|---|---|
+| ✅ URL intent + bounded result window | Shareable queries and stable in-session ordering | Explicit expiry and some server/client cache state |
+| ❌ Global unkeyed result object | Smallest amount of state | Races and Back navigation can show mismatched results |
+| ❌ Fresh offset query for every page | Simple direct page jumps | Index changes can repeat or skip documents |
 
-### Request Deduplication
+The trade-off is a visible expiry case.
+I would retain the query and explain that results have changed,
+then let the user restart without losing what they typed.
+A missing cache entry is not permission to silently attach new results to an old window.
 
-```
-WITHOUT DEDUPLICATION:                WITH DEDUPLICATION:
+### Loading and errors
 
-Request 1: /api/search?q=react        Request 1: /api/search?q=react
-Request 2: /api/search?q=react            |
-Request 3: /api/search?q=react            +---> Server (single request)
-    |           |           |             |
-    v           v           v             v
-  Server     Server     Server        Request 2: returns same promise
-  (3 requests, wasted resources)      Request 3: returns same promise
+For a new query, show a reserved result area and a clear loading state.
+For same-query page navigation, retaining the old page briefly may reduce visual churn,
+but it must remain labeled as the previous page and must not pretend to be current.
 
-                                      (1 request, 3 consumers)
-```
+An empty response means the completed search found no matches.
+An unavailable response means we do not know the answer.
+A partial result needs a visible label and honest count semantics.
 
----
+On an explicit error, keep the submitted query editable and provide Retry.
+Avoid automatic retry loops for every query; they amplify overload.
+For rate limits, respect retry timing while continuing to allow local editing.
 
-## ⚖️ Trade-offs Summary
+## 🔧 Deep dive: safe, readable result rendering — 7 minutes
 
-| Decision | Chosen Approach | Alternative | Why This Choice |
-|----------|----------------|-------------|-----------------|
-| Debounce timing | 150ms | 50ms or 300ms | Balance between responsiveness and API efficiency |
-| State management | Zustand (2KB) | Redux (12KB) | Simpler API, smaller bundle for our use case |
-| Search state location | URL params | Component state | Shareable links, working back button |
-| Text highlighting | Client-side | Server-side | Lower latency, more flexible styling |
-| Loading indicator | Skeleton screens | Spinner | Better perceived performance, no layout shift |
-| Search history | localStorage | Server storage | Privacy-first, user-controlled |
-| Long lists | Virtualization | Simple pagination | Constant memory, smooth scrolling for image search |
-| Page prefetch | On hover | On demand or always | Good balance of speed vs wasted requests |
+### Decision
 
----
+> “I would let the server choose passages using its matching context,
+> but let the client render ordinary text with permitted highlight spans.
+> Crawled markup is not trusted UI.”
 
-## 🚀 Future Enhancements
+The server knows the stemmed terms, phrase matches, and document positions.
+Reconstructing highlights from the raw query in the browser can disagree with ranking.
+Sending full documents also wastes bandwidth and exposes irrelevant content.
 
-1. **Voice Search**: Integrate Web Speech API for hands-free voice input with visual feedback during recognition
+I would request a bounded excerpt and validated highlight offsets or text segments.
+The browser renders text and wraps highlighted runs using its own elements.
+Invalid spans fall back to plain text.
+Destinations are checked against permitted link schemes before being rendered.
 
-2. **Image Search**: Add drag-and-drop image upload with preview, using reverse image search backend
+### Trade-off
 
-3. **Instant Answers**: Render rich cards for calculations, definitions, weather, and other structured data
+| Approach | Benefit | Cost |
+|---|---|---|
+| ✅ Server passages + client text rendering | Consistent matching and a small trusted rendering surface | Shared span/segment contract |
+| ❌ Insert server highlight HTML directly | Convenient and preserves formatting | Crawled or fallback text can become executable markup |
+| ❌ Send full pages and highlight locally | Maximum client flexibility | Bigger responses and duplicated matching logic |
 
-4. **Dark Mode**: Add theme toggle with system preference detection and smooth transitions
+The chosen approach gives up arbitrary rich formatting inside search snippets.
+That is acceptable for ordinary text results.
+If later result types need rich cards, they get explicit component contracts.
 
-5. **Offline Mode**: Implement service worker caching for recent searches and results
+### Keep the list simple
 
-6. **Personalization**: Optional logged-in experience with search history sync and personalized results
+Ten text results do not justify virtualization.
+A normal semantic list supports reading order, browser find, selection,
+assistive technologies, and stable keyboard navigation with less coordination.
 
----
+I would use responsive widths, wrapping titles, and bounded excerpts.
+Long URLs should not push controls off screen.
+Provide visible focus styles and named search/clear/navigation buttons.
+The result count should say “about” or “at least” when the backend reports uncertainty.
 
-## 📝 Summary
+The age label must describe what it measures.
+“Fetched yesterday” is different from “published yesterday” or “indexed yesterday.”
+I would avoid presenting internal PageRank numbers as a promise of result quality.
 
-"In this design, I've focused on the critical frontend decisions that make search feel instant and responsive. The key takeaways are:
+### Rendering strategy
 
-1. **Debouncing at 150ms** reduces API load by 80% while maintaining responsive feel
-2. **URL-driven state** ensures shareability and proper browser navigation
-3. **Skeleton loading** improves perceived performance without layout shift
-4. **Zustand** provides lightweight state management without Redux overhead
-5. **Client-side highlighting** reduces payload size and allows flexible styling
-6. **localStorage for history** prioritizes user privacy
-7. **Virtualization** handles image search and infinite scroll efficiently
-8. **Hover prefetching** gives near-instant page transitions
+I would begin with a small client-rendered application when that meets the product needs.
+A server-rendered initial result page is a valid extension for faster first content
+or usable search before JavaScript hydration on constrained devices.
 
-The architecture supports both simple web search and more complex scenarios like image search, all while maintaining sub-500ms perceived latency and excellent accessibility through proper ARIA attributes and keyboard navigation."
+SSR introduces duplicate-fetch and hydration consistency concerns.
+It should hydrate the same query key and response that the browser will use.
+It does not automatically make autocomplete accessible or solve response races.
+
+I would not stream individual result cards in the initial design.
+A small complete page preserves final ordering and simplifies focus and count updates.
+Streaming can be revisited for genuinely expensive secondary result modules.
+
+## 📈 Performance, failure tests, and trade-offs — 5 minutes
+
+### What I would measure first
+
+- Time from submit to first usable result, separated by cache hit and connection class.
+- Input responsiveness and time from typing pause to current suggestions.
+- Response size and scripting/render time on a representative low-end device.
+- Stale-response rejection, failed searches, partial results, and navigation restarts.
+- Keyboard completion of a search and page navigation without focus loss.
+
+The likely frontend bottleneck is repeated network work or a large initial bundle,
+not rendering ten result cards.
+Keep the search interaction available while optional admin code loads separately.
+
+I would consider bounded prefetch on navigation intent after measuring benefit.
+Hover alone excludes touch and keyboard users; focus or an explicit usage signal may help.
+Honor data-saving preferences and avoid prefetching every page.
+
+### Scenarios I would verify
+
+| Scenario | Expected result |
+|---|---|
+| Older search finishes last | Current URL and results remain matched |
+| Suggestions return after Escape | Popup stays dismissed |
+| Enter during composition | Composition completes without premature search |
+| Storage is blocked or malformed | Search still starts; history can be disabled |
+| Window expires on page three | Query survives; restart is explicit |
+| Excerpt contains HTML-looking text | It renders as text, not active markup |
+| API is down | Error is distinct from “no matches” |
+
+Local history is not automatically private just because it is stored on-device.
+Other users of that browser profile and same-origin scripts may access it.
+I would offer an off switch, a clear action, and a small retention bound.
+
+### Trade-offs to leave on the board
+
+| Choice | Benefit | Cost accepted |
+|---|---|---|
+| ✅ Debounce and request identity | Responsive, correct suggestions | More lifecycle state than a timer alone |
+| ✅ URL intent and stable windows | Shareability and coherent navigation | Expiry and bounded caches |
+| ✅ Safe text excerpts | Relevant highlights without trusted HTML | Limited snippet formatting |
+| ✅ Ordinary paginated list | Simple accessible rendering | No endless browsing experience |
+
+## 🧭 Close and repository comparison — 2 minutes
+
+> “The frontend's most important guarantee is that visible results answer the current query.
+> I would spend the remaining discussion on the request lifecycle, input accessibility,
+> and the boundary between matching text and rendering safe UI.”
+
+The repository already has React, TanStack Router, a shared search store,
+a 200 ms autocomplete timer, URL-based searches, ordinary pagination, and local history.
+These are useful starting points for the proposed design.
+
+It currently lacks request cancellation/generation guards, stable result windows,
+complete combobox semantics, composition handling, clear-history controls,
+and safe highlight rendering. Results and suggestions can be overwritten by late responses.
+The local API uses offset pagination and can apply filters after pagination.
+
+The production decisions in this answer are therefore proposals.
+[architecture.md](./architecture.md) contains the verified source mapping;
+[README.md](./README.md) explains how to explore the small local dataset.

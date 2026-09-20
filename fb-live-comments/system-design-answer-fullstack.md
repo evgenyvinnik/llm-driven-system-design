@@ -36,28 +36,60 @@ Offline queues that replay old comments minutes later are outside the initial sc
 ## 🏗️ Draw the Boundaries — 5 minutes
 
 ```
-┌───────────────────────┐       ┌───────────────────────┐
-│ Composer + receipt    │       │ Video / live feed UI  │
-│ Recoverable text      │       │ Reading / follow mode │
-└───────────┬───────────┘       └───────────▲───────────┘
-            │                               │
-            ▼                               │
-┌──────────────────────────────────────────────────────┐
-│ Browser controller + stream-scoped store             │
-│ Subscription generation / merge / resource budgets   │
-└───────────────────────────┬──────────────────────────┘
-                            │
-                            ▼
-┌──────────────────────────────────────────────────────┐
-│ Session-aware API + WebSocket gateways               │
-└────────────┬───────────────────────────▲─────────────┘
-             ▼                           │
-┌───────────────────────┐       ┌───────────────────────┐
-│ SQL writer            │──────▶│ Outbox / feed service │
-│ Comment + receipt     │       │ Selection + replay    │
-│ Ordered change        │       │ Reaction snapshots    │
-└───────────────────────┘       └───────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│ BROWSER / POSTING, READING AND BOUNDED LIVE UPDATES                                      │
+│                                                                                          │
+│  ┌────────────────────────┐    ┌────────────────────────┐    ┌────────────────────────┐  │
+│  │ Composer + saved ID    │    │ Stream model + control │    │ Video / comment views  │  │
+│  │ Retained text / focus  │◀──▶│ Batch, cursor, version │◀──▶│ Follow / reading mode  │  │
+│  └────────────────────────┘    │ Read intent / budget   │    │ Separate reaction UI   │  │
+│                                └────────────────────────┘    └────────────────────────┘  │
+│                                             ▲                                ▲           │
+│                                             │                                │           │
+└─────────────────────────────────────────────┼────────────────────────────────┼───────────┘
+                  post / receipt / live view  │               video bytes      │
+                                              ▼                                ▼
+                                 ┌────────────────────────┐       ┌────────────────────────┐
+                                 │ Authorized gateway     │       │ External video service │
+             ┌──────────────────▶│ Snapshot/selected tail │       │ Independent CDN path   │
+             │                   │ Comment/reaction types │       │ Playback lifecycle     │
+             │                   └────────────────────────┘       └────────────────────────┘
+             │                                ▲
+             │                                │
+             │  post/action / snapshot        │
+             │                                │
+             │                                ▼
+             │                   ┌────────────────────────┐       ┌────────────────────────┐
+             │                   │ Stream writer          │       │ SQL authority          │
+             │                   │ Access / moderation    │◀─────▶│ Comment + receipt      │
+             │                   │ Commit before ACK      │       │ Order / outbox         │
+             │                   └────────────────────────┘       └────────────────────────┘
+             │                                                                 ▲
+             │                                                                 │
+             │  reaction input / feed output                                   │
+             │                                                                 │
+             │                                                                 ▼
+             │                   ┌────────────────────────┐       ┌────────────────────────┐
+             │                   │ Fan-out + reactions    │       │ Outbox + feed workers  │
+             └──────────────────▶│ Selected batches       │◀─────▶│ Committed changes      │
+                                 │ Totals / epoch / state │       │ Selection / moderation │
+                                 └────────────────────────┘       └────────────────────────┘
+
+Durable post acceptance and the bounded audience view are separate promises.
 ```
+
+I would follow Send from retained composer text to a committed comment/receipt and back
+to the author. The lower loop selects and batches the audience view, while the client
+merges that view under one stream generation and preserves reading intent. Reactions
+replace aggregate snapshots rather than creating comment rows. Video arrives on a separate
+media path, so neither video playback nor a healthy socket proves complete comment delivery.
+
+I would trace a reconnect without claiming to restore the whole conversation:
+
+1. The composer resolves its original scoped post ID and keeps acceptance separate from what the selected audience view includes.
+2. Snapshot/replay carries a compatible selection policy and coverage range; expired state or excessive backlog leads to an explicit reset.
+3. Apply current hide/ban decisions before showing recovered content, including the author's receipt view.
+4. Reaction totals recover from persisted interval progress and a versioned absolute snapshot; decorative effects and stale taps remain disposable.
 
 The composer owns draft text and a pending operation. The connection controller owns
 transport and subscription lifecycle. The stream store owns normalized comments, bounded

@@ -1,297 +1,180 @@
-# Design Google Search - Web Search Engine
+# Google Search
 
-## Codebase Stats
+An educational web search engine with a React search interface, an Express API, an Elasticsearch index, and separate crawl, indexing, and PageRank jobs. It demonstrates the journey from a stored web page to a ranked result. This is a small local implementation, not Google's software or a reconstruction of its current architecture.
 
-| Metric | Value |
-|--------|-------|
-| Total SLOC | 7,591 |
-| Source Files | 62 |
-| .ts | 4,472 |
-| .md | 1,788 |
-| .tsx | 816 |
-| .sql | 175 |
-| .json | 159 |
+The UI provides autocomplete, paginated results, highlighted snippets, recent searches, and an admin dashboard. The crawler and indexing code are useful to study, but several defects currently prevent a clean crawl-to-search workflow. The sample-data preparation below supports exploring search without fetching external websites.
 
-## Overview
+## Documentation
 
-A simplified Google Search-like platform demonstrating web crawling, indexing, ranking algorithms, and query processing at scale. This educational project focuses on building a distributed search engine with relevance-based ranking.
+- [Architecture](./architecture.md): proposed production design, exact local schema, source references, and implementation limitations.
+- Interview walkthroughs: [frontend](./system-design-answer-frontend.md), [backend](./system-design-answer-backend.md), [full stack](./system-design-answer-fullstack.md). Each starts with a high-level diagram and covers three deep dives in 45 minutes.
+- [Development history](./CLAUDE.md): earlier decisions and iterations; some historical feature claims exceed the current implementation.
 
-## Key Features
+## What is implemented
 
-### 1. Web Crawling
-- URL frontier management with priority queuing
-- Politeness policies (rate limiting per host)
-- robots.txt parsing and compliance
-- Duplicate content detection
-- Incremental recrawling support
+| Area | Current behavior |
+|---|---|
+| Search UI | `/` and `/search?q=javascript&page=1`; React 19, TanStack Router, Zustand, Tailwind |
+| Suggestions | 200 ms debounce; Elasticsearch prefix matching with a PostgreSQL fallback when no suggestions match |
+| Results | Ten per page by default; title, URL, snippet, PageRank, and fetch date |
+| History | Last ten successful searches in browser localStorage; no account or cross-device sync |
+| Admin UI | `/admin`; statistics, seed URLs, start crawler, build index, calculate PageRank |
+| Crawling | Axios + Cheerio, URL frontier, robots checks, exact HTML hash comparison, discovered links |
+| Indexing | PostgreSQL document batches to Elasticsearch, deterministic URL-row IDs, indexing circuit breakers |
+| Ranking | Elasticsearch text scoring multiplied by link-rank, inlink-count, and fetch-time factors |
+| Operations | Request logs, Prometheus endpoint, dependency probes, rate limits, limited job deduplication |
 
-### 2. Indexing Pipeline
-- Document parsing and content extraction
-- Tokenization with stopword removal and stemming
-- Inverted index construction in Elasticsearch
-- TF-IDF and BM25 scoring
+There is **no authentication**, including on admin endpoints. Crawling accepts HTTP(S) URLs without private-network or redirect destination checks, and result rendering inserts unescaped highlight/fallback HTML. Keep this development stack local; these are concrete implementation gaps.
 
-### 3. Query Processing
-- Query parsing (phrases, exclusions, site filters)
-- Autocomplete suggestions
-- Spell correction
-- Result caching with Redis
+## Prerequisites
 
-### 4. Ranking System
-- PageRank algorithm implementation
-- Multi-signal ranking (text relevance + PageRank + freshness)
-- Snippet generation with keyword highlighting
+Use Node.js **20 or newer**, npm, and either Docker Compose or the native services below. Infrastructure consists of PostgreSQL 16, Valkey 7, and Elasticsearch 8.11.0. Elasticsearch's configured heap is 512 MB; the processes need additional memory beyond that heap.
 
-### 5. Admin Dashboard
-- System statistics and monitoring
-- Crawler control (seed URLs, start/stop)
-- Index management
-- PageRank calculation trigger
+Run infrastructure commands from `google-search/`. Backend and frontend dependencies are installed separately.
 
-## Tech Stack
-
-- **Frontend**: React 19 + TypeScript + Vite + TanStack Router + Tailwind CSS
-- **Backend**: Node.js + Express
-- **Search**: Elasticsearch 8.x
-- **Database**: PostgreSQL 16
-- **Cache**: Redis 7
-
-## Quick Start
-
-### Prerequisites
-
-- Node.js 20+
-- Docker and Docker Compose
-- npm or yarn
-
-### 1. Start Infrastructure Services
+## Option A: Docker Compose (recommended)
 
 ```bash
-cd google-search
-docker-compose up -d
+docker compose up -d
+docker compose ps
+docker compose exec postgres pg_isready -U searchuser -d searchdb
+docker compose exec redis valkey-cli ping
+curl --fail http://localhost:9200/_cluster/health
 ```
 
-This starts:
-- PostgreSQL on port 5432
-- Redis on port 6379
-- Elasticsearch on port 9200
+The [Compose file](./docker-compose.yml) initializes PostgreSQL from `backend/src/db/init.sql` on a fresh volume. It starts infrastructure only; run the API and UI separately. Service `redis` runs Valkey.
 
-Wait for all services to be healthy:
+| Service | Host port | Development credentials |
+|---|---|---|
+| PostgreSQL | 5432 | `searchuser` / `searchpass`, database `searchdb` |
+| Valkey | 6379 | No password |
+| Elasticsearch | 9200 HTTP, 9300 transport | Security disabled in this demo |
+
+Stop with `docker compose down`. `docker compose down -v` also deletes the project's database, cache, and index volumes; use it only to discard this demo's data.
+
+## Option B: Native installation (no Docker)
+
+On macOS, install PostgreSQL and Valkey with Homebrew. These database creation commands assume a new local database and role:
+
 ```bash
-docker-compose ps
+brew install postgresql@16 valkey
+brew services start postgresql@16
+brew services start valkey
+export PATH="$(brew --prefix postgresql@16)/bin:$PATH"
+psql postgres -c "CREATE ROLE searchuser LOGIN PASSWORD 'searchpass';"
+createdb -O searchuser searchdb
+pg_isready -h localhost -p 5432
+PGPASSWORD=searchpass psql -h localhost -U searchuser -d searchdb -c 'SELECT current_database();'
+valkey-cli ping
 ```
 
-### 2. Set Up Backend
+For Elasticsearch, use the matching **8.11.0 macOS archive** from [Elastic's release page](https://www.elastic.co/downloads/past-releases/elasticsearch-8-11-0), choosing your CPU architecture. This pins the demo's version instead of assuming a Homebrew formula installs the same release. Extract it, enter the extracted directory, and run:
 
 ```bash
-cd backend
-cp .env.example .env
+ES_JAVA_OPTS='-Xms512m -Xmx512m' ./bin/elasticsearch \
+  -Ediscovery.type=single-node \
+  -Enetwork.host=127.0.0.1 \
+  -Expack.security.enabled=false \
+  -Expack.security.enrollment.enabled=false
+```
+
+Leave it running in that terminal. In another terminal, verify with `curl --fail http://localhost:9200/_cluster/health`. These flags deliberately match the local unauthenticated HTTP client. Elastic documents archive startup and command-line settings in its [8.11 installation guide](https://www.elastic.co/guide/en/elasticsearch/reference/8.11/targz.html); that release line is no longer maintained.
+
+## Start the backend and prepare sample results
+
+From `google-search/backend/`:
+
+```bash
 npm install
-```
-
-### 3. Seed Sample Data
-
-```bash
+cp .env.example .env
+npm run db:migrate
 npm run seed
 ```
 
-This populates the database with sample documents for testing.
+`dotenv` loads `.env` from the backend working directory. Migration executes the consolidated schema; it does not repair existing constraints. Seed inserts sample PostgreSQL data only. On a fresh database it creates 12 URLs, 10 documents, 19 links, 10 query logs, and 15 suggestions. Re-running seed increases suggestion frequencies and appends query logs, so it is not a clean reset.
 
-### 4. Start Backend Server
+**Sample-data mismatch:** those ten documents belong to URL rows marked `completed`; the indexer selects `crawled`. Before the first build, prepare this fresh demo database explicitly. For Docker, run from `google-search/`:
 
 ```bash
+docker compose exec -T postgres psql -U searchuser -d searchdb -v ON_ERROR_STOP=1 <<'SQL'
+UPDATE urls SET crawl_status = 'crawled'
+WHERE id BETWEEN 1 AND 10 AND crawl_status = 'completed';
+SELECT setval(pg_get_serial_sequence('urls', 'id'), (SELECT MAX(id) FROM urls));
+SELECT setval(pg_get_serial_sequence('documents', 'id'), (SELECT MAX(id) FROM documents));
+SQL
+```
+
+For native PostgreSQL, run the same SQL with `PGPASSWORD=searchpass psql -h localhost -U searchuser -d searchdb -v ON_ERROR_STOP=1`. Sequence alignment is needed because the seed explicitly supplies URL/document IDs. This prepares sample data; it does not fix the crawler's hash and upsert defects.
+
+Then, from `google-search/backend/`:
+
+```bash
+npm run build-index
+npm run calculate-pagerank
 npm run dev
 ```
 
-Backend runs on http://localhost:3001
+The build command creates the two Elasticsearch indices, updates inlink counts, and indexes eligible documents. PageRank then updates scores in PostgreSQL and Elasticsearch. Check command logs: a job finishing does not guarantee every Elasticsearch bulk item succeeded. Search responses already cached before a rebuild can remain stale for five minutes.
 
-### 5. Set Up Frontend
+## Start the frontend
+
+In a separate terminal, from `google-search/frontend/`:
 
 ```bash
-cd ../frontend
 npm install
 npm run dev
 ```
 
-Frontend runs on http://localhost:5173
+Open [the UI](http://localhost:5173), try `javascript tutorial`, and inspect [the dashboard](http://localhost:5173/admin). The sample pages are fabricated content; result links need not lead to matching real pages.
 
-### 6. Open the Application
+Vite proxies `/api` to port **3001**. Backend `npm run dev` sets 3001 explicitly; `dev:server2` and `dev:server3` use 3002 and 3003. There is no supplied load balancer or safe distributed crawler coordination. `npm start` uses the configured port, or **3000** if `PORT` is absent. A built frontend still needs a same-origin `/api` reverse proxy.
 
-- **Search**: http://localhost:5173
-- **Admin Dashboard**: http://localhost:5173/admin
-- **API Health**: http://localhost:3001/health
+## Configuration
 
-## Running Multiple Backend Instances
+The complete template is [backend/.env.example](./backend/.env.example); defaults are in [config/index.ts](./backend/src/config/index.ts).
 
-For testing load balancing and distributed scenarios:
+| Setting | Default / effect |
+|---|---|
+| `PORT`, `NODE_ENV` | Source defaults: `3000`, `development`; template and dev script use 3001 |
+| `DATABASE_URL` | `postgres://searchuser:searchpass@localhost:5432/searchdb` |
+| `REDIS_URL` | `redis://localhost:6379` |
+| `ELASTICSEARCH_URL` | `http://localhost:9200` |
+| `CRAWLER_USER_AGENT` | `SearchBot/1.0 (Educational)` |
+| `CRAWLER_DELAY_MS` | 1000; scheduler delay check, not a distributed guarantee |
+| `CRAWLER_MAX_CONCURRENT`, `CRAWLER_MAX_PAGES` | 5 and 1000; admin start defaults to 100 successful pages |
+| `AUTOCOMPLETE_LIMIT` | 10 |
+| `SEARCH_RESULTS_PER_PAGE` | 10 in service; HTTP route independently defaults to 10 |
+| `SEARCH_CACHE_TTL` | Parsed but unused; actual query TTL is 300 seconds, autocomplete 600 |
+| `RATE_LIMIT_{SEARCH,AUTOCOMPLETE,ADMIN}_WINDOW_MS` | 60000 each |
+| `RATE_LIMIT_{SEARCH,AUTOCOMPLETE,ADMIN}_MAX` | 60, 120, 10 respectively |
+| `RATE_LIMIT_GLOBAL_MAX` | 200 per minute per process and IP |
+| `CB_{ES,REDIS,PG}_{TIMEOUT,ERROR_THRESHOLD,RESET_TIMEOUT}` | Parsed template settings; current wrappers use hardcoded options |
+| `IDEMPOTENCY_TTL`, `IDEMPOTENCY_LOCK_TIMEOUT` | Parsed but unused by helpers; helper defaults are 3600 and 60 seconds |
 
-```bash
-# Terminal 1
-npm run dev:server1  # Port 3001
+## Commands and verification
 
-# Terminal 2
-npm run dev:server2  # Port 3002
+| Directory | Command | Purpose |
+|---|---|---|
+| backend | `npm run type-check`, `npm run build` | Type checking / compilation |
+| backend | `npm run lint` | ESLint on source |
+| backend | `npm run crawl -- --max-pages 10 --seed https://example.com/` | External HTTP crawling experiment; known defects below |
+| backend | `npm run build-index` | Update inlinks, then bulk-index eligible PostgreSQL documents |
+| backend | `npm run calculate-pagerank` | Calculate graph scores, write PostgreSQL, update Elasticsearch |
+| frontend | `npm run type-check`, `npm run build`, `npm run lint` | Static checks / production assets |
+| google-search | `npm install`, then `npm run test:e2e` | Existing Playwright page-load smoke tests |
 
-# Terminal 3
-npm run dev:server3  # Port 3003
-```
+Neither backend nor frontend defines `npm test`. The Playwright tests check page structure, not successful search, relevance, crawling, or persistence. They may pass with an empty index. This documentation review used source inspection and isolated checks; it did not run the live stack or certify these build commands as passing.
 
-## API Endpoints
+Useful probes: `/healthz` reports a live process; `/ready` and `/health` inspect PostgreSQL, Valkey, and Elasticsearch; `/metrics` exposes Prometheus text. Call them on the API port, for example `curl --fail http://localhost:3001/health`.
 
-### Search API
+## Known limitations
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/api/search?q={query}` | GET | Search for documents |
-| `/api/search/autocomplete?q={prefix}` | GET | Get autocomplete suggestions |
-| `/api/search/popular` | GET | Get popular searches |
-| `/api/search/related?q={query}` | GET | Get related searches |
+- Crawling can fail when unsigned 64-bit URL/content hashes exceed PostgreSQL `BIGINT`. Document writes use `ON CONFLICT (url_id)` without a matching unique constraint.
+- URL selection and status updates are separate operations, with no lease recovery. Concurrent crawlers can duplicate work; a crash leaves `crawling` rows stranded. A temporarily delayed host can cause a run to stop early.
+- Links to already-known URLs are omitted from the graph. The “new links” count also includes existing URLs.
+- Phrases are flattened into ordinary query text; site/exclusion filters run after pagination. Counts can disagree with visible results. Related-search SQL currently has an invalid `DISTINCT`/ordering combination.
+- Multiplicative ranking gives zero score when PageRank or inlink count is zero. There is no trained ranker, click tracking, synonym expansion, or active spelling-correction pipeline.
+- Search and suggestion requests have no stale-response guard. Highlight/fallback HTML is not sanitized; the autocomplete lacks complete combobox semantics and IME handling.
+- Redis failure can fail search. General dependency breaker helpers are not connected to search; indexing breakers do not detect per-item bulk failures. Admin job acknowledgments are not durable job completion records.
 
-### Admin API
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/api/admin/stats` | GET | Get system statistics |
-| `/api/admin/crawl/seed` | POST | Add seed URLs |
-| `/api/admin/crawl/start` | POST | Start the crawler |
-| `/api/admin/index/build` | POST | Build search index |
-| `/api/admin/pagerank/calculate` | POST | Calculate PageRank |
-
-## Project Structure
-
-```
-google-search/
-├── docker-compose.yml      # Infrastructure services
-├── backend/
-│   ├── package.json
-│   ├── src/
-│   │   ├── index.js        # Express server entry
-│   │   ├── config/         # Configuration
-│   │   ├── routes/         # API routes
-│   │   ├── services/       # Business logic
-│   │   │   ├── crawler.js  # Web crawler
-│   │   │   ├── indexer.js  # Index builder
-│   │   │   ├── pagerank.js # PageRank calculator
-│   │   │   └── search.js   # Query processor
-│   │   ├── models/         # Database connections
-│   │   └── utils/          # Helpers
-│   └── scripts/
-│       ├── init.sql        # Database schema
-│       └── seed.js         # Sample data
-├── frontend/
-│   ├── package.json
-│   ├── src/
-│   │   ├── components/     # React components
-│   │   ├── routes/         # Page routes
-│   │   ├── stores/         # Zustand stores
-│   │   ├── services/       # API clients
-│   │   └── hooks/          # Custom hooks
-│   └── public/
-├── architecture.md         # System design documentation
-└── CLAUDE.md              # Development notes
-```
-
-## How It Works
-
-### Crawling Process
-
-1. Seed URLs are added to the frontier (priority queue)
-2. Crawler fetches pages respecting robots.txt and politeness delays
-3. HTML is parsed to extract title, content, and links
-4. New URLs are added to the frontier
-5. Documents are stored in PostgreSQL
-
-### Indexing Process
-
-1. Documents are tokenized (with stopword removal and stemming)
-2. Content is indexed in Elasticsearch with custom analyzers
-3. TF-IDF scores are computed automatically by Elasticsearch
-
-### PageRank Calculation
-
-1. Link graph is built from crawled links
-2. Iterative PageRank algorithm runs until convergence
-3. Scores are stored in PostgreSQL and Elasticsearch
-
-### Search Query Flow
-
-1. Query is parsed (phrases, exclusions, filters)
-2. Cache is checked for recent identical queries
-3. Elasticsearch query combines text matching + PageRank boosting
-4. Results are ranked and snippets are generated
-5. Response is cached and returned
-
-## Development
-
-### Running Tests
-
-```bash
-# Backend
-cd backend
-npm test
-
-# Frontend
-cd frontend
-npm run type-check
-npm run lint
-```
-
-### Environment Variables
-
-Backend environment variables (`.env`):
-
-```env
-PORT=3001
-NODE_ENV=development
-DATABASE_URL=postgres://searchuser:searchpass@localhost:5432/searchdb
-REDIS_URL=redis://localhost:6379
-ELASTICSEARCH_URL=http://localhost:9200
-CRAWLER_USER_AGENT=SearchBot/1.0 (Educational)
-CRAWLER_DELAY_MS=1000
-```
-
-## Implementation Status
-
-- [x] Initial architecture design
-- [x] Web crawler with URL frontier
-- [x] Index construction with Elasticsearch
-- [x] Query processing and search API
-- [x] PageRank implementation
-- [x] Result ranking (multi-signal)
-- [x] Autocomplete suggestions
-- [x] Admin dashboard
-- [ ] Spell correction (basic implementation)
-- [ ] Distributed crawling
-- [ ] Real-time indexing
-
-## Key Technical Challenges
-
-1. **Scale**: Indexing billions of pages efficiently
-2. **Freshness**: Keeping index up-to-date with web changes
-3. **Relevance**: Ranking quality results above spam
-4. **Latency**: Sub-200ms query response times
-5. **Crawl Efficiency**: Maximizing coverage with limited resources
-
-## Architecture
-
-See [architecture.md](./architecture.md) for detailed system design documentation.
-
-## Development Notes
-
-See [CLAUDE.md](./CLAUDE.md) for development insights and design decisions.
-
-## License
-
-Educational project - MIT License
-
-## References & Inspiration
-
-- [The Anatomy of a Large-Scale Hypertextual Web Search Engine](http://infolab.stanford.edu/~backrub/google.html) - The original Google paper by Brin and Page describing PageRank and web search architecture
-- [The PageRank Citation Ranking](http://ilpubs.stanford.edu:8090/422/1/1999-66.pdf) - Original PageRank algorithm paper
-- [Introduction to Information Retrieval](https://nlp.stanford.edu/IR-book/) - Stanford's comprehensive textbook on search engine fundamentals
-- [Google Research Publications](https://research.google/pubs/) - Collection of papers on search, indexing, and distributed systems
-- [Inverted Index](https://en.wikipedia.org/wiki/Inverted_index) - Core data structure for full-text search
-- [BM25 Ranking Algorithm](https://en.wikipedia.org/wiki/Okapi_BM25) - Probabilistic ranking function used by modern search engines
-- [Elasticsearch: The Definitive Guide](https://www.elastic.co/guide/en/elasticsearch/guide/current/index.html) - Comprehensive guide to Elasticsearch for search applications
-- [How Google Works](https://www.google.com/intl/en/search/howsearchworks/) - Google's official explanation of their search technology
-- [Query Understanding at Google](https://research.google/pubs/pub37476/) - How Google processes and understands search queries
+See [Implementation Notes](./architecture.md#implementation-notes) for the precise source mapping and production changes needed.

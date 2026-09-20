@@ -13,11 +13,11 @@ learning design, not Calendly's internal architecture.
 | Time | Discussion |
 |------|------------|
 | 5 minutes | Requirements and capacity |
-| 5 minutes | Architecture, records, and API |
+| 6 minutes | Architecture, records, and API |
 | 9 minutes | Deep dive: reservation authority and retries |
 | 8 minutes | Deep dive: time policy and availability |
 | 9 minutes | Deep dive: notifications and booking revisions |
-| 6 minutes | Failure handling and scaling |
+| 5 minutes | Failure handling and scaling |
 | 3 minutes | Verification and implementation boundary |
 
 ## 🎯 Requirements and capacity — 5 minutes
@@ -62,25 +62,61 @@ My initial targets would be availability p95 below 200 ms, booking p99 below 500
 and 99.9% booking availability. I would define what each timer includes and measure
 contention separately; no database choice by itself establishes those targets.
 
-## 🏗️ Architecture, records, and API — 5 minutes
+## 🏗️ Architecture, records, and API — 6 minutes
 
 I would keep the whiteboard to a few logical responsibilities:
 
 ```
-┌────────────────┐       ┌────────────────┐
-│ Guest / host   │──────▶│ Scheduling API │
-└────────────────┘       └───────┬────────┘
-                                 ▼
-                         ┌────────────────┐
-                         │ PostgreSQL     │
-                         │ Rules/bookings │
-                         │ Receipt/outbox │
-                         └───────┬────────┘
-                                 ▼
-                         ┌────────────────┐
-                         │ Jobs + workers │──────▶ Providers
-                         └────────────────┘
+┌────────────────────────┐       ┌─────────────────────────────────────────────────────────┐
+│ Guest / host clients   │       │ Scheduling API entry                                    │
+│ Scoped booking access  │◀─────▶│ Validate input, capabilities and host session scope     │
+└────────────────────────┘       └─────────────────────────────────────────────────────────┘
+                                              ▲
+                                              │
+             ┌────────────────────────────────┴────────────────────────────────┐
+             │                                │                                │
+             ▼                                ▼                                ▼
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Availability queries   │       │ Booking commands       │       │ Host policy commands   │
+│ Expand local rules     │       │ Create / cancel / move │       │ Versioned rule changes │
+│ Covered instants       │       │ Recover operation      │       │ Coordinate occupancy   │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+             ▲                                ▲                                ▲
+             │                                │                                │
+cached view  │                   host lock    │                   same lock    │
+             │                                │                                │
+             ▼                                ▼                                ▼
+┌────────────────────────┐       ┌─────────────────────────────────────────────────────────┐
+│ Availability cache     │       │ PostgreSQL reservation authority                        │
+│ Range + policy version │◀─────▶│ Hosts, rules, bookings, accepted occupied intervals     │
+│ Miss read, bounded age │       │ Operation receipts, history, outbox and delivery jobs   │
+└────────────────────────┘       └─────────────────────────────────────────────────────────┘
+                                              ▲
+                                              │
+committed work / recorded outcome             │
+                                              │
+                                              ▼
+┌────────────────────────┐       ┌─────────────────────────────────────────────────────────┐
+│ Email / integrations   │       │ Outbox, reminder and delivery workers                   │
+│ External outcomes      │◀─────▶│ Durable jobs, lease/revision checks, provider receipts  │
+│ May be delayed         │       │ Provider calls happen after booking commit              │
+└────────────────────────┘       └─────────────────────────────────────────────────────────┘
+
+Availability proposes a time; one host transaction decides whether it can be reserved.
 ```
+
+The API separates advisory availability from commands that can change a host's
+occupancy or policy. Both use the same scheduling rules, but every command rechecks
+current state under the host's coordination lock and commits its result with a
+receipt and outbox work. Workers process notifications and reminders afterward and
+record their own progress. If a provider is slow, the booking can still be confirmed
+and recovered directly from the reservation authority.
+
+The return paths separate two recoveries: a guest reads the committed operation
+receipt, while a worker resumes the accepted booking revision's delivery jobs.
+After cancellation or a move, a delayed worker checks that its revision is still
+eligible before contacting a provider. Provider uncertainty stays in delivery state;
+it does not roll back occupancy or justify creating the booking a second time.
 
 The API owns authentication, validation, and transaction orchestration. Availability
 calculation can scale separately from booking writes, but both use one definition of
@@ -338,7 +374,7 @@ reliable before adding multiple external providers. The outbox and revision mode
 leave a clear place to add synchronization without moving network calls into the
 booking transaction.
 
-## 📈 Failure handling and scaling — 6 minutes
+## 📈 Failure handling and scaling — 5 minutes
 
 PostgreSQL is the acceptance authority. I would run replicas for suitable historical
 reads and use a failover arrangement that preserves acknowledged booking guarantees.

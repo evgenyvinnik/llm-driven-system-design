@@ -40,17 +40,56 @@ are testable targets, not measured demo performance.
 ## 🏗️ A small architecture and explicit contracts — 5 minutes
 
 ```
-┌─────────────────────────────┐     ┌──────────────────────────────────────┐
-│ Browser / Git transport     │────▶│ Git storage authority                │
-│ Auth + repository routing   │     │ Objects / refs / operation journal   │
-└─────────────────────────────┘     └──────────────────────────────────────┘
-               │                                       │
-               ▼                                       ▼
-┌─────────────────────────────┐     ┌──────────────────────────────────────┐
-│ Collaboration API + SQL     │────▶│ Event processing                     │
-│ PRs / intents / receipts    │     │ Reconcile / index / notify           │
-└─────────────────────────────┘     └──────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│ BROWSER / COMMIT, COMPARISON AND MUTATION IDENTITY                                       │
+│                                                                                          │
+│  ┌────────────────────────┐    ┌────────────────────────┐    ┌────────────────────────┐  │
+│  │ Routes + code/diff UI  │    │ Query + artifact state │    │ Review draft + actions │  │
+│  │ Path / source anchors  │◀──▶│ Immutable content keys │◀──▶│ Exact comparison       │  │
+│  │ Bounded render workers │    │ Request/access context │    │ Saved operation ID     │  │
+│  └────────────────────────┘    └────────────────────────┘    └────────────────────────┘  │
+│                                             ▲                                            │
+│                                             │                                            │
+└─────────────────────────────────────────────┼────────────────────────────────────────────┘
+                  authorized reads / commands │
+                                              ▼
+                                 ┌────────────────────────┐       ┌────────────────────────┐
+                                 │ Repository API         │       │ Git storage authority  │
+             ┌──────────────────▶│ Browse/search/review   │◀─────▶│ Objects/refs/journal   │◀───┐
+             ▲                   │ Current access checks  │       │ Fenced ref publication │    │
+             │                   └────────────────────────┘       └────────────────────────┘    │
+             │                                ▲                                ▲                │
+             │                                │ state / receipts               │ op / receipt   │
+             │                                ▼                                ▼                │
+             │                   ┌────────────────────────┐       ┌────────────────────────┐    │
+             │                   │ Collaboration + SQL    │       │ Merge coordinator      │    │
+             │                   │ Review / merge intent  │◀─────▶│ Admitted comparison    │    │
+             │                   │ Receipts + outbox      │       │ Resolve Git receipt    │    │
+             │                   └────────────────────────┘       └────────────────────────┘    │
+             │                                ▲                                                 │
+             │ query/hits                     │ work / outcome                                  │ replay / cursor
+             ▼                                ▼                                                 │
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐    │
+│ Code search projection │       │ Reconcile/index worker │       │ Git journal replay     │    │
+│ Indexed commit/path    │◀─────▶│ Reconcile operation    │◀─────▶│ Committed ref changes  │◀───┘
+│ No access authority    │       │ Effects / checkpoints  │       │ Recover missed events  │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+
+The browser retains the reviewed comparison; publication stays pending until its outcome is known.
 ```
+
+I would follow one comparison from immutable code into a preserved review draft, then
+into an identified merge intent. Git storage conditionally publishes the admitted result;
+SQL collaboration state follows the recovered publication receipt. The browser keeps an
+uncertain operation pending until that result is known. Search and other projections
+consume durable changes, while current access is checked again on every returned artifact.
+
+For a browser reload during merge, I would follow the saved identity through recovery:
+
+1. Restore a bounded account/repository-scoped operation reference and review draft under the local-storage policy, then reauthorize access.
+2. Query the same operation. SQL may still say pending while the coordinator resolves Git's durable publication receipt.
+3. Reconcile that receipt before reporting completion. New branch activity neither proves nor disproves the original merge outcome.
+4. Let indexing catch up independently, with confirmed effect checkpoints. Preserve the reviewed comparison and label search results with the indexed commit.
 
 The browser has a router, a query cache, a review/draft model, and bounded code/diff
 rendering. The API supplies authorized metadata and comparison contracts. Git storage owns

@@ -13,12 +13,12 @@ source from the design.
 | Time | Discussion |
 |------|------------|
 | 4 minutes | Product scope and visible states |
-| 5 minutes | UI architecture and API boundaries |
+| 6 minutes | UI architecture and API boundaries |
 | 9 minutes | Deep dive: dates, timezones, and calendar coverage |
 | 9 minutes | Deep dive: booking across uncertain responses |
 | 8 minutes | Deep dive: availability and asynchronous state |
 | 6 minutes | Host editing, accessibility, and performance |
-| 4 minutes | Verification and growth |
+| 3 minutes | Verification and growth |
 
 ## 🎯 Product scope and visible states — 4 minutes
 
@@ -55,21 +55,62 @@ evidence from that separate delivery process.
 > “I would design the failure states before polishing the calendar. They determine
 > whether someone retries safely or accidentally creates a second appointment.”
 
-## 🏗️ UI architecture and API boundaries — 5 minutes
+## 🏗️ UI architecture and API boundaries — 6 minutes
 
 I would draw three screens and two server responsibilities:
 
 ```
-┌────────────────┐       ┌────────────────┐
-│ Guest calendar │──────▶│ Availability   │
-│ Booking form   │──────▶│ Booking API    │
-└────────────────┘       └───────┬────────┘
-                                 │
-┌────────────────┐               │
-│ Host dashboard │───────────────┘
-│ Rules editor   │
-└────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│ BROWSER / GUEST CAPABILITIES AND HOST SESSIONS HAVE SEPARATE SCOPE                       │
+│                                                                                          │
+│  ┌────────────────────────┐    ┌────────────────────────┐    ┌────────────────────────┐  │
+│  │ Guest calendar         │    │ Booking / result UI    │    │ Host dashboard         │  │
+│  │ Display date and zone  │    │ Contact draft + status │    │ Working hours + types  │  │
+│  └────────────────────────┘    └────────────────────────┘    └────────────────────────┘  │
+│                          ▲                             ▲                             ▲   │
+│                          │                             │                             │   │
+│   browse / render        │      submit / recover       │      edit / result          │   │
+│                          │                             │                             │   │
+│                          ▼                             ▼                             ▼   │
+│  ┌────────────────────────┐    ┌────────────────────────┐    ┌────────────────────────┐  │
+│  │ Availability model     │    │ Booking attempt        │    │ Host policy model      │  │
+│  │ Candidate instants     │───▶│ Instant + saved op ID  │    │ Local rule draft       │  │
+│  │ Covered range + age    │    │ Canonical confirmation │    │ Expected revision      │  │
+│  └────────────────────────┘    └────────────────────────┘    └────────────────────────┘  │
+│                          ▲                             ▲                             ▲   │
+│                          │                             │                             │   │
+│   range / zone           │      frozen intent          │      versioned policy       │   │
+│                          │                             │                             │   │
+│                          ▼                             ▼                             ▼   │
+│  ┌────────────────────────────────────────────────────────────────────────────────────┐  │
+│  │ Scoped data access and request coordination                                        │  │
+│  │ Query identity, bounded refetch, conflicts, operation recovery and canonical state │  │
+│  └────────────────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                      ▲   │
+│                                                                                      │   │
+│  The date label changes with the display zone; a selected instant stays explicit     │   │
+└──────────────────────────────────────────────────────────────────────────────────────┼───┘
+                                                                                       │
+                                                                                       ▼
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│ Scheduling APIs (server boundary)                                                        │
+│ Availability and covered ranges | atomic booking commands | authorized host policy       │
+│ Booking acceptance and notification delivery have separate status                        │
+└──────────────────────────────────────────────────────────────────────────────────────────┘
 ```
+
+I would follow the selected instant from the availability model into a frozen
+booking attempt, then render the server's confirmation. The calendar formats that
+instant in the chosen display zone and tracks which interval was actually covered.
+Host editing keeps a separate draft and authorization context. Shared request handling
+preserves those identities; a refreshed calendar or a successful email cannot become
+the authority for whether the guest owns the slot.
+
+For a lost submission response, I would restore the saved operation reference and
+guest-scoped recovery proof, then ask for that attempt's canonical outcome. Changing
+the display timezone only reformats the selected instant. Changing to another slot
+creates new intent after resolving the first attempt. Notification retries remain a
+separate status path and cannot turn the booking form into another reservation.
 
 React components own focus, open dialogs, and editable form fields. A query layer owns
 server-derived event types, availability, and booking lists. Shared state contains
@@ -342,7 +383,7 @@ capabilities need separate caching rules. I would measure time to usable choices
 booking outcome latency, and recovery success, with no attendee notes or email
 addresses in analytics events.
 
-## 🧪 Verification and growth — 4 minutes
+## 🧪 Verification and growth — 3 minutes
 
 I would demonstrate a complete guest booking, then deliberately lose its response and
 recover it. Next I would open two guest sessions on the same slot and verify that one

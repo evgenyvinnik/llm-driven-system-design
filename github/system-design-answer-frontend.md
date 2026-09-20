@@ -42,17 +42,52 @@ metadata-response budget.
 I would draw this and label the identities crossing the arrows:
 
 ```
-┌─────────────────────────────┐     ┌──────────────────────────────────────┐
-│ Router + review UI          │────▶│ Authorized repository API            │
-│ URL / drafts / focus        │     │ Commits / comparisons / receipts     │
-└─────────────────────────────┘     └──────────────────────────────────────┘
-               │                                       │
-               ▼                                       ▼
-┌─────────────────────────────┐     ┌──────────────────────────────────────┐
-│ Query cache + workers       │────▶│ Git storage + SQL                    │
-│ Bounded text / diff rows    │     │ Current policy / durable writes      │
-└─────────────────────────────┘     └──────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────┐
+│ BROWSER / REPOSITORY, ACCOUNT AND IMMUTABLE CODE CONTEXT   │
+│                                                            │
+│  ┌────────────────────────┐    ┌────────────────────────┐  │    ┌────────────────────────┐
+│  │ Router + repository UI │    │ Request coordinator    │  │    │ Browse / search API    │
+│  │ Ref/path/query in URL  │◀──▶│ Resolve ref -> commit  │◀─┼───▶│ Current repo access    │
+│  │ Shell / access state   │    │ Request context        │  │    │ Commit-bound results   │
+│  └────────────────────────┘    └────────────────────────┘  │    └────────────────────────┘
+│                                             ▲              │
+│                                             │              │
+│                        commit / artifact    │              │
+│                                             │              │
+│                                             ▼              │
+│  ┌────────────────────────┐    ┌────────────────────────┐  │    ┌────────────────────────┐
+│  │ Code / diff renderer   │    │ Artifact state/worker  │  │    │ Code / comparison API  │
+│  │ Source line anchors    │◀──▶│ Commit/comparison key  │◀─┼───▶│ Fixed commit inputs    │
+│  │ Bounded visible rows   │    │ Bounded text + tokens  │  │    │ Bounded typed content  │
+│  └────────────────────────┘    └────────────────────────┘  │    └────────────────────────┘
+│                                             ▲              │
+│                                             │              │
+│                        comparison / intent  │              │
+│                                             │              │
+│                                             ▼              │
+│  ┌────────────────────────┐    ┌────────────────────────┐  │    ┌────────────────────────┐
+│  │ Review / merge UI      │    │ Draft + local journal  │  │    │ Collaboration API      │
+│  │ Fixed comparison draft │◀──▶│ Anchor / saved op ID   │◀─┼───▶│ Review + merge intent  │
+│  │ Retain unknown outcome │    │ Receipt/current state  │  │    │ Durable op state       │
+│  └────────────────────────┘    └────────────────────────┘  │    └────────────────────────┘
+│                                                            │
+└────────────────────────────────────────────────────────────┘
+
+Commits, comparisons and operation IDs preserve distinct context; each read is authorized.
 ```
+
+I would resolve the requested ref to a commit, then follow that immutable identity into
+bounded file and diff artifacts. Workers tokenize under the same request context; they do
+not bypass the authorized API. A review draft preserves its comparison and source anchor,
+while submission and merge use stable operation identities. The interface can retain work
+through a failure without pretending a changed branch is still the code the reviewer saw.
+
+I would demonstrate returning to an unfinished review:
+
+1. Restore its bounded, account/repository-scoped draft journal under the product's local-storage policy, after confirming current access.
+2. Recover the original comparison and source anchors. If they are outdated, keep them identifiable rather than silently attach the draft to new code.
+3. Resolve a saved review or merge operation ID before submitting again. A timeout keeps the outcome unknown; it does not justify a new merge attempt.
+4. Resume bounded artifact loading and tokenization under the current request generation. A late worker result cannot replace the restored comparison.
 
 The router owns shareable context: repository, requested branch or commit, directory/file
 path, pull request number, comparison revision, and search filters. Back and forward

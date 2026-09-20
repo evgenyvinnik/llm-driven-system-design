@@ -46,29 +46,54 @@ A disconnected device has no bounded receipt latency.
 An operator should see retained or unknown, not a spinner that implies delivery is imminent.
 This distinction guides both backend state and frontend wording.
 
-## 🏗️ Architecture and scale — 5 minutes
+## 🏗️ Architecture and scale — 6 minutes
 
 I would draw the whole path with a separate status read side:
 
 ```
-┌─────────────────┐     ┌────────────────────┐
-│ Operator console│────▶│   Authorized API   │◀──── app provider
-│ Draft + results │     │  Accept + inspect  │
-└────────┬────────┘     └──────────┬─────────┘
-         │                         │ durable commit
-┌────────▲────────┐     ┌──────────▼─────────┐
-│  Status/metrics │◀────│  Operation + work  │
-│    Projection   │     │   Retained state   │
-└─────────────────┘     └──────────┬─────────┘
-                                   ▼
-                        ┌────────────────────┐
-                        │  Delivery workers  │────▶ connection leases
-                        └──────────┬─────────┘
-                                   ▼
-                        ┌────────────────────┐
-                        │ Connection gateway │◀───▶ device transport
-                        └────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│ OPERATOR CONSOLE / BROWSER                                                               │
+│                                                                                          │
+│  ┌────────────────────────┐    ┌────────────────────────┐    ┌────────────────────────┐  │
+│  │ Composer + submit      │    │ Scoped operation model │    │ Status + overview      │  │
+│  │ Draft → frozen request │◀──▶│ Saved ID + revision    │◀──▶│ Evidence and freshness │  │
+│  └────────────────────────┘    └────────────────────────┘    └────────────────────────┘  │
+│                       ▲                                                              ▲   │
+│                       │                                                              │   │
+└───────────────────────┼──────────────────────────────────────────────────────────────┼───┘
+                        │                                                              │
+submit / recover        │                                         bounded polling      │
+                        ▼                                                              ▼
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Acceptance API         │       │ Operation authority    │       │ Status read API        │
+│ Authorized stable ID   │◀─────▶│ State + retained work  │──────▶│ Projected evidence     │
+│ Validate destination   │       │ Outbox commit/progress │       │ Observation time       │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+                                              ▲
+                                              │
+             ┌────────────────────────────────┘  committed work / recorded outcome
+             │
+             ▼
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Broker + workers       │       │ Gateway + leases       │       │ Device transport       │
+│ Retain, expire, retry  │◀─────▶│ Lease owner generation │◀─────▶│ Acknowledge receipt    │
+│ Persist receipt state  │       │ Fence obsolete owners  │       │ Not proof of display   │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+
+The browser polls authorized evidence; delivery workers own transport retries.
 ```
+
+I would trace one test from its frozen browser identity to durable acceptance, then
+down through retained delivery work and the current gateway to the device. Receipt
+evidence returns to the operation authority before appearing in the status read side.
+The console polls that evidence with its observation time; changing a draft never
+rewrites the accepted operation, and a lagging projection does not create a new send.
+
+The saved browser reference recovers acceptance after a lost HTTP response; retained
+server work recovers delivery after a gateway failure. These are different retry
+loops. A new gateway generation fences the previous owner, and a matching receipt
+must be persisted before it becomes console evidence. Neither loop promises that
+the application displayed or acted on the notification.
 
 The API handles authorization, validation, acceptance, and read contracts.
 Workers handle retries, expiry, and retained work.
@@ -384,7 +409,7 @@ The overview is not an instant alarm system.
 Independent monitoring detects and pages on incidents; the console helps explain them.
 I would add streaming only when the user benefit justifies its recovery and ordering costs.
 
-## 🧪 Security, failure handling, and validation — 5 minutes
+## 🧪 Security, failure handling, and validation — 4 minutes
 
 ### Enforce scope on both reads and writes
 

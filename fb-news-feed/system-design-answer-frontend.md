@@ -62,22 +62,48 @@ A ranking-explanation interface is outside this first version. Still label ranke
 ## 🏗️ Architecture
 
 ```
-┌──────────────────────────────────────────────────────┐
-│ Virtual feed / composer / detail view                │
-│ Stable post IDs, measured rows, bounded media        │
-└───────────────────────────┬──────────────────────────┘
-                            ▼
-┌──────────────────────────────────────────────────────┐
-│ Feed store + account/session controller              │
-│ Ordered pages / optimistic intent / refresh hint     │
-└────────────┬───────────────────────────┬─────────────┘
-             │ HTTP pages + mutations    │ live hints
-             ▼                           ▼
-┌──────────────────────────────────────────────────────┐
-│ API: authorized hydration + ranked feed session      │
-│ Pushed candidate IDs + pulled author timelines       │
-└──────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────┐
+│ BROWSER / ACCOUNT, READING SESSION AND STABLE POST ID      │
+│                                                            │
+│  ┌────────────────────────┐    ┌────────────────────────┐  │    ┌────────────────────────┐
+│  │ Virtual feed + detail  │    │ Session + entity state │  │    │ Feed API + hints       │
+│  │ Measured rows / anchor │◀──▶│ Ordered pages / cursor │◀─┼───▶│ Frozen candidate order │
+│  │ Stable reading context │    │ Anchor, hints, budget  │  │    │ Current access check   │
+│  └────────────────────────┘    └────────────────────────┘  │    └────────────────────────┘
+│                                             ▲              │
+│                                             │              │
+│                         entity revisions    │              │
+│                                             │              │
+│                                             ▼              │
+│  ┌────────────────────────┐    ┌────────────────────────┐  │    ┌────────────────────────┐
+│  │ Composer / actions     │    │ Mutation coordinator   │  │    │ Mutation API           │
+│  │ Draft / desired like   │◀──▶│ Saved ID / intent      │◀─┼───▶│ Post/graph/engagement  │
+│  │ Pending feedback       │    │ Receipt / reconcile    │  │    │ Receipt; current state │
+│  └────────────────────────┘    └────────────────────────┘  │    └────────────────────────┘
+│                                                            │
+│  ┌────────────────────────┐    ┌────────────────────────┐  │    ┌────────────────────────┐
+│  │ Visible post media     │    │ Media resource owner   │  │    │ Media delivery         │
+│  │ Images; proposed video │◀──▶│ Post version; viewport │◀─┼───▶│ Processed owned refs   │
+│  │ Loading / controls     │    │ Bounded decode/buffers │  │    │ Current audience grant │
+│  └────────────────────────┘    └────────────────────────┘  │    └────────────────────────┘
+│                                                            │
+└────────────────────────────────────────────────────────────┘
+
+A new-post hint offers refresh; it does not reshuffle the reading session under the user.
 ```
+
+I would follow one feed page into ordered session membership and normalized entities,
+then render only the visible rows with a retained anchor. Mutations reconcile per-post
+intent against canonical results without rebuilding the ranked page order. New-post hints
+offer a deliberate refresh, while media resources follow visibility and memory budgets.
+The server supplies ranking and current access; the browser preserves that reading contract.
+
+I would test return-to-feed and mutation recovery together:
+
+1. Restore bounded account-scoped drafts and original pending IDs, then resolve receipts before a second post or a conflicting engagement update.
+2. Restore the saved page order and anchor only while that feed session remains valid; an expired cursor requires an explicit refresh.
+3. Revalidate private entities and media grants on resume. A frozen order or cached image reference cannot preserve revoked access.
+4. Apply a canonical result beneath the latest pending intent; an old failure must not roll back a newer like choice or reorder the reading session.
 
 One thing the diagram deliberately omits: any client-side ranking. **Scores are computed server-side and the client renders the order it's given.** Re-ranking locally would mean the client and server disagree about position, which breaks cursor pagination immediately — the server resumes from where *it* thinks you are.
 

@@ -50,7 +50,7 @@ The service may attempt the same logical notification more than once.
 If the application requires duplicate suppression, the logical identity must survive
 retries through the device handler. Network receipt is not a business transaction.
 
-## 📐 Capacity and access patterns — 4 minutes
+## 📐 Capacity and access patterns — 3 minutes
 
 I would use round assumptions to identify the first bottlenecks:
 100 million registered destinations, 10 million concurrent connections,
@@ -88,31 +88,61 @@ These patterns argue against putting raw delivery events and console scans on on
 unpartitioned table indefinitely. They do not require every component to become a
 microservice before the first reliable end-to-end flow works.
 
-## 🏗️ High-level architecture — 5 minutes
+## 🏗️ High-level architecture — 6 minutes
 
 ```
-┌──────────────┐     ┌─────────────────────┐
-│ App provider │────▶│  Auth + acceptance  │
-└──────────────┘     └──────────┬──────────┘
-                                │ durable commit
-                     ┌──────────▼──────────┐
-                     │   Operation + work  │
-                     │    Token registry   │
-                     └──────────┬──────────┘
-                                ▼
-                     ┌─────────────────────┐
-                     │   Delivery workers  │────▶ status projection
-                     │ Retention + retries │
-                     └──────────┬──────────┘
-                                │ route lookup
-                     ┌──────────▼──────────┐     ┌──────────────────┐
-                     │ Connection gateways │◀───▶│ Presence leases  │
-                     └──────────┬──────────┘     └──────────────────┘
-                                ▼
-                     ┌─────────────────────┐
-                     │   Device transport  │
-                     └─────────────────────┘
+PROPOSED DELIVERY SERVICE — acceptance and device receipt are separate commits
+
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ App providers            │submit/ACK  │ Acceptance API           │lookup      │ Destination registry     │
+│ Scoped request identity  │◀──────────▶│ Auth / quotas / validate │◀──────────▶│ Token + app/environment  │
+│ Retry same payload + ID  │            │ Recover accepted result  │            │ Registration generation  │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+                                                      ▲
+                                                      │
+                                                      │ commit / recover
+                                                      │
+                                                      ▼
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Status read projection   │evidence    │ Operation authority      │events      │ Outbox relay + broker    │
+│ Scoped API / timestamps  │◀───────────│ State + retained work    │───────────▶│ Durable scheduled work   │
+│ Observed lifecycle state │            │ Atomic result + outbox   │            │ Replayable delivery      │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+                                                      ▲                                       │
+                                                      │                                       │
+                                                      │ claim / state                         │
+                                                      │                                       │ work
+                                                      │                                       │
+                                                      ▼                                       │
+┌──────────────────────────┐            ┌──────────────────────────┐                          │
+│ Presence leases          │route lookup│ Delivery workers         │                          │
+│ Destination to gateway   │◀──────────▶│ Expiry, collapse, retry  │◀─────────────────────────┘
+│ Owner generation + TTL   │            │ Persist matching receipt │
+└──────────────────────────┘            └──────────────────────────┘
+              ▲                                       ▲
+              │                                       │
+              │                                       │ send / receipt
+renew lease   │                                       │
+              │                                       │
+              │                                       ▼
+              │                         ┌──────────────────────────┐            ┌──────────────────────────┐
+              │                         │ Connection gateways      │send/receipt│ Device transport         │
+              └────────────────────────▶│ Socket owner generation  │◀──────────▶│ Receive and acknowledge  │
+                                        │ Bounded output buffers   │            │ App handling separate    │
+                                        └──────────────────────────┘            └──────────────────────────┘
 ```
+
+The provider gets an acceptance result only after the operation authority commits
+recoverable work. The relay and broker feed delivery workers, which resolve a current
+gateway and record the resulting evidence back at the authority. Status projections
+follow those persisted changes. I would walk the return path as carefully as the send
+path: gateway handoff cannot complete retained work as if a device had acknowledged it.
+
+The lease connections have two roles: gateways renew current ownership, and workers
+look up a route before each attempt. An obsolete owner cannot complete or erase newer
+work. If a gateway disappears, the authority still retains the operation for retry
+or expiry. A matching device receipt flows back through the worker to a durable state
+transition before the status projection can report that observation.
 
 ### Responsibilities
 

@@ -6,7 +6,7 @@ This answer proposes a dependable coding assistant. The checked-in project is a
 smaller Node.js prototype; its implemented behavior and missing safeguards are
 mapped in [architecture.md](./architecture.md).
 
-## 📋 Establish the scope — 5 minutes
+## 📋 Establish the scope — 4 minutes
 
 > “For this problem, backend means the engine behind the terminal. I would start
 > with one developer, one workspace, and one active coding task. The difficult
@@ -39,21 +39,56 @@ A local acknowledgement should be fast. Provider latency, shell duration, and hu
 approval time vary, so I would measure them separately rather than promise one
 universal task latency.
 
-## 🏗️ Architecture and request flow — 5 minutes
+## 🏗️ Architecture and request flow — 6 minutes
 
 ```
-┌──────────────┐      ┌──────────────────┐      ┌─────────────────┐
-│ Terminal     │◀────▶│ Task coordinator │◀────▶│ Provider adapter│
-└──────────────┘      └───────┬──────────┘      └─────────────────┘
-                             │
-                    ┌────────▼─────────┐      ┌─────────────────┐
-                    │ Policy/scheduler │─────▶│ Restricted tools│
-                    └────────┬─────────┘      └────────┬────────┘
-                             ▼                         │ outcomes
-                    ┌─────────────────────────────────▼────────┐
-                    │ Durable task and operation journal       │
-                    └──────────────────────────────────────────┘
+┌────────────────────────┐                                        ┌────────────────────────┐
+│ Terminal client        │                                        │ Remote provider API    │
+│ Input / decisions      │                                        │ Untrusted proposals    │
+└────────────────────────┘                                        └────────────────────────┘
+                ▲                                                              ▲
+                │            commands / events   context / proposals           │
+┌───────────────┼──────────────────────────────────────────────────────────────┼───────────┐
+│ LOCAL RUNTIME │                                                              │           │
+│               ▼                                                              ▼           │
+│  ┌──────────────────────────────────────────────────────┐    ┌────────────────────────┐  │
+│  │ Task coordinator                                     │    │ Provider adapter       │  │
+│  │ Task state, context, budgets                         │◀──▶│ Instructions, calls    │  │
+│  │ Operation IDs / observed or unknown outcomes         │    │ Stop reasons           │  │
+│  └──────────────────────────────────────────────────────┘    └────────────────────────┘  │
+│                          ▲                  ▲                                            │
+│                          │                  │                                            │
+│  journal / replay        │                  │  complete operations                       │
+│                          │                  │                                            │
+│                          ▼                  ▼                                            │
+│  ┌────────────────────────┐    ┌────────────────────────┐    ┌────────────────────────┐  │
+│  │ Task journal           │    │ Policy + scheduler     │    │ Restricted executor    │  │
+│  │ Intent / known outcome │    │ Validate, authorize    │◀──▶│ Scoped files/processes │  │
+│  │ Replay + artifact refs │    │ Scope + operation ID   │    │ Known/unknown effects  │  │
+│  └────────────────────────┘    └────────────────────────┘    └────────────────────────┘  │
+│                                                                                      ▲   │
+│                                                                                      │   │
+│                                                              bounded I/O             │   │
+│                                                                                      │   │
+│                                                                                      ▼   │
+│                                                              ┌────────────────────────┐  │
+│                                                              │ Task workspace         │  │
+│                                                              │ Files + process state  │  │
+│                                                              └────────────────────────┘  │
+└──────────────────────────────────────────────────────────────────────────────────────────┘
 ```
+
+The client sends a task command to the coordinator; its selected context crosses the
+provider boundary through the adapter. Complete proposed calls return to policy and
+scheduling before a restricted executor touches the task workspace. The coordinator
+records intent and observed outcomes in the journal and can replay them after a crash.
+The journal and workspace are separate stores, so recording intent is not proof that
+an external effect occurred, and a missing result is not permission to repeat it.
+
+I would mark the provider's return as untrusted proposal data and the executor's return
+as execution evidence. Only policy-authorized, complete operations reach the workspace.
+If a process dies between an effect and its journal result, recovery follows both
+workspace inspection and journal replay before deciding whether another attempt is safe.
 
 The coordinator owns task state, model context, and budgets. The adapter owns
 provider message semantics. Policy and the executor decide what may run and what

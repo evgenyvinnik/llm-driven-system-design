@@ -72,28 +72,49 @@ components cannot compensate for an endpoint that scans every key for each viewe
 ## 🏗️ Architecture and state ownership — 5 minutes
 
 ```
-┌─────────────────────────┐
-│ React operator console  │
-│ Overview / keys / admin │
-└─────────────────────────┘
-             │ authenticated requests
-             ▼
-┌─────────────────────────┐
-│ Console API             │
-│ Samples + operation IDs │
-└─────────────────────────┘
-             │ bounded collection and control
-             ▼
-┌─────────────────────────┐
-│ Membership + cache API  │
-│ Versioned node routing  │
-└─────────────────────────┘
-             │
-             ▼
-┌─────────────────────────┐
-│ Independent cache nodes │
-└─────────────────────────┘
+OPERATOR BROWSER — first two columns; AUTHORIZED SERVER APIs — right column
+
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Overview + node views    │view/input  │ Observation state        │read/result │ Observation API          │
+│ Sample age / coverage    │◀──────────▶│ Per-node timed outcomes  │◀──────────▶│ Shared bounded samples   │
+│ Partial != empty         │            │ Placement-version scope  │            │ Separate query budget    │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+                                                      ▲
+                                                      │
+                                                      │ scope / version
+                                                      │
+                                                      ▼
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Key search + inspector   │query/view  │ Query coordinator        │read/result │ Key + placement API      │
+│ URL scope / selection    │◀──────────▶│ Key + request identity   │◀──────────▶│ Authorize namespace      │
+│ Bounded value preview    │            │ Placement / sample age   │            │ HIT / MISS / unavailable │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+                                                      ▲
+                                                      │
+                                                      │ target / result
+                                                      │
+                                                      ▼
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Admin controls           │act/status  │ Operation recovery       │submit/poll │ Control API              │
+│ Frozen scope + preview   │◀──────────▶│ Saved ID / frozen scope  │◀──────────▶│ Authorize exact action   │
+│ Partial outcome display  │            │ Resolve before retry     │            │ Durable tracked progress │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+
+Keep only scoped operation references for recovery; observed cache values remain transient.
 ```
+
+I would start with the operator's selected environment and namespace, then trace a
+bounded observation into the overview or key inspector. Query identity and sample age
+travel with the result. An administrative action freezes the intended scope and follows
+its operation ID to a complete or partial outcome before refreshing affected views.
+The browser renders placement supplied by the server; it never becomes a second router.
+
+I would make recovery visible without saving cached values locally:
+
+1. Retain only a bounded operation reference and frozen environment/namespace scope, subject to account storage policy.
+2. After reload, reauthenticate and fetch that administrative operation's recorded progress before enabling another attempt.
+3. Refetch observations for the accepted placement version; an old preview is never approval for a new topology.
+4. An ordinary cache mutation without a retained receipt can remain unknown after a timeout. Inspecting the current value does not prove which request changed it.
 
 The browser talks to one authenticated console API. It does not discover arbitrary node
 URLs and call them directly. The backend owns routing and authorization; the browser owns

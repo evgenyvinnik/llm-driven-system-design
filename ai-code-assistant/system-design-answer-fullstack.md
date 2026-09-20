@@ -6,7 +6,7 @@ This is a proposed production-quality local assistant. The repository's prototyp
 implements the basic completion/tool loop. Its missing streaming, recovery, and
 execution safeguards are documented in [architecture.md](./architecture.md).
 
-## 📋 Frame the task — 5 minutes
+## 📋 Frame the task — 4 minutes
 
 > “I would use one concrete workflow: a developer asks the assistant to fix a
 > failing test. The assistant investigates, proposes a change, applies authorized
@@ -40,31 +40,55 @@ editors and clear partial-change behavior.
 The quality bar is not “the model returns plausible code.” It is a traceable path
 from request to authorized action to observed outcome.
 
-## 🏗️ Draw the system — 5 minutes
+## 🏗️ Draw the system — 6 minutes
 
 ```
-┌──────────────┐      ┌──────────────────┐      ┌────────────────┐
-│ Terminal UI  │◀────▶│ Task coordinator │◀────▶│ Model adapter  │
-└──────────────┘      └────────┬─────────┘      └───────┬────────┘
-                              │                        ▼
-                    ┌─────────▼──────────┐      ┌────────────────┐
-                    │ Policy + executor  │      │ Provider API   │
-                    └─────────┬──────────┘      └────────────────┘
-                              │
-                    ┌─────────▼──────────┐      ┌────────────────┐
-                    │ Task workspace     │      │ Task journal   │
-                    └────────────────────┘      └────────────────┘
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Terminal UI            │       │ Task coordinator       │       │ Provider adapter       │
+│ Input + transcript     │◀─────▶│ Context + task state   │◀─────▶│ Instructions + calls   │
+│ Identified decisions   │       │ Operation identities   │       │ Complete results       │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+                                              ▲                               ▲
+                                              │                               │
+commands / outcomes                           │  provider context / stream    │
+                                              │                               ▼
+                                              │                   ┌────────────────────────┐
+                                              │                   │ Remote provider API    │
+            ┌─────────────────────────────────┤                   │ Untrusted proposals    │
+            │                                 │                   └────────────────────────┘
+            │                                 │
+            │  journal / replay               │
+            │                                 │
+            ▼                                 ▼
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Task journal           │       │ Policy + scheduler     │       │ Restricted executor    │
+│ Intent / outcome / seq │       │ Validate full calls    │◀─────▶│ Authorized tools       │
+│ Replay + artifact refs │       │ Bind scope + approval  │       │ Known/unknown effects  │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+                                                                              ▲
+                                                                              │
+                                   observed file/process effects              │
+                                                                              │
+                                                                              ▼
+                                                                  ┌────────────────────────┐
+                                                                  │ Task workspace         │
+                                                                  │ Files + process state  │
+                                                                  └────────────────────────┘
 ```
 
-I would explain the arrows verbally. The coordinator sends context to the model,
-receives text and proposed tools, and passes complete operations to the executor.
-The executor checks policy, applies allowed effects, and returns observed results.
-
-The coordinator and executor record task transitions in the journal. The UI renders
-those events and sends input or identified approval decisions back to the runtime.
+Follow “fix the test” from the terminal to the coordinator, through the adapter, and
+back as proposed operations. Policy and the executor validate the concrete action
+before touching the workspace. The coordinator records intent/outcomes in the connected
+journal and emits identified events back to the transcript. The model sees selected
+context and matching tool results; the UI's success labels come from observed outcomes.
 
 The journal is drawn separately from the workspace because a transcript save and
 a file edit are different writes. A crash between them is a central recovery case.
+
+The return path matters as much as the request: generated proposals pass through policy,
+observed tool outcomes enter the journal, and identified events update the terminal.
+On restart, replay reconstructs the UI while resource inspection resolves uncertain
+effects. Replaying the transcript does not itself rerun the recorded commands.
 
 The model adapter preserves provider-specific system instructions, tool-call IDs,
 and stop reasons. It can normalize events without pretending every provider has

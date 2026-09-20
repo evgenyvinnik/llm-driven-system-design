@@ -70,31 +70,56 @@ made during this documentation review.
 ## High-Level Architecture
 
 ```
-┌──────────────────┐       ┌──────────────────────┐
-│ Browser / mobile │──────▶│ CDN + storefront API │
-│ Browse, checkout │       │ Auth, quotas, routing │
-└──────────────────┘       └─────┬───────────┬────┘
-                                 │           │
-                     ┌───────────▼───┐  ┌────▼───────────────────┐
-                     │ Catalog/search│  │ Cart + checkout        │
-                     │ Read models   │  │ Quote and attempt state│
-                     └───────┬───────┘  └────┬─────────────┬─────┘
-                             │               │             │
-                     ┌───────▼──────┐  ┌─────▼──────┐  ┌───▼─────────┐
-                     │ Search index │  │ Stock/order│  │ Payment     │
-                     │ Read caches  │  │ authority  │  │ coordinator │
-                     └───────▲──────┘  └─────┬──────┘  └───┬─────────┘
-                             │               │             ▼
-                     ┌───────┴───────────────▼──────┐  ┌─────────────┐
-                     │ Transactional outbox → events│  │ Provider API│
-                     │ Index, recommendations, jobs │  │ and webhooks│
-                     └──────────────────────────────┘  └─────────────┘
+PROPOSED PRODUCTION DESIGN — discovery is separate from purchase authority
+
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Shopper clients          │HTTP/result │ Storefront API           │query/result│ Catalog / search         │
+│ Browse, edit, purchase   │◀──────────▶│ Authenticate / scope     │◀──────────▶│ Public product queries   │
+│ Recover saved attempt    │            │ Route reads and commands │            │ Bounded result pages     │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+              ▲                                       ▲                                       ▲
+              │                                       │                                       │
+              │ GET / bytes                           │ purchase / status                     │ read
+              │                                       │                                       │
+              ▼                                       ▼                                       ▼
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Public assets            │            │ Cart + checkout          │            │ Search index + cache     │
+│ Object storage + CDN     │            │ Validate cart + quote    │            │ Versioned projections    │
+│ No private cart caching  │            │ Allocate exact units     │            │ May lag stock and price  │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+                                                      ▲                                       ▲
+                                                      │                                       │
+                                                      │ commit / recover                      │ refresh
+                                                      │                                       │
+                                                      ▼                                       │
+                                        ┌──────────────────────────┐            ┌──────────────────────────┐
+Only committed allocations              │ PostgreSQL authority     │events      │ Outbox relay + indexers  │
+become purchase state.                  │ Stock, orders, attempts  │───────────▶│ Versioned index updates  │
+                                        │ Allocate + outbox commit │            │ Consumer progress        │
+                                        └──────────────────────────┘            └──────────────────────────┘
+                                                      ▲
+                                                      │
+                                                      │ work / outcome
+                                                      │
+                                                      ▼
+                                        ┌──────────────────────────┐            ┌──────────────────────────┐
+Provider calls run outside              │ Payment coordinator      │call/result │ Payment provider         │
+the inventory transaction.              │ Stable payment operation │◀──────────▶│ External effects         │
+                                        │ Reconcile / compensate   │            │ API + callbacks          │
+                                        └──────────────────────────┘            └──────────────────────────┘
 ```
 
 These are ownership boundaries. Cart, order and inventory can share one transactional
 database initially; splitting them into services is justified by scale and ownership,
 not by the number of boxes in a diagram. An inventory allocation has one authoritative
 writer even when many regions serve its catalog description.
+
+The API returns discovery from a potentially stale projection. Purchase commands
+instead commit exact stock allocations, the attempt/order result, and outbox work
+at the PostgreSQL authority. The payment coordinator recovers durable operations
+around external calls; its observed results return to order state for client lookup.
+Projection workers replay versioned updates after commit. Public asset delivery is
+independent of those private commands and their inventory locks.
 
 ## Core Components / Request Flows
 

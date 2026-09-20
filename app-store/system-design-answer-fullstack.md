@@ -77,32 +77,56 @@ PostgreSQL owns business state, Elasticsearch serves retrieval, Redis caches pub
 reads and sessions, and object storage/CDN serves media and approved packages.
 
 ```
-┌──────────────────────────┐      ┌────────────────────────────┐
-│ Browser                  │─────▶│ CDN + object storage       │
-│ Routes, cache, drafts    │      │ Approved artifact bytes    │
-└────────────┬─────────────┘      └────────────────────────────┘
-             │
-             │
-             ▼
-┌──────────────────────────────────────────────────────────────┐
-│ API: discovery, reviews, developer work                      │
-│ Access grants and operation status                           │
-└────────────┬───────────────────────────────────┬─────────────┘
-             │                                   │
-             │                                   │
-             ▼                                   ▼
-┌──────────────────────────┐      ┌────────────────────────────┐
-│ Search + public cache    │      │ PostgreSQL                 │
-│ Versioned derived views  │      │ Authority + outbox         │
-└──────────────────────────┘      └──────────────┬─────────────┘
-             ▲                                   │
-             │                                   │
-             │                                   ▼
-             │                    ┌────────────────────────────┐
-             └────────────────────┤ Relay + queue + workers    │
-                                  │ Indexing / moderation      │
-                                  └────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│ BROWSER / PUBLIC CATALOG AND PRIVATE DEVELOPER WORKSPACE                                 │
+│                                                                                          │
+│  ┌────────────────────────┐    ┌────────────────────────┐    ┌────────────────────────┐  │
+│  │ Discovery + reviews    │    │ Scoped data layer      │    │ Workspace + transfer   │  │
+│  │ URL and local text     │◀──▶│ Saved revisions        │◀──▶│ Draft, upload, acquire │  │
+│  └────────────────────────┘    │ Saved operation ID     │    └────────────────────────┘  │
+│                                └────────────────────────┘                 ▲              │
+│                                             ▲                             │              │
+│                                             │                             │              │
+└─────────────────────────────────────────────┼─────────────────────────────┼──────────────┘
+                                              │               granted bytes │
+metadata / commands / outcomes                │                             │
+                                              ▼                             ▼
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Search + public cache  │       │ Marketplace API        │       │ Object storage + CDN   │
+│ Versioned candidates   │◀─────▶│ Auth + access grants   │       │ Private staged uploads │
+│ May lag publication    │       │ Catalog/review/publish │       │ Approved release bytes │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+             ▲                                ▲                                ▲
+             │                                │                                │
+projection   │  canonical read / commit       │                                │
+             │                                │                                │
+             │                                ▼                                │
+┌────────────────────────┐       ┌────────────────────────┐                    │
+│ Relay + workers        │       │ PostgreSQL authority   │                    │
+│ Verify / moderate      │◀─────▶│ Revisions + approvals  │                    │
+│ Fence stale revisions  │       │ Release, ops, outbox   │                    │
+└────────────────────────┘       └────────────────────────┘                    │
+             ▲                                                                 │
+             │                                                                 │
+             │  verify uploaded bytes before approval                          │
+             │                                                                 │
+             └─────────────────────────────────────────────────────────────────┘
+
+Public access follows the approved immutable release; search is a derived view.
 ```
+
+I would follow a developer's draft through the scoped data layer to a committed
+revision, then follow the separate byte path through storage and validation. Publishing
+moves the authoritative release pointer and records projection work. A visitor can
+then discover a candidate, check current eligibility, and retrieve approved immutable
+bytes using a grant. The browser keeps saved, approved, published and indexed states
+distinct because those arrows do not complete at the same time.
+
+I would also walk the failure path: the browser recovers a saved publication operation,
+workers retry validation against the same private artifact, and the authority rejects
+stale revision results. A shopper always obtains a current access grant before reading
+release bytes; a stale search card is insufficient. Upload progress, publication status,
+and search visibility remain separate observations throughout recovery.
 
 I would keep the diagram at this level. Separate services, replicas, and shards
 can be added where a measured bottleneck appears, without changing the contracts.

@@ -22,8 +22,8 @@ need an explicit recovery path without discarding the user's selections.
 | Discussion | Minutes |
 |------------|---------|
 | Scope and experience | 4 |
-| Frontend architecture and contracts | 5 |
-| Deep dive: reliable playback | 11 |
+| Frontend architecture and contracts | 6 |
+| Deep dive: reliable playback | 10 |
 | Deep dive: library edits and synchronization | 10 |
 | Deep dive: discovery and large collections | 8 |
 | Accessibility and validation | 4 |
@@ -38,26 +38,64 @@ The interface must distinguish loading, playing, paused, buffering, unavailable,
 and playback blocked by the browser. It should also distinguish an unsaved library
 edit from a confirmed one, particularly when the user is offline.
 
-## 🏗️ Frontend architecture and contracts — 5 minutes
+## 🏗️ Frontend architecture and contracts — 6 minutes
 
 I would draw a persistent shell with playback outside the routed page content.
 The important division is ownership of side effects, not a large component tree.
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│ Persistent shell: navigation, routed pages, player bar       │
-└──────────────┬────────────────────────────────┬──────────────┘
-               ▼                                ▼
-┌─────────────────────────────┐  ┌─────────────────────────────┐
-│ Playback controller         │  │ Library and discovery       │
-│ Media element + queue       │  │ Query cache + pending edits │
-└──────────────┬──────────────┘  └──────────────┬──────────────┘
-               ▼                                ▼
-┌─────────────────────────────┐  ┌─────────────────────────────┐
-│ Authorization API + media   │  │ Catalog/library/sync APIs   │
-│ Delivery URL or manifest    │  │ Versioned user data         │
-└─────────────────────────────┘  └─────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│ PERSISTENT SHELL / PLAYBACK SURVIVES ROUTED-PAGE CHANGES                                 │
+│                                                                                          │
+│  ┌──────────────────────────────────────────────────────┐    ┌────────────────────────┐  │
+│  │ Routed discovery + library pages                     │    │ Player UI + queue      │  │
+│  │ Search, browse, saved items and playlist editing     │───▶│ Occurrence IDs         │  │
+│  └──────────────────────────────────────────────────────┘    │ Observed media state   │  │
+│               ▲                             ▲                └────────────────────────┘  │
+│               │                             │                                        ▲   │
+│               │                             │                                        │   │
+│  queries      │                edits        │                 commands / events      │   │
+│               │                             │                                        │   │
+│               ▼                             ▼                                        ▼   │
+│  ┌────────────────────────┐    ┌────────────────────────┐    ┌────────────────────────┐  │
+│  │ Scoped query cache     │    │ Library model          │    │ Playback controller    │  │
+│  │ Catalog + discovery    │    │ Confirmed revision     │    │ One media element      │  │
+│  │ Independent errors     │    │ Saved operation IDs    │    │ Generation + recovery  │  │
+│  └────────────────────────┘    └────────────────────────┘    └────────────────────────┘  │
+│               ▲                             ▲                  ▲                     ▲   │
+│               │                             │              ┌───┘                     │   │
+│               │ read/refresh   sync         │              │                         │   │
+│               │                             │              │  grant / expiry         │   │
+│               ▼                             ▼              │                         │   │
+│  ┌──────────────────────────────────────────────────────┐  │                         │   │
+│  │ Control API client + sync coordinator                │  │                         │   │
+│  │ Grants, query identity, edit receipts, sync pages    │◀─┘                         │   │
+│  └──────────────────────────────────────────────────────┘                            │   │
+│               ▲                                                                      │   │
+│               │                                                                      │   │
+└───────────────┼──────────────────────────────────────────────────────────────────────┼───┘
+                │                                                                      │
+control / sync  │                                                 authorized bytes     │
+                │                                                                      │
+                ▼                                                                      ▼
+┌─────────────────────────────────────────────────────────┐       ┌────────────────────────┐
+│ Music service APIs (server boundary)                    │       │ CDN + private origin   │
+│ Authorization, catalog, library revisions, discovery    │       │ Immutable media        │
+└─────────────────────────────────────────────────────────┘       │ Grant checked on read  │
+                                                                  └────────────────────────┘
 ```
+
+I would trace Play from a page into the persistent queue and controller. The
+controller obtains a grant through the control client, fetches media directly, and
+reports observed events back to the player UI. Browsing reads and library operations
+use separate models and failure states. Navigating a route therefore changes page
+content without replacing the active media element, and sync never owns the queue.
+
+For an expired grant, I would trace the controller back through the control client,
+then accept replacement bytes only for the still-current playback generation. Library
+recovery instead uses saved account-scoped operation IDs and a complete sync cursor.
+A page reload may restore listening intent, but the UI reports playback only after
+the new media element actually starts; routing persistence alone does not provide that.
 
 A playback controller owns the media element, command sequencing, and playback
 instance. A small store exposes observable state to controls and track rows.
@@ -83,7 +121,7 @@ The stream response includes the selected rendition, expiry, and playback identi
 The library response includes a revision and operation result. Search returns
 stable IDs rather than forcing the UI to identify a recording by its display name.
 
-## 🔧 Deep dive 1: reliable playback — 11 minutes
+## 🔧 Deep dive 1: reliable playback — 10 minutes
 
 ### One controller owns the media lifecycle
 

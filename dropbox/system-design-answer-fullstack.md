@@ -44,22 +44,48 @@ This suggests separating the byte path from the namespace path. Metadata traffic
 large service fleet by itself, while object traffic can overwhelm an API that buffers files.
 
 ```
-┌──────────────────┐     ┌──────────────────┐     ┌──────────────────┐
-│ Browser UI       │────▶│ Metadata API     │────▶│ SQL + outbox     │
-│ Routes and cache │     │ Auth and versions│     │ Namespace state  │
-└──────────────────┘     └──────────────────┘     └──────────────────┘
-        │                                                   │
-        ▼                                                   ▼
-┌──────────────────┐     ┌──────────────────┐     ┌──────────────────┐
-│ Upload manager   │────▶│ Upload service   │     │ Change relay     │
-│ Worker and queue │     │ Verified staging │     │ Socket gateways  │
-└──────────────────┘     └──────────────────┘     └──────────────────┘
-                                  │                         │
-                                  ▼                         ▼
-                         ┌──────────────────┐     ┌──────────────────┐
-                         │ Private objects  │     │ Other devices    │
-                         └──────────────────┘     └──────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│ BROWSER / FILE IDENTITY, REVISION AND TRANSFER LIFETIME                                  │
+│                                                                                          │
+│  ┌────────────────────────┐    ┌────────────────────────┐    ┌────────────────────────┐  │
+│  │ File browser + dialogs │    │ Metadata + sync state  │    │ Transfer manager       │  │
+│  │ Namespace / selection  │◀──▶│ Versions / cursor      │◀──▶│ Worker / bounded queue │  │
+│  │ Navigate / share       │    │ Conflict / saved ID    │    │ Journal / file version │  │
+│  └────────────────────────┘    └────────────────────────┘    └────────────────────────┘  │
+│                                             ▲                                ▲           │
+│                                             │                                │           │
+└─────────────────────────────────────────────┼────────────────────────────────┼───────────┘
+                       metadata / commit      │              chunk transfer    │
+                                              ▼                                ▼
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Other devices          │       │ Metadata API           │       │ Transfer service       │
+│ Applied change cursor  │       │ Permissions / versions │◀─────▶│ Verify staged bytes    │
+│ Recover missed changes │       │ Quota + finalization   │       │ Pin downloads          │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+             ▲                                ▲                                ▲
+             │                                │                                │
+             ▼                                ▼                                ▼
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Relay + gateways       │       │ Namespace SQL          │       │ Private immutable data │
+│ Changes / replay       │◀─────▶│ Manifests / quota      │       │ Ordered chunk refs     │
+│ Authorized delivery    │       │ Receipts + change log  │       │ Protected retention    │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+
+Verified transfer progress becomes “Saved” only when the intended namespace version commits.
 ```
+
+I would follow one upload through the browser's bounded transfer queue to verified
+staging, then finalize its manifest under the metadata authority. Only that commit
+produces the saved file version and quota result. A separate change path informs other
+devices, which reconcile by namespace cursor. Both a resumed upload and a download keep
+stable identities even while the user navigates or another device changes the folder.
+
+I would walk a disconnected client through four arrows:
+
+1. Its local journal restores upload identity and manifest; server receipts establish which slots are still verified and protected.
+2. Reselect and verify unavailable source bytes before resuming, and resolve finalization under the original operation ID before creating new intent.
+3. The sync path requests retained changes or a fresh snapshot boundary; a socket notice alone cannot advance an applied cursor.
+4. A resumed download keeps its pinned immutable version and renews authorization. A newer file pointer never changes the bytes mid-transfer.
 
 React renders navigation and dialogs. The URL owns the current namespace/folder. A keyed
 server-state cache owns folder pages and versions; a Zustand-style client store owns selection and

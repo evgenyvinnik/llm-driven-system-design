@@ -49,16 +49,40 @@ One application process, one PostgreSQL pool capped at 20 connections, and three
 The gateway authenticates HTTP/socket requests and routes each file to one logical owner. The owner commits to SQL before publishing accepted edits to subscribed gateways. Presence uses a separate ephemeral topic. Snapshot workers consume the durable log, then store immutable scene versions in object storage; a CDN serves the application and appropriately authorized assets.
 
 ```
-┌─────────────────────────┐     ┌─────────────────────────┐     ┌─────────────────────────┐
-│      Browser editor     │ ──▶ │  Authenticated gateway  │ ──▶ │  File owner / sequencer │
-└─────────────────────────┘     └─────────────────────────┘     └─────────────────────────┘
+PROPOSED DESIGN — accepted edits share one durable order per file
 
-┌─────────────────────────┐     ┌─────────────────────────┐     ┌─────────────────────────┐
-│    SQL operation log    │ ──▶ │     Snapshot worker     │ ──▶ │   Object storage / CDN  │
-└─────────────────────────┘     └─────────────────────────┘     └─────────────────────────┘
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Editor clients           │edit / ACK  │ Gateway + access         │presence    │ Ephemeral presence       │
+│ Saved edit ID / file     │◀──────────▶│ Auth / join / route      │◀──────────▶│ Page / cursor / expiry   │
+│ Preview; reconcile ACK   │            │ Current file access      │            │ Replaceable updates      │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+                                                      ▲
+                                                      │
+                                                      │ edit / bootstrap
+                                                      │
+                                                      ▼
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Delivery gateways        │hint/replay │ Fenced file owner        │commit/read │ SQL file authority       │
+│ Authorized subscribers   │◀──────────▶│ Validate / order / ACK   │◀──────────▶│ Head / log / receipts    │
+│ Hint / resume / reset    │            │ Recover committed state  │            │ Epoch checked at commit  │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+              ▲                                       ▲                                       ▲
+              │                                       │                                       │
+              │ events / resume                       │ recover / version                     │ prefix / progress
+              │                                       │                                       │
+              ▼                                       ▼                                       ▼
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Receiving peers          │            │ Verified version store   │bytes/ready │ Snapshot workers         │
+│ Apply canonical effects  │            │ Scene / schema / hash    │◀──────────▶│ Read committed prefix    │
+│ Own viewport + preview   │            │ Verified named versions  │            │ Verify; publish manifest │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+
+Hints can be lost; recovery uses a verified snapshot and the retained committed suffix.
 ```
 
-The two rows show the interactive path and asynchronous snapshot path. The file owner writes the SQL log shown on the second row. A message broker can notify gateways of new committed sequences, but missed notifications are recovered from the log. Redis is suitable for expiring presence and routing hints; it is not the sole durable source of accepted edits.
+The owner commits an edit and receipt under the current fencing epoch before returning an ACK. Delivery gateways request missing sequences through the owner; notifications are hints, while SQL retains the committed suffix. Snapshot workers read an exact prefix, verify stored bytes, and publish their manifest/progress only after success. The owner uses that verified version and the retained log to recover. Redis is suitable for expiring presence and routing hints; it is not the sole durable source of accepted edits.
+
+A bounded account/file-scoped client journal can retain pending operation IDs and intents for reload recovery under an explicit local-storage policy. Reauthentication and current access precede displaying protected cached content. A document restore changes the generation: old pending work pauses for review instead of silently replaying into the restored scene. This extends short socket reconnection and is a proposed browser capability, not an implemented guarantee.
 
 ## Core Components / Request Flows
 

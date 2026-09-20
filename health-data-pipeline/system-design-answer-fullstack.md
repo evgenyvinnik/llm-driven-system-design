@@ -1,697 +1,392 @@
-# Health Data Pipeline - System Design Answer (Full-Stack Focus)
+# Health Data Pipeline — Fullstack System Design Interview
 
-*45-minute system design interview format - Full-Stack Engineer Position*
+> “I would build around one promise: the user can understand which measurements a report
+> includes and why its numbers changed. That promise connects device retries, aggregation
+> correctness, and the dashboard's state model.”
 
----
+This is a proposed production design for a 45-minute interview. It uses three deep dives and a
+drawable overview. The teaching implementation demonstrates parts of the flow, with a separate
+implementation boundary at the end.
 
-## 📋 Opening Statement (1 minute)
+## 🎯 Scope and user journey — 4 minutes
 
-"I'll design a health data pipeline like Apple Health, which collects metrics from multiple devices, deduplicates overlapping data, and generates actionable health insights while maintaining strict privacy. The key challenges are handling data from diverse sources with different formats, accurately deduplicating overlapping measurements from multiple devices, and protecting highly sensitive health information.
+I would clarify that the product helps someone review personal activity, sleep, and
+measurements from several devices. It is not intended to diagnose conditions or provide
+emergency monitoring.
 
-As a full-stack solution, I'll focus on the end-to-end data flow: from device sync APIs that handle unreliable mobile networks, through the aggregation pipeline that deduplicates and summarizes data, to the React dashboard that visualizes health trends. The integration points between frontend and backend - shared types, API contracts, and real-time sync status - are critical for a cohesive user experience."
+The main journey starts with a device collecting observations, possibly offline. When it
+reconnects, the server accepts a batch. The user later opens a dashboard, explores a metric,
+and checks whether a gap means no observations or processing delay.
 
----
+I would support an overview, a metric explorer, source status, and account controls. A device
+integration handles actual collection; a web registration form alone cannot make a wearable
+start sending measurements.
 
-## 🎯 Requirements Clarification (3 minutes)
+The initial scope includes corrections and deletion because they affect the core data model.
+Clinician sharing, advanced report builders, and clinical advice can remain outside the first
+design.
 
-### Functional Requirements
-- **Ingest**: Collect data from multiple devices (Apple Watch, iPhone, third-party)
-- **Process**: Aggregate, deduplicate, normalize data
-- **Store**: Persist with encryption in time-series database
-- **Query**: Fast access to historical data with caching
-- **Visualize**: Dashboard with charts, insights, and goal tracking
-- **Share**: Controlled data sharing with providers
+| Requirement | Why it shapes the system |
+|-------------|--------------------------|
+| Safe retry after lost response | Requires stable source and batch identities |
+| Several sources can overlap | Requires an explicit fusion policy |
+| Late arrivals can change old reports | Requires complete recomputation and versioned publication |
+| Missing data must be visible | Requires coverage in both API and chart model |
+| Account transitions must be private | Requires server authorization and browser state cleanup |
 
-### Non-Functional Requirements
-- **Privacy**: HIPAA-compliant, per-user encryption
-- **Reliability**: Zero data loss, idempotent ingestion
-- **Latency**: < 1s for dashboard queries, < 100ms for cached data
-- **Offline**: Cached data available when offline
+For discussion, assume one million active users and 1,500 samples per day each. That is about
+17,400 samples/second on average and 300 GB/day at an assumed 200 bytes per sample, before
+indexes and replication.
 
-### Scale Estimates
-- Millions of users with health data
-- ~1,500 samples per day per user
-- Years of historical data
-- Write-heavy: 90% writes, 10% reads
+I would aim for bounded batch acceptance under 500 ms at p95 and ordinary report publication
+within two minutes. Those are design targets, not measurements of the local prototype.
+Historical imports need a separate processing budget.
 
----
+## 🏗️ High-level architecture — 7 minutes
 
-## 🏗️ High-Level Architecture (5 minutes)
-
-```
-+----------------------------------------------------------+
-|                    React Frontend                         |
-|  Dashboard | Trends | Insights | Devices | Sharing        |
-+----------------------------------------------------------+
-                           |
-                    REST API + SSE
-                           |
-+----------------------------------------------------------+
-|                    Express Backend                        |
-|  +----------------+  +----------------+  +--------------+ |
-|  | Ingestion API  |  |   Query API    |  |  Admin API   | |
-|  | POST /sync     |  |  GET /summary  |  | GET /stats   | |
-|  +----------------+  +----------------+  +--------------+ |
-+----------------------------------------------------------+
-                           |
-          +----------------+----------------+
-          |                |                |
-          v                v                v
-+-------------+    +-------------+    +-------------+
-|  RabbitMQ   |    |   Valkey    |    | TimescaleDB |
-|  (queues)   |    |   (cache)   |    | (storage)   |
-+-------------+    +-------------+    +-------------+
-                           |
-                           v
-               +-------------------+
-               | Aggregation Worker|
-               | - Deduplication   |
-               | - Time Bucketing  |
-               | - Insights        |
-               +-------------------+
-```
-
-### Core Components
-
-| Component | Responsibility | Technology |
-|-----------|----------------|------------|
-| Ingestion API | Receive device sync, validate, store | Express + REST |
-| Query API | Serve aggregates, summaries, insights | Express + Valkey |
-| Aggregation Worker | Deduplicate, aggregate, generate insights | Node.js + RabbitMQ |
-| Dashboard | Visualize metrics, trends, insights | React + Recharts |
-| Device Sync | Handle offline/retry with idempotency | TanStack Query |
-
----
-
-## 🔗 Shared Types Strategy (3 minutes)
-
-### Type Contract Overview
+I would draw the upload path, the processing loop, and the browser boundary as one connected
+picture. The most important labels are “accepted” and “published.”
 
 ```
-+------------------+
-|  shared/types/   |
-|                  |
-| HealthDataType   |  <-- Enum: STEPS, HEART_RATE, WEIGHT, etc.
-| HealthSample     |  <-- Raw data from devices
-| HealthAggregate  |  <-- Pre-computed summaries
-| HealthInsight    |  <-- Generated recommendations
-| DailySummary     |  <-- Dashboard display format
-| METRIC_CONFIG    |  <-- Display names, units, goals
-|                  |
-+------------------+
-         |
-    +----+----+
-    |         |
-    v         v
-+-------+  +--------+
-|Backend|  |Frontend|
-|       |  |        |
-| Uses  |  | Uses   |
-| for   |  | for    |
-| API   |  | UI     |
-| logic |  | render |
-+-------+  +--------+
+┌────────────────────────┐        ┌────────────────────────┐        ┌────────────────────────┐
+│ Sync client + journal  │        │ Ingestion API          │        │ Durable raw store      │
+│ Saved batch/sample IDs │◀──────▶│ Validate / receipt     │◀──────▶│ Samples + outbox       │
+└────────────────────────┘        └────────────────────────┘        └────────────────────────┘
+                                                                                 ▲         ▲
+                                               ┌─────────────────────────────────┘         │
+                                               │                     committed work        │
+read complete bucket inputs                    │                                           │
+                                               ▼                                           ▼
+                                  ┌────────────────────────┐        ┌────────────────────────┐
+                                  │ Rollup workers         │        │ Dispatcher + queue     │
+                                  │ Dedup + full buckets   │◀──────▶│ Retry jobs by ID       │
+                                  └────────────────────────┘        └────────────────────────┘
+                                                         ▲
+                                                         │
+                                   guarded publication   │
+                                                         │
+                                                         ▼
+                                  ┌────────────────────────┐        ┌────────────────────────┐
+                                  │ Versioned rollups      │        │ Health query API       │
+                                  │ Coverage + policy      │◀──────▶│ Authorize every read   │
+                                  └────────────────────────┘        └────────────────────────┘
+                                                                              ▲
+                                                                              │
+ Responses include source coverage, bucket revision and processing status.    │
+                                                                              │
+┌─────────────────────────────────────────────────────────────────────────────┼──────────────┐
+│ BROWSER                                                                     │              │
+│                                                                             ▼              │
+│  ┌────────────────────────┐     ┌────────────────────────┐     ┌────────────────────────┐  │
+│  │ Charts + table         │     │ Report model           │     │ Query coordinator      │  │
+│  │ Values, gaps, context  │◀───▶│ Units / gaps / version │◀───▶│ Query / policy / rev   │  │
+│  └────────────────────────┘     └────────────────────────┘     └────────────────────────┘  │
+│                                                                                            │
+│   Range changes → identified reads; account changes → discard old data and requests.       │
+│                                                                                            │
+└────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Health Data Types
-
-| Type | Display Name | Unit | Aggregation | Goal |
-|------|--------------|------|-------------|------|
-| STEPS | Steps | steps | sum | 10,000 |
-| DISTANCE | Distance | meters | sum | - |
-| HEART_RATE | Heart Rate | bpm | average | - |
-| RESTING_HEART_RATE | Resting HR | bpm | average | - |
-| WEIGHT | Weight | kg | latest | - |
-| BODY_FAT | Body Fat | % | latest | - |
-| SLEEP_ANALYSIS | Sleep | minutes | sum | - |
-| ACTIVE_ENERGY | Calories | kcal | sum | 500 |
-| OXYGEN_SATURATION | SpO2 | % | average | - |
-| BLOOD_GLUCOSE | Glucose | mg/dL | average | - |
-
-### Sample Data Structure
-
-```
-+----------------------+
-|    HealthSample      |
-+----------------------+
-| id: UUID             |
-| userId: string       |
-| type: HealthDataType |
-| value: number        |
-| unit: string         |
-| startDate: ISO 8601  |
-| endDate: ISO 8601    |
-| sourceDevice: string |
-| sourceApp?: string   |
-| metadata?: object    |
-+----------------------+
-```
-
-### Aggregate Data Structure
-
-```
-+----------------------+
-|   HealthAggregate    |
-+----------------------+
-| type: HealthDataType |
-| period: hour/day/... |
-| periodStart: ISO8601 |
-| value: number        |
-| minValue?: number    |
-| maxValue?: number    |
-| sampleCount: number  |
-+----------------------+
-```
-
----
-
-## 📱 Deep Dive: Device Sync API (8 minutes)
-
-### End-to-End Sync Flow
-
-```
-+----------+     +-------------+     +-------------+     +-------------+
-|  Mobile  |     |   Backend   |     |   Valkey    |     | TimescaleDB |
-|   App    |     |    API      |     |   (cache)   |     |  (storage)  |
-+----------+     +-------------+     +-------------+     +-------------+
-     |                 |                   |                   |
-     | POST /sync      |                   |                   |
-     | X-Idempotency   |                   |                   |
-     |---------------->|                   |                   |
-     |                 |                   |                   |
-     |                 | Check idempotency |                   |
-     |                 |------------------>|                   |
-     |                 |                   |                   |
-     |                 | Key not found     |                   |
-     |                 |<------------------|                   |
-     |                 |                   |                   |
-     |                 | Validate samples  |                   |
-     |                 | Normalize units   |                   |
-     |                 |                   |                   |
-     |                 | Batch UPSERT      |                   |
-     |                 |---------------------------------------->|
-     |                 |                   |                   |
-     |                 | Store idempotency |                   |
-     |                 | key (24h TTL)     |                   |
-     |                 |------------------>|                   |
-     |                 |                   |                   |
-     |                 | Publish to queue  |                   |
-     |                 | for aggregation   |                   |
-     |                 |                   |                   |
-     | 200 OK          |                   |                   |
-     | synced: N       |                   |                   |
-     |<----------------|                   |                   |
-```
-
-### Idempotency Key Generation
-
-```
-+-------------------------------------------+
-|          Idempotency Key Sources          |
-+-------------------------------------------+
-|                                           |
-|  Client-Generated (preferred):            |
-|  +-------------------------------------+  |
-|  | SHA-256(samples content)            |  |
-|  |                                     |  |
-|  | Hash of:                            |  |
-|  | - sample types                      |  |
-|  | - timestamps                        |  |
-|  | - values                            |  |
-|  +-------------------------------------+  |
-|                                           |
-|  Server-Generated (fallback):             |
-|  +-------------------------------------+  |
-|  | userId + deviceId + batchContent    |  |
-|  +-------------------------------------+  |
-|                                           |
-+-------------------------------------------+
-
-Storage in Valkey:
-+---------------------------+
-| Key: idempotency:{hash}   |
-| Value: response JSON      |
-| TTL: 24 hours             |
-+---------------------------+
-```
-
-### Sample Validation Pipeline
-
-```
-For each sample in batch:
-
-+-------------+     +----------------+     +----------------+
-|   Receive   | --> | Type Validation| --> |Unit Conversion |
-|   Sample    |     | (is type known)|     | (to standard)  |
-+-------------+     +----------------+     +----------------+
-                           |                      |
-                     [Unknown type]          [Convert]
-                           |                      |
-                           v                      v
-                    +------------+        +---------------+
-                    | Add to     |        | Validated     |
-                    | errors[]   |        | sample ready  |
-                    +------------+        +---------------+
-```
-
-### Unit Conversion Examples
-
-| Input | Standard | Conversion |
-|-------|----------|------------|
-| miles → meters | meters | × 1609.34 |
-| km → meters | meters | × 1000 |
-| lbs → kg | kg | × 0.453592 |
-| °F → °C | °C | (°F - 32) × 5/9 |
-| hours → minutes | minutes | × 60 |
-
-### API Response Format
-
-```
-+----------------------------------+
-|      DeviceSyncResponse          |
-+----------------------------------+
-| synced: number   (success count) |
-| errors: number   (failure count) |
-| errorDetails?: [                 |
-|   { sample: {}, error: "..." }   |
-| ]                                |
-+----------------------------------+
-```
-
----
-
-## 📊 Deep Dive: Query API and Dashboard (8 minutes)
-
-### Query Endpoints
-
-| Endpoint | Purpose | Cache TTL |
-|----------|---------|-----------|
-| GET /users/me/summary?date= | Daily summary | 5 min |
-| GET /users/me/aggregates?types=&period=&start=&end= | Historical data | 5 min |
-| GET /users/me/insights | Unacknowledged insights | 1 min |
-
-### Cache Strategy Flow
-
-```
-+----------+     +-------------+     +-------------+     +-------------+
-|  React   |     |   Express   |     |   Valkey    |     | TimescaleDB |
-|  Query   |     |    API      |     |   (cache)   |     |  (storage)  |
-+----------+     +-------------+     +-------------+     +-------------+
-     |                 |                   |                   |
-     | GET /summary    |                   |                   |
-     |---------------->|                   |                   |
-     |                 |                   |                   |
-     |                 | Check cache       |                   |
-     |                 | summary:{user}    |                   |
-     |                 | :{date}           |                   |
-     |                 |------------------>|                   |
-     |                 |                   |                   |
-     |          [Cache HIT]          [Cache MISS]              |
-     |                 |                   |                   |
-     |                 v                   v                   |
-     |           Return cached       Query DB                  |
-     |                 |                   |------------------>|
-     |                 |                   |                   |
-     |                 |                   | Set cache (5 min) |
-     |                 |                   |<------------------|
-     |                 |                   |                   |
-     | JSON response   |<------------------|                   |
-     |<----------------|                   |                   |
-```
-
-### Dashboard Component Hierarchy
-
-```
-+--------------------------------------------------------+
-|                     Dashboard                           |
-|  +-----------------------------+  +-----------------+  |
-|  |      Date Navigation        |  | Sync Status     |  |
-|  | [< Prev] [Today] [Next >]   |  | [● Connected]   |  |
-|  +-----------------------------+  +-----------------+  |
-|                                                         |
-|  +--------------------------------------------------+  |
-|  |              Insights Banner (if any)             |  |
-|  | [!] Your heart rate trend is increasing...        |  |
-|  +--------------------------------------------------+  |
-|                                                         |
-|  Activity Section                                       |
-|  +---------------+ +---------------+ +---------------+  |
-|  | Steps         | | Distance      | | Calories      |  |
-|  | 8,245 / 10K   | | 6.2 km        | | 412 / 500     |  |
-|  | [=====>    ]  | | [========>]   | | [======>  ]   |  |
-|  +---------------+ +---------------+ +---------------+  |
-|                                                         |
-|  Vitals Section                                         |
-|  +---------------+ +---------------+ +---------------+  |
-|  | Heart Rate    | | Resting HR    | | SpO2          |  |
-|  | 72 bpm        | | 58 bpm        | | 98%           |  |
-|  | [avg today]   | | [trend: ↓]    | | [normal]      |  |
-|  +---------------+ +---------------+ +---------------+  |
-|                                                         |
-|  Body Section                                           |
-|  +----------------------+ +----------------------+      |
-|  | Weight               | | Sleep                |      |
-|  | 72.5 kg              | | 7h 23m               |      |
-|  | [trend: stable]      | | [last night]         |      |
-|  +----------------------+ +----------------------+      |
-+--------------------------------------------------------+
-```
-
-### React Query Configuration
-
-| Query Key | Stale Time | Refetch Strategy |
-|-----------|------------|------------------|
-| dailySummary | 5 min | On focus, on mount |
-| aggregates | 5 min | On focus |
-| insights | 1 min | On focus, on mount |
-| devices | 30 min | On focus |
-
-### Sync Status SSE Connection
-
-```
-+----------+              +-------------+
-|  React   |              |   Express   |
-|  Client  |              |    SSE      |
-+----------+              +-------------+
-     |                          |
-     | GET /sync-status         |
-     | Accept: text/event-stream|
-     |------------------------->|
-     |                          |
-     |   Headers:               |
-     |   Content-Type: text/    |
-     |   event-stream           |
-     |   Connection: keep-alive |
-     |                          |
-     |   data: {"syncing":true} |
-     |<-------------------------|
-     |                          |
-     |   data: {"syncing":false,|
-     |    "lastSync": "..."}    |
-     |<-------------------------|
-     |                          |
-     |   [Connection held open] |
-     |                          |
-```
-
----
-
-## 🔄 Deep Dive: Aggregation Worker (8 minutes)
-
-### Message Queue Job Structure
-
-```
-+--------------------------------+
-|     AggregationJob Message     |
-+--------------------------------+
-| userId: string                 |
-| sampleTypes: [STEPS, HEART_RATE] |
-| dateRange: {                   |
-|   start: "2024-01-15",         |
-|   end: "2024-01-15"            |
-| }                              |
-+--------------------------------+
-```
-
-### Aggregation Pipeline
-
-```
-+-------------+     +---------------+     +-------------+
-| Fetch Raw   | --> | Deduplicate   | --> | Aggregate   |
-| Samples     |     | by Priority   |     | by Period   |
-+-------------+     +---------------+     +-------------+
-                                                 |
-                    +----------------------------+
-                    |
-                    v
-+-------------+     +---------------+     +-------------+
-| Store       | --> | Invalidate    | --> | Generate    |
-| Aggregates  |     | Cache Keys    |     | Insights    |
-+-------------+     +---------------+     +-------------+
-```
-
-### Device Priority for Deduplication
-
-| Device Type | Priority | Rationale |
-|-------------|----------|-----------|
-| Apple Watch | 100 | Medical-grade sensors |
-| iPhone | 80 | Good sensors, always carried |
-| iPad | 70 | Less often carried |
-| Third-party wearable | 50 | Variable sensor quality |
-| Third-party scale | 40 | Single measurement type |
-| Manual entry | 10 | User estimates |
-
-### Deduplication Algorithm
-
-```
-Input: Samples sorted by device priority (highest first)
-
-For each sample:
-
-+---------------------------------------------------+
-|  Check overlap with covered time ranges           |
-+---------------------------------------------------+
-           |                    |                 |
-      [No Overlap]        [Partial Overlap]   [Full Overlap]
-           |                    |                 |
-           v                    v                 v
-    +-------------+    +----------------+   +-------------+
-    | Include     |    | Adjust value   |   | Skip sample |
-    | full sample |    | proportionally |   | (already    |
-    +-------------+    | (for sum       |   | covered)    |
-           |           | metrics only)  |   +-------------+
-           |           +----------------+
-           |                    |
-           v                    v
-    +--------------------------------------+
-    |  Add time range to covered ranges   |
-    +--------------------------------------+
-```
-
-### Overlap Detection Visual
-
-```
-Higher Priority Sample (Apple Watch):
-|======================|
-10:00               11:00
-
-Lower Priority Sample (iPhone):
-           |======================|
-          10:30               11:30
-
-Result:
-- 10:00-10:30: Covered by Watch (kept)
-- 10:30-11:00: Overlap (Watch takes precedence)
-- 11:00-11:30: No overlap (iPhone fills gap)
-
-For sum metrics (steps):
-- iPhone value × (remaining_time / total_time)
-- iPhone 1000 steps × (30min / 60min) = 500 steps
-```
-
-### Aggregation Strategy by Metric
-
-| Metric Type | Strategy | Hourly | Daily |
-|-------------|----------|--------|-------|
-| STEPS | sum | ✓ | ✓ |
-| DISTANCE | sum | ✓ | ✓ |
-| HEART_RATE | average | ✓ | ✓ |
-| WEIGHT | latest | - | ✓ |
-| SLEEP_ANALYSIS | sum | - | ✓ |
-| ACTIVE_ENERGY | sum | ✓ | ✓ |
-
-### Cache Invalidation After Aggregation
-
-```
-After storing new aggregates:
-
-+-------------------------------------------+
-|  For each affected date in range:         |
-|                                           |
-|  DEL summary:{userId}:{date}              |
-|                                           |
-|  This forces next query to:               |
-|  1. Miss cache                            |
-|  2. Query fresh aggregates from DB        |
-|  3. Re-populate cache                     |
-+-------------------------------------------+
-```
-
----
-
-## 🔐 Deep Dive: Share Token System (5 minutes)
-
-### Share Token Data Model
-
-```
-+----------------------------------+
-|          share_tokens            |
-+----------------------------------+
-| id: UUID (PK)                    |
-| user_id: UUID (FK)               |
-| recipient_email: string          |
-| data_types: [STEPS, HEART_RATE]  |
-| date_start: date                 |
-| date_end: date                   |
-| expires_at: timestamp            |
-| access_code: string (12 chars)   |
-| revoked_at: timestamp (nullable) |
-| created_at: timestamp            |
-+----------------------------------+
-```
-
-### Share Token Flow
-
-```
-+--------+     +-------------+     +-------------+     +--------+
-|  User  |     |   Backend   |     | TimescaleDB |     |Provider|
-+--------+     +-------------+     +-------------+     +--------+
-    |                |                   |                  |
-    | Create Share   |                   |                  |
-    | POST /tokens   |                   |                  |
-    |--------------->|                   |                  |
-    |                |                   |                  |
-    |                | Generate access   |                  |
-    |                | code (12 chars)   |                  |
-    |                |                   |                  |
-    |                | Store token       |                  |
-    |                |------------------>|                  |
-    |                |                   |                  |
-    | Return URL     |                   |                  |
-    | /shared/{code} |                   |                  |
-    |<---------------|                   |                  |
-    |                |                   |                  |
-    | Send link to   |                   |                  |
-    | provider       |                   |                  |
-    |------------------------------------------->|         |
-    |                |                   |                  |
-    |                | GET /data/{code}  |                  |
-    |                |<------------------------------------ |
-    |                |                   |                  |
-    |                | Validate token    |                  |
-    |                | (not expired,     |                  |
-    |                |  not revoked)     |                  |
-    |                |------------------>|                  |
-    |                |                   |                  |
-    |                | Fetch authorized  |                  |
-    |                | data only         |                  |
-    |                |<------------------|                  |
-    |                |                   |                  |
-    |                | Return filtered   |                  |
-    |                | health data       |                  |
-    |                |------------------------------------->|
-```
-
-### Share Modal UI
-
-```
-+----------------------------------------+
-|          Share Health Data             |
-+----------------------------------------+
-|                                        |
-| Recipient Email:                       |
-| +------------------------------------+ |
-| | doctor@hospital.com                | |
-| +------------------------------------+ |
-|                                        |
-| Data Types:                            |
-| +--------+ +-------+ +--------+        |
-| | Steps  | | Heart | | Weight |        |
-| |  [x]   | |  [x]  | |  [ ]   |        |
-| +--------+ +-------+ +--------+        |
-| +--------+ +-------+                   |
-| | Sleep  | | SpO2  |                   |
-| |  [x]   | |  [ ]  |                   |
-| +--------+ +-------+                   |
-|                                        |
-| Date Range:                            |
-| +----------------+ +----------------+  |
-| | Start: 1/1/24  | | End: 1/31/24   |  |
-| +----------------+ +----------------+  |
-|                                        |
-| Link Expires In:                       |
-| +------------------------------------+ |
-| | 30 days                        [v] | |
-| +------------------------------------+ |
-|                                        |
-| +----------------+ +----------------+  |
-| |    Cancel      | | Create Link    |  |
-| +----------------+ +----------------+  |
-+----------------------------------------+
-```
-
-### Token Validation Rules
-
-```
-Token is valid if ALL conditions met:
-
-+-------------------------------------------+
-| 1. access_code exists in database         |
-| 2. expires_at > NOW()                     |
-| 3. revoked_at IS NULL                     |
-+-------------------------------------------+
-
-Data access is restricted to:
-
-+-------------------------------------------+
-| 1. Only data_types in token               |
-| 2. Only dates within date_start/date_end  |
-| 3. Only daily aggregates (not raw samples)|
-+-------------------------------------------+
-```
-
----
-
-## ⚖️ Trade-offs and Alternatives (5 minutes)
-
-### Architecture Decisions
-
-| Decision | Chosen | Alternative | Rationale |
-|----------|--------|-------------|-----------|
-| Time-series DB | ✅ TimescaleDB | ❌ InfluxDB | SQL compatibility, can join with users/devices tables |
-| Aggregation | ✅ Pre-computed + queue | ❌ On-demand | Fast dashboard queries, background processing absorbs load |
-| Deduplication | ✅ Priority-based | ❌ Latest-wins | Apple Watch sensors more accurate; consistent behavior |
-| Sync | ✅ Batch with idempotency | ❌ Real-time streaming | Battery efficiency, network resilience, simpler retry logic |
-| Caching | ✅ Valkey with invalidation | ❌ React Query only | Shared cache across API instances, faster cold loads |
-| Charts | ✅ Recharts | ❌ D3.js | React-native, declarative API, good for time-series |
-
-### Full-Stack Trade-off: Shared Types
-
-| Approach | Pros | Cons | Decision |
-|----------|------|------|----------|
-| Monorepo with shared package | Single source of truth, TypeScript catches mismatches at build | More complex build setup | ✅ Chosen |
-| Separate type definitions | Independent deployments | Types can drift, runtime errors | ❌ Rejected |
-| Runtime validation only | Flexible schemas | No compile-time safety | ❌ Rejected |
-
-### Full-Stack Trade-off: Cache Invalidation
-
-| Approach | Pros | Cons | Decision |
-|----------|------|------|----------|
-| Backend-initiated invalidation | Cache always consistent after aggregation, fresh data | Slightly more complex worker | ✅ Chosen |
-| TTL-only caching | Simpler implementation | Stale data shown for TTL duration | ❌ Rejected |
-| Pub/sub invalidation | Real-time updates | Infrastructure complexity | ❌ Rejected |
-
-### Full-Stack Trade-off: Sync Feedback
-
-| Approach | Pros | Cons | Decision |
-|----------|------|------|----------|
-| SSE for status updates | Real-time, efficient long-polling | Persistent connection overhead | ✅ Chosen |
-| WebSocket | Bidirectional | Overkill for status-only | ❌ Rejected |
-| Polling | Simpler | Battery drain, delayed feedback | ❌ Rejected |
-
----
-
-## 🚀 Closing Summary (1 minute)
-
-"The health data pipeline is built as a cohesive full-stack system with three key integration points:
-
-**1. Shared Types** - TypeScript types for health samples, aggregates, and insights are shared between frontend and backend. The METRIC_CONFIG object defines display names, units, and aggregation strategies in one place. This catches API contract violations at build time.
-
-**2. Idempotent Sync** - The device sync API uses content-based idempotency keys that can be generated on both client and server. This enables safe retries on unreliable mobile networks while preventing duplicate data. Keys are hashed from sample content.
-
-**3. Cache Coordination** - The aggregation worker invalidates Valkey cache entries after computing new aggregates. React Query on the frontend respects staleTime for optimistic performance while the backend ensures cache consistency through explicit invalidation.
-
-The main trade-off is complexity for correctness:
-- Shared types require monorepo setup, but catch mismatches at compile time
-- Priority-based deduplication is more complex than last-write-wins, but ensures accurate step counts when users carry both iPhone and Apple Watch
-- Backend cache invalidation adds worker complexity, but guarantees users see fresh data after sync"
+Across the top, a sync client sends stable sample IDs and a batch key. Ingestion verifies the
+owner and source, then commits raw observations, a receipt, and an outbox entry together.
+
+The dispatcher delivers committed work to workers. Workers read the complete affected periods,
+apply the chosen source/metric policy, and publish guarded report versions. They do not assume
+that arrival order is measurement order.
+
+I would follow recovery across the return arrows:
+
+1. The sync client retains bounded batch/sample identities under its storage policy, reauthorizes, and resolves the original receipt after an uncertain upload.
+2. Workers retry identified bucket work, publish only against the current generation/epoch, and record completion or supersession before acknowledging it.
+3. A newer correction remains pending until its own report is published. The dashboard keeps acceptance, processing progress, and report coverage separate.
+4. Refresh the matching report on publication change, preserving units and gaps. The browser never reconstructs a new aggregate by adding received upload totals.
+
+The query API reads published rollups after checking current access. It includes coverage,
+policy, and processing status so the browser can explain what the numbers represent.
+
+Inside the browser, a query coordinator owns requests and their identity. A report model
+preserves units, gaps, and versions. Charts and the table render that same model, while range
+controls change the requested view.
+
+> “The browser does not need to know how many workers exist. It does need to know whether its
+> report includes an accepted upload and whether a late response still belongs to the current
+> account and range.”
+
+Initially, the API and query service could be modules in one application. The diagram shows
+responsibilities and failure boundaries, not a requirement to deploy every box as a
+microservice.
+
+I would place a user's raw data, receipt identities, and pending work on the same database
+shard. Time partitioning helps within that shard. Separate workers become useful because a
+long historical import should not occupy an interactive request.
+
+## 💾 Shared contracts and state ownership — 5 minutes
+
+I would define the few contracts that cross boundaries before discussing framework details.
+
+| Contract | Important fields | Responsibility |
+|----------|------------------|----------------|
+| Source sample | Owner/device, stable source ID/version, value/unit, interval | Preserve original evidence and correction identity |
+| Batch receipt | Scoped key, digest, per-item outcome, accepted time | Resolve uncertain retries |
+| Report | Metric/unit, bucket boundaries, coverage, policy, publication version | Explain derived data consistently |
+| Processing status | Accepted work and processed watermark | Distinguish upload progress from chart freshness |
+| Browser query | Account generation, metric, range, zone, resolution | Prevent stale results entering the current view |
+
+There are two deduplication questions. A repeated source ID should not create another
+observation. Two different IDs from a phone and watch may still cover the same activity. We
+need both identity checks and overlap policy.
+
+The database stores original units and normalized values separately. The report also retains
+the policy version, so changing source preferences does not make a historical number
+inexplicable.
+
+On the client, query results are remote state; open menus, focused points, and temporary
+selections are local UI state. Keeping those separate avoids a source-status refresh resetting
+the user's chart interaction.
+
+A small proposed API is enough:
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| POST | `/devices/:id/batches` | Accept a bounded owned batch |
+| GET | `/receipts/:id` | Read acceptance/processing state |
+| GET | `/reports` | Read a metric/range report with coverage and version |
+| GET | `/sources` | Explain source contribution and freshness |
+| POST | `/sessions/logout` | End the current server session |
+
+The repository uses different route names; these paths illustrate the proposed interaction.
+The essential design is in the ownership, retry, and report semantics rather than the spelling
+of each endpoint.
+
+## 🔧 Deep dive 1: A delayed upload, end to end — 8 minutes
+
+**Decision: acknowledge durable acceptance and expose report publication separately.**
+
+Suppose a watch was offline all morning. It reconnects at noon and sends observations for
+several earlier hours. The server commits the batch, but the response disappears when the
+network changes.
+
+The sync client retries with the same batch key and sample identities. Ingestion first checks
+device ownership, then looks up a receipt scoped to that owner and device. It compares a
+digest covering all relevant fields, including units and source versions.
+
+The same key and content returns the original acceptance result. The same key with changed
+content is a conflict. A global cache key would be unsafe because it could replay another
+user's response.
+
+The transaction records accepted raw versions, the final per-item receipt outcome, dirty
+period generations, and an outbox entry. Only after commit can the client safely stop retrying
+that batch.
+
+An outbox is important here. Writing SQL and then independently publishing a queue message has
+a gap: the process can crash after saving samples but before scheduling aggregation.
+
+| Approach | Pros | Cons |
+|----------|------|------|
+| ✅ Durable receipt and outbox | Safe uncertain retries; work survives process failure | Background processing and visible lag |
+| ❌ Aggregate everything within the upload request | Simple immediate happy path | Backfills hold requests; errors can follow committed data |
+| ❌ Cache the response after independent writes | Fast duplicate path | Does not close transaction or concurrency gaps |
+
+Now follow the lower half of the diagram. A worker reads complete affected periods, not just
+the newly uploaded start-time range. Otherwise replacing a daily row from one small batch
+could erase earlier contributions.
+
+New samples advance the desired bucket generation. A worker publishes only if its input
+generation is still current. This matters when an older job finishes after a newer one.
+
+On the browser, the source panel can now say “Upload received; reports updating.” The chart
+remains on the last published version with a clear processing status. It should not announce
+that the new total is final merely because upload succeeded.
+
+I would poll pending status while the page is active, with backoff and explicit refresh. When
+the published version changes, the coordinator fetches that report. A push channel is an
+option if a later requirement needs continuous updates, but it still requires
+resynchronization after reconnect.
+
+I would not optimistically add the batch's steps to the displayed total. Another source may
+already cover that interval, so adding before fusion can double count and then force a
+confusing rollback.
+
+> “The user gets immediate acknowledgment of a real fact—the upload is saved—without
+> pretending that the final chart is ready. The cost is a second progress state, which is
+> preferable to an unreliable single ‘synced’ label.”
+
+## 🔧 Deep dive 2: One report, consistent meaning — 8 minutes
+
+**Decision: the backend defines metric semantics and coverage; every frontend view preserves
+them.**
+
+Consider a phone reporting 90 steps over 90 minutes and a preferred source reporting 30 steps
+over the middle 30 minutes. Those are distinct observations, but simply adding them counts the
+middle interval twice.
+
+For interval totals, the policy subtracts the full union of preferred coverage from
+lower-priority intervals. It then splits the remaining fragments at report boundaries. A
+containing interval and multiple overlaps both need handling.
+
+Allocating an interval's total in proportion to uncovered duration assumes uniform activity.
+That is an estimate, so the report should preserve that qualification. The server cannot
+manufacture exact sub-interval counts from an aggregate measurement.
+
+The same arithmetic does not apply to every metric. If a heart-rate observation spans ten
+minutes and only five are selected, its value does not become half as many beats per minute.
+The chosen weighting changes; the physical rate does not.
+
+| Metric | Server responsibility | Frontend responsibility |
+|--------|-----------------------|-------------------------|
+| Steps | Resolve overlap and sum eligible contributions | Show total, coverage, and any estimation |
+| Heart rate | Define and preserve weighting | Display average/range with correct units |
+| Weight | Select latest eligible event timestamp | Show measurement time, not merely fetch time |
+| Sleep | Resolve eligible interval coverage | Show duration and source gaps explicitly |
+
+A latest-value policy needs timestamp ordering and a stable tie-breaker. Sorting by device
+priority and taking the last result does not necessarily select the newest observation.
+
+Likewise, a weekly heart-rate average cannot generally be the unweighted average of daily
+averages. A day with one measurement should not automatically carry the same weight as a day
+with hundreds.
+
+| Approach | Pros | Cons |
+|----------|------|------|
+| ✅ Semantic reports with coverage and policy versions | Same meaning across cards, charts, and clients | Richer data model and targeted policy tests |
+| ❌ Send numbers and let each view infer meaning | Small initial contract | Inconsistent totals, averages, and missing-data behavior |
+
+The browser should receive real bucket boundaries and an explicit reporting timezone. Changing
+the zone may change which observations belong to a day, so it creates a new report query
+rather than just different axis labels.
+
+A day can be shorter or longer around daylight-saving transitions. The backend computes
+half-open UTC boundaries from the reporting zone; the frontend displays the chosen zone and
+formats labels without discarding bucket identity.
+
+Missing observations should produce a gap or a clearly labeled incomplete bucket. Zero should
+mean a measured or otherwise explicitly supported zero. A sleep card must not turn missing
+input into “0 hours” by default.
+
+For performance, the API supplies bounded points at an appropriate semantic resolution. A
+year-long view does not require downloading every raw sensor sample. The selected resolution
+must remain visible in tooltips and summaries.
+
+Charts and an accessible data table should use the same report model. Keyboard selection, text
+labels, and non-color indicators make source/coverage information available without relying on
+hover or a particular color distinction.
+
+The trade-off is less freedom for each frontend to invent its own aggregation. That is a good
+constraint: the product should give the same answer whether someone reads a summary card,
+opens the table, or changes devices.
+
+## 🔧 Deep dive 3: Corrections and account-safe updates — 7 minutes
+
+**Decision: identify both server publications and browser requests, and reject obsolete work
+at each boundary.**
+
+There are two similar races. On the server, an old worker can publish after a newer one. In
+the browser, an old range request can return after a new selection. Finishing last does not
+make either result current.
+
+For workers, the input generation and policy/deletion epoch are checked atomically with
+publication. A correction dirties the union of old and new intervals. A deleted final sample
+must produce an explicit empty result, not leave an old aggregate untouched.
+
+If a screen needs hourly and daily values from one coherent update, the server publishes a
+report head pointing to the completed bundle. Otherwise it exposes per-bucket revisions and
+freshness. Independent writes should not be described as an atomic report.
+
+For the browser, a query key includes account, metric, range, timezone, and resolution. A
+response is stored under that identity, and the visible page subscribes only to its selected
+identity.
+
+Suppose the user chooses 90 days and immediately switches to 7 days. The 90-day response must
+not replace the current series while the controls still say “7 days.” Abort the old request
+when possible, but retain the identity check because cancellation is not guaranteed to stop
+completion.
+
+| Approach | Pros | Cons |
+|----------|------|------|
+| ✅ Version guards at publication and query boundaries | Rejects obsolete work explicitly | More lifecycle state to maintain |
+| ❌ Last response or worker wins | Easy assignment logic | Newer state can be replaced by older input |
+
+Account changes add a privacy boundary. On logout, advance an account generation, cancel
+requests, clear report/source caches, and remove derived chart state. Any late response from
+the old generation is discarded.
+
+Clearing a token alone is insufficient if global health state remains in memory. The next
+account could see a previous user's chart before its own request finishes, even when every
+backend endpoint is correctly authorized.
+
+Server caches also need current authorization before reuse. A versioned payload can remain
+immutable while the user's permission changes. Payload identity and access permission have
+different lifecycles.
+
+I would default to memory-only report caching and a secure same-origin browser session, with
+its corresponding request-forgery controls. Persistent offline health reports require a
+separate lifecycle decision about device sharing, revocation, keys, and deletion.
+
+A failed refresh can retain the last authorized report for the same query with an explicit
+stale state. It cannot retain another account's data as a loading placeholder. Authentication
+checking also needs its own initial state so routes do not redirect before verification
+completes.
+
+Corrections can legitimately lower a past total. The UI should preserve the user's range and
+focused date, update the published version, and make source inspection available. It should
+not treat all decreases as a failed upload.
+
+The cost is extra query and publication metadata. In return, the two halves of the product
+agree on what “current” means instead of relying on timing.
+
+## 📈 Scaling, operations, and verification — 3 minutes
+
+I would expect overlap resolution, backfills, and repeated period rebuilds to become expensive
+before ordinary dashboard rendering. Coalesce dirty work, bound accepted interval lengths, and
+give recent updates a separate queue budget from historical imports.
+
+Shard by user ownership when necessary, and use time partitions within each shard. Report
+queries should read compact projections. Adding replicas requires an explicit freshness rule
+before claiming a just-accepted upload is visible everywhere.
+
+On the frontend, bound point counts first, isolate subscriptions, and measure chart work on a
+representative phone. Route code splitting and data loading should have separate error
+boundaries.
+
+My key checks cross the service/browser boundary:
+
+- Lose a response after acceptance, retry, and confirm one logical sample effect.
+- Deliver a late overlapping batch and verify a complete corrected period.
+- Finish an old worker after a newer publication and reject its result.
+- Switch ranges or accounts while requests are in flight and reject obsolete responses.
+- Show missing, partial, accepted-but-pending, and published states consistently in chart and table.
+
+Operational metrics should separate capture delay, acceptance latency, oldest pending work,
+publication lag, query latency, and displayed report age. A single “last sync” metric hides
+the distinction between a disconnected source and a stalled worker.
+
+Retention must include raw observations, derived reports, caches, and deletion work. Expiring
+original data also limits which historical policies can be recomputed; the product should
+state that boundary.
+
+## ⚖️ Trade-offs and implementation boundary — 3 minutes
+
+| Decision | Chosen | Alternative | Reason |
+|----------|--------|-------------|--------|
+| Upload completion | ✅ Durable acceptance, then publication | ❌ One ambiguous synced flag | Explain retries and processing lag |
+| Metric meaning | ✅ Server semantic reports | ❌ Generic per-view aggregation | Keep cards, charts, and tables consistent |
+| Current state | ✅ Publication/query identities | ❌ Completion order | Prevent old work replacing new state |
+| Health cache | ✅ Authorized, account-scoped memory | ❌ Persistent global payloads | Make account lifecycle explicit |
+
+The local project contains Express, TimescaleDB, Valkey, React, Zustand, and Recharts. It
+performs aggregation inline and lacks the durable outbox, source-version registry, guarded
+publication, and report coverage contract in this proposal.
+
+Its source also shows incomplete overlap handling, narrow-range replacement of whole
+aggregates, stale query-cache keys, missing device ownership checks, and browser state that
+survives logout. Route components return fresh Promises; the documentation review did not
+verify browser navigation.
+
+Those findings explain why this answer emphasizes clear boundaries. They are documented with
+source references in [architecture.md](./architecture.md#implementation-notes); local commands
+and fixture limitations are in [README.md](./README.md).
+
+> “I would finish with the same journey I started with: a device uploads once logically, the
+> server publishes a traceable report, and the browser shows the right version to the right
+> account with honest gaps and freshness. Each box in the diagram exists to support that
+> journey.”

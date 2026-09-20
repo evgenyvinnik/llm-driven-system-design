@@ -51,24 +51,46 @@ appear within five seconds. These are design targets to test, not measured resul
 the learning project.
 
 ```
-┌──────────────┐        ┌─────────────────────────┐
-│ Browser      │───────▶│ Wiki / search API       │
-└──────────────┘        │ Session + permission    │
-                        └────────────┬────────────┘
-                                     │
-                 ┌───────────────────┴─────────────┐
-                 ▼                                 ▼
-     ┌───────────────────────┐         ┌───────────────────────┐
-     │ PostgreSQL            │         │ Search index          │
-     │ Pages / revisions     │         │ Derived results       │
-     │ Receipts / outbox     │         └───────────▲───────────┘
-     └───────────┬───────────┘                     │
-                 │                                 │
-                 ▼                                 │
-     ┌───────────────────────┐         ┌───────────┴───────────┐
-     │ Outbox publisher      │────────▶│ Queue / indexers      │
-     └───────────────────────┘         └───────────────────────┘
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Browser / clients      │       │ Wiki API modules       │       │ PostgreSQL authority   │
+│ Page or search request │◀─────▶│ Session + permission   │◀─────▶│ Pages / revisions      │
+└────────────────────────┘       │ Revision/tree commands │       │ Receipts, ACL, outbox  │
+                                 └────────────────────────┘       └────────────────────────┘
+                                              ▲                                │
+                                              │                                │
+                              search request  │             committed events   │
+                                              │                                │
+                                              ▼                                ▼
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Derived search index   │       │ Search coordinator     │       │ Outbox relay + queue   │
+│ Versioned documents    │◀─────▶│ Bounded candidates     │       │ Retained obligations   │
+│ No access authority    │       │ Current access check   │       │ Retries and event IDs  │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+             ▲                                                                 │
+             │                                                                 │
+             │                                               indexing work     │
+             │                                                                 │
+             │                                                                 ▼
+             │                                                    ┌────────────────────────┐
+             │                                                    │ Index workers          │
+             └───────────────────────────────────────────────────▶│ Ordered generations    │
+                                                                  │ Updates + tombstones   │
+                                                                  └────────────────────────┘
+
+Save/publication commit first; index visibility follows. Logical modules can share one API.
 ```
+
+A save reaches the relational authority through one authorization and revision check.
+Its transaction records the accepted snapshot, receipt and indexing obligation; the
+response does not wait for the search system. The lower path delivers versioned index
+changes. Search returns candidates through a coordinator that checks current access,
+so a stale index cannot grant permission or decide which revision was published.
+
+I would trace a failed save response back to its durable receipt, and a failed index
+update back to the worker's ordered generation and sink result. Repeating a derived
+update does not repeat the page transaction. Before returning a candidate's title or
+snippet, the search path rechecks current access and the permitted published revision;
+an index acknowledgement is evidence of projection progress, not permission to read.
 
 Redis supports sessions and cached immutable content. It is not the source of truth for
 a page's current revision. A CDN serves application assets; protected page responses

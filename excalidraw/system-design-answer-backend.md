@@ -53,25 +53,47 @@ separately.
 > and disposable presence, with different handling for each.”
 
 ```
-┌──────────────────────┐     ┌──────────────────────┐
-│ Browser collaborators│────▶│ Session / access API │
-└──────────┬───────────┘     └──────────┬───────────┘
-           │                           │
-           ▼                           ▼
-┌──────────────────────┐     ┌──────────────────────┐
-│ WebSocket gateway    │────▶│ Drawing authority    │
-└──────────────────────┘     └──────────┬───────────┘
-                                        │
-                                        ▼
-                             ┌──────────────────────┐
-                             │ PostgreSQL log/state │
-                             └──────────┬───────────┘
-                                        │
-                                        ▼
-                             ┌──────────────────────┐
-                             │ Snapshot workers     │
-                             └──────────────────────┘
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Browser collaborators  │       │ Access API / WS edge   │       │ Presence distribution  │
+│ Saved command identity │◀─────▶│ Auth / route / join    │◀─────▶│ Expiring observations  │
+└────────────────────────┘       │ Connection lifecycle   │       │ No durable edit status │
+                                 └────────────────────────┘       └────────────────────────┘
+                                              ▲
+                                              │
+                 command / durable outcome    │
+                                              │
+                                              ▼
+                                 ┌────────────────────────┐       ┌────────────────────────┐
+                                 │ Fenced drawing owner   │       │ PostgreSQL authority   │
+                                 │ Serialize group edits  │◀─────▶│ Scene / accepted log   │
+                                 │ Commit before ACK      │       │ Receipt, access, epoch │
+                                 └────────────────────────┘       └────────────────────────┘
+                                              ▲                                ▲
+                                              │                                │
+                         events / replay      │           snapshot + suffix    │
+                                              │                                │
+                                              ▼                                ▼
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Peer collaborators     │       │ Accepted event stream  │       │ Snapshot workers       │
+│ Canonical scene events │◀─────▶│ Retained log / replay  │       │ Exact covered sequence │
+│ Replay missing events  │       │ Bounded subscriber IO  │       │ Verified recovery base │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+
+One accepted order per drawing; geometry, style and text have explicit conflict boundaries.
 ```
+
+I would follow a command through authorization to one fenced drawing owner. Its SQL
+transaction binds the accepted sequence, scene change and receipt before acknowledgement.
+Committed events then reach peers, with retained replay and verified snapshots bounding
+recovery. The upper presence path can discard obsolete previews without losing an edit.
+Independent property groups let a move coexist with a recolor under the stated rules.
+
+I would follow a replacement owner through the return arrows:
+
+1. Acquire a new fenced epoch, load a verified snapshot and its committed suffix, and establish the recovered head before admitting commands.
+2. Resolve a retried operation against durable receipts under current access; the same identity must not create a second scene effect.
+3. Peer replay requests return through the owner to retained canonical history. A dropped delivery notification cannot erase an acknowledged command.
+4. Snapshot workers publish only verified content at an exact covered sequence; retire old log segments only when that recovery boundary is usable.
 
 The authority is a logical role, not necessarily a separate deployment on day one. One
 process can own many rooms. A routing layer maps a drawing to its owner. Adding processes

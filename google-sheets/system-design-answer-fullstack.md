@@ -1,353 +1,394 @@
-# Google Sheets Full-Stack — System Design Answer
+# Google Sheets — fullstack system design interview
 
-## 45–50 minute interview walkthrough
+> “I would follow one cell edit from the keyboard to durable storage and back to every
+> collaborator. The UI needs immediate feedback, the server needs one accepted order, and
+> formulas need to say which inputs their results came from.”
 
-| Segment | Focus | Time |
-|---|---|---:|
-| Requirements | Editing and collaboration promises | 4 min |
-| Architecture | Grid, sync service, formula workers, storage | 8 min |
-| Data model | Cells, operations, revisions, client viewport | 6 min |
-| Interfaces | REST, WebSocket, batch edits, resync | 8 min |
-| Deep dives | Virtualization, conflicts, formulas, undo | 20 min |
-| Trade-offs and close | Scale and rollout | 4 min |
+This is a proposed 45-minute interview design. I would draw the complete journey first and use
+three deep dives to connect frontend decisions with backend guarantees. It does not describe
+Google's internal implementation.
 
-## Opening — 2 minutes
+## 🎯 Requirements and scope — 5 minutes
 
-I am designing a collaborative spreadsheet. Users open a workbook, scroll through a very large grid, edit cells, paste ranges, calculate formulas, and see collaborators’ selections and changes.
+I would establish the collaboration unit before discussing infrastructure. In this version, a
+user edits a local cell draft, then commits a replacement value or a bounded rectangular
+paste. We are not merging individual keystrokes inside the same cell.
 
-The browser must render a bounded viewport and remain responsive while the backend persists operations and coordinates revisions. Formula results are derived state. Durable cell edits and document revisions are authoritative.
+A workbook contains multiple sheets and up to 200,000 populated cells, with 100 simultaneous
+editors as an initial limit. Formulas may reference cells in the same workbook, including
+another sheet. Paste is limited to 1,000 cells per atomic operation.
 
-## R — Requirements — 4 minutes
+The user should navigate a large grid, edit values and formatting, see collaborators,
+distinguish saved input from calculating results, and recover after a brief disconnect. Undo
+is conditional so it cannot silently erase someone else's later edit.
 
-### Clarifying questions
+I would defer row/column insertion, macros, external data functions, unrestricted offline
+merging, and full Excel compatibility. Structural changes require a reference-identity or
+transformation design beyond fixed-coordinate cell replacement.
 
-I would ask whether formulas must match a desktop spreadsheet, whether offline editing is required, and how many collaborators can edit one sheet. I will support common formulas, online collaboration, and saved local drafts before full offline mutation replay.
+| Concern | Proposed target / policy |
+|---------|--------------------------|
+| Interaction | Immediate draft and selection feedback within a 16 ms frame budget |
+| Initial load | Useful first viewport within two seconds at p95 on the reference fixture |
+| Save | Durable acknowledgement below 200 ms at p95 in the home region |
+| Collaboration | Canonical peer update below 300 ms at p95 under normal load |
+| Formulas | Ordinary recalculation below 500 ms at p95; expose lag and budget failures |
+| Availability | Reject writes when authority is unavailable; retain user intent |
 
-I would ask whether users can share a workbook with different permissions. I will assume viewer, commenter, and editor roles enforced by the server.
+For sizing, one million daily editors making 100 committed edits each gives approximately
+1,157 edits/second average and 11,600 at a tenfold peak. At 500 bytes per edit record, raw
+history grows by roughly 50 GB/day before replication and indexes.
 
-### Functional requirements
+These are planning assumptions. Browser cost depends on the viewport and local state, while
+backend risk often depends on the hottest single workbook rather than the fleet average.
 
-- Create workbooks and sheets.
-- Load a bounded viewport from a large logical grid.
-- Edit values, formulas, formatting, rows, and columns.
-- Paste a bounded range as one logical operation batch.
-- Recalculate dependent formulas.
-- Collaborate through durable edits and best-effort presence.
-- Undo and redo through the same revision protocol.
-- Share workbooks with scoped permissions.
+## 🏗️ High-level architecture and edit journey — 7 minutes
 
-### Non-functional requirements
-
-- Scroll and active-cell editing remain responsive.
-- Empty logical space does not allocate a two-dimensional browser array.
-- A reconnect cannot lose an acknowledged edit or apply an old calculation over a newer one.
-- Presence may be stale or dropped without affecting document correctness.
-- A large workbook opens through bounded reads.
-- Permission checks apply to every durable operation.
-
-### Out of scope
-
-I will not design the full formula language, external integrations, spreadsheet import formats, or a complete CRDT implementation. I will define the operation and calculation boundaries.
-
-## A — Architecture — 8 minutes
-
-### Combined architecture diagram
+I would draw the browser at the top, durable acceptance in the middle, and calculation/fanout
+below it. Then I would trace an edit in both directions.
 
 ```
-┌────────────────────────────────────────────────────────────────────────────┐
-│ React SPA                                                                   │
-│ routes: /workbooks · /workbooks/$id/sheets/$sheetId                       │
-│ authStore · workbookStore · sparseCellStore · gridStore · formulaStore     │
-│ viewport controller · virtual grid · formula bar · accessibility layer     │
-└──────────────────────────────┬─────────────────────────────────────────────┘
-                               │ HTTPS / WebSocket
-┌──────────────────────────────▼─────────────────────────────────────────────┐
-│ Workbook API and Collaboration Gateway                                      │
-│ viewport reads · permissions · operation batches · acknowledgements        │
-├───────────────────────┬───────────────────────┬────────────────────────────┤
-│ Document service       │ Sync service           │ Formula service            │
-│ snapshots · revisions │ ordering · replay      │ dependency graph · compute │
-├───────────────────────┴───────────────────────┴────────────────────────────┤
-│ Operation log · document store · snapshot store · presence broker           │
-└────────────────────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────────────────────────┐
+│ BROWSER                                                                                    │
+│                                                                                            │
+│  ┌────────────────────────┐     ┌────────────────────────┐     ┌────────────────────────┐  │
+│  │ Grid + editor          │     │ Workbook model         │     │ Sync + local journal   │  │
+│  │ Focus and local draft  │◀───▶│ Confirmed + pending    │◀───▶│ Ranges / saved op IDs  │  │
+│  └────────────────────────┘     └────────────────────────┘     └────────────────────────┘  │
+│                                                                     ▲       ▲              │
+│            ┌────────────────────────────────────────────────────────┘       │              │
+│            │    Pending appears now; saved requires a durable receipt.      │              │
+│            │                                                                │              │
+└────────────┼────────────────────────────────────────────────────────────────┼──────────────┘
+             │                                                                │
+             │                               HTTPS + WebSocket                │
+             │                                                                │
+             │                                                                ▼
+             │                    ┌──────────────────────────────────────────────────────────┐
+             │                    │ Workbook API + live gateway                              │
+  canonical  │                    │ Authorize workbook and sheet; bound each operation       │
+  events     │                    └──────────────────────────────────────────────────────────┘
+             │                                                                ▲
+  + calc rev │                                                                │
+             │                      edit intent / canonical receipt           │
+             │                                                                │
+             │                                                                ▼
+             │                    ┌──────────────────────────────────────────────────────────┐
+             │                    │ Workbook owner + PostgreSQL partition                    │
+             │                    │ Commit raw cells, revision, operation receipt and outbox │
+             │                    │ Serve immutable snapshots plus retained ordered edits    │
+             │                    └──────────────────────────────────────────────────────────┘
+             │                                            ▲                                ▲
+             │                                            │                                │
+             │                     recalculate / publish  │          committed events      │
+             │                                            │                                │
+             │                                            ▼                                ▼
+             │                    ┌────────────────────────┐        ┌────────────────────────┐
+             │                    │ Formula workers        │        │ Outbox + scoped fanout │
+             │                    │ Result batches by rev  │        │ Replay, then live      │
+             │                    └────────────────────────┘        └────────────────────────┘
+             │ events / resume                                                   ▲
+             └───────────────────────────────────────────────────────────────────┘
 ```
 
-### Frontend responsibilities
+The browser separates the active draft from confirmed cells and pending operations. The grid
+reads that model, while the coordinator owns network requests, connection generations, and
+recovery. Canonical events return through the coordinator before the model is rendered.
+
+The API checks identity, workbook/sheet access, and operation bounds. It routes writes to the
+workbook owner, which commits changes and recovery information in one PostgreSQL transaction.
+The same boundary handles WebSocket and HTTP bulk-edit commands.
+
+Formula workers consume committed revisions and publish complete result batches. An outbox
+relay delivers raw-edit and calculation events to gateways. Live transport is a latency
+optimization; durable receipts and history allow recovery after missed messages.
+
+Range reads come from immutable checkpoints plus retained edits at an identified revision. The
+browser fetches the visible portion instead of downloading a whole workbook. Presence is a
+separate disposable stream through the gateway, omitted from the durable-storage boxes to keep
+its role clear.
+
+I would walk through B4 changing from 10 to 20: the editor holds the draft, commit adds a
+pending operation, the server assigns a revision, and the receipt confirms that operation. A
+dependent total may update later with a separate calculation revision.
+
+I would then interrupt the connection:
+
+1. Preserve the bounded account/workbook journal under its storage policy, reauthorize, and resolve the original edit ID before resending or removing its overlay.
+2. Resume the ordered feed and matching range token, or explicitly reset to a new coherent snapshot when history has expired.
+3. Formula workers recover identified inputs and publish only complete batches. Acknowledged background progress does not turn an older result into the newest calculation.
+4. Reconcile raw edits and calculated results separately in the browser, keeping lag visible and unsubmitted text intact.
+
+The owner and data partition are scoped to a workbook because dependencies may cross sheets.
+We can initially co-locate the gateway, owner, and range reader; the diagram defines
+responsibilities before deployment boundaries.
 
-The shell owns workbook routing, tabs, toolbar, permissions, formula bar, keyboard commands, and announcements. The viewport controller computes visible rows and columns. The sparse store owns loaded cell records and local projections.
+## 💾 Shared data and interface contracts — 4 minutes
+
+| Concept | Browser responsibility | Server responsibility |
+|---------|------------------------|-----------------------|
+| Cell identity | Workbook, sheet, row, column | Validate membership and coordinate bounds |
+| Draft | Text, selection, composition state | No durable work until commit |
+| Pending edit | Operation ID, original payload, status | Deduplicate by actor, ID, and payload digest |
+| Canonical cell | Confirmed value, format, cell revision | Persist within the workbook commit order |
+| Range | Snapshot token and request generation | Return a coherent rectangle at its revision |
+| Formula result | Display input/result revisions and errors | Safe parser, bounded evaluation, complete batches |
+| Presence | Render names/cursors with expiry | Relay best-effort sheet-scoped updates |
+
+The durable model needs a workbook authority row, sheet metadata, cells, memberships, ordered
+operation history, receipts, outbox records, immutable snapshot chunks, and calculation
+batches. Current cell rows optimize writes; checkpoints and history support coherent
+historical reads.
+
+| Interface | Required behavior |
+|-----------|-------------------|
+| Metadata and range reads | Authenticate, scope, return revision/token and expiry |
+| Edit submission | Stable operation ID, bounded changes, explicit outcome |
+| Operation lookup/retry | Recover original acceptance after a lost response |
+| Resume subscription | Replay missing revisions, then follow live events |
+| Formula result event | Identify input revision, engine version, complete batch |
+| Undo | Verify the affected cells still match the original operation's versions |
+
+Both ends validate message shape and scope. A late response from an old workbook must be
+rejected by the client even if it is a valid response to an earlier request. Server
+authorization remains mandatory regardless of those client checks.
+
+## 🔧 Deep dive: a responsive grid that preserves intent — 8 minutes
+
+> “I would optimize the amount of work per interaction, not just the number of DOM nodes.
+> Virtualization is useful only if editing and state updates also stay bounded.”
+
+### Separate viewport, data, and editor lifetimes
+
+The grid computes visible row and column intervals and renders their Cartesian product with
+modest overscan. For example, 35 visible rows and 15 columns mean about 525 cells before
+overscan. A spreadsheet needs horizontal virtualization as well as vertical virtualization.
+
+A geometry model owns row heights, column widths, and prefix offsets. Headers, cells,
+selections, and collaborator cursors use the same coordinates. A resize invalidates the
+relevant geometry while preserving the user's scroll anchor.
+
+Data arrives in bounded range tiles. Evicting an offscreen canonical tile is safe if it can be
+fetched again; evicting a pending edit is not. Unloaded data remains explicitly unknown, so a
+blank loading tile cannot be mistaken for an empty saved range.
+
+The editor uses a stable native input overlay, or pins its virtual cell while editing.
+Scrolling must not unmount the input and lose an unfinished draft. Keyboard navigation and
+text editing are separate modes, and composition Enter must not also commit the cell.
+
+I would use cell-level selectors and keep typing in the draft state. Replacing a workbook-wide
+Map on every keystroke would turn a local interaction into repeated whole-model work even with
+a virtualized DOM.
+
+### Account for another user editing the same cell
+
+While I type 20 into B4, another user may save 30. The confirmed layer records 30, but my
+draft remains intact. The UI indicates that the underlying cell changed. Saving my draft is a
+new explicit replacement, resolved by server commit order.
+
+If I submit 20 and then 40 quickly, the receipt for 20 must not clear the pending 40. The
+browser removes only the operation identified by that receipt and reprojects the remaining
+pending operations over canonical state.
+
+When an operation is rejected, the UI retains enough information to recover the user's input
+and explain the reason. It does not silently repaint the previous value and leave the user
+guessing whether the edit was lost.
 
-The grid renderer mounts only visible cells plus overscan. A stable editor overlay preserves focus while cells recycle. A formula worker computes derived values but does not own raw document truth.
+### Preserve keyboard and accessible behavior
 
-### Backend responsibilities
+I would provide grid/row/cell semantics, logical indices for virtualized rows and columns, and
+a deliberate focus model. Navigation renders the target cell before moving focus; editing
+hands caret keys to the native input. The [WAI-ARIA grid
+pattern](https://www.w3.org/WAI/ARIA/apg/patterns/grid/) provides the relevant interaction
+guidance.
 
-The document service stores canonical sheet metadata, cell operations, formatting, and revisions. The sync service broadcasts accepted operations and supports reconnect replay. The formula service or worker fleet calculates dependent values against a revisioned snapshot.
+The formula bar identifies the active coordinate and raw input. Save failures are announced;
+remote cursor movement is not announced on every message. Names supplement colors so
+collaborator identity is not color-only.
 
-### Edit flow
+| Approach | Strength | Cost |
+|----------|----------|------|
+| ✅ Virtualized DOM + stable editor | Native input and accessible structure, bounded viewport work | Geometry and selective subscriptions need care |
+| ❌ Canvas as the initial default | Efficient custom drawing at high visible density | Additional text-input, hit-testing, and accessibility systems |
 
-1. The user edits a cell in a stable overlay.
-2. The client applies a local projection and creates an operation ID.
-3. The sync client sends the operation with base revision and permission context.
-4. The server validates and sequences it.
-5. The acknowledgement includes canonical cell state and new revision.
-6. Collaborators receive the operation through WebSocket.
-7. Formula calculation produces revision-tagged derived updates.
+Canvas is a possible later response to measured rendering limits. It does not solve
+pending-operation reconciliation or data memory. I would accept some DOM overhead to make the
+initial editing contract reliable and accessible.
 
-## D — Data Model — 6 minutes
+## 🔧 Deep dive: what “saved” means across a disconnect — 8 minutes
 
-### Server entities
+> “The acknowledgement is a statement about a database commit. A socket opening, a local
+> optimistic update, or a successful Redis publish is not that statement.”
 
-| Entity | Important fields | Authority |
-|---|---|---|
-| `Workbook` | ID, owner, permissions, revision | document service |
-| `Sheet` | ID, workbook, dimensions, metadata | document service |
-| `CellRecord` | sheet, row, column, raw value, formula, format | document service |
-| `Operation` | ID, author, base revision, patch, sequence | operation log |
-| `Snapshot` | workbook, revision, sparse chunks | snapshot store |
-| `FormulaResult` | cell, computed value/error, source revision | formula service |
-| `Presence` | user, cursor, selection, expiry | presence channel |
+### One atomic acceptance boundary
 
-### Client entities
+The owner validates access and bounds, then checks the workbook's owner epoch under a short
+database transaction. It finds or creates the actor-scoped operation receipt, applies the raw
+cell changes, increments the workbook revision, and inserts history and outbox records
+atomically.
 
-| Entity | Owner | Lifetime |
-|---|---|---|
-| `ViewportState` | grid controller | route/session |
-| `CellStore` | sparse store | loaded range |
-| `SelectionState` | UI store | current sheet |
-| `PendingOperation` | sync queue | until ack/conflict |
-| `FormulaProjection` | worker/store | revision-scoped |
-| `UndoEntry` | history manager | bounded session/history |
+An identical retry returns the original receipt. Reusing the ID with a different payload is
+rejected. A paste is a bounded all-or-nothing operation, and HTTP and WebSocket commands share
+this logic.
 
-The raw value and formula are separate from computed value and formatting. A blank unloaded cell is not the same as a loaded empty cell. Range reads carry revision and coordinate bounds.
+This matters when A sets B4 to 10, B sets it to 20, and A's delayed retry arrives. A blind
+UPSERT would restore 10. A stored receipt answers A without applying it again, preserving B's
+later accepted value.
 
-### Operation semantics
+The authority check also prevents split ownership. If an old owner wakes after failover, its
+epoch is rejected inside the write transaction. Ownership transfer and edits coordinate on the
+same authority row, so a Redis lease expiration alone cannot authorize conflicting database
+writes.
 
-Operations have stable IDs, a base revision, an author, a semantic type, and a bounded payload. Accepted operations receive a document sequence. A reconnect can request operations after the last acknowledged sequence or obtain a canonical snapshot when replay is unavailable.
+### Keep the browser's states honest
 
-### Formula semantics
+| State | Meaning to the user |
+|-------|---------------------|
+| Draft | Input exists locally and has not been submitted |
+| Pending | Submitted intent has no known durable outcome yet |
+| Saved | A canonical event or receipt confirms this operation |
+| Calculating | Raw input is saved; formula results are behind |
+| Disconnected | New server acceptance cannot be assumed |
+| Rejected | Access, validation, or a conditional operation failed |
 
-Formula results are derived by source revision. A worker result for an old revision cannot overwrite a newer local or server revision. Formula errors are values in the derived model, not mutations to raw content.
+A bounded local journal can preserve pending intent across a browser crash, scoped to account
+and workbook. It is still not proof of server acceptance. If storage is unavailable, the UI
+describes that intent as memory-only.
 
-## I — Interfaces — 8 minutes
+On reconnect, the client retries known operation IDs and resumes from its last applied
+revision. A new connection generation invalidates callbacks from the old socket. New
+collaborative commits wait until the session is synchronized and authorization is current.
 
-### REST API
+### Reconcile snapshot and live state
 
-```
-GET  /api/v1/workbooks                         → visible workbooks
-GET  /api/v1/workbooks/:id                    → metadata, sheets, permissions
-GET  /api/v1/workbooks/:id/sheets/:sheetId/range → bounded cell range
-POST /api/v1/workbooks/:id/operations          → batch edit command
-POST /api/v1/workbooks/:id/resync              → snapshot and revision
-POST /api/v1/workbooks/:id/undo                → inverse operation command
-PATCH /api/v1/workbooks/:id/permissions        → share policy
-```
+The server issues a token for a checkpoint plus replay horizon R. The browser installs ranges
+at R while buffering later events. It then applies those events in order, retaining any
+unresolved local overlay.
 
-### WebSocket API
+If revision 84 arrives after 82, it asks for 83 instead of declaring the workbook current. If
+the retained history or token has expired, it obtains a new snapshot and resolves pending IDs
+separately. A full reload without that step could lose user intent or resubmit it as a new
+operation.
 
-```
-CONNECT /api/v1/workbooks/:id/stream
-JOIN    sheet:<sheetId>
-EVENT   operation { sequence, operation }
-EVENT   acknowledgement { operationId, revision }
-EVENT   presence { user, cursor, expiresAt }
-EVENT   resync-required { revision, reason }
-```
+The outbox survives a crash between database commit and notification. Delivery can repeat, so
+clients and gateways deduplicate and fill gaps. Slow clients have bounded buffers; presence is
+dropped first, then durable state falls back to replay or resynchronization.
 
-Presence is lossy and expires. Operations are durable, ordered, and replayable. They may share a connection but not a state machine.
+| Approach | Strength | Cost |
+|----------|----------|------|
+| ✅ Durable receipt/history + pending overlay | Immediate UI and recoverable acceptance | More explicit protocol and recovery states |
+| ❌ Broadcast after an ordinary write | Small implementation for a local demo | Lost responses and missed events leave ambiguous state |
 
-### Frontend interfaces
+The cost is a more involved coordinator and retention policy. I accept it because brief
+network changes are normal. Making users manually reload until two windows happen to agree is
+not a reliable save contract.
 
-| Boundary | Input | Output |
-|---|---|---|
-| Viewport controller | scroll, metrics | visible coordinate window |
-| Grid renderer | cell snapshots, selection | semantic grid and layers |
-| Formula worker | operations, graph, revision | derived values/errors |
-| Sync client | operation batch | ack, remote op, conflict |
-| Cell editor | coordinate, raw value | commit/cancel intent |
-| History manager | operation result | inverse command |
+Conditional undo uses the same command boundary. If a collaborator changed a cell after the
+original operation, the inverse is rejected rather than silently overwriting that later edit.
 
-### Error contract
+## 🔧 Deep dive: saved inputs and trustworthy formula results — 7 minutes
 
-The server distinguishes permission denied, invalid cell operation, stale revision, operation duplicate, resync required, formula unavailable, and transient storage failure. The client preserves local edits for conflicts and never marks a failed operation as acknowledged.
+> “A calculated value needs an input revision. Otherwise a fast-looking total can be wrong
+> even when every individual cell edit was saved correctly.”
 
-## O — Optimizations and Deep Dives — 20 minutes
+### Bound the formula language
 
-### Deep dive 1: Two-dimensional virtualization
+The server parses a supported spreadsheet grammar into an expression tree and dependency
+model. It recognizes same-workbook references, including cross-sheet references, and detects
+cycles. Arbitrary JavaScript, external requests, and macros are excluded.
 
-The browser calculates visible row and column ranges from scroll position and measured sizes. It renders their intersection plus bounded overscan. Frozen rows and columns use the same coordinate system to avoid scroll drift.
+Formula limits cover nesting, referenced ranges, dependency count, memory, and runtime. A
+large range needs an efficient range-dependency representation or a clear size rejection;
+expanding every coordinate into an object is not automatically scalable.
 
-Rendering every populated cell still fails when a sheet has a dense million-cell region. A canvas-only grid reduces DOM count but complicates focus and screen readers. I choose a hybrid semantic grid with a bounded DOM and renderer adapters where profiling justifies them.
+A worker evaluates a pinned input revision in dependency order. Expensive evaluation happens
+outside the raw-edit transaction so it cannot hold the workbook lock or block the gateway's
+event loop.
 
-### Deep dive 2: Sparse storage and viewport reads
+### Publish a coherent result
 
-A sparse coordinate map stores only populated cells and loaded metadata. The server returns bounded ranges rather than a full workbook. Row and chunk indexes make visible range iteration efficient.
+The worker stages a complete result batch tagged with input revision and engine version. The
+database atomically publishes the completed batch pointer and its outbox event. A slow older
+job cannot move the published calculation revision backward.
 
-The trade-off is more complicated range lookup and dependency fetch. The alternative full snapshot is easier for offline formulas but creates memory, startup, and permission costs. A snapshot plus viewport chunks can be introduced when offline support requires it.
+The workbook may have raw revision 81 and calculation revision 79. The UI can truthfully say
+the input is saved while showing the prior result as calculating. It must not label that
+result as derived from 81.
 
-### Deep dive 3: Formula workers and revision guards
+If results arrive in chunks, the client stages them and switches the relevant visible batch
+when complete. Unknown or missing data is a loading/error state, not a reason to silently mix
+result versions.
 
-The worker receives an immutable operation batch or dependency snapshot and returns computed values tagged with the source revision. The client accepts results only when the revision is still current.
+Continuous edits should not cancel every calculation forever. The scheduler coalesces obsolete
+queued work, lets bounded work make progress, and follows with the latest required revision.
+Workbooks that exceed budgets receive explicit errors or limits.
 
-The alternative is calculate on the main thread. It has simpler access to state but freezes typing and scrolling when a paste causes a large dependency cascade. Worker serialization and cancellation are worth the complexity for formula-heavy sheets.
+### Why the browser is not the authority
 
-### Deep dive 4: Collaboration and conflicts
+The browser only loads its viewport. A formula can depend on thousands of offscreen cells or
+another sheet, so missing local data cannot be treated as zero. Fetching the entire dependency
+closure might also overwhelm the browser.
 
-The server sequences operations per workbook or sheet partition. A client applies a local projection, then reconciles the acknowledgement. A conflict includes canonical state and the rejected base revision. The client can rebase disjoint edits or ask the user to review the affected cells.
+A local worker could later preview a restricted formula whose dependencies are all present.
+That preview uses a matching engine version and remains provisional. Worker execution alone
+does not make arbitrary input a safe formula language.
 
-Last-write-wins is acceptable for some independent formatting fields but dangerous for a formula or value where the user needs to know an edit was replaced. Operation semantics and visible conflict state are more important than pretending conflicts do not exist.
+| Approach | Strength | Cost |
+|----------|----------|------|
+| ✅ Server calculation with input revisions | Shared authoritative inputs despite partial browser loading | Network dependence and visible calculation lag |
+| ❌ Each browser calculates independently | Fast for a small fully local workbook | Incomplete dependencies and version drift across collaborators |
 
-### Deep dive 5: Undo and redo
+Synchronous server calculation is another option for tiny bounded sheets. For this workload,
+it would couple expensive dependency chains to edit latency. I prefer saved raw inputs plus
+clearly identified asynchronous results.
 
-Undo sends an inverse operation through the normal permission and revision path. It does not directly mutate local state. A drag or paste can group many low-level changes into one user-facing history entry while still recording a bounded batch.
+This is the same contract across layers: the server publishes a revisioned result, the
+coordinator accepts it monotonically, and the grid communicates its freshness instead of
+hiding it.
 
-If the inverse is stale, the server rejects it and the client marks the history entry conflicted. Direct local mutation would feel fast but could overwrite another collaborator’s work without audit.
+## 📈 Scaling and verification — 4 minutes
 
-### Deep dive 6: Presence versus durable edits
+Independent workbooks scale across owner/database partitions. Gateways scale by active
+connections and delivery volume; workers scale by formula cost. A hot workbook and a long
+dependency chain still have serial bottlenecks, so admission limits and dedicated capacity
+come before splitting one workbook's consistency domain.
 
-Cursor and selection updates are best effort. They use throttling, expiry, and no durable replay. An edit operation carries sequence and must be persisted before the server confirms it.
+Frontend scaling requires bounded range caches, selective subscriptions, and controlled
+geometry work. Presence has a separate budget and can be sampled. A shared rendering store
+should not rerender every cell whenever one cursor moves.
 
-Combining both as generic events makes a slow presence consumer block edits or makes the system retain too much cursor traffic. Separate channels or message classes preserve the distinct consistency requirements.
+I would verify the design through end-to-end failure scenarios:
 
-### Deep dive 7: Failure matrix
+1. Lose the receipt after a committed edit; reconnect returns its original revision.
+2. Deliver an old receipt after a newer local edit; the pending overlay remains correct.
+3. Pause an owner through failover; its stale epoch cannot write.
+4. Deliver a live edit before initial range data; the range does not overwrite the edit.
+5. Finish an old formula job last; published calculation freshness does not regress.
+6. Undo after another user changed the cell; the system reports a conflict.
 
-| Failure | Backend behavior | Frontend behavior |
-|---|---|---|
-| Range read fails | bounded retryable error | preserve selection |
-| Operation timeout | command remains queryable | pending edit state |
-| Revision conflict | reject with canonical state | review/rebase |
-| Formula worker fails | recompute or mark unavailable | formula status badge |
-| Socket gap | request resync | stale collaboration banner |
-| Presence loss | expire cursor | durable edits continue |
-| Permission revoked | reject future operations | read-only route |
+Measure input-to-paint, mounted cells, range bytes, pending age, commit latency, owner queue
+depth, replay gaps, outbox age, and calculation lag. A page-load smoke test alone says little
+about these guarantees.
 
-## Capacity, rollout, and review checkpoints
+For cross-region recovery, I would state the database replication and data-loss policy rather
+than casually promise zero-loss failover. An asynchronous replica can be behind acknowledged
+writes.
 
-### Capacity assumptions
+## 🧭 Close and implementation comparison — 2 minutes
 
-I would test a sparse million-coordinate sheet, a dense pasted range, a formula-heavy region, several collaborators, and a reconnect during editing. The full-stack budget includes viewport latency, DOM work, operation sequencing, formula fan-out, snapshot recovery, and presence bandwidth.
+> “The design connects responsiveness to correctness: the browser preserves intent, the
+> database records one accepted order, and formula results identify the inputs they
+> represent.”
 
-### What I would measure
+The local project has a virtualized React grid, Zustand, SQL cell persistence, and one-process
+WebSocket collaboration. It loads only the first sheet, ignores edit ACK/errors and incoming
+sheet IDs, and has no reconnect, durable journal, workbook revisions, history replay, or owner
+fencing.
 
-- Scroll frame rate and active-cell latency.
-- Range-read latency and visible cell count.
-- Operation acknowledgement and conflict rate.
-- Formula worker queue and server recalculation duration.
-- Socket lag, replay, and resync duration.
-- Snapshot age and recovery time.
-- Presence update rate and dropped messages.
+Redis publication is not connected to a subscriber path. Formula handling supports literal
+examples and unrestricted JavaScript fallback, not cell references or dependent recalculation.
+REST edits bypass calculation and live publication. These limitations are documented rather
+than silently represented as production guarantees.
 
-### Rollout sequence
-
-1. Ship workbook metadata and bounded read-only range reads.
-2. Add sparse cell store, selection, and stable editing overlay.
-3. Add ordered operations and acknowledgements.
-4. Add formula worker with revision guards.
-5. Add collaboration replay and separate presence.
-6. Add paste batches, inverse undo, and offline drafts.
-
-### Alternative architecture review
-
-Rendering every cell is simple but fails on large sheets. A canvas-only renderer bounds DOM cost but makes focus and accessibility difficult. A hybrid virtual grid keeps semantics while allowing specialized render layers.
-
-Full-document saves simplify the server but create large writes and coarse conflicts. Operation batches cost protocol and snapshot work but support collaboration, undo, and bounded recovery.
-
-An iframe per sheet isolates crashes but breaks workbook-level keyboard and formula-bar coordination. A worker is the right boundary for formulas; a module contract is enough for cell renderers.
-
-### Full-stack interview checkpoints
-
-I trace a paste from the stable editor through batch validation, operation sequencing, formula recalculation, acknowledgement, and collaborator broadcast.
-
-I explain why a worker result carries revision and why presence can be dropped without affecting the edit.
-
-I close by returning to bounded rendering, exact revision semantics, and permission checks on every operation.
-
-## Scalability and operations
-
-Partition operation streams by workbook or hot sheet. Snapshot periodically so recovery does not replay unlimited history. Use chunked storage for sparse cells and analytical storage for version history or audit queries.
-
-The first browser bottleneck is visible cell rendering. The first backend bottleneck is hot-sheet operation sequencing and formula fan-out. The first operational risk is snapshot and log divergence. Metrics must measure all three.
-
-## Security and observability
-
-Every range read and operation checks workbook permissions. Shared links are scoped and revocable. Formula functions are allowlisted; external fetches or scripts are not executed by the calculation worker.
-
-Metrics include range latency, visible cell count, active-cell latency, operation acknowledgement, queue depth, formula duration, conflict rate, resync duration, and snapshot age. Logs carry workbook and operation IDs without cell contents.
-
-## Testing and correctness review
-
-I would test coordinate virtualization, stable editor focus, large paste batching, formula revision races, operation retry, reconnect replay, undo after a remote edit, and permission downgrade.
-
-Backend tests verify operation ordering, snapshot recovery, formula result revision, and presence isolation. Browser tests verify scroll performance, keyboard navigation, stale calculation suppression, and visible conflict state.
-
-The acceptance criteria are bounded DOM work, no lost acknowledged operations, no old formula result overwriting a new edit, and presence that never blocks saving.
-
-## Implementation sequence
-
-1. Build bounded workbook and viewport reads.
-2. Add sparse client state, selection, and stable editing overlays.
-3. Add operation IDs, revisions, acknowledgements, and retries.
-4. Add formula worker results tagged by revision.
-5. Add WebSocket replay and separate presence.
-6. Add paste batches, inverse undo, and offline drafts.
-
-The sequence protects the main thread and document correctness before introducing broader collaboration or formula compatibility.
-
-## Interview walkthrough: one collaborative paste
-
-The stable editor normalizes a range into one bounded operation batch. The client applies a local projection and sends operation ID plus base revision. The server authorizes, sequences, persists, and acknowledges it.
-
-The formula worker receives the new revision and returns derived values tagged with that revision. Collaborators receive the durable operation; presence remains separate. A reconnect requests operations or a canonical snapshot.
-
-This scenario demonstrates why viewport rendering, sparse storage, formulas, collaboration, and undo cannot share one undifferentiated state model.
-
-## Further design decisions
-
-The client keeps raw input, computed value, formatting, and remote revision separate. A formula error is a derived result, not a destructive cell mutation.
-
-The server can return a viewport range with a revision and dependency hints. The client never treats an unloaded cell as an empty value when a formula depends on it.
-
-The operation queue uses stable IDs through retries. An acknowledgement includes canonical state so local projections converge without rewriting unrelated visible cells.
-
-The grid, formula worker, and sync client are separate module boundaries but share workbook context and keyboard focus. An iframe would damage those interactions without adding useful trust isolation.
-
-The production review asks whether every old revision is rejected safely, whether snapshots can rebuild a sheet, and whether a presence outage leaves editing unaffected.
-
-### Final questions
-
-- What is raw versus derived?
-- What survives a reconnect?
-- Can formula results be stale?
-- How is undo authorized?
-- Can presence block edits?
-
-The answers should point to revision-tagged formulas, durable operations, snapshots, and an ephemeral presence path.
-
-### Launch gate
-
-The launch gate is bounded viewport work, stable editor focus, revision-safe calculations, durable operation retry, and presence that never blocks edits.
-
-I would not launch full offline collaboration until snapshot and operation replay are proven under reconnect tests.
-
-### Final handoff
-
-- Viewport state bounds browser work.
-- Operations and revisions protect document truth.
-- Formula results are derived and revision-tagged.
-- Presence never blocks a durable edit.
-
-## Trade-offs Summary
-
-| Decision | Chosen | Alternative | Rationale |
-|---|---|---|---|
-| Rendering | bounded hybrid grid | render every cell | protects DOM and memory |
-| Storage | sparse records | two-dimensional array | empty space is cheap |
-| Calculation | revisioned worker | main thread | protects interaction |
-| Sync | ordered operations | full document saves | smaller conflicts |
-| Presence | lossy channel | durable event stream | cursors can expire |
-| Undo | inverse operation | local mutation | collaboration and audit |
-| Reads | viewport ranges | full snapshot always | bounded startup |
-
-## Closing — 3 minutes
-
-The full-stack design keeps raw document state, derived formulas, visible rendering, durable operations, and presence separate. The browser provides immediate local interaction, while the server provides revision, permission, and replay guarantees.
-
-I would ship bounded viewport reads, cell operations, revision-aware sync, and a small formula subset first. Then I would add large-sheet optimizations, richer formulas, offline replay, and stronger conflict resolution based on measured workloads.
+The [architecture document](./architecture.md#implementation-notes) maps those findings to
+source. The [README](./README.md) contains the actual setup and supported demo flows.

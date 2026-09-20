@@ -46,20 +46,53 @@ I would draw the user-facing and data-processing paths separately enough to make
 their failure boundaries visible, while keeping the initial diagram small.
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│ Browser: map renderer, search, trip state, guidance          │
-└────────┬─────────────────────┬──────────────────────┬────────┘
-         ▼                     ▼                      ▼
-┌────────────────┐   ┌───────────────────┐   ┌─────────────────┐
-│ Tiles via CDN  │   │ Search/Route API  │   │ Probe ingestion │
-└────────────────┘   └─────────┬─────────┘   └────────┬────────┘
-                               ▼                      ▼
-                     ┌───────────────────┐   ┌─────────────────┐
-                     │ Places/road graph │   │ Durable stream  │
-                     │ Traffic snapshots │◀──│ Aggregation     │
-                     └───────────────────┘   └─────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│ FOREGROUND BROWSER                                                                       │
+│                                                                                          │
+│  ┌────────────────────────┐    ┌────────────────────────┐    ┌────────────────────────┐  │
+│  │ Map renderer + UI      │    │ Trip + data layer      │    │ Position + consent     │  │
+│  │ Camera + route layers  │◀──▶│ Intent, accepted route │◀───│ Accuracy and age       │  │
+│  └────────────────────────┘    │ Requests and guidance  │    │ Optional upload policy │  │
+│                       ▲        └────────────────────────┘    └────────────────────────┘  │
+│                       │                     ▲                                        ▲   │
+│                       │                     │                                        │   │
+└───────────────────────┼─────────────────────┼────────────────────────────────────────┼───┘
+                        │                     │                                        │
+basemap tiles           │   query / result    │                  opt-in batches        │
+                        ▼                     ▼                                        ▼
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Tile service + CDN     │       │ Search / route API     │       │ Ingestion API          │
+│ Versioned visual map   │       │ Regional place index   │       │ Bounded admissions     │
+│ Separate from graph    │       │ Route workers          │       │ Durable receipt        │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+                                              ▲                                ▲
+                                              │                                │
+              pin coherent versions           │                   commit / ACK │
+                                              │                                │
+                                              ▼                                ▼
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Graph release pipeline │release│ Regional serving data  │       │ Durable traffic stream │
+│ Validate legal graph   │──────▶│ Released road graph    │◀──────│ Match / aggregate      │
+│ Retain prior versions  │       │ Compatible weight view │       │ Age and confidence     │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
 
+Position samples guide locally; uploading them is a separate, consented path.
+
+The route bundle travels back to the matching trip generation before rendering.
 ```
+
+I would walk from a destination choice to a scoped route request, through a pinned
+regional graph and weight view, then back into the accepted trip and renderer. A
+second path takes consented observations through durable aggregation and eventually
+improves that weight view. Local guidance still consumes position samples when
+upload is off. Tiles supply the visual background; they cannot establish that the
+computed route is legal or that traffic data is current.
+
+The release pipeline is the source of the serving graph, while traffic processing
+supplies compatible weights later. An observation is acknowledged after durable
+receipt, not after a map redraw. A failed deployment can leave the prior eligible
+release serving; the browser still accepts results only for its current trip identity
+and displays the bundle's traffic age rather than the HTTP response time.
 
 The browser owns immediate interaction. A map renderer handles camera motion and
 geometry; React renders controls, search results, and instructions. A trip store

@@ -77,21 +77,62 @@ These are interview assumptions, not measured traffic from Apple or this app.
 ## 🏗️ Architecture I would draw
 
 ```
-┌──────────────────────────┐        ┌──────────────────────────┐
-│ Wallet / checkout UI     │───────▶│ Wallet API               │
-│ Reviewed intent          │        │ Enrollment / lifecycle   │
-└────────────┬─────────────┘        └────────────┬─────────────┘
-             ▼                                   ▼
-┌──────────────────────────┐        ┌──────────────────────────┐
-│ Platform / device        │        │ Token authority          │
-│ Credential handoff       │        │ Enroll / revoke          │
-└────────────┬─────────────┘        └──────────────────────────┘
-             ▼
-┌──────────────────────────┐        ┌──────────────────────────┐
-│ Merchant / processor     │───────▶│ Network / issuer         │
-│ Durable payment attempt  │        │ Authorization outcome    │
-└──────────────────────────┘        └──────────────────────────┘
+WALLET LIFECYCLE — account metadata and protected token associations
+
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Wallet client            │ops/status  │ Wallet control + DB      │ops/status  │ Token authority / TSP    │
+│ Safe metadata cache      │◀──────────▶│ Device and token refs    │◀──────────▶│ Activate / revoke        │
+│ Tracked lifecycle status │            │ Durable lifecycle ops    │            │ Provider authority       │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+
+MERCHANT CHECKOUT — distinct order, attempt and payment authority
+
+                    frozen intent + permitted credential / status
+              ┌───────────────────────────────────────────────────────────────────────────────┐
+              │                                                                               │
+              ▼                                                                               ▼
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Checkout UI/controller   │authorize   │ Protected platform       │            │ Merchant / processor     │
+│ Freeze reviewed intent   │◀──────────▶│ Confirm + handoff        │     ┌─────▶│ Validate order version   │
+│ Save attempt reference   │            │ Protected credentials    │     │      │ Reconcile uncertainty    │
+└──────────────────────────┘            └──────────────────────────┘     │      └──────────────────────────┘
+              ▲                                                          │                    ▲
+              │                                                          │                    │
+              │                                         claim/persist    │                    │
+              │                                                          │                    │
+              │ history / read                                           │                    │ provider call/result
+              │                                                          │                    │
+              ▼                                                          │                    ▼
+┌──────────────────────────┐            ┌──────────────────────────┐     │      ┌──────────────────────────┐
+│ History read API         │events      │ Payment authority        │     │      │ Network / issuer         │
+│ Authorized read model    │◀───────────│ Attempt + provider ref   │◀────┘      │ Verified provider result │
+│ May lag current state    │            │ Outcome + outbox         │            │ External authority       │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+                                                      ▲                                       ▲
+                                                      │                                       │
+                                                      │ pending / result                      │
+                                                      │                                       │ query / verify
+                                                      │                                       │
+                                                      ▼                                       │
+                                        ┌──────────────────────────┐                          │
+                                        │ Recovery workers         │                          │
+                                        │ Resume pending attempts  │◀─────────────────────────┘
+                                        │ Reconcile by reference   │
+                                        └──────────────────────────┘
 ```
+
+I would first follow wallet enrollment or suspension across the upper row, then
+follow a purchase independently. The checkout controller confirms a fixed intent
+through the platform and hands only the permitted credential to the merchant. The
+merchant records one attempt and resolves it against provider evidence; status and
+history return from those records. This is an app/web handoff sketch, not a claim
+that every contactless tap travels through a wallet REST service.
+
+The recovery worker makes the uncertain interval visible: it resumes the recorded
+attempt, queries the provider by reference, and commits verified evidence before the
+merchant exposes a final result. History may lag that commit. The checkout controller
+recovers its saved attempt rather than repeating platform confirmation as a new
+purchase, and wallet lifecycle changes remain an independent operation.
 
 The diagram separates who owns credentials from who owns the order. It
 compresses platform-specific handoffs rather than claiming every arrow is

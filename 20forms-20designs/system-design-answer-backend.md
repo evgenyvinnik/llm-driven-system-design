@@ -63,28 +63,53 @@ The browser has another capacity limit: selected form/library pairs become separ
 documents. CDN throughput and build parallelism do not solve excessive client memory.
 I would keep that requirement visible while focusing this discussion on delivery.
 
-## 🏗️ Draw the system — 4 minutes
+## 🏗️ Draw the system — 6 minutes
 
 ```
-┌─────────────────┐   ┌──────────────────┐   ┌─────────────────┐
-│ Source revision │──▶│ Build workers    │──▶│ Staged release  │
-│ + dependencies  │   │ bounded pool     │   │ + validation    │
-└─────────────────┘   └──────────────────┘   └────────┬────────┘
-                                                     │ promote
-                                                     ▼
-                                            ┌─────────────────┐
-                                            │ Static origin   │
-                                            └────────▲────────┘
-                                                     │ cache miss
-                                            ┌────────┴────────┐
-                                            │ CDN             │
-                                            └────────▲────────┘
-                                                     │ requests
-                                            ┌────────┴────────┐
-                                            │ Browser         │
-                                            │ shell + frames  │
-                                            └─────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│ BUILD / RELEASE (off the request path)                                                   │
+│                                                                                          │
+│  ┌────────────────────────┐    ┌────────────────────────┐    ┌────────────────────────┐  │
+│  │ Source + dependencies  │    │ Bounded build workers  │    │ Clean staged release   │  │
+│  │ Pinned build inputs    │───▶│ Shell + library jobs   │───▶│ Manifest / fail closed │  │
+│  └────────────────────────┘    └────────────────────────┘    └────────────────────────┘  │
+│                                                                                   │      │
+│  Revision → independent artifacts → verify every advertised preview               │      │
+│                                                                                   │      │
+│                                                              validated artifact   │      │
+│                                                                                   │      │
+│                                                                                   ▼      │
+│  ┌────────────────────────┐    ┌──────────────────────────────────────────────────────┐  │
+│  │ Retained releases      │    │ Promotion controller                                 │  │
+│  │ Known-good artifacts   │◀──▶│ Gate: publish verified release or restore previous   │  │
+│  └────────────────────────┘    └──────────────────────────────────────────────────────┘  │
+│                                                                           │              │
+│                                 promote complete release                  │              │
+└───────────────────────────────────────────────────────────────────────────┼──────────────┘
+                                                                            │
+┌───────────────────────────────────────────────────────────────────────────┼──────────────┐
+│ PUBLIC SERVING (static)                                                   │              │
+│                                                                           ▼              │
+│  ┌────────────────────────┐    ┌────────────────────────┐    ┌────────────────────────┐  │
+│  │ Browser                │    │ CDN                    │    │ Static origin          │  │
+│  │ Shell + iframe GETs    │◀──▶│ Reusable static bytes  │◀──▶│ Complete releases      │  │
+│  └────────────────────────┘    └────────────────────────┘    └────────────────────────┘  │
+│                                                                                          │
+│  Browser → CDN: GET; CDN → origin on a miss; response bytes return left                  │
+│                                                                                          │
+└──────────────────────────────────────────────────────────────────────────────────────────┘
 ```
+
+A source revision enters the bounded worker pool, and successful outputs enter a clean
+staged release. Validation checks that its catalog and served artifacts agree. The
+promotion controller makes an eligible complete artifact current and retains previous
+ones for rollback. Separately, a browser GET goes to the CDN and, on a miss, the static
+origin; the asset bytes return along that serving path without triggering compilation.
+
+The staged-release box is a gate: a missing advertised preview stops promotion. The
+serving origin continues to expose the previous complete artifact. Rollback follows
+the retained-release connection to the same promotion controller, so it restores the
+shell, catalog, and previews together rather than replacing individual files.
 
 I would distinguish the build path from the serving path. A deployment failure
 should leave the last complete release serving normally. A traffic spike should
@@ -325,7 +350,7 @@ A CDN also does not guarantee sub-100 ms latency everywhere. Network distance,
 connection setup, misses, and device execution all contribute. Measure retrieval
 and application readiness as distinct outcomes.
 
-## 📊 Operations and close — 6 minutes
+## 📊 Operations and close — 4 minutes
 
 I would keep the first operational view small:
 

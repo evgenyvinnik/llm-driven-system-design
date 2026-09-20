@@ -57,26 +57,56 @@ The responsibilities can begin in a modular application; separate boxes do not i
 immediate fleet of microservices.
 
 ```
-┌──────────────────────┐      ┌──────────────────────┐
-│ Browser              │─────▶│ CDN / product images │
-│ Routes / request data│      └──────────────────────┘
-└──────────┬───────────┘
-           ▼
-┌──────────────────────┐      ┌──────────────────────┐
-│ API / session        │─────▶│ Search / Redis cache │
-│ Catalog / cart       │      │ Elasticsearch        │
-└──────────┬───────────┘      └──────────────────────┘
-           ▼
-┌──────────────────────┐      ┌──────────────────────┐
-│ Checkout / orders    │─────▶│ PostgreSQL           │
-│ Inventory authority  │      │ Purchases / outbox   │
-└──────────────────────┘      └──────────┬───────────┘
-                                         ▼
-┌──────────────────────┐      ┌──────────────────────┐
-│ Payment provider     │◀─────│ Durable workers      │
-│ Status / webhooks    │─────▶│ Payment / indexing   │
-└──────────────────────┘      └──────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│ BROWSER / DISCOVER, AGREE A BASKET, RECOVER A PURCHASE                                   │
+│                                                                                          │
+│  ┌────────────────────────┐    ┌────────────────────────┐    ┌────────────────────────┐  │
+│  │ Buyer discovery        │    │ Cart + purchase state  │    │ Seller workspace       │  │
+│  │ URL / facets / images  │◀──▶│ Quote/hold / saved ID  │    │ Draft + saved action   │  │
+│  └────────────────────────┘    │ Recoverable status     │    │ Fulfillment versions   │  │
+│                                └────────────────────────┘    └────────────────────────┘  │
+│                       ▲                             ▲                             ▲      │
+│                       │                             │                             │      │
+└───────────────────────┼─────────────────────────────┼─────────────────────────────┼──────┘
+                        │                             │                             │
+                        ▼                             ▼                             ▼
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│ PUBLIC DELIVERY AND AUTHENTICATED APPLICATION EDGE                                       │
+│ SSR/search and CDN images; private cart, checkout and ownership-checked seller commands  │
+└──────────────────────────────────────────────────────────────────────────────────────────┘
+             ▲                                ▲
+             │                                │
+discovery    │        authoritative commands  │
+             │                                │
+             ▼                                ▼
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Search + read cache    │       │ Purchase SQL authority │       │ Payment coordinator    │
+│ Versioned projections  │       │ Stock holds / orders   │◀─────▶│ Durable attempt ID     │
+│ Freshness; degradation │       │ Receipts / outbox      │       │ Provider recovery      │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+             ▲                                ▲                                ▲
+             │                                │                                │
+             ▼                                ▼                                ▼
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Index workers          │       │ Outbox relay           │       │ Payment provider       │
+│ Ordered index updates  │◀─────▶│ Retry committed work   │       │ Status / webhooks      │
+│ Rebuildable discovery  │       │ Stable effect identity │       │ External outcome       │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+A cart saves intent, a hold claims stock, and a purchase records the agreed outcome.
 ```
+
+I would follow a discovery result into a cart, a quoted hold and one recoverable purchase.
+The private command path validates the basket against SQL; the public read path can show
+an older listing with explicit freshness. Payment recovery uses the same durable attempt,
+while the outbox separately maintains the search projection. The resulting seller orders
+preserve the buyer's agreed items and prices as fulfillment progresses independently.
+
+I would walk through a lost payment reply and a delayed index update:
+
+1. The browser restores its account-scoped operation reference and polls the same purchase, preserving the agreed basket.
+2. Durable payment work reconciles the original provider operation; an unknown result remains distinct from a decline or an eligible unpaid expiry.
+3. The purchase authority records stock consumption and seller-order snapshots once; worker retries return their recorded result.
+4. Index workers report applied versions before acknowledging work. Buyers may briefly see older discovery data while checkout still validates current stock.
 
 React and TanStack Router handle the interactive experience. Public product/shop pages can
 render initial content on the server and hydrate on the client. Images use appropriately

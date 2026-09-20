@@ -1,341 +1,385 @@
-# Google Sheets - System Design Answer (Backend Focus)
+# Google Sheets — backend system design interview
 
-*45-minute system design interview format - Backend Engineer Position*
+> “I would center this design on the workbook revision. An edit is saved when its raw changes
+> and operation receipt commit together. Formula calculation and live delivery can follow
+> asynchronously, but neither may invent a different order of accepted edits.”
 
-## 📋 Problem Statement
+This is a proposed 45-minute interview design, not a description of Google's internal system
+or a claim that this repository implements the complete protocol.
 
-Design the backend for a collaborative spreadsheet: many people editing one grid at once, with live cursors, formulas that recalculate, and undo that works even though someone else is typing.
+## 🎯 Requirements and sizing — 5 minutes
 
-The framing I want to establish early, because it determines the whole design: **a spreadsheet is not a document, it's a dependency graph with a UI.** Two consequences follow immediately. First, a cell edit is not a leaf write — it can trigger a cascade through thousands of dependent cells, so the write amplification is unbounded in a way a chat message never is. Second, the *structure* of the grid is itself mutable: inserting a row rewrites the meaning of every reference below it. That second point is where most designs quietly break, and it's where I'll spend my first deep dive.
+I would clarify whether we need text-character collaboration inside a cell or collaborative
+replacement of cell values. For this version, users edit a local draft and commit a cell value
+or bounded paste. Two users replacing the same cell are resolved by server commit order, with
+history to explain the outcome.
 
-## 🎯 Requirements Clarification
+We support multiple sheets per workbook, same-workbook formula references, cell formatting,
+presence, and conditional undo. I would defer structural row/column insertion, external
+workbook references, macros, and full Excel compatibility. Inserting a row changes reference
+identities and requires a separate transformation design.
 
-- **How many people edit one sheet at once?** Up to ~50 editors, but potentially thousands of *viewers* on a popular shared sheet. Those are very different fan-out problems.
-- **Do formulas evaluate on the client or the server?** Server-authoritative. I'll defend that — it's the difference between everyone agreeing on a number and everyone having their own.
-- **Do we support inserting/deleting rows and columns?** Yes. This is the question I most want answered up front, because the answer changes the concurrency model entirely.
-- **How exact is undo?** Per-user undo that doesn't clobber a collaborator's work. That's a much stronger requirement than a global undo stack.
+| Requirement | Proposed boundary |
+|-------------|-------------------|
+| Workbook size | Initially 200,000 populated cells |
+| Collaboration | Up to 100 active editors per workbook |
+| Paste | At most 1,000 changed cells in one atomic operation |
+| Durability | Acknowledged raw edits survive a process crash |
+| Ordering | One monotonic committed revision per workbook |
+| Recalculation | Complete results identify their input revision |
+| Recovery | Retry receipts and replay, or explicit snapshot reset |
+| Presence | Best effort; never part of document durability |
 
-### Functional Requirements
+For sizing, assume one million daily editors making 100 committed edits each: 100 million
+edits/day, around 1,157 edits/second average and 11,600 at a tenfold peak. At an illustrative
+500 bytes per operation, that is 50 GB/day of history before replication and indexes.
 
-- Real-time collaborative cell editing with live cursors and presence
-- Formulas with dependency tracking, cascading recalculation, and cycle detection
-- Structural operations: insert/delete rows and columns, resize
-- Per-user undo/redo
-- Sparse grids — 10,000+ rows and columns
-- Cell formatting
+Ten average recipients per edit imply roughly 116,000 peak deliveries/second. Presence traffic
+is separate and should be throttled. These fleet estimates do not tell us whether one
+workbook's ordering queue can handle a concentrated burst.
 
-### Non-Functional Requirements
+I would target p95 durable acknowledgement below 200 ms in the home region and p95 ordinary
+recalculation below 500 ms. Expensive formulas get an explicit budget and visible lag. We
+favor correctness over accepting writes without a reachable authority.
 
-| Requirement | Target | Why |
-|-------------|--------|-----|
-| Local edit feedback | < 100ms (optimistic) | Typing that lags is unusable |
-| Edit persist + broadcast p99 | < 200ms | Collaborators must feel present |
-| Concurrent editors per sheet | 50 | Fan-out is 49× per edit |
-| Availability | 99.99% for the collab service | People are mid-sentence |
-| Convergence | All clients reach the same state | Non-negotiable — divergence is silent corruption |
-| Durability | No lost edits | An edit you saw applied must survive |
+## 🏗️ High-level architecture — 7 minutes
 
-### Scale Estimates
-
-The numbers that force the architecture:
-
-- **100M spreadsheets, 10M DAU, ~2M concurrent editors** at peak.
-- **~500K cell edits/second** at peak (2M editors × ~15 edits/min).
-- Each edit naively costs **one cell UPSERT + one history row = 1M writes/second.** That is the number that kills the obvious design, and I'll come back to it.
-- **~50B stored cells** at ~200 bytes each ≈ **10 TB** — and that's *with* sparse storage. Dense storage of a 10,000 × 100 grid would be 1M rows per sheet where ~1,000 are non-empty: a **1000× waste**, and 10 PB instead of 10 TB.
-- Fan-out: 50 collaborators means each edit is broadcast 49 times. 500K edits/sec × 49 ≈ **24M messages/second** across the fleet.
-
-## 🏗️ High-Level Architecture
-
-```
-┌──────────────────────────────────────────────────────────────┐
-│                 Clients (browser, one WS each)               │
-└───────────────────────────┬──────────────────────────────────┘
-                            ▼
-┌──────────────────────────────────────────────────────────────┐
-│         WebSocket Gateways (stateless, ~50K conns each)      │
-│         terminate connections; no sheet logic lives here     │
-└───────────────────────────┬──────────────────────────────────┘
-                            ▼  route by sheet_id
-┌──────────────────────────────────────────────────────────────┐
-│      Sheet Sequencer — ONE owner per active sheet             │
-│  • assigns a monotonic seq number to every operation          │
-│  • transforms cell edits against structural ops               │
-│  • coalesces rapid edits to the same cell                     │
-│  • holds the sheet's cells + dep graph in memory              │
-└────────┬────────────────────────────────┬────────────────────┘
-         │ append (synchronous, cheap)    │ recalc request
-         ▼                                ▼
-┌──────────────────────┐        ┌────────────────────────────┐
-│  Durable op log      │        │  Formula Engine            │
-│  (Kafka / Redis      │        │  • reverse dep index       │
-│   Stream, per sheet) │        │  • topo sort of the        │
-│  ── THE SOURCE OF    │        │    AFFECTED subgraph only  │
-│     TRUTH ──         │        │  • cycle detection         │
-└──────────┬───────────┘        └────────────┬───────────────┘
-           │ async materialize               │
-           ▼                                 ▼
-┌──────────────────────┐        ┌────────────────────────────┐
-│    PostgreSQL        │        │   Redis                    │
-│  cells (sparse)      │        │  • pub/sub fan-out         │
-│  sheets, history     │        │  • presence / cursors      │
-│  ── A MATERIALIZED   │        │  • hot sheet cache         │
-│     VIEW of the log  │        │  (all of it ephemeral)     │
-└──────────────────────┘        └────────────────────────────┘
-```
-
-Two structural decisions carry the whole design:
-
-1. **Each active sheet has exactly one sequencer** — a single writer that assigns a total order to operations. This is the thing that makes concurrent structural edits tractable, and I'll defend it below.
-2. **The durable op log is the source of truth; PostgreSQL is a materialized view of it.** That inverts the usual relationship, and it's what makes 500K edits/second survivable.
-
-## 💾 Data Model
-
-| Table | Key Columns | Indexes | Notes |
-|-------|-------------|---------|-------|
-| spreadsheets | id, title, owner_id, created_at | (owner_id) | |
-| sheets | id, spreadsheet_id, name, index | (spreadsheet_id) | Tabs |
-| **cells** | sheet_id, row_index, col_index, **raw_value**, **computed_value**, format (JSONB) | **unique(sheet_id, row_index, col_index)** | Sparse — only non-empty cells exist. `raw_value` is `=SUM(A1:A10)`; `computed_value` is `42` |
-| cell_deps | sheet_id, dependent (row,col), precedent (row,col) | (sheet_id, precedent) | The **reverse** index — "who depends on me" is the query that matters |
-| op_log | sheet_id, **seq** (monotonic), user_id, op (JSONB), created_at | (sheet_id, seq) | Append-only. The real source of truth |
-| edit_history | sheet_id, user_id, forward_op, inverse_op, seq | (sheet_id, user_id, seq DESC) | Per-user undo stacks |
-| collaborators | spreadsheet_id, user_id, color, last_seen | unique(spreadsheet_id, user_id) | Presence; ephemeral, could live only in Redis |
-
-Three things worth defending:
-
-**Sparse storage is not an optimization, it's the only viable representation.** A dense grid stores every position: 10,000 rows × 100 cols = 1M rows per sheet, of which perhaps 1,000 are non-empty. That's 1000× waste, and at 100M sheets it's the difference between 10 TB and 10 PB. The cost is that "give me rows 100–200" becomes an index range scan instead of an offset calculation — which the composite index handles fine, because a range of rows in a sparse grid is a contiguous slice of that index.
-
-**Storing both `raw_value` and `computed_value` is deliberate denormalization.** The computed value is derivable from the raw value plus the rest of the sheet — so storing it is redundant, and I store it anyway. Without it, opening a sheet with 100,000 formulas means evaluating 100,000 formulas before you can paint a single cell. With it, a read is a read. The cost is that they can drift if a recalculation is lost, which is why recalculation is part of the same durable operation as the edit, not a side effect of it.
-
-**The dependency index is stored *reversed*.** The question we ask on every edit is never "what does A1 depend on" — it's "**who depends on A1**," because that's who needs recalculating. Indexing by `precedent` makes the hot query an index lookup instead of a scan.
-
-## 🔌 API Design
+I would draw the command path first, then add reads, calculation, and fanout below the durable
+store. That keeps the source of truth visible throughout the conversation.
 
 ```
-POST   /api/spreadsheets                  Create
-GET    /api/spreadsheets/:id              Metadata + sheet list
-GET    /api/sheets/:id/cells              Load cells (paged by row range)
-PATCH  /api/sheets/:id/cells              Batch update (non-realtime clients, import)
-
-WSS    /ws?sheet_id=…
-  → client sends: CELL_EDIT, INSERT_ROW, DELETE_COL, CURSOR_MOVE, SELECTION
-  → server sends: OP_APPLIED (with seq), CELLS_RECALCULATED, PRESENCE, SYNC
+┌────────────────────────┐ HTTPS  ┌────────────────────────┐        ┌────────────────────────┐
+│ Clients                │        │ API + socket gateway   │        │ Workbook owner         │
+│ Edits / range reads    │◀──────▶│ Auth, ACL, limits      │◀──────▶│ Fenced ordering        │
+└────────────────────────┘        └────────────────────────┘        └────────────────────────┘
+                                                                                           ▲
+                                                                                           │
+                                                    edit + revision + receipt              │
+                                                                                           │
+                                                                                           ▼
+┌────────────────────────────────────────────────────────────────────────────────────────────┐
+│ PostgreSQL partition (workbook ID): authoritative state                                    │
+│ ACL, owner epoch, raw cells, ordered commits, receipts, outbox                             │
+│ Immutable snapshot chunks + versioned formula-result batches                               │
+└────────────────────────────────────────────────────────────────────────────────────────────┘
+                       ▲                                  ▲                                ▲
+                       │                                  │                                │
+ snapshot + replay     │           committed outbox       │          inputs / results      │
+                       │                                  │                                │
+                       ▼                                  ▼                                ▼
+┌────────────────────────┐        ┌────────────────────────┐job/ACK ┌────────────────────────┐
+│ Range reader           │        │ Outbox relay           │        │ Formula workers        │
+│ Revision-pinned reads  │        │ Retry by event ID      │◀──────▶│ Pinned input / result  │
+└────────────────────────┘        └────────────────────────┘        └────────────────────────┘
+                       ▲                                  ▲
+                       │                                  │
+ scoped ranges         │           edit + calc events     │
+                       │                                  │
+                       ▼                                  ▼  cursors
+┌────────────────────────┐        ┌────────────────────────┐        ┌────────────────────────┐
+│ Authorized range API   │        │ Authorized fanout      │        │ Presence / pub-sub     │
+│ Snapshot / revision    │        │ Ordered replay feed    │◀──────▶│ Ephemeral Valkey       │
+└────────────────────────┘        └────────────────────────┘        └────────────────────────┘
+            ▲                                  ▲
+            │                                  │
+            ▼                                  ▼
+┌──────────────────────────────────────────────────────────┐
+│ Clients apply canonical state + pending overlay          │
+│ Detect gaps; resume or request a new snapshot            │
+└──────────────────────────────────────────────────────────┘
 ```
 
-The WebSocket protocol is where the real API lives. REST exists for load and for clients that aren't in the collaborative session.
+Commands enter through an authenticated gateway, which verifies workbook and sheet access and
+routes them to the current workbook owner. The owner commits the changed raw cells, next
+revision, receipt, and outbox in one PostgreSQL transaction.
+
+The lower-left path serves revision-pinned ranges reconstructed from a checkpoint and retained
+operations. It does not combine independently current rows and call that a coherent snapshot.
+
+The middle path relays committed events. Gateways recover missing revisions from durable
+history before relying on live delivery. Valkey may distribute notifications, but publication
+success is not the durability boundary.
+
+The right path calculates formulas from identified inputs and stores complete result batches.
+Publishing a result pointer and its event is also durable. Presence shares gateway
+infrastructure but has no place in the raw edit log.
+
+I would trace a worker restart and a client reconnect separately:
+
+1. Formula work recovers the same pinned input and engine version, verifies a complete result batch, and conditionally publishes its pointer and event.
+2. Relay progress follows confirmed handoffs/effects; replaying work cannot regress the published calculation revision.
+3. Clients resolve edit receipts and request a contiguous feed after their known revision. Authorization still applies to replay and range reads.
+4. An expired token triggers a new coherent snapshot. Retention preserves the checkpoint and suffix needed by supported tokens; it never silently returns unknown cells as blanks.
+
+I would partition by workbook ID because formulas can reference other sheets in that workbook.
+A per-sheet owner would need coordination for cross-sheet snapshots. Keeping the workbook
+together gives us a simpler initial consistency domain at the cost of a ceiling on one
+workbook's throughput.
+
+These are logical services. A first implementation can co-locate several components and split
+them only when queue depth, connection count, or calculation cost justifies it.
+
+## 💾 Data model and API contract — 4 minutes
+
+| Record | Key fields | Access pattern / invariant |
+|--------|------------|----------------------------|
+| Workbook | ID, home region, owner epoch, raw revision | Lock/check authority before writes |
+| Membership | Workbook, actor, role, permission version | Authorize commands, ranges, replay, export |
+| Sheet | Workbook, sheet ID, dimensions | Fixed coordinate bounds in this version |
+| Cell | Sheet, row, column, raw input, format, edit revision | Unique position; conditional undo |
+| Operation receipt | Workbook, actor, operation ID, digest, revision | Identical retry returns original outcome |
+| Ordered history | Workbook, revision, changed cells, actor | Replay and snapshot reconstruction |
+| Outbox | Event ID, workbook/revision, delivery state | Retry publication after commit |
+| Snapshot chunk | Workbook, checkpoint, range, immutable values | Read a consistent revision |
+| Calculation batch | Workbook, input revision, engine version, results | Publish only a complete identified batch |
 
-**The protocol semantics matter more than the endpoint list.** Every client-to-server message carries the client's `last_seen_seq`; every server-to-client `OP_APPLIED` carries the authoritative `seq` the sequencer assigned. That pairing is the entire concurrency contract:
+Current rows are efficient for writes; immutable checkpoints and history make revisioned reads
+possible. Retention must preserve the data required by active snapshot tokens and the
+supported replay window.
 
-| Message | Direction | Semantics |
-|---------|-----------|-----------|
-| `CELL_EDIT` | C→S | Op id + coordinate + raw value + last-seen seq. Sequencer orders it, transforms coordinates if it was written against an older seq, applies, appends to log |
-| `INSERT_ROW` / `DELETE_COL` | C→S | Structural op — becomes the thing later cell edits are transformed *against*. Rewrites references on the same total order |
-| `OP_APPLIED` | S→C | The assigned seq + final coordinate. Doubles as the ack; the client advances its last-seen seq |
-| `CELLS_RECALCULATED` | S→C | A batch of `(coord, computed_value)` from the affected-subgraph recalc, sent after the triggering edit |
-| `CURSOR_MOVE` / `SELECTION` | C↔S | Conflated and throttled (~10/sec); newest supersedes, drops are fine |
-| `SYNC` | S→C | Full or since-seq state, sent on join and on reconnect-too-far-behind |
+| Interface | Purpose |
+|-----------|---------|
+| GET workbook metadata | Sheets, permissions, raw and calculation revisions |
+| GET workbook range | Snapshot token, rectangle, values at a defined revision |
+| Submit edit command | Scoped operation ID, payload digest, bounded changes |
+| Get operation outcome | Resolve a lost acknowledgement without a new edit |
+| Subscribe/resume feed | Last revision, replay, then ordered live changes |
+| Undo command | Original operation and expected current cell versions |
+| Presence message | Sheet, selection, user, expiry; disposable |
+
+HTTP bulk edits and WebSocket edits must invoke the same command path. A second route that
+writes cells directly would bypass ordering, formula invalidation, and recovery guarantees.
 
-The design rule: the client is never the authority on order. It proposes; the sequencer disposes and echoes back the truth via `OP_APPLIED`. A client that sends an edit and sees its own `OP_APPLIED` come back with a *transformed* coordinate learns, correctly, that the grid shifted under it.
+## 🔧 Deep dive: ordering, ownership, and durable retries — 8 minutes
 
-## 🔧 Deep Dive 1: Conflict Resolution — Where Last-Write-Wins Is Right, and Where It Silently Corrupts
+> “I would choose one logical writer per workbook, but I would enforce its authority in the
+> database. A process believing it owns the workbook is not enough.”
+
+### What happens inside the commit
 
-**The easy half, and I'll defend it.** For two users setting *the same cell to different values*, **last-write-wins is correct**, and reaching for OT or CRDTs here is over-engineering.
+The owner checks authorization and validates the operation's bounds and supported formula
+syntax. It then enters a short transaction that checks the workbook's current owner epoch and
+locks the authority row.
 
-The reason is semantic, not technical: OT exists to merge *character-level* edits, where "Alice typed 'x' at position 3" and "Bob typed 'y' at position 7" have a meaningful merge. A cell value has no such structure. If Alice sets A1 to `100` and Bob sets it to `200`, there is no merged value — `150` is not a compromise, it's a bug. One of them has to win, and the only question is which. LWW answers that with zero coordination overhead, and because both users see the converged value within one round-trip (~50ms), they *notice* and coordinate socially — which is what actually happens in real spreadsheets.
+An actor-scoped operation ID identifies the logical request. If the receipt exists with the
+same digest, return its original outcome. If the same ID carries different content, reject it.
+Otherwise allocate the next revision, change the raw cells, and insert history, receipt, and
+outbox together.
 
-**Now the hard half, which most designs miss entirely: structural operations.**
+Only after commit do we acknowledge success. Formula evaluation that can be expensive must not
+run while this transaction holds the workbook lock. Validation is bounded; calculation is a
+separate stage.
 
-Alice inserts a row at index 5. Simultaneously, Bob — whose client hasn't seen that yet — edits cell A7.
+The uniqueness of the receipt key protects against concurrent duplicate submissions. A failed
+transaction does not leave a receipt saying an edit succeeded. A successful transaction
+followed by a lost response can be retried without changing the workbook again.
 
-- On Bob's screen, A7 holds the number he's changing.
-- After Alice's insert, everything from row 5 down shifts by one. What *was* A7 is now A8.
-- Bob's edit arrives at the server addressed to **A7**. Applied naively, it lands on the wrong cell — a cell that used to be A6.
+A delayed retry illustrates why an UPSERT alone is insufficient: A sets B4 to 10, B later sets
+it to 20, then A retries. Blindly setting 10 again would erase B's accepted edit. A durable
+receipt returns A's historical success without replaying its effect.
 
-**LWW cannot help here, because this is not a conflict — both operations are individually valid and both should be applied.** The problem is that Bob's operation was written against a *coordinate system that no longer exists*. Naive LWW doesn't detect a conflict; it silently writes the right value into the wrong cell. That is data corruption with no error message, and the user finds it three weeks later in a financial model.
+### Fence an old owner
 
-And formulas make it worse: every formula referencing `A7:A10` must have its references rewritten. A cell edit is local; a row insert is a **global rewrite of the sheet's address space.**
+Suppose owner A pauses long enough that its lease expires. Owner B takes over. When A wakes
+up, it may still have queued commands and an open database connection.
 
-**The fix: a single sequencer per sheet, plus operational transformation on coordinates only.**
+Ownership transfer increments the epoch under the same authority-row protocol used by writes.
+A command with A's old epoch is rejected inside its transaction. If an A transaction already
+holds the authority lock, transfer waits for that transaction to finish before installing B's
+epoch.
 
-1. Every active sheet is owned by exactly **one** sequencer process. Every operation for that sheet flows through it and receives a **monotonic sequence number**. This gives a total order, which is the precondition for any of the rest to work.
-2. Every client tags each operation with the **last seq it has seen**.
-3. When an operation arrives that was written against an older seq, the sequencer **transforms its coordinates** against the structural operations that happened in between. Bob's edit to A7, submitted at seq 40 when the insert committed at seq 41, is rewritten to A8 before being applied.
-4. Formula references are rewritten by the same transform, on the same total order.
+A Redis lease without this database check leaves a stale-writer window. A lock protocol also
+works only if every writer, including admin tools and REST routes, participates. I would make
+the command boundary the sole write interface.
 
-> "This is operational transformation — but applied to *coordinates*, not to characters, and only against *structural* ops. That's a dramatically smaller problem than Google Docs solves. The transform function has to handle maybe six operation types against four structural ops. I'm not building general OT; I'm building the minimum amount of it that stops silent corruption, and I'm keeping LWW for the case where LWW is genuinely correct. The trap is picking one model for the whole system: pure LWW corrupts on structural ops, and full CRDT/OT for cell values is a large amount of machinery to solve a problem — merging `100` and `200` — that has no solution."
+PostgreSQL's [explicit locking
+documentation](https://www.postgresql.org/docs/16/explicit-locking.html) describes the
+transaction lifetime of row locks. Fencing is an application protocol built around that
+behavior, not an automatic property of a lease library.
 
-**What the single sequencer costs me.** It's a single point of failure per sheet and a vertical scaling ceiling per sheet. I accept both, for a specific reason: **a sheet has at most ~50 concurrent editors**, so one process is never remotely near its capacity. The sequencer is not a throughput bottleneck; it's a *correctness* device. Failover is a lease in Redis with a heartbeat — a new sequencer picks up the sheet, replays the op log from the last checkpoint, and rebuilds in-memory state. Because the log is the source of truth, that replay is exact.
+### Resolve the conflicts we actually scoped
 
-This is also why sheets shard beautifully: sheets are completely independent, so sequencers spread across the fleet by `sheet_id` with zero cross-shard coordination.
+Ordinary cell replacement follows commit order. Atomic paste occupies one revision and applies
+its bounded changes together. We do not transform characters inside a cell or claim that
+ordering solves row insertion.
 
-## 🔧 Deep Dive 2: Recalculation — The Cascade Is the Real Workload
+Undo is conditional. It can restore the previous value only if the relevant cells still have
+the versions produced by the original operation. Otherwise the user sees a conflict and
+chooses a new edit. Unconditional inverse operations would overwrite intervening work.
 
-A cell edit is not one write. It's one write plus however many cells depend on it, transitively.
+| Approach | Why it fits / fails here | Cost |
+|----------|--------------------------|------|
+| ✅ Workbook owner + fenced SQL commit | Coherent cross-sheet inputs, paste, receipts, and order | One workbook has a write-throughput ceiling |
+| ❌ Independent cell registers alone | Simple replacement convergence, but no atomic workbook revision or calculation snapshot | Extra coordination is still needed |
 
-**How the naive approaches break:**
+I accept home-region write latency and reduced availability during authority loss. For a
+spreadsheet used to make decisions, accepting mutually inconsistent edits during a partition
+would be a more damaging default.
 
-| Approach | The specific bottleneck |
-|----------|-------------------------|
-| ❌ Recompute the whole sheet on every edit | A sheet with 100K formulas recomputes 100K formulas on every keystroke. At 500K edits/sec this is not a performance problem, it's arithmetic that doesn't fit on the planet |
-| ❌ Recompute lazily, on read | Reads vastly outnumber writes (viewers!), and a read now costs a full evaluation. You've moved the cost to the more frequent operation — exactly backwards |
-| ❌ No dependency tracking; just re-evaluate cells that "look related" | There is no such thing as "looks related." `=SUM(A:A)` depends on an entire column |
-| ✅ Reverse dependency index + topological sort of the **affected subgraph only** | See below |
+## 🔧 Deep dive: bounded, revisioned formula calculation — 8 minutes
 
-**The design:**
+> “A formula is an untrusted program in a deliberately limited language. I would give it a
+> parser, explicit dependencies, and a resource budget; I would not evaluate it as
+> host-language code.”
 
-1. When a formula is written, parse it and extract its precedents. Store the edges **reversed**: `precedent → dependents`.
-2. On an edit to A1, look up A1's dependents. Walk transitively to build the **affected subgraph** — usually a handful of cells, occasionally thousands.
-3. **Topologically sort just that subgraph** and evaluate in order, so each cell is computed after everything it depends on. A cell is evaluated exactly once no matter how many paths reach it.
-4. Broadcast the changed `computed_value`s to collaborators as one batch.
+### Build a dependency model
 
-Cost is O(affected), not O(sheet). For the overwhelming majority of edits, "affected" is zero — you typed a number into a cell nobody references, and the recalculation is a no-op.
+A formula parser recognizes only supported operators, functions, and references. It produces
+an expression tree and dependency information. A1 notation resolves to a sheet and coordinate
+within the workbook; cross-workbook data is excluded from this version.
 
-**Cycle detection** falls out of the topological sort: if the affected subgraph can't be ordered, there's a cycle, and the cells in it get an error value rather than an infinite loop. This has to be detected at *write* time, not evaluation time, so the user learns immediately.
+When an input changes, invalidate its reachable dependents and evaluate them in dependency
+order. Detect a cycle and report an explicit formula error. Do not repeatedly recurse until
+the process stack or time budget is exhausted.
 
-**Two failure modes worth naming:**
+Ranges need careful representation. A formula summing a million-row range should not
+necessarily create a million individual graph objects. Range dependency nodes or aggregate
+indexes can reduce that cost, while admission limits keep the first implementation bounded.
 
-**The cascade bomb.** Someone writes a formula that 10,000 cells depend on, and then types into it repeatedly. Each keystroke triggers a 10,000-cell recalculation. The fix is **debounce and coalesce**: aggregate edits over a ~100ms window, then recalculate once against the final state. The user typing "12345" produces five edits to one cell; only the last one's cascade matters, and computing the first four is pure waste. This is the same coalescing that saves the write path — one mechanism, two payoffs.
+I would define numeric and error semantics consistently across the engine. Locale affects
+parsing and display through an explicit workbook setting; random values, current time, and
+external fetch functions would be excluded initially because replay should not silently change
+their result.
 
-**Volatile functions.** `NOW()`, `RAND()`, and `TODAY()` depend on *nothing* and change *anyway*, which means they have no precedents and therefore never appear in any affected subgraph. They break the whole model. The honest answer is that they need a separate periodic recalculation pass, and that they are precisely why a purely dependency-driven engine isn't sufficient. I'd rather name that than pretend the dependency graph is complete.
+### Calculate an identified input snapshot
 
-**Why server-side evaluation, not client-side?** Client-side evaluation is tempting — it's free compute and it's instant. It fails on two counts. First, **50 collaborators evaluating independently can disagree** — different browsers, different float behavior, different versions of the function library — and a spreadsheet where two people see different totals is worse than one that's slow. Second, a **viewer** with a read-only link would have to evaluate 100K formulas just to look at a sheet. The server evaluates once; everyone reads the same answer. The client still evaluates optimistically for instant local feedback, but the server's value is authoritative and overwrites it. Optimism for feel; authority for truth.
+A worker receives workbook revision R and an engine version. It reads a coherent view at R,
+calculates the permitted dependency closure, and writes a result batch identified by those
+inputs.
 
-## 🔧 Deep Dive 3: Surviving 500K Edits/Second by Inverting the Storage Model
+Results are staged until complete. Publishing the batch pointer and an outbox event happens
+atomically, and the published calculation revision must never move backward. A delayed worker
+for R minus 1 cannot overwrite a newer batch.
 
-Here is the number that breaks the obvious design: **500K cell edits/second, each producing an UPSERT and a history row = 1M writes/second to PostgreSQL.** A well-tuned Postgres primary does tens of thousands of writes per second. We are off by roughly two orders of magnitude.
+Raw edits may advance while calculation runs. The system can therefore have raw revision 81
+and calculation revision 79. That is a valid, visible state: inputs are saved and results are
+still catching up. It is not valid to describe the result as calculated from 81.
 
-**Why the usual fixes don't get there.** Sharding by `sheet_id` helps — spread across 100 shards and it's 10K writes/sec each, which is survivable. But we've now got 100 database primaries doing nothing but absorbing keystrokes, and we still write a row for *every intermediate state* of a cell someone is typing into.
+Queued work can be coalesced to a newer input revision, but indiscriminately canceling every
+running job would starve results during continuous editing. I would keep bounded work
+progressing, publish its identified results, and schedule the latest required successor.
 
-**The inversion: make the log the truth and the database a materialized view.**
+### Bound expensive work
 
-1. **The sequencer appends every operation to a durable, per-sheet log** (Kafka partitioned by sheet, or a Redis Stream). This is a **sequential append** — the cheapest write a computer can do — and it's what makes the operation durable. Once it's in the log, the edit cannot be lost.
-2. **The edit is broadcast to collaborators immediately from the sequencer**, straight after the append. Broadcast latency never waits on PostgreSQL.
-3. **A materializer consumes the log asynchronously** and writes to PostgreSQL in batches, **coalescing by cell**. A user typing "12345" into A1 emits five operations; the materializer writes **one** row.
+Limits cover formula length, nesting, dependency count, referenced range size, memory, and
+elapsed execution. Worker isolation prevents a calculation failure from blocking socket
+heartbeats and unrelated workbook edits.
 
-**What coalescing actually buys.** Bursty human typing means most cells are written several times in quick succession. Coalescing over a 1-second window typically collapses 5–10 operations per cell into one write — an order of magnitude off the top. Combine that with batching (one multi-row statement instead of N statements) and sharding by sheet, and the write volume lands in territory PostgreSQL is comfortable in.
+A budget failure preserves the saved raw formula and returns a specific result error. The user
+can simplify the expression. The system must not quietly keep an old value while marking it
+current.
 
-> "The trade I'm making is a window of *materialization lag* — PostgreSQL is behind the log by up to a second. That sounds alarming for a system holding people's financial models, so let me be precise about what it does and doesn't cost. It does **not** risk losing an edit: the log append is synchronous and durable, so an edit the user saw acknowledged is safe the moment it's in the log. What it costs is that a *cold read* — someone opening the sheet from a different server right now — could miss the last second of edits. The fix is that a cold read replays the log tail past the last materialized checkpoint. So the guarantee is: **durability comes from the log, and freshness comes from replaying it.** Postgres is an optimization for fast loads, not the record of truth. Treating it as the truth is what forces you into 1M writes/second."
+Calculation workers scale across workbooks and, where dependencies permit, independent
+subgraphs. A single dense dependency chain remains sequential. Adding workers does not remove
+that critical path.
 
-**What I give up.** Operational complexity, honestly. There are now two stores that must agree, a materializer that can fall behind (and must be monitored — its lag *is* the freshness bound), and a replay path that has to be exercised or it will be broken when you need it. That's a real cost. I'd take it, because the alternative isn't "simpler" — it's "doesn't work at this scale," and a simple design that doesn't work is not simple.
+| Approach | Why it fits / fails here | Cost |
+|----------|--------------------------|------|
+| ✅ Asynchronous revisioned batches | Expensive formulas do not hold the edit transaction | Separate raw/result freshness and worker scheduling |
+| ❌ Full recalculation before every commit | Easy immediate consistency for tiny sheets; long formulas block the whole room | Unbounded commit latency and lock contention |
 
-**Fan-out**, meanwhile, is the easy half: 24M messages/second sounds huge, but it's 50 recipients per edit and it parallelizes perfectly. Redis Pub/Sub distributes an op to whichever gateways hold that sheet's connections. Presence and cursor moves — which are high-frequency and completely disposable — are **conflated**: a cursor's newest position supersedes the old one, so we throttle them to ~10/sec per user and drop the rest. Cell edits are never conflated in transit, because each one is a fact.
+Synchronous calculation is reasonable for a tightly limited toy workbook. Our shared workload
+needs a clear saved-input boundary even when calculation is slow, so I accept eventual derived
+results and make their revision explicit.
 
-## 🧭 Consistency Model
+## 🔧 Deep dive: snapshots, replay, and live fanout — 7 minutes
 
-| Data | Guarantee | Why |
-|------|-----------|-----|
-| Op log | Durable, totally ordered per sheet | The source of truth. Everything else derives from it |
-| Cell values across clients | **Convergent** — all clients reach the same state | Achieved by the single sequencer's total order, not by hoping |
-| Cell edits (same cell, concurrent) | Last-write-wins by seq number | There's no meaningful merge of `100` and `200` |
-| Structural ops vs. cell edits | Transformed against the total order | LWW here would silently write the right value into the wrong cell |
-| Computed values | Eventual, ~100ms behind the edit (debounce window) | A formula result lagging a tenth of a second is invisible |
-| PostgreSQL | Eventual, ≤ ~1s behind the log | It's a materialized view; freshness comes from log replay |
-| Presence / cursors | Best-effort, conflated, lossy | A stale cursor for 100ms harms nobody |
+> “Live messages reduce latency. The durable history is what lets me recover when those
+> messages are missed.”
 
-Cell edits are **idempotent by construction** — an UPSERT keyed on `(sheet_id, row, col)` applied twice produces the same state — which means a replayed log is safe, and that's what makes the whole log-as-truth model work.
+### Establish a synchronization boundary
 
-## 🔁 Undo That Doesn't Clobber Collaborators
+On open, return a token identifying an immutable checkpoint S and a target raw revision R. A
+range reader applies the retained operations between S and R to reconstruct the requested
+rectangle. The client buffers events after R while installing its first viewport.
 
-Undo is deceptively hard in a collaborative system, and the naive design is actively harmful.
+This avoids a common race: joining the room, reading several changing tables, and then sending
+a full state that overwrites a newer live edit. Snapshot and stream must meet at an explicit
+revision, even when the browser fetches only a viewport.
 
-**The naive design:** a global undo stack. Alice hits Ctrl-Z and it undoes *Bob's* last edit. This is a genuinely awful experience and it's what you get for free if you store one stack per sheet.
+Tokens have limits and expiry. Checkpoint chunks and required history remain available while
+tokens are valid. If a client resumes outside the retained window, return a reset requirement
+and a new snapshot, preserving its pending operation identities for separate resolution.
 
-**What's needed is per-user undo:** each user's history is their own operations, and undoing one applies its **inverse**. So every operation is stored with both a forward op and an inverse op (`set A1 to "new"` / `set A1 to "old"`), and Alice's undo emits the inverse of *her* last operation as a **new operation** appended to the log.
+### Publish after commit without losing the event
 
-That last point is what makes it correct: **undo is not a rewind, it's a new forward operation.** It gets a sequence number, it gets broadcast, it gets transformed against structural ops just like any other edit. Trying to actually rewind the log — removing an operation from history — would mean re-deriving every subsequent operation, which is unsolvable when those operations were other people's.
+The edit transaction writes an outbox record. A relay reads committed records and publishes
+them, retrying by event ID. A process crash between commit and publication delays delivery but
+does not erase the fact that publication is needed.
 
-**The honest wrinkle:** if Bob has since overwritten the cell Alice is undoing, Alice's undo will overwrite Bob. There is no universally right answer here; real spreadsheets accept this. What matters is that the *behavior is defined* and the operation goes through the same ordered pipeline as everything else, rather than being a special path that bypasses the sequencer.
+The relay can deliver duplicates or encounter out-of-order transport delivery. Gateways track
+per-workbook revisions and request missing history before advancing the canonical feed. They
+do not declare a revision complete because a pub-sub notification arrived.
 
-## 🔒 Authorization, Sharing, and Formula Injection
+Formula events identify both their input revision and result-batch identity. They are distinct
+from raw edit revisions, so a repeated calculation event does not masquerade as another user
+edit.
 
-Authorization in a spreadsheet is deceptively load-bearing, because the mutating path is the WebSocket, not REST — so an auth model that only guards HTTP endpoints protects nothing.
+### Protect the system from slow peers
 
-**The sharing model.** A spreadsheet has an owner and a `collaborators` table mapping `user_id → role`, where role is one of **owner / editor / commenter / viewer**. Access is checked at two points: once when a client opens the WebSocket (reject the connection outright if the user has no role on the sheet), and again — this is the part people miss — **on the sequencer's hot path for every mutating operation**. The sequencer is already the single point every op flows through, which makes it the natural and only correct place to enforce "can this user edit at all," and later "can this user edit *this range*."
+Per-connection buffers are bounded. Drop superseded cursor positions first. If a client cannot
+keep up with durable events, close the live stream with a replay/reset instruction instead of
+accumulating unlimited memory.
 
-> "The trap is doing the authorization check as a database round-trip per keystroke — that would put a 2ms Postgres read in front of the one process that serializes the entire sheet, and turn the correctness device into a latency bottleneck. Instead the sequencer holds the sheet's ACL in memory alongside its cell and dependency state, refreshed only when a share actually changes. Auth becomes a hash lookup on the hot path, not an I/O. The cost is that a revoked collaborator can linger for the refresh window — acceptable, because the blast radius is one sheet and the fix is a targeted cache bust on the share-change event."
+Reconnection uses backoff and jitter. Reading retained history is paced so a gateway restart
+does not produce a database stampede. A hot workbook can have many gateway subscribers without
+requiring all sockets to live on the owner process.
 
-**Protected ranges** are the same idea one level finer: instead of a sheet-level yes/no, the sequencer consults a per-range rule before applying a coordinate. It's deferred in this design, but it lives in exactly one place — which is the whole point of routing every op through a single owner.
+Access is rechecked for ranges, history, and resumed subscriptions. Revoking access must
+remove the established socket from the room; authenticating only the initial handshake is
+insufficient.
 
-**Formula injection is a real attack surface, not a footnote.** `raw_value` is untrusted user input that the server *evaluates*. Any implementation that reaches for language `eval()` on that string (the kind of shortcut a demo takes for `=5+3*2`) is a remote-code-execution hole. The production formula engine must be a **sandboxed evaluator over a whitelist of functions** — it parses to an AST it controls, never executes arbitrary host code, bounds recursion/iteration to stop a `=SUM` over a giant range from becoming a DoS, and treats cross-sheet references as authorization checks (a `VLOOKUP` into a sheet you can't read must not leak its values). Server-authoritative evaluation is what makes this enforceable at all: there's one trusted evaluator, not fifty browsers.
+| Approach | Why it fits / fails here | Cost |
+|----------|--------------------------|------|
+| ✅ Durable history + live notification | Recover missed delivery with a defined snapshot boundary | Retention, replay admission, and token lifecycle |
+| ❌ Pub-sub as the only history | Fast online delivery but no durable catch-up for disconnected clients | Missed edits require an uncontrolled full reload |
 
-**Idempotency pairs with the log.** Every `CELL_EDIT` carries a client-generated op id. On reconnect a client replays its unacknowledged ops; the sequencer dedupes by op id so a replayed edit produces exactly one log entry. That client-id dedup stops duplicate *log entries*; the UPSERT keyed on `(sheet_id, row, col)` stops duplicate *state*. Two layers, two different failure modes — a network retry can neither double-append nor double-apply.
+I give up the apparent simplicity of “broadcast after every write.” The additional protocol is
+justified because brief disconnects and gateway restarts are normal, not exceptional
+spreadsheet usage.
 
-## 🚀 The Read Path: Opening a 100,000-Cell Sheet Fast
+## 📈 Scaling, failures, and verification — 4 minutes
 
-The write path gets all the attention, but the read path has its own trap: a popular sheet is opened far more often than it's edited, and a cold open must paint fast.
+I would scale owners and PostgreSQL partitions by workbook ID. Gateways scale with sockets and
+delivery bytes; workers scale with calculation cost. Presence gets its own budget so cursor
+movement cannot starve durable edits.
 
-| Concern | How it's handled |
-|---------|------------------|
-| Don't evaluate on open | `computed_value` is denormalized alongside `raw_value`, so opening a sheet with 100K formulas is 100K reads, not 100K evaluations. This is why the denormalization earns its keep despite the drift risk |
-| Don't ship the whole grid | Cells load **paged by row range** (`GET /api/sheets/:id/cells?rows=1-200`), and because storage is sparse, a row range is a contiguous slice of the `(sheet_id, row, col)` index — an index range scan, not a full-sheet fetch |
-| Don't hit Postgres for hot sheets | Active sheets are cached in Redis; the sequencer already holds the authoritative state in memory, so a warm open can be served without touching the database at all |
-| Don't serve stale after a cold open | Postgres lags the log by up to ~1s, so a cold read replays the **log tail** past the last materialized checkpoint before handing the client a `SYNC` — durability from the log, freshness from replaying it |
+The first concentrated bottleneck is often one workbook's queue or dependency graph. I would
+cap paste size, rate-limit expensive edits, and move hot workbooks to dedicated capacity
+before attempting to split one consistency domain.
 
-> "The read path is where the storage inversion pays a second dividend. Because the sequencer holds live state and the log holds truth, the database is free to be *only* a fast-load cache for inactive sheets — it never has to be current, only close. That's what lets a viewer-heavy sheet scale: a read-only viewer doesn't join the collaborative session at all, it gets a CDN-cached snapshot of `computed_value`s plus a low-frequency update channel, and never consumes a sequencer slot meant for the ~50 people actually editing."
+| Failure test | Expected evidence |
+|--------------|-------------------|
+| Crash after commit, before ACK | Retry returns the original receipt and revision |
+| Two owners after a pause | Stale epoch cannot write |
+| Lost/repeated outbox delivery | One canonical effect; replay fills the gap |
+| Slow old formula job | Published calculation revision never decreases |
+| Snapshot token expiry | Explicit reset; no silently incomplete range |
+| Undo after another user's edit | Conflict instead of overwriting that edit |
 
-## 🛠️ Failure Handling
+Metrics should expose commit latency, owner queue age, receipt hits, replay gaps, outbox age,
+calculation lag, and formula budget rejections. Workbook IDs belong in sampled traces, not
+unbounded metric labels.
 
-| Failure | Behavior |
-|---------|----------|
-| **Sequencer for a sheet dies** | Lease expires; a peer acquires it, replays the op log from the last checkpoint, rebuilds cells + dep graph in memory. Clients see a brief pause, then a `SYNC`. Because the log is the truth, the rebuild is exact — no guessing |
-| **Redis Pub/Sub down** | Fan-out degrades to single-gateway; collaborators on *other* gateways stop seeing updates. Circuit-break and surface it — a collaborative editor that silently stops being collaborative is the worst possible failure, because users keep typing |
-| **PostgreSQL down** | Editing **continues** — the log is the truth and broadcast doesn't depend on Postgres. Cold loads of inactive sheets fail. This is exactly the resilience the inverted storage model buys |
-| **Op log unavailable** | **Reject edits.** This is the one place we fail closed: without a durable append we cannot promise the edit survives, and acknowledging an edit we might lose is worse than refusing it |
-| **Client disconnects** | Reconnect with its last-seen seq; the server sends operations since then, or a full state sync if it's too far behind |
-| **Formula engine overloaded** | Recalculation queues and lags; raw values still save and broadcast. Cells show a "calculating" state — degraded and honest |
+For regional failure, I would state the database durability policy explicitly. Zero loss of
+acknowledged edits requires suitable durable replication and fenced failover; merely keeping
+an asynchronous replica does not prove that guarantee.
 
-The rule: **the log is sacred; everything else degrades.**
+## 🧭 Close and implementation comparison — 2 minutes
 
-## 📊 Observability
+> “The three guarantees I would defend are an atomic raw-edit commit, a formula result tied to
+> known inputs, and a recoverable boundary between snapshots and live messages.”
 
-| Signal | What it tells me |
-|--------|------------------|
-| Sequencer op-processing latency, p99 | The core SLO. It's the serialization point, so it's where queuing shows up first |
-| **Materializer lag** | Directly bounds how stale PostgreSQL is — which is to say, it *is* the freshness guarantee. If it grows without bound, cold loads are silently wrong |
-| Recalculation cascade size, p99 | Detects the cascade bomb before a user does. A p99 of 10,000 affected cells means someone built a spreadsheet that will melt |
-| Convergence check | Periodically hash each client's visible state and compare. **Divergence is silent** — it produces no errors, no exceptions, just two people looking at different numbers. It is the single most dangerous failure in this system and the only way to catch it is to look for it |
-| WebSocket connections per gateway | Rebalancing signal |
-| Op log append latency | If this degrades, we start rejecting edits — it's the one hard dependency |
+The repository currently stores cells in PostgreSQL and broadcasts through local WebSocket
+rooms. Its Redis receipts are optional, checked before and stored after SQL without an atomic
+claim; the browser sends no request IDs. Redis publication has no wired subscriber path.
 
-## 📐 Capacity Planning (Back-of-Envelope)
+There is no workbook revision, owner fencing, durable operation log, transactional outbox, or
+replay. Formula evaluation runs synchronously, handles literal examples, and falls back to
+unrestricted JavaScript without reference resolution. REST bulk edits take a different write
+path and do not publish to collaborators.
 
-Turning the scale numbers into a fleet, because "it scales" means nothing without the arithmetic:
-
-- **WebSocket gateways:** 2M concurrent editors ÷ ~50K connections per gateway ≈ **40 gateways**, call it ~60 with headroom. Viewers don't hold sequencer state and are served from CDN snapshots, so they don't size the editing fleet — which is the whole reason to keep them off it.
-- **Sequencers:** one owner per *active* sheet, but each sheet is tiny (≤50 editors), so one process comfortably owns thousands of them. The binding constraint is **memory** — each sequencer holds its sheets' cells + dependency graphs in RAM — not CPU. Packed by `sheet_id`, this is low hundreds of processes, and it scales by adding processes and rebalancing sheet ownership.
-- **Op log:** partitioned by `sheet_id`. 500K edits/sec across ~200 partitions ≈ 2.5K appends/sec/partition — trivial for Kafka. Partition count is chosen for **materializer parallelism**, not for append throughput, which sequential appends make a non-issue.
-- **Materializers and Postgres:** coalescing collapses ~5–10 ops/cell into one write, turning the naive ~1M writes/sec into ~100–200K coalesced writes/sec spread across sharded Postgres — tens of shards, each in comfortable range-scan territory.
-
-> "The single ratio that sizes the whole system is **materializer throughput vs. log ingest rate.** If materializers keep up, Postgres lags the log by well under a second and cold reads are fast. If they fall behind, lag grows without bound, cold reads replay more and more log tail, and the failure is *silent* — nothing errors, opens just get slower. That ratio, not CPU or connection count, is the capacity SLO I'd alert on first."
-
-## 📈 Scalability: What Breaks First
-
-1. **PostgreSQL write volume** — first, and by a wide margin. The log-as-truth inversion plus coalescing plus sharding by `sheet_id` is the answer, and it's the single most important thing in this design.
-2. **WebSocket connections** — ~50K per gateway before event-loop latency eats the 200ms budget. Horizontal gateways, routed by sheet so that a sheet's collaborators tend to land together and much of the fan-out becomes local rather than crossing Redis.
-3. **Recalculation cascades** — a pathological sheet (one cell feeding 10,000 formulas) can saturate a formula worker. Debounce, batch, and move heavy evaluation to a worker pool so it never blocks the sequencer's event loop. The sequencer must stay responsive: it's a serialization point, and anything that blocks it blocks everyone on that sheet.
-4. **Op log / history growth** — every edit is a row, forever. Checkpoint periodically (snapshot the sheet state, truncate the log before it), and prune per-user history after 30 days. Without checkpoints, sequencer failover replay time grows without bound, and the recovery path degrades silently until the day you need it.
-5. **The one-thousand-viewer sheet** — a popular public template has few editors and enormous read fan-out. That's a completely different problem, and it gets a different answer: viewers don't need a sequencer, they need a **CDN-cached snapshot** plus a low-frequency update channel. Serving a read-only viewer through the collaborative editing path is a waste of an expensive resource.
-
-## ⚖️ Trade-offs Summary
-
-| Decision | Chosen | Alternative | Rationale |
-|----------|--------|-------------|-----------|
-| Cell conflict | ✅ Last-write-wins | ❌ OT / CRDT on values | There's no meaningful merge of `100` and `200` |
-| **Structural ops** | ✅ Single sequencer + coordinate transform | ❌ LWW | LWW silently writes the right value into the *wrong cell* — corruption with no error |
-| Ordering | ✅ One sequencer per sheet | ❌ Multi-writer with vector clocks | 50 editors never saturate one process; the sequencer buys correctness, not throughput |
-| Source of truth | ✅ Durable op log | ❌ PostgreSQL | 1M writes/sec doesn't fit; a sequential append does |
-| Persistence | ✅ Async materialize + coalesce | ❌ Synchronous write per edit | Typing "12345" should be one row, not five |
-| Storage | ✅ Sparse cells | ❌ Dense grid | 1000× waste; 10 TB vs 10 PB |
-| Formula eval | ✅ Server-authoritative (client optimistic) | ❌ Client-side | 50 clients computing independently can disagree; viewers shouldn't have to compute |
-| Recalculation | ✅ Reverse dep index + topo sort of the affected subgraph | ❌ Full-sheet recompute | O(affected), not O(sheet) — and usually affected is zero |
-| Cursors/presence | ✅ Conflated, throttled, lossy | ❌ Reliable delivery | Newest cursor supersedes; nobody needs the old one |
-| Undo | ✅ Per-user, inverse ops appended as new ops | ❌ Global stack / log rewind | Undoing your colleague's work is unforgivable; rewinding a shared log is unsolvable |
-| Edit log unavailable | ✅ Fail closed (reject edits) | ❌ Accept and hope | Acknowledging an edit we might lose is worse than refusing it |
-
-## 🚀 Closing: What I'd Build Next
-
-The most interesting unbuilt thing is **offline editing**, and it's interesting because it breaks my central assumption. Everything here rests on a single sequencer assigning a total order — which requires the client to be *online* to get one. A client that edits offline for an hour and reconnects has a batch of operations written against an ancient coordinate system, and transforming them all against an hour of other people's structural changes is exactly the case where OT gets genuinely hard and where a CRDT starts to look like the right tool after all. I'd want to be honest that the design I've described is a *connected* design, and that offline is not a feature you bolt on — it's a different concurrency model.
-
-Beyond that: **cell-level permissions and protected ranges** (which turn every operation into an authorization check on the sequencer's hot path), **import/export** at scale (a 500MB CSV is a very different write pattern than a keystroke and shouldn't go anywhere near the sequencer), and **a real formula language** — the moment you support `VLOOKUP` across sheets, the dependency graph stops being per-sheet and the clean sharding boundary I've been relying on all answer quietly disappears. That last one is the kind of thing that looks like a feature request and is actually an architecture change.
-
-One more that's nearly free given this design: **cell-level audit and provenance** — "who set B12 to this, and when." Financial models are exactly the sheets where this matters, and I already have the substrate for it, because the op log *is* an immutable, totally-ordered, per-user record of every change. Cell history becomes a query over the log (or a projection materialized alongside cells) rather than a new subsystem — a good sign the log-as-truth model was the right spine to build on. The work is retention and indexing (the log grows forever, so audit projections need their own checkpoint/rollup), not a new write path. That it falls out of the existing architecture, rather than fighting it, is the strongest evidence the core decision — order everything through one sequencer into one durable log — was worth its operational cost.
+Those are useful teaching gaps, but they must not be described as an implemented distributed
+spreadsheet. The verified mapping is in
+[architecture.md](./architecture.md#implementation-notes), with setup in
+[README.md](./README.md).

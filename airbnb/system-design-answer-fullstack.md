@@ -37,28 +37,64 @@ Assume ten million listings, a peak of ten thousand searches per second and one
 hundred booking attempts per second. These are sizing assumptions, not measurements.
 Read-heavy discovery and concentrated inventory writes need different scaling paths.
 
-## 🏗️ Draw one end-to-end architecture — 5 minutes
+## 🏗️ Draw one end-to-end architecture — 6 minutes
 
 ```
-┌──────────────────────┐      ┌──────────────────────────────┐
-│ React web client     │─────▶│ API / sessions               │
-│ Search, listing,     │      └────────┬─────────────┬───────┘
-│ booking, host tools  │               │             │
-└──────────────────────┘               ▼             ▼
-                           ┌────────────────┐ ┌─────────────────┐
-                           │ Search / cache │ │ Booking / rules │
-                           └────────┬───────┘ └────────┬────────┘
-                                    ▼                  ▼
-                           ┌────────────────┐ ┌─────────────────┐
-                           │ PostGIS reads /│ │ Database +      │
-                           │ search view    │ │ outbox          │
-                           └────────────────┘ └────────┬────────┘
-                                                       ▼
-                                              ┌─────────────────┐
-                                              │ Broker / workers│
-                                              │ notifications   │
-                                              └─────────────────┘
+BROWSER — private query and recovery state is scoped to the account
+
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Guest / host screens     │intent/UI   │ Route + recovery state   │key/state   │ Shared data layer        │
+│ Search, details, trips   │◀──────────▶│ Query / draft / op ID    │◀──────────▶│ Account + query IDs      │
+│ Pending != confirmed     │            │ Resume unresolved intent │            │ Fetch, retry, reconcile  │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+              ▲                                                                               ▲
+              │                                         HTTP / result or conflict             │
+              │                                       ┌───────────────────────────────────────┘
+              │ GET / bytes                           │
+              │                                       │
+              ▼                                       ▼
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Public images + CDN      │            │ Marketplace API          │session     │ Shared sessions          │
+│ Static listing bytes     │            │ Actor + resource scope   │◀──────────▶│ Current user identity    │
+│ No private booking cache │            │ Resolve quote + op ID    │            │ Expiry and revocation    │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+                                                      ▲
+                                                      │
+candidate query/results                               │
+              ┌───────────────────────────────────────┤
+              │                                       │ reserve / recover
+              │                                       │
+              ▼                                       ▼
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Discovery reads          │            │ Inventory transaction    │events      │ Relay / broker / workers │
+│ PostGIS + scoped cache   │            │ PostgreSQL + outbox      │───────────▶│ Retry committed work     │
+│ May lag real inventory   │            │ Booking / rules / op ID  │            │ Consumer-scoped progress │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+              ▲                                                                               │
+              │                                                                               │
+              │          versioned projection refresh                                         │
+              └───────────────────────────────────────────────────────────────────────────────┤
+                                                                                              │ deliver
+                                                                                              │
+                                                                                              ▼
+Commit returns booking state; worker delivery may follow later.                 ┌──────────────────────────┐
+On a lost response, resolve the retained operation ID first.                    │ Notification delivery    │
+                                                                                │ Booking ID + revision    │
+                                                                                │ Separate from UI result  │
+                                                                                └──────────────────────────┘
 ```
+
+I would trace the guest's dates and guests through the route/data layer into a quote,
+then follow one identified reservation down the inventory path. The committed booking
+state returns to the shared data layer and the screen, while outbox work refreshes
+search separately. The return arrows matter: a candidate card cannot manufacture a
+confirmation, and an interrupted response must resolve the same booking operation.
+
+The browser saves the operation reference under the active account before sending
+the reservation; it keeps that private reference out of shareable URLs. A reload
+restores the reference and follows the same API path to recover the result. Public
+images use the separate CDN path, while worker retries affect notifications and
+discovery freshness rather than inventing a new reservation outcome.
 
 A CDN serves public images and static assets. The diagram's service boundaries are
 logical at first; a modular Express application and PostgreSQL/PostGIS can support
@@ -353,7 +389,7 @@ The browser, database and workers each keep enough identity to detect stale work
 That is the shared design principle: a later arrival is not automatically the newest
 intent or the most authoritative fact.
 
-## ⚡ Performance, privacy and secondary flows — 5 minutes
+## ⚡ Performance, privacy and secondary flows — 4 minutes
 
 Image delivery dominates many listing pages. Use responsive variants, reserve layout
 space, prioritize visible images and lazy-load the rest. Load the map only when used.

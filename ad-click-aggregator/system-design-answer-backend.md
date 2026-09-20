@@ -3,7 +3,7 @@
 *A 45-minute interview discussion. This is a proposed production design. The local
 implementation and its correctness gaps are described in [architecture.md](./architecture.md).*
 
-## 🎯 Define acceptance and counting — 5 minutes
+## 🎯 Define acceptance and counting — 4 minutes
 
 > “I would start by separating three moments: receiving a click, durably accepting
 > it, and making it visible in analytics. A system can be fast at the first while
@@ -62,33 +62,59 @@ One thousand dashboard users refreshing once every five seconds imply about
 200 queries per second for one combined report endpoint. Query caching and bounded
 ranges can matter as much as raw event throughput.
 
-## 🏗️ Draw the service boundaries — 5 minutes
+## 🏗️ Draw the service boundaries — 6 minutes
 
 ```
-┌─────────────┐   ┌─────────────┐   ┌────────────────────┐
-│ Click source│──▶│ Collector   │──▶│ Canonical events   │
-│ stable IDs  │   │ validate    │   │ + outbox transaction│
-└─────────────┘   └─────────────┘   └──────────┬─────────┘
-                                              │ relay
-                                              ▼
-                                    ┌───────────────────┐
-                                    │ Durable stream    │
-                                    └──────────┬────────┘
-                                               ▼
-                                    ┌───────────────────┐
-                                    │ Fraud + aggregate │
-                                    │ durable state     │
-                                    └──────────┬────────┘
-                                               │ versioned snapshots
-                                               ▼
-                                    ┌───────────────────┐
-                                    │ Analytics store   │
-                                    └──────────┬────────┘
-                                               ▼
-                                    ┌───────────────────┐
-                                    │ Reporting API     │
-                                    └───────────────────┘
+ACCEPTANCE — the response acknowledges the canonical transaction
+
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Click source             │event/ACK   │ Collector                │commit/read │ Canonical DB + outbox    │
+│ Stable event ID, payload │◀──────────▶│ Validate / authorize ad  │◀──────────▶│ Unique ID + payload      │
+│ Retry ambiguous response │            │ Return saved acceptance  │            │ One atomic acceptance    │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+                                                                                              │
+                                                                                              │ committed only
+                                                                                              │
+                                                                                              ▼
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Fraud / rollup processor │replay      │ Durable stream           │publish     │ Outbox relay             │
+│ Apply events/corrections │◀───────────│ Partitioned ordered work │◀───────────│ Publish committed events │
+│ Version rule decisions   │            │ Replay from checkpoint   │            │ Retry uncertain delivery │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+              ▲
+              │
+              │ apply / recover
+              │
+              ▼
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Durable processor state  │snapshots   │ Analytics projection     │query/result│ Reporting API            │
+│ Identity + measures      │───────────▶│ Absolute bucket versions │◀──────────▶│ Auth, range, dimensions  │
+│ Progress committed here  │            │ One published generation │            │ Values + coverage        │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+                                                                                              ▲
+                                                                                              │
+                                                                                              │ scope / report
+                                                                                              │
+Replays reuse durable applied identity.                                                       │
+Snapshot retries retain the same revision.                                                    ▼
+                                                                                ┌──────────────────────────┐
+                                                                                │ Analyst clients          │
+Redis may accelerate signals; it does not                                       │ Provisional report       │
+decide acceptance or own aggregate truth.                                       │ Fetch time != coverage   │
+                                                                                └──────────────────────────┘
 ```
+
+The top arrows include the acceptance result: the collector acknowledges only after
+the canonical event and outbox commit. The relay and stream may deliver again, so the
+processor couples applied identity, measures, and durable progress before exporting
+absolute versioned snapshots. The separate reporting path queries one valid projection
+revision and returns coverage. Redis accelerates signals without deciding acceptance.
+
+I would circle two distinct durable boundaries: canonical acceptance at the top and
+applied identity, measures, and progress in the processor-state store below. Neither
+an in-memory worker nor a stream acknowledgement substitutes for that second commit.
+After a crash, the processor reloads committed state and replays unacknowledged work;
+it exports the same saved bucket revision again if projection delivery was uncertain.
 
 PostgreSQL is an initial candidate for canonical events, metadata, and an outbox.
 A durable stream decouples acceptance from projection. ClickHouse serves bounded

@@ -64,22 +64,47 @@ Proposed production architecture; the execution boundary is absent from the loca
 prototype.
 
 ```
-┌──────────────┐       ┌───────────────────┐       ┌────────────────┐
-│ Terminal UI  │◀─────▶│ Task coordinator  │◀─────▶│ Model adapter  │
-└──────────────┘       └────────┬──────────┘       └───────┬────────┘
-                               │                          ▼
-                    ┌──────────▼──────────┐       ┌────────────────┐
-                    │ Policy + scheduler  │       │ Provider API   │
-                    └──────────┬──────────┘       └────────────────┘
-                               ▼
-                    ┌─────────────────────┐       ┌────────────────┐
-                    │ Restricted executor │◀─────▶│ Workspace      │
-                    └──────────┬──────────┘       └────────────────┘
-                               ▼
-                    ┌─────────────────────┐
-                    │ Task journal        │
-                    └─────────────────────┘
+┌────────────────────────┐                                        ┌────────────────────────┐
+│ Terminal client        │                                        │ Remote provider API    │
+│ Input / decisions      │                                        │ Untrusted proposals    │
+└────────────────────────┘                                        └────────────────────────┘
+                ▲                                                              ▲
+                │            commands / events   context / proposals           │
+┌───────────────┼──────────────────────────────────────────────────────────────┼───────────┐
+│ LOCAL RUNTIME │                                                              │           │
+│               ▼                                                              ▼           │
+│  ┌──────────────────────────────────────────────────────┐    ┌────────────────────────┐  │
+│  │ Task coordinator                                     │    │ Provider adapter       │  │
+│  │ Task state, context, budgets                         │◀──▶│ Instructions, calls    │  │
+│  │ Operation IDs / observed or unknown outcomes         │    │ Stop reasons           │  │
+│  └──────────────────────────────────────────────────────┘    └────────────────────────┘  │
+│                          ▲                  ▲                                            │
+│                          │                  │                                            │
+│  journal / replay        │                  │  complete operations                       │
+│                          │                  │                                            │
+│                          ▼                  ▼                                            │
+│  ┌────────────────────────┐    ┌────────────────────────┐    ┌────────────────────────┐  │
+│  │ Task journal           │    │ Policy + scheduler     │    │ Restricted executor    │  │
+│  │ Intent / known outcome │    │ Validate, authorize    │◀──▶│ Scoped files/processes │  │
+│  │ Replay + artifact refs │    │ Scope + operation ID   │    │ Known/unknown effects  │  │
+│  └────────────────────────┘    └────────────────────────┘    └────────────────────────┘  │
+│                                                                                      ▲   │
+│                                                                                      │   │
+│                                                              bounded I/O             │   │
+│                                                                                      │   │
+│                                                                                      ▼   │
+│                                                              ┌────────────────────────┐  │
+│                                                              │ Task workspace         │  │
+│                                                              │ Files + process state  │  │
+│                                                              └────────────────────────┘  │
+└──────────────────────────────────────────────────────────────────────────────────────────┘
 ```
+
+Read the two outside boxes as different trust boundaries: the terminal supplies
+user intent, while the remote provider returns untrusted proposals. The coordinator
+records intent, policy admits a concrete operation, and the executor returns observed
+effects from the workspace. Journal replay reconstructs task state after a crash; an
+unfinished operation still requires inspection before it can be considered safe to retry.
 
 The coordinator owns task ordering and budgets. Policy makes authorization
 choices; the executor enforces granted capabilities. The journal records task and

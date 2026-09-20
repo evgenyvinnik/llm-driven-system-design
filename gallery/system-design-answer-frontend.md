@@ -50,14 +50,50 @@ I would draw the metadata, rendering, and viewer boundaries rather than every co
 the visual tree.
 
 ```
-┌────────────────────────┐     ┌────────────────────────┐     ┌────────────────────────┐
-│ Gallery route / state  │ ──▶ │    Layout adapters     │ ──▶ │     Image loaders      │
-└────────────────────────┘     └────────────────────────┘     └────────────────────────┘
+┌────────────────────────────────────────────────────────────┐
+│ BROWSER / GALLERY, LISTING AND IMAGE GENERATION            │
+│                                                            │
+│  ┌────────────────────────┐    ┌────────────────────────┐  │    ┌────────────────────────┐
+│  │ Gallery route / layout │    │ Collection model/query │  │    │ Metadata API           │
+│  │ Gallery / layout mode  │◀──▶│ Ordered IDs / metadata │◀─┼───▶│ Access / listing state │
+│  │ Stable image identity  │    │ Page revision / errors │  │    │ Ready variant manifest │
+│  └────────────────────────┘    └────────────────────────┘  │    └────────────────────────┘
+│               ▲                             ▲              │
+│               │                             │              │
+│               ▼                             ▼              │
+│  ┌────────────────────────┐    ┌────────────────────────┐  │    ┌────────────────────────┐
+│  │ Tiles, masonry, slides │    │ Image resource loaders │  │    │ Image delivery         │
+│  │ One collection order   │◀──▶│ Variant / resource ID  │◀─┼───▶│ Authorized CDN path    │
+│  │ Reserved image slots   │    │ Load, decode, error    │  │    │ Finite image profiles  │
+│  └────────────────────────┘    └────────────────────────┘  │    └────────────────────────┘
+│               ▲                             ▲              │
+│               │                             │              │
+│  open/return  │             selected image  │              │
+│               │                             │              │
+│               ▼                             ▼              │
+│  ┌────────────────────────┐    ┌────────────────────────┐  │
+│  │ Lightbox / slideshow   │    │ Viewer controller      │  │
+│  │ Focus / keys / timer   │◀──▶│ Saved ID / view anchor │  │
+│  │ Shared traversal order │    │ Pause reasons + focus  │  │
+│  └────────────────────────┘    └────────────────────────┘  │
+│                                                            │
+└────────────────────────────────────────────────────────────┘
 
-┌────────────────────────┐     ┌────────────────────────┐
-│  Metadata query layer  │ ──▶ │  API / image delivery  │
-└────────────────────────┘     └────────────────────────┘
+Layouts share image identity/order; each resource load has its own generation and state.
 ```
+
+I would follow one metadata page into stable image slots and layout adapters, then select
+only an appropriate rendition for each visible slot. The same collection context drives
+the lightbox and slideshow. Their controller owns selected identity, focus return and pause
+reasons, while each loader owns decode/error state for a specific resource generation.
+Changing layout or receiving a late decode cannot redefine which photo the user selected.
+
+I would walk through opening and returning from the viewer:
+
+1. The controller records the selected image, listing context, and focus/scroll anchor; it drives both lightbox controls and image loading.
+2. Navigation requests a neighbor in that same listing and starts a resource-specific decode. Late events cannot replace the current selection.
+3. Returning restores the initiating item if it still exists, or a nearby focus target. An expired listing explicitly refreshes rather than silently reusing its cursor.
+4. A saved view checkpoint contains intent and identity. Protected metadata and bytes still follow current access policy before redisplay.
 
 The route identifies the gallery and a selected image when deep linking is useful. A
 metadata query layer owns fetched pages, listing revision, loading/error states, and

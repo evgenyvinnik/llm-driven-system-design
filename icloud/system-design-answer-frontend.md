@@ -1,697 +1,439 @@
-# iCloud Sync - System Design Answer (Frontend Focus)
+# Design iCloud Sync — frontend interview
 
-*45-minute system design interview format - Frontend Engineer Position*
+> “I’ll design the browser experience for a private file drive and photo library.
+> The central promise is that users can tell whether their work is only on this
+> device, committed to the cloud, or waiting for a conflict decision.”
 
-## Opening Statement (1 minute)
+This is a proposed 45-minute design. The repository implements an online subset;
+its boundaries appear at the end. The design is independent of Apple's internals.
 
-"I'll design iCloud, a file and photo synchronization service that keeps data consistent across all Apple devices. As a frontend engineer, I'll focus on the client-side architecture: building an offline-first experience with local persistence, implementing smooth sync status UI, and creating an efficient photo gallery with virtualization for thousands of images.
+## 🎯 Requirements and scope — 5 minutes
 
-The key frontend challenges are: managing complex sync state across file operations, building a responsive UI that works offline and syncs seamlessly when reconnected, and rendering large photo libraries efficiently without overwhelming memory or degrading scroll performance."
+I would first clarify what “sync” means for this client. Are we building a native
+filesystem agent, a browser file manager, or both? I’ll focus on the browser and
+assume native clients use the same server protocol.
 
-## Requirements Clarification (3 minutes)
+A browser can accept user-selected files and maintain an explicit offline library.
+I would not promise that it watches arbitrary folders or keeps working indefinitely
+after the user closes the tab.
 
-### Functional Requirements
-- **File Browser**: Navigate folders, view files, upload/download content
-- **Photo Gallery**: Grid view of photos with thumbnails, full-screen viewer
-- **Sync Status**: Clear indication of sync progress and conflicts
-- **Offline Support**: Full functionality offline with pending changes queue
-- **Sharing**: Share files and photo albums with other users
+The primary journeys are:
 
-### Non-Functional Requirements
-- **Performance**: 60fps scrolling through 10,000+ photos
-- **Responsiveness**: < 100ms UI response for all interactions
-- **Offline-first**: Core features work without network
-- **Memory efficiency**: Handle large libraries without memory bloat
+- Browse folders, upload files, and download a selected revision.
+- Rename, move, or delete an item while showing the pending outcome.
+- Resume an interrupted upload without losing the selected bytes.
+- See another device's changes and resolve genuinely concurrent edits.
+- Browse a large photo library using thumbnails, then open a larger preview.
 
-### Key Frontend Challenges
-1. How to represent sync state visually (synced, pending, conflict)?
-2. How to handle offline operations and queue them for sync?
-3. How to efficiently render thousands of photos?
+I would defer shared albums, collaborative document editing, and system-wide photo
+backup. Those change permissions, conflict semantics, and platform capabilities.
 
-## High-Level Architecture (4 minutes)
+For sizing, assume a heavy account can have 100,000 photos and thousands of files
+in a folder. A phone may have a slow network, little free storage, and a short-lived
+browser session. Those constraints drive pagination, virtualization, and persistence.
 
-```
-┌───────────────────────────────────────────────────────────────────────────┐
-│                        FRONTEND APPLICATION                               │
-├───────────────────────────────────────────────────────────────────────────┤
-│                                                                           │
-│  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐            │
-│  │  File Browser   │  │  Photo Gallery  │  │  Admin Panel    │            │
-│  │  - Tree view    │  │  - Grid view    │  │  - Storage      │            │
-│  │  - List view    │  │  - Lightbox     │  │  - Devices      │            │
-│  │  - Upload/DL    │  │  - Albums       │  │  - Sharing      │            │
-│  └─────────────────┘  └─────────────────┘  └─────────────────┘            │
-│                                                                           │
-│  ┌───────────────────────────────────────────────────────────────────┐    │
-│  │                     STATE MANAGEMENT (Zustand)                     │    │
-│  │  ┌──────────────┐  ┌──────────────┐  ┌─────────────────────┐      │    │
-│  │  │ File Store   │  │ Photo Store  │  │ Sync State Store    │      │    │
-│  │  │ - Files tree │  │ - Library    │  │ - Pending ops       │      │    │
-│  │  │ - Selection  │  │ - Albums     │  │ - Conflicts         │      │    │
-│  │  │ - Operations │  │ - Viewer     │  │ - Device status     │      │    │
-│  │  └──────────────┘  └──────────────┘  └─────────────────────┘      │    │
-│  └───────────────────────────────────────────────────────────────────┘    │
-│                                                                           │
-│  ┌───────────────────────────────────────────────────────────────────┐    │
-│  │                       SERVICE LAYER                                │    │
-│  │  ┌──────────────┐  ┌────────────────┐  ┌──────────────────┐       │    │
-│  │  │ Sync Engine  │  │ Offline Queue  │  │ WebSocket Client │       │    │
-│  │  └──────────────┘  └────────────────┘  └──────────────────┘       │    │
-│  └───────────────────────────────────────────────────────────────────┘    │
-│                                                                           │
-│  ┌───────────────────────────────────────────────────────────────────┐    │
-│  │                     PERSISTENCE LAYER                              │    │
-│  │            IndexedDB (files, photos, pending operations)           │    │
-│  └───────────────────────────────────────────────────────────────────┘    │
-│                                                                           │
-└───────────────────────────────────────────────────────────────────────────┘
-                                    │
-                                    ▼
-┌───────────────────────────────────────────────────────────────────────────┐
-│                            BACKEND API                                    │
-└───────────────────────────────────────────────────────────────────────────┘
-```
+My proposed experience targets are an immediate pending indicator after an action,
+p95 metadata reads below 200 ms in-region, and online change visibility within a few
+seconds of cloud commit. These are targets to validate, not measured results.
 
-### Component Structure
+I would establish three distinct states before drawing any components:
+
+| User-visible state | What the system has established |
+|--------------------|---------------------------------|
+| Saved on this device | Intent and required bytes are persisted locally |
+| Saved to cloud | Server returned a durable revision or matching receipt |
+| Available offline here | This device has verified, retained bytes for that revision |
+
+An upload reaching 100% on the network establishes none of the last two by itself.
+The server can still reject publication, and another device may not have downloaded
+anything yet.
+
+## 🏗️ High-level architecture — 6 minutes
+
+> “I’ll separate views, authoritative client state, and synchronization. Components
+> express what the user wants; one coordinator owns retries and reconciliation.”
 
 ```
-┌───────────────────────────────────────────────────────────────────────────┐
-│                      COMPONENT ORGANIZATION                               │
-├───────────────────────────────────────────────────────────────────────────┤
-│                                                                           │
-│  components/                                                              │
-│  ├── admin/                      # Admin dashboard components             │
-│  │   ├── OverviewTab             # System statistics                      │
-│  │   ├── OperationsTab           # Sync operations table                  │
-│  │   ├── ConflictsTab            # Conflict management                    │
-│  │   └── UsersTab                # User administration                    │
-│  │                                                                        │
-│  ├── common/                     # Shared UI primitives                   │
-│  │   ├── StatCard                # Metric display cards                   │
-│  │   ├── LoadingSpinner          # Loading indicators                     │
-│  │   ├── Modal                   # Dialog wrapper                         │
-│  │   └── ModalActions            # Cancel/confirm buttons                 │
-│  │                                                                        │
-│  ├── files/                      # File browser components                │
-│  │   ├── FileItemComponent       # Single file/folder row                 │
-│  │   ├── FileToolbar             # Breadcrumb and actions                 │
-│  │   ├── FileList                # File listing container                 │
-│  │   ├── FileStatusBanners       # Sync status banners                    │
-│  │   ├── NewFolderModal          # Folder creation                        │
-│  │   ├── SelectionBar            # Selection count                        │
-│  │   └── DragOverlay             # Drop zone indicator                    │
-│  │                                                                        │
-│  └── photos/                     # Photo gallery components               │
-│      ├── PhotoItem               # Single photo thumbnail                 │
-│      ├── PhotoViewer             # Full-screen lightbox                   │
-│      ├── PhotoToolbar            # Filter controls                        │
-│      ├── PhotoGrid               # Virtualized grid                       │
-│      └── CreateAlbumModal        # Album creation                         │
-│                                                                           │
-└───────────────────────────────────────────────────────────────────────────┘
+BROWSER — one account/session generation; confirmed data and pending intent stay distinct
+
+┌────────────────────────────┐            ┌────────────────────────────┐            ┌────────────────────────────┐
+│ Drive / Photos / Viewer    │1 UI/state  │ Account-scoped state       │2 intents   │ Sync coordinator           │
+│ Folder list, grid, preview │◀──────────▶│ Entities + query pages     │◀──────────▶│ Command ID / replay cursor │
+│ Selection and focus        │            │ Pending UI projection      │            │ Reconcile, retry, resolve  │
+└────────────────────────────┘            └────────────────────────────┘            └────────────────────────────┘
+               ▲                                         ▲                                         ▲
+               │                                         │                                         │
+               │ preview / result                        │ 3 save / hydrate                        │ send / event
+               │                                         │                                         │
+               ▼                                         ▼                                         ▼
+┌────────────────────────────┐            ┌────────────────────────────┐            ┌────────────────────────────┐
+│ Media loader + cache       │            │ IndexedDB + staged bytes   │4 bytes     │ Transfer + network adapter │
+│ Thumbnails / preview       │            │ Confirmed data + cursor    │◀──────────▶│ Hash worker / bounded I/O  │
+│ Bounded decoded images     │            │ Durable pending commands   │            │ HTTP replies + push hints  │
+└────────────────────────────┘            └────────────────────────────┘            └────────────────────────────┘
+               ▲                                                                                   ▲
+               │                                                                                   │
+               │ 5 private fetch                                                                   │ 6 REST / WS
+               │                NETWORK / AUTHORIZATION BOUNDARY                                   │
+───────────────┼───────────────────────────────────────────────────────────────────────────────────┼──────────────
+               │                                                                                   │
+               ▼                                                                                   ▼
+┌────────────────────────────┐                                                      ┌────────────────────────────┐
+│ Private media interface    │                                                      │ Sync / upload interface    │
+│ Authorized derivatives     │                                                      │ Sessions + saved receipts  │
+│ Versioned originals        │        REMOTE CONTRACTS                              │ Change feed / reset        │
+└────────────────────────────┘                                                      └────────────────────────────┘
 ```
 
-## Deep Dive: Sync State Management (10 minutes)
+The upper region is one browser account/session. IndexedDB survives a reload; the
+views and in-memory state do not. The lower region exposes two remote contracts:
+authorized media reads and sync/upload commands. Every network path crosses account
+authorization, including a cached photo read.
 
-The sync state is the most complex part of the frontend. We need to track file status, pending operations, and conflicts.
+The numbered arrows make ownership and the return paths explicit:
 
-### Zustand Store Architecture
+1. Views submit actions and render state snapshots; selection and focus stay in the view.
+2. The coordinator accepts intent and reconciles receipts or changes into confirmed state.
+3. Persistence saves pending work and hydrates the confirmed baseline and cursor on reload.
+4. Transfer workers read staged bytes and record verified progress under a stable job ID.
+5. The media loader fetches only the derivatives or originals the current view needs.
+6. The adapter exchanges commands, receipts, change pages, and push hints with the cloud.
 
-```
-┌───────────────────────────────────────────────────────────────────────────┐
-│                         FILE STORE STRUCTURE                              │
-├───────────────────────────────────────────────────────────────────────────┤
-│                                                                           │
-│  FileItem                                                                 │
-│  ─────────                                                                │
-│  ┌─────────────────┐  ┌─────────────────────────────────────────────────┐ │
-│  │ id: string      │  │ syncStatus: 'synced' | 'pending' | 'syncing'    │ │
-│  │ name: string    │  │            | 'conflict' | 'error'               │ │
-│  │ path: string    │  ├─────────────────────────────────────────────────┤ │
-│  │ type: file|folder│  │ version: Record<deviceId, sequenceNumber>       │ │
-│  │ size: number    │  │  (Version vector for conflict detection)        │ │
-│  └─────────────────┘  └─────────────────────────────────────────────────┘ │
-│                                                                           │
-│  PendingOperation                                                         │
-│  ────────────────                                                         │
-│  ┌────────────────────────────────────────────────────────────────────┐   │
-│  │ id: string                                                         │   │
-│  │ type: 'upload' | 'download' | 'delete' | 'rename' | 'move'         │   │
-│  │ fileId: string                                                     │   │
-│  │ payload: File | metadata                                           │   │
-│  │ createdAt: Date                                                    │   │
-│  │ retries: number (max 3)                                            │   │
-│  └────────────────────────────────────────────────────────────────────┘   │
-│                                                                           │
-└───────────────────────────────────────────────────────────────────────────┘
-```
+The state layer owns normalized file and photo entities, query membership, pending
+commands, and a session generation. Views own transient details such as an open menu,
+selection focus, and the current preview. The journal owns durable unsent work.
 
-### File Upload Flow with Optimistic Updates
+Walk through an upload with me. The user selects a file in Drive. The coordinator
+freezes the destination folder, stores the intent and bytes when offline persistence
+is available, and projects a pending item into the visible list.
 
-```
-┌───────────────────────────────────────────────────────────────────────────┐
-│                        OPTIMISTIC UPLOAD FLOW                             │
-└───────────────────────────────────────────────────────────────────────────┘
+The transport negotiates an upload session and sends chunks. Publication returns a
+revision and receipt. The coordinator reconciles that result into confirmed state
+and retires the journal entry. The view changes its status from pending to cloud saved.
 
-  User drops file
-        │
-        ▼
-  ┌─────────────────────────────────────────────────────────────────────────┐
-  │ 1. OPTIMISTIC UPDATE                                                    │
-  │    Create temp file entry with status='pending'                         │
-  │    Display immediately in UI                                            │
-  └───────────────────────────────────┬─────────────────────────────────────┘
-                                      │
-                                      ▼
-                        ┌──────────────────────────┐
-                        │   navigator.onLine?      │
-                        └───────────┬──────────────┘
-                                    │
-              ┌─────────────────────┴─────────────────────┐
-              │ ONLINE                                    │ OFFLINE
-              ▼                                           ▼
-  ┌───────────────────────────────────┐   ┌───────────────────────────────────┐
-  │ 2a. Set status='syncing'          │   │ 2b. Queue operation               │
-  │     Show spinner on file          │   │     Store in IndexedDB            │
-  └───────────────────┬───────────────┘   │     Will process when online      │
-                      │                   └───────────────────────────────────┘
-                      ▼
-  ┌───────────────────────────────────┐
-  │ 3. API upload                     │
-  └───────────────────┬───────────────┘
-                      │
-        ┌─────────────┴─────────────┐
-        │ SUCCESS                   │ FAILURE
-        ▼                           ▼
-  ┌─────────────────────┐   ┌─────────────────────┐
-  │ 4a. Replace temp ID │   │ 4b. Set status=     │
-  │     with server ID  │   │     'error'         │
-  │     status='synced' │   │     Queue for retry │
-  └─────────────────────┘   └─────────────────────┘
-```
+A push hint takes the reverse logical path: transport tells the coordinator that
+something changed; the coordinator pulls changes and updates state; subscribed views
+render those entities. A hint does not directly become an authoritative file row.
 
-### Pending Queue Processing
+After a reconnect, that same loop starts from the journal's cursor. After an ambiguous
+upload response, it queries the existing command receipt before creating any new work.
 
-```
-┌───────────────────────────────────────────────────────────────────────────┐
-│                    PENDING QUEUE PROCESSOR                                │
-├───────────────────────────────────────────────────────────────────────────┤
-│                                                                           │
-│  processPendingQueue()                                                    │
-│                                                                           │
-│  ┌────────────────────────────────────────────────────────────────────┐   │
-│  │ Guard: if (!isOnline || pendingOperations.length === 0) return     │   │
-│  └───────────────────────────────────┬────────────────────────────────┘   │
-│                                      │                                    │
-│                                      ▼                                    │
-│  ┌────────────────────────────────────────────────────────────────────┐   │
-│  │ For each operation in queue:                                       │   │
-│  │                                                                    │   │
-│  │   ┌──────────────────────────────────────────────────────────────┐ │   │
-│  │   │ Try: executeOperation(op)                                    │ │   │
-│  │   │   Success ──▶ Remove from queue                              │ │   │
-│  │   │   Failure ──▶ Increment retries                              │ │   │
-│  │   │              If retries < 3 ──▶ Keep in queue                │ │   │
-│  │   │              If retries >= 3 ──▶ Mark as permanent error     │ │   │
-│  │   └──────────────────────────────────────────────────────────────┘ │   │
-│  └────────────────────────────────────────────────────────────────────┘   │
-│                                                                           │
-│  Trigger: Called when 'online' event fires                                │
-│                                                                           │
-└───────────────────────────────────────────────────────────────────────────┘
-```
+For Photos, the entity contains derivative readiness and private media URLs. The grid
+loads thumbnails for visible rows, while the viewer requests a preview for a stable
+photo ID. The original is a separate explicit transfer.
 
-### File Status Banners
+I would start with React and a small external state store. The correctness boundary
+is the command and reconciliation model, not the choice between Zustand and Redux.
+A query cache can manage remote pages, but it does not replace the durable journal.
+
+## 💾 Data ownership and interfaces — 5 minutes
+
+I would avoid storing several mutable copies of the same photo in the grid, favorites
+view, and viewer. Each view refers to the same entity ID and has its own ordered list
+of matching IDs.
+
+| State | Owner | Lifetime |
+|-------|-------|----------|
+| Current account and session generation | Authentication boundary | Until logout or account switch |
+| Confirmed entities and revisions | Entity cache | Account-scoped, refreshable |
+| Folder/filter pages and continuation | Query cache | Keyed by account and query |
+| Pending command and base revision | Coordinator and journal | Until a terminal server outcome |
+| Staged file bytes and upload session | Transfer journal | Until committed, canceled, or explicitly discarded |
+| Selection and keyboard focus | Current view | Retained only while meaningful |
+| Previewed photo ID | Viewer | Independent of array position |
+| Durable feed cursor | Journal | Advances with applied change pages |
+
+The folder path or stable folder ID belongs in the URL so refresh and back navigation
+work. Search and filter parameters also need a reproducible query identity. Selection
+is not part of a server response and should survive a safe entity refresh by ID.
+
+These are proposed server contracts, not the repository's current route inventory:
+
+| Method | Endpoint | Frontend needs from it |
+|--------|----------|------------------------|
+| GET | `/folders/:id/items` | Stable IDs, revisions, opaque continuation |
+| POST | `/upload-sessions` | Account-bound session and missing-chunk plan |
+| PUT | `/upload-sessions/:id/chunks/:index` | Verified acknowledgement for one chunk |
+| POST | `/files/:id/commands` | Durable receipt or explicit conflict/rejection |
+| GET | `/commands/:id` | Resolve an ambiguous response |
+| GET | `/changes?cursor=...` | Ordered changes, next cursor, or reset required |
+| GET | `/photos` | Query-bound page and derivative status |
+| POST | `/conflicts/:id/resolve` | Outcome conditioned on the observed siblings |
+
+Commands carry a stable identity, desired operation, and base revision. Responses
+carry enough revision information to reconcile duplicates and events arriving out of
+order. Errors distinguish expired authentication, quota failure, conflict, and retryable
+transport failure; the UI should not turn all four into “Try again.”
+
+The client also validates response shape at its boundary. TypeScript types alone
+cannot validate JSON received over the network.
+
+## 🔧 Deep dive 1: Offline intent and reconciliation — 8 minutes
+
+> “I’d persist an intent before claiming it is safely queued. An optimistic row is
+> a projection of that intent, not evidence that the cloud has accepted it.”
+
+### The local write boundary
+
+For a rename, the journal records the account, file ID, observed revision, desired
+name, and command ID. For an upload, it also needs the actual bytes or a durable,
+permissioned handle whose availability has been checked.
+
+A filename, size, or hash is not enough to resume after reload. If local storage cannot
+retain the bytes, I would explain that the upload requires the tab to stay open or
+that the user will need to select the file again.
+
+Persisting can fail because the device is full, permission changes, or storage is
+unavailable. In that case, the UI must not display a durable offline acknowledgement.
+It can offer an online-only upload and keep that distinction visible.
+
+I would model the lifecycle with a small state diagram:
 
 ```
-┌───────────────────────────────────────────────────────────────────────────┐
-│                     STATUS BANNER SYSTEM                                  │
-├───────────────────────────────────────────────────────────────────────────┤
-│                                                                           │
-│  ┌─────────────────────────────────────────────────────────────────────┐  │
-│  │ OFFLINE BANNER (amber)                                              │  │
-│  │ ┌────────────────────────────────────────────────────────────────┐  │  │
-│  │ │ [CloudOff Icon]  You're offline                                │  │  │
-│  │ │                  Changes will sync when back online            │  │  │
-│  │ │                                         [X pending] ──────────▶│  │  │
-│  │ └────────────────────────────────────────────────────────────────┘  │  │
-│  └─────────────────────────────────────────────────────────────────────┘  │
-│                                                                           │
-│  ┌─────────────────────────────────────────────────────────────────────┐  │
-│  │ CONFLICT BANNER (red)                                               │  │
-│  │ ┌────────────────────────────────────────────────────────────────┐  │  │
-│  │ │ [AlertTriangle]  N conflict(s) detected                        │  │  │
-│  │ │                  Same file was edited on multiple devices      │  │  │
-│  │ │                                            [Resolve Button] ──▶│  │  │
-│  │ └────────────────────────────────────────────────────────────────┘  │  │
-│  └─────────────────────────────────────────────────────────────────────┘  │
-│                                                                           │
-│  ┌─────────────────────────────────────────────────────────────────────┐  │
-│  │ SYNCING BANNER (blue)                                               │  │
-│  │ ┌────────────────────────────────────────────────────────────────┐  │  │
-│  │ │ [RefreshCw spinning]  Syncing N file(s)...                     │  │  │
-│  │ └────────────────────────────────────────────────────────────────┘  │  │
-│  └─────────────────────────────────────────────────────────────────────┘  │
-│                                                                           │
-│  ┌─────────────────────────────────────────────────────────────────────┐  │
-│  │ ERROR BANNER (red)                                                  │  │
-│  │ ┌────────────────────────────────────────────────────────────────┐  │  │
-│  │ │ [XCircle]  N file(s) failed to sync                            │  │  │
-│  │ │                                              [Retry Button] ──▶│  │  │
-│  │ └────────────────────────────────────────────────────────────────┘  │  │
-│  └─────────────────────────────────────────────────────────────────────┘  │
-│                                                                           │
-└───────────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────┐
+│ Intent + bytes persisted │
+└──────────────────────────┘
+              │ transfer and publish
+              ▼
+┌──────────────────────────┐
+│ Await durable outcome    │
+└──────────────────────────┘
+              │ receipt / conflict / rejection
+              ▼
+┌──────────────────────────┐
+│ Reconcile or ask user    │
+└──────────────────────────┘
 ```
 
-### Sync Status Icon Mapping
+The journal remains the recovery source when the tab crashes in the middle state.
+A timeout is an unknown outcome, not proof of rejection. On restart, the coordinator
+looks up the existing command before creating a replacement.
 
-```
-┌───────────────────────────────────────────────────────────────────────────┐
-│                      SYNC STATUS ICONS                                    │
-├───────────────────────────────────────────────────────────────────────────┤
-│                                                                           │
-│  Status      │  Icon            │  Color        │  Meaning                │
-│  ────────────┼──────────────────┼───────────────┼─────────────────────────│
-│  synced      │  CheckCircle     │  green-500    │  Fully synchronized     │
-│  pending     │  Clock           │  amber-500    │  Waiting to sync        │
-│  syncing     │  RefreshCw spin  │  blue-500     │  Currently uploading    │
-│  conflict    │  AlertTriangle   │  red-500      │  Needs user resolution  │
-│  error       │  XCircle         │  red-500      │  Failed after retries   │
-│                                                                           │
-└───────────────────────────────────────────────────────────────────────────┘
-```
+### Applying remote changes safely
 
-## Deep Dive: Photo Gallery with Virtualization (10 minutes)
+I would apply a change page and its next cursor in the same local transaction. If the
+browser crashes afterward, it can replay safely; if it crashes beforehand, it re-fetches
+the page. Deduplication uses revision or event identity, not arrival order.
 
-The photo gallery must handle thousands of images efficiently using row-based virtualization.
+A reconnect, tab focus, or push hint triggers catch-up. If the cursor is too old, the
+server requests a snapshot reset. The client replaces its confirmed baseline while
+preserving pending intents and then rebases or surfaces them against that baseline.
 
-### Why Row-Based Virtualization
+For example, a user renames a file offline while another device deletes it. Replaying
+the rename should not silently recreate the file. The coordinator presents the missing
+base and offers an explicit recovery path if the user still has the content.
 
-Unlike single-item virtualization, we virtualize rows containing multiple photos:
-- Grid layout requires consistent column structure
-- Virtualizing rows maintains grid alignment
-- Simpler CSS layout (grid within each virtualized row)
+For two independent content edits, I would show both versions with device, revision,
+and available preview information. “Keep both” is a server command preserving two
+manifests, not a client-side copy of the filename.
 
-### PhotoGrid Architecture
+A resolution names the siblings the user actually reviewed. If another version arrives
+before submission, the server returns a refreshed conflict rather than discarding that
+new work under an old decision.
 
-```
-┌───────────────────────────────────────────────────────────────────────────┐
-│                    ROW-BASED VIRTUALIZATION                               │
-└───────────────────────────────────────────────────────────────────────────┘
+### Decision and cost
 
-  Constants: COLUMNS = 4, ITEM_HEIGHT = 200px, GAP = 8px
+| Approach | Pros | Cons |
+|----------|------|------|
+| ✅ Durable journal with optimistic projection | Responsive actions survive reload and can be reconciled | Storage pressure, schema migration, and recovery logic |
+| ❌ In-memory optimistic mutations alone | Easy to build and fast online | Reload loses intent; timeout can create duplicate actions |
 
-  ┌───────────────────────────────────────────────────────────────────────┐
-  │                     Scroll Container (parentRef)                       │
-  │  ┌─────────────────────────────────────────────────────────────────┐  │
-  │  │                   Virtual Height Container                       │  │
-  │  │           (height = rowCount * (ITEM_HEIGHT + GAP))              │  │
-  │  │                                                                  │  │
-  │  │    ═══════════════ VIEWPORT TOP ═══════════════                  │  │
-  │  │                                                                  │  │
-  │  │  ┌─────────────────────────────────────────────────────────────┐ │  │
-  │  │  │ Row 5 (rendered)  translateY(row.start)                     │ │  │
-  │  │  │ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐                 │ │  │
-  │  │  │ │ Photo  │ │ Photo  │ │ Photo  │ │ Photo  │                 │ │  │
-  │  │  │ │  17    │ │  18    │ │  19    │ │  20    │                 │ │  │
-  │  │  │ └────────┘ └────────┘ └────────┘ └────────┘                 │ │  │
-  │  │  └─────────────────────────────────────────────────────────────┘ │  │
-  │  │  ┌─────────────────────────────────────────────────────────────┐ │  │
-  │  │  │ Row 6 (rendered)                                            │ │  │
-  │  │  │ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐                 │ │  │
-  │  │  │ │ Photo  │ │ Photo  │ │ Photo  │ │ Photo  │                 │ │  │
-  │  │  │ │  21    │ │  22    │ │  23    │ │  24    │                 │ │  │
-  │  │  │ └────────┘ └────────┘ └────────┘ └────────┘                 │ │  │
-  │  │  └─────────────────────────────────────────────────────────────┘ │  │
-  │  │  ┌─────────────────────────────────────────────────────────────┐ │  │
-  │  │  │ Row 7 (rendered)                                            │ │  │
-  │  │  │ ... (2 more rows with overscan: 2)                          │ │  │
-  │  │  └─────────────────────────────────────────────────────────────┘ │  │
-  │  │                                                                  │  │
-  │  │    ═══════════════ VIEWPORT BOTTOM ═══════════════               │  │
-  │  │                                                                  │  │
-  │  │    (Rows 1-4 and 10+ are NOT in DOM)                             │  │
-  │  │                                                                  │  │
-  │  └─────────────────────────────────────────────────────────────────┘  │
-  └───────────────────────────────────────────────────────────────────────┘
-```
+For this product, losing an unsent file after showing “saved” breaks the primary
+promise. The persistence cost is justified. It still cannot guarantee browser storage
+will survive every eviction or user data-clear action; durable local status is scoped
+to the browser's storage capabilities and the explicit retention policy.
 
-### Virtualizer Configuration
+I would also isolate the journal by account, stop workers on logout, invalidate request
+generations, and avoid showing prior-account entities during a new login. An old response
+must not repopulate a cleared store.
 
-```
-┌───────────────────────────────────────────────────────────────────────────┐
-│                    @tanstack/react-virtual SETUP                          │
-├───────────────────────────────────────────────────────────────────────────┤
-│                                                                           │
-│  useVirtualizer({                                                         │
-│    count: Math.ceil(photos.length / COLUMNS),  // Number of rows          │
-│    getScrollElement: () => parentRef.current,   // Scroll container       │
-│    estimateSize: () => ITEM_HEIGHT + GAP,       // Row height estimate    │
-│    overscan: 2                                  // 2 extra rows = 8 photos│
-│  })                                                                       │
-│                                                                           │
-│  For each virtualRow:                                                     │
-│    startIndex = virtualRow.index * COLUMNS                                │
-│    rowPhotos = photos.slice(startIndex, startIndex + COLUMNS)             │
-│                                                                           │
-│  Position: absolute, transform: translateY(virtualRow.start)              │
-│                                                                           │
-└───────────────────────────────────────────────────────────────────────────┘
-```
+## 🔧 Deep dive 2: Resumable transfers and honest progress — 8 minutes
 
-### Infinite Scroll Detection
+> “I’d make transfer progress about verified work, and keep cloud publication as a
+> separate final step. Sending the last byte is not the same as saving the file.”
 
-```
-┌───────────────────────────────────────────────────────────────────────────┐
-│                    INFINITE SCROLL HANDLER                                │
-├───────────────────────────────────────────────────────────────────────────┤
-│                                                                           │
-│  onScroll = () => {                                                       │
-│    const { scrollTop, scrollHeight, clientHeight } = container           │
-│                                                                           │
-│    ┌─────────────────────────────────────────────────────────────────┐    │
-│    │                                                                 │    │
-│    │   scrollHeight (total virtual height)                           │    │
-│    │   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  │    │
-│    │   ▲                                                             │    │
-│    │   │ scrollTop (distance scrolled)                               │    │
-│    │   │                                                             │    │
-│    │   │  ┌─────────────────────────────┐                            │    │
-│    │   │  │ clientHeight (visible area) │                            │    │
-│    │   ▼  └─────────────────────────────┘                            │    │
-│    │                                      ◀── Threshold: 300px        │    │
-│    │   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  │    │
-│    │                                                                 │    │
-│    └─────────────────────────────────────────────────────────────────┘    │
-│                                                                           │
-│    if (scrollHeight - scrollTop - clientHeight < 300) {                   │
-│      onLoadMore()  // Fetch next page of photos                           │
-│    }                                                                      │
-│  }                                                                        │
-│                                                                           │
-└───────────────────────────────────────────────────────────────────────────┘
-```
+### Keep expensive work off the interaction path
 
-### PhotoItem with Lazy Loading
+Hashing and chunk preparation belong in a worker with bounded concurrency. I would
+process slices rather than copy an entire multi-gigabyte file into the main thread.
+Cancellation stops scheduling new chunks and releases resources when active work ends.
 
-```
-┌───────────────────────────────────────────────────────────────────────────┐
-│                      PHOTO ITEM COMPONENT                                 │
-├───────────────────────────────────────────────────────────────────────────┤
-│                                                                           │
-│  ┌─────────────────────────────────────────────────────────────────────┐  │
-│  │                         PhotoItem                                   │  │
-│  │  ┌───────────────────────────────────────────────────────────────┐  │  │
-│  │  │                                                               │  │  │
-│  │  │  ┌──────┐                                                     │  │  │
-│  │  │  │ ✓    │  Selection checkbox (top-left)                      │  │  │
-│  │  │  └──────┘  - Click toggles selection                          │  │  │
-│  │  │            - Blue when selected                               │  │  │
-│  │  │                                                               │  │  │
-│  │  │     ┌──────────────────────────────────────────────────┐      │  │  │
-│  │  │     │                                                  │      │  │  │
-│  │  │     │           <img> with lazy loading                │      │  │  │
-│  │  │     │                                                  │      │  │  │
-│  │  │     │   IntersectionObserver triggers src assignment   │      │  │  │
-│  │  │     │   when 100px from viewport                       │      │  │  │
-│  │  │     │                                                  │      │  │  │
-│  │  │     │   While loading: spinner animation               │      │  │  │
-│  │  │     │   After load: fade in (opacity transition)       │      │  │  │
-│  │  │     │                                                  │      │  │  │
-│  │  │     └──────────────────────────────────────────────────┘      │  │  │
-│  │  │                                                               │  │  │
-│  │  │                                                   ┌────────┐  │  │  │
-│  │  │                           Sync status indicator ──│ [icon] │  │  │  │
-│  │  │                           (bottom-right, if not   └────────┘  │  │  │
-│  │  │                            synced)                            │  │  │
-│  │  │                                                               │  │  │
-│  │  └───────────────────────────────────────────────────────────────┘  │  │
-│  │                                                                     │  │
-│  │  Styles: aspect-square, rounded-lg, overflow-hidden                 │  │
-│  │  If selected: ring-2 ring-blue-500 ring-offset-2                    │  │
-│  │                                                                     │  │
-│  └─────────────────────────────────────────────────────────────────────┘  │
-│                                                                           │
-└───────────────────────────────────────────────────────────────────────────┘
-```
+The transfer record captures the original destination and selected content identity.
+Navigating to another folder must not redirect later files in the same batch. Each
+file has its own job ID; filenames can collide and are poor progress-map keys.
 
-### Virtualization Performance Impact
+The server returns which chunks are already verified for this upload session. The
+client uploads only missing chunks and records acknowledgements. The server verifies
+bytes itself; it does not trust a client-provided digest as proof of possession.
 
-| Metric | Without Virtualization | With Virtualization |
-|--------|------------------------|---------------------|
-| DOM nodes (1000 photos) | 4000+ | ~80 |
-| Memory usage | 400MB+ | 80MB |
-| Initial render | 2+ seconds | <200ms |
-| Scroll FPS | Degrades with size | Constant 60fps |
+If connectivity drops after a chunk upload but before its response, the client asks
+for session state. Retrying the same chunk identity is safe. If a session expires,
+the client reconciles what can be reused under a new authorized session.
 
-## Deep Dive: Offline Support (8 minutes)
+Once all chunks are verified, the client submits a manifest and base revision. That
+commit can still fail because of a conflict, quota change, or revoked permission.
+The bytes remain staged until the recovery policy resolves the outcome.
 
-### IndexedDB Schema
+### Progress and cancellation semantics
 
-```
-┌───────────────────────────────────────────────────────────────────────────┐
-│                        INDEXEDDB STORES                                   │
-├───────────────────────────────────────────────────────────────────────────┤
-│                                                                           │
-│  Database: 'icloud-cache' (version 1)                                     │
-│                                                                           │
-│  ┌─────────────────────────────────────────────────────────────────────┐  │
-│  │ Store: 'files'                                                      │  │
-│  │ keyPath: 'id'                                                       │  │
-│  │ Indexes: 'by-path' ──▶ file.path                                    │  │
-│  │ Content: FileItem objects                                           │  │
-│  └─────────────────────────────────────────────────────────────────────┘  │
-│                                                                           │
-│  ┌─────────────────────────────────────────────────────────────────────┐  │
-│  │ Store: 'photos'                                                     │  │
-│  │ keyPath: 'id'                                                       │  │
-│  │ Indexes: 'by-date' ──▶ photo.takenAt                                │  │
-│  │ Content: Photo metadata objects                                     │  │
-│  └─────────────────────────────────────────────────────────────────────┘  │
-│                                                                           │
-│  ┌─────────────────────────────────────────────────────────────────────┐  │
-│  │ Store: 'pendingOps'                                                 │  │
-│  │ keyPath: 'id'                                                       │  │
-│  │ Content: PendingOperation objects for offline queue                 │  │
-│  └─────────────────────────────────────────────────────────────────────┘  │
-│                                                                           │
-│  ┌─────────────────────────────────────────────────────────────────────┐  │
-│  │ Store: 'thumbnails'                                                 │  │
-│  │ keyPath: (auto-generated)                                           │  │
-│  │ Content: Blob data keyed by photoId                                 │  │
-│  └─────────────────────────────────────────────────────────────────────┘  │
-│                                                                           │
-└───────────────────────────────────────────────────────────────────────────┘
-```
+| Display | Meaning |
+|---------|---------|
+| Preparing | Reading, hashing, or persisting selected content |
+| Uploading | Some required chunks have not been acknowledged |
+| Verifying / saving | Transfer is complete; publication is not yet confirmed |
+| Saved to cloud | Matching durable receipt received |
+| Needs attention | Conflict, missing local bytes, or a terminal rejection |
 
-### Offline Storage Operations
+I would report acknowledged bytes for resumable progress and expose transient network
+progress separately if useful. Progress may need to be recalculated when an expired
+session loses staged chunks; pretending it is still 100% would mislead the user.
 
-```
-┌───────────────────────────────────────────────────────────────────────────┐
-│                    OFFLINE STORAGE API                                    │
-├───────────────────────────────────────────────────────────────────────────┤
-│                                                                           │
-│  offlineStorage.getFiles(path)                                            │
-│  ─────────────────────────────                                            │
-│  Returns all files in directory from IndexedDB cache                      │
-│                                                                           │
-│  offlineStorage.saveFile(file)                                            │
-│  ──────────────────────────────                                           │
-│  Upserts FileItem to 'files' store                                        │
-│                                                                           │
-│  offlineStorage.saveThumbnail(photoId, blob)                              │
-│  ────────────────────────────────────────────                             │
-│  Stores thumbnail binary for offline photo display                        │
-│                                                                           │
-│  offlineStorage.getThumbnail(photoId)                                     │
-│  ─────────────────────────────────────                                    │
-│  Retrieves cached thumbnail blob                                          │
-│                                                                           │
-│  offlineStorage.queueOperation(op)                                        │
-│  ─────────────────────────────────                                        │
-│  Adds pending operation to queue                                          │
-│                                                                           │
-│  offlineStorage.getPendingOperations()                                    │
-│  ──────────────────────────────────────                                   │
-│  Returns all queued operations for processing                             │
-│                                                                           │
-│  offlineStorage.removeOperation(id)                                       │
-│  ───────────────────────────────────                                      │
-│  Removes successfully synced operation                                    │
-│                                                                           │
-└───────────────────────────────────────────────────────────────────────────┘
-```
+Canceling a transfer stops future work but cannot retract a server commit that already
+happened. If the final outcome is unknown, the UI says it is checking. Removing an
+already committed file is a distinct delete command.
 
-### Online/Offline Detection Hook
+A batch should continue independent files after one failure and report per-file status.
+Large files should not monopolize all upload slots; I would use a small fair scheduler
+and reduce background work on constrained devices.
 
-```
-┌───────────────────────────────────────────────────────────────────────────┐
-│                     useOnlineStatus() HOOK                                │
-├───────────────────────────────────────────────────────────────────────────┤
-│                                                                           │
-│  ┌─────────────────────────────────────────────────────────────────────┐  │
-│  │ State: isOnline = navigator.onLine                                  │  │
-│  └─────────────────────────────────────────────────────────────────────┘  │
-│                                                                           │
-│  useEffect:                                                               │
-│    window.addEventListener('online', handleOnline)                        │
-│    window.addEventListener('offline', handleOffline)                      │
-│                                                                           │
-│  handleOnline = () => {                                                   │
-│    setIsOnline(true)                                                      │
-│    processPendingQueue()  ──▶ Sync all queued changes                     │
-│  }                                                                        │
-│                                                                           │
-│  handleOffline = () => {                                                  │
-│    setIsOnline(false)                                                     │
-│  }                                                                        │
-│                                                                           │
-│  return isOnline                                                          │
-│                                                                           │
-└───────────────────────────────────────────────────────────────────────────┘
-```
+### Why not always upload whole files?
 
-### Service Worker for Thumbnail Caching
+| Approach | Pros | Cons |
+|----------|------|------|
+| ✅ Resumable chunks for large files | Bounded retries and explicit recovery | Session lifecycle, manifests, and more requests |
+| ❌ Whole-file retries for every upload | Simple endpoint and client | A late failure repeats all bytes and may exceed memory |
 
-```
-┌───────────────────────────────────────────────────────────────────────────┐
-│                    SERVICE WORKER STRATEGY                                │
-├───────────────────────────────────────────────────────────────────────────┤
-│                                                                           │
-│  Cache Name: 'thumbnails-v1'                                              │
-│                                                                           │
-│  fetch event handler:                                                     │
-│                                                                           │
-│    if (url.pathname.includes('/thumbnails/')) {                           │
-│                                                                           │
-│      ┌─────────────────────────────────────────────────────────────────┐  │
-│      │                   Cache-First Strategy                          │  │
-│      │                                                                 │  │
-│      │   Request ──▶ Check Cache ──┬──▶ HIT ──▶ Return cached          │  │
-│      │                             │                                   │  │
-│      │                             └──▶ MISS ──▶ Fetch from network    │  │
-│      │                                         │                       │  │
-│      │                                         ▼                       │  │
-│      │                                  Clone response                 │  │
-│      │                                         │                       │  │
-│      │                                         ▼                       │  │
-│      │                                  Store in cache                 │  │
-│      │                                         │                       │  │
-│      │                                         ▼                       │  │
-│      │                                  Return response                │  │
-│      └─────────────────────────────────────────────────────────────────┘  │
-│                                                                           │
-│    }                                                                      │
-│                                                                           │
-│  Benefit: Thumbnails persist across sessions, instant display offline    │
-│                                                                           │
-└───────────────────────────────────────────────────────────────────────────┘
-```
+Whole-file upload remains a reasonable fast path for small files. The hard requirement
+is recoverability for large transfers over unreliable networks, not chunking everything
+for its own sake.
 
-## Deep Dive: Conflict Resolution UI (5 minutes)
+Fixed chunk boundaries are easy to explain and implement. An insertion can change all
+later chunk hashes, so I would not promise ideal delta savings. Content-defined chunking
+is a later optimization if measured workloads justify the extra CPU and complexity.
 
-### Conflict Resolution Modal
+### Push is a scheduling hint
 
-```
-┌───────────────────────────────────────────────────────────────────────────┐
-│                    CONFLICT RESOLUTION MODAL                              │
-├───────────────────────────────────────────────────────────────────────────┤
-│                                                                           │
-│  ┌─────────────────────────────────────────────────────────────────────┐  │
-│  │  [X]                                         Resolve Conflict        │  │
-│  ├─────────────────────────────────────────────────────────────────────┤  │
-│  │                                                                     │  │
-│  │  ┌─────────────────────────────────────────────────────────────┐    │  │
-│  │  │ (amber background)                                          │    │  │
-│  │  │ "document.docx" was edited on multiple devices.             │    │  │
-│  │  │ Choose which version to keep.                               │    │  │
-│  │  └─────────────────────────────────────────────────────────────┘    │  │
-│  │                                                                     │  │
-│  │  ┌──────────────────────────┐  ┌──────────────────────────┐         │  │
-│  │  │                          │  │                          │         │  │
-│  │  │  [Laptop Icon]           │  │  [Cloud Icon]            │         │  │
-│  │  │                          │  │                          │         │  │
-│  │  │  This device             │  │  iCloud                  │         │  │
-│  │  │  ─────────────           │  │  ──────                  │         │  │
-│  │  │  MacBook Pro             │  │  iPhone 15               │         │  │
-│  │  │  Modified 2 hours ago    │  │  Modified 30 minutes ago │         │  │
-│  │  │  15.2 KB                 │  │  18.7 KB                 │         │  │
-│  │  │                          │  │                          │         │  │
-│  │  │  [Click to select]       │  │  [Click to select]       │         │  │
-│  │  └──────────────────────────┘  └──────────────────────────┘         │  │
-│  │                                                                     │  │
-│  │  ┌──────────────────────────────────────────────────────────────┐   │  │
-│  │  │  [Copy Icon]  Keep both versions                             │   │  │
-│  │  │               (Creates "document (conflict).docx")           │   │  │
-│  │  └──────────────────────────────────────────────────────────────┘   │  │
-│  │                                                                     │  │
-│  └─────────────────────────────────────────────────────────────────────┘  │
-│                                                                           │
-│  Resolution options:                                                      │
-│    'local'  ──▶ Overwrite server with local version                       │
-│    'server' ──▶ Overwrite local with server version                       │
-│    'both'   ──▶ Keep local as main, rename server copy                    │
-│                                                                           │
-└───────────────────────────────────────────────────────────────────────────┘
-```
+I would use a persistent notification channel while the app is active. WebSocket is
+reasonable if the protocol also needs client messages; SSE plus REST is sufficient for
+one-way hints. Either way, reconnect uses jitter, an authenticated session generation,
+and a pull from the saved cursor.
 
-## Trade-offs and Alternatives (5 minutes)
+A burst of fifty hints should schedule one catch-up loop, not fifty full folder reloads.
+The loop drains pages, reconciles state, and checks again if a hint arrived while it was
+running. Connection state and synchronization freshness remain separate indicators.
 
-### 1. Zustand vs. Redux
+## 🔧 Deep dive 3: A large, accessible photo library — 8 minutes
 
-| Aspect | Zustand | Redux |
-|--------|---------|-------|
-| Boilerplate | Minimal | Significant |
-| Bundle size | ~2KB | ~7KB + toolkit |
-| DevTools | Supported | Native |
-| Learning curve | Low | Moderate |
+> “I would bound three different resources: rendered elements, downloaded images,
+> and decoded image memory. Virtualization only directly solves the first.”
 
-**Chose Zustand**: Simpler API, built-in persistence, perfect for this complexity level.
+### Rendering and pagination
 
-### 2. Row vs. Item Virtualization
+The grid virtualizes rows because all cells in a row share a vertical position. Column
+count follows container width, with a predictable thumbnail aspect ratio. A resize
+preserves the anchor photo rather than interpreting the old row index literally.
 
-| Aspect | Row-Based | Item-Based |
-|--------|-----------|------------|
-| Grid alignment | Natural | Complex |
-| Implementation | Simpler | More flexible |
-| Dynamic heights | Harder | Easier |
+I would request a small first page, render a useful viewport, and fetch more as the
+user approaches the end. If the first page does not fill the viewport, fetching must
+continue without waiting for a scroll event that cannot occur.
 
-**Chose Row-Based**: Grid layout requires consistent columns. Row virtualization maintains alignment naturally.
+Cursor pages are bound to the account, filter, ordering, and snapshot policy. When the
+user switches to Favorites, old All Photos responses are discarded by request generation.
+A per-query in-flight guard prevents duplicate page requests.
 
-### 3. IndexedDB vs. localStorage
+The entity cache deduplicates IDs before extending ordered membership. A new upload
+may belong at the start of All Photos but not in the current album or Favorites view.
+A push update changes query membership deliberately rather than blindly prepending it.
 
-| Aspect | IndexedDB | localStorage |
-|--------|-----------|--------------|
-| Size limit | GB+ | 5-10MB |
-| Data types | Any | Strings only |
-| Performance | Async, indexed | Sync, blocking |
+### Image and viewer budgets
 
-**Chose IndexedDB**: Need to store file metadata, thumbnails, and pending operations - can easily exceed localStorage limits.
+Thumbnails serve the grid. A preview serves the viewer. Originals are downloaded for
+explicit high-resolution or offline use. Fetching every original would waste bandwidth
+and decoded memory even if the DOM contained only a few visible cells.
 
-### Trade-offs Summary
+I would keep a small prefetch window around the viewport and cancel stale requests.
+The viewer may prefetch the next preview, but not an entire album. Object URLs and
+other retained buffers need cleanup when the account or active photo changes.
 
-| Decision | Chosen | Alternative | Reason |
-|----------|--------|-------------|--------|
-| State management | Zustand | Redux | Simpler, built-in persist |
-| Virtualization | Row-based | Item-based | Grid alignment |
-| Offline storage | IndexedDB | localStorage | Size + performance |
-| Thumbnail caching | Service Worker | In-memory | Persistence across sessions |
+The viewer tracks a photo ID. If an earlier page changes order, an array index could
+suddenly show a different person's photo. Deleting the current item deliberately selects
+an adjacent surviving ID or closes the viewer and restores focus.
 
-## Component Size Guidelines
+For an offline photo, the UI records the exact retained revision and verifies the local
+bytes before claiming availability. Eviction removes that claim as well as the bytes.
+A server-side “download started” row cannot establish browser-side persistence.
 
-Each component follows a ~150-200 line maximum:
-- **Orchestrator components** (e.g., `PhotoGallery.tsx`): Handle state, effects, compose sub-components
-- **Presentation components** (e.g., `PhotoItem.tsx`): Pure UI rendering with props
+### Keyboard and assistive technology
 
-## Closing Summary (1 minute)
+Each photo needs a meaningful accessible name and a keyboard selection/open action.
+Double-click and a decorative image alone are insufficient. I would expose selection
+state, predictable arrow-key navigation, and the logical position in the collection.
 
-"The iCloud frontend is built around three core innovations:
+When the focused item leaves the rendered window, the virtualizer must preserve or
+intentionally move focus. Opening the viewer traps focus appropriately, supports Escape,
+and returns focus to the originating item, scrolling it into view if necessary.
 
-1. **Offline-first architecture** with IndexedDB persistence - users can browse, organize, and queue changes offline, with seamless sync when reconnected
-2. **Row-based virtualization** for the photo gallery - enabling smooth 60fps scrolling through thousands of photos without memory bloat
-3. **Clear sync status UI** with conflict resolution - users always know what's synced, pending, or in conflict, with intuitive resolution flows
+Loading and error states need announcements without narrating every chunk. Empty,
+filtered-empty, offline, and failed states should be distinct. A “Load more” fallback
+helps keyboard users and makes pagination recoverable after an automatic fetch fails.
 
-The key trade-off throughout is complexity vs. user experience. We chose Zustand with persistence for state management because sync state is inherently complex but the API remains simple. We chose row-based virtualization because maintaining grid alignment is critical for photo browsing.
+### Decision and cost
 
-For future improvements, I'd add drag-and-drop file organization, predictive prefetching for photos likely to be viewed, and progressive JPEG loading for faster perceived performance."
+| Approach | Pros | Cons |
+|----------|------|------|
+| ✅ Row virtualization plus derivative budgets | Bounded render and image work for large libraries | Focus, resize, and scroll-anchor coordination |
+| ❌ Render all photos with lazy images | Straightforward layout | DOM and accessibility tree grow with every page |
+
+I would keep ordinary rendering for small result sets where its simplicity is useful.
+For the assumed 100,000-photo account, the accumulated DOM becomes the problem even
+when native image lazy loading defers some downloads.
+
+The cost of virtualization is interaction complexity, so I would test it with real
+keyboard navigation, screen readers, narrow layouts, and changing data. A frame-rate
+number without those conditions is not a meaningful success claim.
+
+## 📈 Scaling, failure tests, and observability — 4 minutes
+
+The first frontend bottlenecks are main-thread hashing, whole-file buffers, excessive
+list reloads, and decoded images. I would measure long tasks, memory growth, interaction
+latency, and time from cloud commit to reconciled display on representative devices.
+
+The most revealing tests are sequences, not isolated happy-path clicks:
+
+1. Close the tab after local persistence, reopen it, and recover the same command.
+2. Lose the commit response and verify that retry does not create another file.
+3. Rename offline while another device deletes or edits the same revision.
+4. Switch filters or accounts while old page requests are still in flight.
+5. Reconnect after the change-feed retention window and preserve pending local work.
+6. Open a photo, reorder its page remotely, and preserve viewer identity and focus.
+
+Logs can include command IDs and lifecycle transitions without recording filenames,
+photo URLs, or content. Client telemetry should distinguish “no connection” from
+“connected but behind” and “bytes uploaded but publication unknown.”
+
+For rollout, I would first ship correct online commands and account-scoped state,
+then resumable transfers, then persistent offline intents. Offline support multiplies
+the recovery cases, so it should build on an already explicit command contract.
+
+## ⚖️ Trade-offs and implementation boundary — 1 minute
+
+| Decision | Chosen | Cost accepted |
+|----------|--------|---------------|
+| Offline actions | Durable journal and projected state | Persistence and reconciliation complexity |
+| Large transfers | Verified resumable chunks | Upload sessions and manifest lifecycle |
+| Large libraries | Virtual rows and derivative budgets | Focus and scroll-anchor management |
+| Notifications | Hints followed by durable pull | A second delivery mechanism |
+
+The local repository has React/Zustand views, whole-file uploads, a four-column
+virtualized photo grid, lazy thumbnails, previews, and process-local WebSocket hints.
+It has no persistent journal, transfer sessions, conflict dialog, or replay-on-reconnect.
+
+Its current stores also lack request-generation guards and account-wide reset; photo
+pagination uses offsets and the viewer uses an array index. Those are implementation
+gaps, not properties I would rely on in the proposed design.
+
+> “The important contract is that every visible acknowledgement corresponds to a
+> real durability boundary. Once that is clear, retries, offline work, and rendering
+> optimizations can improve the experience without hiding what has actually saved.”
+
+[Implementation details](./architecture.md) · [Run the demo](./README.md)

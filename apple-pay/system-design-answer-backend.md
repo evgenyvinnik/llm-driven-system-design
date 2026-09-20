@@ -85,21 +85,49 @@ and issuer response times need separate measurements. The owned service's
 ## 🏗️ A small architecture
 
 ```
-┌──────────────────────────┐        ┌──────────────────────────┐
-│ Wallet + device          │───────▶│ Wallet control API       │
-│ Protected credential     │        │ Enrollment / lifecycle   │
-└────────────┬─────────────┘        └────────────┬─────────────┘
-             ▼                                   ▼
-┌──────────────────────────┐        ┌──────────────────────────┐
-│ Merchant / terminal      │        │ Token authority / TSP    │
-│ Checkout identity        │        │ Enroll / revoke          │
-└────────────┬─────────────┘        └──────────────────────────┘
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Wallet + device        │ops    │ Wallet control + DB    │status │ Token authority / TSP  │
+│ Protected credential   │◀─────▶│ Enroll / revoke ops    │◀─────▶│ Provision + enforce    │
+│ Display metadata only  │       │ Token refs + outbox    │       │ Issuer verification    │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+             │
+             │ permitted credential handoff
+             │
              ▼
-┌──────────────────────────┐        ┌──────────────────────────┐
-│ Merchant processor       │───────▶│ Network / issuer         │
-│ Durable payment attempts │        │ Authorization outcome    │
-└──────────────────────────┘        └──────────────────────────┘
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Merchant / checkout    │pay    │ Payment orchestrator   │auth   │ Network / issuer       │
+│ Order version + total  │◀─────▶│ Retry and reconcile    │◀─────▶│ Authorization outcome  │
+│ Intended attempt ID    │       │ Guarded transitions    │       │ Separate from capture  │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+                                              ▲                                ▲
+                                              │                                │
+claim / commit known outcome                  │  query / verify provider result│
+                                              │                                │
+                                              ▼                                ▼
+                                 ┌────────────────────────┐       ┌────────────────────────┐
+                                 │ Payment authority      │       │ Recovery workers       │
+                                 │ Attempts / uncertainty │◀─────▶│ Resume durable work    │
+                                 │ Refund reservations    │       │ Reconcile by reference │
+                                 │ Outbox/history         │       │ Publish scoped history │
+                                 └────────────────────────┘       └────────────────────────┘
+
+Wallet lifecycle authority and merchant payment authority remain separate.
+
+A timeout records uncertainty; only verified evidence resolves the operation.
 ```
+
+The upper path manages a device's token association with its external authority.
+The payment path hands permitted credentials to the merchant integration and claims
+one durable attempt before external work. The processor and recovery workers use
+the same recorded provider references; confirmed outcomes and refund reservations
+change at the payment authority. This keeps wallet state, issuer decisions and
+merchant recovery records from being mistaken for the same source of truth.
+
+On an ambiguous provider call, the authority retains the attempt and reference as
+unresolved. Recovery follows the worker-to-provider path, verifies the evidence, and
+applies a guarded transition at the same authority. A new HTTP request or a history
+projection refresh cannot manufacture another authorization or resolve uncertainty.
+Wallet token lifecycle results continue through their separate control path.
 
 Enrollment and lifecycle store wallet metadata and durable operation state.
 The processor owns authorization attempts, provider references, and recovery.

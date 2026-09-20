@@ -1,458 +1,370 @@
-# Health Data Pipeline - System Design Answer (Frontend Focus)
+# Health Data Pipeline — Frontend System Design Interview
 
-*45-minute system design interview format - Frontend Engineer Position*
+> “I would design a personal health dashboard that helps someone understand what was measured,
+> which sources contributed, and how current the report is. A smooth chart is useful only if
+> missing data and delayed processing remain visible.”
 
----
+This is a proposed production design, separate from the teaching implementation. The
+walkthrough is paced for 45 minutes, with three deep dives. I would put the overview on the
+whiteboard early and return to its arrows as we discuss correctness and user experience.
 
-## 📋 Opening Statement (1 minute)
+## 🎯 Requirements and scope — 4 minutes
 
-"I'll design the frontend for a health data pipeline like Apple Health, which displays metrics from multiple devices, visualizes health trends over time, and allows users to share data with healthcare providers. The key frontend challenges are rendering large amounts of time-series data efficiently, building responsive chart visualizations that work across date ranges, and creating intuitive interfaces for managing privacy and sharing settings.
+I would first clarify the audience: someone reviewing their own activity, sleep, and
+measurements across several devices. This is a reporting product, not a clinical diagnosis or
+emergency-monitoring system.
 
-The core technical challenges are implementing performant chart rendering with Recharts, managing complex health data state with Zustand, building accessible date range selectors for historical queries, and creating a dashboard that surfaces AI-generated insights prominently while showing real-time device sync status."
+The main journey is to open today's summary, inspect a metric over time, understand a gap or
+change, and check which device last contributed. Registering a device is part of the
+experience, but actual device acquisition belongs to a separate sync client or provider
+integration.
 
----
+I would agree on four initial surfaces:
 
-## 🎯 Requirements Clarification (3 minutes)
+| Surface | User question |
+|---------|---------------|
+| Overview | What was recorded today, and is it complete? |
+| Metric explorer | How did this metric change over my chosen period? |
+| Source details | Which observations contributed, and what is delayed? |
+| Account controls | Who can access this data, and how do I end my session? |
 
-### User-Facing Features
-- **Dashboard**: Daily summary with key health metrics across activity, vitals, body, and sleep
-- **Trends**: Historical charts for each metric type with configurable date ranges
-- **Insights**: AI-generated health recommendations sorted by severity
-- **Devices**: Manage connected devices and monitor sync status
-- **Sharing**: Create and manage time-limited share tokens for providers
+A zero step count, no observations, and an unfinished upload are different states. I would
+make that distinction a requirement before choosing a chart library.
 
-### Non-Functional Requirements
-- **Performance**: Charts render in under 100ms with weeks of data
-- **Responsiveness**: Dashboard adapts from mobile to desktop breakpoints
-- **Accessibility**: WCAG 2.1 AA for health-critical information display
-- **Offline**: Display cached data when the device loses connectivity
+For discussion, assume a useful initial view within two seconds on a midrange phone and
+ordinary report updates within two minutes of server acceptance. These are targets to validate
+with representative devices and networks, not claims about the demo.
 
-### UI Scale Estimates
-- 16 health metric types across 4 categories (activity, vitals, body, sleep)
-- Charts can show 7 to 365 days of data
-- Up to 1,440 data points per day for heart rate at one-minute granularity
-- Real-time sync status updates via SSE connection
+I would defer clinician sharing, complex dashboards, medical advice, and persistent offline
+health history. A clear read-only report is enough to expose the central design problems.
 
----
+## 🏗️ High-level architecture — 7 minutes
 
-## 🏗️ High-Level Architecture (5 minutes)
-
-```
-┌──────────────────────────────────────────────────────────────┐
-│                     React Application                         │
-│                                                               │
-│  ┌─────────────────────┐   ┌───────────────────────────────┐ │
-│  │    Layout Shell      │   │       Route Components        │ │
-│  │  - Navigation        │   │  - Dashboard (/)              │ │
-│  │  - Header            │   │  - Trends (/trends/:type)     │ │
-│  │  - SyncStatusBar     │   │  - Insights (/insights)       │ │
-│  └─────────────────────┘   │  - Devices (/devices)          │ │
-│                             │  - Sharing (/sharing)          │ │
-│  ┌─────────────────────┐   └───────────────────────────────┘ │
-│  │   Zustand Stores     │                                     │
-│  │  - healthStore       │   ┌───────────────────────────────┐ │
-│  │  - uiStore           │   │      Chart Components         │ │
-│  │  - syncStore         │   │  - LineChart (trends)         │ │
-│  └─────────────────────┘   │  - BarChart (daily totals)    │ │
-│                             │  - AreaChart (ranges)          │ │
-│                             └───────────────────────────────┘ │
-└──────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌──────────────────────────────────────────────────────────────┐
-│                       API Layer                               │
-│  /api/v1/users/me/summary  │  /api/v1/users/me/aggregates    │
-│  /api/v1/users/me/insights │  /api/v1/devices/:id/sync       │
-└──────────────────────────────────────────────────────────────┘
-```
-
-> "I'm using TanStack Router for file-based routing, Zustand for global state, and Recharts for chart rendering. The layout shell persists across routes and includes the sync status indicator, so users always know whether their data is fresh. Chart components are shared between the Dashboard (mini sparklines) and Trends page (full interactive charts)."
-
----
-
-## 📊 Deep Dive: Health Dashboard Layout (8 minutes)
-
-The dashboard is the primary surface. It shows a daily snapshot organized by health category.
+I would draw the browser boundary, three view areas, the state they consume, and one shared
+data-access layer. The server stays an abstract authorized reporting boundary in this frontend
+interview.
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│            INSIGHTS BANNER (full width, if any)               │
-│  ⚠️  Your resting heart rate has increased 5% this month     │
-└──────────────────────────────────────────────────────────────┘
-
-┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐
-│    ACTIVITY       │  │     VITALS        │  │      SLEEP       │
-├──────────────────┤  ├──────────────────┤  ├──────────────────┤
-│ Steps             │  │ Heart Rate        │  │ 7h 23m           │
-│   8,234 / 10,000  │  │   72 bpm avg      │  │   ████████░░     │
-│   ████████░░      │  │                   │  │   Goal: 8h       │
-│                   │  │ Resting HR        │  └──────────────────┘
-│ Calories          │  │   58 bpm          │
-│   423 / 500       │  │                   │  ┌──────────────────┐
-│   ████████░       │  │ Blood O2          │  │     WEIGHT       │
-└──────────────────┘  │   98%             │  ├──────────────────┤
-                      └──────────────────┘  │ 72.5 kg           │
-                                            │ 22.1% body fat    │
-                                            └──────────────────┘
+┌────────────────────────────────────────────────────────────────────────────────────────────┐
+│ BROWSER                                                                                    │
+│                                                                                            │
+│  ┌────────────────────────┐     ┌────────────────────────┐     ┌────────────────────────┐  │
+│  │ Charts + data table    │     │ Metric / date controls │     │ Sources + sync status  │  │
+│  │ Values and gaps        │     │ Range + reporting zone │     │ Coverage / freshness   │  │
+│  └────────────────────────┘     └────────────────────────┘     └────────────────────────┘  │
+│                         ▲                              ▲                              ▲    │
+│   render / inspect      │        choose view           │        inspect status        │    │
+│                         │                              │                              │    │
+│                         ▼                              ▼                              ▼    │
+│  ┌────────────────────────┐     ┌────────────────────────┐     ┌────────────────────────┐  │
+│  │ Report model           │     │ View state             │     │ Source status          │  │
+│  │ Points + provenance    │◀───▶│ Metric, range, zone    │◀───▶│ Captured / accepted    │  │
+│  │ Policy / report rev    │     │ Resolution budget      │     │ Processed watermarks   │  │
+│  └────────────────────────┘     └────────────────────────┘     └────────────────────────┘  │
+│                         ▲                              ▲                              ▲    │
+│                         │                              │                              │    │
+│   scoped reports        │        query identity        │        refresh status        │    │
+│                         │                              │                              │    │
+│                         ▼                              ▼                              ▼    │
+│  ┌──────────────────────────────────────────────────────────────────────────────────────┐  │
+│  │ Query coordinator + authorized report cache                                          │  │
+│  │ Account + metric/range/zone/resolution/policy/version; response guards               │  │
+│  │ Per-query loading, stale, empty and error states; clear on account change            │  │
+│  └──────────────────────────────────────────────────────────────────────────────────────┘  │
+│                                              ▲                                             │
+└──────────────────────────────────────────────┼─────────────────────────────────────────────┘
+                                               │
+                                               │  HTTPS: report / status / explicit refresh
+                                               │
+                                               ▼
+   ┌──────────────────────────────────────────────────────────────────────────────────────┐
+   │ Health query service (server boundary)                                               │
+   │ Current access checks, published aggregates, source coverage and processing status   │
+   └──────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Responsive Grid Strategy
-
-| Breakpoint | Grid Layout | Description |
-|------------|-------------|-------------|
-| Mobile (< 768px) | 1 column | Cards stack vertically, insights banner collapses |
-| Tablet (768-1024px) | 2 columns | Activity + Vitals side by side, Sleep + Weight below |
-| Desktop (> 1024px) | 3 columns | All category cards visible simultaneously |
-
-> "I use a CSS Grid with Tailwind's responsive utilities. Each card is self-contained with its own loading state. On mobile, the insights banner becomes a dismissible notification to save vertical space. The grid reflows naturally without JavaScript layout calculations."
-
-### Daily Summary Card Anatomy
-
-Each card follows a consistent structure: icon and category title at the top, then a list of metrics with progress bars for goal-tracked values and plain readings for vitals.
-
-```
-┌──────────────────────────────┐
-│  [icon]  ACTIVITY             │
-├──────────────────────────────┤
-│                               │
-│  Steps              8,234     │
-│  ████████░░░░░░░░    steps    │
-│  (82% of 10,000 goal)        │
-│                               │
-│  Distance            5.2 km   │
-│                               │
-│  Active Calories      423     │
-│  ████████░░░░░░░░    kcal     │
-│  (85% of 500 goal)           │
-│                               │
-└──────────────────────────────┘
-```
-
-Progress bars use role="progressbar" with aria-valuenow, aria-valuemax, and a descriptive aria-label like "8,234 of 10,000 steps". This ensures screen readers announce meaningful context rather than just a percentage.
-
-### Metric Configuration
-
-| Metric | Display Name | Unit | Color | Goal |
-|--------|--------------|------|-------|------|
-| STEPS | Steps | steps | #22c55e (green) | 10,000 |
-| HEART_RATE | Heart Rate | bpm | #ef4444 (red) | - |
-| RESTING_HEART_RATE | Resting HR | bpm | #f97316 (orange) | - |
-| SLEEP_ANALYSIS | Sleep | hours | #8b5cf6 (purple) | 8 |
-| WEIGHT | Weight | kg | #3b82f6 (blue) | - |
-| DISTANCE | Distance | km | #06b6d4 (cyan) | - |
-| ACTIVE_ENERGY | Calories | kcal | #eab308 (yellow) | 500 |
-| OXYGEN_SATURATION | Blood O2 | % | #0ea5e9 (sky) | - |
-
----
-
-## 📈 Deep Dive: Trend Charts with Recharts (8 minutes)
-
-The Trends page shows a full interactive chart for a selected health metric over a configurable date range. This is the most complex frontend component.
-
-```
-┌──────────────────────────────────────────────────────────────┐
-│                  TrendChart Component                          │
-│  ┌──────────────────────────────────────────────────────────┐ │
-│  │  ResponsiveContainer (100% width, 320px height)          │ │
-│  │  ┌──────────────────────────────────────────────────────┐│ │
-│  │  │    120 ─┤                   .                        ││ │
-│  │  │         │                  . .    Goal line           ││ │
-│  │  │    100 ─┤ ─ ─ ─ ─ ─ ─ .─.─.─.─.─.─.─.─.─ ─ ─ ─ ─  ││ │
-│  │  │         │           .         .                      ││ │
-│  │  │     80 ─┤        .             .                     ││ │
-│  │  │         │      .                 .    Trend line      ││ │
-│  │  │     60 ─┤ . . . . . . . . . . . . . . . . .         ││ │
-│  │  │         │                                            ││ │
-│  │  │     40 ─┤                                            ││ │
-│  │  │         └──┬────┬────┬────┬────┬────┬────┬──         ││ │
-│  │  │           Mon  Tue  Wed  Thu  Fri  Sat  Sun          ││ │
-│  │  └──────────────────────────────────────────────────────┘│ │
-│  └──────────────────────────────────────────────────────────┘ │
-└──────────────────────────────────────────────────────────────┘
-```
-
-### Date Formatting by Range
-
-| Date Range | X-Axis Format | Example | Tick Count |
-|------------|---------------|---------|------------|
-| 7 days | Day name | Mon, Tue, Wed | 7 |
-| 30 days | Month Day | Jan 5, Jan 12 | ~8 |
-| 90 days | Month | Jan, Feb, Mar | ~6 |
-| 1 year | Month | Jan, Apr, Jul, Oct | ~12 |
-
-### Tooltip Design
-
-When the user hovers or taps a data point, a tooltip appears showing the formatted date and the metric value with its unit. The tooltip follows the cursor and is positioned to avoid clipping at chart edges.
-
-```
-┌─────────────────────────┐
-│ Saturday, January 15     │
-│                          │
-│ 8,234 steps              │
-└─────────────────────────┘
-```
-
-### Trend Line Calculation
-
-The trend line uses linear regression over the visible data points. The slope is calculated as (n * SumXY - SumX * SumY) / (n * SumX^2 - (SumX)^2), where X is the day index and Y is the metric value. The trend line only renders when the data set contains at least 7 points, preventing misleading conclusions from sparse data.
-
-> "I chose to compute the trend line on the frontend because it's a pure function of the displayed data points. When the user switches date ranges, the trend line recalculates instantly without an API call. The calculation is O(n) and operates on at most 365 pre-aggregated points, so performance is never a concern."
-
----
-
-## 🔧 Deep Dive: Trade-off -- SVG vs Canvas for Chart Rendering
-
-**Decision**: Use SVG-based rendering via Recharts.
-
-**Why SVG works for this problem**: Health dashboards display at most 365 data points for a one-year view, well within SVG's performance ceiling. SVG gives us native DOM events for tooltips and hover interactions, crisp rendering at any display density (critical for retina displays where health professionals might read charts), and built-in accessibility through ARIA attributes on chart elements.
-
-**Why Canvas fails here**: Canvas rendering would require us to implement our own hit-testing for tooltip interactions -- effectively rebuilding DOM event handling in JavaScript. It also produces rasterized output that blurs on high-DPI displays unless we manually handle device pixel ratio scaling. For a data visualization where users need to hover individual data points to see exact values, canvas creates unnecessary complexity.
-
-**What we give up**: SVG degrades when rendering more than approximately 1,000 DOM nodes. If a user requests minute-level heart rate data for a full day (1,440 points), we would hit this threshold. We mitigate this by requesting server-side aggregation -- the API accepts a period parameter (hour, day, week) so the frontend never receives more than 365 data points regardless of the date range selected.
-
----
-
-## 🗄️ Deep Dive: Zustand Health Store (8 minutes)
-
-### Store Architecture
-
-```
-┌──────────────────────────────────────────────────────────────┐
-│                        healthStore                            │
-├──────────────────────────────────────────────────────────────┤
-│                                                               │
-│  ┌────────────────────┐   ┌────────────────────────────────┐ │
-│  │  Date Selection     │   │  Cached Data                   │ │
-│  ├────────────────────┤   ├────────────────────────────────┤ │
-│  │  selectedDate       │   │  dailySummary: {type: value}   │ │
-│  │  dateRange:         │   │  aggregates: {type: points[]}  │ │
-│  │    { start, end }   │   │  insights: Insight[]           │ │
-│  │  dateRangePreset:   │   └────────────────────────────────┘ │
-│  │    7d | 30d | 90d   │                                      │
-│  └────────────────────┘                                      │
-│                                                               │
-│  ┌────────────────────────────────────────────────────────┐  │
-│  │  Actions                                                │  │
-│  │  setSelectedDate(date) ──▶ triggers fetchDailySummary   │  │
-│  │  setDateRangePreset(p) ──▶ updates range, refetches     │  │
-│  │  fetchDailySummary(date) ──▶ GET /api/v1/users/me/summary│  │
-│  │  fetchAggregates(types[], range) ──▶ GET /aggregates    │  │
-│  │  fetchInsights() ──▶ GET /api/v1/users/me/insights      │  │
-│  └────────────────────────────────────────────────────────┘  │
-└──────────────────────────────────────────────────────────────┘
-```
-
-### Persistence Strategy
-
-The store uses Zustand's persist middleware, but only persists user preferences (dateRangePreset), never health data. Health data is always fetched fresh on app load to ensure accuracy.
-
-> "Persisting stale health data would create a dangerous UX for a health application -- a user might see yesterday's heart rate reading and mistake it for current. By only persisting the user's preferred date range, we restore their view preferences while guaranteeing data freshness."
-
-### Sync Status Store
-
-```
-┌──────────────────────────────────────────────────────────────┐
-│                        syncStore                              │
-├──────────────────────────────────────────────────────────────┤
-│  devices: Array of {                                          │
-│    id, name, type, lastSync, isSyncing                        │
-│  }                                                            │
-│                                                               │
-│  overallStatus: synced | syncing | error | offline            │
-│                                                               │
-│  Status indicator mapping:                                    │
-│  ┌──────────┬───────────┬──────────────────────────────────┐ │
-│  │  Status   │  Icon     │  Label                           │ │
-│  ├──────────┼───────────┼──────────────────────────────────┤ │
-│  │  synced   │  ● green  │  "All devices synced"            │ │
-│  │  syncing  │  ◐ blue   │  "Syncing..." (animated)         │ │
-│  │  error    │  ● red    │  "Sync error - tap to retry"     │ │
-│  │  offline  │  ○ gray   │  "Offline - cached data"         │ │
-│  └──────────┴───────────┴──────────────────────────────────┘ │
-└──────────────────────────────────────────────────────────────┘
-```
-
-The sync status indicator lives in the layout header, visible on every route. It connects to an SSE endpoint at /sync-status that pushes real-time updates as devices complete their sync cycles.
-
----
-
-## 📅 Deep Dive: Date Range Selector (5 minutes)
-
-### Selector Layout
-
-```
-┌──────────────────────────────────────────────────────────────┐
-│  ┌───────┬───────┬───────┬───────┐     Jan 8 - Jan 15, 2024  │
-│  │  7D   │  30D  │  90D  │  1Y   │                            │
-│  └───────┴───────┴───────┴───────┘                            │
-│     ↑                                                         │
-│   selected (white bg, ring shadow)                            │
-└──────────────────────────────────────────────────────────────┘
-```
-
-### Interaction Flow
-
-```
-    User clicks "30D"
-         │
-         ▼
-┌──────────────────────┐
-│ setDateRangePreset   │
-│ ('30d')              │
-└──────────┬───────────┘
-           │
-           ▼
-┌──────────────────────┐
-│ Calculate range:      │
-│ start = today - 30    │
-│ end = today           │
-└──────────┬───────────┘
-           │
-           ▼
-┌──────────────────────┐
-│ Store updates:        │
-│ dateRangePreset, range│
-└──────────┬───────────┘
-           │
-           ▼
-┌──────────────────────┐
-│ Charts re-render with │
-│ new data window       │
-└──────────────────────┘
-```
-
-Each button uses aria-pressed to indicate the active selection. The button group is wrapped in a role="group" with an aria-label of "Date range selection" so screen readers announce context. Keyboard navigation moves between buttons with arrow keys.
-
----
-
-## 💡 Deep Dive: Insights Display (5 minutes)
-
-### Insight Card Design
-
-Insights are sorted by severity (high first) and capped at 3 on the dashboard preview. The full list is available on the Insights page.
-
-```
-┌──────────────────────────────────────────────────────────────┐
-│ HIGH SEVERITY (red left border)                               │
-├──────────────────────────────────────────────────────────────┤
-│ ⚠️  Your resting heart rate has increased over the past month │
-│                                                               │
-│   Consider scheduling a check-up with your doctor if          │
-│   this trend continues.                                       │
-│                                                         [X]   │
-└──────────────────────────────────────────────────────────────┘
-
-┌──────────────────────────────────────────────────────────────┐
-│ MEDIUM SEVERITY (yellow left border)                          │
-├──────────────────────────────────────────────────────────────┤
-│ 😴  You've averaged 5.8 hours of sleep over the past 2 weeks │
-│                                                               │
-│   Try setting a consistent bedtime to improve sleep quality.  │
-│                                                         [X]   │
-└──────────────────────────────────────────────────────────────┘
+Starting at the center, metric/date controls update view state. That state defines a query
+identity: account, metric, range, reporting timezone, and requested resolution. It does not
+directly mutate the chart's previous response.
 
-┌──────────────────────────────────────────────────────────────┐
-│ LOW SEVERITY (blue left border)                               │
-├──────────────────────────────────────────────────────────────┤
-│ 📈  Great job! You're 23% more active than your 4-week avg   │
-│                                                         [X]   │
-└──────────────────────────────────────────────────────────────┘
-```
+The coordinator fetches an authorized report. The report model retains values, units, gaps,
+provenance, and publication versions. Charts and the data table consume that same model so
+they cannot disagree about the underlying points.
 
-### Insight Types and Triggers
+The source panel asks a different question: what was captured, accepted, and processed? It can
+update independently from a long-range chart. A single global loading flag would unnecessarily
+hide unrelated information.
 
-| Insight Type | Icon | Condition | Severity |
-|--------------|------|-----------|----------|
-| Heart Rate Trend (up) | 📈 | slope > 0.5 BPM/day over 30 days | medium |
-| Heart Rate Trend (down) | 📉 | slope < -0.5 BPM/day over 30 days | low |
-| Sleep Deficit | 😴 | avg < 6 hours over 14 days | high |
-| Activity Change (up) | 🏃 | > +20% vs 4-week average | low |
-| Activity Change (down) | ⚠️ | < -20% vs 4-week average | medium |
-| Weight Change | ⚖️ | > 3% change over 30 days | medium |
+On the return path, the coordinator accepts a response only if it still belongs to the current
+account and query. This is where cancellation, cache reuse, and late-response guards belong.
 
-### Severity Styling
+I would demonstrate an accepted backfill while the chart is open:
 
-| Severity | Background | Border | Text |
-|----------|------------|--------|------|
-| high | bg-red-50 | border-l-4 border-red-500 | text-red-800 |
-| medium | bg-yellow-50 | border-l-4 border-yellow-500 | text-yellow-800 |
-| low | bg-blue-50 | border-l-4 border-blue-500 | text-blue-800 |
+1. The source panel can show acceptance while the existing chart remains explicitly stale or processing.
+2. Poll status within a bound, then fetch a new report when its publication version changes; do not add uploaded sample values directly to chart points.
+3. Replace only the matching account, metric, range, zone, resolution, and policy context. Preserve gaps and coverage even when the request succeeds.
+4. Returning to the page restores view preferences and reauthorizes report reads; this design does not promise a persistent offline health-history cache.
 
-High-severity insights use role="alert" with aria-live="polite" so screen readers announce them when the page loads, without interrupting current navigation.
+> “The main separation is between what the user wants to view and what the server has actually
+> published. Keeping those separate makes range changes, retries, and processing delays easier
+> to explain.”
 
----
+I would begin with a client-rendered authenticated application and route-level loading/error
+boundaries. Server rendering is optional for the public shell; it does not remove the need to
+authorize and reconcile private report data.
 
-## 🔧 Deep Dive: Trade-off -- Server-Side vs Client-Side Aggregation
+React components can remain small: a route composes controls, status, summary cards, charts,
+and a table. A query cache manages remote data; local component state manages open menus and
+focus. A small shared store is sufficient for account context and cross-view preferences.
 
-**Decision**: Request pre-aggregated data from the server.
+## 💾 Data model and API contract — 5 minutes
 
-**Why server-side aggregation works**: The backend already computes hourly and daily aggregates during the ingestion pipeline. Sending raw samples to the frontend would mean transmitting 1,440 heart rate readings per day -- for a 30-day chart view, that is 43,200 data points. At roughly 50 bytes per sample, that is over 2MB per chart load, which is unacceptable on mobile networks. Pre-aggregated daily data for the same view is 30 data points at about 1.5KB total.
+I would ask the backend for semantic report points rather than raw rows that every browser
+must interpret independently.
 
-**Why client-side aggregation fails at scale**: Beyond the payload size problem, client-side aggregation would require the browser to run the deduplication algorithm. Two devices might report overlapping step counts for the same time window, and the frontend would need to understand device priority rankings to resolve conflicts. This is domain logic that belongs on the server -- if the priority algorithm changes, we would need to push a client update rather than simply reprocessing on the backend.
+| Model | Important fields | Owner |
+|-------|------------------|-------|
+| View selection | Metric, start/end, timezone, resolution | Browser |
+| Report point | Bucket boundaries, value, unit, coverage, source policy | Server |
+| Report identity | Query scope, publication version, processing watermark | Server / coordinator |
+| Source status | Device label, last capture, last acceptance, processing state | Server |
+| Query state | Loading, success, empty, stale, error, retry state | Coordinator |
+| Interaction state | Focused point, tooltip, open source panel | Component |
 
-**What we give up**: Flexibility. When a user is viewing a 7-day chart and wants to drill down to hourly resolution for a specific day, we need an additional API call with a different period parameter. This adds latency to the drill-down interaction (approximately 200ms for a cached response). For a health dashboard where users primarily view daily summaries, this trade-off favors smaller payloads and consistent deduplication over interactive drill-down speed.
+Bucket boundaries should be real timestamps with a declared reporting timezone. A formatted
+“Sep 12” label is presentation, not identity. It loses year and offset information and cannot
+describe daylight-saving boundaries by itself.
 
----
+The server should tell me whether the point is observed, partially covered, estimated, or
+absent. The frontend can explain that information but should not invent it from a nullable
+number.
 
-## 🔧 Deep Dive: Trade-off -- Zustand vs React Query for Data Management
+A compact proposed API is enough for the whiteboard:
 
-**Decision**: Use Zustand for state management with custom fetch actions.
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | `/reports` | Bounded metric/range report with coverage and version |
+| GET | `/sources` | Registered sources and their status |
+| GET | `/receipts/:id` | Accepted-versus-processed upload status when relevant |
+| POST | `/sessions/logout` | End the current server session |
 
-**Why Zustand works for this application**: Health data has a natural structure -- a selected date drives the daily summary, and a date range drives chart data. Zustand's flat store model makes it easy to derive views from these two pieces of state. The persist middleware handles saving user preferences (preferred date range) without additional configuration. Unlike Redux, there is no boilerplate of action creators, reducers, and middleware setup.
+These paths illustrate the proposed contract; the repository's actual routes are documented in
+architecture.md. I would avoid spending interview time on request JSON.
 
-**Why React Query would create problems**: React Query excels when each component independently fetches its own data. But on the health dashboard, multiple cards share the same summary response -- steps, heart rate, sleep, and weight all come from a single GET /summary call. With React Query, we would either make redundant requests from each card or extract the query to a parent component and prop-drill the results. Zustand's shared store gives every card access to the same fetched data without coordination overhead.
+The important error contract distinguishes expired access, an invalid range, a temporary
+reporting failure, and no available measurements. Each produces a different screen action.
 
-**What we give up**: React Query provides automatic background refetching, stale-while-revalidate, and cache invalidation out of the box. With Zustand, we implement these manually -- a 5-minute refetch interval via setInterval, and explicit cache clearing when the user navigates away. This is approximately 30 lines of custom code that React Query would handle for free. For this application, the simpler mental model of a flat store outweighs the convenience of automatic cache management.
+## 🔧 Deep dive 1: Charts that preserve meaning — 8 minutes
 
----
+**Decision: aggregate by metric semantics on the server and render explicit coverage in the
+browser.**
 
-## ♿ Accessibility Considerations (2 minutes)
+A daily step total, average heart rate, and latest weight are three different kinds of report.
+Treating them as interchangeable numbers makes the UI simpler initially but can make its
+summaries wrong.
 
-### Chart Accessibility
+For steps, combining days means adding their totals. For an observation-weighted heart-rate
+average, I need the sum and count or an equivalent weighted aggregate. Averaging daily
+averages equally gives a day with one observation the same weight as a day with a thousand.
 
-Charts are inherently visual. For screen reader users, each chart includes a hidden data table alternative that presents the same information in tabular form. The chart container uses an aria-label describing the chart purpose and data range, for example "Steps trend chart showing 7 days of data."
+For latest weight, I need the latest measurement timestamp and the chosen value. Summing
+weights or choosing the last item after priority sorting would not answer the user's question.
 
-### Color Accessibility
+| Approach | Pros | Cons |
+|----------|------|------|
+| ✅ Server supplies semantic aggregates and coverage | Consistent meaning across clients; bounded payloads | Requires a richer contract and policy versioning |
+| ❌ Browser applies one generic reducer to raw samples | Flexible initial prototype | Large transfers; inconsistent fusion and summaries |
 
-Each metric uses both color and line pattern to distinguish from others when multiple metrics are overlaid.
+I would walk through a concrete gap. Suppose a watch records steps on Monday and Wednesday but
+has no Tuesday observations. The chart should break or mark the missing bucket, and the table
+should say “No observations.” Connecting a smooth line across Tuesday suggests evidence we do
+not have.
 
-| Metric | Color | Pattern |
-|--------|-------|---------|
-| Steps | Green (#22c55e) | Solid line |
-| Heart Rate | Red (#ef4444) | Dashed line |
-| Sleep | Purple (#8b5cf6) | Dotted line |
+Zero is different. If a supported source explicitly reports a zero over a known covered
+interval, the report can show zero with that coverage. “No rows” does not prove inactivity.
 
-All color combinations meet WCAG 2.1 AA contrast requirements with a minimum 4.5:1 ratio against the white chart background.
+The same principle applies to partial days. At noon, today's total may be correct for the
+received data but incomplete for the day. A “through 11:40” status is more useful than an
+unexplained comparison with yesterday's complete total.
 
-### Keyboard Navigation
+Timezone belongs in the report request and identity. If the user changes reporting zone, day
+boundaries and totals may change, so I would request a new report instead of merely relabeling
+the old x-axis.
 
-- Date range selector buttons support arrow key navigation within the group
-- Dashboard cards are focusable and expand details on Enter
-- Insight dismiss buttons are keyboard accessible with visible focus rings
+For rendering, I would set a point budget based on the visible width and period. A year can
+use daily or weekly buckets without returning every sensor observation. The response must
+state that resolution so the tooltip and summary remain honest.
 
----
+I would preserve meaningful extrema where needed and avoid a generic visual downsampling rule
+that changes totals or implies a new average. The server chooses the semantic resolution; the
+browser can reduce decorative detail without changing the result.
 
-## ⚖️ Trade-offs Summary (3 minutes)
+Accessibility is part of the report design. A keyboard-operable point selection, meaningful
+labels, visible units, and a table using the same data model make the information available
+beyond pointer hover. Color alone cannot distinguish missing, estimated, and observed data.
 
-| Decision | Chosen | Alternative | Rationale |
-|----------|--------|-------------|-----------|
-| Chart Library | ✅ Recharts | ❌ D3.js | React-native declarative API, good TypeScript support, built-in responsiveness |
-| State Management | ✅ Zustand | ❌ React Query | Flat shared store for multi-card dashboard, built-in persistence |
-| Rendering | ✅ SVG | ❌ Canvas | Crisp at any resolution, native DOM events for tooltips, accessible |
-| Date Library | ✅ date-fns | ❌ Moment.js | Tree-shakeable, immutable, no global mutation |
-| Aggregation | ✅ Server-side | ❌ Client-side | Smaller payloads, consistent deduplication logic on server |
-| Styling | ✅ Tailwind CSS | ❌ CSS Modules | Utility-first for rapid iteration, consistent spacing system |
+> “I am giving up some visual smoothness and client-side flexibility. That is worthwhile
+> because the product's value is helping someone understand their measurements, not simply
+> filling every pixel with a continuous curve.”
 
----
+I would verify this with missing days, one-observation days, midnight-spanning intervals,
+different timezones, and a narrow viewport. Snapshot tests alone would not catch an incorrect
+weighted average.
 
-## 🚀 Closing Summary (1 minute)
+## 🔧 Deep dive 2: Rapid navigation and account changes — 7 minutes
 
-"The health data pipeline frontend is built around three principles:
+**Decision: key every request completely and guard its result by account generation.**
 
-1. **Dashboard-first design** -- The daily summary provides an at-a-glance view of key health metrics with progress indicators toward goals. Insights are prominently displayed with severity-based ordering so critical health alerts are never buried.
+Consider someone selecting 90 days and then 7 days. The 7-day response arrives first. If the
+cache is keyed only by metric, the older 90-day response can replace it while the controls
+still say “7 days.”
 
-2. **Responsive chart visualizations** -- Recharts provides declarative SVG-based charts for trend analysis. Date range presets (7D, 30D, 90D, 1Y) enable quick navigation through historical data with server-side aggregation keeping payloads small regardless of the time window.
+That is a state-ownership problem, not a chart rendering problem. The coordinator needs a key
+that includes the range and timezone, and the component should subscribe to that exact query.
 
-3. **Zustand for coordinated state** -- A single store manages date selection, cached aggregates, and insights with persist middleware for user preferences. This enables consistent state across the dashboard, trends, and insights views without prop-drilling or redundant API calls.
+Cancellation saves bandwidth, but it is not the correctness guarantee. A response may already
+be in flight or a server may finish despite cancellation. The acceptance check must still
+reject a response whose identity is no longer current.
 
-The main trade-off is simplicity versus flexibility. Server-side aggregation means smaller payloads and consistent deduplication, but requires additional API calls when users want different time granularities. For a health dashboard where users typically view daily aggregates, this trade-off favors simpler client code and faster initial loads."
+An account generation handles a more serious version of the race. On logout or account switch,
+increment the generation, cancel active queries, clear private caches and derived view state,
+and reset source status. A response from the old generation cannot repopulate the new session.
+
+| Approach | Pros | Cons |
+|----------|------|------|
+| ✅ Identified queries plus generation guards | Correct range/account ownership; independent states | More explicit cache lifecycle |
+| ❌ One global metric map and loading flag | Little setup code | Late responses overwrite current views; data survives transitions |
+
+I would keep stale data visible only when it belongs to the same authorized query context. It
+needs a clear refreshing or failed-refresh label. A previous account's chart is never a useful
+loading placeholder.
+
+Similarly, changing from heart rate to sleep should not briefly relabel the old series as
+sleep. Either retain the old chart with its old title during a deliberate transition or show
+the new query's loading state.
+
+Authentication initialization needs an explicit state: checking, authenticated, or signed out.
+Redirecting before the session check finishes causes flicker and can discard the intended
+route.
+
+A temporary network failure should not automatically look like invalid credentials. I would
+distinguish “cannot verify right now” from an explicit unauthorized response, then define
+whether an already-open report may remain visible under the session policy.
+
+For browser session storage, I would prefer a secure cookie-based session for a same-origin
+product, with the corresponding request-forgery protection. This reduces token exposure to
+ordinary script reads. It does not protect health data if malicious script already controls
+the page.
+
+The report payload stays in memory by default. Persisting it offline would require a separate
+decision about device sharing, eviction, encryption keys, revocation, and deletion. I would
+not add that complexity solely to avoid a loading spinner.
+
+The trade-off is less offline availability and occasionally refetching data after navigation.
+I would accept that first and measure whether a scoped cache solves most repeat reads before
+adding persistent storage.
+
+## 🔧 Deep dive 3: Freshness without misleading optimism — 7 minutes
+
+**Decision: show upload acceptance and report publication as separate states.**
+
+A source can capture data while offline, upload it later, and trigger recomputation of
+yesterday's report. A last-sync timestamp collapses all of those stages and cannot explain
+whether the visible total includes that upload.
+
+I would model the experience around three timestamps:
+
+| Time | Meaning | Display consequence |
+|------|---------|---------------------|
+| Captured | Device observed the measurement | Explains how recent the source evidence is |
+| Accepted | Server durably stored the upload | Safe for the sync client to stop retrying it |
+| Processed | A published report includes the accepted work | Safe to refresh the chart as updated |
+
+The source panel can say “Upload received; reports updating” while the chart continues to show
+its last published version. This is a valid partial-progress state, not an error.
+
+I would not optimistically add an uploaded step count to the displayed daily total. Another
+device might already cover the same interval, and the server's fusion policy might replace
+rather than add that contribution.
+
+Optimism is more appropriate for reversible presentation actions, such as dismissing an
+informational card, provided failure restores it. Measurement totals need authoritative
+reconciliation.
+
+| Approach | Pros | Cons |
+|----------|------|------|
+| ✅ Poll active status and refresh published versions | Simple recovery; explicit processing progress | Some update delay and status requests |
+| ❌ Immediately modify totals from upload payloads | Instant apparent feedback | Double counting and visible rollback after fusion |
+
+For this reporting product, I would begin with bounded polling while the page is visible or
+work is pending, plus explicit refresh. Back off on errors, stop hidden-tab polling, and avoid
+launching a new request while the previous one is unresolved.
+
+If the interviewer changes the requirement to continuous live exercise monitoring, I would
+reconsider a push channel. That introduces reconnect and resynchronization behavior, and a
+push notification still needs a versioned report read.
+
+A worker failure should leave the last published chart available with a delayed-processing
+message. A source that has not uploaded is a different explanation from a server that has
+accepted data but is behind.
+
+Corrections can lower an old total. I would preserve the selected range and focused date while
+refreshing, show that the report changed, and allow source inspection. Treating every decrease
+as an error would hide legitimate deduplication.
+
+Descriptive trend cards should reference the report version and coverage used to produce them.
+Comparing a partial week with a complete week can create a false change even when the chart
+itself is accurate.
+
+The cost of this design is additional status fields and more nuanced UI states. It avoids
+promising immediate correctness where the underlying pipeline is deliberately asynchronous.
+
+## 📈 Performance and failure checks — 4 minutes
+
+I would measure time to useful report, interaction responsiveness, request cancellation/reuse,
+chart render cost, and the age of the displayed publication. A fast response with stale or
+mismatched data is not a successful experience.
+
+The first performance fix is bounded data. Then I would isolate subscriptions so a
+source-status refresh does not rebuild every chart, memoize expensive transformations when
+measurements justify it, and defer offscreen reports.
+
+Route code splitting should use supported lazy components and loading/error boundaries. It is
+separate from data loading: a route's JavaScript can arrive successfully while its health
+query fails.
+
+I would prioritize these behavioral checks:
+
+- Rapidly change ranges and deliver responses out of order.
+- Log out during a request, sign into another account, and deliver the old response.
+- Render empty, zero, partially covered, delayed, and failed-refresh states.
+- Compare chart/table values and keyboard navigation across reporting timezones.
+- Simulate an accepted upload whose report publication is delayed, then corrected.
+
+On mobile, range controls, navigation, and source explanations must remain reachable. A
+desktop navigation row hidden at small widths needs an actual replacement, not simply fewer
+visible links.
+
+## ⚖️ Trade-offs and implementation boundary — 3 minutes
+
+| Decision | Chosen | Alternative | Reason |
+|----------|--------|-------------|--------|
+| Data semantics | ✅ Server-defined points and coverage | ❌ Generic browser aggregation | Preserve metric meaning |
+| State ownership | ✅ Complete query keys and account guards | ❌ Global metric-only state | Prevent range/account races |
+| Freshness | ✅ Accepted-versus-published status | ❌ Optimistic health totals | Respect overlap and correction processing |
+| Offline reports | ✅ Memory cache initially | ❌ Persistent private history | Keep lifecycle and revocation manageable |
+
+The local project has React, Zustand, Recharts, summary cards, metric selectors, device
+registration, and admin views. It lacks the proposed coverage/version contract, account/range
+guards, accessible table, and processing-status flow. Its route components return fresh
+Promises, and browser navigation was not verified in the documentation review.
+
+The local health store survives logout and can accept an old range response. Those examples
+motivate the boundaries in the overview; they are not recommended behavior. See
+[architecture.md](./architecture.md#implementation-notes) for the source audit and
+[README.md](./README.md) for setup.
+
+> “I would finish by walking the diagram once more: controls choose an identified report, the
+> coordinator accepts only current authorized responses, and the views explain values, gaps,
+> sources, and freshness. That is the experience I would establish before expanding the
+> feature set.”

@@ -37,26 +37,58 @@ I would exclude real payment-field implementation and tax rules from the whitebo
 We integrate a provider's payment component/reference and a server-calculated quote.
 The storefront does not need to receive raw card details to orchestrate checkout.
 
-## 🏗️ Draw the page and data boundaries — 5 minutes
+## 🏗️ Draw the page and data boundaries — 6 minutes
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│ Storefront shell: navigation, account state, cart summary          │
-├──────────────────────┬──────────────────────┬────────────────────┤
-│ Discovery            │ Purchase             │ After purchase     │
-│ Search / product     │ Cart / checkout      │ Order status       │
-│ Public cached data   │ Private current data │ Recoverable result │
-└───────────┬──────────┴──────────┬───────────┴─────────┬──────────┘
-            │                     │                     │
-┌───────────▼─────────────────────▼─────────────────────▼──────────┐
-│ Data layer: query identity, cancellation, errors, mutation status │
-└───────────┬─────────────────────┬─────────────────────┬──────────┘
-            ▼                     ▼                     ▼
-┌────────────────────┐  ┌───────────────────┐  ┌──────────────────┐
-│ Catalog/search API │  │ Cart/quote API    │  │ Checkout/status  │
-│ Stale reads allowed│  │ Versioned snapshot│  │ Stable attempt ID│
-└────────────────────┘  └───────────────────┘  └──────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│ STOREFRONT / BROWSER STATE                                                               │
+│                                                                                          │
+│  ┌────────────────────────┐    ┌────────────────────────┐    ┌────────────────────────┐  │
+│  │ Discovery views        │    │ Cart + checkout        │    │ Order status           │  │
+│  │ Search + product pages │    │ Drafts, pending edits  │    │ Known / unknown result │  │
+│  └────────────────────────┘    └────────────────────────┘    └────────────────────────┘  │
+│                          ▲                             ▲                             ▲   │
+│                          │                             │                             │   │
+│   query / render         │      edit / snapshot        │      recover / render       │   │
+│                          │                             │                             │   │
+│                          ▼                             ▼                             ▼   │
+│  ┌────────────────────────┐    ┌────────────────────────┐    ┌────────────────────────┐  │
+│  │ URL + public queries   │    │ Cart model             │    │ Attempt + recovery     │  │
+│  │ Filters + pages        │    │ Confirmed version      │    │ Saved purchase ID      │  │
+│  │ Bounded result cache   │    │ Quote + pending edits  │───▶│ Account-scoped status  │  │
+│  └────────────────────────┘    └────────────────────────┘    └────────────────────────┘  │
+│                          ▲                             ▲                             ▲   │
+│                          │                             │                             │   │
+│   normalized query       │      cart version           │      same attempt ID        │   │
+│                          │                             │                             │   │
+│                          ▼                             ▼                             ▼   │
+│  ┌────────────────────────────────────────────────────────────────────────────────────┐  │
+│  │ Data access and reconciliation                                                     │  │
+│  │ Request/account identity, bounded pages, typed conflicts, canonical results        │  │
+│  └────────────────────────────────────────────────────────────────────────────────────┘  │
+│                                                                           ▲              │
+│                                                                           │              │
+└───────────────────────────────────────────────────────────────────────────┼──────────────┘
+   HTTP: read, edit, submit, recover                                        │
+                                                                            │
+                                                                            ▼
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│ Storefront APIs (server boundary)                                                        │
+│ Catalog/search | versioned cart and quotes | durable attempts and order status           │
+└──────────────────────────────────────────────────────────────────────────────────────────┘
 ```
+
+I would trace browsing from the URL and public query cache to the discovery views.
+Purchase screens instead share a confirmed cart version and a recoverable attempt
+reference. The data layer returns canonical results to those owners; it does not
+turn pending edits into a stock promise. Public page rendering can happen at the
+edge, while account, cart and checkout responses stay outside shared HTML caches.
+
+The cart-to-attempt arrow freezes the reviewed quote and cart version into one purchase
+intent. I would retain its reference under the active account before submission. After
+a lost response or reload, the controller queries that same attempt and renders its
+known state; changing a form does not silently create a second purchase or rewrite
+the payload of an attempt already in flight.
 
 Public product metadata can be rendered and cached close to the visitor. I would
 use server rendering with selective revalidation for indexable product/category
@@ -357,7 +389,7 @@ For slow devices, bound rendered results, avoid blocking input with expensive fi
 and defer optional modules. Measure network, rendering and interaction delay separately;
 a fast backend cannot compensate for a blocked main thread.
 
-## ✅ Verify the customer-visible guarantees — 4 minutes
+## ✅ Verify the customer-visible guarantees — 3 minutes
 
 I would test these end-to-end behaviors before broad visual polish:
 

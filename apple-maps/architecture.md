@@ -82,33 +82,54 @@ There are no runtime benchmarks or resource measurements in this review.
 Proposed production boundaries:
 
 ```text
-┌──────────────────────────┐        ┌──────────────────────────┐
-│ Map / navigation client  │───────▶│ CDN: versioned map data  │
-└────────────┬─────────────┘        └────────────▲─────────────┘
-             ▼                                   │
-┌──────────────────────────┐        ┌────────────┴─────────────┐
-│ API gateway              │        │ Map build + object store │
-└────────────┬─────────────┘        └──────────────────────────┘
-             ▼
-┌──────────────────────────┐        ┌──────────────────────────┐
-│ Routing + place search   │◀───────│ Published graph snapshot │
-│ Workers with local graph │        │ Spatial source/importer  │
-└────────────▲─────────────┘        └──────────────────────────┘
-             │
-┌────────────┴─────────────┐        ┌──────────────────────────┐
-│ Traffic weight snapshots │◀───────│ Matcher + aggregation    │
-│ Age/coverage/confidence  │        └────────────▲─────────────┘
-└──────────────────────────┘                     │
-                                    ┌────────────┴─────────────┐
-                                    │ Durable probe stream     │
-                                    │ Validated observations   │
-                                    └──────────────────────────┘
+┌─────────────────────────────────────────────────────────┐       ┌────────────────────────┐
+│ Map clients                                             │       │ Tile service + CDN     │
+│ Search, route intent, optional observation batches      │◀─────▶│ Versioned basemap      │
+└─────────────────────────────────────────────────────────┘       │ Independent delivery   │
+                                              ▲                   └────────────────────────┘
+                                              │
+queries / consented observations              │
+                                              │
+                                              ▼
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│ API edge                                                                                 │
+│ Validation, bounded request cost, region selection; separate workload budgets            │
+└──────────────────────────────────────────────────────────────────────────────────────────┘
+             ▲                                ▲                                ▲
+             │                                │                                │
+places       │                   route query  │                   observations │
+             │                                │                                │
+             ▼                                ▼                                ▼
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Regional place search  │       │ Regional route workers │       │ Traffic ingestion      │
+│ Text + spatial index   │       │ Legal transitions      │       │ Validate, limit, admit │
+│ Stable place IDs       │       │ Pinned graph + weights │       │ Durable acceptance     │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+                                              ▲                                ▲
+                                              │                                │
+               pin serving snapshot           │                   commit / ACK │
+                                              │                                │
+                                              ▼                                ▼
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Map build pipeline     │       │ Versioned serving view │       │ Durable log + pipeline │
+│ Validate road graph    │──────▶│ Graph + legal turns    │◀──────│ Match / aggregate      │
+│ Retain prior releases  │       │ Compatible weight view │       │ Age and confidence     │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+
+A query pins compatible graph and traffic versions; ingestion does not own route CPU.
 ```
 
 The tile-delivery path does not depend on a route query. The routing query uses a
 compatible graph and traffic snapshot, not a database lookup for every edge it
 expands. Traffic processing owns a separate write workload and publishes derived
 weights for routers and visual overlays.
+
+Trace a route response back through the worker and API edge to the requesting trip;
+its graph and weight versions form one coherent bundle. The ingestion return path
+acknowledges a durable observation independently of its later aggregation. Graph
+publication validates a fixed release and retains eligible prior versions for recovery.
+Traffic fallback is explicit about freshness and compatibility; it cannot silently
+reuse weights whose edge identities belong to another graph release.
 
 ## Core Components / Request Flows
 

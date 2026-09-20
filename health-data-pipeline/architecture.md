@@ -1,209 +1,160 @@
-# Design Health Data Pipeline - Architecture
+# Health Data Pipeline Architecture
 
 ## System Overview
 
-A health data aggregation pipeline collecting metrics from multiple devices, processing and deduplicating data, and generating health insights while maintaining strict privacy. Core challenges involve multi-source ingestion, data quality, and privacy protection.
+This project explores how to accept measurements from several devices, distinguish retries from overlapping observations, and turn imperfect time-series data into understandable personal reports. The difficult boundary is between “we saved your upload” and “this chart includes every accepted correction under a known aggregation policy.”
 
-**Learning Goals:**
-- Build multi-source data ingestion
-- Design data deduplication algorithms
-- Implement privacy-preserving processing
-- Handle time-series health data at scale
+The production design below is a proposal for a nonclinical personal reporting product. The repository contains a smaller Express/TimescaleDB/Valkey prototype and a React dashboard. Its ingestion, aggregation, authentication, and rendering limitations are documented in the final [Implementation Notes](#implementation-notes). Capacity figures are design assumptions, not measurements of this implementation.
 
 ## Requirements
 
-### Functional Requirements
+### Functional requirements — proposed product
 
-1. **Ingest** - Collect health data from multiple devices (wearables, phones, third-party sensors) via batch sync API
-2. **Process** - Aggregate, deduplicate, and normalize data from overlapping sources using device priority ranking
-3. **Store** - Persist time-series data with encryption, tiered retention, and compression
-4. **Query** - Fast access to historical data, pre-computed aggregates, and daily summaries
-5. **Insights** - Generate health trend analysis, sleep deficit alerts, and activity change notifications
-6. **Share** - Controlled, time-limited data sharing with doctors and family via share tokens
+- Register devices under an authenticated owner; ingest bounded batches with stable source sample IDs and explicit correction versions.
+- Preserve original units, normalized values, source identity, capture intervals, and processing provenance.
+- Produce hourly/daily reports with metric-specific rules, source coverage, reporting timezone, and visible freshness.
+- Accept offline device backfills and recompute affected periods without double counting or allowing old jobs to replace newer results.
+- Let users inspect sources and delete their data. Treat descriptive trend messages as optional, coverage-dependent summaries.
 
-### Non-Functional Requirements
+Real wearable integrations, clinical decision support, and clinician sharing are separate product scopes. A future sharing feature would require explicit metric/date grants and revocation checks; an unused token table does not implement it.
 
-| Requirement | Target (Production) |
-|-------------|-------------------|
-| Privacy | All data encrypted at rest and in transit, per-user encryption keys |
-| Reliability | Zero data loss -- sync acknowledgment only after durable write |
-| Query latency (p99) | < 100ms for aggregated data, < 1s for raw sample queries |
-| Ingestion throughput | 50,000 samples/second across all users |
-| Availability | 99.99% for read path, 99.9% for write path |
-| Compliance | HIPAA-ready architecture with 7-year retention for raw samples |
-| Data freshness | Aggregates updated within 60 seconds of sync |
+### Non-functional requirements — proposed targets
+
+| Concern | Initial target / contract |
+|---------|---------------------------|
+| Availability | 99.9% monthly for ingestion and authorized report reads |
+| Acceptance | p95 below 500 ms for a valid bounded batch, excluding client upload time |
+| Report latency | p95 below 300 ms for a bounded aggregate query |
+| Freshness | 99% of ordinary accepted batches reflected in reports within two minutes |
+| Durability | A successful acceptance receipt follows a committed durable write |
+| Correctness | Deterministic policy version; no duplicate effect from retries; explicit missing coverage |
+| Privacy | Owner/device authorization, protected transport/storage, bounded access and deletion |
+
+Backfills have a separate processing objective so a year of imported data cannot consume the entire interactive queue. Availability never permits one account to read another account's cached report.
 
 ## Capacity Estimation
 
-### Production Scale
+Assume one million daily active users and 1,500 samples per user per day: 1.5 billion samples/day, about 17,400 samples/second on average. A 100,000-sample/second peak is a planning input. At 500 samples per full batch that is 200 batch requests/second, but small batches increase request overhead.
 
-| Metric | Estimate |
-|--------|----------|
-| Users | 10M active |
-| Samples per user per day | ~1,500 (heart rate 1/min + hourly steps + daily vitals) |
-| Total daily ingest | ~15B samples |
-| Raw sample size | ~100 bytes average |
-| Daily storage growth | ~1.5 TB (raw) + ~50 GB (aggregates) |
-| Hot storage (90 days) | ~135 TB raw + ~4.5 TB aggregates |
-| Read QPS (dashboards) | ~100K (dominated by aggregate queries) |
-| Write QPS (syncs) | ~50K samples/s during peak sync windows |
+At an assumed 200 bytes per normalized sample, raw payload alone is 300 GB/day before indexes, replicas, metadata, and backups. This makes retention, batch efficiency, partition sizing, and user-based sharding important. It does not justify silently discarding provenance or keeping every resolution forever.
+
+Daily charts should return hundreds of points, not millions of raw measurements. Query and worker load depends on the maximum accepted interval length, backfill age, number of overlapping devices, and requested resolution; bound those dimensions independently of request bytes.
 
 ### Local Development Scale
 
-| Metric | Estimate |
-|--------|----------|
-| Users | 2-5 seeded |
-| Samples per user | ~500 seeded |
-| Storage | < 50 MB |
-| Concurrent requests | 1-3 |
+Compose provides one TimescaleDB and one Valkey process. One Express process performs ingestion, inline aggregation, queries, and auth. Additional API port scripts are available, but there is no provided load balancer or cross-instance aggregation coordinator. No throughput, resource-use, or availability target has been benchmarked here.
 
 ## High-Level Architecture
 
+**Proposed production components:** draw the acceptance path first, then the asynchronous projection and reporting path. The database box represents a user shard containing relational control records and time-partitioned samples; it is not a promise that one server handles the estimated workload.
+
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                     Data Sources                                 │
-│  ┌───────────────┐  ┌───────────────┐  ┌───────────────┐       │
-│  │  Apple Watch  │  │    iPhone     │  │ Third-Party   │       │
-│  │               │  │               │  │   Devices     │       │
-│  │ - Heart rate  │  │ - Steps       │  │ - Scales      │       │
-│  │ - Workouts    │  │ - Distance    │  │ - BP monitors │       │
-│  │ - ECG         │  │ - Flights     │  │ - Glucometers │       │
-│  └───────────────┘  └───────────────┘  └───────────────┘       │
-└─────────────────────────────────────────────────────────────────┘
-                              │ HTTPS (encrypted batch sync)
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    API Gateway / Load Balancer                    │
-│         (TLS termination, rate limiting, auth)                   │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-               ┌──────────────┼──────────────┐
-               ▼              ▼              ▼
-┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐
-│  Ingestion API  │ │  Query API      │ │  Admin API      │
-│  (write path)   │ │  (read path)    │ │  (ops)          │
-│                 │ │                 │ │                 │
-│ - Validation    │ │ - Samples       │ │ - User mgmt    │
-│ - Normalize     │ │ - Aggregates    │ │ - Reaggregate   │
-│ - Idempotency   │ │ - Summaries     │ │ - Stats         │
-│ - Batch upsert  │ │ - History       │ │ - Retention     │
-└────────┬────────┘ └────────┬────────┘ └────────┬────────┘
-         │                   │                   │
-         ▼                   │                   │
-┌─────────────────┐          │                   │
-│  Message Queue  │          │                   │
-│  (RabbitMQ)     │          │                   │
-│                 │          │                   │
-│ - aggregation   │          │                   │
-│ - insights      │          │                   │
-│ - dead-letter   │          │                   │
-└────────┬────────┘          │                   │
-         │                   │                   │
-         ▼                   │                   │
-┌─────────────────┐          │                   │
-│  Workers        │          │                   │
-│  (Background)   │          │                   │
-│                 │          │                   │
-│ - Deduplication │          │                   │
-│ - Aggregation   │          │                   │
-│ - Insight gen   │          │                   │
-│ - Retention     │          │                   │
-└────────┬────────┘          │                   │
-         │                   │                   │
-         ▼                   ▼                   ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                     Data Layer                                    │
-│                                                                   │
-│  ┌─────────────────┐  ┌──────────────┐  ┌───────────────┐       │
-│  │  TimescaleDB    │  │  Redis /     │  │  Object Store │       │
-│  │  (PostgreSQL)   │  │  Valkey      │  │  (S3 / MinIO) │       │
-│  │                 │  │              │  │               │       │
-│  │ - Hypertables   │  │ - Sessions   │  │ - Archives    │       │
-│  │ - Compression   │  │ - Agg cache  │  │ - Exports     │       │
-│  │ - Partitioned   │  │ - Idempotency│  │ - Backups     │       │
-│  └─────────────────┘  └──────────────┘  └───────────────┘       │
-└─────────────────────────────────────────────────────────────────┘
+┌────────────────────────┐ batch  ┌────────────────────────┐        ┌────────────────────────┐
+│ Sync client + journal  │        │ Ingestion API          │        │ Identity + grants      │
+│ Saved batch/sample IDs │◀──────▶│ Validate + authorize   │◀──────▶│ User / device scope    │
+└────────────────────────┘        └────────────────────────┘        └────────────────────────┘
+                                                         ▲
+                                                         │
+atomic: samples, receipt, dirty buckets, outbox          │
+                                                         │
+                                                         ▼
+┌────────────────────────────────────────────────────────────────────────────────────────────┐
+│ PostgreSQL / time-series partitions, sharded by user                                       │
+│ Raw versions + source identity registry + receipts + dirty generations / outbox            │
+│ Published bucket versions, provenance, policy version, access grants                       │
+└────────────────────────────────────────────────────────────────────────────────────────────┘
+                       ▲                                  ▲                                ▲
+                       │                                  │                                │
+ inputs / publish      │           committed jobs         │          scoped reads          │
+                       │                                  │                                │
+                       ▼                                  ▼                                ▼
+┌────────────────────────┐        ┌────────────────────────┐        ┌────────────────────────┐
+│ Rollup workers         │        │ Dispatcher + queue     │        │ Query API              │
+│ Full affected buckets  │◀──────▶│ Retry / bounded jobs   │        │ Current authorization  │
+│ Metric-specific rules  │        │ Outcome / retry state  │        │ Published versions     │
+└────────────────────────┘        └────────────────────────┘        └────────────────────────┘
+                                                                                           ▲
+                                                                                           │
+                                                                     reports / status      │
+                                                                                           │
+                                                                                           ▼
+                                  ┌──────────────────────────────────────────────────────────┐
+                                  │ Dashboard clients                                        │
+                                  │ Charts, source coverage, accepted vs processed status    │
+                                  └──────────────────────────────────────────────────────────┘
 ```
 
-## Core Components
+A device sends a bounded batch through authenticated ingestion. In one shard-local transaction, ingestion records the raw versions, a scoped receipt, affected bucket generations, and an outbox entry. Only then does it report acceptance.
 
-### Data Types and Validation
+The dispatcher delivers committed work to retryable workers. A worker reads complete affected bucket inputs, applies the metric policy, and publishes only if its input generation is still current. The query API checks current access and returns published results with coverage and processing status. A cache can accelerate these reads but cannot become the authority for access or acceptance.
 
-The system supports 16 health data types across 4 categories, each with a defined unit and aggregation strategy:
+The sync client's bounded journal retains the original batch/sample identities until an authorized receipt lookup resolves the upload; it is separate from the dashboard's report cache. Worker acknowledgements follow a durable publication or recorded supersession/retry outcome. A newer correction or deletion can invalidate an older job, so completing that job does not prove the latest requested report is ready. The dashboard observes the published version and its coverage before refreshing its matching query.
 
-| Category | Types | Unit | Aggregation |
-|----------|-------|------|-------------|
-| Activity | Steps, Distance, Active Energy | count, meters, kcal | sum |
-| Vitals | Heart Rate, Resting HR, BP Systolic, BP Diastolic, Blood Glucose, SpO2 | bpm, mmHg, mg/dL, % | average |
-| Body | Weight, Body Fat | kg, % | latest |
-| Sleep | Sleep Analysis, Sleep State | minutes, enum | sum |
+## Core Components / Request Flows
 
-Each incoming sample is validated: type must be recognized, unit must match the type's canonical unit (with automatic conversion if needed), and timestamps must be reasonable (not in the future, not more than 1 year old).
+### 1. Authorize and accept a batch
 
-### Device Sync Service
+Validate the session and verify ownership of the device before receipt lookup. Validate sample count, finite values, known units, timestamps, permitted backfill age, and interval duration. Reject unknown unit conversions instead of relabeling their numeric values.
 
-Handles batch sync from mobile devices. The sync protocol:
+Use a source identity registry keyed by owner, device/provider, source sample ID, and version. Its row points to the sample's time partition and records a content digest. This prevents a retry with a changed timestamp from evading identity checks. A correction is a new explicit version, not a silent overwrite or another unrelated UUID.
 
-1. Device sends a batch of samples with an `X-Idempotency-Key` header
-2. Server checks idempotency cache (Redis) -- if key exists, return cached response
-3. Each sample is validated and normalized to canonical units
-4. Valid samples are bulk-inserted with `ON CONFLICT (id) DO NOTHING` to handle duplicates
-5. Aggregation jobs are queued for affected date ranges and data types
-6. Response includes count of synced samples, errors, and error details
+Receipt identity includes owner, device, and client batch key. A canonical digest includes every semantically relevant field. Reusing the same key with a different digest is a conflict. Valid samples and per-item validation failures can share one final batch receipt; unauthorized devices are rejected before processing any item.
 
-Error handling is per-sample: one invalid sample does not reject the entire batch. This is critical for mobile sync where network conditions cause retries.
+The transaction commits raw versions, receipt outcome, dirty bucket generations, and outbox work together. An acknowledgment means durable acceptance, not completed aggregation. The SDK can retain an encrypted, bounded retry journal until that receipt is known; the browser report cache is a separate concern.
 
-### Deduplication Algorithm
+### 2. Resolve overlapping observations
 
-When multiple devices measure the same metric (e.g., Apple Watch and iPhone both count steps), the deduplication algorithm resolves overlaps using device priority:
+Two equal sample IDs are a retry/correction problem. Two distinct samples from different sensors can legitimately describe the same activity. Preserve both raw records, and choose a documented per-metric projection policy.
 
-1. **Priority ranking**: Apple Watch (100) > iPhone (80) > iPad (70) > Third-party wearable (50) > Third-party scale (40) > Manual entry (10)
-2. **Sort all samples** for a given type and time range by source device priority (highest first)
-3. **For each sample**, check against already-covered time ranges:
-   - **No overlap**: Include the full sample
-   - **Full overlap**: Skip (higher-priority source already covers this period)
-   - **Partial overlap**: Proportionally adjust the value for the non-overlapping portion
+For interval totals such as steps, resolve the union of covered intervals, then subtract all higher-priority coverage from lower-priority intervals. Split uncovered fragments at bucket boundaries. Duration-based allocation of an interval total is an estimate; preserve that fact because uniform activity within an interval is not known.
 
-This approach is deterministic and idempotent -- re-running deduplication on the same data produces the same result regardless of order of insertion.
+For point measurements such as weight, choose the latest eligible observation by measurement timestamp and a stable tie-breaker. Heart-rate aggregation must explicitly define observation weighting or time weighting; clipping an interval must not turn 100 bpm into 50 bpm. Sleep duration uses covered sleep intervals and a documented source/stage policy, not an indiscriminate sum of overlapping durations.
 
-### Aggregation Pipeline
+Source preference is a product policy with a version, not evidence that a particular branded device is medically more accurate. Raw observations remain available for inspection and recomputation while within retention.
 
-After deduplication, samples are aggregated into hourly and daily buckets:
+### 3. Recompute and publish a complete period
 
-| Strategy | Metrics | Computation |
-|----------|---------|-------------|
-| `sum` | Steps, Distance, Calories, Sleep | Total for the period |
-| `average` | Heart Rate, Blood Pressure, SpO2 | Mean value with sample count |
-| `latest` | Weight, Body Fat | Most recent value in the period |
+Convert reporting-day boundaries from the user's IANA timezone to half-open UTC intervals. A day can differ from 24 hours around daylight-saving transitions. Store event instants with timezone-aware semantics and retain the reporting zone/policy used by each projection.
 
-Aggregates are stored with `ON CONFLICT DO UPDATE` so re-aggregation (after a bug fix or late-arriving data) atomically replaces old values. Both `min_value` and `max_value` are tracked alongside the primary aggregate for range queries.
+A job loads every relevant sample intersecting the affected period, including samples that began before it. For an old-to-new correction, dirty the union of the old and new intervals. Replacing a bucket requires a complete recomputation, including an explicit empty result when the final sample was deleted.
 
-### Insights Engine
+Each dirty bucket has a desired generation. Workers read an identified input snapshot and policy version. Publication compares that generation and the account's deletion/policy epoch with the current values. A stale worker discards its result and leaves the newest work pending. The check and publication happen in one transaction.
 
-Analyzes aggregated data to generate health recommendations using simple statistical methods:
+Publish related report buckets through a versioned report head when the product requires an internally consistent bundle. Otherwise expose per-bucket revisions and freshness. Do not describe a sequence of independent hourly/daily writes as one atomic report.
 
-1. **Heart Rate Trend** - Linear regression over 30 days of resting heart rate. Alerts if slope exceeds +/- 0.5 bpm/day (clinically significant sustained change)
-2. **Sleep Deficit** - Average sleep over 14 days. Alerts if below 6 hours (medium severity) or 5 hours (high severity)
-3. **Activity Change** - Compares current week's steps to 4-week rolling average. Alerts on > 20% change in either direction
-4. **Weight Change** - Detects > 3% body weight change over 30 days
+### 4. Read reports and show freshness
 
-Insights are stored in the `health_insights` table with severity, direction, message, and supporting data. Users can acknowledge insights to dismiss them from the dashboard.
+The query service authorizes each request, resolves the published report head, and reads bounded aggregate points. Versioned cache keys include owner, metric, range, resolution, reporting zone, policy, and publication version. A cached payload is reusable only after current access checks.
 
-### Privacy Layer
+Responses distinguish measurement time, acceptance time, processing watermark, and source coverage. A device's “last sync” timestamp alone cannot prove that a chart contains all of its data. Poll processing status while a report is active and refresh when its published version changes; a persistent push connection is optional.
 
-Health data requires defense-in-depth privacy protection:
-
-- **Encryption at rest**: PostgreSQL `pgcrypto` for column-level encryption of sensitive values; TimescaleDB transparent data encryption for the storage layer
-- **Per-user encryption keys**: Derived from user credentials, enabling data to be shared only with explicit key derivation for recipients
-- **Share tokens**: Time-limited, scope-limited (specific data types, date ranges) tokens with access codes. Revocable at any time
-- **Minimal exposure**: API responses never include data outside the authenticated user's scope. Admin endpoints show only aggregate statistics, never individual health data
+The browser owns metric/range controls and presentation state. The server owns normalized measurements and report semantics. Charts show gaps, units, provenance, and an equivalent data table. A shared query coordinator guards responses by account generation and complete query identity, so an old range or account cannot populate the current view.
 
 ## Database Schema
 
-### Core Tables
+### Verified local schema
+
+The following is the exact checked-in [init.sql](./backend/src/db/init.sql): **11 tables and 14 explicitly declared secondary indexes**, in addition to indexes created by primary/unique constraints and TimescaleDB. This is an implementation reference, not the complete proposed production schema.
+
+`health_samples` uses `(id, start_date)` as its primary key; `health_aggregates` uses `(id, period_start)` plus a unique user/type/period/start tuple. The standalone generator's conflict target `(id)` does not match the raw table. Local timestamps are `TIMESTAMP` without time zone. The schema does not constrain finite measurement values, supported units, interval ordering, or device ownership through a composite foreign key.
 
 ```sql
-CREATE TABLE users (
+-- ============================================================================
+-- Health Data Pipeline - Consolidated Database Schema
+-- ============================================================================
+-- This file consolidates all migrations into a single init script.
+-- Use this for fresh database setup or Docker initialization.
+-- ============================================================================
+
+-- Enable required extensions
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+-- ============================================================================
+-- Core Tables
+-- ============================================================================
+
+-- Users table
+CREATE TABLE IF NOT EXISTS users (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   email VARCHAR(255) UNIQUE NOT NULL,
   password_hash VARCHAR(255) NOT NULL,
@@ -213,7 +164,8 @@ CREATE TABLE users (
   updated_at TIMESTAMP DEFAULT NOW()
 );
 
-CREATE TABLE user_devices (
+-- User devices
+CREATE TABLE IF NOT EXISTS user_devices (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   device_type VARCHAR(50) NOT NULL,
@@ -226,13 +178,14 @@ CREATE TABLE user_devices (
 );
 
 CREATE INDEX idx_devices_user ON user_devices(user_id);
-```
 
-### Health Data Tables (TimescaleDB Hypertables)
+-- ============================================================================
+-- Health Data Tables (TimescaleDB Hypertables)
+-- ============================================================================
 
-```sql
-CREATE TABLE health_samples (
-  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+-- Raw health samples (TimescaleDB hypertable)
+CREATE TABLE IF NOT EXISTS health_samples (
+  id UUID DEFAULT uuid_generate_v4(),
   user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   type VARCHAR(50) NOT NULL,
   value DOUBLE PRECISION,
@@ -243,15 +196,21 @@ CREATE TABLE health_samples (
   source_device_id UUID REFERENCES user_devices(id),
   source_app VARCHAR(100),
   metadata JSONB DEFAULT '{}',
-  created_at TIMESTAMP DEFAULT NOW()
+  created_at TIMESTAMP DEFAULT NOW(),
+  -- TimescaleDB requires the partitioning column (start_date) to be part of
+  -- every unique/primary-key constraint, so the PK is composite rather than id alone.
+  PRIMARY KEY (id, start_date)
 );
 
+-- Convert to hypertable for time-series optimization
 SELECT create_hypertable('health_samples', 'start_date', if_not_exists => TRUE);
+
 CREATE INDEX idx_samples_user_type ON health_samples(user_id, type, start_date DESC);
 CREATE INDEX idx_samples_device ON health_samples(source_device_id);
 
-CREATE TABLE health_aggregates (
-  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+-- Aggregated data (TimescaleDB hypertable)
+CREATE TABLE IF NOT EXISTS health_aggregates (
+  id UUID DEFAULT uuid_generate_v4(),
   user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   type VARCHAR(50) NOT NULL,
   period VARCHAR(10) NOT NULL,
@@ -261,17 +220,21 @@ CREATE TABLE health_aggregates (
   max_value DOUBLE PRECISION,
   sample_count INTEGER DEFAULT 1,
   updated_at TIMESTAMP DEFAULT NOW(),
+  -- Partitioning column (period_start) must be in every key constraint (TimescaleDB).
+  PRIMARY KEY (id, period_start),
   UNIQUE(user_id, type, period, period_start)
 );
 
 SELECT create_hypertable('health_aggregates', 'period_start', if_not_exists => TRUE);
+
 CREATE INDEX idx_aggregates_user_type ON health_aggregates(user_id, type, period, period_start DESC);
-```
 
-### Insights and Sharing
+-- ============================================================================
+-- User Insights & Sharing
+-- ============================================================================
 
-```sql
-CREATE TABLE health_insights (
+-- User insights
+CREATE TABLE IF NOT EXISTS health_insights (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   type VARCHAR(50) NOT NULL,
@@ -287,7 +250,8 @@ CREATE TABLE health_insights (
 CREATE INDEX idx_insights_user ON health_insights(user_id, created_at DESC);
 CREATE INDEX idx_insights_unread ON health_insights(user_id, acknowledged) WHERE acknowledged = false;
 
-CREATE TABLE share_tokens (
+-- Share tokens for controlled data sharing
+CREATE TABLE IF NOT EXISTS share_tokens (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   recipient_email VARCHAR(255),
@@ -304,12 +268,13 @@ CREATE TABLE share_tokens (
 CREATE INDEX idx_shares_user ON share_tokens(user_id);
 CREATE INDEX idx_shares_recipient ON share_tokens(recipient_id, expires_at);
 CREATE INDEX idx_shares_code ON share_tokens(access_code) WHERE revoked_at IS NULL;
-```
 
-### Operational Tables
+-- ============================================================================
+-- Authentication
+-- ============================================================================
 
-```sql
-CREATE TABLE sessions (
+-- Sessions for authentication
+CREATE TABLE IF NOT EXISTS sessions (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   token VARCHAR(255) UNIQUE NOT NULL,
@@ -317,16 +282,15 @@ CREATE TABLE sessions (
   created_at TIMESTAMP DEFAULT NOW()
 );
 
-CREATE TABLE idempotency_keys (
-  key VARCHAR(255) PRIMARY KEY,
-  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  request_hash VARCHAR(64) NOT NULL,
-  response JSONB,
-  created_at TIMESTAMP DEFAULT NOW(),
-  expires_at TIMESTAMP NOT NULL
-);
+CREATE INDEX idx_sessions_token ON sessions(token);
+CREATE INDEX idx_sessions_user ON sessions(user_id);
 
-CREATE TABLE health_data_types (
+-- ============================================================================
+-- Reference Data
+-- ============================================================================
+
+-- Health data type definitions (reference table)
+CREATE TABLE IF NOT EXISTS health_data_types (
   type VARCHAR(50) PRIMARY KEY,
   display_name VARCHAR(100) NOT NULL,
   unit VARCHAR(20),
@@ -335,7 +299,38 @@ CREATE TABLE health_data_types (
   description TEXT
 );
 
-CREATE TABLE retention_jobs (
+
+-- ============================================================================
+-- Migration 001: Idempotency Keys
+-- ============================================================================
+
+-- Add idempotency tracking table for deduplicating sync requests
+CREATE TABLE IF NOT EXISTS idempotency_keys (
+  key VARCHAR(255) PRIMARY KEY,
+  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  request_hash VARCHAR(64) NOT NULL,
+  response JSONB,
+  created_at TIMESTAMP DEFAULT NOW(),
+  expires_at TIMESTAMP NOT NULL
+);
+
+CREATE INDEX idx_idempotency_user ON idempotency_keys(user_id);
+CREATE INDEX idx_idempotency_expires ON idempotency_keys(expires_at);
+
+-- Schema migrations tracking table
+CREATE TABLE IF NOT EXISTS schema_migrations (
+  version INTEGER PRIMARY KEY,
+  name VARCHAR(255) NOT NULL,
+  applied_at TIMESTAMP DEFAULT NOW(),
+  checksum VARCHAR(64)
+);
+
+-- ============================================================================
+-- Migration 002: Retention Policies
+-- ============================================================================
+
+-- Add retention tracking table for audit purposes
+CREATE TABLE IF NOT EXISTS retention_jobs (
   id SERIAL PRIMARY KEY,
   job_type VARCHAR(50) NOT NULL,
   started_at TIMESTAMP DEFAULT NOW(),
@@ -349,25 +344,33 @@ CREATE TABLE retention_jobs (
   status VARCHAR(20) DEFAULT 'running'
 );
 
-CREATE TABLE schema_migrations (
-  version INTEGER PRIMARY KEY,
-  name VARCHAR(255) NOT NULL,
-  applied_at TIMESTAMP DEFAULT NOW(),
-  checksum VARCHAR(64)
-);
-```
+CREATE INDEX idx_retention_jobs_date ON retention_jobs(started_at DESC);
 
-### TimescaleDB Compression Policies
+-- Enable TimescaleDB compression policies (if TimescaleDB is available)
+DO $$
+BEGIN
+  -- Check if TimescaleDB is available
+  IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'timescaledb') THEN
+    -- Add compression policy for health_samples (compress after 90 days)
+    PERFORM add_compression_policy('health_samples', INTERVAL '90 days', if_not_exists => true);
 
-```sql
--- Automatically compress chunks older than 90 days
-SELECT add_compression_policy('health_samples', INTERVAL '90 days');
-SELECT add_compression_policy('health_aggregates', INTERVAL '90 days');
-```
+    -- Add compression policy for health_aggregates (compress after 90 days)
+    PERFORM add_compression_policy('health_aggregates', INTERVAL '90 days', if_not_exists => true);
 
-### Functions and Triggers
+    RAISE NOTICE 'TimescaleDB compression policies added';
+  ELSE
+    RAISE NOTICE 'TimescaleDB not installed, skipping compression policies';
+  END IF;
+EXCEPTION
+  WHEN OTHERS THEN
+    RAISE NOTICE 'Could not add compression policies: %', SQLERRM;
+END $$;
 
-```sql
+-- ============================================================================
+-- Functions and Triggers
+-- ============================================================================
+
+-- Function to update updated_at timestamp
 CREATE OR REPLACE FUNCTION update_updated_at_column()
 RETURNS TRIGGER AS $$
 BEGIN
@@ -376,383 +379,243 @@ BEGIN
 END;
 $$ language 'plpgsql';
 
--- Applied to: users, health_aggregates
+-- Triggers for updated_at
+CREATE TRIGGER update_users_updated_at
+  BEFORE UPDATE ON users
+  FOR EACH ROW
+  EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_aggregates_updated_at
+  BEFORE UPDATE ON health_aggregates
+  FOR EACH ROW
+  EXECUTE FUNCTION update_updated_at_column();
+
+-- ============================================================================
+-- Record applied migrations
+-- ============================================================================
+
+-- Seed data is in db-seed/seed.sql
 ```
+
+The schema enables `uuid-ossp`, but assumes TimescaleDB already exists for its two unconditional hypertable calls. The [Timescale Docker entrypoint](https://github.com/timescale/timescaledb-docker/blob/main/docker-entrypoint-initdb.d/000_install_timescaledb.sh) creates that extension during fresh image initialization. The native README option explicitly removes the hypertable calls in a temporary copy for ordinary PostgreSQL.
+
+The compression block catches errors and does not first enable compression on these tables. Its presence does not prove that compression policies work. Some indexes and triggers are unguarded, so this is a fresh-database initialization file, not a repeatable migration runner. The migration tracker and health type reference table are not populated.
+
+### Additional records required by the proposed design
+
+| Record | Key / important fields | Purpose |
+|--------|------------------------|---------|
+| Source identity registry | Owner, device/provider, source ID, version, digest, partition timestamp | Identity independent of event-time partitioning |
+| Batch receipt | Owner, device, key, digest, per-item outcome, accepted time | Durable, scoped retry result |
+| Raw sample version | Original/normalized value and unit, interval, source version, tombstone | Preserve provenance and corrections |
+| Dirty bucket | Owner, metric, bucket, zone/policy, desired generation | Bound recomputation and fence old jobs |
+| Outbox record | Job ID, affected scope, committed generation, delivery state | Recover work after acceptance |
+| Published report | Bucket values, coverage, input generation, policy, publication version | Explain and consistently serve derived data |
+| Account epoch / access grants | Current deletion/policy epoch, explicit recipient scope if added | Block revoked reads and stale republishing |
+
+These are proposed additions; their names in this table do not identify existing application tables.
 
 ## API Design
 
-### Authentication
+### Actual routes
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| POST | `/api/v1/auth/register` | Register new user |
-| POST | `/api/v1/auth/login` | Login with email/password |
-| POST | `/api/v1/auth/logout` | Destroy session |
-| GET | `/api/v1/auth/me` | Get current user profile |
+All health and device routes require authentication; admin routes also check the user's current admin role. Authentication middleware alone does not establish the missing device ownership check on sync.
 
-### Device Management
+| Method | Path | Actual behavior |
+|--------|------|-----------------|
+| POST | `/api/v1/auth/register`, `/login`, `/logout` | Account creation, opaque session creation, session deletion |
+| GET | `/api/v1/auth/me` | Current user |
+| GET / POST | `/api/v1/devices` | List owned devices / register a device |
+| POST | `/api/v1/devices/:deviceId/sync` | Insert valid samples, update device, aggregate inline, cache receipt |
+| GET | `/api/v1/health/types` | Read currently unseeded reference table |
+| GET | `/api/v1/health/samples` | Raw samples; default limit 1,000 and offset pagination |
+| GET | `/api/v1/health/aggregates` | Hourly/daily aggregate rows |
+| GET | `/api/v1/health/summary/daily`, `/summary/weekly` | Daily or rolling-week summaries |
+| GET | `/api/v1/health/latest`, `/history/:type` | Latest daily aggregates / daily metric history |
+| GET | `/api/v1/health/insights` | Stored insights |
+| POST | `/api/v1/health/insights/analyze` | Run illustrative analysis explicitly |
+| POST | `/api/v1/health/insights/:insightId/acknowledge` | Mark an owned insight acknowledged |
+| GET | `/api/v1/admin/stats`, `/users`, `/users/:userId` | Stats, users, individual details including recent insights |
+| POST | `/api/v1/admin/users/:userId/reaggregate` | Inline reaggregation over a requested/default range |
+| GET | `/api/v1/admin/config/types` | Code-defined metric configuration |
+| GET | `/health`, `/ready`, `/health/deep`, `/metrics` | Public diagnostics |
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/api/v1/devices` | List user's registered devices |
-| POST | `/api/v1/devices` | Register a new device |
-| PUT | `/api/v1/devices/:id` | Update device name/priority |
-| DELETE | `/api/v1/devices/:id` | Remove device |
-| POST | `/api/v1/devices/:id/sync` | Batch sync health samples from device |
+Grouped paths share the prefix shown by the first path. There are no device update/delete, sharing, export, batch-status, or durable job APIs. Query limits and dates are not consistently bounded or validated; several bad inputs become server errors.
 
-### Health Data Queries
+### Proposed contract changes
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/api/v1/health/samples` | Raw samples (type, date range, limit) |
-| GET | `/api/v1/health/aggregates` | Pre-computed aggregates (types, period, date range) |
-| GET | `/api/v1/health/summary` | Daily summary across all metrics |
-| GET | `/api/v1/health/history` | Historical trend data for charts |
-| GET | `/api/v1/health/insights` | User's health insights |
-| PUT | `/api/v1/health/insights/:id/acknowledge` | Dismiss an insight |
+Ingestion should return a receipt ID, per-item validation outcomes, and acceptance/processing status. A repeated request with the same scoped key and payload returns that outcome; different content returns a conflict. Expose receipt status separately from report queries.
 
-### Admin
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/api/v1/admin/stats` | System statistics (users, samples, devices) |
-| GET | `/api/v1/admin/users` | List all users with sample counts |
-| POST | `/api/v1/admin/reaggregate` | Trigger reaggregation for date range |
+Report responses should include metric/unit, bucket boundaries, zone, resolution, value/coverage, source policy, publication revision, and pending-processing status. Use explicit null/missing states. An insight response should always return the persisted insight identity and the report version it summarizes. These richer contracts are not present in the local API.
 
 ## Key Design Decisions
 
-### On-Device Processing First
+### Durable acceptance before asynchronous aggregation
 
-**Chosen:** Process and aggregate on device when possible before syncing.
+Store samples and outbox work transactionally, then process bounded jobs. A device can safely retry an uncertain upload without holding a request open for a year of recomputation. Inline aggregation couples acceptance latency to backfill size and can fail after data has already committed.
 
-**Why:** Minimizes sensitive data leaving the device. A heart rate reading of 72 bpm at 14:32:15 is more revealing than a daily average of 68 bpm. By aggregating on-device, we reduce the data surface exposed to the server. This also reduces server load -- the device does the O(n) aggregation, and the server only stores O(1) hourly summaries.
+A broker-only acknowledgment is insufficient if the advertised receipt refers to database durability; a SQL write followed by an independent publish can lose work between those steps. An outbox makes recovery inspectable. The cost is worker operations, queue lag, and an explicitly eventual report rather than one deceptively synchronous response.
 
-**Trade-off:** Aggregation logic must be duplicated (device and server). When the server-side algorithm changes (e.g., fixing a deduplication bug), we cannot retroactively fix on-device aggregations. We mitigate this by storing raw samples alongside aggregates, enabling server-side reaggregation.
+### Metric-specific fusion over universal overlap clipping
 
-### Source Priority for Deduplication
+A single “prefer watch, clip phone” algorithm is appealing, but counts, rates, latest measurements, and sleep coverage have different meanings. Clipping a rate's value by duration changes its physical quantity; retaining a whole interval total after partial overlap double counts activity.
 
-**Chosen:** Apple Watch > iPhone > Third-party, with deterministic overlap resolution.
+Use explicit policies with examples and versioned outputs. Keep raw observations so changed policies are reversible. The cost is more domain modeling and estimates that must be labeled. Avoid claiming a generic priority ranking proves clinical accuracy.
 
-**Why:** When a user goes for a walk, both their Apple Watch and iPhone count steps. Without deduplication, daily step counts would be double-reported. Priority-based deduplication uses the most accurate sensor (wrist-worn > pocket) and proportionally adjusts overlapping time ranges.
+### Complete recomputation with guarded publication
 
-**Alternative:** Time-based "first writer wins" would be simpler but produces worse results. If the iPhone syncs first with lower-accuracy pedometer data, the more accurate Apple Watch data would be discarded. Priority-based deduplication always prefers the better sensor regardless of sync order.
+At first, recompute complete affected buckets from retained inputs. This handles late arrivals, deletions, and corrections more transparently than a web of reversible increments. Blindly adding a batch double counts retries; replacing from only the batch erases prior data. Independent workers can still race, so generation checks are essential.
 
-### TimescaleDB for Time-Series
-
-**Chosen:** TimescaleDB extension on PostgreSQL for health data storage.
-
-**Why:** Health data is fundamentally time-series: queries are almost always time-bounded (`WHERE start_date BETWEEN ? AND ?`), and data arrives roughly in chronological order. TimescaleDB automatically partitions data into time-based chunks, making range queries fast and enabling transparent compression of older chunks (10:1 ratio for repetitive numeric health data). Critically, it is 100% PostgreSQL-compatible -- we keep familiar SQL, pg_dump, and the entire PostgreSQL ecosystem.
-
-**Alternative:** InfluxDB offers better write throughput for pure time-series workloads, but requires learning InfluxQL/Flux, cannot join with relational metadata tables, and adds operational complexity. Since our health data has strong relational properties (user -> device -> sample), PostgreSQL compatibility outweighs InfluxDB's raw performance advantage.
-
-### Pre-Computed Aggregation
-
-**Chosen:** Compute hourly and daily aggregates immediately after sync, store in a dedicated table.
-
-**Why:** Health dashboards are read-heavy. Every page load queries the same aggregated data (today's steps, this week's heart rate trend). Pre-computation converts this from O(n) at query time (scanning thousands of raw samples) to O(1) lookup of a pre-computed row. The dashboard loads in < 100ms instead of > 1s.
-
-**Trade-off:** Storage overhead is ~2x raw data size (hourly + daily aggregates alongside raw samples). Aggregation adds a processing delay of up to 60 seconds after sync. But storage is cheap and 60-second freshness is imperceptible for health dashboards that users check a few times per day.
+The cost is repeat reads and CPU for busy periods. Bound intervals, coalesce dirty jobs, and partition work before adopting incremental algorithms. Beyond raw-data retention, explain when a period can no longer be fully recomputed rather than pretending old aggregates preserve all source evidence.
 
 ## Consistency and Idempotency
 
-### Sync Idempotency
+The proposal provides at-least-once delivery with idempotent committed effects, not a claim of exactly-once networking. Scope receipts to the authenticated owner and device, bind them to content, and commit their final result with accepted rows and work records.
 
-Mobile devices operate on unreliable networks. A sync request might succeed on the server but the response is lost, causing the device to retry. Without idempotency, this produces duplicate data that corrupts aggregates.
+For concurrent retries, a database uniqueness constraint serializes receipt ownership. Other callers can wait briefly or receive pending status; only one logical acceptance is created. Expiring a response cache must not erase stable source identity. Different raw IDs can still represent overlapping observations, which is why sample identity and fusion are separate.
 
-The idempotency layer works as follows:
-1. Client sends `X-Idempotency-Key` header (or server generates from `userId + deviceId + SHA256(samples)`)
-2. Server checks Redis for existing key
-3. If found: return cached response immediately (no re-processing)
-4. If new: process request, cache response with 24-hour TTL
-5. Database-level `ON CONFLICT (id) DO NOTHING` provides a second layer of protection
+Deletion advances an account/data epoch, tombstones affected raw versions, invalidates publication heads, and schedules rebuilding or removal. Worker publication checks that epoch to prevent deleted data from reappearing. A fresh authorization decision precedes even an immutable cached report read.
 
-### Aggregation Idempotency
+## Security / Auth
 
-Aggregation uses `ON CONFLICT (user_id, type, period, period_start) DO UPDATE`, making it safe to re-run. Reaggregation after a bug fix simply overwrites old values with corrected ones.
+The proposed product uses protected transport and storage, secure browser sessions, least-privilege administration, and explicit device ownership checks. Logs omit measurements, credentials, and sensitive query strings. Access events need a protected audit trail if that becomes a product requirement; ordinary application logs are insufficient.
 
-## Security
+The current app uses opaque Bearer tokens stored in browser localStorage and SQL/Valkey sessions. There is no configured application TLS, field encryption, external identity provider, request rate limiter, or security/compliance certification. The admin detail API can return individual health insights, so administration is not restricted to anonymous usage metrics.
 
-- Session-based auth with token stored in PostgreSQL `sessions` table
-- bcrypt password hashing
-- Per-user data isolation enforced at the query layer (every query includes `WHERE user_id = ?`)
-- Share tokens are scoped to specific data types and date ranges, with expiration and revocation
-- Admin endpoints check `role = 'admin'` at the middleware level
+Retention is a product and jurisdiction-specific decision. Do not describe the hardcoded seven-year raw-data interval as a HIPAA requirement: HHS states that the HIPAA Privacy Rule does not specify a medical-record retention period. See the [HHS retention FAQ](https://www.hhs.gov/hipaa/for-professionals/faq/580/does-hipaa-require-covered-entities-to-keep-medical-records-for-any-period/index.html).
 
 ## Observability
 
-### Metrics (Prometheus via prom-client)
-- `health_pipeline_http_request_duration_seconds` - Request latency histograms by route
-- `health_pipeline_samples_ingested_total` - Ingestion rate by type
-- `health_pipeline_sync_duration_seconds` - Device sync performance
-- `health_pipeline_db_pool_size` - Connection pool health
-- Default Node.js metrics (CPU, memory, event loop, GC)
+For the proposal, measure receipt latency, accepted/rejected/duplicate sample counts, oldest pending work, bucket publication delay, stale-worker rejections, query coverage, and correction outcomes. Separate device capture lag from server processing lag; a disconnected device and a blocked worker require different action.
 
-### Structured Logging (Pino)
-- JSON output with request IDs for correlation
-- Redaction of sensitive fields (authorization headers, passwords, tokens)
-- Pretty printing in development, machine-parseable JSON in production
+Local Pino middleware logs requests and named credential paths are redacted. HTTP/default runtime metrics, successful sync timing, and pool gauges are wired. Aggregation duration, database duration, active-user, and cache metrics are declared without corresponding instrumentation on the relevant paths. A metrics definition is not evidence of a functioning dashboard or alert.
 
-### Health Checks
-- `GET /health` - Liveness probe (is process alive?)
-- `GET /ready` - Readiness probe (database + Redis connected?)
-- `GET /health/deep` - Debugging endpoint with memory and pool statistics
+`/health` is liveness. `/ready` checks PostgreSQL and Redis sequentially and can return 503; there is no overall timeout or schema verification. `/health/deep` exposes details and still returns 200 when degraded. Startup retries a simple database query, not schema or Redis readiness. See [health helpers](./backend/src/shared/health.ts), [metrics](./backend/src/shared/metrics.ts), and [logger](./backend/src/shared/logger.ts).
 
 ## Failure Handling
 
-### Ingestion Resilience
-- Per-sample error handling: one invalid sample does not reject the batch
-- Idempotency keys prevent duplicate processing on retry
-- Failed aggregation jobs go to dead-letter queue with 24-hour retention for debugging
-
-### Data Retention and Recovery
-- **Hot tier** (0-90 days): Uncompressed TimescaleDB chunks, fast read/write
-- **Warm tier** (90 days - 2 years): Compressed in-place, ~10:1 ratio, 10x slower reads
-- **Archive**: Monthly Parquet exports to object storage before deletion
-- Reaggregation can replay from raw samples for any date range
-
-### Graceful Shutdown
-- SIGTERM/SIGINT handlers stop accepting new requests
-- In-flight requests complete within 30-second timeout
-- Database and Redis connections closed after request draining
+| Failure | Proposed behavior | Current implementation |
+|---------|-------------------|------------------------|
+| Response lost after acceptance | Retry same receipt identity | Optional Redis receipt, separate from SQL |
+| Worker crash | Retry committed outbox job | Aggregation is awaited inside sync |
+| New input while old job runs | Reject stale publication | No generation or publication guard |
+| Redis unavailable | Preserve SQL correctness; deliberate bounded fallback | Session/cache/receipt calls can fail requests |
+| Partial device coverage | Show gap and freshness | Missing values can look like zero or empty data |
+| Logout/account change | Clear private state and fence late requests | Health store survives logout |
+| Shutdown | Stop readiness, drain work, close all dependencies | HTTP/database close and force timeout; no Redis quit |
 
 ## Scalability Considerations
 
-### Write Path Scaling
-- Ingestion API servers are stateless; scale horizontally behind load balancer
-- RabbitMQ distributes aggregation work across multiple workers
-- TimescaleDB chunk partitioning prevents write hotspots on recent data
-- Bulk `COPY` or multi-row INSERT for high-throughput sync (not row-by-row)
+Scale by user ownership so raw data, receipts, and outbox mutations stay within one shard. Time partitions bound scans and lifecycle operations within a shard. Report reads favor compact projections; replicas need a version/freshness rule before claiming read-your-accepted-data behavior.
 
-### Read Path Scaling
-- Pre-computed aggregates eliminate expensive real-time calculations
-- Redis caches recent aggregates (7-day window) with 1-hour TTL
-- PostgreSQL read replicas for query API servers at scale
-- TimescaleDB continuous aggregates could replace batch aggregation for real-time views
+The first ingestion bottleneck is likely recomputation of dense overlap windows, not HTTP routing. Bound interval sizes and backfills, coalesce repeated dirty periods, and prioritize recent reports separately from history imports. Use stable jobs and fair queues to prevent one account from monopolizing workers.
 
-### What Breaks First
-1. **Single TimescaleDB instance** - At 10M users, a single PostgreSQL instance cannot handle 50K writes/s. Solution: horizontal sharding by user_id (range or hash), or TimescaleDB multi-node
-2. **Aggregation backlog** - Flash syncs (millions of devices syncing at 8 AM) create queue spikes. Solution: auto-scaling workers with queue depth-based triggers
-3. **Redis memory** - Caching aggregates for 10M users exceeds single-instance memory. Solution: Redis Cluster with consistent hashing
+As retained data grows, tier raw history only under an explicit restoration/recomputation contract. A deletion job must include derived data and caches. If sharing is added, grant checks belong ahead of cache reuse and download authorization. Multi-region writes would require an ownership/failover protocol; it is intentionally outside this first design.
 
 ## Trade-offs Summary
 
 | Decision | Chosen | Alternative | Rationale |
 |----------|--------|-------------|-----------|
-| Primary storage | TimescaleDB | InfluxDB | SQL compatibility, relational joins, compression |
-| Aggregation | Pre-computed on sync | On-demand at query time | Dashboard loads in < 100ms vs > 1s |
-| Encryption | Per-user keys | Single system key | Enables selective sharing, limits blast radius |
-| Sync protocol | Batch REST | Real-time streaming | Battery-efficient, works offline, simpler retry |
-| Deduplication | Priority-based | Time-based first-writer-wins | Data accuracy from best sensor regardless of sync order |
-| Queue | RabbitMQ | Kafka | Simpler operations, sufficient for aggregation workload |
-| Session storage | PostgreSQL sessions table | Redis sessions | Fewer dependencies, acceptable for auth-only reads |
+| Acceptance | SQL receipt + outbox | Inline aggregation | Durable retry result with bounded request latency |
+| Fusion | Metric-specific versioned policy | Universal priority clipping | Preserve units and measurement meaning |
+| Corrections | Complete bucket rebuild | Blind increment or partial replacement | Handle late input and deletion coherently |
+| Publication | Generation-checked versions | Last worker wins | Prevent older inputs replacing newer reports |
+| Report cache | Authorized versioned payloads | User-agnostic or TTL-only cache | Bound staleness and private-data reuse |
+| Browser data | Account-scoped memory | Persistent health payload cache | Reduce retention and account-switch exposure |
 
 ## Implementation Notes
 
-### Local Architecture
+### Actual topology and source map
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│                        Browser                                    │
-│   React + TanStack Router + Zustand + Recharts + Tailwind        │
-│   http://localhost:5173                                           │
-└──────────────────────────┬───────────────────────────────────────┘
-                           │ fetch (proxied)
-                           ▼
-┌──────────────────────────────────────────────────────────────────┐
-│                 Express API Server                                │
-│                 http://localhost:3000                              │
-│                                                                   │
-│  Routes: auth, devices (sync), health (queries), admin           │
-│                                                                   │
-│  Services: deviceSyncService, aggregationService,                │
-│            insightsService, healthQueryService, authService       │
-│                                                                   │
-│  Shared: logger, metrics, health, idempotency, retention         │
-└──────┬───────────────────────────────────────────┬───────────────┘
-       │                                           │
-       ▼                                           ▼
-┌──────────────────────┐              ┌────────────────────────┐
-│  TimescaleDB         │              │   Valkey (Redis)       │
-│  PostgreSQL :5432    │              │   :6379                │
-│                      │              │                        │
-│  health_data DB      │              │   Sessions             │
-│  (users, devices,    │              │   Idempotency cache    │
-│   samples [hyper],   │              │   Aggregate cache      │
-│   aggregates [hyper],│              │                        │
-│   insights, shares,  │              │                        │
-│   sessions)          │              │                        │
-└──────────────────────┘              └────────────────────────┘
+┌────────────────────────┐ HTTP   ┌────────────────────────┐        ┌────────────────────────┐
+│ React dashboard        │        │ Express process        │        │ TimescaleDB            │
+│ Zustand + Recharts     │◀──────▶│ Sync + inline rollups  │◀──────▶│ Samples and rollups    │
+└────────────────────────┘        │ Queries + auth/admin   │        │ SQL sessions / users   │
+                                  └────────────────────────┘        └────────────────────────┘
+                                                         ▲
+                                                         │
+                                                         │
+Session lookups, query cache, optional receipt cache     │
+                                                         │
+                                                         ▼
+                                  ┌────────────────────────┐
+                                  │ Valkey                 │
+                                  │ Session + JSON cache   │
+                                  └────────────────────────┘
+
+
+No queue worker, sharing route, device SDK, archive store, or live status stream.
 ```
 
-### Production-Grade Patterns Implemented
+| Area | Source | Verified responsibility |
+|------|--------|-------------------------|
+| Server / configuration | [index.ts](./backend/src/index.ts), [config](./backend/src/config/index.ts) | Express routes, 10 MB body limit, environment defaults, startup/shutdown |
+| Database / cache | [database.ts](./backend/src/config/database.ts), [redis.ts](./backend/src/config/redis.ts) | PostgreSQL pool, JSON cache, user invalidation helper |
+| Ingestion | [deviceSyncService.ts](./backend/src/services/deviceSyncService.ts), [healthSample.ts](./backend/src/models/healthSample.ts) | Validation, unit normalization, bulk insert, inline rollups |
+| Aggregation | [aggregationService.ts](./backend/src/services/aggregationService.ts), [healthTypes.ts](./backend/src/models/healthTypes.ts) | Priority clipping, hourly/daily UPSERTs, metric configuration |
+| Queries / trends | [healthQueryService.ts](./backend/src/services/healthQueryService.ts), [insightsService.ts](./backend/src/services/insightsService.ts) | Reports, cache reads, illustrative statistical messages |
+| Authentication | [authService.ts](./backend/src/services/authService.ts), [middleware](./backend/src/middleware/auth.ts) | SQL/Redis session lookup and current-role checks |
+| Receipts / lifecycle | [idempotency.ts](./backend/src/shared/idempotency.ts), [retention.ts](./backend/src/shared/retention.ts) | Redis response helpers; unscheduled retention helpers |
+| Browser | [routes](./frontend/src/routes/index.tsx), [health store](./frontend/src/stores/healthStore.ts), [auth store](./frontend/src/stores/authStore.ts) | Programmatic routing and global state |
+| Charts / requests | [HealthChart.tsx](./frontend/src/components/HealthChart.tsx), [api.ts](./frontend/src/services/api.ts) | Recharts rendering and REST calls |
 
-| Pattern | File | Why It Matters |
-|---------|------|----------------|
-| Structured Logging (Pino) | `src/shared/logger.ts` | JSON logs with request IDs, redaction of auth headers/passwords. Enables log aggregation for HIPAA audit trails. |
-| Prometheus Metrics | `src/shared/metrics.ts` | HTTP duration histograms, ingestion counters by type, sync duration, DB pool gauge. Enables SLO monitoring. |
-| Health Checks (liveness + readiness) | `src/shared/health.ts` | `/health` for liveness, `/ready` for dependency checks, `/health/deep` for debugging. Required for load balancer and container orchestration. |
-| Data Retention | `src/shared/retention.ts` | Tiered retention (90-day hot, 2-year warm, 7-year archive). Automated cleanup jobs with audit logging in `retention_jobs` table. |
-| Idempotency | `src/shared/idempotency.ts` | Content-based key generation from userId + deviceId + SHA256(samples). Redis-cached with 24h TTL. Prevents duplicate processing on mobile retry. |
-| Deduplication | `src/services/aggregationService.ts` | Priority-based overlap resolution with proportional value adjustment for partial overlaps. |
-| Insights Engine | `src/services/insightsService.ts` | Linear regression for trends, rolling averages for sleep/activity. Generates actionable health recommendations. |
+### Patterns implemented and their limits
 
-### Simplifications
+**Batch insertion and retries.** The raw insert uses `ON CONFLICT (id, start_date) DO NOTHING`, which prevents a repeated identical key from creating another row. It does not bind that key to payload content or owner. Missing IDs receive fresh UUIDs. The reported synced count is the count of valid inputs, including rows ignored on conflict, not the count newly inserted.
 
-| Production Design | Local Substitute | Why Acceptable |
-|-------------------|------------------|----------------|
-| RabbitMQ for aggregation queue | In-process aggregation after sync | Avoids queue infrastructure; aggregation is fast for small datasets |
-| Per-user encryption keys | No field-level encryption | Demonstrates schema support for encryption; actual crypto would require KMS |
-| MinIO for cold storage archival | No archival implemented | Retention policies and archive schema defined; MinIO not deployed |
-| Multiple API instances + workers | Single Express server | All services (ingestion, query, admin, aggregation) in one process |
-| Redis Cluster | Single Valkey instance | Sufficient for < 5 users in development |
-| Real device SDKs (HealthKit, Google Fit) | Seeded data + manual sync API calls | Focuses on pipeline logic rather than SDK integration |
+The sequence is raw insert, device last-sync update, inline aggregation, cache invalidation, and Redis receipt storage. These are not one transaction. Failure after the insert can return an error despite committed samples, and there is no durable pending work to finish later.
 
-### Omitted
+**Operational hooks.** Request logging, HTTP metrics, successful-sync timing, readiness checks, and database startup retries provide useful entry points for diagnosing failures. They do not establish complete aggregation instrumentation, alerting, dependency deadlines, or a resilient queue. Several shared helper functions are never invoked.
 
-- Real HealthKit / Google Fit / Fitbit device integration
-- End-to-end encryption with user-managed keys
-- Differential privacy for aggregate analytics
-- GDPR data export and deletion workflows
-- CDN and multi-region deployment
-- Kubernetes orchestration
-- Kafka for high-throughput ingestion
-- ML-based anomaly detection for health data
-- Family sharing with consent management
-- Healthcare provider portal
+**Simple authentication.** Sessions use UUID Bearer tokens with a hardcoded seven-day expiry. SQL and Redis writes/deletes are separate. A cache miss falls back to SQL; a Redis error does not. If logout deletes SQL but Redis deletion fails, the cached token can remain accepted. `SESSION_SECRET` and the configurable session max-age do not control this implementation.
 
----
+### Ingestion, identity, and aggregation defects
 
-## Frontend Architecture
+Device sync overwrites the sample owner with the authenticated user and sets the path's device ID, but never verifies that device ownership matches. The foreign key checks only device existence. Sync also updates `last_sync` by device ID alone. Registration supports list/create only; repeat identifiers update name and last-sync without updating type/priority.
 
-### Component Hierarchy
+Explicit idempotency keys use a global Redis namespace. An authenticated caller reusing a key can receive another request's stored result, including raw invalid-sample details. Automatic keys use an order-sensitive 32-bit rolling hash over a subset of fields; units, IDs, source information, and metadata are omitted. Lookup/work/store is non-atomic, and the SQL idempotency table is unused.
 
-```
-Root Layout (Navbar + main content area)
-├── Login (email/password login form)
-├── Register (registration form)
-├── Dashboard (/) (health overview)
-│   ├── MetricCard (individual metric: steps, heart rate, sleep, etc.)
-│   ├── HealthChart (Recharts line/bar chart for trend visualization)
-│   └── InsightCard (health insight with severity, recommendation, acknowledge button)
-├── Metrics (/metrics) (detailed metric history)
-│   └── HealthChart (per-metric time-series charts)
-├── Devices (/devices) (device management)
-│   └── (device list with sync status, priority, last sync time)
-└── Admin (/admin) (system administration)
-    └── (user list, sample counts, reaggregation controls)
-```
+Validation accepts unsupported units by leaving the number unchanged and assigning the canonical unit. For example, seven hours of sleep becomes seven minutes. It does not reject infinity, invalid end times, reversed intervals, future timestamps, or excessive backfills. The bulk insert also drops the sample's source-app field.
 
-### Zustand Stores
+Aggregation fetches samples whose start times lie between the submitted batch's minimum and maximum start times, then replaces entire hourly/daily rows. A later single sample can therefore erase earlier contributions in that day. Intervals crossing bucket boundaries are assigned wholly to their start bucket. Host-local date operations and timezone-free SQL timestamps do not implement a user reporting timezone.
 
-**`useAuthStore`** (`stores/authStore.ts`) -- Authentication state with persistence:
+The clipping helper misses a lower-priority interval containing an existing covered interval, clips against only the first overlap, and never subtracts the full union of coverage. It duration-scales every metric, including rates and latest-value measurements. “Latest” selection follows the resulting priority order rather than the latest timestamp. Linear overlap scans can become quadratic.
 
-- **`user`**: Current user (email, name, role) or null
-- **`token`**: Session token persisted in localStorage
-- **`isAuthenticated`**: Derived from token presence and validation
-- **Persistence**: Uses Zustand's `persist` middleware to store the token in localStorage, surviving page refreshes. On app load, `checkAuth()` validates the stored token against the server.
-- **Actions**: `login(email, password)`, `register(email, password, name)`, `logout()`, `checkAuth()`
+Isolated source examples demonstrate the impact: a containing interval produces 120 instead of 90 units; a fragment overlapping two selected ranges produces 70 instead of 60; two 100-bpm samples become a 75-bpm average after clipping; an older lower-priority value can become the “latest” result. These are correctness defects, not intentional production trade-offs.
 
-**`useHealthStore`** (`stores/healthStore.ts`) -- Health data state:
+### Query, insight, and lifecycle limits
 
-- **`dailySummary`**: Today's aggregated metrics (steps, heart rate, sleep, calories)
-- **`weeklySummary`**: 7-day rolling summary for trend cards
-- **`latestMetrics`**: Most recent value for each metric type
-- **`insights[]`**: Active health insights with severity (low/medium/high), direction (improving/declining), message, and recommendation
-- **`history`**: A `Record<string, HealthAggregate[]>` keyed by metric type, storing time-series data for charts. Each fetch appends to this record, so multiple metric histories can be loaded without overwriting each other.
-- **`devices[]`**: Registered devices with sync status and priority
-- **Actions**: `fetchDailySummary(date?)`, `fetchWeeklySummary()`, `fetchLatestMetrics()`, `fetchInsights()`, `fetchHistory(type, days)`, `fetchDevices()`, `analyzeHealth()` (triggers server-side insight generation), `acknowledgeInsight(id)` (optimistically updates local state)
+Query cache keys begin with `aggregates:` or `summary:`, while invalidation searches `user:<id>:*`. It matches neither family, leaving results stale for the five-minute TTL. Redis errors propagate instead of falling back to authoritative SQL. Other query methods are not cached merely because cache settings exist.
 
-### Routing
+Raw reads use start-time filtering, offset pagination, and no hard maximum limit. Weekly summaries sum/average daily values across a rolling range without metric-specific weighting or complete-period coverage. “Latest” reads daily aggregates. History returns snake-case min/max/count fields while frontend types expect camel case.
 
-TanStack Router with programmatic route definition (not file-based):
+Analysis runs only through the explicit API. Heart-rate regression uses observation index rather than elapsed dates. Sleep uses available rows without a missing-day denominator. Activity compares a partial current week with prior weekly totals. Weight has limited baseline validation. These examples are not clinically validated models.
 
-| Route | File | Description |
-|-------|------|-------------|
-| `/` | `routes/Dashboard.tsx` | Health overview with metric cards, charts, and insights |
-| `/login` | `routes/Login.tsx` | Login form |
-| `/register` | `routes/Register.tsx` | Registration form |
-| `/metrics` | `routes/Metrics.tsx` | Detailed metric history with per-type charts |
-| `/devices` | `routes/Devices.tsx` | Device management (register, sync, configure priority) |
-| `/admin` | `routes/Admin.tsx` | System stats, user management, reaggregation triggers |
+Analysis stores insights but returns generated objects without the persisted IDs, creation times, or acknowledgment fields expected by the client. Duplicate detection is a non-unique recent lookup, so concurrent analysis can duplicate messages; existing acknowledgments and old creation times can survive updates. Conditions that disappear do not retire old messages automatically.
 
-Routes are defined programmatically in `routes/index.tsx` using `createRootRoute` and `createRoute` with lazy component loading via dynamic `import()`. The root layout renders a `Navbar` component that provides navigation links and authentication status.
+Retention functions are exported helpers without a scheduler or job command. They specify 2,555 days for raw samples, 730 for hourly aggregates/insights, and never delete daily aggregates; no archive precedes deletion. The retention audit table is not written. Sharing records have no consuming routes. Compression helpers are likewise not proof of an active compression system.
 
-### Data Fetching
+### Frontend behavior and limitations
 
-All data fetching goes through a centralized API service (`services/api.ts`) organized by domain:
+The route definitions return a new Promise from an async import during component rendering. This is not the supported lazy route-component pattern; see [TanStack code splitting](https://tanstack.com/router/latest/docs/guide/code-splitting) and [React's cached Promise guidance](https://react.dev/reference/react/use). Isolated checks confirm the fresh-Promise behavior, but no browser navigation was run during this review.
 
-- **`api.auth`**: login, register, logout, session validation
-- **`api.health`**: dailySummary, weeklySummary, latest metrics, insights, history, analyze, acknowledgeInsight
-- **`api.devices`**: list, register, update, delete, sync (batch health sample upload)
-- **`api.admin`**: system stats, user list, reaggregation trigger
+The dashboard source has four summary cards, two 30-day charts, and five recent insights. The metric page offers ten metrics and 7/14/30/60/90-day ranges. Device UI lists and registers devices; it cannot edit, delete, or sync them. Admin UI shows stats and the first 50 users; it has no detail, pagination, or reaggregation controls.
 
-The API service includes the session token in request headers for authentication. Each store action calls the corresponding API method, updates local state on success, and sets error state on failure. There is no client-side caching layer -- health data should always reflect the latest sync.
+History is keyed only by metric, so a late response for an older range replaces a newer range. Loading/error state is shared across unrelated requests. Logout clears auth but retains health state; late requests can also repopulate it after an account change. Auth initialization has no ready gate, and network errors can force logout. Health data is not persistently cached, but the Bearer token is in localStorage.
 
-### Key UI Patterns
+Charts use formatted month/day categories, can connect across missing dates, and do not supply an equivalent data table or explicit coverage information. Area mode ignores its min/max flag. Missing sleep can display as zero; some nullable values are treated as numbers. No request cancellation, live status stream, polling, offline health journal, chart downsampling, or optimistic sample sync is implemented.
 
-- **Recharts for data visualization**: Line charts for time-series data (heart rate trends, step history), bar charts for daily aggregates. Recharts provides responsive, declarative React charting components
-- **Metric cards**: Each MetricCard displays a metric name, current value, unit, and optionally a trend indicator (arrow up/down with color coding)
-- **Insight cards with acknowledge**: InsightCards show severity-coded health recommendations. Acknowledging an insight optimistically removes it from the active list without waiting for the server response
-- **Lazy-loaded routes**: Route components use dynamic `import()` for code splitting, reducing the initial bundle size. The dashboard loads first; metrics, devices, and admin pages load on navigation
-- **Token persistence**: The auth store persists only the session token to localStorage (not the full user object), and re-validates it on page load via `checkAuth()`
+The device modal lacks focus trapping and explicit label associations; navigation links disappear on small screens without a replacement menu. Errors are not consistently shown in dashboard, devices, or admin views. Acknowledgment updates local state after the server call, rather than optimistically.
 
----
+### Setup, fixtures, and verification
 
-## Deep Pattern Explanations
+Compose uses TimescaleDB `latest-pg16` on 5432 and Valkey 7 on 6379. Database credentials are `health_user` / `health_password`, database `health_data`. The backend loads `.env`, defaults to port 3000, and runs TypeScript source even for `npm start`. Vite proxies `/api` to 3000. The additional 3001–3003 scripts do not supply a load balancer.
 
-This section explains each production-grade pattern implemented in this project. Each explanation covers what the pattern is, why it exists, how it works mechanically, and when you would use it.
+The seed has seven invalid `dev...` UUIDs and matching raw references. The README provides a temporary fresh-demo copy using `dea...` instead. It contains four users, seven devices, 32 raw samples, 12 precomputed aggregates, five illustrative insights, and two unused shares. Inserted passwords were checked as `password123`. Seeded aggregate and insight semantics are not validated ground truth, and repeated seeding can duplicate rows.
 
-### Prometheus Metrics (prom-client)
+The generator reads exported environment variables, uses a conflict target incompatible with the current composite raw key, holds generated data in memory, and bypasses normal overlap processing and cache invalidation. There is no backend migration, seed, or unit-test package script. Existing smoke/screenshot fixtures request `/dashboard` although the route is `/`, and ordinary-user admin checks can pass on a shared layout element.
 
-**What it is**: Prometheus is a monitoring system that collects numerical time-series data from applications. The application exposes a `/metrics` HTTP endpoint that Prometheus periodically scrapes. The `prom-client` library provides four metric types: Counter (only goes up), Gauge (goes up and down), Histogram (distribution of values in configurable buckets), and Summary (similar to histogram with quantile calculation).
+The documentation review used 18 isolated checks against actual source with mocked infrastructure: 15 ingestion/query/seed checks and three frontend state/routing checks. These reproduced the limitations above. Documentation checks cover links, diagrams, shell syntax, exact local schema, and interview pacing. No migrations, setup recipes, complete build, browser flow, load test, or live-service integration test was executed.
 
-**How it works**: The application creates metric objects at startup. During operation, the application records observations. In this project, key metrics include: `health_pipeline_http_request_duration_seconds` (histogram of request latency by route), `health_pipeline_samples_ingested_total` (counter of ingested samples by type -- steps, heart_rate, etc.), `health_pipeline_sync_duration_seconds` (histogram of device sync operation duration), and `health_pipeline_db_pool_size` (gauge of active database connections). Default Node.js metrics (CPU usage, memory, event loop lag, garbage collection) are also collected automatically.
-
-**Why it matters**: For a health data pipeline, the most critical metric is ingestion throughput (`samples_ingested_total`). If the ingestion rate drops suddenly, it could mean devices are failing to sync, the API is rejecting valid samples, or the database is overloaded. The sync duration histogram reveals whether batch inserts are becoming slower as the database grows. Without these metrics, operators would only discover ingestion problems when users report missing health data -- potentially hours after the issue began. For HIPAA compliance, monitoring and audit trails are not optional; they are required.
-
-**When to use it**: In any production system, but especially in systems handling sensitive data like health records, where compliance frameworks require monitoring and alerting capabilities.
-
-### Structured Logging (Pino)
-
-**What it is**: Structured logging produces log entries as machine-parseable JSON objects rather than human-readable text strings. Each log entry includes consistent field names, enabling automated parsing, filtering, indexing, and alerting.
-
-**How it works**: Pino produces JSON log entries with severity level, timestamp, and contextual fields. In this project, a critical feature is **field redaction**: authorization headers, passwords, and session tokens are automatically stripped from log output. This prevents sensitive credentials from appearing in log files, log aggregation systems, or debug outputs. The `pino-http` middleware logs every HTTP request with method, path, status code, and duration. Domain-specific events (device syncs, aggregation completions, insight generation) include user IDs and metric types but never raw health data values.
-
-**Why it matters**: Health data systems operate under strict privacy regulations (HIPAA in the US, GDPR in Europe). Logging a patient's heart rate or blood glucose value in a debug log could constitute a compliance violation. Pino's redaction feature ensures that even when verbose logging is enabled for debugging, sensitive fields are automatically stripped. Request IDs enable tracing a sync operation from device upload through deduplication, aggregation, and insight generation without exposing the health data itself.
-
-**When to use it**: Always in production environments, and especially in systems handling personally identifiable information (PII) or protected health information (PHI). The redaction feature should be configured at project setup, not added later as an afterthought.
-
-### Idempotency
-
-**What it is**: Idempotency means that performing the same operation multiple times produces the same result as performing it once. For health data sync, idempotency prevents duplicate samples from corrupting aggregated metrics.
-
-**How it works**: This project implements a two-layer idempotency system:
-1. **Request-level**: The client sends an `X-Idempotency-Key` header with each sync request. The server generates this key from `userId + deviceId + SHA256(samples)`, making it content-based. The server checks Redis for the key: if found, it returns the cached response from the first processing. If not found, it processes the sync, caches the response with a 24-hour TTL, and returns the result.
-2. **Record-level**: Each health sample has a UUID primary key. The database insert uses `ON CONFLICT (id) DO NOTHING`, so even if the same sample appears in two different sync batches, it is inserted only once.
-
-**Why it matters**: Mobile health apps sync over unreliable cellular networks. A device might upload 500 heart rate samples, the server processes them all, but the HTTP response is lost to a network timeout. The device retries the entire batch. Without idempotency, those 500 samples would be counted twice, making the user's daily average heart rate appear higher than it actually is. For health data, accuracy is not just a user experience issue -- incorrect aggregates could lead to false health alerts or missed warnings. The content-based key generation (SHA-256 of the samples) is particularly important: even if the client does not include an idempotency header, the server can detect duplicate batches by their content hash.
-
-**When to use it**: For any operation that has side effects, especially when clients operate over unreliable networks (mobile apps, IoT devices). Health data sync is a textbook use case because the consequences of duplicate data are both subtle (slightly wrong averages) and serious (false medical insights).
-
-### Health Checks
-
-**What it is**: Health checks are dedicated HTTP endpoints that report whether the application and its dependencies are functioning correctly. They are consumed by load balancers, container orchestrators, and monitoring systems.
-
-**How it works**: This project implements three health check endpoints:
-- **`/health`** (liveness): Returns 200 if the process is alive. Checks nothing beyond the ability to respond to HTTP. Used by Kubernetes to decide whether to restart the container.
-- **`/ready`** (readiness): Returns 200 only if the TimescaleDB database responds to a query and Redis responds to PING. Used by load balancers to decide whether to route traffic to this instance. A freshly started instance that has not yet established its database connection pool reports "not ready."
-- **`/health/deep`** (diagnostic): Returns detailed status including memory usage, database connection pool statistics (active, idle, waiting connections), and dependency versions. Used by operators for debugging without SSH access.
-
-**Why it matters**: The readiness check is especially important for health data pipelines because a server that cannot reach its database will accept sync requests but fail to store them -- silently losing health data. The readiness check prevents this by ensuring the load balancer only routes traffic to instances that can actually persist data. The deep health check helps diagnose connection pool exhaustion, which can happen during peak sync windows (e.g., millions of devices syncing when their users wake up in the morning).
-
-**When to use it**: Every production service needs liveness and readiness checks. The deep diagnostic check is valuable for systems with complex dependency chains (database, cache, queue, external services). For health data systems, readiness checks should verify write path dependencies (database) because accepting data that cannot be stored violates the "zero data loss" requirement.
-
-### Rate Limiting
-
-**What it is**: Rate limiting restricts the number of requests a client can make within a time window. It protects the service from abuse by rejecting excess requests with HTTP 429 (Too Many Requests) responses before they consume server resources.
-
-**How it works**: The server maintains request counters per client identifier (IP address or authenticated user ID). When a request arrives, the counter is checked against the configured limit. If within limits, the request proceeds. If exceeded, the request is rejected with a 429 response and a `Retry-After` header. For the health data pipeline, rate limiting is applied per-user on sync endpoints, preventing a malfunctioning device from overwhelming the ingestion path.
-
-**Why it matters**: A buggy health app or a compromised device could send thousands of sync requests per second, each containing hundreds of samples. Without rate limiting, this would exhaust database connections, fill up storage, and delay aggregation for all other users. Rate limiting on the sync endpoint ensures that even a malfunctioning client cannot degrade the service for others. It also provides a simple defense against denial-of-service attacks targeting the ingestion path.
-
-**When to use it**: On every externally-facing API, with particular attention to write-heavy endpoints (sync, upload) where each request triggers significant server-side processing (validation, deduplication, aggregation).
+The proposed outbox, source identity registry, correction protocol, policy generations, consistent publication, timezone model, privacy controls, and accessible report state are omitted locally. Historical iteration notes remain in [CLAUDE.md](./CLAUDE.md); setup belongs in the [README](./README.md).

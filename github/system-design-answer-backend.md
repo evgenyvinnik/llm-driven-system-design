@@ -42,17 +42,49 @@ not an unconditional “zero data loss” promise.
 ## 🏗️ Architecture and authority — 5 minutes
 
 ```
-┌─────────────────────────────┐     ┌──────────────────────────────────────┐
-│ Browser / Git transport     │────▶│ Git storage authority                │
-│ Auth + repository routing   │     │ Objects / refs / operation journal   │
-└─────────────────────────────┘     └──────────────────────────────────────┘
-               │                                       │
-               ▼                                       ▼
-┌─────────────────────────────┐     ┌──────────────────────────────────────┐
-│ Collaboration API + SQL     │────▶│ Event processing                     │
-│ PRs / intents / receipts    │     │ Reconcile / index / notify           │
-└─────────────────────────────┘     └──────────────────────────────────────┘
+PROPOSED DESIGN — SQL accepts intent; Git durably publishes code
+
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Browser / Git clients    │request/ACK │ API + repo routing       │Git/browse  │ Fenced Git authority     │
+│ Repository + commit      │◀──────────▶│ Current authorization    │◀──────────▶│ Objects; conditional ref │◀────┐
+│ Saved operation ID       │            │ Browse / Git transport   │            │ Publication journal      │     │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘     │
+              ▲                                       ▲                                       ▲                  │
+              │                                       │                                       │                  │
+              │ query / results                       │ command / outcome                     │ publish/receipt  │
+              │                                       │                                       │                  │
+              ▼                                       ▼                                       ▼                  │
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐     │
+│ Authorized search API    │access/read │ Collaboration + SQL      │intent/state│ Merge coordinator        │     │
+│ Query / indexed commit   │◀──────────▶│ PRs / access / receipts  │◀──────────▶│ Fixed head/base/policy   │     │ read/replay
+│ Current access check     │            │ Merge intents + outbox   │            │ Publish / resolve op     │     │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘     │
+              ▲                                       ▲                                                          │
+              │                                       │                                                          │
+              │ query / hits                          │ work / outcome                                           │
+              │                                       │                                                          │
+              ▼                                       ▼                                                          │
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐     │
+│ Search projection        │apply / ACK │ Reconcile/index workers  │event / ACK │ Git event replay         │     │
+│ Commit-bound documents   │◀──────────▶│ SQL + Git outcomes       │◀──────────▶│ Durable ref changes      │◀────┘
+│ Rebuildable index        │            │ Effects and checkpoints  │            │ Resume journal cursor    │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+
+A lost merge reply is resolved by its stored operation receipt, not today's branch tip.
 ```
+
+I would trace a merge from a durable SQL intent to conditional publication by the Git
+authority, then resolve that storage operation before updating collaboration state.
+The two authorities exchange receipts rather than pretending one transaction covers both.
+Their durable changes feed reconciliation and indexing. Search retrieves an indexed commit
+but still checks current repository access before returning code or snippets.
+
+I would use a crash after ref publication to explain the recovery loop:
+
+1. The accepted SQL intent retains its admitted head/base/policy and storage operation ID.
+2. The coordinator asks the fenced Git authority for that operation's durable receipt. The current branch tip may have moved again and cannot substitute for this result.
+3. Reconciliation records the verified outcome in SQL and finishes the pending intent without publishing another merge.
+4. Index workers resume committed ref events and acknowledge confirmed revision effects. Search remains commit-bound and rechecks current access while these projections catch up.
 
 The gateway authenticates the caller and routes by stable repository identity. The
 collaboration API owns relational entities such as issues, review records, and merge

@@ -1,271 +1,171 @@
-# Google Docs Clone - Collaborative Document Editing
+# Google Docs: rich-text editor and collaboration study
 
-A real-time collaborative document editing platform built with React, Node.js, WebSocket, and PostgreSQL. This project implements core Google Docs features including rich text editing, real-time collaboration using Operational Transformation (OT), comments, and version history.
+A Google Docs-style learning project with a React/TipTap editor, document management,
+sharing, threaded comments, snapshot endpoints, and an experimental WebSocket/OT backend.
+It is useful for studying where a collaborative editor needs stronger integration and
+consistency guarantees.
 
-## Codebase Stats
+**The current browser does not save or synchronize typed document content.** Its editor
+update callback is a placeholder, and its document page does not apply incoming edit
+messages. Formatting and typing affect the local editor only. Presence indicators and
+several REST workflows are wired, but this is not a complete collaborative editor.
 
-| Metric | Value |
-|--------|-------|
-| Total SLOC | 9,857 |
-| Source Files | 69 |
-| .ts | 5,610 |
-| .md | 2,067 |
-| .tsx | 1,551 |
-| .sql | 177 |
-| .css | 163 |
+## What you can explore
 
-## Key Features
+| Area | Current implementation |
+|------|------------------------|
+| Accounts | Register/login/logout; PostgreSQL session records cached in Valkey |
+| Documents | List owned/shared documents, create, open, rename, and soft-delete |
+| Editor | Render stored ProseMirror JSON; local typing, formatting, and undo/redo |
+| Sharing | Owner grants view/comment/edit access to an existing account; email-only grants are stored but not claimed on signup |
+| Comments | Document-level comments/replies and author/owner resolve/delete actions; no inline anchor creation or tracking in the UI |
+| Presence | WebSocket join/leave and selection messages; colored names/avatars, without remote caret overlays |
+| History | List/name stored snapshots and request restore; see the version and consistency limits below |
+| Suggestions | REST records with accept/reject status; acceptance does not change document text, and no suggestion UI is wired |
 
-- **Rich Text Editing** - Full formatting support with TipTap/ProseMirror
-- **Real-time Collaboration** - Multiple users editing simultaneously via WebSocket
-- **Comments & Replies** - Threaded comment discussions
-- **Version History** - Track and restore document versions
-- **Sharing & Permissions** - View, comment, and edit access levels
-- **User Authentication** - Session-based auth with Redis
+The application has no admin screen or admin API. The seeded admin account has a role
+field, but that does not give it access to every document.
 
-## Technology Stack
+## Stack and local topology
 
-- **Frontend**: TypeScript, Vite, React 18, TipTap, Zustand, Tailwind CSS
-- **Backend**: Node.js, Express, WebSocket (ws)
-- **Database**: PostgreSQL 16
-- **Cache/Sessions**: Redis 7
-- **Real-time Sync**: Operational Transformation (OT)
+React 18, TypeScript, Vite, React Router v6, Zustand, Tailwind, and TipTap 2 form the
+frontend. Express and `ws` share one Node.js server. PostgreSQL 16 stores application
+data; the Compose service named `redis` runs Valkey 7 for sessions, optional response
+receipts, and pub/sub. Use Node.js **20 or newer** for this repository.
 
-## Prerequisites
+Vite serves port **5173** and proxies `/api` and `/ws` to **3001**. The backend dev
+script explicitly selects 3001; the entry point and `npm start` otherwise default to
+3000. Infrastructure exposes PostgreSQL on **5432** and Valkey on **6379**.
 
-- Node.js 18+ and npm
-- Docker and Docker Compose (for PostgreSQL and Redis)
+## Option A: Docker Compose (recommended)
 
-## Quick Start
-
-### 1. Start Infrastructure (Docker)
+From the repository root:
 
 ```bash
 cd google-docs
-docker-compose up -d
+docker compose up -d
+docker compose ps
+docker compose exec -T postgres pg_isready -U googledocs -d googledocs
+docker compose exec -T redis redis-cli ping
 ```
 
-This starts:
-- PostgreSQL on port 5432
-- Redis on port 6379
-
-The database is automatically initialized with schema and seed data.
-
-### 2. Start Backend
+Compose mounts [the schema](./backend/src/db/init.sql) into PostgreSQL's initialization
+directory. It runs only when the database volume is first created. **Seed data is a
+separate step**, not part of that schema:
 
 ```bash
-cd backend
-npm install
-npm run dev
+docker compose exec -T postgres psql -U googledocs -d googledocs -v ON_ERROR_STOP=1 < backend/db-seed/seed.sql
 ```
 
-Backend runs on http://localhost:3001
+The seed is intended for a fresh schema. Its fixed user IDs assume those email
+addresses have not already been registered with different IDs.
 
-### 3. Start Frontend
+To stop infrastructure, run `docker compose down`. To discard the local database and
+Valkey volumes as well, use `docker compose down -v`; the next startup initializes a
+new empty schema and needs the seed step again.
 
-```bash
-cd frontend
-npm install
-npm run dev
-```
+## Option B: native services (no Docker)
 
-Frontend runs on http://localhost:5173
-
-### 4. Access the Application
-
-Open http://localhost:5173 in your browser.
-
-**Demo Accounts** (password: `password123` for all):
-- alice@example.com
-- bob@example.com
-- admin@example.com
-
-## Running Multiple Backend Instances
-
-To test distributed behavior:
+On macOS with Homebrew, start these services instead of the Compose stack. From the
+`google-docs` directory, create the role and database once on a fresh installation:
 
 ```bash
-# Terminal 1
-cd backend && npm run dev:server1  # Port 3001
-
-# Terminal 2
-cd backend && npm run dev:server2  # Port 3002
-
-# Terminal 3
-cd backend && npm run dev:server3  # Port 3003
-```
-
-## Native Services (Without Docker)
-
-If you prefer running PostgreSQL and Redis natively:
-
-### PostgreSQL
-
-```bash
-# macOS with Homebrew
-brew install postgresql@16
+brew install postgresql@16 valkey
 brew services start postgresql@16
-
-# Create database
-createdb googledocs
-psql googledocs -c "CREATE USER googledocs WITH PASSWORD 'googledocs_secret';"
-psql googledocs -c "GRANT ALL PRIVILEGES ON DATABASE googledocs TO googledocs;"
-psql googledocs < backend/db/init.sql
+brew services start valkey
+export PATH="$(brew --prefix postgresql@16)/bin:$PATH"
+psql postgres -v ON_ERROR_STOP=1 -c "CREATE ROLE googledocs LOGIN PASSWORD 'googledocs_secret';"
+createdb --owner=googledocs googledocs
+PGPASSWORD=googledocs_secret psql -h localhost -U googledocs -d googledocs -v ON_ERROR_STOP=1 -f backend/src/db/init.sql
+PGPASSWORD=googledocs_secret psql -h localhost -U googledocs -d googledocs -v ON_ERROR_STOP=1 -f backend/db-seed/seed.sql
+pg_isready -h localhost -U googledocs -d googledocs
+valkey-cli ping
 ```
 
-### Redis
+The schema is not a repeatable migration: its table/index creation statements assume
+an empty database. There is no `db:migrate` npm script in this project.
+
+## Start the application
+
+In one terminal, from the repository root:
 
 ```bash
-# macOS with Homebrew
-brew install redis
-brew services start redis
+cd google-docs/backend
+npm install
+npm run dev
 ```
 
-### Environment Variables
+In a second terminal, also from the repository root:
 
-Create `backend/.env`:
-
-```env
-DB_HOST=localhost
-DB_PORT=5432
-DB_USER=googledocs
-DB_PASSWORD=googledocs_secret
-DB_NAME=googledocs
-REDIS_HOST=localhost
-REDIS_PORT=6379
-PORT=3001
-CORS_ORIGIN=http://localhost:5173
+```bash
+cd google-docs/frontend
+npm install
+npm run dev
 ```
 
-## Project Structure
+Open [the app](http://localhost:5173). After seeding, `alice@example.com`,
+`bob@example.com`, `carol@example.com`, `david@example.com`, and `admin@docs.local`
+all use **`password123`**. The seed includes five documents with different owners
+and permissions; Alice can see her two documents plus the technical-design and
+sprint-planning documents shared with her.
 
-```
-google-docs/
-├── backend/
-│   ├── src/
-│   │   ├── index.ts          # Server entry point
-│   │   ├── routes/           # REST API routes
-│   │   │   ├── auth.ts       # Authentication
-│   │   │   ├── documents.ts  # Document CRUD
-│   │   │   ├── comments.ts   # Comments
-│   │   │   ├── suggestions.ts# Suggestions
-│   │   │   └── versions.ts   # Version history
-│   │   ├── services/
-│   │   │   ├── collaboration.ts # WebSocket handling
-│   │   │   └── ot.ts         # Operational Transformation
-│   │   ├── middleware/
-│   │   │   └── auth.ts       # Auth middleware
-│   │   ├── utils/
-│   │   │   ├── db.ts         # PostgreSQL connection
-│   │   │   └── redis.ts      # Redis connection
-│   │   └── types/
-│   │       └── index.ts      # TypeScript types
-│   └── db/
-│       └── init.sql          # Database schema
-├── frontend/
-│   ├── src/
-│   │   ├── App.tsx           # Main app with routing
-│   │   ├── routes/           # Page components
-│   │   ├── components/       # UI components
-│   │   ├── stores/           # Zustand stores
-│   │   ├── services/         # API & WebSocket
-│   │   └── types/            # TypeScript types
-│   └── index.html
-├── docker-compose.yml
-└── README.md
-```
+[Backend health](http://localhost:3001/health) checks PostgreSQL and Valkey;
+[metrics](http://localhost:3001/metrics) exposes the prom-client registry. A healthy
+response confirms dependency connectivity, not end-to-end edit synchronization.
 
-## API Endpoints
+## Configuration and commands
 
-### Authentication
-- `POST /api/auth/register` - Register new user
-- `POST /api/auth/login` - Login
-- `POST /api/auth/logout` - Logout
-- `GET /api/auth/me` - Get current user
+Defaults come from the source; no dotenv loader reads a `backend/.env` file. Export
+custom values in the shell before launching the backend.
 
-### Documents
-- `GET /api/documents` - List user's documents
-- `POST /api/documents` - Create document
-- `GET /api/documents/:id` - Get document
-- `PATCH /api/documents/:id` - Update document
-- `DELETE /api/documents/:id` - Delete document
-- `POST /api/documents/:id/share` - Share document
+| Variable | Default | Use |
+|----------|---------|-----|
+| `DB_HOST`, `DB_PORT` | `localhost`, `5432` | PostgreSQL address |
+| `DB_USER`, `DB_PASSWORD`, `DB_NAME` | `googledocs`, `googledocs_secret`, `googledocs` | PostgreSQL credentials/database |
+| `REDIS_HOST`, `REDIS_PORT` | `localhost`, `6379` | Valkey/Redis address |
+| `PORT` | `3000` in source; `3001` in dev script | HTTP and WebSocket server |
+| `CORS_ORIGIN` | `http://localhost:5173` | Allowed REST browser origin |
+| `NODE_ENV` | Unset/development behavior | Secure-cookie flag and logging format |
+| `LOG_LEVEL`, `SERVICE_NAME` | `info`, `google-docs-backend` | Pino logging |
 
-### Comments
-- `GET /api/documents/:id/comments` - List comments
-- `POST /api/documents/:id/comments` - Add comment
-- `PATCH /api/documents/:id/comments/:commentId` - Update/resolve
-- `DELETE /api/documents/:id/comments/:commentId` - Delete
+Both halves expose `build`, `type-check`, `lint`, and `format` scripts. Use
+`npm run type-check` in each directory for TypeScript validation. The frontend lint
+script currently fails before linting because it passes unsupported `--ext` options
+alongside a flat ESLint config. Backend production
+startup after building is `PORT=3001 npm start` to retain the Vite proxy target.
 
-### Version History
-- `GET /api/documents/:id/versions` - List versions
-- `POST /api/documents/:id/versions` - Create named version
-- `POST /api/documents/:id/versions/:num/restore` - Restore version
+`dev:server1`, `dev:server2`, and `dev:server3` start backend ports 3001–3003. Vite
+continues to use 3001. There is no load balancer, document owner election, or fencing;
+starting more processes does not make the OT state consistent across them.
 
-### WebSocket Protocol
+The project-level `test:e2e` script runs three Playwright page smoke tests. It can
+start Vite, but infrastructure, seeded data, and the backend must already be running.
+Those tests cover login/register/home rendering, not collaboration or durable editing.
 
-Connect to `ws://localhost:3001/ws?token=<session_token>`
+## Important implementation limits
 
-Messages:
-```typescript
-// Subscribe to document
-{ type: "SUBSCRIBE", doc_id: "..." }
+- The server's live document state holds a version and operation arrays, not updated
+  rich-text content. Its debounce persists only the last operation in a burst and
+  advances the database version without applying edits to `documents.content`.
+- Operation ACKs precede persistence. The history buffer uses absolute versions as
+  array offsets, loses its origin after restart/trimming, and has no durable replay
+  or safe retry protocol. Redis pub/sub forwards messages without updating peer
+  servers' in-memory version/log state.
+- WebSocket subscription checks read access; edit messages do not recheck edit
+  permission. Revocation, deletion, and session logout do not close an already
+  authorized document connection. Several auxiliary REST routes also omit the
+  soft-delete check.
+- Restore copies a stored snapshot through separate SQL writes. It does not update
+  live collaboration state, and the default PostgreSQL BIGINT string representation
+  makes `current_version + 1` concatenate values (for example, `5` becomes `51`).
+- The browser has no durable offline queue, replay of its pending operations, or
+  account/document generation guard for late responses. Comments can clear input
+  after a failed request. A green connection dot is not a saved-content indicator.
 
-// Send operation
-{ type: "OPERATION", doc_id: "...", version: 5, operation: [...] }
-
-// Cursor update
-{ type: "CURSOR", doc_id: "...", cursor: { position: 42 } }
-```
-
-## Implementation Status
-
-- [x] Database schema and seed data
-- [x] User authentication (register, login, logout)
-- [x] Document CRUD operations
-- [x] Rich text editor with TipTap
-- [x] WebSocket collaboration infrastructure
-- [x] Operational Transformation engine
-- [x] Presence awareness (cursors)
-- [x] Comments and replies
-- [x] Version history
-- [x] Document sharing
-- [ ] Full OT integration with editor
-- [ ] Offline support
-- [ ] Suggestions/track changes
-- [ ] Export (PDF, DOCX)
-
-## Architecture
-
-See [architecture.md](./architecture.md) for detailed system design.
-
-Key design decisions:
-- **Operational Transformation** for concurrent editing (vs CRDT for lower memory)
-- **Sticky sessions** by document ID for efficient WebSocket handling
-- **Redis pub/sub** for cross-server operation broadcasting
-- **Periodic snapshots** with operation logs for version history
-
-## Development Notes
-
-See [claude.md](./claude.md) for development history and design decisions.
-
-## Future Enhancements
-
-- Offline editing with IndexedDB queue
-- Peer-to-peer sync fallback
-- Document templates
-- Rich embeds (images, tables, drawings)
-- Export to multiple formats
-- Mobile-optimized editor
-
-## References & Inspiration
-
-- [Operational Transformation FAQ](https://www3.ntu.edu.sg/home/czsun/projects/otfaq/) - Comprehensive overview of OT algorithms and implementations
-- [High-Latency, Low-Bandwidth Windowing in the Jupiter Collaboration System](https://dl.acm.org/doi/10.1145/215585.215706) - Original Jupiter OT paper from Xerox PARC
-- [Google Wave Operational Transformation](https://svn.apache.org/repos/asf/incubator/wave/whitepapers/operational-transform/operational-transform.html) - Google's OT implementation for Wave
-- [CRDTs: Consistency without Consensus](https://crdt.tech/) - Alternative approach to collaborative editing
-- [Convergent and Commutative Replicated Data Types](https://hal.inria.fr/inria-00555588/document) - Shapiro et al. paper on CRDT foundations
-- [ProseMirror Collaborative Editing](https://prosemirror.net/docs/guide/#collab) - Guide on building collaborative editors
-- [Yjs: Shared Editing with CRDTs](https://yjs.dev/) - CRDT library for real-time collaboration
-- [Real Differences between OT and CRDT for Co-Editors](https://arxiv.org/abs/1810.02137) - Academic comparison of approaches
-- [Designing Data-Intensive Applications](https://dataintensive.net/) - Martin Kleppmann's book covering replication and consistency
+These are source-review findings, not fixes delivered by this documentation change.
+See [architecture.md](./architecture.md#implementation-notes) for the evidence and
+production-to-local mapping. The [frontend](./system-design-answer-frontend.md),
+[backend](./system-design-answer-backend.md), and
+[fullstack](./system-design-answer-fullstack.md) interview answers explain a proposed
+complete design with whiteboard diagrams. [CLAUDE.md](./CLAUDE.md) records development
+history; some older completion claims conflict with the current source.

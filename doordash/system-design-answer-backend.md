@@ -56,32 +56,58 @@ updates SQL on every sample.
 I would draw one regional architecture and explain how markets become partition boundaries:
 
 ```
-┌───────────────────────┐
-│ API + authentication  │
-└───────────┬───────────┘
-            │
-      ┌─────┴─────────────────────┐
-      ▼                           ▼
-┌──────────────────┐    ┌──────────────────┐
-│ Catalog + orders │    │ Location intake  │
-└────────┬─────────┘    └────────┬─────────┘
-         ▼                       ▼
-┌──────────────────┐    ┌──────────────────┐
-│ Market SQL       │    │ Fresh geo index  │
-│ Orders + outbox  │    └────────┬─────────┘
-└────────┬─────────┘             ▼
-         │              ┌──────────────────┐
-         │              │ Dispatch + ETA   │
-         │              └──────────────────┘
-         ▼                 Claims use SQL
-┌──────────────────┐
-│ Relay + event bus│
-└────────┬─────────┘
-         ▼
-┌──────────────────────────────────────────┐
-│ Socket gateways + notification workers   │
-└──────────────────────────────────────────┘
+PROPOSED MARKET — orders/claims are durable; positions are replaceable observations
+
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Customer / kitchen       │HTTP/result │ API + authentication     │quote/read  │ Catalog + quote module   │
+│ Driver clients           │◀──────────▶│ Participant access       │◀──────────▶│ Current menu / coverage  │
+│ Role-scoped saved intent │            │ Command / query budgets  │            │ Bound revisions + expiry │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+              ▲                                       ▲
+              │                                       │
+              │ report / result                       │ action / snapshot
+              │                                       │
+              ▼                                       ▼
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Location ingestion       │            │ Order authority          │commit/read │ Market SQL authority     │
+│ Session, sequence, time  │            │ Quote / state / claims   │◀──────────▶│ Orders / live claims     │◀─────┐
+│ Auth + freshness checks  │            │ Serialize decisions      │            │ Receipt + outbox commit  │      │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘      │
+              ▲                                       ▲                                       ▲                   │
+              │                                       │                                       │                   │
+              │ update / result                       │ claim / transition                    │ outbox / progress │
+              │                                       │                                       │                   │
+              ▼                                       ▼                                       ▼                   │
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐      │
+│ Fresh geo index          │candidates  │ Dispatch + ETA           │work/ACK    │ Outbox relay + bus       │      │
+│ Latest valid samples     │◀──────────▶│ Score fresh candidates   │◀──────────▶│ Committed lifecycle      │      │
+│ Approximate candidates   │            │ Recover claim + deadline │            │ Retained work / retry    │      │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘      │
+              │                                                                               │                   │
+              │ latest sample                                                                 │ wake              │
+              │                                                                               │           replay  │
+              │                                                                               │                   │
+              ▼                                                                               ▼                   │
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐      │
+│ Position push            │latest/read │ Participant clients      │event/resume│ Event gateways           │      │
+│ Coalesce old samples     │◀──────────▶│ Order / location state   │◀──────────▶│ Current read permission  │◀─────┘
+│ Scoped latest data       │            │ Reconcile + show age     │            │ Replay / bounded queues  │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
 ```
+
+I would trace checkout into a complete order transaction and follow dispatch separately:
+fresh locations produce candidates, then the order authority makes the exclusive claim
+in market SQL. Committed lifecycle events travel through the outbox to participants.
+Position push takes a coalescing path because replacing an old point is useful, whereas
+dropping an accepted order transition would require recovery. The two paths retain
+different freshness, replay and load budgets.
+
+I would use a worker restart to explain the recovery arrows:
+
+1. Replay committed dispatch work, then reload the order and its current claim instead of assuming the original offer still exists.
+2. Acceptance, cancellation, expiry, and replacement serialize on the same records. A delayed timeout can release only its matching claim.
+3. Event gateways read committed history or a current authorized snapshot when a notification is missed; delivery hints never decide order state.
+4. Location intake reports acceptance separately. Its replaceable samples cannot commit a pickup, extend a claim, or prove that delivery happened.
 
 The dispatcher reads candidates from the geo index and writes authoritative claims in market
 SQL. Location intake updates the geo index. The bus carries durable lifecycle events to

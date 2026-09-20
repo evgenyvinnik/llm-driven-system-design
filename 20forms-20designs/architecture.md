@@ -66,29 +66,46 @@ three forms and three libraries, creating nine preview documents.
 ## High-Level Architecture
 
 ```
-┌─────────────────┐    ┌────────────────────┐
-│ Source + catalog│───▶│ Build and validation│
-└─────────────────┘    └─────────┬──────────┘
-                                 │ complete versioned release
-                                 ▼
-                       ┌────────────────────┐
-                       │ Static origin + CDN│
-                       └─────────┬──────────┘
-                                 │ HTML, JS, CSS, fonts
-                                 ▼
-┌─────────────────────────────────────────────────┐
-│ Browser                                         │
-│ ┌─────────────────────────────────────────────┐ │
-│ │ Shell: URL state, selection, preview manager │ │
-│ └──────────────────┬──────────────────────────┘ │
-│             ┌──────┴──────┐                     │
-│             ▼             ▼                     │
-│       ┌───────────┐ ┌───────────┐               │
-│       │ Library A │ │ Library B │               │
-│       │ document  │ │ document  │               │
-│       └───────────┘ └───────────┘               │
-└─────────────────────────────────────────────────┘
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Source + catalog       │       │ Build and validate     │       │ Static origin + CDN    │
+│ Library applications   │──────▶│ Gate complete release  │──────▶│ Retained release bytes │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+                                                                               ▲
+Pinned inputs → validated publication                                          │
+                                                                               │
+                                           GET documents / asset bytes         │
+                                                                               │
+                                                                               ▼
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│ BROWSER                                                                                  │
+│                                                                                          │
+│  ┌────────────────────────┐    ┌────────────────────────┐    ┌────────────────────────┐  │
+│  │ Controls + cards       │    │ Comparison model       │    │ Preview manager        │  │
+│  │ Selection and display  │◀──▶│ IDs / URL / theme      │◀──▶│ Queue / ready / retry  │  │
+│  └────────────────────────┘    └────────────────────────┘    └────────────────────────┘  │
+│                                                                           ▲              │
+│                                                                           │              │
+│                                       ┌───────────────────────────────────┴────────┐     │
+│                                       │                                            │     │
+│  form + theme / ready                 │           form + theme / ready             │     │
+│                                       │                                            │     │
+│                                       ▼                                            ▼     │
+│  ┌──────────────────────────────────────┐         ┌───────────────────────────────────┐  │
+│  │ Library A iframe                     │         │ Library B iframe                  │  │
+│  │ Native controls, styles, theme       │         │ Native controls, styles, theme    │  │
+│  │ Local input and validation           │         │ Local input and validation        │  │
+│  └──────────────────────────────────────┘         └───────────────────────────────────┘  │
+│                                                                                          │
+│  Comparison state is shared; typed form values remain inside each document               │
+│                                                                                          │
+└──────────────────────────────────────────────────────────────────────────────────────────┘
 ```
+
+This is the proposed publication and browser design. A complete release crosses the
+build gate before the origin can serve it. In the browser, selection flows through
+the comparison model and preview manager; readiness returns from each iframe while
+form values stay inside it. A failed build leaves the retained release available,
+and a failed preview can be retried without resetting the whole comparison.
 
 The origin serves static artifacts; there is no dynamic application server. CDN
 cache misses still require an origin. Build concurrency and browser frame

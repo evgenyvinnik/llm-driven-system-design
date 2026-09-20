@@ -55,29 +55,49 @@ Compose provides one PostgreSQL 16 instance, one Valkey 7 instance, and one Elas
 Production proposal; each box expresses responsibility and need not initially be a separate deployment.
 
 ```
-┌─────────────────────┐        ┌─────────────────────┐
-│ Browser / mobile    │───────▶│ CDN / image storage │
-└──────────┬──────────┘        └─────────────────────┘
-           ▼
-┌─────────────────────┐
-│ API gateway / auth  │
-└──────────┬──────────┘
-           ▼
-┌─────────────────────┐        ┌─────────────────────┐
-│ Catalog / search    │───────▶│ Elasticsearch       │
-│ Favorites / cart    │        │ Redis read caches   │
-└──────────┬──────────┘        └─────────────────────┘
-           ▼
-┌─────────────────────┐        ┌─────────────────────┐
-│ Checkout / orders   │───────▶│ PostgreSQL          │
-│ Stock / ownership   │        │ State + outbox      │
-└─────────────────────┘        └──────────┬──────────┘
-                                         ▼
-┌─────────────────────┐        ┌─────────────────────┐
-│ Payment provider    │◀───────│ Durable workers     │
-│ Status / webhooks   │───────▶│ Payment / indexing  │
-└─────────────────────┘        └─────────────────────┘
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Buyer / seller clients │       │ API + sessions         │       │ Discovery reads        │
+│ Search / saved intent  │◀─────▶│ Scope / request limits │◀─────▶│ Search index + cache   │◀───┐
+└────────────────────────┘       │ Catalog / cart access  │       │ Explicit freshness     │    │
+             ▲                   └────────────────────────┘       └────────────────────────┘    │
+             │                                ▲                                                 │
+             │                                │                                                 │
+public images│         accepted terms / edits │                                                 │
+             │                                │                                                 │
+             ▼                                ▼                                                 │
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐    │
+│ Image delivery         │       │ Catalog + checkout     │       │ PostgreSQL authority   │    │
+│ Object derivatives     │       │ All-line stock holds   │◀─────▶│ Stock / purchase state │    │
+│ Public CDN             │       │ Buyer / seller orders  │       │ Receipts / outbox      │    │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘    │
+                                              ▲                                ▲                │
+                                              │                                │                │
+                      payment state           │             committed work     │                │
+                                              │                                │                │
+                                              ▼                                ▼                │
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐    │
+│ Payment provider       │       │ Payment + refund work  │       │ Outbox + durable work  │    │
+│ Stable payment ref     │◀─────▶│ Attempt / recovery     │◀─────▶│ Retry named effects    │    │
+│ Status API / webhooks  │       │ Network outside SQL TX │       │ Catalog generations    │    │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘    │
+                                                                               ▲                │
+                                                                               │  apply / ACK   │
+                                                                               ▼                │
+                                                                  ┌────────────────────────┐    │
+                                                                  │ Index workers          │    │
+                                                                  │ Versioned updates      │◀───┘
+                                                                  │ Rebuildable projection │
+                                                                  └────────────────────────┘
+
+One purchase binds the agreed basket; each seller order can then be fulfilled independently.
 ```
+
+Use the proposed diagram to separate four recoverable outcomes:
+
+1. The private API binds buyer/seller identity and operation ID to exact intent; the browser retains scoped recovery references and base revisions.
+2. The purchase authority creates the all-line hold and records payment work. Expiry cannot release a hold whose payment is still claimed or unresolved without the defined reconciliation/compensation policy.
+3. Payment/refund workers recover the same provider operation, record the outcome through guarded purchase transitions, and then acknowledge retained work.
+4. Index workers apply listing versions/tombstones and record progress independently. A cache or search response cannot establish current sellable stock.
 
 PostgreSQL owns inventory, purchases, receipts, and seller orders. Redis and Elasticsearch contain rebuildable browsing projections; losing a cache cannot authorize another sale. Durable workers consume committed outbox work and apply versioned, repeatable effects. Payment webhooks and reconciliation both use the same guarded purchase transitions.
 

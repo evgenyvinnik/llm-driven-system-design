@@ -43,31 +43,54 @@ I would propose shell interactions around 200 ms and first useful content within
 few seconds on an agreed device/network profile. These are targets to measure, not
 promises based on framework choice.
 
-## 🏗️ Draw one end-to-end picture — 5 minutes
+## 🏗️ Draw one end-to-end picture — 6 minutes
 
 ```
-┌─────────────────────┐       ┌─────────────────────┐
-│ Source + catalog    │──────▶│ Build, validate,    │
-│ library applications│       │ publish release     │
-└─────────────────────┘       └──────────┬──────────┘
-                                        ▼
-                              ┌─────────────────────┐
-                              │ Static origin + CDN │
-                              └──────────┬──────────┘
-                                         │ assets
-                                         ▼
-┌──────────────────────────────────────────────────┐
-│ Browser                                          │
-│ ┌──────────────────────────────────────────────┐ │
-│ │ Shell: controls, URL state, preview lifecycle│ │
-│ └──────────────┬─────────────────┬─────────────┘ │
-│                ▼                 ▼               │
-│       ┌────────────────┐ ┌────────────────┐      │
-│       │ Library A frame│ │ Library B frame│      │
-│       │ Native form    │ │ Native form    │      │
-│       └────────────────┘ └────────────────┘      │
-└──────────────────────────────────────────────────┘
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Source + catalog       │       │ Build and validate     │       │ Static origin + CDN    │
+│ Library applications   │──────▶│ Gate complete release  │──────▶│ Retained release bytes │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+                                                                               ▲
+Pinned inputs → validated publication                                          │
+                                                                               │
+                                           GET documents / asset bytes         │
+                                                                               │
+                                                                               ▼
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│ BROWSER                                                                                  │
+│                                                                                          │
+│  ┌────────────────────────┐    ┌────────────────────────┐    ┌────────────────────────┐  │
+│  │ Controls + cards       │    │ Comparison model       │    │ Preview manager        │  │
+│  │ Selection and display  │◀──▶│ IDs / URL / theme      │◀──▶│ Queue / ready / retry  │  │
+│  └────────────────────────┘    └────────────────────────┘    └────────────────────────┘  │
+│                                                                           ▲              │
+│                                                                           │              │
+│                                       ┌───────────────────────────────────┴────────┐     │
+│                                       │                                            │     │
+│  form + theme / ready                 │           form + theme / ready             │     │
+│                                       │                                            │     │
+│                                       ▼                                            ▼     │
+│  ┌──────────────────────────────────────┐         ┌───────────────────────────────────┐  │
+│  │ Library A iframe                     │         │ Library B iframe                  │  │
+│  │ Native controls, styles, theme       │         │ Native controls, styles, theme    │  │
+│  │ Local input and validation           │         │ Local input and validation        │  │
+│  └──────────────────────────────────────┘         └───────────────────────────────────┘  │
+│                                                                                          │
+│  Comparison state is shared; typed form values remain inside each document               │
+│                                                                                          │
+└──────────────────────────────────────────────────────────────────────────────────────────┘
 ```
+
+I would draw publication above the browser because it supplies the contract the shell
+can advertise. Within the browser, selection flows through the comparison model into
+the preview manager; configuration and readiness cross the iframe boundary. Static GETs
+retrieve the published documents, while form interaction and validation stay local to
+each library. These are the main flows I would trace before discussing optimizations.
+
+There are two useful recovery paths on this drawing. A failed build stays behind the
+release gate, leaving the retained complete release serving. A failed frame stays
+inside the preview manager's retry lifecycle, leaving other comparisons usable.
+Neither failure should erase the shell's selected IDs or publish half a comparison.
 
 The build process produces static entry documents and assets for the shell and each
 library. A CDN serves reusable objects, and its origin handles cache misses. There

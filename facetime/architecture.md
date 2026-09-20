@@ -60,28 +60,49 @@ The fixture creates four users and four sample device rows, with no calls. The a
 The proposed control path is separate from the media path:
 
 ```
-┌──────────────────────┐     ┌──────────────────────┐
-│ Authenticated device │────▶│ HTTPS / WS gateway   │
-└──────────────────────┘     └──────────┬───────────┘
-                                        ▼
-┌──────────────────────┐     ┌──────────────────────┐
-│ Device routing / push│◀────│ Call authority       │
-└──────────────────────┘     └──────────┬───────────┘
-                                        ▼
-                             ┌──────────────────────┐
-                             │ PostgreSQL + outbox  │
-                             │ Claims / receipts    │
-                             └──────────────────────┘
+   ┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+   │ Caller device          │       │ Device gateway fleet   │       │ Call authority         │
+┌─▶│ Call control + media   │◀─────▶│ Auth / live routes     │◀─────▶│ Invitation / busy slot │
+│  │ Endpoint / saved op ID │       │ Call commands + events │       │ One winning device     │
+│  └────────────────────────┘       │ SDP / ICE / leases     │       └────────────────────────┘
+│               ▲                   │                        │                    ▲
+│               │                   │                        │                    │
+│               ▼                   │                        │                    ▼
+│  ┌────────────────────────┐       │                        │       ┌────────────────────────┐
+│  │ TURN relay             │       │                        │       │ PostgreSQL authority   │
+│  │ Selected ICE relay     │       │                        │       │ Call/claims/receipts   │
+│  │ Encrypted media        │       │                        │       │ Revision + outbox      │
+│  └────────────────────────┘       │                        │       └────────────────────────┘
+│               ▲                   │                        │                    ▲
+│               │                   │                        │                    │
+│               ▼                   │                        │                    ▼
+│  ┌────────────────────────┐       │                        │       ┌────────────────────────┐
+│  │ Callee endpoint        │       │                        │       │ Outbox + delivery      │
+└─▶│ Winning device only    │◀─────▶│                        │◀─────▶│ Retained call events   │
+   │ One accepted endpoint  │       │                        │       │ Deadline / resume      │
+   └────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+                                                 ▲                                ▲
+                                                 │                                │
+                                                 │ lease / renew                  │
+                                                 ▼                                │
+                                    ┌────────────────────────┐                    │
+                                    │ Connection leases      │ route / result     │
+                                    │ Device / gateway route │◀───────────────────┘
+                                    │ Independent expiry     │
+                                    └────────────────────────┘
 
-┌──────────────────────┐     ┌──────────────────────┐
-│ Browser A            │◀───▶│ Browser B            │
-└──────────────────────┘     └──────────────────────┘
-      Direct encrypted media, or opaque TURN relay
+Outer left path: direct peer media. The TURN path is used only when ICE selects a relay.
 
-┌──────────────────────┐     ┌──────────────────────┐
-│ Group endpoints      │◀───▶│ SFU media forwarding │
-└──────────────────────┘     └──────────────────────┘
+Call control stays in gateways and SQL; group SFU topology is a separate extension.
 ```
+
+The proposed diagram separates control recovery from media continuity:
+
+1. A device resolves its original scoped operation against the committed call receipt and current endpoint claim; local recovery stores references, not live media resources.
+2. Gateways renew independent connection leases. Delivery workers use current routes and invitation eligibility before retrying retained call events.
+3. Outbox progress records transport work; only the call authority can accept a device, claim a busy slot, or commit a timeout/end transition.
+4. Reconnecting signaling reauthenticates and reconciles call/endpoint generations. A reload creates fresh peer resources; obsolete SDP and candidates are discarded.
+5. Direct or TURN-relayed media has its own observed health. Route expiry, control acceptance, and working audio/video remain separate facts.
 
 The gateway authenticates a connection and routes commands to the call authority. PostgreSQL commits call transitions, unique claims, retry receipts, and notification outbox records together. Redis holds bounded presence/routing caches and optional delivery hints. A socket itself remains on a particular gateway; Redis does not make that process stateless.
 

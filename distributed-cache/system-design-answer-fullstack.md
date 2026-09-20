@@ -66,28 +66,63 @@ each. I would use it to validate behavior before attempting the production sizin
 ## 🏗️ One architecture, two request paths — 5 minutes
 
 ```
-┌───────────────────────┐       ┌───────────────────────┐
-│ Application services  │──────▶│ Durable origin        │
-│ Cache-aside + budgets │       │ Application-owned     │
-└───────────────────────┘       └───────────────────────┘
-            │ cache operations
-            ▼
-┌───────────────────────┐       ┌───────────────────────┐
-│ Router pool           │◀──────│ Membership authority  │
-│ Deadlines + admission │       │ Accepted generations  │
-└───────────────────────┘       └───────────────────────┘
-            │
-            ▼
-┌───────────────────────┐       ┌───────────────────────┐
-│ Cache nodes           │──────▶│ Observation/admin API │
-│ Memory, LRU, TTL      │       │ Samples + operations  │
-└───────────────────────┘       └───────────────────────┘
-                                           │
-                                           ▼
-                               ┌────────────────────────┐
-                               │ React operator console │
-                               └────────────────────────┘
+OPERATOR PATH — browser views/state at left; authenticated console at right
+
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Operator views           │view/input  │ Browser state            │HTTP/result │ Console API              │
+│ Overview / keys / admin  │◀──────────▶│ Scoped query / preview   │◀──────────▶│ Auth / scope / action    │
+│ Sample age and coverage  │            │ Saved operation ID       │            │ Read / submit / status   │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+                                                                                    ▲         ▲
+                sample / coverage                                                   │         │
+              ┌─────────────────────────────────────────────────────────────────────┘         │
+              │                                                                               │
+              │                                         scoped command / status               │
+              │                                       ┌───────────────────────────────────────┘
+              │                                       │
+              ▼                                       ▼
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Observation service      │            │ Transition controller    │commit/read │ Membership authority     │
+│ Shared bounded samples   │            │ Drain / fence / recover  │◀──────────▶│ Durable placement + ops  │
+│ Age / errors / epoch     │            │ Advance recorded phases  │            │ One accepted generation  │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+              ▲                                       ▲                                       ▲
+              │                                       │                                       │
+              │                                       │ fence / result                        │
+              │                                       │             placement / refresh       │
+              │ sample / result                       │     ┌─────────────────────────────────┘
+              │                                       │     │
+              ▼                                       ▼     ▼
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Cache node partitions    │op/result   │ Regional router pool     │cache/reply │ Application services     │
+│ Owner epoch checks       │◀──────────▶│ Namespace / admission    │◀──────────▶│ Cache-aside read + fill  │
+│ Disposable memory / TTL  │            │ Route accepted version   │            │ Freshness / refill cap   │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+                                                                                              ▲
+                                                                                              │
+                                                                                              │ MISS / fallback read
+Controllers send bounded fencing work through routers to nodes.                               │
+A new placement is published only after fencing is established.                               │
+                                                                                              ▼
+                                                                                ┌──────────────────────────┐
+Cache acceptance is disposable; durable origin state belongs                    │ Durable origin           │
+to the application. Observations never establish ownership.                     │ Application-owned data   │
+                                                                                │ Budgeted refill reads    │
+                                                                                └──────────────────────────┘
 ```
+
+I would draw the operator and application as different users of the same cache.
+The application follows accepted routing and controls origin refill after a miss. The
+operator sees bounded observations with sample age, then follows a scoped change through
+its operation identity. Placement updates reach routers through the control boundary;
+a health timeout or a browser refresh cannot independently appoint a new owner.
+
+I would trace one interrupted node removal through this diagram:
+
+1. The browser saves the operation reference and exact scope, then polls its recorded progress after reconnecting.
+2. A replacement controller resumes the durable phase, verifies fencing through the routers/nodes, and only then advances accepted placement.
+3. The observation service reports separately timed samples, including missing nodes; those samples cannot complete the transition by themselves.
+4. Applications see hits, misses, or unavailability and budget origin refills. A successful control transition does not promise warm cache contents.
 
 The application data path goes through a router to the accepted owner. The observation path
 collects bounded samples for many viewers. These can share a deployment at first, but their

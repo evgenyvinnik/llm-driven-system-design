@@ -68,21 +68,57 @@ evaluation reuses query semantics, but receives its own resource budget so a pop
 dashboard cannot starve incident detection.
 
 ```
-┌────────────────┐      ┌────────────────┐      ┌────────────────┐
-│ Producers      │─────▶│ Ingest API     │─────▶│ Durable log    │
-└────────────────┘      └────────────────┘      └────────┬───────┘
-                                                         │
-                                                         ▼
-┌────────────────┐      ┌────────────────┐      ┌────────────────┐
-│ Query API      │◀────▶│ Time series    │◀─────│ Store worker   │
-└────────┬───────┘      └────────────────┘      └────────────────┘
-         │
-         ▼
-┌────────────────┐      ┌────────────────────┐
-│ Rule workers   │─────▶│ Incident DB        │
-└────────────────┘      │ + deliveries       │
-                        └────────────────────┘
+PROPOSED SERVICES — durable acceptance is earlier than query visibility
+
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Metric producers         │batch/ACK   │ Ingest API               │append/ACK  │ Durable ingestion log    │
+│ Saved immutable batch ID │◀──────────▶│ Auth / quota / semantics │◀──────────▶│ Append before acceptance │
+│ Retry unknown acceptance │            │ Bytes + series limits    │            │ Retained replay window   │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+                                                                                              ▲
+                                                                                              │
+                                                                                              │ replay / checkpoint
+                                                                                              │
+                                                                                              ▼
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Query API                │read/result │ Time-series store        │commit/read │ Storage workers          │
+│ Auth / coverage plans    │◀──────────▶│ Samples + batch receipts │◀──────────▶│ Atomic samples + receipt │
+│ Dashboard + rule budgets │            │ Rollups + coverage       │            │ Checkpoint after commit  │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+              ▲
+              │
+              │ query / evidence
+              │
+              ▼
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Rule workers             │commit/read │ Relational authority     │work/status │ Notification workers     │
+│ Fenced rule/group owner  │◀──────────▶│ Rules + incident state   │◀──────────▶│ Lease identified work    │
+│ Quality-aware evaluation │            │ Delivery outbox commit   │            │ Persist actual outcome   │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+                                                                                              ▲
+                                                                                              │
+                                                                                              │ attempt / result
+                                                                                              │
+Dashboard clients read through the Query API.                                                 ▼
+Config APIs authorize revisioned metadata reads/writes.                         ┌──────────────────────────┐
+                                                                                │ External destinations    │
+Notification success is separate from incident state;                           │ Webhook / email          │
+query success is separate from complete, current data.                          │ Receiver dedup support   │
+                                                                                └──────────────────────────┘
 ```
+
+I would trace a batch across the log acknowledgement and the later sample/receipt
+transaction before discussing query latency. Interactive reads and scheduled rules use
+the same coverage-aware query semantics with separate resource budgets. A rule worker
+commits an incident and delivery obligation; the notification worker records whether the
+external attempt succeeded. Missing observations and delivery failures remain explicit.
+
+The return arrows define the failure boundaries:
+
+1. Producers retain an immutable batch through retries; a log acknowledgement establishes acceptance, not query visibility.
+2. Workers recover the sample/receipt transaction before advancing the log checkpoint; replay must not add another sample effect.
+3. Query responses carry coverage and resolution even when a retained backlog is still being processed.
+4. A fenced rule owner commits the incident and delivery obligation together; notification retries record their own outcomes.
 
 A durable log such as Kafka absorbs a bounded backlog and separates acknowledgement from
 storage processing. It does not increase database capacity or make an unlimited outage

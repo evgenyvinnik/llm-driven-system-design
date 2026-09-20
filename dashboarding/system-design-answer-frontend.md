@@ -69,20 +69,47 @@ between dashboard configuration and independent panel renderers. The server owns
 authorization and query semantics; the browser owns interaction and presentation.
 
 ```
-┌──────────────────────┐      ┌──────────────────────┐
-│ Route + controls     │─────▶│ Query coordinator    │
-└──────────────────────┘      └───────────┬──────────┘
-                                          │
-                                          ▼
-                              ┌──────────────────────┐
-                              │ Query API            │
-                              └───────────┬──────────┘
-                                          │
-                                          ▼
-┌──────────────────────┐      ┌──────────────────────┐
-│ Panel renderers      │◀─────│ Results + quality    │
-└──────────────────────┘      └──────────────────────┘
+BROWSER — first two columns; SERVER CONTRACTS — right column
+
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Route + controls         │edit/state  │ Config + recovery draft  │save/result │ Configuration API        │
+│ Range, filters, account  │◀──────────▶│ Base / saved operation   │◀──────────▶│ Access / revision saves  │
+│ Shareable investigation  │            │ Scoped local draft copy  │            │ Commit + replay receipt  │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+                                                      │
+                                                      │ panel definitions
+                                                      │
+                                                      ▼
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Panel renderers          │data/input  │ Query coordinator        │query/reply │ Query API                │
+│ Actual times and units   │◀──────────▶│ Shared window + plans    │◀──────────▶│ Auth / bounded plans     │
+│ Gaps / stale / errors    │            │ Generation / query cache │            │ Coverage + resolution    │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+                                                      │
+                                                      │ inspect related rule
+                                                      ▼
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Alert + incident views   │view/input  │ Incident state           │read/reply  │ Incident API             │
+│ Rule version / evidence  │◀──────────▶│ Account + rule context   │◀──────────▶│ Auth / evidence reads    │
+│ Delivery and freshness   │            │ Refresh / stale / error  │            │ Actual delivery outcomes │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+
+Config recovery, chart results, and incident evidence have separate lifecycles.
 ```
+
+I would start with the route and saved panel definitions, then follow one shared time
+window through the query coordinator to independent renderers. Results carry their
+actual timestamps and quality; a chart does not manufacture missing measurements.
+Configuration drafts and incident evidence have separate lifecycles, so a failed refresh
+cannot erase an edit or turn absent telemetry into a healthy status.
+Selecting a panel's related rule changes the incident scope; that state owns its own refresh schedule.
+
+I would walk through recovery separately from refresh:
+
+1. Keep a bounded draft, base revision, and save identity scoped to account/dashboard when local-storage policy permits.
+2. After a lost save reply, resolve the same operation and reload the current revision before offering another save.
+3. On reconnect, start a new query generation; retain older matching results only with a visible stale label.
+4. Refresh incidents independently. Neither a fresh HTTP response nor a successful notification proves the measurements are complete.
 
 The route identifies the dashboard and shareable investigation context. Time range,
 selected filters, and a pinned absolute window belong in the URL when sharing them is

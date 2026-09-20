@@ -60,28 +60,67 @@ The budgets must cover active series, new-series creation, bytes, scanned work, 
 points, and active alert groups. Request rate alone does not describe cost: one broad
 query or a label containing unique request IDs can dominate the system.
 
-## 🏗️ Draw the end-to-end path — 4 minutes
+## 🏗️ Draw the end-to-end path — 5 minutes
 
 I would keep the whiteboard focused on how data becomes visible and actionable.
 Authentication, relational configuration, caching, and static asset delivery can be
 described alongside these main boundaries.
 
 ```
-┌────────────────┐      ┌────────────────┐      ┌────────────────┐
-│ Producers      │─────▶│ Ingest + log   │─────▶│ Store worker   │
-└────────────────┘      └────────────────┘      └────────┬───────┘
-                                                         │
-                                                         ▼
-┌────────────────┐      ┌────────────────┐      ┌────────────────┐
-│ Browser        │◀────▶│ Query API      │◀────▶│ Time series    │
-│ coordinator    │      └────────┬───────┘      └────────────────┘
-└────────────────┘               │
-                                 ▼
-                        ┌────────────────┐      ┌────────────────────┐
-                        │ Rule workers   │─────▶│ Incidents +        │
-                        └────────────────┘      │ delivery jobs      │
-                                                └────────────────────┘
+BROWSER: upper-left two boxes. SERVER: APIs, authorities, and workers.
+
+┌──────────────────────────┐            ┌──────────────────────────┐
+│ Refresh + config state   │HTTP/result │ Authorized APIs          │query / result
+│ Window / generation      │◀──────────▶│ Bound queries + results  │◀────────────────────────┐
+│ Saved draft + operation  │      ┌────▶│ Revisioned config saves  │                         │
+└──────────────────────────┘      │     └──────────────────────────┘                         │
+              ▲                   │                   ▲                                      │
+              │                   │                   │                                      │
+              │                   │ config            │                                      │
+              │ render / input    │ read/             │ query / evidence                     │
+              │                   │ save              │                                      │
+              │                   │                   │                                      │
+              ▼                   │                   ▼                                      ▼
+┌──────────────────────────┐      │     ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Panels + incident views  │      │     │ Rule evaluation          │            │ Time-series authority    │
+│ Values / gaps / evidence │      │     │ Independent work budget  │            │ Samples + batch receipts │
+│ Controls and stale state │      │     │ Missing is not healthy   │            │ Rollups + coverage       │
+└──────────────────────────┘      │     └──────────────────────────┘            └──────────────────────────┘
+                                  │                   ▲                                       ▲
+                                  │                   │                                       │
+                                  │                   │ transition / evidence                 │ commit / recover
+                                  └─────────────┐     │                                       │
+                                                │     │                                       │
+                                                ▼     ▼                                       ▼
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Notification workers     │work/status │ Relational authority     │            │ Storage workers          │
+│ Lease / retry obligation │◀──────────▶│ Config, rules, incidents │            │ Samples + receipt commit │
+│ Persist delivery outcome │            │ Receipts + delivery work │            │ Checkpoint after commit  │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+              ▲                                                                               ▲
+              │                                                                               │
+              │ attempt / result                                                              │ replay / checkpoint
+              │                                                                               │
+              ▼                                                                               ▼
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ External destinations    │            │ Metric producers         │batch/ACK   │ Ingest + durable log     │
+│ Webhook / email          │            │ Saved immutable batch    │◀──────────▶│ Auth / quota / append    │
+│ Independent delivery     │            │ Retry same identity      │            │ ACK after durable append │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
 ```
+
+I would follow a producer's accepted batch into stored measurements, then up through a
+bounded query and the browser's shared refresh window. The chart displays the returned
+coverage and resolution instead of implying every point is current. The alert branch
+uses those same measurement semantics, commits incident state, and attempts notification
+separately. Configuration edits keep their own revision and draft recovery contract.
+
+I would use a dropped connection to test this drawing:
+
+1. A producer retries its saved batch identity; a storage worker replays from the last committed checkpoint.
+2. The browser starts a new refresh generation and shows incomplete or old observations explicitly.
+3. An editor restores its scoped draft and original save identity, then resolves the receipt and current revision through the APIs.
+4. Alert evaluation keeps its own schedule; missing data and failed external delivery remain separate from incident state.
 
 The ingestion API validates producers and appends identified batches to a durable log.
 Storage workers write samples and receipts. A time-series store maintains raw
@@ -323,7 +362,7 @@ monitoring must remain understandable. I would prioritize correct state transiti
 recovery before adding elaborate chart editors. A visually polished interface cannot
 compensate for an alert that disappears when its data source fails.
 
-## 📈 Scale and verify the complete experience — 4 minutes
+## 📈 Scale and verify the complete experience — 3 minutes
 
 First reduce unbounded work: series creation, repeated identity lookups, matching-series
 discovery, raw scans, returned points, simultaneous cache misses, and active alert

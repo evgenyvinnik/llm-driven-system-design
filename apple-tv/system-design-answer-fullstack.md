@@ -8,12 +8,12 @@ player; the production media pipeline is an extension.
 | Discussion | Minutes |
 |------------|---------|
 | Establish scope and success | 4 |
-| Draw one viewing journey | 5 |
+| Draw one viewing journey | 6 |
 | Deep dive: publish a playable title | 9 |
 | Deep dive: start and sustain playback | 9 |
 | Deep dive: resume in the right profile | 8 |
 | Failure handling, scale and observability | 6 |
-| Validate the design and relate it to the demo | 4 |
+| Validate the design and relate it to the demo | 3 |
 | Total | 45 |
 
 ## 🎯 Establish scope and success — 4 minutes
@@ -59,29 +59,64 @@ meaningful.
 | Resume | An acknowledged position is recoverable after handoff |
 | Rights enforcement | Stale catalog results do not bypass playback authorization |
 
-## 🏗️ Draw one viewing journey — 5 minutes
+## 🏗️ Draw one viewing journey — 6 minutes
 
 > “I would draw media delivery separately from the control APIs. That separation
 > explains both the scale and the client responsibilities.”
 
 ```
-┌────────────────┐                  ┌────────────────┐
-│ Viewer apps    │─ media ─────────▶│ CDN + shield   │
-│                │                  │                │
-└────────────────┘                  └────────────────┘
-        │ control                           │ cache miss
-        ▼                                   ▼
-┌────────────────┐                  ┌────────────────┐
-│ Domain APIs    │                  │ Private origin │
-│ SQL / cache    │                  │                │
-└────────────────┘                  └────────────────┘
-                                            ▲ publish
-                                            │
-                                    ┌────────────────┐
-                                    │ Encode workers │
-                                    │ Queue / jobs   │
-                                    └────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│ VIEWER CLIENT / PROFILE-SCOPED STATE                                                     │
+│                                                                                          │
+│  ┌────────────────────────┐    ┌────────────────────────┐    ┌────────────────────────┐  │
+│  │ Browse + profile UI    │    │ Playback controller    │    │ Media engine           │  │
+│  │ Keyed personal results │◀──▶│ Intent + generation    │◀──▶│ Actual frames + events │  │
+│  └────────────────────────┘    │ Resume / progress IDs  │    │ Protected playback     │  │
+│                                └────────────────────────┘    └────────────────────────┘  │
+│                                   ▲                            ▲                     ▲   │
+│            ┌──────────────────────┘                            │                     │   │
+│            │                                        ┌──────────┘                     │   │
+└────────────┼────────────────────────────────────────┼────────────────────────────────┼───┘
+             ▼                                        ▼                                ▼
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Control APIs           │       │ Protected license API  │       │ CDN + shield           │
+│ Authorize + resume     │◀─────▶│ Platform integration   │       │ Manifests and segments │
+│ Profile + title scope  │       │ Session-scoped result  │       │ Versioned media bytes  │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+             ▲                                ▲                                ▲
+             │                                │                                │
+state        │                   keys         │                   cache miss   │
+             │                                │                                │
+             ▼                                ▼                                ▼
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Domain authority       │       │ Key management         │       │ Private origin         │
+│ Rights, profiles, jobs │       │ Restricted key access  │       │ Validated fixed assets │
+│ Progress + active rev  │       │ Never public objects   │       │ Pinned media revisions │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+             ▲                                                                 ▲
+             │                                                                 │
+             │ jobs / validation / active pointer                 media output │
+             │                                                                 │
+             ▼                                                                 │
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│ Admin ingestion and publication pipeline                                                 │
+│ Durable jobs + outbox; fenced workers; complete validated media revision                 │
+│ Advance the active revision only after required assets pass validation                   │
+└──────────────────────────────────────────────────────────────────────────────────────────┘
 ```
+
+I would start at the bottom: accepted ingestion work produces a complete validated
+revision and updates the active pointer. At Play, the controller binds profile, title
+and generation, gets authorization/resume state, then prepares license and media
+requests through the engine. Actual frames and progress return to that same context.
+This explains how publication correctness, protected delivery and cross-device resume
+combine into one viewing journey without sharing a single failure-prone request path.
+
+There are two recovery loops on the drawing. Publication retries a fenced durable
+job and exposes a release only after validation; playback retries or renews resources
+for its current profile, session, and media revision. Progress updates have their own
+sequenced receipts, so a delayed save cannot revive a superseded session. A control,
+license, or media failure remains attributable to the path that actually failed.
 
 Domain APIs cover accounts/profiles, catalog, playback authorization, progress and
 subscription state. A protected license service participates in playback where the
@@ -432,7 +467,7 @@ A health response proves only the checks it performs. Database connectivity is n
 proof that media exists, licensing works or the player renders. Use a representative
 synthetic playback journey alongside component diagnostics.
 
-## 🧪 Validate the design and relate it to the demo — 4 minutes
+## 🧪 Validate the design and relate it to the demo — 3 minutes
 
 I would test the complete journey with deliberate failures. Upload a source, kill a
 worker after object creation, redeliver the job and confirm that only a complete

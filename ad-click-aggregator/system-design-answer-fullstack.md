@@ -4,7 +4,7 @@
 correctness and freshness contracts. See [architecture.md](./architecture.md) for
 what the local implementation actually does.*
 
-## 🎯 Follow a click to an analyst's decision — 5 minutes
+## 🎯 Follow a click to an analyst's decision — 4 minutes
 
 > “I would design the journey from a click arriving to an analyst interpreting a
 > campaign chart. The interesting problem is that acceptance, aggregation, and
@@ -42,28 +42,58 @@ far the pipeline has processed.
 Impressions, bidding, attribution, and a general-purpose dashboard builder are out
 of scope. The test-click UI is a development tool, not the production event source.
 
-## 🏗️ Draw the system and estimate load — 5 minutes
+## 🏗️ Draw the system and estimate load — 6 minutes
 
 ```
-┌────────────────┐   ┌────────────────┐   ┌────────────────────┐
-│ Click producer │──▶│ Collector      │──▶│ Canonical events   │
-│ stable identity│   │ validation     │   │ + outbox            │
-└────────────────┘   └────────────────┘   └──────────┬─────────┘
-                                                     ▼
-                                            ┌─────────────────┐
-                                            │ Durable stream  │
-                                            └────────┬────────┘
-                                                     ▼
-                                            ┌─────────────────┐
-                                            │ Fraud + rollups │
-                                            │ durable progress│
-                                            └────────┬────────┘
-                                                     ▼
-┌────────────────┐   ┌────────────────┐   ┌────────────────────┐
-│ React dashboard│◀──│ Reporting API  │◀──│ Analytics projection│
-│ query + state  │   │ scope + cover │   │ versioned buckets   │
-└────────────────┘   └────────────────┘   └────────────────────┘
+EVENT PIPELINE — accepted, processed, and report-visible are distinct
+
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Click producer           │event/ACK   │ Admission API            │commit/read │ Canonical event + outbox │
+│ Stable ID / same payload │◀──────────▶│ Validate and authorize   │◀──────────▶│ Identity and payload     │
+│ Retry lost acceptance    │            │ Return durable outcome   │            │ Commit before ACK        │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+                                                                                              │
+                                                                                              │ relay / retry
+                                                                                              │
+                                                                                              ▼
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Analytics projection     │snapshots   │ Fraud / rollups + state  │replay      │ Outbox relay + stream    │
+│ Versioned bucket values  │◀───────────│ Identity, counts, offset │◀───────────│ Durable accepted work    │
+│ Published generation     │            │ Commit together; replay  │            │ At-least-once delivery   │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+              ▲
+              │
+              │ bounded query
+              │                         BROWSER DASHBOARD
+              │
+              ▼
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Reporting API            │HTTP/report │ Query + report cache     │render/UI   │ Cards / chart / table    │
+│ Account / scope checks   │◀──────────▶│ Request + account IDs    │◀──────────▶│ One report, one coverage │
+│ Report + coverage        │            │ Poll / cancel / stale UI │            │ Local hover / drill-down │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+                                                      ▲
+                                                      │
+The browser retries queries; it never                 │ query identity
+adds accepted clicks to displayed totals.             │
+                                                      │                         ┌──────────────────────────┐
+                                                      │apply / restore          │ Applied filters + URL    │
+                                                      └────────────────────────▶│ Scope, zone, resolution  │
+                                                                                │ Validate, restore, share │
+                                                                                └──────────────────────────┘
 ```
+
+I would trace the upper path as the click's lifecycle and the lower path as the
+analyst's read journey. A committed click can still be waiting in the stream or
+processor, so the Reporting API returns projection coverage with its values. Within
+the browser, applied filters drive the query coordinator; the cache publishes only
+matching results, and cards/charts render that report's revision and freshness.
+
+Read the return arrows as three different outcomes: the producer receives durable
+acceptance, the processor recovers its own committed application state, and the
+browser receives a report with a coverage boundary. An acceptance response never
+increments a dashboard card directly. Backend replay repairs a lagging projection;
+frontend retry fetches that projection without changing authoritative totals.
 
 I would use PostgreSQL for transactional metadata and an initial canonical event
 store, a durable stream for projection work, and ClickHouse for analytical reads.

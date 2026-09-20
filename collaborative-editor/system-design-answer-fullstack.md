@@ -13,12 +13,12 @@ Notes](./architecture.md#implementation-notes) for the source audit.
 | Time | Discussion |
 |------|------------|
 | 4 minutes | Product scope and guarantees |
-| 5 minutes | End-to-end architecture and contracts |
+| 6 minutes | End-to-end architecture and contracts |
 | 9 minutes | Deep dive: one edit through concurrent views |
 | 9 minutes | Deep dive: save status, durability, and recovery |
 | 8 minutes | Deep dive: text, presence, and permission state |
 | 6 minutes | Scaling, user experience, and operations |
-| 4 minutes | Verification and implementation boundary |
+| 3 minutes | Verification and implementation boundary |
 
 ## 🎯 Product scope and guarantees — 4 minutes
 
@@ -57,31 +57,64 @@ history.
 > “I would define the save promise before choosing the queue. Otherwise it is easy
 > to build a fast interface that acknowledges work the system cannot recover.”
 
-## 🏗️ End-to-end architecture and contracts — 5 minutes
+## 🏗️ End-to-end architecture and contracts — 6 minutes
 
 I would draw the browser's optimistic state beside the server's committed state:
 
 ```
-┌──────────────────┐       ┌──────────────────┐
-│ Browser editor   │──────▶│ Gateway/session  │
-│ Base + local ops │◀──────│ Document routing │
-└──────────────────┘       └────────┬─────────┘
-                                    │
-                           ┌────────▼─────────┐
-                           │ Document owner   │
-                           │ Ordered OT edits │
-                           └────────┬─────────┘
-                                    │ atomic commit
-                           ┌────────▼─────────┐
-                           │ PostgreSQL       │
-                           │ Log + snapshots  │
-                           │ Receipts/outbox  │
-                           └────────┬─────────┘
-                                    │ committed delivery
-                           ┌────────▼─────────┐
-                           │ Fanout gateways  │
-                           └──────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│ BROWSER / OPTIMISTIC TEXT AND EXPLICIT SAVE STATE                                        │
+│                                                                                          │
+│  ┌────────────────────────┐    ┌────────────────────────┐    ┌────────────────────────┐  │
+│  │ Editor + product shell │    │ Sync + local recovery  │    │ Presence model + UI    │  │
+│  │ Text, selection, IME   │◀──▶│ Base / sent / buffer   │───▶│ Versioned cursor state │  │
+│  │ Document navigation    │    │ Original IDs + draft   │    │ Separate render store  │  │
+│  └────────────────────────┘    └────────────────────────┘    └────────────────────────┘  │
+│                       ▲                     ▲                                        ▲   │
+│                       │                     │                                        │   │
+└───────────────────────┼─────────────────────┼────────────────────────────────────────┼───┘
+                        │                     │                                        │
+                        ▼                     ▼                                        ▼
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Metadata/access API    │       │ Session / doc gateway  │       │ Presence service       │
+│ Titles and permissions │       │ Auth + subscriptions   │◀─────▶│ Ephemeral WS channel   │
+│ Independent revisions  │       │ Baseline + suffix      │       │ Expiry and session IDs │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+                                              ▲
+                                              │
+identified edit / durable ACK                 │
+                                              │
+                                              ▼
+                                 ┌────────────────────────┐       ┌────────────────────────┐
+                                 │ Fenced document owner  │       │ Document authority     │
+                                 │ Validate + transform   │◀─────▶│ Head/log/receipts      │
+                                 │ Ordered admission      │       │ Snapshots + outbox     │
+                                 └────────────────────────┘       └────────────────────────┘
+                                                                               │
+                                                 committed delivery            │
+                                                                               │
+                                                                               ▼
+┌────────────────────────┐       ┌─────────────────────────────────────────────────────────┐
+│ Peer sync + editor     │       │ Outbox relay + delivery gateways                        │
+│ Apply ordered versions │◀─────▶│ Committed events; bounded queues; replay requests       │
+│ Recover gaps           │       │ Baseline/replay recovers missed transport delivery      │
+└────────────────────────┘       └─────────────────────────────────────────────────────────┘
+
+An ACK retires the sender’s pending operation; it does not apply the same local text again.
 ```
+
+I would trace one optimistic edit through the gateway and fenced owner to a committed
+version, then back as the sender's matching acknowledgement and out to peer editors.
+The sender removes pending work rather than inserting the same characters twice.
+Peers apply canonical versions or recover a gap from a coordinated baseline and suffix.
+Metadata and expiring presence have separate lifecycles, so an open connection or a
+moving cursor cannot substitute for a durable save acknowledgement.
+
+Local recovery retains the draft and original pending-operation context, while server
+recovery retains receipts and committed history. After interruption, the client resolves
+its in-flight request and requests the missing baseline/suffix before rebasing pending
+work. If safe reconciliation is no longer possible, it preserves the draft for explicit
+recovery. A fresh socket or a visible peer cursor does not close that durability gap.
 
 The browser adapter turns text input into operations and preserves selection. A
 synchronization controller owns the committed baseline, submitted edit, unsent
@@ -381,7 +414,7 @@ Supporting independent regional writers changes the conflict and authority desig
 Replicating RabbitMQ or running more Node processes is not enough to provide that
 guarantee.
 
-## 🧪 Verification and implementation boundary — 4 minutes
+## 🧪 Verification and implementation boundary — 3 minutes
 
 I would verify the contract through concrete failure cases: concurrent insertion at
 one position, overlapping deletions, typing during remote delivery, delayed

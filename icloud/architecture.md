@@ -1,242 +1,189 @@
-# Design iCloud Sync - Architecture
+# iCloud Sync Architecture
 
 ## System Overview
 
-iCloud is a file and data synchronization service across Apple devices. Core challenges involve consistency, conflict resolution, and efficient sync at scale.
+This independent learning project explores file synchronization and a private photo
+library. It is not a description of Apple's implementation. The core questions are
+causality, preservation of concurrent edits, metadata-to-object consistency, and
+recovery when a device misses notifications.
 
-**Learning Goals:**
-- Build bidirectional sync protocols
-- Design conflict resolution systems
-- Implement chunk-based file transfer
-- Handle offline-first architecture
-
----
+This document has two explicit layers. Requirements, capacity, the first diagram, and
+design decisions describe a **proposed production system**. The SQL and API inventory
+record the **checked-in implementation**. The final Implementation Notes trace actual
+request paths and their limitations. Proposed guarantees are not local test results.
 
 ## Requirements
 
-### Functional Requirements
+### Proposed production behavior
 
-1. **Sync**: Bidirectional file synchronization across iPhone, iPad, Mac, and web
-2. **Photos**: Photo library sync with derivative generation (thumbnail, preview, full-res)
-3. **Conflict**: Detect and resolve concurrent edits using version vectors
-4. **Offline**: Work offline with local queue, sync when connectivity returns
-5. **Share**: Share files and photo albums with other users
+- Browse, upload, download, rename, move, and delete files across authenticated devices.
+- Preserve concurrent file versions and let users resolve conflicts deliberately.
+- Resume interrupted transfers and reconcile changes after an offline interval.
+- Browse thumbnails and previews without downloading every original photo.
+- Distinguish locally queued work, cloud-committed revisions, and bytes downloaded by a
+  particular device. These are different acknowledgements.
 
-### Non-Functional Requirements
+Proposed service targets are 99.9% monthly metadata availability, p95 metadata reads
+under 200 ms within the home region, and p95 online-device notification under two
+seconds after commit. Large-transfer latency depends on bytes and bandwidth. Correctness
+requires no silently overwritten accepted revision and no committed manifest referencing
+unverified bytes. These are design targets, not measured repository properties.
 
-- **Consistency**: Eventual consistency with causal ordering via version vectors
-- **Latency**: < 5 seconds for sync propagation between online devices
-- **Storage**: Petabytes of user data across billions of files
-- **Privacy**: End-to-end encryption for sensitive categories
-- **Availability**: 99.99% for sync operations
-- **Durability**: 99.999999999% (11 nines) for stored data
-- **Throughput**: 100K+ file operations per second globally
+Native clients could observe permitted filesystem changes. A browser handles files the
+user selects and explicit offline copies; background execution and arbitrary filesystem
+watching are outside its promise. Shared albums, collaborative document editing, and
+CloudKit-style application databases are separate scopes.
 
----
+## Capacity Estimation
+
+Assume one million active accounts, three registered devices per account, 20 GiB of
+logical retained content per account, and ten file mutations per active account per day.
+That gives about 19 PiB logical storage and 116 average metadata mutations/second.
+A 10× peak is roughly 1,160/second. At an assumed 1 MiB of newly uploaded bytes per
+mutation, ingress is about 9.5 TiB/day before replication and derivatives.
+
+These are workload assumptions. Compression, deduplication, retained versions, photo
+mix, and erasure coding change physical cost; no savings percentage is established here.
+A 4 MiB fixed chunk implies roughly 5,120 manifest entries for a 20 GiB file, so manifests
+and resumable transfer state must be bounded and paged independently of directory reads.
+
+### Local Development Scale
+
+The local app buffers a complete upload: 100 MiB maximum for Drive and 50 MiB for
+Photos. Photo decoding and derivative buffers add to memory use; file download assembly
+also buffers the complete result. The PostgreSQL pool allows 20 connections per API
+process. These implementation limits do not establish safe concurrent capacity.
 
 ## High-Level Architecture
 
+Proposed production design; each box is a responsibility, not necessarily a separately
+deployed service on day one.
+
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                     Client Layer                                 │
-│          iPhone │ iPad │ Mac │ Apple Watch │ Web                 │
-│     Local file system + sync engine + offline queue             │
-└─────────────────────────────────────────────────────────────────┘
-                              │ HTTPS + WebSocket
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    CDN / Edge Network                            │
-│       Photo derivatives, shared album assets, static files      │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    API Gateway                                   │
-│         (Auth, Rate Limiting, Routing, Request Dedup)           │
-└─────────────────────────────────────────────────────────────────┘
-        │              │              │              │
-        ▼              ▼              ▼              ▼
-┌────────────┐ ┌────────────┐ ┌────────────┐ ┌────────────┐
-│   Sync     │ │  Storage   │ │   Photo    │ │   Share    │
-│  Service   │ │  Service   │ │  Service   │ │  Service   │
-│            │ │            │ │            │ │            │
-│ Version    │ │ Chunk mgmt │ │ Derivatives│ │ Albums     │
-│ vectors    │ │ Dedup      │ │ Thumbnails │ │ Permissions│
-│ Conflict   │ │ Upload/DL  │ │ EXIF parse │ │ Public URL │
-│ resolution │ │ Quota      │ │ Favorites  │ │            │
-└─────┬──────┘ └─────┬──────┘ └─────┬──────┘ └─────┬──────┘
-      │              │              │              │
-      ▼              ▼              ▼              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      Data Layer                                  │
-├─────────────────┬───────────────────┬───────────────────────────┤
-│  PostgreSQL     │  Redis/Valkey     │  Object Storage (S3)      │
-│  - File meta    │  - Sync state     │  - File chunks            │
-│  - Versions     │  - Cache (meta)   │  - Photo derivatives      │
-│  - Photos       │  - Idempotency    │  - Thumbnails             │
-│  - Albums       │  - Rate limits    │                           │
-│  - Sync ops     │  - WebSocket pub  │                           │
-├─────────────────┤                   │                           │
-│  WebSocket Hub  │                   │                           │
-│  - Device push  │                   │                           │
-│  - Change notify│                   │                           │
-└─────────────────┴───────────────────┴───────────────────────────┘
+DEVICES AND AUTHENTICATED EDGE — commands, receipts, and catch-up pages
+
+┌────────────────────────────┐            ┌────────────────────────────┐            ┌────────────────────────────┐
+│ Device A                   │1 cmd/ACK   │ API gateway / sessions     │2 replay    │ Device B / other devices   │
+│ Local pending command      │◀──────────▶│ Account / device identity  │◀──────────▶│ Saved replay cursor        │
+│ Selected bytes + base      │            │ Request and quota bounds   │            │ Verified local revisions   │
+└────────────────────────────┘            └────────────────────────────┘            └────────────────────────────┘
+               ▲                                         ▲                                         ▲
+               │                                         │                                         │
+               │ 3 staged bytes                          │ authorized command                      │ 6 WS hints
+               │                                         │                                         │
+               ▼                                         ▼                                         ▼
+┌────────────────────────────┐            ┌────────────────────────────┐            ┌────────────────────────────┐
+│ Transfer service           │verify      │ Sync admission             │            │ Push gateway               │
+│ Upload sessions + leases   │◀──────────▶│ Ownership + base revision  │            │ Account subscriptions      │
+│ Verify digest and length   │            │ Verified manifest / quota  │            │ Hints trigger change pull  │
+└────────────────────────────┘            └────────────────────────────┘            └────────────────────────────┘
+               ▲                                         ▲                                         ▲
+               │                                         │                                         │
+               │ put / get                               │ 4 commit / read                         │ publish hints
+               │                                         │                                         │
+BYTE STORAGE   │                          COMMIT STORE   │                          ASYNC EVENTS   │
+               │                                         │                                         │
+               ▼                                         ▼                                         │
+┌────────────────────────────┐            ┌────────────────────────────┐            ┌────────────────────────────┐
+│ Private object storage     │            │ PostgreSQL account shard   │5 events    │ Outbox relay / job queue   │
+│ Verified immutable chunks  │            │ Heads, receipts, feed      │───────────▶│ Retry committed events     │
+│ Originals + derivatives    │            │ Outbox in same transaction │            │ Deduplicate event IDs      │
+└────────────────────────────┘            └────────────────────────────┘            └────────────────────────────┘
+               ▲                                         ▲                                         │
+               │                                         │                                         │
+               │                                         │ 7 readiness commit                      │
+               │                                         │                                         │
+               │ read / write                            │                                         │ jobs
+               │                                         │                                         │
+               │                          ┌────────────────────────────┐                           │
+               │7 derive                  │ Photo workers              │                           │
+               └◀────────────────────────▶│ Original / transform ID    │◀──────────────────────────┘
+                                          │ Commit derivative status   │
+                                          └────────────────────────────┘
 ```
 
----
+Device A first stages and verifies blobs through the transfer service. Its sync command
+then names an immutable manifest and a base revision. Admission checks ownership and
+causality and commits the new head or conflict sibling, a command receipt, a change
+record, and an outbox entry together. The outbox drives photo jobs and push hints.
+Other devices pull the durable change feed and fetch any missing authorized chunks.
 
-## Core Components
+The numbered paths distinguish commands/receipts (1), replay (2), byte transfer (3),
+metadata admission (4), durable event publication (5), notification hints (6), and
+derivative processing/readiness (7). PostgreSQL contains the atomic commit boundary;
+object storage and worker execution remain outside that transaction. Device B reaches
+the same admission/read services through the gateway, including after reconnect.
 
-### 1. Sync Engine (Version Vectors)
+The metadata service validates a staged manifest before publication. Upload sessions
+pin staged objects so cleanup cannot race a commit. Push carries a reason to reconcile;
+it is not the source of truth. A lost hint changes freshness, not eventual recoverability.
 
-The sync engine uses version vectors to detect causality and conflicts between devices editing the same file.
+## Core Components / Request Flows
 
-**Version Vector**: A map of `{deviceId: sequenceNumber}` attached to each file. When device A edits a file, it increments its own entry: `{A: 3, B: 2}`. When device B independently edits, it has `{A: 2, B: 3}`. These vectors diverge, signaling a conflict.
+### Proposed file publication
 
-**Comparison Logic:**
+1. Authenticate the account and a stable installation identity; authorize the file ID.
+2. Create a bounded upload session and reserve logical quota for the proposed revision.
+3. Upload absent chunks, verify their lengths and digests, and record staged ownership.
+4. In one metadata transaction, lock the relevant file and namespace records, compare
+   the submitted base with current heads, and either fast-forward or preserve a sibling.
+5. Publish an immutable manifest, receipt, change entry, and outbox entry atomically.
+6. Return the durable revision and receipt. Retry with the same command identity returns
+   that result; another payload using that identity is rejected.
+7. Release staging reservations after publication or expiry under the same reclamation
+   protocol that protects retained versions and active transfers.
 
-Given vectors V1 and V2, iterate all device entries:
-- If V1[d] > V2[d] for some devices AND V2[d] > V1[d] for others: **conflict** (concurrent edits)
-- If V1[d] >= V2[d] for all devices: **V1 is newer** (V1 causally dominates)
-- If V2[d] >= V1[d] for all devices: **V2 is newer**
-- If equal: **same version**
+For an initial implementation, a per-account feed counter locked until transaction commit
+provides a simple commit-ordered cursor. A plain database sequence allocated before
+commit does not: a later number can become visible while an earlier transaction is still
+uncommitted. High-volume accounts may need a partitioned log and a more involved cursor.
 
-**Conflict Resolution Strategy:**
-1. **Auto-merge** if possible (e.g., both added different photos to an album)
-2. **Last-write-wins** with user notification for binary conflicts
-3. **Conflict copy** for irreconcilable edits: keep both versions, name the conflict copy `filename (conflict from DeviceName).ext`
+### Proposed photo path
 
-**Sync Protocol (Push/Pull):**
-1. Device connects and sends its sync cursor (last known server sequence number)
-2. Server returns all changes since that cursor
-3. Device applies remote changes, detects conflicts with local pending changes
-4. Device pushes local changes with version vectors
-5. Server validates version vectors, detects conflicts, stores new versions
-6. Server broadcasts change notifications to all other connected devices via WebSocket
+Publish the original first, then enqueue derivative generation through the outbox. A
+worker claims a versioned job, decodes within resource limits, normalizes orientation,
+and writes immutable thumbnail and preview objects. It publishes derivative readiness
+only after the objects exist. Retries target the same original revision and transform
+version. A photo can be present while its preview is still processing.
 
-### 2. Chunk-Based File Storage
-
-Files are split into content-addressed chunks for efficient storage and transfer.
-
-**Chunking Strategy:**
-- Fixed-size 4MB chunks (simple, predictable)
-- Each chunk is SHA-256 hashed for content addressing
-- Chunks are stored once globally with reference counting for deduplication
-- Upload only chunks that don't already exist in the global chunk store
-
-**Deduplication Flow:**
-1. Client computes chunk hashes for a file
-2. Client queries server: "which of these chunks do you already have?"
-3. Server checks `chunk_store` table by hash
-4. Client uploads only missing chunks
-5. Server creates `file_chunks` records linking file to its chunks
-6. Global `chunk_store.reference_count` is incremented
-
-**Dedup savings** are significant: similar documents share most chunks (a 10MB file with a 1-line edit uploads only 4MB instead of 10MB). Across users, common files (OS updates, popular documents) are stored once.
-
-**Delta Sync**: When a file is modified, only changed chunks are uploaded. The client computes the new chunk list and diffs against the old chunk list stored on the server.
-
-### 3. Photo Service
-
-Photos require special handling due to size (10-50MB per RAW) and the need for multiple derivatives.
-
-**Derivative Pipeline:**
-1. Original uploaded to object storage (full resolution)
-2. Server generates three derivatives using Sharp:
-   - Thumbnail: 200px wide, JPEG quality 80 (~10KB)
-   - Preview: 1024px wide, JPEG quality 85 (~100KB)
-   - Full resolution: original file
-3. EXIF metadata extracted: camera make/model, GPS coordinates, capture time
-4. All three derivatives stored in separate object storage buckets
-
-**Optimized Storage Mode**: Devices track which photos have full-res locally (`device_photos` junction table). When device storage is low, full-res copies are evicted, keeping only thumbnails. Full-res is always in the cloud and downloaded on demand.
-
-**Photo Organization**: Albums are user-created collections with a junction table (`album_photos`). Albums can be shared with other users via `album_shares` with optional contribute permissions. Shared albums generate a unique `share_token` for public URL access.
-
-### 4. Real-Time Sync (WebSocket)
-
-WebSocket connections provide instant change notification to online devices.
-
-When a file operation completes on one device, the server broadcasts a lightweight change event to all other devices owned by the same user. The event contains the file ID and operation type -- not the file content. Receiving devices then pull the updated metadata and content as needed.
-
-This avoids pushing large payloads over WebSocket while ensuring sub-second notification latency for online devices.
-
----
+User-selected metadata such as favorites and album membership is separate from binary
+photo content. An explicit desired favorite value is safe to retry; a toggle is not.
+Private media delivery must authorize cache hits as well as origin misses.
 
 ## Database Schema
 
-### Entity-Relationship Overview
+### Actual local schema
 
-```
-┌──────────────┐     1:N      ┌──────────────┐     1:N      ┌──────────────┐
-│    users     │◄─────────────│   devices    │◄─────────────│device_photos │
-│──────────────│              │──────────────│              │──────────────│
-│ id (UUID PK) │              │ id (UUID PK) │              │ device_id FK │
-│ email        │              │ user_id FK   │              │ photo_id FK  │
-│ password_hash│              │ name         │              │ has_full_res │
-│ storage_quota│              │ device_type  │              └──────────────┘
-│ storage_used │              │ sync_cursor  │
-│ role         │              └──────┬───────┘
-└──────┬───────┘                     │
-       │                             │ last_modified_by
-       │ 1:N                         │
-       ▼                             ▼
-┌──────────────┐     1:N      ┌──────────────┐     1:N      ┌──────────────┐
-│    files     │◄─────────────│ file_versions│              │ file_chunks  │
-│──────────────│              │──────────────│              │──────────────│
-│ id (UUID PK) │              │ id (UUID PK) │              │ id (UUID PK) │
-│ user_id FK   │              │ file_id FK   │              │ file_id FK   │
-│ parent_id FK │◄─── self-ref │ version_num  │              │ chunk_index  │
-│ name, path   │              │ content_hash │              │ chunk_hash   │
-│ version_vector│             │ version_vec  │              │ storage_key  │
-│ is_folder    │              │ is_conflict  │              └──────────────┘
-│ is_deleted   │              └──────────────┘
-└──────┬───────┘                                            ┌──────────────┐
-       │                                                    │ chunk_store  │
-       │ 1:1                                                │──────────────│
-       ▼                                                    │chunk_hash PK │
-┌──────────────┐     N:M (albums)     ┌──────────────┐     │ storage_key  │
-│   photos     │◄─────────────────────│album_photos  │     │ ref_count    │
-│──────────────│                      │──────────────│     └──────────────┘
-│ id (UUID PK) │                      │ album_id FK  │
-│ user_id FK   │                      │ photo_id FK  │
-│ file_id FK   │                      └──────────────┘
-│ original_hash│                             ▲
-│ thumb/prev/  │                             │
-│ full_res keys│              ┌──────────────┤
-│ EXIF metadata│              │   albums     │     1:N      ┌──────────────┐
-│ is_favorite  │              │──────────────│◄─────────────│album_shares  │
-└──────────────┘              │ id (UUID PK) │              │──────────────│
-                              │ user_id FK   │              │ album_id FK  │
-                              │ name         │              │ user_id FK   │
-                              │ is_shared    │              │can_contribute│
-                              │ share_token  │              └──────────────┘
-                              └──────────────┘
-```
-
-### Table Definitions
+The following is the exact schema in [init.sql](./backend/src/db/init.sql), including
+its current defaults, indexes, and omissions. It is not a production migration proposal.
+Fresh Docker volumes execute it automatically; rerunning it against existing tables fails.
+Its final seed-file comment is stale: the actual fixture is `backend/db-seed/base.sql`,
+applied by `backend/src/db/seed-photos.ts`.
 
 ```sql
+-- iCloud Sync Database Schema
+
+-- Enable UUID extension
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
--- Users
+-- Users table
 CREATE TABLE users (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   email VARCHAR(200) UNIQUE NOT NULL,
   password_hash VARCHAR(255) NOT NULL,
-  storage_quota BIGINT DEFAULT 5368709120,  -- 5GB default
+  storage_quota BIGINT DEFAULT 5368709120, -- 5GB default
   storage_used BIGINT DEFAULT 0,
-  role VARCHAR(20) DEFAULT 'user',
+  role VARCHAR(20) DEFAULT 'user', -- 'user' or 'admin'
   created_at TIMESTAMP DEFAULT NOW(),
   updated_at TIMESTAMP DEFAULT NOW()
 );
 
--- Devices
+-- Devices table
 CREATE TABLE devices (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   user_id UUID REFERENCES users(id) ON DELETE CASCADE,
   name VARCHAR(100) NOT NULL,
-  device_type VARCHAR(50) NOT NULL,
+  device_type VARCHAR(50) NOT NULL, -- 'iphone', 'ipad', 'mac', 'web'
   last_sync_at TIMESTAMP,
   sync_cursor JSONB DEFAULT '{}',
   created_at TIMESTAMP DEFAULT NOW(),
@@ -245,7 +192,7 @@ CREATE TABLE devices (
 
 CREATE INDEX idx_devices_user ON devices(user_id);
 
--- Files (self-referencing for folder hierarchy)
+-- Files table
 CREATE TABLE files (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   user_id UUID REFERENCES users(id) ON DELETE CASCADE,
@@ -255,7 +202,7 @@ CREATE TABLE files (
   mime_type VARCHAR(200),
   size BIGINT DEFAULT 0,
   content_hash VARCHAR(64),
-  version_vector JSONB DEFAULT '{}',
+  version_vector JSONB DEFAULT '{}', -- { deviceId: sequenceNumber }
   is_folder BOOLEAN DEFAULT FALSE,
   is_deleted BOOLEAN DEFAULT FALSE,
   last_modified_by UUID REFERENCES devices(id),
@@ -267,14 +214,14 @@ CREATE INDEX idx_files_user_path ON files(user_id, path);
 CREATE INDEX idx_files_parent ON files(parent_id);
 CREATE INDEX idx_files_user_deleted ON files(user_id, is_deleted);
 
--- File chunks (per-file chunk manifest)
+-- File chunks for chunked storage
 CREATE TABLE file_chunks (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   file_id UUID REFERENCES files(id) ON DELETE CASCADE,
   chunk_index INTEGER NOT NULL,
   chunk_hash VARCHAR(64) NOT NULL,
   chunk_size INTEGER NOT NULL,
-  storage_key VARCHAR(200) NOT NULL,
+  storage_key VARCHAR(200) NOT NULL, -- MinIO object key
   created_at TIMESTAMP DEFAULT NOW(),
   UNIQUE(file_id, chunk_index)
 );
@@ -282,7 +229,7 @@ CREATE TABLE file_chunks (
 CREATE INDEX idx_chunks_file ON file_chunks(file_id);
 CREATE INDEX idx_chunks_hash ON file_chunks(chunk_hash);
 
--- Global chunk deduplication store
+-- Global chunk deduplication table
 CREATE TABLE chunk_store (
   chunk_hash VARCHAR(64) PRIMARY KEY,
   storage_key VARCHAR(200) NOT NULL,
@@ -291,7 +238,7 @@ CREATE TABLE chunk_store (
   created_at TIMESTAMP DEFAULT NOW()
 );
 
--- File version history (for conflict resolution)
+-- File versions for conflict resolution
 CREATE TABLE file_versions (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   file_id UUID REFERENCES files(id) ON DELETE CASCADE,
@@ -313,9 +260,9 @@ CREATE TABLE sync_operations (
   user_id UUID REFERENCES users(id) ON DELETE CASCADE,
   device_id UUID REFERENCES devices(id) ON DELETE CASCADE,
   file_id UUID REFERENCES files(id) ON DELETE SET NULL,
-  operation_type VARCHAR(20) NOT NULL,
+  operation_type VARCHAR(20) NOT NULL, -- 'create', 'update', 'delete', 'conflict'
   operation_data JSONB,
-  status VARCHAR(20) DEFAULT 'pending',
+  status VARCHAR(20) DEFAULT 'pending', -- 'pending', 'completed', 'failed'
   created_at TIMESTAMP DEFAULT NOW(),
   completed_at TIMESTAMP
 );
@@ -323,7 +270,7 @@ CREATE TABLE sync_operations (
 CREATE INDEX idx_sync_ops_user_device ON sync_operations(user_id, device_id);
 CREATE INDEX idx_sync_ops_status ON sync_operations(status);
 
--- Photos
+-- Photos table
 CREATE TABLE photos (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   user_id UUID REFERENCES users(id) ON DELETE CASCADE,
@@ -350,7 +297,7 @@ CREATE INDEX idx_photos_user ON photos(user_id);
 CREATE INDEX idx_photos_user_date ON photos(user_id, taken_at DESC);
 CREATE INDEX idx_photos_favorite ON photos(user_id, is_favorite) WHERE is_favorite = TRUE;
 
--- Albums
+-- Photo albums
 CREATE TABLE albums (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   user_id UUID REFERENCES users(id) ON DELETE CASCADE,
@@ -365,7 +312,7 @@ CREATE TABLE albums (
 CREATE INDEX idx_albums_user ON albums(user_id);
 CREATE UNIQUE INDEX idx_albums_share_token ON albums(share_token) WHERE share_token IS NOT NULL;
 
--- Album-photo junction
+-- Album photos junction table
 CREATE TABLE album_photos (
   album_id UUID REFERENCES albums(id) ON DELETE CASCADE,
   photo_id UUID REFERENCES photos(id) ON DELETE CASCADE,
@@ -383,7 +330,7 @@ CREATE TABLE album_shares (
   UNIQUE(album_id, shared_with_user_id)
 );
 
--- Device photo sync state
+-- Device photo sync state (for optimized storage)
 CREATE TABLE device_photos (
   device_id UUID REFERENCES devices(id) ON DELETE CASCADE,
   photo_id UUID REFERENCES photos(id) ON DELETE CASCADE,
@@ -393,7 +340,7 @@ CREATE TABLE device_photos (
   PRIMARY KEY (device_id, photo_id)
 );
 
--- Sessions
+-- Sessions table for authentication
 CREATE TABLE sessions (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   user_id UUID REFERENCES users(id) ON DELETE CASCADE,
@@ -405,512 +352,311 @@ CREATE TABLE sessions (
 
 CREATE INDEX idx_sessions_token ON sessions(token);
 CREATE INDEX idx_sessions_user ON sessions(user_id);
+
+-- Seed data is in db-seed/seed.sql
 ```
 
-### Schema Design Rationale
+The schema contains 13 tables. `files` owns the current mutable head; `file_chunks` is a
+current manifest, not a manifest per immutable revision. `file_versions` retains hashes
+and vectors, but no reference to old chunk lists. `sync_operations` is an activity table,
+not a commit-ordered change feed. `album_shares` and sharing columns exist without a
+corresponding sharing workflow.
 
-**Self-referencing files table**: `parent_id` references `files(id)` to form a tree hierarchy for folders. `path` stores the materialized path (e.g., `/Documents/Work/report.pdf`) for fast prefix queries (`WHERE path LIKE '/Documents/%'`). Both are maintained: `parent_id` for tree traversal, `path` for fast lookups.
+The `(user_id, path)` index is nonunique. There is no chunk-hash foreign key from
+`file_chunks` to `chunk_store`, no unique per-user photo digest, no quota constraint,
+and no check that album members belong to the album owner. Device references from files
+and versions can prevent deleting a device even though sessions use `ON DELETE SET NULL`.
+Timestamps are without time zone; the API additionally serializes them through JavaScript
+millisecond dates. These facts matter for cursor and retention reasoning.
 
-**Version vectors as JSONB**: `{deviceId: sequenceNumber}` maps naturally to JSONB. PostgreSQL JSONB supports efficient containment queries and indexing if needed. The vector is small (one entry per device, typically 2-5 devices per user).
+### Proposed production additions
 
-**chunk_store with reference counting**: Global deduplication table keyed by content hash. When multiple files share the same chunk, `reference_count` tracks how many references exist. Chunks with zero references are garbage-collected. This pattern saves 30-50% storage for typical document workloads.
-
-**Three photo derivative keys**: `thumbnail_key`, `preview_key`, `full_res_key` are separate object storage paths. This allows CDN caching of immutable content-addressed derivatives with infinite TTL. Devices download only the derivative they need (thumbnail for grid view, preview for lightbox, full-res for editing).
-
-**Partial index for favorites**: `WHERE is_favorite = TRUE` keeps the index tiny since only a small percentage of photos are favorited. The "Favorites" album query hits this small index instead of scanning all photos.
-
-**device_photos junction table**: Tracks which devices have full-resolution copies of which photos. Enables "Optimize Mac Storage" -- when device storage is low, evict full-res copies (set `has_full_res = FALSE`), keeping only cloud-backed thumbnails.
-
-**sync_operations log**: Append-only log of all sync operations for debugging, conflict analysis, and audit. `file_id` uses `SET NULL` on delete so the log preserves the operation record even after the file is removed.
-
----
+| Entity | Required purpose |
+|--------|------------------|
+| File revision and revision chunks | Immutable manifest, size, digest, causal ancestry, retained sibling bytes |
+| Namespace entry | Stable file ID, parent ID, normalized name, live sibling-name uniqueness |
+| Upload session | Account binding, verified chunks, expiry, reserved quota, staging references |
+| Command receipt | Account, command ID, payload digest, durable outcome and resulting revision |
+| Account changes and outbox | Commit-ordered cursor, tombstone events, durable publication |
+| Device epoch and acknowledgements | Retired actors, replay progress, explicit rebootstrap boundary |
+| Blob lifecycle | Staged/live/deleting states and a protocol shared by writers and collectors |
 
 ## API Design
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| POST | `/api/v1/auth/register` | Create user account |
-| POST | `/api/v1/auth/login` | Authenticate, create session, register device |
-| POST | `/api/v1/auth/logout` | Destroy session |
-| GET | `/api/v1/files` | List files in a folder |
-| POST | `/api/v1/files` | Create file or folder |
-| PUT | `/api/v1/files/:id` | Update file metadata |
-| DELETE | `/api/v1/files/:id` | Soft-delete file |
-| POST | `/api/v1/files/:id/upload` | Upload file content (chunked) |
-| GET | `/api/v1/files/:id/download` | Download file content |
-| POST | `/api/v1/sync/push` | Push local changes to server (idempotent) |
-| GET | `/api/v1/sync/pull` | Pull remote changes since cursor |
-| GET | `/api/v1/sync/conflicts` | List unresolved conflicts |
-| POST | `/api/v1/sync/conflicts/:id/resolve` | Resolve a conflict |
-| GET | `/api/v1/photos` | List photos with pagination |
-| POST | `/api/v1/photos/upload` | Upload photo (generates derivatives) |
-| GET | `/api/v1/photos/:id/thumbnail` | Get thumbnail derivative |
-| GET | `/api/v1/photos/:id/preview` | Get preview derivative |
-| GET | `/api/v1/photos/:id/full` | Get full-resolution original |
-| POST | `/api/v1/photos/:id/favorite` | Toggle favorite status |
-| GET | `/api/v1/devices` | List user's devices |
-| GET | `/api/v1/admin/stats` | Admin system statistics |
-| GET | `/api/v1/admin/users` | Admin user management |
-| GET | `/health` | Full system health check |
-| GET | `/health/live` | Liveness probe |
-| GET | `/health/ready` | Readiness probe |
-| GET | `/metrics` | Prometheus metrics |
-| WS | `/ws` | WebSocket for real-time sync notifications |
+### Implemented HTTP surface
 
----
+All paths below are relative to `/api/v1`. Protected routes use session authentication;
+admin routes also check the cached user's role. These are inventories, not guarantees
+that every operation has correct concurrency semantics.
+
+| Method | Path | Current behavior |
+|--------|------|------------------|
+| POST | `/auth/register`, `/auth/login`, `/auth/logout` | Account/session lifecycle |
+| GET | `/auth/me` | SQL session lookup and current user |
+| GET | `/files?path=...` | Immediate directory entries; optional deleted entries |
+| GET | `/files/:fileId` | File metadata |
+| POST | `/files/folder` | Create a folder from name and parent path |
+| POST | `/files/upload` | Multipart field `file`, optional `parentPath`; entire upload |
+| GET | `/files/:fileId/download` | Assemble current chunks into a response buffer |
+| PATCH / DELETE | `/files/:fileId` | Rename/move or soft-delete |
+| GET | `/files/:fileId/versions` | Version metadata; no historical-byte restore |
+| GET | `/sync/state`, `/sync/changes`, `/sync/conflicts` | Device state, timestamp scan, conflict metadata |
+| POST | `/sync/push` | Apply metadata changes individually |
+| POST | `/sync/resolve-conflict` | Experimental metadata-only resolution |
+| POST | `/sync/delta` | Compare supplied hashes with the current manifest |
+| GET | `/sync/chunk/:chunkHash` | Chunk download after an owner/manifest join |
+| GET / POST | `/photos`, `/photos/upload` | Offset photo list; multipart field `photo` |
+| GET | `/photos/:photoId/thumbnail` | Stream the thumbnail |
+| GET | `/photos/:photoId/preview`, `/photos/:photoId/full` | Stream a preview or original |
+| POST / DELETE | `/photos/:photoId/favorite`, `/photos/:photoId` | Toggle favorite; soft-delete photo |
+| GET / POST | `/photos/albums` | List or create albums |
+| POST | `/photos/albums/:albumId/photos` | Add members to an owned album |
+| GET / POST | `/devices` | List or register devices |
+| GET / PATCH / DELETE | `/devices/:deviceId` | Device detail, name/type update, delete |
+| GET | `/devices/:deviceId/sync-history` | Activity records |
+| GET | `/admin/stats`, `/admin/users`, `/admin/users/:userId` | Diagnostic counts and account views |
+| PATCH | `/admin/users/:userId` | Role/quota updates |
+| GET | `/admin/sync-operations`, `/admin/conflicts` | Administrative lists |
+| POST | `/admin/cleanup-chunks`, `/admin/purge-deleted` | Manual experimental reclamation |
+
+For example, a Drive upload sends multipart `file` and `parentPath`, then receives
+file metadata including ID, path, size, hash, and vector. There is no upload-init,
+chunk-upload, or upload-finalize endpoint. A sync push returns applied IDs, conflicts,
+and per-item errors in a successful HTTP response; callers must inspect those fields.
+
+The proposed production API adds upload sessions, immutable revision reads, payload-bound
+command receipts, a durable changes cursor, and version-conditioned resolution. These
+contracts belong in a new protocol version rather than being inferred from the routes above.
 
 ## Key Design Decisions
 
-### 1. Version Vectors vs Timestamps
+### Preserve causality and content together
 
-Version vectors detect true causality: two devices editing independently produce diverging vectors that cannot be ordered by wall-clock time alone. Timestamps fail because device clocks drift (by seconds to minutes), leading to silent data loss when a "newer" timestamp overwrites a concurrent edit. Version vectors guarantee that concurrent edits are detected as conflicts, never silently lost. The trade-off is increased metadata size (one entry per device) and more complex merge logic, but for a sync service where data integrity is paramount, this is essential.
+A vector can distinguish equal, earlier, later, and concurrent histories; wall clocks
+cannot prove that one edit observed another. I would compare a submitted base under a
+transactional admission boundary and retain both immutable manifests for concurrent
+edits. Joining vector components is metadata reconciliation, not document merging.
 
-### 2. Chunk-Based Storage vs Whole-File
+The cost is retained bytes, conflict UI, and actor lifecycle management. A single-server
+revision token can suffice for simpler online editing; vectors earn their complexity
+when independently edited offline histories must be distinguished. Retiring a device
+requires an epoch/rebootstrap protocol, not silently deleting its vector component.
 
-Chunking files into 4MB content-addressed blocks enables three critical features: (1) deduplication across files and users (common documents stored once), (2) delta sync (only changed chunks uploaded on edit), and (3) resumable uploads (retry from the last successful chunk, not the beginning). The trade-off is increased complexity in the storage layer (chunk manifest tracking, reference counting, garbage collection) and small files being inefficient (a 10KB file still creates a chunk record). We mitigate the small-file overhead by storing files under 1MB inline without chunking.
+### Chunking and private deduplication
 
-### 3. Optimized Storage Mode for Photos
+Fixed-size chunks are simple and bound memory per transfer unit, but inserting bytes
+near the beginning shifts subsequent boundaries and can destroy reuse. Content-defined
+chunking helps that workload at CPU and implementation cost. Start with fixed chunks,
+measure reuse on representative files, and avoid implying that compressed photos gain
+large cross-image savings.
 
-Rather than syncing all full-resolution photos to all devices (which would fill a 128GB iPhone in months), we sync only thumbnails by default and download full-res on demand. The `device_photos` table tracks what each device has locally. This reduces device storage by 95%+ while keeping the full library browsable. The trade-off is latency when opening a photo for the first time (must download from cloud), mitigated by predictive prefetching of recently viewed albums.
+Prefer account-scoped deduplication for the initial private-cloud design. Global content
+hashes introduce cross-account existence signals and complicate encryption and deletion.
+Randomized per-account encryption limits cross-account reuse; convergent encryption
+changes the threat model and is not claimed as an Apple implementation detail.
 
----
+### Durable replay plus lightweight push
 
-## Caching and Edge Strategy
-
-### CDN Layer
-
-Photo derivatives are the highest-bandwidth content. Thumbnails and previews are content-addressed (keyed by hash) and cached at CDN edge with `Cache-Control: public, max-age=31536000, immutable`. Since the content hash changes when the photo changes, no explicit cache invalidation is needed.
-
-### Redis/Valkey Cache
-
-| Data Type | TTL | Pattern | Invalidation |
-|-----------|-----|---------|--------------|
-| File metadata | 1 hour | Cache-aside | On file update/delete |
-| User storage quota | 5 minutes | Cache-aside | On upload/delete |
-| Sync state cursor | 24 hours | Write-through | On sync completion |
-| Photo derivatives | Forever | CDN + content-hash | Never (immutable) |
-| Chunk existence | 1 hour | Cache-aside | On chunk upload |
-| Device list | 15 minutes | Cache-aside | On device register/remove |
-| Idempotency keys | 24 hours | Write-on-submit | Natural expiry |
-
-**Write-Through** is used for sync state because losing the cursor would cause the device to re-sync everything. Both cache and database are written atomically.
-
-**Cache-Aside** is used for file metadata where occasional stale reads (up to TTL) are acceptable. On writes, relevant cache keys are explicitly invalidated.
-
----
+A durable feed recovers changes after a device disconnects. WebSocket or SSE hints reduce
+latency while allowing coalescing during bursts. Polling alone is simpler and may be
+sufficient for less interactive clients. A persistent channel adds connection, heartbeat,
+and reauthorization costs but never eliminates the need for replay.
 
 ## Consistency and Idempotency
 
-### Write Consistency Model
+The proposed transaction commits one accepted metadata outcome and its receipt together.
+That supports repeatable admission, not exactly-once network delivery. Scope receipts by
+account, operation, and stable command ID; compare payload digests and retain receipts
+for the supported retry lifetime. Expired identities require explicit reconciliation.
 
-| Data Type | Consistency | Rationale |
-|-----------|-------------|-----------|
-| File metadata | Strong (transactions) | Must not lose edits |
-| Version vectors | Strong (compare-and-swap) | Conflict detection requires accuracy |
-| Chunk storage | Eventual (content-addressed) | Chunks are immutable; dedup is idempotent |
-| Photo derivatives | Eventual | Regenerated if missing |
-| Sync operations log | Strong (append-only) | Audit trail must be complete |
-| User storage quota | Eventually consistent | Updated after upload/delete, minor lag acceptable |
+Deletes are versioned tombstones. Retain them until active consumers acknowledge the
+relevant feed position, with a bounded offline lease. Expired devices rebootstrap from a
+consistent snapshot before submitting old work. A snapshot and its cursor must describe
+the same boundary; otherwise the client can miss a change between listing and replay.
 
-### Idempotency Implementation
+A collector cannot safely select `reference_count = 0` and delete objects later while
+writers can add references. It must claim candidates under the same lifecycle protocol
+used by publishers, account for staging and retained revisions, and revalidate ownership
+before deletion. Reconciliation repairs counters from authoritative manifests.
 
-**Sync Push**: The client sends an `Idempotency-Key` header derived from `SHA-256(userId + operation + changes_hash)`. The server checks Redis for an existing result:
-- **Found**: Return cached response (safe replay)
-- **Not found**: Acquire a processing lock (5-min TTL), execute the handler, store the result (24h TTL), release the lock
-- **In progress**: Wait up to 30 seconds for the result, or return 409 Conflict with `Retry-After`
+## Security / Auth
 
-This handles the common case where a client times out after 30 seconds, the server actually processed the request, and the client retries -- without the retry causing duplicate files or incorrect version vectors.
+Proposed production controls include object-level authorization on every manifest/media
+request, bounded session caching with expiry and revocation, account-bound upload sessions,
+strict vector/payload limits, and ownership checks on album membership. A digest identifies
+bytes; knowing it is not permission to download them.
 
-**File Upload**: Content-addressed chunks are inherently idempotent. Uploading the same chunk (same hash) twice is a no-op since the chunk store uses the hash as the primary key.
+The local implementation uses bcrypt passwords, SQL sessions, HTTP-only SameSite=Lax
+cookies, secure cookies in production mode, and a Redis session cache. Cache hits reuse
+roles and session state for up to five minutes without a fresh SQL expiry check. Logout
+and role changes do not revoke established sockets. Device display names are reused as
+identity during login; different installations with the same browser/OS name can share
+an actor ID.
 
----
+Photo thumbnails and previews currently send `Cache-Control: public` despite serving
+private account content. A shared cache can reuse a response without invoking origin
+authorization. A proposed private delivery policy needs account-safe cache keys and edge
+authorization, or private/no-store responses. See [MDN's cache privacy explanation](https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/Caching).
 
 ## Observability
 
-### Metrics (Prometheus)
+Pino request logs and correlation IDs, prom-client HTTP/process and domain metrics, and
+health routes are implemented. No Prometheus or Grafana deployment is included. Domain
+counters do not cover all paths: new chunks affect uploaded-byte totals, while photo
+transfers and full-file download totals are not comprehensively measured. The WebSocket
+connection gauge does not decrement on each peer disconnect.
 
-| Category | Metric | Type | Purpose |
-|----------|--------|------|---------|
-| HTTP | `icloud_http_request_duration_seconds` | Histogram | API latency by endpoint |
-| Sync | `icloud_sync_duration_seconds` | Histogram | Sync operation timing |
-| Sync | `icloud_conflicts_total` | Counter | Conflict frequency |
-| Storage | `icloud_chunk_operation_duration_seconds` | Histogram | MinIO/S3 latency |
-| Storage | `icloud_dedup_hits_total` | Counter | Deduplication effectiveness |
-| Cache | `icloud_cache_hits_total` | Counter | Cache hit rate |
-| Circuit | `icloud_circuit_breaker_state` | Gauge | Breaker open/closed status |
-| WebSocket | `icloud_websocket_connections` | Gauge | Active real-time connections |
-
-### Alert Thresholds
-
-| Metric | Warning | Critical |
-|--------|---------|----------|
-| Sync p95 latency | > 5s | > 10s |
-| Sync error rate | > 1% | > 5% |
-| Conflict rate spike | > 10/min | > 50/min |
-| Cache hit rate | < 85% | < 70% |
-| Storage quota > 95% | per-user | per-user |
-| Circuit breaker open | any breaker | storage breaker |
-
-### Structured Logging
-
-Pino JSON logger with:
-- Request correlation IDs for tracing sync operations across services
-- Component child loggers (`syncService`, `chunkService`, `photoService`)
-- Audit logger for security events (file shares, device registrations, admin actions)
-- Development mode: `pino-pretty` for human-readable output
-- Production mode: raw JSON for log aggregators (ELK, Loki)
-
----
+The proposed operational view measures commit latency, oldest pending command, feed lag,
+conflict rate, derivative delay, missing-object errors, and reference reconciliation
+mismatches. Separate notification lag from time until a specific device has all bytes.
+Avoid file IDs and user IDs as unbounded metric labels; logs require deliberate redaction.
 
 ## Failure Handling
 
-### Circuit Breaker for Storage
+Production clients persist intent before showing durable offline acceptance, retry with
+jitter and stable command IDs, and query receipts after ambiguous responses. They keep
+uncommitted bytes until the authoritative outcome is known. Workers retry immutable jobs;
+poisoned images get a terminal processing error rather than blocking a whole queue.
 
-MinIO/S3 failures can cascade to the entire sync service. Three separate circuit breakers protect different operation types:
+Locally, Opossum wraps chunk object operations, but not photo operations or stream
+consumption after `getObject` returns. A timeout does not cancel the underlying write.
+Health instantiates a separate breaker set from the one used by ChunkService, so reported
+breaker health is not the active chunk path's state. `/health/ready` checks SQL and Redis;
+full health lists buckets without verifying required names or object writes.
 
-| Breaker | Timeout | Threshold | Reset | Purpose |
-|---------|---------|-----------|-------|---------|
-| `storage_put` | 30s | 50% error | 30s | Large uploads |
-| `storage_get` | 15s | 50% error | 30s | Downloads |
-| `storage_stat` | 5s | 50% error | 15s | Existence checks |
-
-State machine: CLOSED --(threshold reached)--> OPEN --(reset timeout)--> HALF-OPEN --(3 successes)--> CLOSED.
-
-When a breaker opens, the sync service returns 503 for storage-dependent operations. File metadata operations (list, rename, delete) continue working since they only touch PostgreSQL.
-
-### Retry Strategy
-
-**Client-side**: Exponential backoff (1s base, 2x multiplier, 30s max) with jitter. Idempotency key ensures safe replay. Only 5xx errors are retried; 4xx errors (validation, auth) are not.
-
-**Server-side**: Sync push operations that partially fail (some chunks uploaded, metadata not committed) are rolled back within a database transaction. The client can retry the entire operation safely via idempotency key.
-
-### Graceful Shutdown
-
-On SIGTERM/SIGINT: close WebSocket connections with close frame, drain in-flight HTTP requests, close database pool and Redis connections, close MinIO client, exit.
-
----
+Startup begins listening before dependency checks complete. Shutdown closes SQL/Redis
+before draining HTTP and does not explicitly close WebSocket peers or their heartbeat
+interval. This is not a proven graceful-drain implementation.
 
 ## Scalability Considerations
 
-### What Breaks First
+The first local bottlenecks are whole-file buffering, synchronous Sharp work, unbounded
+folder/conflict lists, and per-event list reloads. Multiple API processes share SQL and
+objects but have separate socket maps and rate-limit stores.
 
-1. **Object storage throughput** -- At scale, chunk uploads/downloads dominate bandwidth. Solution: CDN for reads, multi-region S3 with cross-region replication.
-2. **Sync state database** -- Every file operation writes to `files`, `file_versions`, and `sync_operations`. Solution: user-level sharding (all data for a user on the same shard), read replicas for listing queries.
-3. **WebSocket connections** -- Each online device maintains a persistent connection. At 1B devices, this requires a distributed WebSocket hub (e.g., Redis pub/sub for cross-instance fan-out).
-4. **Photo derivative generation** -- CPU-intensive Sharp operations. Solution: dedicated worker pool with auto-scaling based on queue depth.
-
-### Horizontal Scaling Path
-
-- **Sync service**: Stateless, horizontal scaling behind load balancer. WebSocket connections are sticky by user_id.
-- **Storage service**: Stateless, scales with S3/MinIO throughput. Chunk existence checks cached in Redis.
-- **Database**: User-level sharding. All tables for a user co-located on the same shard for transactional integrity.
-- **Photo workers**: Queue-based with auto-scaling. Derivative generation is embarrassingly parallel.
-
----
+A production path first streams bytes and limits image concurrency, then moves derivatives
+to workers. Partition metadata by account to keep ownership and most transactions local.
+Use shared event delivery for gateways and a durable per-account feed for clients. Add
+replicas for stale-tolerant browsing while keeping revision admission authoritative.
+A very active account eventually outgrows a single serialized feed counter; splitting
+that ordering domain is an explicit protocol change.
 
 ## Trade-offs Summary
 
 | Decision | Chosen | Alternative | Rationale |
 |----------|--------|-------------|-----------|
-| Sync model | Version vectors | Timestamps / CRDTs | Correct conflict detection without clock sync; CRDTs too complex for file sync |
-| Storage | Chunked, content-addressed | Whole file | 30-50% dedup savings, delta sync, resumable uploads |
-| Photo delivery | Optimized (thumbnail-first) | Full sync | 95% device storage savings |
-| Encryption | Per-file keys | Single user key | Granular sharing, independent key rotation |
-| Real-time sync | WebSocket | Polling / SSE | Bidirectional, sub-second latency, connection state tracking |
-| Chunk size | 4MB fixed | Content-defined (Rabin) | Simpler implementation; content-defined better for dedup at scale |
-| Conflict resolution | Version vectors + conflict copies | Last-write-wins | No silent data loss; user decides for irreconcilable conflicts |
-| Session storage | Cookie + token in DB | JWT | Immediate revocation, server-side session data |
-
----
-
-## Frontend Architecture
-
-### Component Hierarchy
-
-```
-App
-├── RouterProvider (TanStack Router)
-│   ├── RootLayout
-│   │   ├── Header (nav: Drive, Photos, Admin + user info + logout)
-│   │   └── Outlet
-│   │       ├── LoginPage
-│   │       ├── RegisterPage
-│   │       ├── DrivePage
-│   │       │   └── FileBrowser
-│   │       │       ├── FileToolbar (upload, new folder, view controls)
-│   │       │       ├── FileStatusBanners (upload progress, conflict alerts)
-│   │       │       ├── SelectionBar (batch actions for selected files)
-│   │       │       ├── FileList
-│   │       │       │   └── FileItemComponent (icon, name, size, modified date)
-│   │       │       ├── DragOverlay (visual feedback during drag-and-drop)
-│   │       │       └── NewFolderModal
-│   │       ├── PhotosPage
-│   │       │   └── PhotoGallery
-│   │       │       ├── PhotoToolbar (upload, albums, favorites filter, view mode)
-│   │       │       ├── PhotoGrid (@tanstack/react-virtual row-based virtualization)
-│   │       │       │   └── PhotoItem (thumbnail, favorite badge, selection checkbox)
-│   │       │       ├── PhotoViewer (lightbox with prev/next, zoom, favorite toggle)
-│   │       │       └── CreateAlbumModal
-│   │       └── AdminPage
-│   │           └── AdminDashboard
-│   │               ├── OverviewTab (StatCards: users, files, storage, sync ops)
-│   │               ├── UsersTab (user list with storage quotas)
-│   │               ├── OperationsTab (recent sync operations log)
-│   │               └── ConflictsTab (unresolved conflicts with resolution actions)
-│   └── common/
-│       ├── StatCard (metric value + label + icon)
-│       ├── LoadingSpinner
-│       └── Modal (reusable dialog wrapper)
-```
-
-### Zustand Stores
-
-Three domain-separated stores manage global state:
-
-**`authStore`** -- Manages authentication lifecycle. Holds the current `user` object, `deviceId`, and session `token`. On login/register, it calls the API, stores the result, and connects the WebSocket service for real-time sync. On logout, it disconnects WebSocket and clears all state. `checkAuth()` restores session from existing httpOnly cookie on page load.
-
-**`fileStore`** -- Manages the iCloud Drive experience. Tracks `files` (current directory listing), `currentPath` (navigation state), `selectedFiles` (Set for multi-select batch operations), `conflicts` (unresolved version conflicts), and `uploadProgress` (Map of filename to percentage). Key behaviors: navigating to a path triggers an automatic file reload; file operations (create, rename, delete) perform API calls then update local state optimistically; `subscribeToChanges()` listens to WebSocket events and reloads files when another device modifies the same directory.
-
-**`photoStore`** -- Manages iCloud Photos. Tracks `photos` (paginated array), `albums`, `selectedPhotos` (Set), `hasMore` (for infinite scroll), `viewMode` (grid/list), and `filter` (all/favorites). Supports cursor-based pagination: `loadMore()` appends the next page of 50 photos without resetting the existing list. Photo uploads prepend new photos to the array. Like the file store, it subscribes to WebSocket events for cross-device sync.
-
-### Routing
-
-Uses TanStack Router with programmatic route definitions (not file-based). The route tree:
-
-| Path | Guard | Component | Purpose |
-|------|-------|-----------|---------|
-| `/` | None | Redirect | Sends authenticated users to `/drive`, others to `/login` |
-| `/login` | None | LoginPage | Email/password authentication |
-| `/register` | None | RegisterPage | New account creation |
-| `/drive` | `protectedBeforeLoad` | DrivePage | File browser (requires auth) |
-| `/photos` | `protectedBeforeLoad` | PhotosPage | Photo gallery (requires auth) |
-| `/admin` | Auth + role check | AdminPage | Admin dashboard (requires `role === 'admin'`) |
-
-Route guards use `useAuthStore.getState()` in `beforeLoad` to check authentication synchronously. Non-admin users attempting to access `/admin` are redirected to `/drive`.
-
-### Data Fetching
-
-All API communication is centralized in `services/api.ts`, which wraps `fetch` calls with `credentials: 'include'` for cookie-based session auth. The API module provides typed methods for every backend endpoint (auth, files, sync, photos, devices, admin). Stores call API methods and update their own state on success. There is no separate data-fetching library (no React Query or SWR) -- stores handle loading states and error tracking directly.
-
-### Real-Time Updates
-
-`services/websocket.ts` provides a WebSocket client that connects after login. Both `fileStore` and `photoStore` subscribe to WebSocket events via `subscribeToChanges()`. When a file or photo operation occurs on another device, the server broadcasts a change event, and the relevant store reloads its data from the API. The WebSocket carries only event types and file IDs -- not file content.
-
-### Key UI Patterns
-
-**Virtualized photo grid**: `PhotoGrid` uses `@tanstack/react-virtual` with row-based virtualization. Photos are arranged in rows (based on viewport width), and only rows visible in the viewport are rendered. This maintains 60fps scrolling with 1000+ photos by avoiding DOM nodes for off-screen content.
-
-**Drag-and-drop file upload**: The `FileBrowser` component listens for `dragenter`, `dragover`, and `drop` events on the file list area. When files are dropped, they are passed to `fileStore.uploadFiles()`, which uploads them sequentially with progress tracking. A `DragOverlay` component provides visual feedback during the drag.
-
-**Multi-select with batch operations**: Both `fileStore` and `photoStore` maintain a `Set<string>` of selected IDs. The `SelectionBar` (files) and `PhotoToolbar` (photos) appear when selections exist, offering batch delete, move-to-album, and other operations.
-
-**Conflict resolution UI**: The `ConflictsTab` in the admin dashboard and `FileStatusBanners` in the drive view display unresolved sync conflicts. Each conflict shows the local and server versions with their version vectors, and offers resolution options: use local, use server, or keep both (creates a conflict copy).
-
----
-
-## Deep Pattern Explanations
-
-This section explains each production-grade backend pattern implemented in this project. Each explanation covers what the pattern is, why it exists, how it works mechanically, and why it matters for a system operating at scale.
-
-### RBAC (Role-Based Access Control)
-
-RBAC is a method for restricting system access based on the roles assigned to individual users, rather than assigning permissions directly to each user. In this project, users have a `role` column in the `users` table (values: `'user'` or `'admin'`). When a request arrives at a protected endpoint, the auth middleware checks the session to identify the user, and route-specific guards check the role.
-
-The purpose of RBAC is to separate "who can do what" from "who is who." Instead of maintaining a per-user permission list (which becomes unmanageable at thousands of users), you define a small set of roles and assign permissions to roles. A user inherits all permissions of their role. In this project, regular users can manage their own files and photos, while admins can view system statistics, manage all users, and inspect sync conflicts across the system.
-
-On the frontend, the TanStack Router `beforeLoad` guard checks `user.role !== 'admin'` and redirects non-admins away from the `/admin` route. On the backend, the admin routes middleware verifies the role server-side, so even direct API calls from non-admin users are rejected with 403 Forbidden.
-
-At production scale, RBAC prevents unauthorized access to sensitive operations (viewing all users' data, modifying system configuration) without requiring complex per-resource permission checks on every request.
-
-### Redis Cache-Aside
-
-Cache-aside (also called "lazy loading") is a caching strategy where the application checks the cache before querying the database, and populates the cache on a miss. The cache does not communicate with the database directly -- the application code sits between them and manages both.
-
-The flow works as follows: (1) The application receives a request for data. (2) It checks Redis for a cached value using a deterministic key (e.g., `file:metadata:{fileId}`). (3) If the key exists (cache hit), the cached value is returned immediately, avoiding a database query. (4) If the key does not exist (cache miss), the application queries PostgreSQL, stores the result in Redis with a TTL (time-to-live), and returns the result.
-
-On writes, the application explicitly invalidates (deletes) the relevant cache keys so that subsequent reads fetch fresh data from the database. This project uses cache-aside for file metadata (1-hour TTL), user storage quota (5-minute TTL), chunk existence checks (1-hour TTL), and device lists (15-minute TTL).
-
-The pattern matters at scale because database queries are orders of magnitude slower than Redis lookups. A file listing that takes 5ms from PostgreSQL takes 0.1ms from Redis. At 100K concurrent users browsing their files, cache-aside reduces database load by 80-90% for read-heavy workloads, keeping p99 latency low and preventing database connection exhaustion.
-
-The trade-off is eventual consistency: after a write, there is a brief window (until the cache key is invalidated) where stale data could be served. For file metadata, this is acceptable -- seeing a file's old modification date for a fraction of a second is harmless. For sync state (where accuracy is critical), this project uses write-through caching instead, updating both cache and database atomically.
-
-### Circuit Breaker
-
-A circuit breaker is a stability pattern that prevents an application from repeatedly calling a failing external service, which would waste resources and increase latency. It works like an electrical circuit breaker: when failures exceed a threshold, the breaker "opens" and subsequent calls fail immediately without attempting the operation.
-
-The circuit breaker has three states:
-
-1. **Closed** (normal operation): Requests flow through to the external service. The breaker monitors the error rate. If failures exceed a threshold (e.g., 50% of recent requests fail), the breaker transitions to Open.
-
-2. **Open** (failing fast): All requests are immediately rejected with a predefined error (e.g., 503 Service Unavailable) without contacting the external service. This protects the system from wasting time on a service that is down. After a reset timeout (e.g., 30 seconds), the breaker transitions to Half-Open.
-
-3. **Half-Open** (probing): A limited number of requests are allowed through to test whether the service has recovered. If they succeed, the breaker closes (back to normal). If they fail, it reopens.
-
-This project uses three separate Opossum-based circuit breakers for MinIO/S3 storage operations: `storage_put` (30s timeout, for large uploads), `storage_get` (15s timeout, for downloads), and `storage_stat` (5s timeout, for existence checks). Each has a 50% error threshold.
-
-The reason for separate breakers per operation type is that they fail independently. A network issue might prevent large uploads (PUT) while small existence checks (HEAD) still work. With a single breaker, a PUT failure would block all storage operations, including reads. With separate breakers, file downloads continue working even when uploads are broken.
-
-At scale, circuit breakers prevent cascade failures. If MinIO becomes slow (e.g., disk saturation), without a breaker, every request would wait 30 seconds for a timeout, consuming a server thread/connection the entire time. With 1000 concurrent requests, that is 1000 threads blocked on a dead service, leaving no capacity for healthy operations like file listing (which only needs PostgreSQL). The breaker short-circuits these calls, returning an error in microseconds instead of seconds.
-
-### Structured Logging
-
-Structured logging means emitting log entries as machine-parseable data (typically JSON objects) rather than free-form text strings. Each log entry contains a set of named fields (timestamp, level, message, request ID, user ID, component name, etc.) that can be indexed, searched, and aggregated by log management systems.
-
-This project uses Pino, a high-performance Node.js JSON logger. In development, `pino-pretty` formats the output for human readability. In production, raw JSON is emitted for consumption by log aggregation systems (ELK stack, Grafana Loki, Datadog).
-
-Key features of the logging setup:
-- **Request correlation IDs**: Each HTTP request is assigned a UUID that propagates through all log entries generated during that request. This allows tracing a single sync operation across multiple log lines (e.g., "chunk upload started" -> "chunk deduplicated" -> "file metadata updated" -> "WebSocket notification sent").
-- **Component child loggers**: Pino child loggers are created for each service component (`syncService`, `chunkService`, `photoService`). Each child logger automatically includes the component name in every log entry, making it trivial to filter logs by component.
-- **Audit logger**: A separate Pino instance for security-sensitive events (file sharing, device registration, admin actions). This log stream can be routed to a separate, tamper-evident storage for compliance.
-
-At scale, structured logging is essential because text-based logging is unsearchable across thousands of server instances. When a user reports "my file sync failed," you need to search across all servers for that user's request ID. With structured logs, this is a simple JSON field query (`requestId == "abc123"`). With text logs, you would need regex matching across terabytes of log files.
-
-### Prometheus Metrics
-
-Prometheus is a time-series monitoring system that collects numerical measurements from applications at regular intervals (scraping). Applications expose an HTTP endpoint (`/metrics`) in a specific text format, and the Prometheus server periodically fetches this endpoint to collect data points.
-
-This project exposes metrics via the `prom-client` library. Each metric has a type:
-
-- **Counter**: A value that only goes up (e.g., `icloud_conflicts_total` -- the total number of sync conflicts detected since the server started). Useful for computing rates: "how many conflicts per minute?"
-- **Histogram**: Records the distribution of values (e.g., `icloud_http_request_duration_seconds` -- how long each API request took). Prometheus computes percentiles (p50, p95, p99) from histograms. This answers "what is the latency that 99% of requests are below?"
-- **Gauge**: A value that goes up and down (e.g., `icloud_websocket_connections` -- how many WebSocket connections are currently active). Useful for capacity monitoring.
-
-The metrics exposed by this project cover HTTP latency by endpoint, sync operation duration, conflict frequency, chunk operation timing (MinIO/S3 latency), deduplication effectiveness (how often chunks are reused), cache hit rates, circuit breaker state, and active WebSocket connections.
-
-At scale, metrics enable alerting and capacity planning. Without metrics, you discover that sync latency is high only when users complain. With metrics, you set an alert: "if sync p95 latency exceeds 5 seconds for 5 minutes, page the on-call engineer." Metrics also reveal trends: "chunk upload latency has been increasing 10% per week" -- which signals an impending storage capacity issue before it becomes a user-facing outage.
-
-### Rate Limiting
-
-Rate limiting restricts how many requests a client can make to the API within a time window. Its purpose is to prevent abuse (intentional or accidental) from overwhelming the server and degrading service for all users.
-
-This project implements rate limiting at 1000 requests per 15-minute window per IP address. The implementation uses Redis to track request counts: each incoming request increments a counter keyed by the client's IP address. If the counter exceeds the limit, the server returns 429 Too Many Requests with a `Retry-After` header indicating when the client can try again.
-
-Rate limiting matters at scale for several reasons: (1) A single misbehaving client (buggy sync engine retrying in a tight loop) could generate thousands of requests per second, consuming database connections and CPU that should serve other users. (2) Malicious actors could attempt brute-force login attacks without rate limiting. (3) Burst traffic from a popular shared album being viewed by hundreds of users simultaneously could overwhelm the photo service.
-
-The trade-off is that legitimate high-volume operations (bulk file upload, initial sync of a large library) may hit the limit. This is mitigated by setting the limit high enough for normal usage patterns and by designing the sync protocol to batch operations efficiently.
-
-### Idempotency
-
-Idempotency means that performing the same operation multiple times produces the same result as performing it once. In a distributed system with unreliable networks, clients frequently retry requests when they do not receive a response (timeout, connection drop). Without idempotency, a retry could create duplicate files, double-count storage quota, or corrupt version vectors.
-
-This project implements idempotency for sync push operations using a Redis-backed idempotency key system. The flow works as follows:
-
-1. The client generates a deterministic key: `SHA-256(userId + operation + changes_hash)` and sends it as the `Idempotency-Key` header.
-2. The server checks Redis for this key. If found, it returns the cached response from the original execution -- the retry is handled without re-executing the operation.
-3. If not found, the server acquires a processing lock (5-minute TTL) in Redis, executes the handler, stores the result in Redis (24-hour TTL), and returns the response.
-4. If another request with the same key arrives while the first is still processing (lock exists), the server waits up to 30 seconds or returns 409 Conflict with `Retry-After`.
-
-File chunk uploads are inherently idempotent because chunks are content-addressed (keyed by SHA-256 hash). Uploading the same chunk twice is a no-op since the storage key is the hash itself. This is a form of "natural idempotency" that requires no additional mechanism.
-
-At scale, idempotency prevents data corruption during network partitions. Consider a mobile device uploading on a flaky cellular connection: the upload completes on the server, but the response is lost. The client retries. Without idempotency, the server would create a duplicate file and increment the version vector incorrectly. With idempotency, the retry returns the original response.
-
-### Health Checks
-
-Health checks are HTTP endpoints that report whether the application is functioning correctly. They are designed for automated systems (load balancers, container orchestrators like Kubernetes) to determine whether to route traffic to an instance.
-
-This project implements a three-tier health check system:
-
-1. **`/health/live`** (liveness probe): Returns 200 if the process is running. This is the simplest check -- if the HTTP server can respond at all, the process is alive. Kubernetes uses this to decide whether to restart a container.
-
-2. **`/health/ready`** (readiness probe): Tests connectivity to all critical dependencies (PostgreSQL, Redis/Valkey, MinIO). If any dependency is unreachable, the endpoint returns 503 Service Unavailable. Kubernetes uses this to decide whether to route traffic -- a server that is alive but cannot reach the database should not receive requests.
-
-3. **`/health`** (full health check): Returns detailed status including dependency latencies, circuit breaker states (open/closed/half-open for each storage breaker), memory usage, and uptime. This is used by monitoring dashboards and human operators, not by automated routing.
-
-The distinction between liveness and readiness is critical at scale. A server stuck in an infinite loop is not live (needs restart). A server that just started and has not yet established database connections is live but not ready (should not receive traffic yet). Conflating these checks leads to either premature restarts (restarting a server that is still initializing) or routing traffic to broken instances (sending requests to a server that cannot reach the database).
-
----
+| Concurrent edits | Retained causal siblings | Wall-clock overwrite | Preserve independent accepted work |
+| Publication | Atomic metadata admission | Independent writes | Head, receipt, and feed agree |
+| Transfers | Verified staged chunks | Whole-file retry | Bound retry cost for large files |
+| Deduplication | Account scope initially | Global hash reuse | Simpler privacy and ownership |
+| Delivery | Durable pull plus push hints | Push-only state | Recover after missed notifications |
+| Photo display | Derivatives on demand | Download every original | Bound bandwidth and decoded memory |
 
 ## Implementation Notes
 
-This section maps the production architecture above to the actual local implementation running on Docker + Node.js + Express + React.
-
-### Local Architecture
+### What actually runs
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│               React Frontend (:5173)                         │
-│  FileBrowser + PhotoGallery + AdminDashboard                │
-│  Drag-and-drop upload, photo viewer, conflict resolution    │
-│  Virtualized photo grid (@tanstack/react-virtual)           │
-│  State: Zustand (fileStore, photoStore, authStore)           │
-└────────────────────────┬──────────────┬─────────────────────┘
-                         │ HTTP         │ WebSocket (:3000/ws)
-                         ▼              ▼
-┌─────────────────────────────────────────────────────────────┐
-│           Express Backend (:3000)                            │
-│  Routes: auth, files, sync, photos, devices, admin          │
-│  Middleware: auth (cookie+token), rate limiting, idempotency │
-│  Services: websocket, chunks, sync                          │
-│  Shared: logger, metrics, cache, circuitBreaker,            │
-│          idempotency, health                                 │
-└──────┬──────────────┬──────────────┬────────────────────────┘
-       │              │              │
-       ▼              ▼              ▼
-┌────────────┐ ┌────────────┐ ┌────────────┐
-│ PostgreSQL │ │   Valkey   │ │   MinIO    │
-│  (:5432)   │ │  (:6379)   │ │(:9000/9001)│
-│ DB:        │ │  Cache,    │ │ Buckets:   │
-│ icloud_sync│ │  idempot., │ │ chunks,    │
-│ User:icloud│ │  rate limit│ │ photos,    │
-│            │ │            │ │ thumbnails │
-└────────────┘ └────────────┘ └────────────┘
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ React browser            │HTTP / WS   │ Express + ws process     │queries     │ PostgreSQL 16            │
+│ In-memory Zustand        │───────────▶│ Routes and sync helpers  │───────────▶│ Mutable file metadata    │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+                                                      │          │
+                                                      │          │
+                                                      │          │    objects
+                                                      │ cache    └────────────────────────────┐
+                                                      │                                       │
+                                                      │                                       │
+                                                      ▼                                       ▼
+                                        ┌──────────────────────────┐            ┌──────────────────────────┐
+                                        │ Valkey                   │            │ MinIO                    │
+                                        │ Session cache / receipts │            │ Chunks and photo objects │
+                                        └──────────────────────────┘            └──────────────────────────┘
 ```
 
-### Production Patterns Actually Implemented
+This is one Express process with route modules, not deployed microservices. The actual
+startup ports, credentials, seeding, and native/Docker alternatives are in the
+[README](./README.md). No CDN, broker, object replication, sharding, native sync client,
+service worker, or persistent browser journal is configured.
 
-| Pattern | File | Why It Matters at Scale |
-|---------|------|------------------------|
-| Structured logging (Pino) | `backend/src/shared/logger.ts` | JSON logs with correlation IDs; audit logger for compliance events (file shares, admin actions) |
-| Prometheus metrics | `backend/src/shared/metrics.ts` | HTTP latency histograms, sync duration, conflict counters, chunk operation timing, WebSocket gauge, dedup hits |
-| Redis caching (dual pattern) | `backend/src/shared/cache.ts` | Cache-aside for file metadata (1h TTL), write-through for sync state (24h TTL); explicit invalidation on writes |
-| Circuit breakers (Opossum) | `backend/src/shared/circuitBreaker.ts` | Separate breakers for storage put (30s), get (15s), stat (5s); prevents MinIO failures from cascading |
-| Idempotency | `backend/src/shared/idempotency.ts` | Redis lock + result cache for sync push operations; prevents duplicate files on client retry |
-| Health checks | `backend/src/shared/health.ts` | Three tiers: `/health/live` (liveness), `/health/ready` (DB+Redis+MinIO), `/health` (full with breaker states) |
-| Version vector sync | `backend/src/services/sync.ts` | Compare-and-detect conflicts, auto-merge or conflict copies, cursor-based pull |
-| Chunk dedup | `backend/src/services/chunks.ts` | SHA-256 content addressing, reference counting, upload-only-missing optimization |
-| WebSocket real-time | `backend/src/services/websocket.ts` | Per-user device broadcast on file operations; excludes originating device |
-| Photo derivatives (Sharp) | `backend/src/routes/photos.ts` | Thumbnail (200px) + preview (1024px) + full-res; stored in separate MinIO buckets |
-| Graceful shutdown | `backend/src/index.ts` | SIGTERM/SIGINT: close WebSocket, drain connections, close pools |
-| Photo grid virtualization | `frontend/src/components/photos/PhotoGrid.tsx` | @tanstack/react-virtual row-based virtualization; constant 60fps with 1000+ photos |
-| Rate limiting | `backend/src/index.ts` | 1000 requests per 15-minute window per IP |
+### Implemented patterns and their boundaries
 
-### Frontend Component Architecture
+| Pattern and source | Actual wiring and limitation |
+|--------------------|------------------------------|
+| [Auth middleware](./backend/src/middleware/auth.ts) | SQL sessions cached in Redis; stale role/expiry and Redis failure affect authorization |
+| [Idempotency](./backend/src/shared/idempotency.ts) | Optional only on sync push/resolve; raw global key, no payload/account scope, async receipt write |
+| [Circuit breakers](./backend/src/shared/circuitBreaker.ts) | Chunk put/get/delete calls; photos bypass them, stream errors occur after breaker completion |
+| [Cache helpers](./backend/src/shared/cache.ts) | Instantiated on app.locals; metadata/quota/sync caches are not invoked by routes |
+| [Logger](./backend/src/shared/logger.ts) | Request timing and correlation; not a durable business audit trail |
+| [Metrics](./backend/src/shared/metrics.ts) | Prometheus endpoint and partial domain instrumentation |
+| [Health](./backend/src/shared/health.ts) | Dependency probes with readiness and breaker-reporting gaps |
+| [Server limiter](./backend/src/index.ts) | Process-memory IP limit, 1,000 requests per 15 minutes; includes health/metrics |
 
-The frontend is organized into feature modules with barrel exports:
+For example, [chunk assembly](./backend/src/services/chunks.ts) verifies each fetched
+chunk before concatenation:
 
-| Module | Components | Purpose |
-|--------|-----------|---------|
-| `files/` | FileList, FileItem, FileToolbar, FileStatusBanners, DragOverlay, NewFolderModal, SelectionBar | iCloud Drive file browser with drag-and-drop |
-| `photos/` | PhotoGrid, PhotoItem, PhotoViewer, PhotoToolbar, CreateAlbumModal | Photo library with virtualized grid and lightbox |
-| `admin/` | OverviewTab, UsersTab, OperationsTab, ConflictsTab | Admin dashboard with system stats |
-| `common/` | StatCard, LoadingSpinner, Modal | Shared UI primitives |
+```typescript
+const actualHash = crypto.createHash('sha256').update(chunkBuffer).digest('hex');
+if (actualHash !== chunk.chunk_hash) {
+  throw new Error(`Chunk integrity check failed for ${chunk.chunk_hash}`);
+}
+```
 
-State management uses Zustand stores (`fileStore`, `photoStore`, `authStore`) for global state and React local state for UI concerns (modals, selections).
+That check detects corrupted fetched bytes. It does not establish manifest completeness:
+assembly receives the rows returned by a join and does not validate final length/hash or
+missing indexes. A missing manifest can produce an empty download, including seeded files.
 
-### Simplifications from Production Design
+### Actual Drive and sync behavior
 
-| Production | Local Substitute | Why |
-|------------|-----------------|-----|
-| S3 with cross-region replication | MinIO (single instance) | S3-compatible API, same code path |
-| CDN for photo derivatives | Direct MinIO access via backend proxy | No edge network needed locally |
-| Distributed WebSocket hub (Redis pub/sub) | In-process WebSocket with per-instance user map | Single server instance, no cross-instance fan-out needed |
-| Content-defined chunking (Rabin fingerprint) | Fixed 4MB chunks | Simpler; Rabin better for dedup at scale |
-| End-to-end encryption (per-file keys) | No encryption | Encryption layer orthogonal to sync protocol |
-| Selective sync (per-folder, per-device) | Full sync to all devices | Feature complexity deferred |
-| Background photo derivative pipeline | Synchronous Sharp processing in upload handler | No worker queue needed at dev scale |
-| OAuth / Apple ID | Cookie + token session auth | Simpler; focused on sync, not identity |
-| Offline queue with IndexedDB | Online-only (no local persistence) | Offline sync requires service worker |
-| Read replicas for listing queries | Single PostgreSQL instance | One database sufficient for dev workload |
+[File upload](./backend/src/routes/files.ts) buffers the entire multipart file, changes
+metadata, removes the old manifest on overwrite, stores chunks, and increments storage
+usage in separate operations. Old references are not decremented on overwrite and quota
+is not enforced. Failures can expose partially published files. Rename changes `name`
+without `path`; folder moves do not update descendant vectors/timestamps, and normal
+routes do not consistently maintain `parent_id`.
 
-### What Was Omitted
+[SyncService](./backend/src/services/sync.ts) compares valid vectors but reads and writes
+without a transaction or compare-and-swap. Concurrent requests can overwrite each other;
+`MAX(version_number) + 1` is also racy. A create-by-path fallback authorizes a matched
+owned row but updates the caller-supplied file ID, which is a distinct authorization bug.
+Delete accepts a causally older vector unless it is concurrent. Resolution keeps metadata
+without copying a chunk manifest, and `use-local` does not install local content.
 
-- **CDN and edge caching** -- no multi-POP deployment
-- **Multi-region deployment** -- single local instance
-- **Kubernetes orchestration** -- Docker Compose only
-- **End-to-end encryption** -- no per-file key management
-- **Offline-first with IndexedDB** -- online-only
-- **Selective sync** -- all files sync to all devices
-- **User-level database sharding** -- single PostgreSQL
-- **Content-defined chunking** -- fixed 4MB chunks
-- **Compression before upload** -- gzip/zstd deferred
-- **Public sharing links** -- share_token column exists but UI not implemented
+[Sync routes](./backend/src/routes/sync.ts) scan mutable `modified_at` timestamps with a
+1,000-row limit, exclude the current device, and have no durable cursor/reset protocol.
+Timestamp ties, precision loss, and delayed commits can break replay. Push can list a
+change as applied even when the service returns `applied: false`; its `file_create` event
+name also differs from the browser's expected `file_created` family.
+
+Optional Redis receipt locks expire after five minutes, are released without comparing
+an ownership token, and save responses asynchronously. The frontend sends no idempotency
+header. These helpers do not make file upload or sync admission exactly once.
+
+### Actual photos, browser state, and cleanup
+
+[Photo upload](./backend/src/routes/photos.ts) directly writes an original plus two JPEG
+derivatives using UUID object keys, then inserts SQL metadata. It does not use the Drive
+chunk pipeline. EXIF fields remain empty for real uploads; fixture camera/date/location
+values are synthetic. Full-resolution delivery records `has_full_res` before streaming,
+which does not prove local persistence, and always advertises JPEG even for other inputs.
+Album additions validate the album owner but not each photo's owner; the returned album
+cover URL has no implemented route.
+
+The browser uses three in-memory Zustand stores and eager programmatic routes. Drive
+lists are not virtualized. The photo grid virtualizes four-column, 200-pixel rows with two
+rows of overscan; it uses lazy thumbnails and a preview viewer. There is no measured
+frame-rate claim. Grid focus semantics, modal focus trapping, responsive row sizing,
+request cancellation, stable viewer identity, and account-scoped reset are unfinished.
+Pagination is offset-based; filter changes and push-triggered reloads can race requests.
+
+[WebSocket auth](./backend/src/services/websocket.ts) requires a Redis-cached session;
+login itself only writes SQL, so an initial socket can fail before a protected HTTP
+request warms that cache. Cookie session restoration never reconnects the browser socket.
+Subscriptions accumulate without cleanup, and reconnection does not pull missed changes.
+
+[Administrative purge](./backend/src/routes/admin.ts) and chunk cleanup use independent
+queries and object deletes. New references can race deletion; retries can distort counts;
+repeated identical chunks in one file are not correctly decremented by the joined update
+([PostgreSQL updates a target row only once](https://www.postgresql.org/docs/16/sql-update.html#SQL-UPDATE-NOTES)).
+There is no offline acknowledgement gate before tombstone removal or photo-object purge.
+These paths demonstrate maintenance concerns without providing a safe reclamation protocol.

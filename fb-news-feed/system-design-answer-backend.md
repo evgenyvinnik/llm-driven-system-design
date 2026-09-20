@@ -48,21 +48,51 @@ feed-session read path. Media processing/CDN is an external dependency that retu
 references and dimensions.
 
 ```
-┌──────────────────────────┐       ┌──────────────────────────┐
-│ Post / graph / likes API │       │ Feed API                 │
-│ Authorized operations    │       │ Current access checks    │
-└────────────┬─────────────┘       └────────────┬─────────────┘
-             ▼                                  ▼
-┌──────────────────────────┐       ┌──────────────────────────┐
-│ SQL records + receipts   │       │ Ranked session IDs       │
-│ Transactional outbox     │       │ Viewer + order + expiry  │
-└────────────┬─────────────┘       └────────────▲─────────────┘
-             ▼                                  │
-┌──────────────────────────┐       ┌──────────────────────────┐
-│ Fan-out workers          │──────▶│ Candidate aggregation    │
-│ Bounded retryable chunks │       │ Pushed + pulled IDs      │
-└──────────────────────────┘       └──────────────────────────┘
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Authors / actors       │       │ Mutation authority     │       │ Canonical SQL          │
+│ Saved mutation ID      │◀─────▶│ Current permission     │◀─────▶│ Posts / graph / likes  │◀───┐
+└────────────────────────┘       │ Receipt + event commit │       │ Receipts + outbox      │    │
+                                 └────────────────────────┘       └────────────────────────┘    │
+                                                                               ▲                │
+                                                                               │                │
+                                                                               ▼                │
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐    │
+│ Pushed candidate IDs   │       │ Fan-out workers        │       │ Outbox relay           │    │
+│ Ordinary author push   │◀─────▶│ Bounded work chunks    │◀─────▶│ Committed events       │    │
+│ Viewer/post identity   │       │ Effect receipt / retry │       │ Durable distribution   │    │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘    │
+             ▲                                                                 ▲                │
+             │                                                                 │                │
+             │                                                                 ▼                │
+             │                   ┌────────────────────────┐       ┌────────────────────────┐    │
+             │                   │ Candidate merge + rank │       │ Hot author timelines   │    │
+             └──────────────────▶│ Push and pull union    │◀─────▶│ Pull expensive authors │    │
+                                 │ Deduplicate / score    │       │ IDs; coverage/version  │    │
+                                 └────────────────────────┘       └────────────────────────┘    │
+                                              ▲                                                 │
+                                              │                                                 │
+                                              ▼                                                 │
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐    │
+│ Reading clients        │       │ Feed API + sessions    │       │ Current hydration      │    │
+│ Opaque session cursor  │◀─────▶│ Frozen order + expiry  │◀─────▶│ Canonical posts/access │◀───┘
+│ Refresh is explicit    │       │ Authorized page read   │       │ Viewer overlay         │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+
+Stable candidate order preserves reading continuity; every page still checks current access.
 ```
+
+I would trace an accepted post through its outbox to two candidate sources: pushed IDs
+for ordinary authors and timelines pulled for expensive authors. The merge ranks and
+freezes a short-lived reading session. Page requests follow that order but hydrate against
+current canonical posts and access rules, so deletion or revocation still takes effect.
+Candidate distribution is asynchronous; it does not decide whether the original post saved.
+
+I would follow a failed fan-out chunk through the return paths:
+
+1. Read the original accepted event and distribution-policy version, then retry the same bounded recipient chunk.
+2. Deduplicate viewer/post effects and record completed progress only after those effects are confirmed; an incomplete cache is not complete coverage.
+3. Candidate reads merge the supported push/pull overlap before freezing a session. Projection progress never establishes current access.
+4. Hydration reads current canonical posts, relationships, and viewer overlays on every page; revocation can remove an item without changing the remaining order.
 
 The post authority commits a source record, an operation receipt, and an outbox event. A
 durable relay schedules recipient work. Feed candidates contain IDs and selection metadata;

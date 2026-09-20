@@ -59,21 +59,47 @@ I would draw a small architecture with separate public discovery and authenticat
 responsibilities.
 
 ```
-┌──────────────────────┐      ┌──────────────────────┐
-│ Browser              │─────▶│ CDN / image variants │
-│ Routes and UI state  │      └──────────────────────┘
-└──────────┬───────────┘
-           ▼
-┌──────────────────────┐      ┌──────────────────────┐
-│ API / session        │─────▶│ Catalog and search   │
-│ Typed client adapter │      │ Public projections   │
-└──────────┬───────────┘      └──────────────────────┘
-           ▼
-┌──────────────────────┐      ┌──────────────────────┐
-│ Cart / checkout      │─────▶│ Orders and payment   │
-│ Authoritative quote  │      │ Durable status       │
-└──────────────────────┘      └──────────────────────┘
+┌────────────────────────────────────────────────────────────┐
+│ BROWSER / PUBLIC QUERY AND PRIVATE ACCOUNT SCOPE           │
+│                                                            │
+│  ┌────────────────────────┐    ┌────────────────────────┐  │    ┌────────────────────────┐
+│  │ Search + product views │    │ Discovery model        │  │    │ Public discovery       │
+│  │ URL filters / history  │◀──▶│ Query-keyed results    │◀─┼───▶│ SSR / search API       │
+│  │ Hydrated public pages  │    │ Facets / freshness     │  │    │ CDN image variants     │
+│  └────────────────────────┘    └────────────────────────┘  │    └────────────────────────┘
+│                                             │              │
+│                              chosen lines   │              │
+│                                             │              │
+│                                             ▼              │
+│  ┌────────────────────────┐    ┌────────────────────────┐  │    ┌────────────────────────┐
+│  │ Cart + purchase views  │    │ Purchase coordinator   │  │    │ Cart + checkout API    │
+│  │ Shop groups / consent  │◀──▶│ Cart revision / quote  │◀─┼───▶│ Authoritative holds    │
+│  │ Unknown outcome status │    │ Saved ID / hold state  │  │    │ Durable purchase state │
+│  └────────────────────────┘    └────────────────────────┘  │    └────────────────────────┘
+│                                                            │
+│  ┌────────────────────────┐    ┌────────────────────────┐  │    ┌────────────────────────┐
+│  │ Seller workspace       │    │ Seller resource state  │  │    │ Seller API             │
+│  │ Listing draft / shop   │◀──▶│ Listing/order versions │◀─┼───▶│ Current shop authority │
+│  │ Fulfillment actions    │    │ Draft/base / saved ID  │  │    │ Accepted revisions     │
+│  └────────────────────────┘    └────────────────────────┘  │    └────────────────────────┘
+│                                                            │
+└────────────────────────────────────────────────────────────┘
+
+Discovery, cart intent, reserved stock and confirmed purchase are different states.
 ```
+
+I would follow a query from the URL into public discovery, then move selected lines into
+an account-scoped cart. Checkout obtains a current quote and hold before the buyer accepts
+payment terms. The purchase coordinator retains the operation identity through an unknown
+outcome. Seller editing and fulfillment use separate shop-scoped resources, so a public
+listing cache never becomes authority for a private action or a stock claim.
+
+I would test the two private workflows after a reload:
+
+1. Restore a bounded account-scoped purchase reference and original operation ID, then fetch current purchase/hold state before enabling another acceptance.
+2. Treat the server's deadline and payment state as authoritative; a local countdown reaching zero does not prove that an unknown payment failed.
+3. Keep seller drafts, their base version, and saved action identity scoped to the selected shop when storage policy permits.
+4. Resolve an uncertain seller action and reload the accepted revision before resubmitting. A public search result may still lag that revision.
 
 Public product and shop pages benefit from server-rendered initial content, discoverable
 metadata, and cached image derivatives. Search can hydrate the initial result page and then

@@ -43,22 +43,50 @@ browser should not own transfer lifetimes, because navigating to another folder 
 unrelated work.
 
 ```
-┌──────────────────┐     ┌──────────────────┐     ┌──────────────────┐
-│ Folder route     │────▶│ Metadata cache   │────▶│ Metadata API     │
-└──────────────────┘     └──────────────────┘     └──────────────────┘
-        │                         ▲                         │
-        ▼                         │                         ▼
-┌──────────────────┐     ┌──────────────────┐     ┌──────────────────┐
-│ Upload manager   │     │ Change listener  │◀────│ Revision feed    │
-│ Worker + queue   │     └──────────────────┘     └──────────────────┘
-└──────────────────┘
-        │
-        ▼
-┌──────────────────┐
-│ Private objects  │
-│ Scoped transfers │
-└──────────────────┘
+BROWSER — first two columns; AUTHORIZED SERVER CONTRACTS — right column
+
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Transfer controls        │act/status  │ Upload manager           │bytes/ACK   │ Upload service           │
+│ Progress / pause / retry │◀──────────▶│ Worker + bounded queue   │◀──────────▶│ Session + verified slots │
+│ Fixed destination + file │    ┌──────▶│ Original intent + slots  │            │ Scoped resumable staging │
+└──────────────────────────┘    │       └──────────────────────────┘            └──────────────────────────┘
+                                │                     ▲
+                                │                     │
+save / restore                  │                     │
+                                │                     │ finalize / result
+                                │                     │
+                                │                     ▼
+┌──────────────────────────┐    │       ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Local transfer journal   │    │       │ Metadata + change sync   │HTTP/change │ Metadata + change API    │
+│ IDs, manifest, receipts  │◀───┘       │ Keyed pages / versions   │◀──────────▶│ Current namespace access │
+│ Account / namespace      │        ┌──▶│ Applied cursor / gaps    │            │ Commit / receipt / feed  │
+└──────────────────────────┘        │   └──────────────────────────┘            └──────────────────────────┘
+                                    │                 ▲
+                                    │                 │
+                                    │ list            │ selected version
+                                    │                 │
+                                    │                 ▼
+┌──────────────────────────┐        │   ┌──────────────────────────┐            ┌──────────────────────────┐
+│ File browser + preview   │◀───────┘   │ Download manager         │range/bytes │ Private delivery         │
+│ URL / selection / dialog │open/state  │ Pinned version + grant   │◀──────────▶│ Scoped immutable bytes   │
+│ Stable file + version    │◀──────────▶│ Bounded range transfer   │            │ Authorized admission     │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+
+A journal can restore transfer identity; original bytes may require verified reselection.
 ```
+
+I would trace a dropped file into an upload manager that survives route changes.
+It hashes bounded slices and resumes verified slots; finalization then goes through the
+metadata contract with the original target, base version and operation ID. Change sync
+reconciles committed namespace revisions into the folder cache. Downloads pin one
+permitted version, so a rename or concurrent replacement cannot mix bytes in one file.
+
+I would use a reload to explain the journal and return arrows:
+
+1. Restore the scoped task ID, target, base version, and manifest; reauthenticate and reconcile server slot receipts before sending more bytes.
+2. If the original file is unavailable, ask for reselection and verify it against that manifest. Persisted metadata does not preserve file access.
+3. Resolve an uncertain finalization by the original operation ID. A conflict preserves staged work without overwriting a newer version.
+4. Restore a change cursor only with its matching local metadata state, or obtain a new snapshot boundary; downloads renew grants for the same pinned version.
 
 React renders the browser and dialogs. TanStack Router owns the namespace and folder location. A
 server-state cache owns folder pages and file versions; Zustand is suitable for the transfer queue,

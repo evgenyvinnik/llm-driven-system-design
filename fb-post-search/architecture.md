@@ -48,18 +48,40 @@ Compose has PostgreSQL 16, Valkey 7, and Elasticsearch 8.11.0 with a 512 MB Java
 Production proposal; a CDN serves the static application and authorized/public media through a separate media contract.
 
 ```
-┌────────────────────────────┐       ┌────────────────────────────┐
-│ Search API + auth          │       │ Post / graph authority     │
-│ PIT / rank / validation    │       │ SQL + receipts + outbox    │
-└─────────────┬──────────────┘       └─────────────┬──────────────┘
-              ▼                                    ▼
-┌────────────────────────────┐       ┌────────────────────────────┐
-│ ES candidate projection    │◀──────│ Versioned index workers    │
-│ Exact visibility tokens    │       │ Bulk + retries + repair    │
-└────────────────────────────┘       └────────────────────────────┘
+PROPOSED DESIGN — current authority validates every returned result
+
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Search clients           │HTTP / page │ Search coordinator       │query/hits  │ ES retrieval projection  │
+│ Query / opaque cursor    │◀──────────▶│ Fixed query / rank / PIT │◀──────────▶│ PIT / index generation   │
+│ Viewer-scoped results    │            │ Bound candidate work     │            │ Audience tokens; hits    │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+                                                      ▲                                       ▲
+                                                      │                                       │
+                                                      │ scope / checked hits                  │ bulk / item results
+                                                      │                                       │
+                                                      ▼                                       ▼
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Authors / actors         │            │ Current validator        │            │ Index workers            │
+│ Post / audience / graph  │            │ Viewer scope + revisions │            │ Version / tombstone      │
+│ Saved operation ID       │            │ Only safe text/snippets  │            │ Per-item retry / repair  │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+              ▲                                       ▲                                       ▲
+              │                                       │                                       │
+              │ change / receipt                      │ read / current state                  │ event / progress
+              │                                       │                                       │
+              ▼                                       ▼                                       ▼
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Mutation API             │commit/read │ Canonical SQL authority  │work / ACK  │ Outbox relay             │
+│ Authorize; commit once   │◀──────────▶│ Posts / graph / receipts │◀──────────▶│ Retained revision events │
+│ Return saved receipt     │            │ Revision + outbox        │            │ Checkpoint / replay      │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+
+Canonical acceptance, index progress, and safe query results are separate outcomes.
 ```
 
 Search serving builds an exact token filter from the viewer's graph context, retrieves a bounded candidate window, and checks current authoritative visibility and record versions before releasing content. The index is a retrieval projection. Outbox workers maintain that projection, while separate suggestion policy prevents hidden content or personal queries leaking through another endpoint.
+
+The upper path obtains current viewer scope, retrieves candidates, and returns only validated text. The lower path accepts identified source mutations independently of index availability. Worker acknowledgements describe individual revision effects and durable progress, not merely a successful bulk HTTP request. Rebuilds use a caught-up replacement generation; existing PIT sessions retain the old generation for a bounded overlap or explicitly expire. These are proposed production boundaries, not additional processes or guarantees in the local demo.
 
 ## Core Components / Request Flows
 

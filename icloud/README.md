@@ -1,277 +1,227 @@
-# Design iCloud Sync - File and Photo Synchronization
+# iCloud Sync — files, photos, and sync experiments
 
-## Codebase Stats
+An educational iCloud-like application with an online Drive, a photo library, and an
+administrator dashboard. The useful design questions are how to recognize concurrent
+edits, keep metadata consistent with stored bytes, and recover after a device disconnects.
+This repository is an independent teaching project; it does not describe Apple's internals.
 
-| Metric | Value |
-|--------|-------|
-| Total SLOC | 13,438 |
-| Source Files | 88 |
-| .ts | 7,240 |
-| .tsx | 3,361 |
-| .md | 2,151 |
-| .sql | 233 |
-| .json | 172 |
+The browser currently uploads whole files. The API divides Drive uploads into 4 MiB,
+SHA-256-addressed chunks and can compare chunk manifests for download experiments.
+Version-vector and conflict endpoints exist, but the browser does not run a durable
+bidirectional sync engine. Offline journaling, resumable uploads, and safe conflict
+preservation are proposed extensions, not completed features.
 
-## Overview
+## What you can explore
 
-A simplified iCloud-like platform demonstrating file synchronization, conflict resolution, and cross-device consistency. This educational project focuses on building a sync service that handles photos, documents, and app data across devices.
+| Area | Implemented behavior | Important boundary |
+|------|----------------------|--------------------|
+| Drive | Browse folders, upload, download, rename, soft-delete, drag and drop | Whole uploads buffered in memory; 100 MiB per file |
+| Chunk storage | Server-side chunk deduplication and per-chunk download verification during assembly | Metadata, references, and object writes are not atomic |
+| Sync API | Vector comparison, changes query, conflicts, device state, delta manifest | No reliable replay log, transactional conflict admission, or restorable history |
+| Photos | Upload, 200-pixel square thumbnails, previews up to 1024 pixels, favorites, delete | 50 MiB uploads; EXIF capture data is not parsed |
+| Photo UI | Four-column row virtualization, lazy thumbnails, preview viewer, album creation | No album browser, offline originals, or storage eviction manager |
+| Notifications | WebSocket events within one API process | Session restoration and cross-instance delivery are incomplete |
+| Administration | Statistics, user search, operation/conflict lists, manual cleanup/purge | Counts are diagnostic; maintenance is not concurrency-safe |
 
-## Key Features
+Double-click a Drive folder to open it or a file to download it; right-click for rename
+and delete. In Photos, click to select and double-click to open the preview. Conflict
+warnings are shown, but the current UI has no conflict-resolution dialog. Device and
+version APIs likewise have no dedicated management screens.
 
-### 1. File Synchronization
-- Bidirectional sync with version vectors
-- Delta sync (only upload/download changed chunks)
-- Chunk-based file transfer with deduplication
-- Real-time sync notifications via WebSocket
+## Stack and source map
 
-### 2. Conflict Resolution
-- Version vector-based conflict detection
-- Automatic merge when possible
-- Conflict copies for manual resolution
-- Full version history
+React 19, TypeScript, Vite, TanStack Router, Zustand, Tailwind, and TanStack Virtual run
+in the frontend. One Express process serves REST and WebSocket traffic. PostgreSQL 16
+stores metadata; Valkey provides Redis-compatible session caching and optional request
+receipts; MinIO stores chunks and photo objects. Sharp produces photo derivatives.
 
-### 3. Photo Library
-- Full-resolution cloud storage
-- Automatic thumbnail and preview generation
-- Optimized device storage
-- Album management
+| Source | Responsibility |
+|--------|----------------|
+| [Server entry](./backend/src/index.ts) | Middleware, routes, health, metrics, WebSocket setup |
+| [Schema](./backend/src/db/init.sql) | Thirteen metadata, account, and sync tables |
+| [File routes](./backend/src/routes/files.ts) | Whole-file upload and Drive operations |
+| [Sync service](./backend/src/services/sync.ts) | Vector comparison and conflict experiments |
+| [Chunk service](./backend/src/services/chunks.ts) | Chunk manifests, storage, assembly, cleanup |
+| [Photo routes](./backend/src/routes/photos.ts) | Derivatives, photos, and albums |
+| [File state](./frontend/src/stores/fileStore.ts) / [photo state](./frontend/src/stores/photoStore.ts) | In-memory browser state |
+| [Photo grid](./frontend/src/components/photos/PhotoGrid.tsx) | Virtualized rows |
 
-### 4. Multi-Device Support
-- Device registration and management
-- Per-device sync state tracking
-- Cross-device real-time notifications
-- Sync history per device
+## Prerequisites
 
-### 5. Admin Dashboard
-- System-wide statistics
-- User management
-- Sync operation monitoring
-- Storage optimization tools
+Use Node.js 20 or newer and npm. Run one project at a time on the default ports. Choose
+one infrastructure option below; application processes run on the host in both cases.
+Commands begin in this repository's root unless a different directory is stated.
 
-## Tech Stack
-
-- **Frontend:** TypeScript + Vite + React 19 + Tanstack Router + Zustand + Tailwind CSS
-- **Backend:** Node.js + Express
-- **Database:** PostgreSQL
-- **Cache:** Redis
-- **Object Storage:** MinIO (S3-compatible)
-- **Real-time:** WebSocket
-
-## Implementation Status
-
-- [x] Initial architecture design
-- [x] File metadata sync
-- [x] Chunk-based upload/download
-- [x] Conflict detection with version vectors
-- [x] Photo library sync with derivatives
-- [x] Multi-device state management
-- [x] Admin dashboard
-- [x] Documentation
-
-## Quick Start
-
-### Prerequisites
-
-- Node.js 18+
-- Docker and Docker Compose
-
-### 1. Start Infrastructure
+### Option A: Docker Compose
 
 ```bash
 cd icloud
-docker-compose up -d
+docker compose up -d
+docker compose ps
+docker compose logs minio-init
+docker compose exec postgres pg_isready -U icloud -d icloud_sync
+docker compose exec redis redis-cli ping
+curl --fail http://localhost:9000/minio/health/live
 ```
 
-This starts:
-- PostgreSQL on port 5432
-- Redis on port 6379
-- MinIO on ports 9000 (API) and 9001 (Console)
+Compose initializes the SQL schema only when PostgreSQL's data volume is first created.
+There is no `db:migrate` script. The MinIO initializer creates `icloud-chunks`,
+`icloud-photos`, and `icloud-thumbnails`; inspect its logs because its final success exit
+can mask a failed bucket command.
 
-MinIO Console: http://localhost:9001 (admin: minioadmin / minioadmin123)
+The checked-in Compose file uses unpinned `minio/minio:latest` and `minio/mc:latest`
+images. Their availability was not verified by pulling them in this review. MinIO's
+upstream community repository is archived and documents source-only distribution;
+if these image pulls fail, use the native option or an explicitly selected local image.
+See the [upstream status and build instructions](https://github.com/minio/minio).
 
-### 2. Start Backend
+Stop services while retaining data with `docker compose down`. For an intentional,
+destructive reset of this demo's database and objects, `docker compose down -v` removes
+its named volumes; the next start initializes a fresh schema.
+
+### Option B: Native installation on macOS
+
+Install and start PostgreSQL and Valkey:
 
 ```bash
-cd backend
+brew install postgresql@16 valkey minio minio-mc
+brew services start postgresql@16
+brew services start valkey
+export PATH="$(brew --prefix postgresql@16)/bin:$PATH"
+createuser --login --pwprompt icloud
+createdb --owner=icloud icloud_sync
+PGPASSWORD=icloud_secret psql -h localhost -U icloud -d icloud_sync \
+  -v ON_ERROR_STOP=1 -f icloud/backend/src/db/init.sql
+pg_isready -h localhost -U icloud -d icloud_sync
+valkey-cli ping
+```
+
+Enter `icloud_secret` at the role password prompt. These role, database, and schema
+commands are for a fresh installation, not a repeatable migration. Existing installations
+should verify their state before rerunning them.
+
+Homebrew currently lists [minio](https://formulae.brew.sh/formula/minio) as deprecated,
+with a scheduled disable date of February 17, 2027; [minio-mc](https://formulae.brew.sh/formula/minio-mc)
+provides the `mc` command. Package availability can change.
+
+In a separate terminal, keep the MinIO server running:
+
+```bash
+mkdir -p "$HOME/.local/share/icloud-minio"
+MINIO_ROOT_USER=minioadmin MINIO_ROOT_PASSWORD=minioadmin123 \
+  minio server "$HOME/.local/share/icloud-minio" --console-address ':9001'
+```
+
+Then create and verify the three buckets:
+
+```bash
+mc alias set icloud-local http://localhost:9000 minioadmin minioadmin123
+mc mb --ignore-existing icloud-local/icloud-chunks
+mc mb --ignore-existing icloud-local/icloud-photos
+mc mb --ignore-existing icloud-local/icloud-thumbnails
+mc ls icloud-local
+curl --fail http://localhost:9000/minio/health/live
+```
+
+## Start the application and seed data
+
+In one terminal, from the repository root:
+
+```bash
+cd icloud/backend
+npm install
+npm run db:seed
+npm run dev
+```
+
+`db:seed` and `db:seed:photos` execute the same script. It applies
+[base.sql](./backend/db-seed/base.sql), then fetches up to twelve Unsplash images and
+writes their originals and derivatives into MinIO. Network failures can leave a partial
+photo set; any existing photo for the demo user makes a later run skip that photo batch.
+The seed does not reconcile storage counters.
+
+Seeded Drive files contain illustrative metadata only: they have no chunk manifests or
+object bytes. Upload your own small file to exercise an actual download. Seeded photo
+dates, camera fields, locations, and hashes are illustrative fixture values.
+
+In another terminal, from the repository root:
+
+```bash
+cd icloud/frontend
 npm install
 npm run dev
 ```
 
-Backend runs on http://localhost:3001
+Open [the application](http://localhost:5173). The frontend proxies `/api` and `/ws` to
+port 3001. The MinIO console is at [localhost:9001](http://localhost:9001).
 
-### 3. Start Frontend
+| Account after seeding | Password |
+|-----------------------|----------|
+| `user@icloud.local` | `password123` |
+| `admin@icloud.local` | `password123` |
 
-```bash
-cd frontend
-npm install
-npm run dev
-```
+The login page and SQL comments advertise different passwords; the fixture hash matches
+`password123` for both accounts. Registration also creates an ordinary user, but does not
+add sample photos or administrator privileges.
 
-Frontend runs on http://localhost:5173
+## Configuration
 
-### Demo Accounts
+These defaults are read directly from the process environment in
+[db.ts](./backend/src/db.ts). The application does not load a `.env` file itself. Export
+changed values in the terminal before starting it; `DATABASE_URL` and `REDIS_URL` are
+not consumed by this project.
 
-- **Admin:** admin@icloud.local / password123
-- **User:** user@icloud.local / password123
+| Variable | Default / meaning |
+|----------|-------------------|
+| `POSTGRES_HOST`, `POSTGRES_PORT` | `localhost`, `5432` |
+| `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD` | `icloud_sync`, `icloud`, `icloud_secret` |
+| `REDIS_HOST`, `REDIS_PORT` | `localhost`, `6379` |
+| `MINIO_ENDPOINT`, `MINIO_PORT` | `localhost`, `9000`; endpoint is a hostname |
+| `MINIO_USE_SSL` | Enabled only when exactly `true` |
+| `MINIO_ACCESS_KEY`, `MINIO_SECRET_KEY` | `minioadmin`, `minioadmin123` |
+| `FRONTEND_URL` | `http://localhost:5173`, credentialed CORS origin |
+| `PORT` | Source fallback 3000; development scripts explicitly choose 3001–3003 |
+| `NODE_ENV` | Development scripts set `development`; `start` sets `production` |
+| `LOG_LEVEL`, `APP_VERSION` | Optional logging and health metadata overrides |
 
-## Project Structure
+`npm start` runs TypeScript through `tsx` and enables secure cookies; configure HTTPS and
+an appropriate proxy for that mode. A frontend production build also needs `/api` and
+`/ws` routing; Vite's development proxy is not included in static assets.
 
-```
-icloud/
-├── docker-compose.yml     # PostgreSQL, Redis, MinIO
-├── backend/
-│   ├── package.json
-│   ├── db/
-│   │   └── init.sql       # Database schema
-│   └── src/
-│       ├── index.js       # Express server
-│       ├── db.js          # Database connections
-│       ├── middleware/
-│       │   └── auth.js    # Session authentication
-│       ├── routes/
-│       │   ├── auth.js    # Login/register/logout
-│       │   ├── files.js   # File CRUD operations
-│       │   ├── sync.js    # Sync protocol endpoints
-│       │   ├── photos.js  # Photo management
-│       │   ├── devices.js # Device management
-│       │   └── admin.js   # Admin operations
-│       └── services/
-│           ├── chunks.js  # Chunk storage service
-│           ├── sync.js    # Sync logic with version vectors
-│           └── websocket.js # Real-time notifications
-└── frontend/
-    ├── package.json
-    ├── vite.config.ts
-    └── src/
-        ├── main.tsx
-        ├── App.tsx
-        ├── router.tsx     # Tanstack Router setup
-        ├── components/
-        │   ├── FileBrowser.tsx
-        │   ├── PhotoGallery.tsx
-        │   ├── AdminDashboard.tsx
-        │   └── Icons.tsx
-        ├── routes/
-        │   ├── LoginPage.tsx
-        │   ├── RegisterPage.tsx
-        │   ├── DrivePage.tsx
-        │   ├── PhotosPage.tsx
-        │   └── AdminPage.tsx
-        ├── stores/
-        │   ├── authStore.ts
-        │   ├── fileStore.ts
-        │   └── photoStore.ts
-        ├── services/
-        │   ├── api.ts
-        │   └── websocket.ts
-        └── types/
-            └── index.ts
-```
+## Verification and known limitations
 
-## API Endpoints
+From each of `icloud/backend` and `icloud/frontend`, `npm run type-check` and
+`npm run build` are available. Both packages also expose lint and format scripts.
+Health endpoints are `/health`, `/health/live`, and `/health/ready`; Prometheus text is
+at `/metrics`. Readiness checks PostgreSQL and Redis, not object-storage readiness.
 
-### Authentication
-- `POST /api/v1/auth/register` - Create account
-- `POST /api/v1/auth/login` - Sign in
-- `POST /api/v1/auth/logout` - Sign out
-- `GET /api/v1/auth/me` - Get current user
+The project-root `npm run test:e2e` runs Playwright and can start only the frontend.
+Its smoke tests use `alice@example.com / password123`, which the seed does not create,
+and reuse that identity for an admin test. They are not a valid fresh-seed acceptance
+suite without reconciling those assumptions. The repository screenshot configuration
+uses the seeded accounts instead.
 
-### Files
-- `GET /api/v1/files` - List files in folder
-- `GET /api/v1/files/:id` - Get file metadata
-- `POST /api/v1/files/folder` - Create folder
-- `POST /api/v1/files/upload` - Upload file
-- `GET /api/v1/files/:id/download` - Download file
-- `PATCH /api/v1/files/:id` - Rename/move file
-- `DELETE /api/v1/files/:id` - Delete file
-- `GET /api/v1/files/:id/versions` - Get version history
+This documentation review inspected source, schema, scripts, and fixtures; it did not
+start the full stack or establish throughput, multi-device correctness, or accessibility.
 
-### Sync
-- `GET /api/v1/sync/state` - Get device sync state
-- `GET /api/v1/sync/changes` - Get changes since last sync
-- `POST /api/v1/sync/push` - Push local changes
-- `GET /api/v1/sync/conflicts` - Get unresolved conflicts
-- `POST /api/v1/sync/resolve-conflict` - Resolve conflict
-- `POST /api/v1/sync/delta` - Get delta for file
-- `GET /api/v1/sync/chunk/:hash` - Download chunk
+Current limitations worth investigating:
 
-### Photos
-- `GET /api/v1/photos` - List photos
-- `POST /api/v1/photos/upload` - Upload photo
-- `GET /api/v1/photos/:id/thumbnail` - Get thumbnail
-- `GET /api/v1/photos/:id/preview` - Get preview
-- `GET /api/v1/photos/:id/full` - Get full resolution
-- `POST /api/v1/photos/:id/favorite` - Toggle favorite
-- `DELETE /api/v1/photos/:id` - Delete photo
-- `GET /api/v1/photos/albums` - List albums
-- `POST /api/v1/photos/albums` - Create album
+- Upload publication, version updates, reference counts, and quota accounting lack a
+  shared transaction. Overwrites and concurrent requests can leave inconsistent state.
+- Conflict copies have metadata but no copied chunk manifest; history does not preserve
+  immutable file bytes. The changes endpoint scans mutable timestamps, not a replay log.
+- Browser state disappears on reload. Request races and reconnect gaps can leave stale
+  lists; WebSocket delivery is process-local and restored sessions do not reconnect it.
+- Private photo routes currently send public cache directives. Album membership checks,
+  cached authorization, and optional idempotency-key scoping need further hardening.
+- Cleanup and purge are experimental maintenance paths. They do not implement safe
+  concurrent reference reclamation or offline-device tombstone acknowledgement.
 
-### Devices
-- `GET /api/v1/devices` - List devices
-- `POST /api/v1/devices` - Register device
-- `DELETE /api/v1/devices/:id` - Remove device
-- `GET /api/v1/devices/:id/sync-history` - Get sync history
+You can start `dev:server2` and `dev:server3` in additional backend terminals, but there
+is no load balancer or shared WebSocket fanout. This demonstrates the scaling gap rather
+than a completed distributed deployment.
 
-### Admin
-- `GET /api/v1/admin/stats` - System statistics
-- `GET /api/v1/admin/users` - List users
-- `PATCH /api/v1/admin/users/:id` - Update user
-- `GET /api/v1/admin/sync-operations` - Recent operations
-- `GET /api/v1/admin/conflicts` - All conflicts
-- `POST /api/v1/admin/cleanup-chunks` - Cleanup orphaned chunks
-- `POST /api/v1/admin/purge-deleted` - Purge deleted files
-
-## Key Design Decisions
-
-### Version Vectors for Conflict Detection
-Each file maintains a version vector `{deviceId: sequenceNumber}` that tracks modifications from each device. When syncing, we compare vectors to detect:
-- **Local newer:** Local has higher sequence for some device
-- **Server newer:** Server has higher sequence for some device
-- **Conflict:** Both have changes not seen by the other
-
-### Chunk-Based Storage
-Files are split into 4MB chunks identified by SHA-256 hash. This enables:
-- **Deduplication:** Same chunk stored once across all files
-- **Delta sync:** Only download/upload changed chunks
-- **Resumable transfers:** Resume interrupted uploads/downloads
-
-### Photo Derivatives
-Photos are stored in multiple resolutions:
-- **Full resolution:** Original quality in MinIO
-- **Preview (1024px):** For viewing in app
-- **Thumbnail (200px):** For grid display
-
-Devices can choose to store only thumbnails locally and download full resolution on demand.
-
-## Running Multiple Backend Instances
-
-For testing distributed scenarios:
-
-```bash
-# Terminal 1
-npm run dev:server1  # Port 3001
-
-# Terminal 2
-npm run dev:server2  # Port 3002
-
-# Terminal 3
-npm run dev:server3  # Port 3003
-```
-
-## Architecture
-
-See [architecture.md](./architecture.md) for detailed system design documentation.
-
-## Development Notes
-
-See [claude.md](./claude.md) for development insights and design decisions.
-
-## References & Inspiration
-
-- [CloudKit Documentation](https://developer.apple.com/documentation/cloudkit) - Apple's framework for iCloud data storage and sync
-- [iCloud Security Overview](https://support.apple.com/en-us/HT202303) - Apple's documentation on iCloud data protection
-- [NSFileCoordinator Documentation](https://developer.apple.com/documentation/foundation/nsfilecoordinator) - File coordination for conflict prevention
-- [How Dropbox Designed Its Sync Engine](https://dropbox.tech/infrastructure/how-we-designed-dropbox-atf) - Dropbox's sync architecture patterns
-- [Vector Clocks Explained](https://en.wikipedia.org/wiki/Vector_clock) - Distributed systems causality tracking
-- [Content-Defined Chunking in Restic](https://restic.readthedocs.io/en/latest/100_references.html#design) - Efficient chunking algorithms for deduplication
-- [Building a Distributed File Sync Service](https://www.allthingsdistributed.com/2007/12/eventually_consistent.html) - Werner Vogels on eventual consistency patterns
+Read [architecture.md](./architecture.md) for precise implementation boundaries and
+[frontend](./system-design-answer-frontend.md), [backend](./system-design-answer-backend.md),
+or [fullstack](./system-design-answer-fullstack.md) for whiteboard interview proposals.
+[CLAUDE.md](./CLAUDE.md) records development history and may describe earlier intentions.

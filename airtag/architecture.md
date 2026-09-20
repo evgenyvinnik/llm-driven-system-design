@@ -78,25 +78,56 @@ uses one latest-location request per listed device and polls selected history ev
 ## High-Level Architecture
 
 ```
-┌──────────────┐       ┌─────────────────────┐       ┌─────────────────┐
-│ Item beacon  │──────▶│ Nearby finder / OS  │──────▶│ Ingestion API   │
-│ Rotating key │ BLE   │ Encrypt observation │ HTTPS │ Validate, admit │
-└──────────────┘       └──────────┬──────────┘       └────────┬────────┘
-                                 │ safety signals            ▼
-                       ┌─────────▼──────────┐       ┌─────────────────┐
-                       │ Local unwanted-   │       │ Durable log /   │
-                       │ tracker detection  │       │ report workers  │
-                       └────────────────────┘       └────────┬────────┘
-                                                            ▼
-┌──────────────────────┐      ┌─────────────────┐   ┌─────────────────┐
-│ Owner app            │◀────▶│ Bounded query API│◀─▶│ Opaque report   │
-│ Keys, decrypt, map   │      │ and read cache  │   │ store + index   │
-└──────────────────────┘      └─────────────────┘   └─────────────────┘
+NEARBY PLATFORM                                                                 REPORT SERVICE: CIPHERTEXT
+
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Item beacon              │BLE         │ Nearby finder / OS       │report/ACK  │ Ingestion API            │
+│ Rotating public value    │───────────▶│ Observe + encrypt        │◀──────────▶│ Validate opaque envelope │
+│ Broadcast                │            │ Stable report ID / retry │            │ ACK after log commit     │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+                                                      │                                       ▲
+                                                      │                                       │
+                                                      │ nearby evidence                       │ commit / ACK
+                                                      │                                       │
+                                                      ▼                                       ▼
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Affected person UI       │evidence/UI │ Nearby safety path       │            │ Durable report log       │
+│ Evidence and actions     │◀──────────▶│ Detect / action progress │            │ Committed envelopes      │
+│ Independent of owner     │            │ Platform integration     │            │ Replay after worker loss │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+                                                                                              │
+                                                                                              │ replay / persist
+                                                                                              │
+OWNER DEVICE / PRIVATE STATE                                                                  │
+                                                                                              ▼
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Local key boundary       │local use   │ Owner report client      │            │ Workers + report store   │
+│ Unlock / use / clear     │───────────▶│ Cache IDs / decrypt      │◀────┐      │ Idempotent report IDs    │
+│ No keys sent to API      │            │ Merge; reject stale work │     │      │ Persist then checkpoint  │
+└──────────────────────────┘            └──────────────────────────┘     │      └──────────────────────────┘
+                                                      ▲                  │                    ▲
+                                                      │                  │                    │
+                             selection / evidence     │                  │                    │
+Key material stays local.                             │                  │ tokens/envelopes   │
+                                                      │                  │                    │ query / result
+                                                      │                  │                    │
+                                                      ▼                  │                    ▼
+                                        ┌──────────────────────────┐     │      ┌──────────────────────────┐
+                                        │ Observation model + map  │     └─────▶│ Query API + cache        │
+                                        │ Observed time + accuracy │            │ Auth / bounded batches   │
+                                        │ Refresh and key errors   │            │ Opaque bytes + cursor    │
+                                        └──────────────────────────┘            └──────────────────────────┘
 ```
 
 Account/pairing metadata is a separate concern from report contents. The owner app
 obtains its keys through a protected local pairing and encrypted synchronization
 flow. The report service has ciphertext and lookup tokens, not a decrypting key store.
+
+The finder receives acceptance after the log commit; workers may still be making the
+report queryable. Worker recovery replays the committed envelope with the same report
+identity and advances progress only after persistence. The owner follows the bounded
+query path, decrypts locally, and merges observations by identity and observation time.
+The safety path has its own evidence and action results, independent of owner refresh.
 
 The nearby device handles safety observations through a dedicated platform path.
 Uploading every person's plaintext movement history to a centralized anti-stalking

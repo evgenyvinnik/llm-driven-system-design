@@ -12,12 +12,12 @@ and where it falls short.
 | Time | Discussion |
 |------|------------|
 | 5 minutes | Scope, guarantees, and sizing |
-| 5 minutes | Architecture and shared contracts |
+| 6 minutes | Architecture and shared contracts |
 | 9 minutes | Deep dive: one booking across client and server |
 | 8 minutes | Deep dive: calendar dates and availability |
 | 8 minutes | Deep dive: changes, reminders, and notifications |
 | 6 minutes | Host workflows, failure handling, and growth |
-| 4 minutes | Verification and implementation boundary |
+| 3 minutes | Verification and implementation boundary |
 
 ## 🎯 Scope, guarantees, and sizing — 5 minutes
 
@@ -56,25 +56,66 @@ I would target availability p95 below 200 ms and booking p99 below 500 ms, with 
 booking availability. Those are planning targets to validate. The confirmation screen
 should appear after durable acceptance; email delivery has a separate delay objective.
 
-## 🏗️ Architecture and shared contracts — 5 minutes
+## 🏗️ Architecture and shared contracts — 6 minutes
 
 I would draw the complete flow without splitting every function into a microservice:
 
 ```
-┌────────────────┐       ┌────────────────┐
-│ Guest calendar │──────▶│ Scheduling API │
-│ Host dashboard │◀──────│ Auth + policy  │
-└────────────────┘       └───────┬────────┘
-                                 ▼
-                         ┌────────────────┐
-                         │ Booking store  │
-                         │ Receipt/outbox │
-                         └───────┬────────┘
-                                 ▼
-                         ┌────────────────┐
-                         │ Jobs / workers │──────▶ Providers
-                         └────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│ BROWSER / DISTINCT GUEST AND HOST AUTHORIZATION CONTEXTS                                 │
+│                                                                                          │
+│  ┌────────────────────────┐    ┌────────────────────────┐    ┌────────────────────────┐  │
+│  │ Guest calendar + query │    │ Booking form + attempt │    │ Host rules + dashboard │  │
+│  │ Zone + covered slots   │◀──▶│ Saved ID + instant     │    │ Draft and saved policy │  │
+│  └────────────────────────┘    │ Confirmed result       │    │ Host session scope     │  │
+│                       ▲        └────────────────────────┘    └────────────────────────┘  │
+│                       │                     ▲                                        ▲   │
+│                       │                     │                                        │   │
+└───────────────────────┼─────────────────────┼────────────────────────────────────────┼───┘
+                        │                     │                                        │
+range / zone            │  create / recover   │                 policy changes         │
+                        ▼                     ▼                                        ▼
+┌────────────────────────┐       ┌─────────────────────────────────────────────────────────┐
+│ Availability API       │       │ Reservation and policy APIs                             │
+│ Same scheduling rules  │       │ Validate current eligibility under the host lock        │
+│ Covered instant range  │       │ Atomic create, cancel, reschedule and policy changes    │
+└────────────────────────┘       └─────────────────────────────────────────────────────────┘
+             ▲                                                                 ▲
+             │                                                                 │
+read view    │                    current policy / atomic commit               │
+             │                                                                 │
+             ▼                                                                 ▼
+┌────────────────────────┐       ┌─────────────────────────────────────────────────────────┐
+│ Availability cache     │       │ PostgreSQL authority                                    │
+│ Versioned range views  │◀─────▶│ Booking + occupied range + receipt + history + outbox   │
+│ Refresh on change      │       │ Reschedule keeps the old booking if the move fails      │
+└────────────────────────┘       └─────────────────────────────────────────────────────────┘
+                                              ▲
+                                              │
+accepted revision / delivery state            │
+                                              │
+                                              ▼
+                                 ┌────────────────────────┐       ┌────────────────────────┐
+                                 │ Outbox + reminders     │       │ Email / integrations   │
+                                 │ Leased revision checks │◀─────▶│ External delivery      │
+                                 │ Delivery receipts      │       │ Separate from booking  │
+                                 └────────────────────────┘       └────────────────────────┘
+
+The confirmation uses the committed booking; email has its own recoverable outcome.
 ```
+
+I would trace a guest's chosen instant through one identified attempt to a host
+transaction and back into the confirmation. Availability and cached ranges help
+choose the time but do not reserve it. Host policy edits use the same coordination
+boundary, while outbox work carries the accepted booking revision into reminders and
+delivery. A conflict preserves the guest's draft, and a failed reschedule preserves
+the original reservation rather than turning it into an inactive historical action.
+
+The saved operation reference and scoped recovery proof survive a page refresh.
+The client uses them to recover the reservation, while the worker uses durable job
+identity and revision checks to recover delivery. A stale reminder is suppressed
+after a later booking change. Guest confirmation continues to come from the host
+transaction, even when the email provider has not produced a final outcome.
 
 A cache accelerates availability calculations, and a CDN serves static assets. Neither
 decides whether a booking commits. PostgreSQL owns reservation state, operation
@@ -370,7 +411,7 @@ same rows. Broad copy/delete predicates can diverge as bookings change concurren
 Booking history, operation receipts, attendee data, and delivery logs also have
 different retention purposes.
 
-## 🧪 Verification and implementation boundary — 4 minutes
+## 🧪 Verification and implementation boundary — 3 minutes
 
 I would first test the user promise end to end: choose a time, submit, lose the
 response after commit, refresh, and recover exactly that appointment. The confirmation

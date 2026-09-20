@@ -1,428 +1,420 @@
-# Google Search - System Design Answer (Full-Stack Focus)
+# Google Search: full-stack system design interview
 
-*45-minute system design interview format - Full-Stack Engineer Position*
+A 45-minute spoken outline for a proposed text-search product.
+The repository's actual implementation is compared with the proposal at the end.
 
----
+## 🎯 Requirements and budgets — 4 minutes
 
-## 📋 Introduction (1 minute)
+> “I would connect two journeys: a page becoming searchable,
+> and a person submitting a query and reading the right results.
+> They run at different speeds and meet at the published search index.”
 
-"I'll design Google Search, a web search engine that indexes and searches 100+ billion web pages with sub-200ms latency. As a full-stack engineer, I'll focus on how the frontend and backend systems integrate: the search interface with autocomplete, how queries flow through the API to the index, and how results are streamed back for progressive rendering.
+The first product searches a selected corpus of public text pages.
+It supports autocomplete, terms and common operators, ranked excerpts,
+shareable query URLs, and bounded page navigation.
 
-The key full-stack challenges are building a responsive search experience with instant feedback, designing APIs that support both fast autocomplete and comprehensive search results, and optimizing the data flow from inverted index to rendered snippets."
+I would leave ads, generated answers, image search, voice search,
+and personalized ranking outside the initial interview scope.
+Authenticated operators can manage crawl/index jobs; public search is anonymous.
 
----
+| Planning assumption | Consequence |
+|---|---|
+| 100M indexed pages | Separate ingestion, durable storage, and indexed serving |
+| 100M searches/day | About 1,157 QPS average; assume 10,000 QPS peak for planning |
+| Ten results/page | A small complete response and ordinary semantic list are sufficient |
+| 200 ms p95 API budget | Bound retrieval, ranking, cache waits, and retries |
+| 500 ms submit-to-result target | Network and browser rendering need their own budgets |
+| 10M daily fetches | Daily freshness is possible only for a prioritized subset |
 
-## 🎯 Requirements (3 minutes)
+The interface should stay usable while requests are outstanding.
+A result must belong to the current query and filters.
+An unavailable search must be distinguishable from a search with no matches.
 
-### Functional Requirements
-- Crawl and discover web pages continuously
-- Build and maintain a searchable index of content
-- Process user search queries with real-time autocomplete
-- Rank results by relevance, quality, and freshness
-- Serve results with low latency and rich snippets
+These are design assumptions to validate, not measured behavior of the local demo.
 
-### Non-Functional Requirements
-- Scale: Index 100B+ web pages
-- Latency: < 200ms for search, < 50ms for autocomplete
-- Freshness: Update popular pages daily
-- Accessibility: WCAG 2.1 AA compliant interface
+## 🏗️ High-level architecture — 6 minutes
 
-### Scale Estimates
-- 100+ billion web pages indexed
-- 8+ billion searches per day
-- Average query touches millions of documents
-- Index size: Petabytes
-
----
-
-## 🏗️ High-Level Design (5 minutes)
-
-```
-+------------------+       +------------------+       +------------------+
-|     FRONTEND     |       |    API LAYER     |       |   BACKEND CORE   |
-|                  |       |                  |       |                  |
-|  Search Box      |       |  /autocomplete   |       |  Query Processor |
-|  Results List    | <---> |  /search         | <---> |  Ranker          |
-|  Pagination      |       |  /suggest        |       |  Index Servers   |
-|  Filters         |       |  Rate Limiter    |       |  Cache Layer     |
-+------------------+       +------------------+       +------------------+
-        |                          |                          |
-        v                          v                          v
-+------------------+       +------------------+       +------------------+
-|   STATE LAYER    |       |    MIDDLEWARE    |       |    DATA LAYER    |
-|                  |       |                  |       |                  |
-|  Zustand Store   |       |  Authentication  |       |  Elasticsearch   |
-|  Query History   |       |  Caching Logic   |       |  PostgreSQL      |
-|  Preferences     |       |  Logging         |       |  Redis           |
-+------------------+       +------------------+       +------------------+
-```
-
-### Why These Components?
-
-"I'm structuring this as three horizontal layers because it maps cleanly to team ownership and allows independent scaling. The frontend layer handles user interaction and local state. The API layer acts as a gateway with cross-cutting concerns like rate limiting. The backend core contains the search logic that takes the most engineering investment."
-
----
-
-## 🔍 Deep Dive (20 minutes)
-
-### Deep Dive 1: Search Box with Autocomplete
-
-"The search box is the most critical UI element. Users expect instant feedback as they type."
+> “I would start with this connected diagram and trace both journeys.
+> The browser owns interaction; the server owns search semantics;
+> the publishing pipeline decides which corpus is visible.”
 
 ```
-User Types: "javasc"
-      |
-      v
-+-------------------+
-| Debounce 150ms    |  <-- Prevents excessive API calls
-+-------------------+
-      |
-      v
-+-------------------+
-| GET /autocomplete |
-| ?q=javasc         |
-+-------------------+
-      |
-      v
-+-------------------+     miss      +-------------------+
-|   Redis Cache     | -----------> |   Suggestion      |
-|   (TTL: 5 min)    |              |   Trie Lookup     |
-+-------------------+              +-------------------+
-      | hit                               |
-      v                                   v
-+-------------------+              +-------------------+
-| Return cached     |              | Merge sources:    |
-| suggestions       |              | - Trie results    |
-+-------------------+              | - Popular queries |
-                                   | - Corrections     |
-                                   +-------------------+
-                                          |
-                                          v
-                                   +-------------------+
-                                   | Cache & Return    |
-                                   | Top 10 suggestions|
-                                   +-------------------+
+┌────────────────────────────────────────────────────────────────────────────────────────────┐
+│ BROWSER                                                                                    │
+│                                                                                            │
+│  ┌────────────────────────┐     ┌────────────────────────┐     ┌────────────────────────┐  │
+│  │ Search + result views  │     │ Navigation model       │     │ Data access            │  │
+│  │ Draft / focus / text   │◀───▶│ URL / window / expiry  │◀───▶│ Guard response / cache │  │
+│  └────────────────────────┘     └────────────────────────┘     └────────────────────────┘  │
+│                                                                            ▲               │
+│                                                                            │               │
+└────────────────────────────────────────────────────────────────────────────┼───────────────┘
+                                                                             │
+                                 HTTPS search / suggest / status             │
+                                                                             │
+                                                                             ▼
+┌────────────────────────┐        ┌────────────────────────┐        ┌────────────────────────┐
+│ Published index        │        │ Query cache            │        │ Search API             │
+│ Document shards        │        │ Query/rank/corpus key  │◀──────▶│ Rank / window / status │
+└────────────────────────┘        └────────────────────────┘        └────────────────────────┘
+   ▲        ▲                                                                             ▲
+   │        │                                                                             │
+   │        │                   Cache miss: API queries index                             │
+   │        └─────────────────────────────────────────────────────────────────────────────┘
+   │
+   │  publish / ACK
+   │
+   ▼
+┌────────────────────────┐        ┌────────────────────────┐        ┌────────────────────────┐
+│ Index + rank pipeline  │        │ Pages + link graph     │        │ Frontier + fetchers    │
+│ Verify / publish / ACK │◀──────▶│ Durable crawl versions │◀──────▶│ Host budget / robots   │
+└────────────────────────┘        └────────────────────────┘        └────────────────────────┘
+
+New crawl content becomes visible after indexing; the UI receives complete pages.
 ```
 
-#### Trade-off 1: Why 150ms Debounce vs Other Values?
+For the user journey, submitting the search commits a URL and a request identity.
+Data access asks the API for a ranked page.
+The API reads the query cache or retrieves from the published index on a miss.
+The response is validated and rendered only if it still matches the active search.
 
-| Aspect | 150ms (Chosen) | 50ms | 300ms |
-|--------|----------------|------|-------|
-| Feel | ✅ Balanced | Too aggressive | Sluggish |
-| API calls | ✅ ~85% reduction | 60% reduction | 95% reduction |
-| User perception | ✅ "Instant" | Better | Noticeable delay |
-| Server load | ✅ Moderate | High | Low |
+For the content journey, fetchers write versioned pages and outgoing links.
+The pipeline builds and validates a searchable generation with rank metadata.
+It publishes that generation while the previous good one remains recoverable.
+Queries never wait for a live fetch of the web.
 
-"I'm choosing 150ms because user studies show anything under 200ms feels instantaneous. At 50ms, we'd make too many wasted API calls for fast typists. At 300ms, users notice the lag. 150ms hits the sweet spot where most users have paused momentarily after typing a few characters."
+I would use a publication change while someone reads page two as the recovery example:
 
-#### Trade-off 2: Why Trie + Redis vs Database-Only?
+1. The browser continues its matching result window, preserving query intent and reading position.
+2. The API uses that window's corpus/rank context; an expired or unavailable window causes an explicit restart.
+3. Fetchers and builders recover from durable versions and confirmed effect checkpoints, independently of the active search request.
+4. Publication exposes a validated generation and records the outcome. Earlier windows either retain their supported generation or expire visibly; they never silently append new ordering.
 
-| Aspect | Trie + Redis (Chosen) | Database Only |
-|--------|----------------------|---------------|
-| Latency | ✅ < 10ms | 50-100ms |
-| Memory usage | Higher (in-memory) | ✅ Lower |
-| Prefix search | ✅ O(k) where k=prefix length | Table scan or LIKE query |
-| Updates | Periodic rebuild | ✅ Real-time |
-| Complexity | Higher | ✅ Simpler |
+The cache is a branch off the API, not a mandatory storage authority.
+If it fails, bounded direct retrieval can continue subject to capacity.
+Suggestions use an independently budgeted prefix service behind the same API boundary.
 
-"I'm choosing Trie + Redis because autocomplete has a hard 50ms latency requirement. A database round-trip alone consumes most of that budget. The trie gives us O(k) prefix lookups, and Redis provides the distributed cache layer. We accept the complexity of periodic rebuilds because suggestions don't need to be real-time fresh."
+The first implementation could use React, a router, and a small shared store,
+Express query services, Elasticsearch, PostgreSQL metadata, object storage,
+and a distributed cache. The diagram's responsibilities matter more than those brands.
 
----
+## 💾 Shared model and API contract — 5 minutes
 
-### Deep Dive 2: API Design and Integration
+### Ownership across the boundary
 
-"The API layer bridges frontend and backend. I need to decide on the contract between them."
+| Data | Owner | Why |
+|---|---|---|
+| Draft text and active suggestion | Browser input | Editing must not wait for server agreement |
+| Submitted query and requested page | URL/router | Sharing and Back/Forward should preserve intent |
+| Current response and loading/error state | Browser request model | Prevent mismatched results after navigation |
+| Operator parsing and ranking | Search service | One interpretation across all clients |
+| Result window and expiry | Search service | Stable navigation while the corpus changes |
+| Crawl version and index generation | Ingestion/publisher | Search must expose a known corpus state |
+| Recent local queries | User-controlled browser preference | Separate from aggregate public suggestions |
 
-```
-+------------------+       +------------------+       +------------------+
-|    FRONTEND      |       |     API          |       |    BACKEND       |
-|                  |       |                  |       |                  |
-|  TypeScript      |       |  Express +       |       |  Query Parser    |
-|  Interfaces      | <---> |  TypeScript      | <---> |  Elasticsearch   |
-|                  |       |                  |       |  Ranker          |
-+------------------+       +------------------+       +------------------+
-        |                          |                          |
-        +----------+---------------+                          |
-                   |                                          |
-                   v                                          |
-        +------------------+                                  |
-        | Shared Types     | <--------------------------------+
-        | (npm package or  |
-        |  monorepo path)  |
-        +------------------+
-```
+### Proposed endpoints
 
-#### Trade-off 3: Why REST API vs GraphQL for Search?
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/api/search` | Query, page size, optional result-window/page |
+| GET | `/api/search/autocomplete` | Prefix and locale; bounded suggestions |
+| POST | `/api/admin/crawl/jobs` | Authenticated, bounded job submission |
+| GET | `/api/admin/jobs/:id` | Durable job state and failure information |
 
-| Aspect | REST (Chosen) | GraphQL |
-|--------|--------------|---------|
-| Caching | ✅ HTTP caching works naturally | Requires custom cache layer |
-| Simplicity | ✅ Simple GET /search?q=... | Query parsing overhead |
-| Response shape | Fixed, predictable | ✅ Client-specified |
-| Tooling | ✅ Universal support | Needs Apollo/Relay |
-| Performance | ✅ Minimal overhead | Schema validation cost |
+I would use a small REST contract because these operations have predictable shapes.
+GraphQL can also express them; it would not remove the need for cache identity,
+request validation, or a stable pagination contract.
 
-"I'm choosing REST over GraphQL because search responses have a predictable shape. GraphQL's flexibility is wasted here since every client wants the same fields. More importantly, REST's native HTTP caching integrates with CDNs and browser caches. For a search engine, cache hit rate directly impacts infrastructure cost."
+The response contains result IDs, plain titles, safe destinations,
+excerpts and highlight spans, count relation, freshness, and navigation expiry.
+The server returns the interpreted query so operator behavior can be explained.
 
-#### Trade-off 4: Why Shared TypeScript Types vs OpenAPI Codegen?
+Both sides validate at runtime where untrusted data enters.
+Shared TypeScript declarations improve maintenance but disappear at runtime.
+I would test the contract with malformed limits and unexpected response fields.
 
-| Aspect | Shared Types (Chosen) | OpenAPI Codegen |
-|--------|----------------------|-----------------|
-| Setup complexity | ✅ Low (path import) | Schema definition + tooling |
-| Type safety | ✅ Compile-time | ✅ Compile-time |
-| Runtime validation | Manual | ✅ Auto-generated |
-| Cross-language | TypeScript only | ✅ Any language |
-| Maintenance | ✅ Single source | Schema drift risk |
+The job response means “accepted” and includes an ID.
+Only a later completed state means all required processing succeeded.
+This distinction prevents a two-second UI refresh from becoming a false completion signal.
 
-"I'm choosing shared TypeScript types because both frontend and backend are TypeScript in this monorepo. We get compile-time safety with zero codegen overhead. If we had multiple client languages or an external API, OpenAPI would be worth the investment."
+## 🔧 Deep dive: keeping search intent and visible results aligned — 8 minutes
 
----
+### Decision
 
-### Deep Dive 3: Search Execution Flow
+> “I would separate draft typing from submitted search state,
+> then guard every response against the active request.
+> This makes the browser's behavior understandable even when requests finish out of order.”
 
-```
-User Submits: "javascript tutorial"
-           |
-           v
-+------------------------+
-| GET /search?q=...      |
-| Parse query params     |
-+------------------------+
-           |
-           v
-+------------------------+       +------------------------+
-|    Redis Cache         | ----> | Return cached results  |
-|    Key: query hash     |  hit  | (Add timing metadata)  |
-+------------------------+       +------------------------+
-           | miss
-           v
-+------------------------+
-|    Query Parser        |
-|    - Extract terms     |
-|    - Parse operators   |
-|    - Detect phrases    |
-+------------------------+
-           |
-           v
-+------------------------+
-|    Elasticsearch       |
-|    - BM25 text match   |
-|    - Apply filters     |
-|    - Get top 1000 docs |
-+------------------------+
-           |
-           v
-+------------------------+
-|    Phase 2 Ranking     |
-|    - Add PageRank      |
-|    - Add freshness     |
-|    - Add click data    |
-|    - Re-rank top 100   |
-+------------------------+
-           |
-           v
-+------------------------+
-|    Snippet Generation  |
-|    - Find best passage |
-|    - Highlight terms   |
-|    - Truncate text     |
-+------------------------+
-           |
-           v
-+------------------------+
-|    Cache & Return      |
-|    - Store in Redis    |
-|    - Send to client    |
-+------------------------+
-```
+Typing updates the input immediately and starts a 200 ms suggestion debounce.
+The user can submit at any point; autocomplete is optional assistance.
+Submission commits the query to the URL, resets the requested page,
+and creates a new search generation.
 
-#### Trade-off 5: Why Cache Results for 5 Minutes vs Other TTLs?
+The generation belongs to the complete query context.
+It changes for query, filters, locale, page size, or navigation session changes.
+The response and its error/loading state are accepted only for the current generation.
 
-| TTL | Pros | Cons |
-|-----|------|------|
-| No cache | Always fresh | ❌ High index load |
-| 1 minute | Very fresh | Moderate cache hits |
-| **5 minutes** | ✅ Good hit rate (~70%) | Acceptable staleness |
-| 1 hour | Excellent hit rate | ❌ Stale for trending topics |
+### The race to explain
 
-"I'm choosing 5-minute TTL because query distribution follows a power law. Popular queries repeat frequently within 5 minutes, giving us ~70% cache hit rate. For breaking news queries, we can add a bypass mechanism. The staleness is acceptable because web content doesn't change that fast, and freshness signals are baked into the ranking."
+A user searches for “java,” then quickly submits “python.”
+The Python request returns first and becomes visible.
+The Java request later succeeds or fails.
+Either outcome must be ignored rather than replace Python results or their status.
 
-#### Trade-off 6: Why Offset-Based Pagination vs Cursor-Based?
+Aborting superseded fetches helps reduce waste.
+It is not the correctness boundary: cancellation can race with completion.
+The final state-update guard is still required.
 
-| Aspect | Offset-Based (Chosen) | Cursor-Based |
-|--------|----------------------|--------------|
-| Jump to page 5 | ✅ Simple ?page=5 | Impossible without iterating |
-| URL shareability | ✅ page=3 works | Opaque cursor token |
-| Implementation | ✅ Simple OFFSET/LIMIT | Keyset pagination |
-| Consistency | Results can shift | ✅ Stable ordering |
-| Deep pages | Performance degrades | ✅ Constant time |
+### Trade-off
 
-"I'm choosing offset-based pagination because search users expect to jump to specific pages. 'Go to page 5' is a common action that cursor-based pagination doesn't support. The performance degradation at deep pages is acceptable because very few users go past page 3. If they do, the slight slowdown is tolerable."
+| Approach | Benefit | Cost |
+|---|---|---|
+| ✅ URL intent + keyed response lifecycle | Correct Back/navigation and predictable display | More explicit state than a single result object |
+| ❌ One global unkeyed response | Easy initial implementation | Late requests can show the wrong query's results |
+| ❌ Disable all interaction during fetch | Avoids some overlap | Makes slow networks block useful editing |
 
----
+The chosen approach allows a user to keep refining the query.
+It gives up the simplicity of one mutable response slot,
+but that complexity represents real concurrent interactions already happening.
 
-### Deep Dive 4: Results Rendering and State
+### Input behavior
 
-```
-+------------------+                    +------------------+
-|   API Response   |                    |   Zustand Store  |
-|                  |                    |                  |
-|  - results[]     | -----------------> |  - results       |
-|  - totalResults  |                    |  - totalResults  |
-|  - timing        |                    |  - isLoading     |
-|  - correction    |                    |  - error         |
-+------------------+                    |  - currentPage   |
-                                        |  - history       |
-                                        +------------------+
-                                                 |
-                         +-----------------------+----------------------+
-                         |                       |                      |
-                         v                       v                      v
-               +----------------+      +----------------+      +----------------+
-               |  Results List  |      |   Pagination   |      |  Search Box    |
-               |  Component     |      |   Component    |      |  Component     |
-               +----------------+      +----------------+      +----------------+
-```
+A focused combobox provides a suggestion list with explicit active-option state.
+Arrow keys navigate, Escape dismisses, and Enter accepts or submits once.
+Recent-history and server-suggestion choices should use the same selection action.
 
-#### Trade-off 7: Why Zustand for Frontend State vs Redux?
+During composition, Enter completes text entry rather than submit a query.
+On dismissal or unmount, invalidate pending popup requests.
+A late suggestion response must not reopen a popup the user closed.
 
-| Aspect | Zustand (Chosen) | Redux |
-|--------|-----------------|-------|
-| Bundle size | ✅ ~1KB | ~7KB + middleware |
-| Boilerplate | ✅ Minimal | Actions, reducers, types |
-| Learning curve | ✅ 10 minutes | Hours |
-| DevTools | Basic | ✅ Excellent time-travel |
-| Middleware | Limited | ✅ Rich ecosystem |
-| Async handling | ✅ Just use async/await | Redux-thunk/saga |
+I would test focus and announcements on keyboard and screen readers.
+The [WAI-ARIA combobox guidance](https://www.w3.org/WAI/ARIA/apg/patterns/combobox/)
+is a reference for interaction, not evidence that the local UI already conforms.
 
-"I'm choosing Zustand because search state is straightforward: query, results, loading, error. We don't need Redux's time-travel debugging or complex middleware. Zustand's hooks-based API lets us write async actions naturally without thunks. For a feature this focused, Redux would be over-engineering."
+### Results and failures
 
----
+A new query gets a clear loading state without freezing the input.
+A same-query page transition can retain the previous page temporarily,
+but must label it as old and avoid pairing it with the new page number.
 
-### Deep Dive 5: Snippet Generation
+“No matches” follows a completed search.
+“Search unavailable” follows a failed request.
+“Some results unavailable” requires a partial-response contract from the server.
+The browser should not infer those outcomes from an empty array alone.
 
-```
-Document Content (2000 words)
-              |
-              v
-+---------------------------+
-|   Split into sentences    |
-+---------------------------+
-              |
-              v
-+---------------------------+
-|   Score each sentence     |
-|   - Term frequency        |
-|   - Consecutive terms     |
-|   - Position in document  |
-+---------------------------+
-              |
-              v
-+---------------------------+
-|   Select best passages    |
-|   - Stay under 200 chars  |
-|   - Prefer contiguous     |
-+---------------------------+
-              |
-              v
-+---------------------------+
-|   Highlight query terms   |
-|   - Wrap in <b> tags      |
-|   - Escape HTML first     |
-+---------------------------+
-              |
-              v
-     "...Learn <b>JavaScript</b>
-      basics in this <b>tutorial</b>..."
-```
+Retry preserves the query and follows server retry timing.
+Avoid unbounded automatic retry loops during overload.
+Optional suggestion failures should never block explicit search submission.
 
-#### Trade-off 8: Why Server-Side Snippet Generation vs Client-Side?
+## 🔧 Deep dive: coherent ranking, caching, and pagination — 8 minutes
 
-| Aspect | Server-Side (Chosen) | Client-Side |
-|--------|---------------------|-------------|
-| Payload size | ✅ ~200 chars per result | Full document content |
-| Highlighting consistency | ✅ Uniform algorithm | Browser-dependent |
-| Processing cost | Server CPU | ✅ Distributed to clients |
-| SEO/accessibility | ✅ Pre-rendered | Requires JS |
-| Latency | Adds ~10ms | ✅ Zero server overhead |
+### Decision
 
-"I'm choosing server-side snippet generation because it dramatically reduces payload size. Sending full documents to the client for 10 results would be megabytes. Pre-computing snippets keeps responses under 50KB. The 10ms server overhead is negligible compared to network savings, and we get consistent highlighting across all browsers."
+> “I would apply query constraints before ranking,
+> then serve a bounded stable result window.
+> The browser and server need to agree what ‘page two’ refers to.”
 
----
+The server parses phrases, exclusions, and site operators into one query structure.
+The index evaluates those constraints while retrieving candidates.
+For site filters, hostname boundaries matter: substring matching is insufficient.
 
-## 📊 Data Flow (2 minutes)
+Filtering only after taking ten hits can produce a nearly empty page
+while valid matches exist later in the candidate set.
+It also makes the displayed count disagree with visible results.
+I would define count value and exact/lower-bound/approximate relation explicitly.
 
-### Complete Request Flow
+### Retrieval and ranking
 
-```
-   User Input                Browser                      Server
-       |                        |                           |
-       | Types "java"           |                           |
-       +----------------------->|                           |
-       |                        | [150ms debounce]          |
-       |                        |                           |
-       |                        | GET /autocomplete?q=java  |
-       |                        +-------------------------->|
-       |                        |                           | [Redis lookup]
-       |                        |                           | [Trie search]
-       |                        | ["javascript","java api"] |
-       |                        |<--------------------------+
-       | Show dropdown          |                           |
-       |<-----------------------+                           |
-       |                        |                           |
-       | Press Enter            |                           |
-       +----------------------->|                           |
-       |                        | GET /search?q=javascript  |
-       |                        +-------------------------->|
-       |                        |                           | [Cache check]
-       |                        |                           | [ES query]
-       |                        |                           | [Rank]
-       |                        |                           | [Snippets]
-       |                        | {results, total, timing}  |
-       |                        |<--------------------------+
-       | Render results         |                           |
-       |<-----------------------+                           |
-       |                        |                           |
-```
+Document shards perform multi-term matching locally and return bounded candidates.
+The coordinator merges them with comparable scoring and applies useful rank signals.
+A more expensive reranker is optional and requires evidence of relevance improvement.
 
----
+A fixed candidate cutoff can lose relevant pages.
+I would measure recall before claiming that reranking the first thousand hits is sufficient.
+New pages also need nonzero quality priors so missing link history does not erase relevance.
 
-## ⚖️ Trade-offs Summary (2 minutes)
+Link scores are computed offline from a named graph snapshot.
+They are distinct from the time a document was last fetched.
+The server should not treat a new fetch of unchanged text as a new publication date.
 
-| Decision | Chosen | Alternative | Why |
-|----------|--------|-------------|-----|
-| Debounce timing | 150ms | 50ms or 300ms | Feels instant, reduces calls 85% |
-| Autocomplete storage | Trie + Redis | Database | < 10ms latency requirement |
-| API style | REST | GraphQL | HTTP caching, simpler for fixed responses |
-| Type sharing | TypeScript imports | OpenAPI codegen | Both ends are TS, zero tooling overhead |
-| Result cache TTL | 5 minutes | 1 min / 1 hour | 70% hit rate with acceptable freshness |
-| Pagination | Offset-based | Cursor-based | Users expect "go to page 5" |
-| State management | Zustand | Redux | Simple state, minimal boilerplate |
-| Snippet generation | Server-side | Client-side | 100x smaller payload, consistent UX |
+### Cache contract
 
----
+A cache key includes the canonical query structure, locale, safety policy,
+page size, corpus generation, ranking version, and a freshness-time bucket.
+The cached object contains the ordered result window and its context.
+It never represents the global source of truth for the corpus.
 
-## 🚀 Future Enhancements (1 minute)
+For an initial ten-page limit, a window might hold the first 100 results.
+The response includes a short-lived handle for that ordering.
+Page changes refer to that handle; the browser can cache visited pages within it.
 
-### Full-Stack Improvements
-1. **Voice search**: Web Speech API with streaming transcription
-2. **Infinite scroll**: Virtual list replacing pagination for smoother browsing
-3. **Real-time results**: WebSocket for live trending topic updates
-4. **Image search**: Grid layout with lazy loading and visual similarity
-5. **Search operators UI**: Visual query builder for advanced syntax
-6. **Personalization**: Re-rank using search history signals
-7. **PWA support**: Offline history and cached result pages
+| Approach | Benefit | Cost |
+|---|---|---|
+| ✅ Bounded stable window | Consistent navigation and reusable results | Memory, expiry, and capped depth |
+| ❌ Rerun an offset query on every click | Simple numbered URLs | Changed scores can repeat or skip results |
+| ❌ Unlimited retained sessions | Long-lived stable navigation | Unbounded memory and retained-index cost |
 
----
+The trade-off is visible expiry.
+If the window disappears, the server returns an explicit restart outcome.
+The browser retains the query and asks for fresh results,
+instead of silently returning a different order under the old handle.
 
-## 📝 Summary (1 minute)
+A shared query URL recreates the query, not an immutable result page.
+That is an honest contract for a changing public corpus.
+If deep traversal becomes necessary, a snapshot and deterministic continuation
+can extend the model, with bounded resource lifetime.
 
-"The Google Search full-stack architecture connects three key layers:
+### Outages and overload
 
-**Frontend experience**: The search box uses 150ms debounced autocomplete for instant feedback. Zustand manages query state, results, and history with URL synchronization for shareability.
+Use a short cache deadline and bounded bypass to the index.
+Coalesce identical misses so a hot query does not create a simultaneous retry storm.
+If the index cannot complete retrieval, return unavailable or explicitly partial results.
 
-**API layer**: RESTful endpoints share TypeScript types with the frontend. The autocomplete endpoint uses a trie cached in Redis for sub-50ms responses. The search endpoint handles query parsing, two-phase ranking, and result caching.
+A five-minute TTL does not guarantee any particular hit ratio.
+Measure the traffic distribution and freshness tolerance before tuning retention.
+A completed cache write should not be required to return a successful search.
 
-**Integration points**: Results flow from Elasticsearch through the ranker, with snippets generated server-side for consistent highlighting and smaller payloads. The suggestion trie is populated from query logs, creating a feedback loop that improves autocomplete over time.
+### Safe response rendering
 
-The main full-stack trade-off is cache staleness versus freshness. We accept 5-minute stale results to reduce index load by 70%, while breaking news queries can bypass cache when needed. The 150ms debounce and server-side snippets together reduce API load and payload size without perceptible user impact."
+The server chooses excerpts using its matching context.
+It returns text and permitted highlight spans, not arbitrary crawled HTML.
+The client renders text, validates destinations, and falls back to plain text on bad spans.
+
+This avoids duplicating stemming and phrase logic in the browser,
+while keeping the response small and the rendering boundary explicit.
+Ten result cards need ordinary pagination, not virtualization or streamed reordering.
+
+## 🔧 Deep dive: from fetched page to published result — 8 minutes
+
+### Decision
+
+> “I would make crawl work retryable and index publication explicit.
+> A completed HTTP fetch is not yet a searchable result,
+> and an accepted admin request is not a completed index job.”
+
+The frontier keeps URL identity, origin, priority, next eligible fetch,
+and a leased attempt token.
+An atomic claim prevents two current workers from owning the same attempt.
+Expired work is recoverable, and stale completions cannot overwrite newer versions.
+
+Per-origin budgets control request spacing and concurrency.
+More crawler instances add coverage across origins, not permission to overload one site.
+Priority needs aging so long-tail pages eventually get revisited.
+
+### Content flow
+
+1. Check robots policy, DNS resolution, and every redirect destination.
+2. Fetch with bounded bytes, time, and decompression work.
+3. Persist an artifact, then commit its content version and processing event.
+4. Parse text and outgoing edges, including links to targets already known.
+5. Build documents against a corpus checkpoint and named graph/ranking version.
+6. Inspect all indexing item outcomes and retain failures for retry or correction.
+7. Validate and publish the completed generation; update durable job status.
+
+The metadata commit and processing event belong together.
+Otherwise a crash after content storage can leave a page that never reaches indexing.
+An orphaned artifact is cheaper to reclaim than a missing processing event is to discover.
+
+### Publication trade-off
+
+| Approach | Benefit | Cost |
+|---|---|---|
+| ✅ Validated generation publication | Failed rebuilds leave the last good corpus serving | Extra storage and build capacity |
+| ❌ Replace the active index during a build | Minimal staging state | Queries can see an incomplete corpus |
+| ❌ Treat bulk HTTP success as complete | Easy job bookkeeping | Failed items disappear behind a false success report |
+
+A deterministic document ID handles repeated delivery of the same identity.
+A version check prevents a late old update from replacing a newer document.
+Those are separate invariants, and both matter during retries.
+
+Deletion also needs a versioned event.
+Otherwise removing a page from the document store leaves an old searchable hit behind.
+The publisher must account for deletes and failed items when validating a generation.
+
+### What the admin UI should say
+
+| Job state | UI message / action |
+|---|---|
+| Accepted | Show job ID and scope; avoid claiming progress yet |
+| Running | Show meaningful completed/failed counts and last update |
+| Failed | Explain the failed stage and whether a retry resumes or restarts |
+| Completed | Show published generation or confirmed completed operation |
+
+The admin can poll a durable job endpoint at a modest interval.
+A push channel is optional if operators need frequent progress updates.
+Neither transport can replace durable state after a process restart.
+
+The public search path continues against the last good generation during failures.
+New content becomes visible after publication, according to the freshness policy.
+This is eventual visibility with explicit checkpoints, not exactly-once network delivery.
+
+### Security at both ends
+
+Authenticate operators before accepting crawl seeds or build commands.
+Do not trust a caller-supplied API-key string as an identity by itself.
+Validate crawl destinations at connection time, including redirects and private networks.
+
+Search text and excerpts are untrusted at the UI boundary.
+Aggregate and filter query data before using it for public suggestions.
+Give users control over local history and apply deliberate retention to server logs.
+
+## 📈 Scaling and verification — 4 minutes
+
+I would measure the end-to-end path instead of adding component latency guesses.
+Break down submit-to-render into request wait, retrieval, ranking, payload transfer,
+and browser rendering on representative devices.
+
+On the backend, index CPU/I/O and shard fan-out are likely early bottlenecks.
+Add replicas for serving capacity and isolate builders from query workloads.
+The crawler scales across origins; a single site's budget remains unchanged.
+
+On the frontend, repeated network work and bundle size matter more than ten DOM cards.
+Optional prefetch should be bounded and work for keyboard/touch intent,
+not depend exclusively on a mouse hover.
+
+### Scenarios that cross the boundary
+
+| Scenario | Expected behavior |
+|---|---|
+| Search A finishes after B | Browser retains B's results and status |
+| Site filter excludes early candidates | Retrieval still fills the page from eligible matches |
+| Page size differs for the same query | Cache entries cannot return the wrong page shape |
+| Search window expires | UI preserves intent and offers a fresh search |
+| Bulk indexing has one failed item | Job/generation cannot falsely claim complete success |
+| Crawler crashes before acknowledgment | Work is recovered with version/attempt protection |
+| Excerpt contains markup | It appears as text or permitted highlights only |
+
+Track query latency, partial/error rate, relevance judgments, cache effectiveness,
+crawl due-age, failed indexing items, and time from content version to publication.
+An increasing document count alone does not tell us whether search is correct.
+
+### Choices to leave visible
+
+| Choice | Why it fits | Cost accepted |
+|---|---|---|
+| ✅ Separate draft and request state | Responsive editing with correct results | Explicit lifecycle logic |
+| ✅ Stable bounded result windows | Predictable page navigation | Expiry and memory |
+| ✅ Document-sharded retrieval | Local matching of multiple constraints | Bounded scatter/gather |
+| ✅ Validated publication | Search survives a failed rebuild | Extra storage and build coordination |
+
+## 🧭 Close and repository comparison — 2 minutes
+
+> “The design connects the product promise to backend guarantees.
+> Search intent is explicit, result pages have a defined lifetime,
+> and published content has a recoverable path from crawl to index.”
+
+The repository has a React search/admin UI, Express routes, PostgreSQL content,
+Elasticsearch text scoring, Valkey caching, and manual PageRank/index jobs.
+It is useful for examining those boundaries on a small dataset.
+
+The local code does not yet provide the guards shown here:
+request races can overwrite results, highlight HTML is unsanitized,
+admin operations are unauthenticated, and job acknowledgment is not durable completion.
+Crawl schema/hash defects and seed statuses also affect the local workflow.
+
+Current indexing lacks per-item success handling and generation publication;
+search filters and cache keys do not fully preserve request semantics.
+The proposal explains how I would evolve those boundaries, not what is already deployed.
+
+See [architecture.md](./architecture.md) for source-verified details
+and [README.md](./README.md) for the actual demo setup and limitations.

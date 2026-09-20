@@ -59,25 +59,58 @@ The renderer owns frame-by-frame camera movement and geometry drawing.
 React owns controls, accessible text, selected results, and workflow state.
 
 ```
-┌────────────────────────────────────────────────────────────┐
-│ Search / route planner / navigation panel                  │
-└─────────────┬────────────────────────────────┬─────────────┘
-              ▼                                ▼
-┌───────────────────────────┐    ┌───────────────────────────┐
-│ Route and request state   │    │ Map renderer              │
-│ Accepted generation       │───▶│ Camera, tiles, layers     │
-└─────────────┬─────────────┘    └─────────────┬─────────────┘
-              ▼                                ▼
-┌───────────────────────────┐    ┌───────────────────────────┐
-│ API client + query cache  │    │ Viewport data scheduler   │
-│ Results keyed by context  │◀───│ Bounded layer requests    │
-└─────────────┬─────────────┘    └───────────────────────────┘
-              ▼
-┌────────────────────────────────────────────────────────────┐
-│ Routing / search / traffic APIs + versioned tile source    │
-└────────────────────────────────────────────────────────────┘
-
+        ┌──────────────────────────────────────────────────────────────────────────────────────────┐
+        │ BROWSER / RENDERING AND APPLICATION STATE                                                │
+        │                                                                                          │
+        │  ┌────────────────────────┐    ┌────────────────────────┐    ┌────────────────────────┐  │
+        │  │ Search + map controls  │    │ Trip state             │    │ Position adapter       │  │
+        │  │ Intent and follow mode │◀──▶│ Accepted route bundle  │    │ Foreground samples     │  │
+        │  └────────────────────────┘    │ Intent generation      │    │ Time + accuracy        │  │
+        │               ▲                └────────────────────────┘    └────────────────────────┘  │
+        │               │                             ▲                             │              │
+        │               │                             │                             │              │
+        │  camera       │                intent       │                samples      │              │
+        │               │                             │                             │              │
+        │               ▼                             ▼                             ▼              │
+        │  ┌────────────────────────┐    ┌────────────────────────┐    ┌────────────────────────┐  │
+        │  │ Map renderer           │    │ Route coordinator      │    │ Position quality       │  │
+  ┌─────┼─▶│ Camera, geometry       │◀───│ Keep matched route     │◀───│ Match / uncertainty    │  │
+  │     │  │ Stable engine instance │    │ Reroute deliberately   │    │ Reject stale samples   │  │
+  │     │  └────────────────────────┘    └────────────────────────┘    └────────────────────────┘  │
+  │     │               ▲                             ▲                                            │
+  │     │               │                             │                                            │
+  │     │  viewport     │                             │ route / result                             │
+  │     │               │                             │                                            │
+  │     │               ▼                             ▼                                            │
+  │     │  ┌────────────────────────┐    ┌──────────────────────────────────────────────────────┐  │
+  │     │  │ Viewport scheduler     │    │ API client + scoped result cache                     │  │
+  │     │  │ Traffic/POI cell cache │◀──▶│ Intent IDs; compatible versions; retry/freshness     │  │
+  │     │  │ Bounded layer work     │    └──────────────────────────────────────────────────────┘  │
+  │     │  └────────────────────────┘                                               ▲              │
+  │     │                                                                           │              │
+  │     └───────────────────────────────────────────────────────────────────────────┼──────────────┘
+  │                                                                                 │
+  │ tiles                                search / routes / traffic                  │
+  │                                                                                 │
+  ▼                                                                                 ▼
+┌────────────────────────┐               ┌─────────────────────────────────────────────────────────┐
+│ Versioned tile CDN     │               │ Map service APIs (server boundary)                      │
+│ Renderer fetches tiles │               │ Places, coherent route bundles, aged traffic estimates  │
+└────────────────────────┘               └─────────────────────────────────────────────────────────┘
 ```
+
+I would trace a new destination through trip intent, the route coordinator and a
+scoped API request; only a matching route bundle replaces the accepted trip. The
+renderer draws that bundle and owns camera motion. Settled viewports schedule bounded
+overlays, while the renderer fetches basemap tiles independently. Position samples
+pass through quality checks before changing guidance; they are not camera commands
+and do not automatically start a new route request.
+
+On a route-service failure, I would keep an already accepted bundle only under its
+original trip identity and show the refresh error. A changed destination cannot borrow
+that old result. Overlay retries retain their own age and viewport scope; an unavailable or
+inaccurate position source cannot silently advance guidance. Tile recovery, route
+recovery, and position quality therefore remain separate inputs to the renderer.
 
 There are four useful kinds of state:
 

@@ -49,14 +49,60 @@ across files. The diagram should fit on a whiteboard without becoming a catalog 
 infrastructure service we might add later.
 
 ```
-┌────────────────────────┐     ┌────────────────────────┐     ┌────────────────────────┐
-│  Controls + renderer   │ ──▶ │  Scene + sync client   │ ──▶ │    File owner / API    │
-└────────────────────────┘     └────────────────────────┘     └────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│ BROWSER / STABLE OBJECT IDS AND EXPLICIT EDIT LIFETIMES                                  │
+│                                                                                          │
+│  ┌────────────────────────┐    ┌────────────────────────┐    ┌────────────────────────┐  │
+│  │ Tools / layers / forms │    │ Scene + sync owner     │    │ Retained renderer      │  │
+│  │ Gesture / undo intent  │◀──▶│ Base/pending/preview   │◀──▶│ Viewport / dirty flags │  │
+│  └────────────────────────┘    │ Seq + saved edit IDs   │    │ Disposable graphics    │  │
+│                                └────────────────────────┘    └────────────────────────┘  │
+│                                             ▲                                            │
+│                                             │                                            │
+└─────────────────────────────────────────────┼────────────────────────────────────────────┘
+                  bootstrap / edit / replay   │
+                                              ▼
+                                 ┌────────────────────────┐       ┌────────────────────────┐
+                                 │ Authenticated gateway  │       │ Ephemeral presence     │
+                                 │ File generation/access │◀─────▶│ Page/connection scope  │
+                                 │ Join + resource limits │       │ Cursor freshness       │
+                                 └────────────────────────┘       └────────────────────────┘
+                                              ▲
+                                              │
+                     semantic operations      │
+                                              │
+                                              ▼
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Verified version store │       │ Fenced file owner      │       │ Durable file authority │
+│ Snapshot/schema/hash   │◀─────▶│ Property/tree checks   │◀─────▶│ Head / log / receipts  │
+│ Named versions         │       │ One committed order    │       │ Commit checks epoch    │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
+             ▲                                                                 ▲       ▲
+ versions    │              committed prefix / progress                        │       │ events / replay
+             │          ┌──────────────────────────────────────────────────────┘       │
+             │          │                                                              │
+             ▼          ▼                                                              ▼
+┌────────────────────────┐       ┌────────────────────────┐       ┌────────────────────────┐
+│ Snapshot workers       │       │ Other collaborators    │       │ Gateway delivery       │
+│ Verified commit prefix │       │ Canonical edits/replay │◀─────▶│ Fan-out / log replay   │
+│ Publish version info   │       │ Independent local view │       │ Canonical peer events  │
+└────────────────────────┘       └────────────────────────┘       └────────────────────────┘
 
-┌────────────────────────┐     ┌────────────────────────┐     ┌────────────────────────┐
-│     Operation log      │ ──▶ │    Snapshot worker     │ ──▶ │    Version storage     │
-└────────────────────────┘     └────────────────────────┘     └────────────────────────┘
+A gesture previews locally, commits in file order, and reaches peers as a canonical effect.
 ```
+
+I would follow a designer's movement through the local scene preview, then the gateway,
+file owner and durable edit receipt. Peers apply the canonical effect while keeping their
+own viewport. The snapshot branch turns complete committed prefixes into named versions;
+the owner uses those versions and the log for recovery. Undo and restore pass through that
+same authority, so they cannot bypass newer edits or silently replace another client's scene.
+
+I would use a lost acknowledgement to explain the return paths:
+
+1. A bounded, account/file-scoped journal can retain the operation for reload recovery; it does not make the local preview canonical.
+2. The reauthorized client resolves the saved ID while recovering the current committed prefix. A replaced owner must pass the storage epoch check.
+3. Peer delivery can resume independently, and snapshot workers report verified publication before advancing progress.
+4. A restore changes the document generation. Preserve old pending intent for explicit review rather than replaying it over the restored version.
 
 React owns the file route, toolbar, layer navigation, properties forms, and dialogs. A
 normalized scene store contains committed object state. A sync coordinator adds pending

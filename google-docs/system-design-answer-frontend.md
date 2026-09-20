@@ -1,302 +1,411 @@
-# Google Docs - System Design Interview Answer (Frontend Focus)
+# Google Docs: frontend system design interview
 
-> **Role Focus**: Frontend Engineer - Rich Text Editor, Real-time Collaboration UI, Presence Indicators, State Management, Accessibility
+A proposed 45-minute design for a collaborative rich-text editor. The repository's
+smaller demo is discussed at the end; this answer describes the design I would propose
+at a whiteboard, not a completed feature list.
 
-## Opening Statement
+## 🎯 Clarify the experience — 5 minutes
 
-"Today I'll design Google Docs, a real-time collaborative document editing platform. As a frontend engineer, I'll focus on the rich text editor implementation with TipTap/ProseMirror, the real-time collaboration UI with cursor sharing and presence indicators, optimistic updates for low-latency editing, and offline support with local-first architecture."
+> “I would start with the promise users care about: typing feels immediate, collaborators converge on the same document, and the editor tells me whether my work is actually saved. I will cover basic rich text, small editing groups, comments, sharing, and version history.”
 
----
+The first release supports paragraphs, headings, lists, and common formatting marks.
+I would bound document size and active editors instead of promising arbitrary page
+counts. Tables, embedded applications, precise print pagination, export, and full
+tracked-change suggestions are later extensions.
 
-## Step 1: Requirements Clarification (3-5 minutes)
+Short disconnects should preserve local work. Unlimited offline collaboration is a
+separate requirement because it affects the synchronization model and how much history
+we retain. I would ask whether the interviewer wants that trade explored before
+making every document an indefinitely disconnected replica.
 
-### Functional Requirements
+I would distinguish four states: visible locally, waiting for acknowledgment,
+committed to the service, and observed by another participant. A connected socket does
+not imply saved content, and a browser storage write is only local recovery.
 
-1. **Rich text editing** - Bold, italic, headings, lists, links, images
-2. **Real-time collaboration** - See others' edits appear live
-3. **Cursor and selection sharing** - Visual indicators for collaborators
-4. **Comments and suggestions** - Inline comments with threads, track changes
-5. **Version history** - View and restore previous versions
-6. **Document management** - Create, share, organize documents
+| User action | Expected behavior |
+|-------------|-------------------|
+| Type or format | Update locally without waiting for the server |
+| Receive another edit | Preserve local intent, selection, and a coherent document |
+| Lose the connection | Keep work and show the unresolved save state |
+| Add a comment | Preserve the draft and attach it to the intended revision/range |
+| Preview history | Keep the live editing session separate from the preview |
+| Lose edit permission | Stop submission, preserve unresolved work, explain the new capability |
 
-### Non-Functional Requirements (Frontend-Specific)
+For planning, I would propose p95 local input-to-paint below 50 ms on a named modest
+device, and peer visibility below 200 ms in the document's home region. I would measure
+initial usable editor time separately from complete sidebar/history loading.
 
-- **Latency**: < 50ms for local keystroke response, < 100ms sync to collaborators
-- **Offline**: Continue editing without network, sync on reconnect
-- **Accessibility**: WCAG 2.1 AA compliant, full keyboard navigation
-- **Performance**: Smooth editing on documents up to 100 pages
+The semantic requirement is more important than those illustrative numbers: no response
+may replace newer authored work merely because it arrived last. Document ID, account,
+protocol schema, and request generation belong to the response context.
 
-### Frontend Challenges I'll Focus On
+## 🏗️ Draw the editor and its state boundaries — 5 minutes
 
-1. **Rich Text Editor**: TipTap/ProseMirror integration with custom extensions
-2. **Collaboration UI**: Cursor avatars, selection highlighting, presence list
-3. **State Management**: Zustand for UI state, ProseMirror for document state
-4. **Offline Support**: IndexedDB for local storage, operation queue
-5. **Performance**: Virtualized rendering for large documents
-
----
-
-## Step 2: Component Architecture (5 minutes)
+I would draw three views and their owners, then the shared transport boundary. The
+editor model is specialized state, while comments and presence have different lifetimes.
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                          DocumentPage                                    │
-├─────────────────────────────────────────────────────────────────────────┤
-│  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │                        Toolbar                                   │    │
-│  │  [B][I][U][S] │ [H1][H2][H3] │ [•][1.][✓] │ [Link][Image] │ [...] │
-│  └─────────────────────────────────────────────────────────────────┘    │
-│                                                                          │
-│  ┌──────────────────────────────────────┐  ┌──────────────────────────┐ │
-│  │           Editor                      │  │     Sidebar              │ │
-│  │  ┌────────────────────────────────┐  │  │  ┌────────────────────┐  │ │
-│  │  │     CollaboratorCursors        │  │  │  │  PresenceList      │  │ │
-│  │  │  (overlay layer)               │  │  │  │  Alice (editing)   │  │ │
-│  │  └────────────────────────────────┘  │  │  │  Bob (viewing)     │  │ │
-│  │  ┌────────────────────────────────┐  │  │  └────────────────────┘  │ │
-│  │  │     TipTapEditor               │  │  │  ┌────────────────────┐  │ │
-│  │  │  (ProseMirror core)            │  │  │  │  CommentsList      │  │ │
-│  │  │                                │  │  │  │  Comment 1         │  │ │
-│  │  │  [Document content here...]    │  │  │  │  Comment 2         │  │ │
-│  │  │                                │  │  │  └────────────────────┘  │ │
-│  │  └────────────────────────────────┘  │  │  ┌────────────────────┐  │ │
-│  │  ┌────────────────────────────────┐  │  │  │  VersionHistory    │  │ │
-│  │  │     InlineComments             │  │  │  │  Today, 2:30 PM    │  │ │
-│  │  │  (margin annotations)          │  │  │  │  Today, 1:15 PM    │  │ │
-│  │  └────────────────────────────────┘  │  │  └────────────────────┘  │ │
-│  └──────────────────────────────────────┘  └──────────────────────────┘ │
-│                                                                          │
-│  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │                      StatusBar                                   │    │
-│  │  [Saving...] │ [3 collaborators] │ [Last edit: 2 min ago]       │    │
-│  └─────────────────────────────────────────────────────────────────┘    │
-└─────────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│ BROWSER / ACCOUNT, DOCUMENT AND SCHEMA CONTEXT                                           │
+│                                                                                          │
+│  ┌────────────────────────┐    ┌────────────────────────┐    ┌────────────────────────┐  │
+│  │ Editor + toolbar       │    │ Review panels          │    │ Presence view          │  │
+│  │ Input / formatting     │    │ Comment draft/history  │    │ Names / mapped cursors │  │
+│  │ Selection/composition  │    │ Share / restore UI     │    │ Independent frame work │  │
+│  └────────────────────────┘    └────────────────────────┘    └────────────────────────┘  │
+│               ▲                             ▲                             ▲              │
+│               │                             │                             │              │
+│ local input   │              review intent  │                visual state │              │
+│               │                             │                             │              │
+│               ▼                             ▼                             ▼              │
+│  ┌────────────────────────┐    ┌────────────────────────┐    ┌────────────────────────┐  │
+│  │ Editor + collab model  │    │ Review/query state     │    │ Presence state         │  │
+│  │ Schema/steps/selection │◀──▶│ Pinned revision/anchor │    │ Connection + version   │  │
+│  │ Pending work + history │    │ Drafts + current role  │    │ Expiring selections    │  │
+│  └────────────────────────┘    └────────────────────────┘    └────────────────────────┘  │
+│       ▲       ▲                             ▲                             ▲              │
+│       │       │                             │                             │              │
+│       │       └─────────────────────────────┼─────────────────────────────┘              │
+│       │ save / restore                      ▲                                            │
+│       ▼                                     ▼                                            │
+│  ┌────────────────────────┐    ┌────────────────────────┐                                │
+│  │ Local recovery journal │    │ Sync / API coordinator │                                │
+│  │ Pending steps / IDs    │    │ Batches, ACKs, replay  │                                │
+│  │ Account / doc / schema │    │ Scoped queries/errors  │                                │
+│  └────────────────────────┘    └────────────────────────┘                                │
+│                                             ▲                                            │
+│                                             │                                            │
+└─────────────────────────────────────────────┼────────────────────────────────────────────┘
+                                              │
+  content commands / reads / presence         │
+                                              ▼
+   ┌────────────────────────────────────────────────────────────────────────────────────┐
+   │ Document service (server boundary)                                                 │
+   │ Ordered accepted steps, durable attempt outcomes, current capability and history   │
+   └────────────────────────────────────────────────────────────────────────────────────┘
+
+The editor maps accepted steps and review anchors; presence never marks content saved.
 ```
 
-### Component Hierarchy
+Typing goes through the editor model into unconfirmed steps. The transport submits
+identified batches and receives committed changes; the collaboration adapter reconciles
+them before the editor renders. Review panels use pinned revisions and independent
+drafts. Presence is version-relative, disposable state that never marks content saved.
 
-The app structure starts with DocumentListPage containing DocumentGrid (virtualized), NewDocumentButton, and SearchBar. DocumentPage includes Toolbar (FormatButtons, HeadingDropdown, ListButtons, InsertMenu), EditorContainer (CollaboratorCursors overlay, TipTapEditor, InlineComments), Sidebar (PresenceList, CommentsList, VersionHistory), and StatusBar. Additional components include ShareModal, CommentPopover, and SuggestionBubble.
+I would trace a reload through the bounded account/document/schema journal:
+
+1. Retain local pending steps and the immutable submitted attempt under an explicit storage policy. Local storage does not mark the document Saved.
+2. Reauthorize, recover a coherent committed prefix, and resolve that original attempt before changing its base, payload, or identity.
+3. Remove accepted work from the pending overlay. After a definitive no-effect rejection, rebase and submit a new attempt; unresolved history requires explicit recovery rather than guessing.
+4. Restore review drafts against their pinned anchors. Presence reconnects with a fresh connection and is never replayed as durable content.
+
+The shell owns navigation, account state, panel visibility, and notifications. The
+editor owns document structure, selection, composition, and undo. A server-state cache
+owns document metadata, paged comments, and version lists. Small Zustand slices are
+reasonable for coordination, but no library should subscribe the whole page to every
+keystroke or cursor movement.
+
+I would use the editor's schema-aware transaction and mapping mechanisms. Rich text
+is not a flat string with bold ranges painted over it: inserting a list item or
+splitting a paragraph changes structure as well as text positions.
+
+For this proposal I choose a centralized step-rebase protocol. The server accepts a
+batch at the current base revision; a stale client catches up and rebases its pending
+work. I would not mix that protocol with a Yjs-backed collaboration extension and
+assume their version and undo models are interchangeable.
 
----
+## 🔌 Agree on the small set of contracts — 4 minutes
 
-## Step 3: Deep Dive - TipTap Editor Implementation (10 minutes)
+> “Before discussing React components, I want enough protocol information to avoid guessing whether a write committed or which version a selection refers to.”
+
+| Contract | What the browser needs |
+|----------|------------------------|
+| Bootstrap | Document/schema identity, verified snapshot revision, contiguous suffix, capability |
+| Submit batch | Stable attempt ID, immutable payload, base version, bounded ordered steps |
+| Acceptance | Attempt identity and accepted step range; durable outcome |
+| Rejection | Explicit no-effect result, current head, bounded catch-up or resync requirement |
+| Committed changes | Contiguous versions, origin/batch identities, editor steps |
+| Attempt lookup | Resolve uncertainty without submitting different content |
+| Comment | Comment ID, body/state version, anchored revision/range or detached status |
+| Presence | Connection ID, referenced document version, cursor/selection, expiry |
 
-### Editor Setup with Custom Extensions
+A document version advances with accepted steps, not mouse movements or WebSocket
+messages. A batch of three steps advances three positions in the version stream. The
+client validates version ranges and does not skip a gap because a later packet arrived.
 
-"I'm choosing TipTap with ProseMirror as the editor foundation because it provides excellent extension support for collaborative features. The key configuration disables local history since OT handles undo/redo, and integrates collaboration extensions for real-time sync."
+REST remains useful for document discovery, comment pages, and history. WebSocket
+serves interactive batches and presence. The transport choice does not create a second
+content authority: restore and other content commands still enter the same ordering path.
 
-The TipTapEditor component configures StarterKit (with history disabled for OT), Collaboration extension connected to the provider document, CollaborationCursor extension for cursor sharing with user name and avatar color, Highlight extension with multicolor support, Link extension with styling, Placeholder extension, and custom CommentMark and SuggestionMark extensions.
+Bootstrap must describe one coherent document. A snapshot at revision 100 followed by
+steps 101–110 is valid. An old snapshot labeled “current version 110” without those
+steps is not. I would make that invariant visible in the API contract.
 
-The editor props set styling classes for prose formatting, focus outline removal, minimum height, and padding. A useEffect hook updates awareness with cursor position on selectionUpdate events, sending the from/to selection range.
+## 🔧 Deep dive 1: reconcile immediate typing with a durable shared document — 10 minutes
 
-### Custom Comment Mark Extension
+### Separate displayed state from confirmed state
 
-The CommentMark extension creates a custom mark with a commentId attribute. It parses from span elements with data-comment-id attributes and renders with yellow background and border styling to indicate commented text. Commands include setComment(commentId) and unsetComment() for applying and removing the mark.
+The user types into the editor immediately. The collaboration plugin tracks confirmed
+steps and unconfirmed local transactions, while the displayed document includes both.
+The UI can show a subtle pending state without delaying the caret or input.
 
-### Custom Suggestion Mark Extension
+I would allow one unresolved submitted batch per client/document. Further local changes
+remain editable and accumulate behind it. This gives one clear answer to “which request
+might already have committed?” and bounds the transport state machine.
 
-The SuggestionMark extension handles track changes with attributes for suggestionId, type (insert/delete), authorId, authorName, and authorColor. Insert suggestions render with green background and underline, while delete suggestions render with red background and strikethrough. The border color matches the author's assigned color.
+The submitted batch is immutable: attempt ID, base version, schema, and steps stay
+fixed until its outcome is known. Retrying it after a lost response must not include
+characters the user typed later. Those characters belong to the local buffer.
 
----
+A short batching interval can combine nearby typing transactions, with a maximum delay
+and byte/step limit. It must preserve transaction order and composition boundaries.
+Batching is a network/storage optimization, not a reason to drop intermediate edits.
 
-## Step 4: Deep Dive - Collaborator Cursors (8 minutes)
+### Walk through two people editing
 
-### Cursor Overlay Component
+Suppose Alice and Bob have confirmed version 20. Alice adds a word, Bob formats a
+nearby phrase, and both see their local changes immediately. The authority accepts
+Alice's batch first and records its resulting version range.
 
-"I'm implementing cursor overlays as an absolutely positioned layer above the editor. This approach gives precise control over cursor rendering without interfering with ProseMirror's DOM management."
+Bob's attempt still names base 20. It receives a definite stale-base rejection with
+no effect. Bob receives Alice's accepted steps, maps his unconfirmed formatting through
+them, and submits a newly identified attempt based on the updated shared revision.
 
-The CollaboratorCursors component listens to awareness state changes, filtering out the local client and collecting collaborator positions (id, name, color, cursor range). Each collaborator renders a CollaboratorCursor component.
+The important part is the editor-aware mapping. If Alice deleted the phrase Bob was
+formatting, blindly keeping Bob's old offsets could format unrelated text. Mapping can
+make the pending step empty or invalid; the interface preserves the original work for
+recovery when intent cannot be represented safely.
 
-CollaboratorCursor calculates DOM coordinates from the document position using editor.view.coordsAtPos(), subtracting the editor's bounding rectangle to get relative positioning. For range selections (from !== to), it renders a SelectionHighlight component.
+Alice also receives her own accepted steps in the canonical stream. The adapter
+confirms the matching local steps instead of inserting her word a second time.
+Accepted steps from other users are integrated while local pending work is rebased.
 
-The cursor line is a 2px wide div with smooth transitions, positioned absolutely. Above it floats a name label with the collaborator's name on a color-coded background.
+I would use the collaboration library's transaction path, including selection and
+history mappings. Calling a generic “replace document” command after every ACK loses
+those relationships even if the text happens to look correct.
 
-### Selection Highlight Component
+### Handle the uncertain outcome before rebasing
 
-SelectionHighlight handles both single-line and multi-line selections. For single-line, it creates one DOMRect from start to end coordinates. For multi-line, it iterates through each line, creating separate rectangles. Each rectangle renders as a semi-transparent overlay matching the collaborator's color.
+If Alice's socket drops after the server commits but before she sees acceptance, she
+must not assume the batch failed. On reconnect, query the original attempt or recover
+a committed range carrying its identity. Only the same frozen payload may be retried
+while that outcome is unresolved.
 
-### Presence List Sidebar
+If it committed, reconcile that accepted range and retire the matching local work.
+If it was definitively rejected, rebase the remaining work and create a new attempt.
+If its outcome is still unknown, retain the pending state and continue resolution.
 
-The PresenceList component displays all users viewing the document, sorted with active users (those with cursor) first, then alphabetically by name. Each user shows a color indicator dot, their name, and an "editing" status badge if they have an active cursor.
+This distinction prevents a subtle duplication bug: rebasing an already accepted
+insert and submitting it under a fresh identity can add the same user intent twice.
+A generic offline queue sorted by client timestamps does not resolve that ambiguity.
 
----
+The server declares how long attempt outcomes and rebase history remain available.
+When the browser is too old to recover safely, offer a recovery copy or a comparison
+against the latest document. Do not silently clear pending edits on a fresh SYNC.
 
-## Step 5: Deep Dive - Toolbar Component (5 minutes)
+### Save status follows acknowledgments
 
-### Rich Text Toolbar
+I would expose “Saving,” “Saved,” “Offline changes,” and “Needs attention” as meaningful
+states. Saved means every local content change through an identified revision has a
+durable acceptance result. A one-second debounce or successful socket send is not proof.
 
-The Toolbar component renders a sticky header with formatting controls organized into groups separated by dividers:
+If the user keeps typing after a batch leaves, its acceptance updates the acknowledged
+revision but leaves the newer text pending. Connection status can be shown separately
+so reconnecting does not turn an unresolved save green.
 
-**Undo/Redo Group**: Undo and Redo buttons with disabled state based on editor.can() checks.
+| Approach | Why choose or reject it here | Cost |
+|----------|-----------------------------|------|
+| ✅ Immediate local steps with ordered reconciliation | Responsive typing and explicit accepted history | Pending-state, mapping, and recovery complexity |
+| ❌ Wait for every server response before typing | Simple shared-state reasoning | Network latency enters every interaction |
+| ❌ Replace the document with the latest response | Simple rendering integration | Can destroy local edits, composition, selection, and undo |
 
-**Text Formatting Group**: Bold (Ctrl+B), Italic (Ctrl+I), Underline (Ctrl+U), Strikethrough buttons with isActive state for toggle styling.
+> “I choose optimistic editing because input cannot wait for the network. I pay for that responsiveness with an explicit reconciliation protocol rather than pretending the browser and server are always at the same revision.”
 
-**Headings Group**: H1, H2, H3 toggle buttons checking editor.isActive('heading', { level }).
+## 🔧 Deep dive 2: keep rich-text interaction responsive — 8 minutes
 
-**Lists Group**: Bullet list, Ordered list, and Task/checklist toggle buttons.
+### Give the editor control of its DOM
 
-**Insert Group**: Link button prompting for URL, Image button prompting for image URL.
+A mature editor owns selection, transaction application, and DOM updates. React should
+render the surrounding toolbar and panels through small derived subscriptions. Copying
+the entire document into a global React store on every edit creates serialization,
+re-rendering, and feedback-loop work before the user gets another frame.
 
-**Collaboration Group**: Comment button (disabled when selection is empty), Version history button.
+The toolbar observes only the active selection's formatting and available commands.
+A cursor update does not rebuild the document model. An open comment panel does not
+subscribe to every paragraph's text when it only needs a mapped anchor and draft.
 
-ToolbarButton is a reusable component with onClick, disabled, isActive, and title props. It applies hover/focus styles, disabled opacity, and active state highlighting (blue background for active toggles).
+I would lazy-load heavy history or review code after the usable editor appears. A
+loading sidebar should not block typing in a ready document. Conversely, editing must
+wait until bootstrap has established a valid schema and confirmed revision.
 
----
+### Composition, undo, and large paste are correctness paths
 
-## Step 6: Deep Dive - Comments System (5 minutes)
+Input-method composition can involve several transient browser events for one authored
+sequence. I would let the editor integration handle composition rather than converting
+every DOM mutation into a separate network operation. Replacing the editor state while
+composition is active can lose text or move the caret unexpectedly.
 
-### Inline Comments Component
+Test keyboard input, mobile selection, bidirectional text, emoji, and combining marks.
+Editor positions follow its model; they are not automatically bytes, Unicode code
+points, or visible characters. Pasting nested content also needs schema normalization
+and limits before it becomes a large synchronous task.
 
-"I'm positioning comments in the right margin, aligned with their anchor positions in the document. This gives visual context while keeping the main content area clean."
+Undo should target the local user's logical transactions after mapping through remote
+changes. Disabling all history because “collaboration handles undo” removes a product
+feature; keeping an unrelated local snapshot history can undo another user's work.
+Use history behavior compatible with the chosen collaboration model and test it.
 
-InlineComments tracks commentPositions by finding each comment's mark position in the editor and calculating DOM coordinates. The newCommentAnchor state holds the selection range for new comments.
+For expensive optional work such as spellchecking, send bounded snapshots or ranges to
+a worker and tag results with document/revision identity. Discard stale annotations.
+Moving work off-thread does not make an old result correct.
 
-When adding a comment, the component generates a UUID, applies the comment mark to the selection using editor.chain().setComment(commentId), then saves to the server. On success, the anchor is cleared.
+### Large documents require a measured rendering plan
 
-### Comment Card Component
+I would start with a stated document-size budget and incremental editor updates. Profile
+large paste, scroll, text selection, and presence overlays before choosing virtualization.
+The editor's DOM participates in selection and composition; unmounting arbitrary
+paragraphs can break cross-paragraph selection, find, accessibility, and measurement.
 
-CommentCard renders positioned absolutely based on the comment's top coordinate. It displays:
-- Header with author avatar (color circle), name, and relative timestamp
-- Comment content text
-- Replies section (indented with left border) if replies exist
-- Reply input field and button (when active and not resolved)
-- Resolve button to close the thread
+Virtualize document cards, comment lists, and version lists first because those are
+ordinary collections. For much larger editable documents, investigate supported block
+rendering or section boundaries with the editor's model, including cross-boundary
+selection and undo. That is not a generic list-virtualizer toggle.
 
-The card shows active state with blue border and shadow, and resolved state with reduced opacity.
+Presence updates are coalesced to the latest meaningful state and rendered within a
+frame budget. Expire old connections, cap visible labels, and avoid measuring all remote
+selections on every mouse movement. A range may wrap over several lines; one rectangle
+between its endpoints does not describe its visual geometry.
 
----
+I would prefer editor decorations for mapped anchors and selections when supported.
+A separate overlay can work, but its coordinates must account for scrolling, zoom,
+line wrapping, font loading, and layout changes. Color alone cannot identify a person.
 
-## Step 7: Deep Dive - Version History (5 minutes)
+### Preserve focus as the layout changes
 
-### Version History Sidebar
+Formatting controls need labels, pressed states, keyboard access, and visible focus.
+A toolbar action restores the intended editor selection without hijacking input in a
+comment field. Global shortcuts must not intercept unrelated text-entry contexts.
 
-The VersionHistory component groups versions by date using a Map structure. Each date section has a sticky header, and versions within show time, optional named version badge, author name, and changes summary.
+Share dialogs need modal semantics, focus containment, Escape handling, and focus
+restoration. Side panels can remain modeless. On small screens, closing a panel returns
+the user to their prior document position instead of jumping to the top.
 
-Clicking a version triggers handlePreview which fetches the version content from the API and stores it in previewContent state. The selected version highlights with blue background.
+A restrained live region can announce save failure or permission loss. Announcing every
+remote caret movement overwhelms assistive technology. Accessibility is a tested
+interaction model, not a compliance claim inferred from using an editor library.
 
-The footer shows a "Restore this version" button when a version is selected. A VersionPreviewModal renders the document content in read-only mode for comparison before restoring.
+| Approach | Benefit here | Cost or failure mode |
+|----------|--------------|----------------------|
+| ✅ Editor-owned transactions with narrow UI subscriptions | Preserves input context and bounds surrounding renders | Requires deliberate adapter boundaries |
+| ❌ Global document JSON on every event | Easy to inspect centrally | Serialization and broad updates compete with typing |
+| ❌ Naive editable-paragraph virtualization | Reduces DOM count | Can break selection, composition, and assistive navigation |
 
----
+> “I would optimize the work around the editor before changing how the editor renders its document. Fewer DOM nodes are useful only if the editing interaction remains correct.”
 
-## Step 8: State Management (5 minutes)
+## 🔧 Deep dive 3: comments and history keep their original context — 7 minutes
 
-### Document Store with Zustand
+### Anchor the discussion to a revision
 
-"I'm using Zustand with persist middleware for state management. The store handles UI state while ProseMirror manages document content separately, avoiding duplication."
+A comment draft remembers the selected document, base revision, range, and boundary
+affinity. If another person inserts text before the selection, accepted mappings move
+the anchor with its intended text. The draft body remains independent of those changes.
 
-The DocumentState interface includes:
-- **currentUser**: User object or null
-- **activeDocumentId/documentMeta**: Currently open document
-- **sidebarView**: 'comments' | 'versions' | 'outline' | null
-- **isOffline**: Network status boolean
-- **saveStatus**: 'saved' | 'saving' | 'error'
-- **pendingOperations**: Queue for offline operations
+If the selected text is deleted, keep the discussion as detached and show the original
+quoted context where authorized. A collapsed range at the deletion point does not mean
+the user intended to comment on the next sentence.
 
-Actions include setCurrentUser, setActiveDocument, setSidebarView, setOffline, setSaveStatus, addPendingOperation, and clearPendingOperations.
+Before submitting an anchor that includes local unconfirmed edits, establish a committed
+base or submit it through a defined combined command. Do not send raw displayed offsets
+as though they belonged to the server's older document.
 
-The persist middleware saves currentUser and pendingOperations to localStorage, enabling offline recovery.
+The server maps or rejects the anchor under the current document authority. The client
+uses a stable comment attempt identity so a lost response does not create duplicate
+threads. A failed submission retains the draft and tells the user what can be retried.
 
-### Collaboration Provider Hook
+For reply and resolve actions, preserve the current desired state and reconcile the
+canonical result. Restoring an entire cached comment list after an old failure can
+remove newer replies that arrived meanwhile.
 
-useCollaborationProvider manages the WebSocket connection and Yjs document lifecycle. It creates a Y.Doc and WebsocketProvider on mount, sets local awareness state with user info and null cursor, and handles connection status events to update offline state and save status.
+### Keep preview separate from live editing
 
-The hook returns provider, awareness, connectionStatus, and ydoc reference. Cleanup destroys both provider and document on unmount.
+A version preview is a read-only, pinned document instance. Opening it does not replace
+the live editor's content or confirmed revision. Its loading/error state belongs to
+that preview request, and later responses check the selected document/version identity.
 
----
+Restore names a historical revision and the current head the user reviewed. It creates
+a new document event through the same authority as edits. If the head changed before
+admission, refresh the comparison and ask for a new restore intent rather than silently
+replacing someone else's intervening work.
 
-## Step 9: Offline Support (3 minutes)
+Before submitting restore, resolve the local pending batch or preserve a recovery copy.
+Other participants may also have pending work when the reset arrives. The protocol
+must let them stop and recover that work if automatic mapping is unsafe.
 
-### Offline Queue with IndexedDB
+The history list should distinguish “named checkpoint” from “current document.” The
+newest listed snapshot may be older than current edits, and a snapshot timestamp is
+not evidence that the user's newest typing was saved.
 
-"I'm using IndexedDB via the idb library for structured offline storage. This handles larger documents than localStorage and provides indexed access for efficient queries."
+### Permission changes affect active sessions
 
-The OfflineQueue class manages two object stores: operations (keyed by id) and documents (keyed by id with content, version, lastModified).
+Viewers can read; commenters can discuss; editors can change content. Rendering the
+right buttons helps explain capability, but the server enforces it for every command.
+A commenter must not get an editable body just because they are not a viewer.
 
-Key methods:
-- **queueOperation**: Store pending operation
-- **getQueuedOperations**: Retrieve operations for a document, sorted by timestamp
-- **clearOperations**: Remove synced operations by ID array
-- **saveDocumentLocally**: Cache document content and version
-- **getLocalDocument**: Retrieve cached document
+On revocation or deletion, stop sending, remove protected data from active views, and
+cancel or ignore stale requests. Unresolved local work needs an explicit recovery
+policy; do not quietly upload it after a later account switch.
 
-### Sync on Reconnect Hook
+The application cannot erase text a user already copied. Its enforceable promise is
+that it stops returning new protected content and accepting unauthorized operations.
+Long-lived sockets must follow that same rule as fresh HTTP requests.
 
-useOfflineSync monitors isOffline state and syncs pending operations when coming back online. It fetches queued operations from IndexedDB, sends each to the server via provider.send(), clears synced operations on success, and updates the Zustand store.
+| Approach | Why it fits | Cost |
+|----------|-------------|------|
+| ✅ Versioned anchors and isolated history preview | Preserves the user's intended context | Mapping, detached state, and guarded restore |
+| ❌ Fixed offsets forever | Small initial model | Comments drift as earlier text changes |
+| ❌ Replace live editor for preview/restore | Reuses one editor instance | Destroys pending work and mixes historical/live revisions |
 
----
+> “I want a comment or restore to mean what the person reviewed when they acted. That requires carrying context through the operation, rather than relying on whatever document happens to be displayed when a response returns.”
 
-## Step 10: Keyboard Accessibility (3 minutes)
+## 🛡️ Recovery and verification — 4 minutes
 
-### Keyboard Navigation Hook
+I would test the whole state transition, not only individual buttons. Two browser
+contexts type and format concurrently, disconnect one before its acknowledgment, and
+reconnect it while the other continues. Assert that both end at the same committed
+revision, each accepted intent appears once, and unsent work remains available.
 
-useEditorKeyboard sets up global keyboard shortcuts:
-- **Ctrl+Alt+M**: Create comment (when text selected)
-- **Ctrl+K**: Insert link with URL prompt
-- **Ctrl+Alt+1/2/3**: Toggle heading levels
-- **Ctrl+Shift+7**: Toggle ordered list
-- **Ctrl+Shift+8**: Toggle bullet list
+| Scenario | What I would verify |
+|----------|---------------------|
+| Lost acceptance response | Original attempt resolves without duplicate insertion |
+| Missing committed step | Client repairs the gap before applying later versions |
+| Stale request after navigation | It cannot replace the new document or account state |
+| Composition during remote edit | Authored text, caret, and undo remain coherent |
+| Anchor text deleted | Thread becomes detached instead of moving to unrelated text |
+| Failed comment or restore | Draft/context survives; no false success indication |
+| Permission revoked mid-session | Future commands and replay stop under current access |
 
-The hook checks for modifier keys (Ctrl/Cmd) and prevents default browser behavior before executing editor commands.
+Performance measurements include input-to-paint, long tasks during paste, editor
+bootstrap time, memory after repeated document navigation, and overlay work per frame.
+Measure on representative devices and network conditions with realistic documents.
 
-### Focus Management
+Log body-free operation identities and reasons for resync, not private document text.
+Track unresolved-save age and recovery failures separately from socket uptime. A fast
+render with an indefinitely pending queue is still a poor editing experience.
 
-FocusTrap component manages focus within modals and dialogs. It queries all focusable elements (button, [href], input, select, textarea, [tabindex]), traps Tab/Shift+Tab navigation to cycle between first and last elements, and auto-focuses the first element on activation.
+## ⚖️ Decisions and local implementation boundary — 2 minutes
 
----
+I have chosen a schema-aware editor with explicit pending state, a centralized ordered
+step protocol, and versioned review context. The costs are mapping and recovery logic,
+an owner-dependent write path, and a bounded offline contract. A long-offline product
+could justify a different collaboration model.
 
-## Step 11: Performance Optimizations (2 minutes)
+The local [Editor](./frontend/src/components/Editor.tsx) has no operation send in its
+update callback, and [DocumentPage](./frontend/src/routes/DocumentPage.tsx) does not apply
+incoming edits or SYNC content. The demo displays stored rich text and presence names,
+with REST document/comment/history workflows; it does not implement the proposed sync,
+offline recovery, remote caret layer, or anchored review behavior.
 
-### Large Document Handling
-
-useLargeDocumentOptimizations applies three strategies:
-
-1. **Throttled cursor updates**: Limit awareness updates to 20/second max, reducing WebSocket traffic
-2. **Debounced save status**: Delay "saved" indicator by 1 second to avoid flicker
-3. **Virtual rendering**: For documents exceeding 100,000 characters, enable scroll handlers that update visible paragraph range on requestAnimationFrame, rendering only visible content
-
----
-
-## Step 12: Trade-offs (2 minutes)
-
-| Decision | Chosen | Alternative | Trade-off |
-|----------|--------|-------------|-----------|
-| ✅ TipTap/ProseMirror | Slate.js, Quill | Better OT support, steeper learning curve |
-| ✅ Zustand | Redux, Jotai | Simpler API, less boilerplate, smaller bundle |
-| ✅ CSS cursor overlay | ProseMirror decorations | More control, but manual position calculations |
-| ✅ IndexedDB offline | Service Worker cache | Better for structured data, more complex API |
-| ✅ WebSocket (Yjs) | Custom OT implementation | Proven library, less control over protocol |
-| ✅ Comment marks | Decorations | Persisted with document, requires anchor tracking |
-
----
-
-## Closing Summary
-
-"I've designed a collaborative document editor frontend with:
-
-1. **TipTap/ProseMirror integration** with custom extensions for comments and suggestions
-2. **Real-time cursor sharing** using awareness protocol with smooth animations
-3. **Rich toolbar** with full formatting controls and keyboard shortcuts
-4. **Comments system** with inline anchors that track document changes
-5. **Offline support** using IndexedDB for local storage and operation queuing
-6. **Accessibility** with WCAG 2.1 AA compliance and full keyboard navigation
-
-The key insight is that ProseMirror's transaction model naturally integrates with OT, while the awareness protocol provides low-latency presence sharing. The offline-first architecture ensures editing continues seamlessly during network interruptions."
-
----
-
-## Potential Follow-up Questions
-
-1. **How would you optimize for very large documents (100+ pages)?**
-   - Virtualized rendering (only render visible paragraphs)
-   - Lazy loading of document sections
-   - Debounced/batched operation broadcasts
-
-2. **How would you implement real-time spell checking?**
-   - Web Worker for spell check computation
-   - Decorations for underlines (not marks, for performance)
-   - Dictionary loaded progressively
-
-3. **How would you handle image uploads in the editor?**
-   - Drop zone with preview
-   - Upload to object storage, insert placeholder
-   - Replace placeholder with final URL on complete
+The [architecture](./architecture.md#implementation-notes) records the backend's
+persistence, authorization, and version-history limits. I would finish the interview
+by tracing one local edit through durable acceptance and peer reconciliation on the
+diagram, then discussing whichever of those boundaries the interviewer wants to probe.

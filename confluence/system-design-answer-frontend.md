@@ -40,26 +40,52 @@ content area can show a page, an editor, history, or search results. The reader 
 not download the editor bundle simply to open a short document.
 
 ```
-┌──────────────────────────────────────────────────────┐
-│ App shell: account, space, search                    │
-├───────────────────┬──────────────────────────────────┤
-│ Page navigation   │ Reader / editor / history        │
-│ Metadata only     │ Route + revision context         │
-└─────────┬─────────┴─────────────────────┬────────────┘
-          │                               │
-          ▼                               ▼
-┌──────────────────────┐     ┌─────────────────────────┐
-│ Resource cache       │     │ Editor session          │
-│ Server snapshots     │     │ Base + draft + request  │
-└─────────┬────────────┘     └────────────┬────────────┘
-          │                               │
-          └────────────────┬──────────────┘
-                           ▼
-            ┌────────────────────────────┐
-            │ API: pages + search        │
-            │ Permissions / receipts     │
-            └────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│ BROWSER / ACCOUNT, SPACE, PAGE ID AND REVISION CONTEXT                                   │
+│                                                                                          │
+│  ┌────────────────────────┐    ┌────────────────────────┐    ┌────────────────────────┐  │
+│  │ Tree, reader, history  │    │ Editor session         │    │ Search + review views  │  │
+│  │ Safe page rendering    │    │ Draft, selection, undo │    │ Query / review version │  │
+│  └────────────────────────┘    └────────────────────────┘    └────────────────────────┘  │
+│                       ▲                             ▲                             ▲      │
+│  read / select        │        save / result        │        query / review       │      │
+│                       │                             │                             │      │
+│                       ▼                             ▼                             ▼      │
+│  ┌────────────────────────┐    ┌────────────────────────┐    ┌────────────────────────┐  │
+│  │ Resource cache         │    │ Save coordinator       │    │ Query + review state   │  │
+│  │ Immutable revisions    │◀──▶│ Base + frozen payload  │    │ Scoped responses       │  │
+│  │ Metadata + permissions │ ┌─▶│ Saved ID / conflict    │    │ Freshness; publication │  │
+│  └────────────────────────┘ │  └────────────────────────┘    └────────────────────────┘  │
+│                       ▲     │                       ▲                             ▲      │
+│                       │     │ save / restore        │                             │      │
+│  read accepted state  │     │  identified commands  │        authorized results   │      │
+│                       │     │                       │                             │      │
+│                       │     ▼                       │                             │      │
+│                       │ ┌────────────────────────┐  │                             │      │
+│                       │ │ Local recovery copy    │  │                             │      │
+│                       │ │ Base / draft / save ID │  │                             │      │
+│                       │ │ Policy + scope + quota │  │                             │      │
+│                       │ └────────────────────────┘  │                             │      │
+└───────────────────────┼─────────────────────────────┼─────────────────────────────┼──────┘
+                        │                             │                             │
+                        ▼                             ▼                             ▼
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│ WIKI API / CURRENT SPACE AUTHORIZATION                                                   │
+│ Page reads, revision receipts, review decisions, bounded tree and search contracts       │
+└──────────────────────────────────────────────────────────────────────────────────────────┘
 ```
+
+I would trace reading through the resource cache and editing through a separate draft
+and save coordinator. An accepted revision can refresh server state without erasing
+newer typing. Search and review keep their own scope: a saved draft is not necessarily
+the published revision, and indexing may lag publication. Every API path checks the
+current space permissions; the browser's capability flags only shape the interface.
+
+The local recovery copy is bounded by workspace policy, account/page scope, and storage
+availability. It preserves the base, draft, and save identity; it cannot mark a page
+saved or published. After a reload, the coordinator resolves the original receipt and
+checks the current head before offering another save. A storage failure remains visible
+while newer text stays in memory, rather than silently claiming reload protection.
 
 The boxes describe ownership, not a requirement for a different state library in each
 box. React and a small Zustand store are reasonable tools, but one global `currentPage`

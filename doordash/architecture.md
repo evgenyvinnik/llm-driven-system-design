@@ -56,29 +56,52 @@ The seed contains four users, five restaurants, 25 menu items, one driver, and o
 Proposed production layout; each market has an authoritative order/assignment database:
 
 ```
-┌─────────────────────┐    ┌─────────────────────┐
-│ Three client apps   │───▶│ CDN + API gateway   │
-└─────────────────────┘    └──────────┬──────────┘
-                                     │
-           ┌─────────────────────────┼──────────────────────┐
-           ▼                         ▼                      ▼
-┌─────────────────────┐  ┌─────────────────────┐  ┌─────────────────┐
-│ Catalog + orders    │  │ Dispatch + ETA      │  │ Location intake │
-└──────────┬──────────┘  └──────────┬──────────┘  └────────┬────────┘
-           │                       │                      │
-           ▼                       ▼                      ▼
-┌───────────────────────────────────────┐       ┌─────────────────┐
-│ Market SQL: orders, claims, outbox    │       │ Fresh geo index │
-└───────────────────┬───────────────────┘       └────────┬────────┘
-                    ▼                                    │
-          ┌───────────────────┐                          │
-          │ Outbox → event bus│                          │
-          └─────────┬─────────┘                          │
-                    ▼                                    ▼
-          ┌────────────────────────────────────────────────┐
-          │ Authorized socket gateways + notification jobs │
-          └────────────────────────────────────────────────┘
+PROPOSED MARKET — orders/claims are durable; positions are replaceable observations
+
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Customer / kitchen       │HTTP/result │ API + authentication     │quote/read  │ Catalog + quote module   │
+│ Driver clients           │◀──────────▶│ Participant access       │◀──────────▶│ Current menu / coverage  │
+│ Role-scoped saved intent │            │ Command / query budgets  │            │ Bound revisions + expiry │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
+              ▲                                       ▲
+              │                                       │
+              │ report / result                       │ action / snapshot
+              │                                       │
+              ▼                                       ▼
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐
+│ Location ingestion       │            │ Order authority          │commit/read │ Market SQL authority     │
+│ Session, sequence, time  │            │ Quote / state / claims   │◀──────────▶│ Orders / live claims     │◀─────┐
+│ Auth + freshness checks  │            │ Serialize decisions      │            │ Receipt + outbox commit  │      │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘      │
+              ▲                                       ▲                                       ▲                   │
+              │                                       │                                       │                   │
+              │ update / result                       │ claim / transition                    │ outbox / progress │
+              │                                       │                                       │                   │
+              ▼                                       ▼                                       ▼                   │
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐      │
+│ Fresh geo index          │candidates  │ Dispatch + ETA           │work/ACK    │ Outbox relay + bus       │      │
+│ Latest valid samples     │◀──────────▶│ Score fresh candidates   │◀──────────▶│ Committed lifecycle      │      │
+│ Approximate candidates   │            │ Recover claim + deadline │            │ Retained work / retry    │      │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘      │
+              │                                                                               │                   │
+              │ latest sample                                                                 │ wake              │
+              │                                                                               │           replay  │
+              │                                                                               │                   │
+              ▼                                                                               ▼                   │
+┌──────────────────────────┐            ┌──────────────────────────┐            ┌──────────────────────────┐      │
+│ Position push            │latest/read │ Participant clients      │event/resume│ Event gateways           │      │
+│ Coalesce old samples     │◀──────────▶│ Order / location state   │◀──────────▶│ Current read permission  │◀─────┘
+│ Scoped latest data       │            │ Reconcile + show age     │            │ Replay / bounded queues  │
+└──────────────────────────┘            └──────────────────────────┘            └──────────────────────────┘
 ```
+
+Follow one order and one recovery through the proposed overview:
+
+1. Checkout returns only after the agreed order, receipt, and outbox commit. Each role retains its own scoped pending operation for uncertain-response recovery.
+2. Dispatch consumes retained work, reads fresh candidates, and creates an exclusive order/driver claim through the same authority.
+3. A restarted worker reloads the current claim and deadline; acceptance, expiry, cancellation, and replacement serialize against that identity.
+4. Gateways can read committed history independently of a missed bus notification. Clients can also reconcile a current authorized snapshot through the API.
+5. Location reports and coalesced latest positions follow their own freshness path; neither a map marker nor an observation ACK changes order state.
 
 Dispatch reads fresh geo candidates and writes assignment claims in the same market database as orders. Telemetry feeds a coalescing fan-out path; committed lifecycle events take the durable outbox path. Notification jobs must recheck whether an action is still relevant before sending an old offer. Each socket gateway needs events for its connected subscribers; a single consumer group that distributes events arbitrarily across gateways is insufficient without another routing layer.
 

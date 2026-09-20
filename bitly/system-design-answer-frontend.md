@@ -13,12 +13,12 @@ Notes](./architecture.md#implementation-notes) describe its actual behavior.
 | Time | Discussion |
 |------|------------|
 | 4 minutes | Product scope and visible states |
-| 5 minutes | UI architecture and API responsibilities |
+| 6 minutes | UI architecture and API responsibilities |
 | 9 minutes | Deep dive: creating a link across uncertain responses |
 | 8 minutes | Deep dive: account context and link lifecycle |
 | 9 minutes | Deep dive: useful, honest analytics |
 | 6 minutes | Rendering, accessibility, and performance |
-| 4 minutes | Verification and scaling decisions |
+| 3 minutes | Verification and scaling decisions |
 
 ## 🎯 Product scope and visible states — 4 minutes
 
@@ -54,20 +54,61 @@ should never share the same visual treatment.
 > requests, navigation, and account state change around it. Rendering a short string
 > is the easy part.”
 
-## 🏗️ UI architecture and API responsibilities — 5 minutes
+## 🏗️ UI architecture and API responsibilities — 6 minutes
 
 I would draw one small diagram and use it for the remaining discussion:
 
 ```
-┌────────────────┐       ┌────────────────┐
-│ Form and list  │──────▶│ Management API │
-│ Analytics view │◀──────│ Auth + links   │
-└────────────────┘       │ Reports        │
-                         └────────────────┘
-┌────────────────┐       ┌────────────────┐
-│ Open short URL │──────▶│ Resolver       │──────▶ Destination
-└────────────────┘       └────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│ MANAGEMENT BROWSER / ACCOUNT OR ANONYMOUS OPERATION SCOPE                                │
+│                                                                                          │
+│  ┌────────────────────────┐    ┌────────────────────────┐    ┌────────────────────────┐  │
+│  │ Create form + result   │    │ Owned link list        │    │ Activity report        │  │
+│  │ Draft, alias, expiry   │    │ Status and selection   │    │ Range and freshness    │  │
+│  └────────────────────────┘    └────────────────────────┘    └────────────────────────┘  │
+│                          ▲                             ▲                             ▲   │
+│                          │                             │                             │   │
+│   submit / render        │      select / render        │      filter / render        │   │
+│                          │                             │                             │   │
+│                          ▼                             ▼                             ▼   │
+│  ┌────────────────────────┐    ┌────────────────────────┐    ┌────────────────────────┐  │
+│  │ Creation attempt       │    │ Scoped link cache      │    │ Report query model     │  │
+│  │ Saved ID / frozen data │───▶│ Revision and lifecycle │    │ Scope/code/range/zone  │  │
+│  │ Confirmed code only    │    │ URL-owned filters      │    │ Coverage + watermark   │  │
+│  └────────────────────────┘    └────────────────────────┘    └────────────────────────┘  │
+│                          ▲                             ▲                             ▲   │
+│                          │                             │                             │   │
+│   create / recover       │      read / deactivate      │      poll aggregates        │   │
+│                          │                             │                             │   │
+│                          ▼                             ▼                             ▼   │
+│  ┌────────────────────────────────────────────────────────────────────────────────────┐  │
+│  │ API layer + reconciliation                                                         │  │
+│  │ Request/account identity, typed errors, canonical revisions and report coverage    │  │
+│  └────────────────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                      ▲   │
+│                                                                                      │   │
+│  Owned-list updates require confirmed account ownership                              │   │
+│  Recipients follow short links without loading this dashboard                        │   │
+└──────────────────────────────────────────────────────────────────────────────────────┼───┘
+                                                                                       │
+                                                                                       ▼
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│ Management and report APIs (server boundary)                                             │
+│ Create/recover one mapping | authorized lists and lifecycle changes | bounded reports    │
+└──────────────────────────────────────────────────────────────────────────────────────────┘
 ```
+
+I would follow a submitted draft into a stable attempt, then render only the code
+confirmed by the API. Lists reconcile lifecycle revisions; reports have their own
+account, code, range and timezone identity plus coverage. Those paths share request
+handling without sharing one loading state. A recipient bypasses this application:
+the resolver returns a 302 response and the recipient's browser follows its Location.
+
+I would retain the creation reference within its account or anonymous-operation scope
+before submitting. After a lost response, recovery resolves that same operation while
+newly edited form text stays a separate draft. A successful report refresh updates
+only the matching code/range query and preserves its coverage information; it cannot
+turn missing observations into a complete history of visits.
 
 React components own the form draft, open panels, focus, and copy feedback. Shared
 application state contains the current authenticated identity and durable operation
@@ -346,7 +387,7 @@ I would measure time to usable form, submission responsiveness, report render ti
 and failed or recovered operations. Request counts alone do not reveal whether users
 can copy a result or understand a failed deactivation.
 
-## 🧪 Verification and scaling decisions — 4 minutes
+## 🧪 Verification and scaling decisions — 3 minutes
 
 The most valuable tests cross state transitions. I would lose a creation response
 after commit and verify that recovery returns one link. I would then edit a draft
