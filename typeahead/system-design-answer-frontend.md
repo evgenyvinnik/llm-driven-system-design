@@ -1,420 +1,315 @@
-# Typeahead - System Design Answer (Frontend Focus)
+# Typeahead — System Design Answer (Frontend Focus)
 
-*45-minute system design interview format - Frontend Engineer Position*
+*Staff frontend engineer interview · 45–50 minutes · structured with the [RADIO framework](https://www.greatfrontend.com/front-end-system-design-playbook/framework): Requirements → Architecture → Data model → Interface → Optimizations*
 
----
+> "A typeahead looks like a text box with a list under it. Three things make it hard. First, latency is measured against typing speed, not page loads: at five characters a second, a list that arrives 200 ms late already describes a prefix the user has typed past. Second, correctness under out-of-order async: it's easy to render suggestions for the wrong prefix. Third, the ARIA combobox is one of the most commonly broken accessibility patterns on the web. I'll design a reusable component that gets all three right once, so product teams don't each get them wrong."
 
-## 📋 Introduction
-
-"Today I'll be designing the frontend architecture for a typeahead/autocomplete system. This is the component users see when they start typing in a search box and suggestions appear below. Think of Google Search suggestions or the command palette in VS Code. The frontend is critical here because we're dealing with real-time user input, and any perceived lag will make the product feel broken."
-
----
-
-## 🎯 Requirements
-
-### Functional Requirements
-
-1. **Instant Suggestions** - Show results as user types each character
-2. **Multiple Widget Types** - Search box, command palette, form autocomplete, rich suggestions with images
-3. **History Integration** - Merge user's recent searches with API suggestions
-4. **Offline Support** - Work without network using cached data
-5. **Keyboard Navigation** - Full keyboard accessibility for power users
-
-### Non-Functional Requirements
-
-1. **Perceived Latency** - Under 50ms from keypress to suggestions visible
-2. **Cache Hit Rate** - Over 80% to reduce server load
-3. **Bundle Size** - Under 5KB gzipped for core typeahead module
-4. **Accessibility** - WCAG 2.1 AA compliant
-5. **Offline** - Functional with stale data when network unavailable
-
-### Scale Estimates
-
-"Let me think about the frontend-specific scale here."
-
-- Keystrokes per session: 50-100
-- API calls per session: 10-20 (with effective caching)
-- Memory cache size: Around 500 entries
-- IndexedDB storage: Approximately 5MB for offline trie
+| Phase | Time | What the interviewer should leave with |
+|-------|------|----------------------------------------|
+| R — Requirements | ~5 min | Scope, numeric targets, what's out |
+| A — Architecture | ~8 min | Headless controller, data access layer, one connected diagram |
+| D — Data model | ~5 min | Who owns which state; what a cache entry actually guarantees |
+| I — Interface | ~8 min | The server contract that makes caching possible; the component API |
+| O — Optimizations | ~18 min | Three deep dives: request lifecycle, caching/prefetch, combobox interaction |
+| Wrap-up | ~2 min | Trade-offs and what I'd validate first |
 
 ---
 
-## 🏗️ High-Level Design
+## 🎯 R — Requirements Exploration (~5 min)
 
-"Let me draw the browser-side architecture. The key insight is that we need multiple caching layers to hit that 50ms latency target."
+### Clarifying questions (and the answers I'll assume)
 
-```
-+------------------------------------------------------------------------+
-|                          BROWSER ENVIRONMENT                            |
-+------------------------------------------------------------------------+
-|                                                                         |
-|   +--------------+     +----------------+     +-----------------+       |
-|   | Search Box   |     | Command Palette|     | Rich Typeahead  |       |
-|   | Widget       |     | Widget         |     | Widget          |       |
-|   +------+-------+     +-------+--------+     +--------+--------+       |
-|          |                     |                       |                |
-|          +---------------------+-----------------------+                |
-|                                |                                        |
-|                                v                                        |
-|   +----------------------------------------------------------------+   |
-|   |                    TYPEAHEAD CORE MODULE                        |   |
-|   |                                                                 |   |
-|   |  +------------------+  +------------------+  +---------------+  |   |
-|   |  | Request Manager  |  | Cache Coordinator|  | Source Merger |  |   |
-|   |  | (debounce,abort) |  | (multi-layer)    |  | (API+history) |  |   |
-|   |  +------------------+  +------------------+  +---------------+  |   |
-|   +----------------------------------------------------------------+   |
-|                                |                                        |
-|          +---------------------+---------------------+                  |
-|          |                     |                     |                  |
-|          v                     v                     v                  |
-|   +-------------+     +-----------------+     +----------------+        |
-|   | Memory Cache|     | Service Worker  |     | IndexedDB      |        |
-|   | (0ms)       |     | (1-5ms)         |     | (5-20ms)       |        |
-|   | ~500 items  |     | stale-while-    |     | offline trie   |        |
-|   +-------------+     | revalidate      |     | user history   |        |
-|                       +-----------------+     +----------------+        |
-|                                |                                        |
-+--------------------------------|----------------------------------------+
-                                 |
-                                 v
-+------------------------------------------------------------------------+
-|                           NETWORK LAYER                                 |
-+------------------------------------------------------------------------+
-|   CDN Edge Cache (10-50ms)  ---->  Origin API (50-200ms)               |
-+------------------------------------------------------------------------+
-```
+| Question | Why it changes the design | Assumption |
+|----------|---------------------------|------------|
+| One search box, or a component other teams reuse? | Reuse means a headless API, with accessibility owned centrally | Platform component. Web search is the main consumer; people pickers and a command palette reuse it |
+| Text completions or rich results? | Rich rows mean variable heights, images, grouped sections | Mostly query completions, some entity rows (thumbnail + subtitle), grouped as "Recent" and "Suggestions" |
+| Where does data come from? | Determines caching and cancellation | Remote API for search; local in-memory list for the command palette; one source abstraction serves both |
+| Personalized for signed-in users? | Decides whether a response can be shared-cached | Yes, recent searches for signed-in users; anonymous users get global suggestions |
+| Devices and networks? | JS budget, touch, virtual keyboard | Desktop and mobile web; the p75 device is a mid-range Android on 4G |
+| Languages? | IME composition, RTL, Unicode normalization | 40+ locales including Japanese/Chinese/Korean (IME) and Arabic/Hebrew (RTL) |
+| Offline? | Adds a storage layer | Degrade gracefully: show recent searches. No offline suggestions, since there are no offline results either |
 
-"The core insight here is the cascade of caching layers, each with different latency characteristics. Memory cache gives us 0ms response for repeated queries. Service Worker survives page refreshes. IndexedDB provides offline capability."
+### Functional requirements
+
+1. As the user types, show ranked suggestions with the matched portion emphasized.
+2. On focus with an empty input, show a zero state of recent searches, each removable.
+3. Keyboard (↑ ↓ Home End Enter Esc Tab), pointer and touch selection. Selecting either navigates or fills the input; the consumer decides which.
+4. Grouped sections and rich rows come from consumer-supplied renderers.
+5. Emit impression and selection telemetry so ranking can learn.
+
+### Non-functional requirements
+
+| Property | Target | Why this number |
+|----------|--------|-----------------|
+| Input responsiveness | Each keystroke paints within a frame; INP < 100 ms on the p75 device | Suggestion work must never block the input |
+| Suggestion latency | Cached prefix: same frame. Network: p75 < 150 ms after the request is sent | ~200 ms is one keystroke behind a normal typist |
+| Correctness | Never render results for a prefix that isn't the current input, except an ancestor's results filtered to the current input | A wrong list erodes trust more than a slow one |
+| Network efficiency | ≤ ~0.4 requests per keystroke on average | At global scale every keystroke is a request |
+| Accessibility | WCAG 2.2 AA, WAI-ARIA APG combobox pattern | It's the primary control on the most-visited page |
+| Bundle | Core < 8 KB gzipped; rich renderers lazy-loaded | It sits on the critical path of the landing page |
+
+**Out of scope:** ranking and the index (the server is a black box, but I'll specify the contract I need from it), the results page, voice input.
+
+> "I'll keep 'one keystroke behind' and 'never show the wrong prefix' in the corner of the board. Most of the deep dives come back to those two."
 
 ---
 
-## 🔍 Deep Dive
+## 🏗️ A — Architecture / High-Level Design (~8 min)
 
-### Widget Architecture
+```
+┌──────────────────────────────────────────────────────────────────────────────────────┐
+│ BROWSER TAB                                                                          │
+│                                                                                      │
+│  ┌────────────────────┐      ┌─────────────────────────┐      ┌────────────────────┐ │
+│  │ Search input       │      │ Suggestion popover      │      │ Live region        │ │
+│  │ role=combobox      │      │ listbox · groups · rows │      │ "8 suggestions"    │ │
+│  └─────────┬──────────┘      └────────────▲────────────┘      └─────────▲──────────┘ │
+│            │ 1 keys · input ·             │ 7 items · activeId ·        │ 7 settled  │
+│            │   composition                │   status                    │   count    │
+│  ┌─────────▼──────────────────────────────┴─────────────────────────────┴──────────┐ │
+│  │ TYPEAHEAD CONTROLLER — headless state machine, one per widget instance          │ │
+│  │ inputValue · activeId · open · status · isComposing · lastAcceptedSeq           │ │
+│  └─────────┬───────────────────────────────▲───────────────────────────┬───────────┘ │
+│            │ 2 request(prefix, seq)        │ 6 merged list + seq       │ 8 select    │
+│  ┌─────────▼───────────────────────────────┴───────────┐  ┌────────────▼───────────┐ │
+│  │ DATA ACCESS LAYER                                   │  │ SELECTION EFFECTS      │ │
+│  │ scheduler: debounce · in-flight cap · seq guard     │  │ onSelect → navigate    │ │
+│  │ sources: remote · recent · static                   │  │ record recent search   │ │
+│  │ merger: dedupe · group · cap                        │  │ enqueue telemetry      │ │
+│  └────────┬───────────────────┬─────────────────┬──────┘  └───┬─────────────┬──────┘ │
+│           │ 3 get/put         │ 4 fetch         │ 5 recents   │ 9 write     │ 10     │
+│  ┌────────▼────────┐ ┌────────▼────────┐ ┌──────▼─────────────▼───┐ ┌───────▼──────┐ │
+│  │ Prefix cache    │ │ HTTP cache      │ │ Recent-search store    │ │ Beacon queue │ │
+│  │ memory LRU, TTL │ │ max-age · SWR   │ │ IndexedDB + mirror     │ │ batched      │ │
+│  └─────────────────┘ └────┬───────▲────┘ └────────────────────────┘ └───────┬──────┘ │
+└───────────────────────────┼───────┼─────────────────────────────────────────┼────────┘
+            GET /suggest?q= │       │ q echo · items · ttl       POST /events │
+                            ▼       │                                         ▼
+  ┌─────────────────────────────────┴────────────────────────────────────────────────┐
+  │ SERVER BOUNDARY (black box): Suggest API · History API · Events · CDN for anon   │
+  └──────────────────────────────────────────────────────────────────────────────────┘
+```
 
-"Before diving into the technical decisions, let me describe the different widget types we need to support."
+**Walking the arrows for one keystroke and one selection:**
 
-**Search Box Widget** - The classic typeahead with API-backed suggestions. Uses 150ms debounce, shows 8 suggestions maximum, merges with recent searches.
+1. Input, keydown and composition events go to the controller, which updates `inputValue` synchronously. The input never waits for anything async.
+2. The controller asks the data access layer for suggestions, tagged with a monotonically increasing sequence number.
+3. The prefix cache is checked first. A hit answers within the same frame and sends no request.
+4. On a miss, the scheduler decides when to send (debounce policy, in-flight cap). The request goes through the browser HTTP cache to the server. The response echoes the normalized `q`.
+5. In parallel, the recent-search source prefix-matches the user's local history from an in-memory mirror, in under a millisecond.
+6. The merger dedupes and groups. The guard drops any result whose seq is older than the last accepted one, or whose `q` isn't the current input or an ancestor of it.
+7. The view renders; the live region announces the count only once results settle.
+8. On selection, the controller hands off to selection effects, which (9) record the recent search, (10) queue telemetry (impression list, chosen position, latency), and call `onSelect`.
 
-**Command Palette Widget** - Like VS Code's Cmd+K. Local-first with fuzzy matching, 50ms debounce since data is in-memory, shows all commands initially when empty.
+### Why this decomposition
 
-**Rich Suggestions Widget** - Like Google showing artist cards with images. Requires additional metadata and layout complexity.
+**Headless controller with prop getters, not a monolithic component.** Product teams render whatever they want, but the core owns state transitions, keyboard handling, ids and every ARIA attribute, so a team can't forget `aria-activedescendant`.
 
-**Mobile Typeahead** - Full-screen overlay, larger touch targets of 48px minimum, separate section for recent searches.
+| Approach | Pros | Cons |
+|----------|------|------|
+| ✅ Headless core + prop getters + render slots | One correct a11y/keyboard implementation; unlimited visual freedom | Consumers write more markup; prop-getter APIs need good docs |
+| ❌ Monolithic `<Typeahead>` with props | Fastest for the first consumer | Prop explosion by the third team; forks appear and each fork breaks a11y differently |
+| ❌ Web component | Framework-agnostic | ARIA id references can't cross shadow roots, so a consumer's own label, input or slotted rows break `aria-labelledby` / `aria-activedescendant`, the exact wiring we need |
+
+**Instance-local state, not a global store.** Keystroke state lives in the controller. If `inputValue` lived in an app-wide store, every keystroke would notify every subscriber and compete with painting the character. The only shared state is the recent-search store: the header box and the page box show the same history, and a `BroadcastChannel` keeps tabs consistent.
+
+**Where computation lives.** The server ranks and returns **match ranges**. The client merges history, dedupes and renders. The server returns highlight ranges rather than the client computing `startsWith`, because the server's normalization decides what matched: accent folding ("zur" matching "Zürich"), transliteration, and locale case rules (Turkish dotted İ). Naive client highlighting gets those wrong.
 
 ---
 
-### Trade-off 1: Why Debounce Over Throttle?
+## 💾 D — Data Model (~5 min)
 
-"This is a critical decision for request management. Let me explain why I'm choosing debounce."
+| Entity | Origin | Owner | Key fields | Lifetime |
+|--------|--------|-------|------------|----------|
+| SuggestResponse | Server | Data access layer | `q` (normalized echo), items, `complete` flag, `ttl`, `rankingVersion` | Cached per prefix |
+| SuggestionItem | Server | Popover rows | stable `id`, `kind` (query / entity / navigational), text, match ranges, secondary text, thumbnail, destination URL, badges (trending) | Inside a response |
+| RecentSearch | Client, persistent (synced when signed in) | Recent-search store | normalized text, display text, `lastUsedAt`, use count, origin (local / synced) | Capped at 50; user-deletable |
+| PrefixCacheEntry | Client, derived | Prefix cache | key = locale + user scope + normalized prefix; response; `fetchedAt`; `complete` | Server TTL; LRU of ~200 |
+| TypeaheadState | Client, ephemeral | Controller | `inputValue`, `isComposing`, status, items, `activeId`, highlight source (keyboard / pointer), `lastAcceptedSeq` | Widget lifetime |
+| TelemetryEvent | Client → server | Beacon queue | session id, prefix at impression, item ids shown, selected position, latency, cache source | Until flushed |
+
+Four details here prevent most of the bugs:
+
+- **Cache key and display text are different strings.** The key is NFKC-normalized, locale-lowercased, with internal whitespace collapsed. It **keeps a trailing space**, because "new" and "new " are different queries: the first completes to "newsletter", the second to "new york".
+- **`activeId`, not `activeIndex`.** When the list changes underneath the user, an index silently points at a different item. An id either still exists or it doesn't. Deep dive 3 builds on this.
+- **`complete` means the set is exhaustive.** If "weat" returned fewer than `limit` items, the server has told us every completion, so "weath" can be answered by filtering locally. Without that flag, a parent's top 8 cannot be filtered into a child's top 8, because the child's best item might have been the parent's 9th.
+- **"Pending with previous results" and "pending with nothing" are different states.** Only the second ever shows a spinner.
 
 ```
-User typing "weather":
-
-Timeline (ms):    0     50    100   150   200   250   300   350   400
-Keystroke:        w     e     a     t     h     e     r
-                  |     |     |     |     |     |     |
-
-DEBOUNCE (150ms): [-----wait-----] [-----wait-----] [-----wait-----][FIRE]
-                                                            Only fires for "weather"
-
-THROTTLE (150ms): [FIRE] [----] [FIRE] [----] [FIRE] [----] [FIRE]
-                    w            eat           eather       weather
-                  Fires at 0, 150, 300, 450 regardless of typing pace
+┌──────┐  focus, empty   ┌────────────┐  input ≥ minChars   ┌─────────┐
+│ idle │────────────────▶│ zero-state │────────────────────▶│ pending │
+└──▲───┘                 └─────▲──────┘                     └──┬───▲──┘
+   │ blur · Esc                │ input cleared        response │   │ new input
+   │                           │                               ▼   │
+   │                     ┌─────┴───────────────────────────────────┴────┐
+   └─────────────────────┤ showing · empty · error                      │
+                         └──────────────────────────────────────────────┘
 ```
-
-| Approach | API Requests | User Experience | Best For |
-|----------|--------------|-----------------|----------|
-| Debounce (150ms) | 1 per typing pause | Shows final prefix only | Typeahead |
-| Throttle (150ms) | Regular intervals | Progressive results | Scroll tracking, resize |
-| Neither | Every keystroke | Immediate but expensive | Local-only data |
-
-**Decision: Debounce at 150ms**
-
-"I'm choosing debounce because the user typically wants suggestions for their final intended prefix, not intermediate states. For the word 'weather', debounce makes 1 request while throttle would make 4. The 150ms value is the sweet spot - fast enough to feel responsive but slow enough to batch rapid typing. Users rarely notice this delay because they're focused on their own typing."
 
 ---
 
-### Trade-off 2: Why Multi-Layer Cache?
+## 🔌 I — Interface Definition (~8 min)
 
-"Let me break down the caching strategy and why we need multiple layers."
+### Server contract: what I need from the black box
 
 ```
-CACHE LAYER DIAGRAM:
-
-                Query: "weat"
-                      |
-                      v
-+---------------------|---------------------+
-|              Memory Cache                 |
-|  Map<prefix, {suggestions, timestamp}>    |
-|  Latency: 0ms  |  Size: ~500 entries      |
-|  TTL: 60 seconds                          |
-+---------------------|---------------------+
-                      | MISS
-                      v
-+---------------------|---------------------+
-|            Service Worker Cache           |
-|  Cache API with stale-while-revalidate    |
-|  Latency: 1-5ms  |  Survives refresh      |
-|  TTL: 5 min (popular) / 1 min (long-tail) |
-+---------------------|---------------------+
-                      | MISS
-                      v
-+---------------------|---------------------+
-|               IndexedDB                   |
-|  Larger dataset, user history, trie       |
-|  Latency: 5-20ms  |  Persists forever     |
-|  Used for offline fallback                |
-+---------------------|---------------------+
-                      | MISS
-                      v
-+---------------------|---------------------+
-|                 Network                   |
-|  CDN: 10-50ms  |  Origin: 50-200ms        |
-+---------------------------------------------+
+GET    /v1/suggest?q={prefix}&locale={l}&limit=8&client=web   → ranked items for the prefix
+GET    /v1/suggest/zero?locale={l}                             → zero-state items (trending) for an empty focus
+GET    /v1/history?limit=50                                    → signed-in recent searches, for sync
+DELETE /v1/history/{id}                                        → remove one recent search
+POST   /v1/events            (sendBeacon, batched)             → impressions, selections, abandonment
 ```
 
-| Strategy | Latency | Survives Refresh | Offline | Complexity |
-|----------|---------|------------------|---------|------------|
-| Memory only | 0ms | No | No | Low |
-| Memory + Service Worker | 0-5ms | Yes | Partial | Medium |
-| Memory + SW + IndexedDB | 0-20ms | Yes | Yes | High |
-| Memory + LocalStorage | 0-1ms | Yes | Limited 5MB | Low |
+| Response field | Why the client needs it |
+|----------------|-------------------------|
+| `q` (normalized echo) | Identity check before rendering. Lets the client drop a mismatched response even when abort didn't happen in time |
+| `complete` | Lets the client answer longer prefixes by filtering locally |
+| item match ranges | The server's normalization decides what matched; the client can't recompute it correctly |
+| `ttl` | The server knows which prefixes are volatile (trending) and which are stable |
+| item `id` | Stable keys for rendering and for `activeId` |
+| `rankingVersion` | Telemetry joins a selection to the model that produced the list |
 
-**Decision: Memory + Service Worker + IndexedDB**
+**Protocol: HTTP GET, not WebSocket.**
 
-"I'm choosing the full three-layer approach because typeahead is one of those features where every millisecond matters to user perception. Memory gives instant response for the current session. Service Worker survives page navigation and refreshes, which is common in single-page apps. IndexedDB provides true offline capability - the user can search even when disconnected. Yes, it's more complex, but the latency improvement justifies it. We can lazy-load the IndexedDB layer so it doesn't block initial page load."
+> "A WebSocket would save request headers, but the URL is our cache key. A GET for `q=wea` can be answered by the browser HTTP cache, by a CDN, or by an edge node, without our server ever seeing it. On a socket, every message reaches the origin. HTTP/2 already multiplexes requests and compresses headers, so the per-request overhead WebSocket would save is about a hundred bytes. I'd rather keep the cache hierarchy."
+
+**Personalization must not poison cacheability.** Anonymous responses are `public, max-age=60, stale-while-revalidate=60`, keyed only by URL. I keep personalization out of that URL. Signed-in users' recent searches are synced to the client (50 items, a few KB) and blended locally by the merger. The suggest request can then be **cookieless**: smaller requests, and the CDN can share one cached response across every user typing "wea". The cost: server-side personalization beyond history (interest-based boosts, say) isn't possible on this path. If product needs it, a parallel private `GET /v1/suggest/personal` feeds the same merger, and the global request stays cacheable.
+
+### Component API for consuming teams
+
+| Category (RADIO) | Props | Notes |
+|------------------|-------|-------|
+| Data | sources, `value` / `defaultValue` (controlled or not), initial items | A source takes a query and an abort signal and resolves items. Cancellation is part of the contract, so every source can be cancelled |
+| Callbacks | `onSelect(item, how)`, `onInputChange`, `onOpenChange`, `onHighlightChange`, `onRemoveRecent` | `how` is keyboard, pointer or Tab. Behavior and telemetry differ by method |
+| Configuration | `minChars`, debounce policy, `maxItems`, `openOnFocus`, `autoHighlightFirst`, `inlineCompletion`, group order | Defaults tuned per surface: search vs command palette |
+| Styling | `className`, per-part class names, density | No inline styles, so it's themeable |
+| Render slots | `renderItem`, `renderGroupHeader`, `renderEmpty`, `renderLoading`, `renderFooter` | Inversion of control for rich rows |
+
+The hook also returns **prop getters**: input props, label props, listbox props and option props. Each merges the consumer's handlers with the core's and stamps ids, roles and ARIA state. Of everything in this design, this is the lever that makes accessibility hold across an organization of 30 teams.
+
+**Inter-component communication:** props and callbacks within a widget; a tiny observable store for recent searches (shared by instances, synced across tabs); window events only for the global "/" focus shortcut. No global store for keystroke state.
 
 ---
 
-### Trade-off 3: Why Stale-While-Revalidate?
+## 🔧 O — Optimizations and Deep Dives (~18 min)
 
-"The Service Worker uses the stale-while-revalidate pattern. Let me explain why."
+> "I'll go deep on three areas: the request lifecycle, where most shipped typeaheads have bugs; caching and prefetching, where the latency actually goes; and the combobox interaction model, covering accessibility, IME, and what I call the Enter race."
 
-```
-STALE-WHILE-REVALIDATE FLOW:
-
-User types "wea"
-      |
-      v
-+------------------+
-| Check SW Cache   |
-+--------+---------+
-         |
-    +----+----+
-    |         |
-  FRESH     STALE
-    |         |
-    v         v
-Return     Return cached immediately
-immediately   +
-              |
-              v
-          Fetch fresh in background
-              |
-              v
-          Update cache for next request
-```
-
-| Strategy | First Response | Freshness | When to Use |
-|----------|---------------|-----------|-------------|
-| Cache-first | Instant | May be stale | Static assets |
-| Network-first | 50-200ms | Always fresh | Critical data |
-| Stale-while-revalidate | Instant | Fresh on next request | Typeahead suggestions |
-| Network-only | 50-200ms | Always fresh | Personalized data |
-
-**Decision: Stale-While-Revalidate**
-
-"I'm choosing stale-while-revalidate because typeahead suggestions don't need to be perfectly fresh - showing yesterday's top suggestions for 'wea' is fine. What matters is speed. This pattern gives us the best of both worlds: instant response from cache while quietly updating in the background. For popular prefixes we use a 5-minute TTL with 1-hour stale tolerance. For long-tail queries we use 1-minute TTL since they're less likely to be cached anyway."
-
----
-
-### Trade-off 4: Why IndexedDB Over LocalStorage?
-
-"For offline storage, we have a choice between IndexedDB and LocalStorage."
-
-| Feature | LocalStorage | IndexedDB |
-|---------|--------------|-----------|
-| Storage limit | 5-10MB | 50MB+ (browser dependent) |
-| Data structure | String key-value only | Objects, arrays, binary |
-| Indexing | None | Yes, queryable |
-| Async API | No (blocks main thread) | Yes (non-blocking) |
-| Transaction support | No | Yes |
-| Browser support | Universal | Universal |
-
-**Decision: IndexedDB**
-
-"I'm choosing IndexedDB because we need to store structured data - the trie for offline prefix matching, user search history with counts and timestamps, and popular query datasets. LocalStorage's 5MB limit is too restrictive, and its synchronous API would block the main thread during reads. IndexedDB lets us store our entire offline trie, which could be several megabytes, and query it efficiently. The async API means we never block the UI thread during storage operations."
-
----
-
-### Trade-off 5: Why Zustand Over Redux or Context?
-
-"For state management, I need to choose between several options."
-
-| Library | Bundle Size | Boilerplate | Learning Curve | Persistence |
-|---------|-------------|-------------|----------------|-------------|
-| Zustand | 1.1KB | Minimal | Low | Built-in |
-| Redux Toolkit | 11KB | Medium | Medium | Requires middleware |
-| React Context | 0KB | Medium | Low | Manual |
-| Jotai | 2.5KB | Minimal | Low | Built-in |
-| MobX | 16KB | Low | Medium | Manual |
-
-**Decision: Zustand**
-
-"I'm choosing Zustand because typeahead state is relatively simple - query string, suggestions array, loading state, active index, and recent searches. Redux would be overkill here with its actions, reducers, and middleware. React Context alone would work but doesn't have built-in persistence for recent searches. Zustand gives us a tiny bundle, simple API, and built-in persist middleware to save recent searches to localStorage. The store is literally a single function call with no providers needed."
-
----
-
-### Trade-off 6: Why AbortController for Request Cancellation?
-
-"When users type quickly, we get overlapping requests. We need a strategy to handle this."
+### Deep dive 1: Request lifecycle — debounce, cancellation and ordering (~7 min)
 
 ```
-USER TYPES FAST:
-
-Request 1: "w"   --> starts
-Request 2: "we"  --> starts
-Request 3: "wea" --> starts
-
-WITHOUT CANCELLATION:
-  Response 3 arrives (fast server)  --> shows "wea" results
-  Response 1 arrives (slow network) --> OVERWRITES with "w" results [BUG!]
-
-WITH ABORTCONTROLLER:
-  Request 1: aborted when Request 2 starts
-  Request 2: aborted when Request 3 starts
-  Only Response 3 can update the UI
+keystroke      w         we        wea                weat
+time (ms)      0         90        180                260
+request        (skip)    (skip)    A "wea"  ─────────────────────────────────┐
+                                                      B "weat" ──────┐       │
+                                                                     ▼ 420   ▼ 610
+                                                          render B (newest)  A lands late:
+                                                                             drop, or show as
+                                                                             filtered interim?
 ```
 
-| Strategy | Stale Response Risk | Network Waste | Complexity |
-|----------|---------------------|---------------|------------|
-| No cancellation | High - race conditions | High | Low |
-| AbortController | None | Low | Low |
-| Request ID tracking | Low | High | Medium |
-| RxJS switchMap | None | Low | High |
+**Debounce is a server-load tool with a latency cost.** A fixed 150 ms debounce adds 150 ms to *every* suggestion served from the network, which is most of the budget. So:
 
-**Decision: AbortController**
+- **No debounce on cache hits.** They're free; answer immediately.
+- **On a miss, use a short debounce of 60–100 ms that adapts to the user's measured inter-keystroke interval.** A hunt-and-peck typist at 300 ms per key gains nothing from waiting. A fast typist at 80 ms per key benefits from skipping prefixes they'll never pause on. The scheduler keeps a rolling median of the last few intervals.
+- **Throttle is the wrong tool.** It fires mid-word on a fixed clock, which guarantees requests for prefixes nobody pauses on.
 
-"I'm choosing AbortController because it solves the stale response problem with minimal complexity. Before firing each request, we abort the previous pending request. This prevents the race condition where an old response arrives late and overwrites newer data. It also saves bandwidth by cancelling network requests the user no longer cares about. The API is simple - create a controller, pass its signal to fetch, call abort when needed. Browser support is universal in modern browsers."
+**Ordering: three mechanisms that guarantee different things.**
 
----
+| Mechanism | Guarantees | Does not guarantee |
+|-----------|------------|--------------------|
+| `AbortController` on each new request | Frees the socket and skips parsing | Correctness. A response that already resolved, or a cache hit that doesn't trigger an abort, can still land late |
+| Sequence number (`lastAcceptedSeq`) | An older request never overwrites a newer one | That the result fits the *current* input after a backspace |
+| `q` echo checked against the current input | The rendered list belongs to the current input or an ancestor of it | — |
 
-### Trade-off 7: Why Full ARIA Pattern Over Basic Keyboard?
+> "Abort is an optimization; the sequence and echo checks are what make it correct. Abort-only implementations have a hole: a synchronous cache hit for 'weat' renders, but nothing aborted the in-flight network request for 'wea', so that request lands 300 ms later and overwrites the right list with the wrong one. Our own demo's API client has exactly this bug. Abort also doesn't save server work: on HTTP/2 the stream is reset after the server has already done the lookup. The real server-side savings are requests you never send."
 
-"Accessibility isn't optional, but we have choices in how deep to go."
+**Starvation on slow networks.** Abort-on-every-keystroke means a fast typist on a 400 ms RTT connection sees *nothing* until they stop typing. Every request dies before it lands. My policy:
 
-| Approach | Effort | Screen Reader Support | WCAG Level |
-|----------|--------|----------------------|------------|
-| Basic keyboard (arrows, enter, escape) | Low | Poor | A |
-| ARIA combobox pattern | Medium | Good | AA |
-| Full ARIA with live regions | High | Excellent | AA+ |
+1. Allow up to two requests in flight.
+2. Don't abort a request whose prefix is an *ancestor* of the current input. When "wea" lands while the input says "weat", filter it to items starting with "weat" and render that as an **interim** result (flagged in telemetry). It's never wrong, only possibly incomplete.
+3. Abort when the in-flight prefix stops being an ancestor (the user backspaced or edited the middle).
 
-ARIA attributes needed for full combobox pattern:
-- Input: role="combobox", aria-expanded, aria-controls, aria-activedescendant, aria-autocomplete="list"
-- Listbox: role="listbox", aria-labelledby
-- Options: role="option", aria-selected
-- Status: role="status", aria-live="polite" for announcing suggestion count
+| Approach | Outcome |
+|----------|---------|
+| ❌ Fixed 150 ms debounce + abort-all | Simple, but adds 150 ms to every miss, starves slow networks, and still races on cache hits |
+| ❌ Throttle | Requests for prefixes nobody pauses on; still needs an ordering guard |
+| ✅ Cache-first, adaptive short debounce, ≤2 in flight, seq + echo guard, ancestor-filtered interim results | More scheduler state, but correct by construction and fast for both slow and fast typists |
 
-**Decision: Full ARIA Pattern with Live Regions**
+What I give up: a slightly more complex scheduler, and interim lists that are occasionally less relevant than the final one. I accept that. A list that is a correct subset beats an empty dropdown, especially on the networks where the dropdown would otherwise stay empty.
 
-"I'm choosing the full ARIA pattern because typeahead is a common interaction pattern and screen reader users deserve an equal experience. The combobox pattern is well-documented in WAI-ARIA authoring practices. We'll use aria-activedescendant to communicate the currently focused suggestion, aria-expanded to indicate dropdown state, and a live region to announce when suggestions load. Yes, it's more work, but it's the right thing to do and often required for enterprise customers."
+### Deep dive 2: Caching and prefetching — making the next keystroke free (~6 min)
 
----
+> "For every cache layer I'd ask what it catches that the layer above it doesn't. A count of layers doesn't tell you that."
 
-## 📊 Data Flow
+| Layer | Holds | What it catches | Decision |
+|-------|-------|-----------------|----------|
+| In-memory prefix cache (per tab, LRU ~200, server TTL) | normalized prefix → response | Backspace, retyping, revisits, children derived from `complete` parents | ✅ Ship |
+| Browser HTTP cache | URL → response with max-age + SWR | Revisits across navigations and tabs, at no cost | ✅ Ship; it already honors the server's headers |
+| IndexedDB, recent searches only | The user's own history (≤50) | Zero state at startup, offline | ✅ Ship; user-owned data has to survive restarts |
+| Service worker cache for suggestions | A second copy of the HTTP cache | Nothing the HTTP cache doesn't | ❌ Cut for v1. A stopped worker has to boot before it can answer a fetch, which costs tens of ms on mobile, exactly where we're latency-bound. It also re-implements cache semantics and adds an invalidation surface |
+| IndexedDB copy of suggestions / an offline trie | — | Offline suggestions | ❌ Cut. Async reads, storage eviction and stale data for a feature with no offline results page to land on |
 
-"Let me trace through the complete flow when a user types a character."
+**Answers derived without a request:**
 
-```
-USER TYPES "a"
-     |
-     v
-+--------------------+
-| onInput fires      |
-+--------------------+
-     |
-     v
-+--------------------+
-| Clear debounce     |
-| timer if exists    |
-+--------------------+
-     |
-     v
-+--------------------+
-| Check memory cache |-----> HIT: Return immediately, done
-+--------------------+
-     | MISS
-     v
-+--------------------+
-| Start 150ms timer  |
-+--------------------+
-     |
-     | (user stops typing)
-     v
-+--------------------+
-| Timer fires        |
-+--------------------+
-     |
-     v
-+--------------------+
-| Abort previous     |
-| pending request    |
-+--------------------+
-     |
-     v
-+--------------------+
-| Create new         |
-| AbortController    |
-+--------------------+
-     |
-     v
-+--------------------+
-| Check SW cache     |-----> HIT: Return stale, revalidate in background
-+--------------------+
-     | MISS
-     v
-+--------------------+
-| Check IndexedDB    |-----> HIT: Return offline results
-+--------------------+
-     | MISS
-     v
-+--------------------+
-| Fetch from CDN     |
-| /api/v1/suggest?q= |
-+--------------------+
-     |
-     v
-+--------------------+
-| Response received  |
-+--------------------+
-     |
-     v
-+--------------------+
-| Merge with recent  |
-| searches           |
-+--------------------+
-     |
-     v
-+--------------------+
-| Rank and limit     |
-| to 8 suggestions   |
-+--------------------+
-     |
-     v
-+--------------------+
-| Update all cache   |
-| layers             |
-+--------------------+
-     |
-     v
-+--------------------+
-| Render suggestions |
-| Update ARIA state  |
-+--------------------+
-```
+- **Backspace** is always free: the parent prefix is in the cache.
+- **Exhaustive parents.** If "weat" was `complete`, every longer prefix is a local filter.
+- **Non-exhaustive parents** give an interim answer while the real request runs. This is the same ancestor-filter rule as deep dive 1, applied to cached data.
+
+**Prefetching: spend speculation where it pays.**
+
+- **On focus:** preconnect to the suggest origin (TLS setup is 1–2 RTTs on mobile, more than the request itself) and fetch the zero state. Focus-to-first-keystroke is typically 300–800 ms of idle network.
+- **No speculative next-character prefetch.** Guessing "weat" from "wea" (by keyboard adjacency or a client model) yields low hit rates. At hundreds of thousands of QPS, a 10% hit rate nearly doubles server load to save a round trip the debounce window already hides.
+- **Prefetch the destination, not the suggestion.** What users experience as "search speed" is the time from Enter to the results page. When an item has been highlighted by arrow keys or hovered for ~100 ms, I add a Speculation Rules prefetch for its results URL (prerender only for the top item, at moderate eagerness). Enter then feels instant. This is the largest perceived-latency win in the whole design, and it isn't in the typeahead's own latency numbers.
+
+**Invalidation is mostly unnecessary by construction.** Global suggestions are a pure function of (locale, prefix, ranking version) and expire by TTL. Personal recents come from the local store, so a search the user just ran shows up in recents immediately. Signing in or out clears the prefix cache because the user scope is part of the key. One bound matters: the server keeps `stale-while-revalidate` short (60 s), because each extra staleness window delays a legal takedown on the client.
+
+### Deep dive 3: The combobox interaction model — accessibility, IME and the Enter race (~5 min)
+
+**ARIA 1.2 combobox, done properly:**
+
+- DOM focus **stays on the input**. `aria-activedescendant` points at the highlighted option's id. Moving real focus into the list breaks typing, the caret and IME composition.
+- The input has `role=combobox`, `aria-expanded`, `aria-controls` (the listbox id) and `aria-autocomplete="list"`, or `"both"` with inline completion. Options get `role=option` and `aria-selected`. Groups are `role=group` labelled by their header.
+- **Live region etiquette:** announce "8 suggestions" politely, ~500 ms after results settle, not on every keystroke. Otherwise screen reader users hear "5 results, 7 results, 6 results" talking over their own typing echo.
+- **Row actions break the listbox role.** A "remove" button inside a recent-search row is an interactive control nested in an option, which is invalid. Two options: a keyboard shortcut (Shift+Delete, as in Chrome's omnibox) announced through the option's description, with a pointer-only button; or switch the popup to the grid pattern so each row can have cells. I'd ship the shortcut first. The grid pattern is correct but significantly more complex for every consumer.
+
+**The Enter race.** The user arrows down twice to "weather radar". A late response replaces the list. Index 2 is now "weather tomorrow", and Enter selects something they never saw highlighted. My rule: **never change what Enter will do without the user seeing it.**
+
+- Track `activeId`. If the highlighted item survives the update, keep it highlighted at its new position.
+- While the user is navigating by keyboard, **freeze the list**: buffer incoming results until the next character is typed.
+- While the pointer is over the list, don't reorder rows under the cursor. Append or defer instead.
+
+**Layout stability.** Keep previous results visible while pending; no flash to a spinner. Show a spinner only after ~300 ms with nothing to display. Use fixed row heights and sized thumbnails so the popover never shifts. Rich renderers are code-split, but their skeleton dimensions are known up front.
+
+**IME composition (Japanese, Chinese, Korean).** While composing, the input holds unconverted text, and Enter *commits the conversion*. It must not select a suggestion, so key handling checks the composition state. Japanese users expect suggestions for the kana reading as they type, so fetching during composition is allowed. But I never rewrite the input value (inline completion) during composition, because that breaks the IME.
+
+**Mobile.** The virtual keyboard covers half the screen. On small viewports the popover becomes a full-screen takeover sized from the `visualViewport`. The input uses `type=search`, `enterkeyhint=search`, autocapitalize/autocorrect/spellcheck off, 44 px touch targets, and the active option is scrolled into view.
+
+**Security.** Suggestions are user-generated strings, which makes them an XSS vector. They're rendered as text, never as HTML. This is the second reason the server returns match *ranges* rather than `<b>` markup.
+
+| Popup pattern | Pros | Cons |
+|---------------|------|------|
+| ✅ Listbox + keyboard shortcut for row actions | Best screen reader support, simplest for consumers | Row actions are less discoverable |
+| ❌ Grid popup | Real per-row actions | Two-dimensional navigation; uneven screen reader support |
+| ❌ Moving DOM focus into options | Easy to build | Breaks typing, the caret and IME; fails the APG pattern |
+
+### Resilience and degradation (~1 min)
+
+> "Search has to work even when suggestions don't. Every failure below degrades the dropdown, never the input."
+
+| Condition | Behavior |
+|-----------|----------|
+| Suggest API slow (> 1 s) or returning 5xx | Keep showing recents and any ancestor-filtered cache entry; no error banner in the dropdown. Retry on the next keystroke, never in a background loop |
+| Offline (fetch fails fast) | Zero state and recents only, labelled "Recent searches"; submitting goes to the results page, which owns the offline message |
+| Rate limited (429) | Honor `Retry-After` and raise the debounce floor for the rest of the session |
+| JS failed or is still loading | The input is a real form field with an action URL, so Enter performs a plain search (progressive enhancement) |
+| IndexedDB unavailable (some private modes) | In-memory recents for the session; no error |
+
+### Performance and observability (~2 min)
+
+- **Measure what users feel:** keystroke-to-suggestions-painted, from the input event's timestamp to the frame after commit, split by source (memory / HTTP cache / network / interim). Also INP on the search page, requests per keystroke, stale responses dropped, selection rate, mean selected position, abandonment.
+- **No virtualization for 8–10 rows.** It adds `aria-setsize`/`aria-posinset` bookkeeping and scroll-into-view edge cases for no gain. Only the command palette, with thousands of local items, virtualizes.
+- **Typing before hydration.** The search input is server-rendered, so users can type before JS loads. On hydrate, the controller reads the input's current value and focus state and issues the first request, so early keystrokes aren't lost. The core (controller + data access layer) loads eagerly; renderers are lazy.
 
 ---
 
@@ -422,40 +317,26 @@ USER TYPES "a"
 
 | Decision | Chosen | Alternative | Rationale |
 |----------|--------|-------------|-----------|
-| Request pattern | Debounce 150ms | Throttle | Fewer requests, final prefix only |
-| Caching | Multi-layer | Memory only | Offline support, survives refresh |
-| SW strategy | Stale-while-revalidate | Network-first | Speed over perfect freshness |
-| Offline storage | IndexedDB | LocalStorage | Larger capacity, structured queries |
-| State management | Zustand | Redux | Simpler API, smaller bundle |
-| Request cancellation | AbortController | None | Prevent stale response overwrites |
-| Accessibility | Full ARIA | Basic keyboard | Screen reader support, WCAG compliance |
+| Component shape | Headless core + prop getters | Monolithic component | One a11y implementation, unlimited visuals |
+| Keystroke state | Instance-local controller | Global store | Avoids app-wide re-renders on every key |
+| Highlighting | Server match ranges | Client `startsWith` | Server normalization decides what matched; no HTML injection |
+| Request timing | Cache-first + adaptive short debounce | Fixed 150 ms debounce | No added latency on hits or for slow typists |
+| Ordering | Seq + echo guard, abort as optimization | Abort-only | Closes the cache-hit race |
+| Slow networks | ≤2 in flight + ancestor-filtered interim | Abort-all | Prevents starvation |
+| Protocol | HTTP GET | WebSocket | The URL is the cache key; the CDN absorbs load |
+| Personalization | Local blend of synced recents | Personalized server response | Keeps the suggest request public and cookieless |
+| Cache layers | Memory + HTTP cache + IndexedDB (recents) | + service worker suggestion cache | The worker catches nothing new and costs a boot |
+| Prefetch | Destination (Speculation Rules) on highlight | Next-character guessing | Optimizes time-to-results; avoids load amplification |
+| List updates | `activeId` + freeze while navigating | Index-based highlight | Prevents the Enter race |
 
 ---
 
-## 🚀 Future Enhancements
+## 📝 Wrap-up (~2 min)
 
-"If we have more time or resources, here's what I'd prioritize next."
+> "To summarize: a headless controller owns state and accessibility; a data access layer owns timing, caching and ordering; and a server contract (normalized echo, `complete`, match ranges, public cacheable responses) lets the client avoid most requests. The hardest decisions were giving up a fixed debounce, treating abort as an optimization rather than a guarantee, and cutting the service worker layer.
+>
+> What I'd validate first: instrument keystroke-to-paint by source before tuning anything; A/B the adaptive debounce against a fixed one on both requests per keystroke and selection rate; and test the combobox with NVDA, JAWS, VoiceOver and TalkBack, plus Japanese and Korean IMEs, early, because those are the failures you don't see in your own browser."
 
-1. **WebSocket Streaming** - Real-time suggestion updates as user types without polling
-2. **Voice Input** - Speech-to-text integration, especially valuable on mobile
-3. **Rich Previews** - Inline preview cards when hovering over suggestions
-4. **Gesture Navigation** - Swipe to delete recent searches on mobile
-5. **Smart Prefetch** - ML-based prediction of next likely prefix based on user behavior
-6. **Theme Support** - Dark mode with proper contrast ratios maintained
-7. **Internationalization** - RTL language support, locale-specific sorting
+### How the local implementation compares
 
----
-
-## 📝 Summary
-
-"To wrap up, I've designed a frontend typeahead system with these key characteristics:
-
-First, sub-50ms perceived latency through a three-layer caching strategy - memory for instant session hits, Service Worker for cross-navigation persistence, and IndexedDB for offline capability.
-
-Second, robust request management using debouncing to reduce server load and AbortController to prevent race conditions with stale responses.
-
-Third, full accessibility compliance with the ARIA combobox pattern, live regions for screen reader announcements, and proper keyboard navigation.
-
-Fourth, multiple widget types supported through a configurable core module - search boxes, command palettes, and rich suggestion displays all share the same underlying engine.
-
-The main trade-off I made was complexity - three cache layers is more to maintain than one. But for a typeahead where every keystroke matters, the latency improvement is worth it."
+The repo's `frontend/` demonstrates part of this design. `useTypeahead` uses a fixed 150 ms debounce; `services/api.ts` aborts the previous request and keeps a 1,000-entry memory LRU with a 60 s TTL; the hook reads an IndexedDB suggestion cache before the network; the service worker (production builds only) applies stale-while-revalidate to API calls; the four widgets share the hook's ARIA props. Gaps relative to this answer: a memory-cache hit returns before cancelling an in-flight request, so the race in deep dive 1 can occur; the memory-cache key omits `userId`; `services/prefetch.ts` (keyboard-adjacency prefetching, the approach I argue against above) exists but isn't wired into any component; and highlighting is computed client-side.
