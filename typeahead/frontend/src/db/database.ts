@@ -4,6 +4,7 @@
  */
 import Dexie, { type Table } from 'dexie';
 import type { Suggestion } from '../types';
+import { normalizePrefix } from '../utils/normalize.js';
 
 // Cached suggestion entry
 export interface CachedSuggestion {
@@ -89,24 +90,22 @@ export function suggestionCacheKey(
   prefix: string,
   variant: { limit: number; fuzzy: boolean; userId?: string }
 ): string {
-  return `${variant.limit}|${variant.fuzzy ? 'fuzzy' : 'exact'}|${variant.userId ?? ''}|${prefix}`;
+  return `${variant.limit}|${variant.fuzzy ? 'fuzzy' : 'exact'}|${variant.userId ?? ''}|${normalizePrefix(prefix)}`;
 }
 
 /**
- * Cache suggestions for a prefix (or a suggestionCacheKey).
+ * Cache suggestions under a suggestionCacheKey().
  */
 export async function cacheSuggestions(
-  prefix: string,
+  key: string,
   suggestions: CachedSuggestion['suggestions'],
   ttl: number = SUGGESTION_TTL
 ): Promise<void> {
-  const normalized = prefix.toLowerCase().trim();
-
-  // Delete existing entry for this prefix
-  await db.suggestions.where('prefix').equals(normalized).delete();
+  // The key is already normalized by suggestionCacheKey; trimming here would merge "java " into "java"
+  await db.suggestions.where('prefix').equals(key).delete();
 
   await db.suggestions.add({
-    prefix: normalized,
+    prefix: key,
     suggestions,
     timestamp: Date.now(),
     ttl,
@@ -118,15 +117,20 @@ export async function cacheSuggestions(
 }
 
 /**
- * Get cached suggestions for a prefix.
+ * Drop every cached suggestion list, e.g. after an admin change made them stale.
+ */
+export async function clearSuggestionCache(): Promise<void> {
+  await db.suggestions.clear();
+}
+
+/**
+ * Get cached suggestions for a suggestionCacheKey().
  * Returns null if not found or expired.
  */
 export async function getCachedSuggestions(
-  prefix: string
+  key: string
 ): Promise<CachedSuggestion['suggestions'] | null> {
-  const normalized = prefix.toLowerCase().trim();
-
-  const entry = await db.suggestions.where('prefix').equals(normalized).first();
+  const entry = await db.suggestions.where('prefix').equals(key).first();
 
   if (!entry) return null;
 

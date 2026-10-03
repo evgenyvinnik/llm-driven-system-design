@@ -32,17 +32,6 @@ type IdempotencyRecord =
   | { state: 'pending'; fingerprint: string; token: string }
   | { state: 'done'; fingerprint: string; result: CachedResult };
 
-interface IdempotencyHandlerOptions {
-  prefix?: string;
-  expirySeconds?: number;
-}
-
-interface ProcessResult<T> {
-  processed: boolean;
-  duplicate: boolean;
-  result: T;
-}
-
 // Extend Express Request to include idempotencyKey
 declare global {
   namespace Express {
@@ -58,7 +47,7 @@ const RESULT_TTL_MS = 5 * 60 * 1000;
 const PENDING_TTL_MS = 60 * 1000;
 // Longest accepted X-Idempotency-Key (a UUID is 36 characters)
 const MAX_KEY_LENGTH = 128;
-// Redis key prefix for the middleware's records (RedisIdempotencyHandler uses 'idem:')
+// Redis key prefix for the middleware's records
 const REDIS_PREFIX = 'idem:http:';
 
 // Delete a reservation only if it is still the one this request made
@@ -141,19 +130,6 @@ class IdempotencyStore {
 
 // Global in-memory store
 const inMemoryStore = new IdempotencyStore();
-
-/**
- * Generate an idempotency key from request data
- */
-export function generateIdempotencyKey(operation: string, data: Record<string, unknown>): string {
-  const payload = JSON.stringify({
-    operation,
-    ...data,
-    // Don't include timestamp for idempotency
-  });
-
-  return crypto.createHash('sha256').update(payload).digest('hex').slice(0, 32);
-}
 
 /**
  * Where a request's idempotency record lives: Redis when it is connected (shared by every
@@ -342,145 +318,6 @@ export function idempotencyMiddleware(
 }
 
 /**
- * Redis-based idempotency handler for distributed deployments
- */
-export class RedisIdempotencyHandler {
-  private redis: Redis;
-  private prefix: string;
-  private expirySeconds: number;
-
-  constructor(redis: Redis, options: IdempotencyHandlerOptions = {}) {
-    this.redis = redis;
-    this.prefix = options.prefix || 'idem';
-    this.expirySeconds = options.expirySeconds || 300; // 5 minutes
-  }
-
-  /**
-   * Check if operation was already processed
-   */
-  async check(idempotencyKey: string): Promise<{ result: unknown } | null> {
-    try {
-      const result = await this.redis.get(`${this.prefix}:${idempotencyKey}`);
-      if (result) {
-        return JSON.parse(result);
-      }
-    } catch (error) {
-      logger.error({
-        event: 'idempotency_check_error',
-        idempotencyKey,
-        error: (error as Error).message,
-      });
-    }
-    return null;
-  }
-
-  /**
-   * Store operation result
-   */
-  async store(idempotencyKey: string, operation: string, result: unknown): Promise<void> {
-    try {
-      await this.redis.setex(
-        `${this.prefix}:${idempotencyKey}`,
-        this.expirySeconds,
-        JSON.stringify({
-          operation,
-          result,
-          timestamp: Date.now(),
-        })
-      );
-
-      logger.debug({
-        event: 'idempotency_stored_redis',
-        idempotencyKey,
-        operation,
-      });
-    } catch (error) {
-      logger.error({
-        event: 'idempotency_store_error',
-        idempotencyKey,
-        error: (error as Error).message,
-      });
-    }
-  }
-
-  /**
-   * Process operation with idempotency
-   */
-  async process<T>(
-    idempotencyKey: string,
-    operation: string,
-    fn: () => Promise<T>
-  ): Promise<ProcessResult<T>> {
-    // Check if already processed
-    const cached = await this.check(idempotencyKey);
-    if (cached) {
-      auditLogger.logIdempotencySkip(idempotencyKey, operation);
-      idempotencyMetrics.duplicates.inc({ operation });
-
-      return {
-        processed: false,
-        duplicate: true,
-        result: cached.result as T,
-      };
-    }
-
-    // Try to acquire lock using SETNX
-    const lockKey = `${this.prefix}:lock:${idempotencyKey}`;
-    const acquired = await this.redis.set(lockKey, '1', 'EX', 30, 'NX');
-
-    if (!acquired) {
-      // Another process is handling this
-      logger.info({
-        event: 'idempotency_lock_failed',
-        idempotencyKey,
-        operation,
-      });
-
-      // Wait and check for result
-      await new Promise((r) => setTimeout(r, 100));
-      const retryResult = await this.check(idempotencyKey);
-      if (retryResult) {
-        return {
-          processed: false,
-          duplicate: true,
-          result: retryResult.result as T,
-        };
-      }
-
-      // Still no result, let it proceed (edge case)
-    }
-
-    try {
-      // Execute the operation
-      const result = await fn();
-
-      // Store result
-      await this.store(idempotencyKey, operation, result);
-      idempotencyMetrics.processed.inc({ operation });
-
-      return {
-        processed: true,
-        duplicate: false,
-        result,
-      };
-    } finally {
-      // Release lock
-      await this.redis.del(lockKey);
-    }
-  }
-}
-
-/**
- * Create idempotency handler from Redis client
- */
-export function createRedisIdempotencyHandler(
-  redis: Redis,
-  options: IdempotencyHandlerOptions = {}
-): RedisIdempotencyHandler {
-  return new RedisIdempotencyHandler(redis, options);
-}
-
-/**
  * Cleanup function for graceful shutdown
  */
 export function cleanup(): void {
@@ -488,8 +325,6 @@ export function cleanup(): void {
 }
 
 export default {
-  generateIdempotencyKey,
   idempotencyMiddleware,
-  createRedisIdempotencyHandler,
   cleanup,
 };

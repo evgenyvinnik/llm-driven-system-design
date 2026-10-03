@@ -13,8 +13,6 @@ interface SearchBoxProps {
 
 /** Renders the typeahead search input with debounced suggestions, keyboard navigation, and search history. */
 export function SearchBox({ placeholder = 'Search...', onSearch, className = '' }: SearchBoxProps) {
-  const containerRef = useRef<HTMLDivElement>(null);
-  const inputRef = useRef<HTMLInputElement>(null);
   const [isOpen, setIsOpen] = useState(false);
   const [selectedIndex, setSelectedIndex] = useState(-1);
   const [announcement, setAnnouncement] = useState('');
@@ -269,11 +267,10 @@ export function SearchBox({ placeholder = 'Search...', onSearch, className = '' 
   };
 
   return (
-    <div ref={containerRef} className={`relative ${className}`}>
+    <div className={`relative ${className}`}>
       <form onSubmit={handleSubmit}>
         <div className="relative">
           <input
-            ref={inputRef}
             type="text"
             value={query}
             onChange={handleInputChange}

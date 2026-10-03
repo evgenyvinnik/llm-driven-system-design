@@ -20,22 +20,23 @@ A typeahead/autocomplete system demonstrating prefix matching, ranking suggestio
 
 ### 1. Prefix Matching
 - Trie-based data structure with O(prefix length) lookups
-- Pre-computed top-k suggestions at each node
-- Character-by-character suggestions
+- Pre-computed top-10 suggestions at each node, root included (the root's list is `/popular`)
+- Character-by-character suggestions; a trailing space is kept, so `java ` suggests `java vs javascript` rather than `javascript`
+- Optional fuzzy matching (`fuzzy=true`): prefix edit distance with a budget of 1 edit for 3-5 characters and 2 beyond
 
 ### 2. Ranking System
-- Multi-factor scoring: popularity, recency, personalization, trending
-- Configurable weight factors
-- Real-time trending detection
+- Multi-factor scoring: popularity, recency, personalization, trending, match quality
+- Fixed, hand-set weights (constants in `backend/src/services/ranking-service.ts`)
+- Trending from 5-minute windows over the last hour, recomputed every 30 seconds
 
 ### 3. Real-Time Updates
 - Query log aggregation with buffered writes
 - Sliding window counters for trending
-- Automatic trie updates
+- Trie counts updated from each 30-second flush
 
 ### 4. Caching Layer
 - Redis caching with short TTL for freshness
-- Automatic cache invalidation on updates
+- Admin changes (add, remove, filter, unfilter a phrase) invalidate every cached prefix of that phrase plus the popular list; count changes from the 30-second aggregation flush wait out the 60-second TTL
 
 ## Architecture
 
@@ -120,9 +121,9 @@ A typeahead/autocomplete system demonstrating prefix matching, ranking suggestio
    ```
 
 7. **Open the app:**
-   - Frontend: http://localhost:5173
+   - Frontend: http://localhost:5173 (search page), http://localhost:5173/widgets (four `useTypeahead` widget variants), http://localhost:5173/admin
    - Backend API: http://localhost:3000
-   - Health check: http://localhost:3000/health
+   - Health check: http://localhost:3000/health (liveness), http://localhost:3000/health/ready (503 until the trie has loaded)
 
 ### Option 2: Native Services
 
@@ -134,9 +135,11 @@ If you prefer to run PostgreSQL and Redis natively:
    brew install postgresql@16
    brew services start postgresql@16
 
-   # Create database
-   createdb typeahead
-   psql typeahead -f backend/init.sql
+   # Create the role and database the backend uses by default
+   createuser typeahead
+   psql postgres -c "ALTER USER typeahead PASSWORD 'typeahead_password'"
+   createdb -O typeahead typeahead
+   psql -U typeahead -d typeahead -f backend/src/db/init.sql
    ```
 
 2. **Install Redis:**
@@ -150,11 +153,14 @@ If you prefer to run PostgreSQL and Redis natively:
    ```bash
    export PG_HOST=localhost
    export PG_PORT=5432
-   export PG_USER=your_user
-   export PG_PASSWORD=your_password
+   export PG_USER=typeahead               # default
+   export PG_PASSWORD=typeahead_password  # default
    export PG_DATABASE=typeahead
    export REDIS_HOST=localhost
    export REDIS_PORT=6379
+   # Optional
+   export CORS_ORIGINS=http://localhost:5173   # comma-separated origins allowed to call the API directly
+   export TRUST_PROXY=                          # unset: X-Forwarded-For is ignored (rate-limit keys use the socket IP)
    ```
 
 4. Follow steps 2-7 from Option 1.
@@ -173,6 +179,8 @@ npm run dev:server2  # Port 3002
 # Terminal 3
 npm run dev:server3  # Port 3003
 ```
+
+Each instance holds its own trie and its own aggregation buffer, so their suggestions diverge as searches are logged; there is no load balancer or shared trie.
 
 ## API Endpoints
 
@@ -202,34 +210,61 @@ npm run dev:server3  # Port 3003
 | `/api/v1/admin/status` | GET | Get system status |
 | `/api/v1/admin/trie/stats` | GET | Get trie statistics |
 | `/api/v1/admin/trie/rebuild` | POST | Rebuild trie from database |
-| `/api/v1/admin/phrases` | POST | Add a phrase |
-| `/api/v1/admin/filter` | POST | Filter a phrase |
+| `/api/v1/admin/phrases` | POST | Add a phrase, or raise an existing one's count (never lowers it; 409 if the phrase is filtered) |
+| `/api/v1/admin/phrases/:phrase` | DELETE | Remove a phrase from suggestions (kept in `phrase_counts` with `is_filtered = true`) |
+| `/api/v1/admin/filter` | POST | Filter a phrase (blocks searches for it and removes it from suggestions) |
+| `/api/v1/admin/filter/:phrase` | DELETE | Remove a filter and restore the phrase to suggestions |
+| `/api/v1/admin/filtered` | GET | List filtered phrases |
 | `/api/v1/admin/cache/clear` | POST | Clear suggestion cache |
+
+Behavior notes:
+
+- A `q` longer than 200 characters returns an empty list, and a `/log` body `query` over 200 characters gets 400; `limit`/`offset` are clamped and fall back to defaults when invalid. At most 10 suggestions come back, since that is what each trie node stores.
+- `POST /suggestions/log` always answers 200 with `accepted: true|false` (plus `reason` such as `low_quality` or `inappropriate`); only accepted queries are counted and added to the user's history. It is not deduplicated, so a retried log counts twice.
+- Admin mutations are deduplicated only when the client sends an `X-Idempotency-Key` header (the admin UI sends a fresh one per action): a retry with the same key replays the first response, an in-flight duplicate gets 409. Without the header a request always runs.
+- Suggestion responses include `meta.cached` (base list came from Redis) and `meta.degraded` (circuit-breaker fallback, sent with `Cache-Control: no-store`). Personalized requests (`userId` present) get `private, no-cache` plus a weak ETag; anonymous ones get `public, max-age=60, stale-while-revalidate=300`.
+- Analytics endpoints are sent with `private, no-cache`; errors and `/log` responses are never cached.
+- `/health/ready` returns 503 until the trie has been loaded from Postgres, and whenever Redis or Postgres is unreachable. With Redis down, suggestions are still served from the trie (personal and trending signals drop to 0).
+- Rate limits are fixed windows per client IP: suggestions 20/s, `/log` 5/s, admin 30/min, 1000/min overall (`/health*` and `/metrics` are not counted).
 
 ## Example Usage
 
 ### Get Suggestions
 
 ```bash
-curl "http://localhost:3000/api/v1/suggestions?q=java&limit=5"
+curl "http://localhost:3000/api/v1/suggestions?q=java&limit=2"
 ```
 
-Response:
+Response (freshly seeded data, anonymous request; `lastUpdated` is epoch ms of `phrase_counts.last_updated`):
 ```json
 {
   "prefix": "java",
   "suggestions": [
-    { "phrase": "javascript", "count": 50000, "score": 0.85 },
-    { "phrase": "javascript tutorial", "count": 35000, "score": 0.78 },
-    { "phrase": "java", "count": 45000, "score": 0.75 }
+    {
+      "phrase": "java",
+      "count": 45000,
+      "lastUpdated": 1791043470365,
+      "score": 0.405,
+      "scores": { "popularity": 0.517, "recency": 1.0, "personal": 0, "trending": 0, "match": 1.0 }
+    },
+    {
+      "phrase": "javascript",
+      "count": 50000,
+      "lastUpdated": 1791043470365,
+      "score": 0.395,
+      "scores": { "popularity": 0.522, "recency": 1.0, "personal": 0, "trending": 0, "match": 0.88 }
+    }
   ],
   "meta": {
-    "count": 3,
-    "responseTimeMs": 12,
-    "cached": false
+    "count": 2,
+    "responseTimeMs": 4,
+    "cached": false,
+    "degraded": false
   }
 }
 ```
+
+`java` outranks the more popular `javascript` because match quality rewards a prefix that covers more of the phrase.
 
 ### Log a Search
 
@@ -239,36 +274,43 @@ curl -X POST "http://localhost:3000/api/v1/suggestions/log" \
   -d '{"query": "javascript tutorial"}'
 ```
 
+Response: `{"success":true,"accepted":true,"message":"Query logged successfully"}`. A rejected query (for example `asdfghjkl`) still gets 200, with `"accepted":false,"reason":"low_quality","message":"Query not counted"`.
+
 ## Implementation Details
 
 ### Trie Data Structure
 
-The trie stores pre-computed top-k suggestions at each node, enabling O(prefix length) lookups:
+The trie stores pre-computed top-k suggestions at each node, ordered by count, enabling O(prefix length) lookups:
 
 ```
-root
-├── j
-│   ├── a
-│   │   ├── v
-│   │   │   ├── a       [java, java spring, ...]
-│   │   │   └── s       [javascript, javascript tutorial, ...]
+root                         [google, youtube, facebook, ...]   (global top-10)
+└── j
+    └── a
+        └── v
+            └── a            [javascript, java, javascript tutorial, ...]
+                ├── s        [javascript, javascript tutorial, ...]
+                └── (space)  [java vs javascript, java spring boot]
 ```
+
+Ranking then re-orders each list per request (see below).
 
 ### Ranking Algorithm
 
 Final score = weighted sum of:
-- Popularity (30%): log10(count)
-- Recency (15%): exponential decay over 1 week
-- Personalization (25%): user history match
-- Trending (20%): real-time trending boost
-- Match quality (10%): prefix match quality
+- Popularity (30%): log10(count + 1) / 9
+- Recency (15%): exp(-hours since `phrase_counts.last_updated` / 168), a half-life of about 116 hours
+- Personalization (25%): 0.7 × exp(-days since the user last searched it / 30) + 0.3 × min(times searched / 10, 1)
+- Trending (20%): min(score in `trending_queries` / 1000, 1)
+- Match quality (10%): 0.8-1.0 for a prefix match (higher when the prefix covers more of the phrase), 0.7 at a word boundary, 0.4 for a substring
+
+Fuzzy matches lose 0.2 per edit. The weights are constants, not configuration.
 
 ### Aggregation Pipeline
 
-1. Query received -> Buffer incremented
-2. Every 30 seconds -> Flush to database + update trie
-3. Sliding window counters -> Real-time trending
-4. Periodic decay -> Trending score decay
+1. Completed search logged (`POST /log`) -> quality and blocklist checks, buffer incremented, one `query_logs` row
+2. Every 30 seconds -> Upsert buffered counts to `phrase_counts`, then update the trie with the stored totals (filtered or admin-removed phrases stay out)
+3. Sliding window counters (5-minute windows) -> Real-time trending
+4. Every 30 seconds -> `trending_queries` recomputed from the last 12 windows weighted 0.9^age (that weighting is the decay), excluding blocked phrases
 
 ## Development
 

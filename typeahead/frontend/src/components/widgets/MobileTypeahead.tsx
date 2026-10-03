@@ -123,8 +123,9 @@ export function MobileTypeahead({
       aria-modal="true"
       aria-label={title}
       onKeyDown={(e) => {
-        // The hook handles (and prevents) Escape while its suggestion list is open
-        if (e.key === 'Escape' && !e.isDefaultPrevented()) {
+        // The overlay always shows its suggestions, so the hook's list state isn't visible on
+        // its own here: Escape closes the whole dialog (the hook has already reset its list)
+        if (e.key === 'Escape') {
           handleCancel();
         }
         trapTabKey(e, dialogRef.current);

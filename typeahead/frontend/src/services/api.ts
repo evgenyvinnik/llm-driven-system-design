@@ -9,19 +9,10 @@ import type {
 } from '../types';
 import { v4 as uuidv4 } from 'uuid';
 import { memoryCache } from './cache.js';
+import { normalizePrefix } from '../utils/normalize.js';
 
 const API_BASE = '/api/v1';
 const DEFAULT_TIMEOUT = 5000; // 5 seconds
-
-/**
- * Mirror of the backend's normalizePrefix (lowercase, no leading whitespace, a trailing
- * whitespace run kept as one space) so "How" and "how" share one memory-cache entry.
- */
-function normalizeCachePrefix(prefix: string): string {
-  const lookup = prefix.toLowerCase().trimStart();
-  const trimmed = lookup.trimEnd();
-  return trimmed.length < lookup.length ? `${trimmed} ` : lookup;
-}
 
 /**
  * Memory-cache key for a suggestions request. The prefix comes first and is JSON-encoded so
@@ -50,6 +41,18 @@ function clearServiceWorkerApiCache(): void {
   } catch {
     // No service worker (dev server, unsupported browser): nothing to clear
   }
+}
+
+/**
+ * Drop the IndexedDB suggestion lists the /widgets typeaheads fall back to. Imported lazily so
+ * the home page bundle doesn't pull in Dexie; best effort, like the service-worker clear.
+ */
+function clearIndexedDbSuggestionCache(): void {
+  import('../db/database.js')
+    .then((db) => db.clearSuggestionCache())
+    .catch(() => {
+      // IndexedDB unavailable (private mode, blocked storage): nothing to clear
+    });
 }
 
 /** HTTP client for the typeahead API covering suggestions, trending, analytics, and admin endpoints. */
@@ -144,7 +147,7 @@ class ApiService {
   ): Promise<SuggestionsResponse> {
     const requestGroup = `suggestions:${options.group ?? 'default'}:`;
     const cacheKey = suggestionsCacheKey(
-      normalizeCachePrefix(prefix),
+      normalizePrefix(prefix),
       options.userId,
       options.limit || 5,
       options.fuzzy || false
@@ -280,6 +283,7 @@ class ApiService {
     } finally {
       memoryCache.invalidatePrefix('suggestions:');
       clearServiceWorkerApiCache();
+      clearIndexedDbSuggestionCache();
     }
   }
 

@@ -355,6 +355,16 @@ export class RankingService {
    * Get top trending queries.
    */
   async getTopTrending(limit: number = 10): Promise<TrendingResult[]> {
+    return (await this.getTopTrendingWithStatus(limit)).trending;
+  }
+
+  /**
+   * Top trending queries, plus whether Redis could actually be read. An unreadable Redis
+   * yields an empty list with degraded: true, so callers don't cache it as "nothing trending".
+   */
+  async getTopTrendingWithStatus(
+    limit: number = 10
+  ): Promise<{ trending: TrendingResult[]; degraded: boolean }> {
     try {
       const trending = await this._withRedis(() =>
         this.redis.zrevrange('trending_queries', 0, limit - 1, 'WITHSCORES')
@@ -368,10 +378,10 @@ export class RankingService {
         });
       }
 
-      return results;
+      return { trending: results, degraded: false };
     } catch (error) {
       console.error('Error getting trending:', (error as Error).message);
-      return [];
+      return { trending: [], degraded: true };
     }
   }
 

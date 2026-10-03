@@ -293,26 +293,21 @@ export class SuggestionService {
   }
 
   /**
-   * Clear cache for a prefix and every longer prefix starting with it, or all suggestion
-   * caches when no prefix is given (call when trie is updated).
+   * Clear every suggestion cache entry (admin request, trie rebuild).
+   * Returns false when Redis isn't reachable, so callers don't report a clear that didn't happen.
    */
-  async clearCache(prefix: string | null = null): Promise<void> {
+  async clearCache(): Promise<boolean> {
     if (!this._cacheAvailable()) {
       console.error('Redis clear cache skipped: Redis not ready');
-      return;
+      return false;
     }
 
     try {
-      if (prefix) {
-        // Escape glob characters so the prefix is matched literally
-        const pattern = normalizePrefix(prefix).replace(/[*?[\]\\]/g, '\\$&');
-        await this._deleteMatching(`${this.prefixCachePrefix}${pattern}*`);
-      } else {
-        // Clear all suggestion caches
-        await this._deleteMatching(`${this.cachePrefix}*`);
-      }
+      await this._deleteMatching(`${this.cachePrefix}*`);
+      return true;
     } catch (error) {
       console.error('Redis clear cache error:', (error as Error).message);
+      return false;
     }
   }
 

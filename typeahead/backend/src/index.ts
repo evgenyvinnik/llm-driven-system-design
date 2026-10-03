@@ -21,7 +21,7 @@ import {
 } from './shared/metrics.js';
 import { getCircuitStatus } from './shared/circuit-breaker.js';
 import { globalRateLimiter } from './shared/rate-limiter.js';
-import { cleanup as cleanupIdempotency, createRedisIdempotencyHandler } from './shared/idempotency.js';
+import { cleanup as cleanupIdempotency } from './shared/idempotency.js';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -75,6 +75,7 @@ const redis = new Redis({
 
 // ioredis reconnects on its own; log the first error of each outage rather than every retry
 let redisErrorLogged = false;
+let redisWasReadyBefore = false;
 redis.on('error', (err: Error) => {
   if (redisErrorLogged) return;
   redisErrorLogged = true;
@@ -83,9 +84,13 @@ redis.on('error', (err: Error) => {
 redis.on('ready', () => {
   if (redisErrorLogged) {
     logger.info({ event: 'redis_reconnected' });
-    // Admin filter changes skip the Redis blocked set while it is down: re-mirror filtered_phrases
-    if (trieLoaded) void aggregationService.syncBlockedPhrases();
   }
+  // On every reconnect (not only after a logged error: a quick restart may not emit one),
+  // re-mirror filtered_phrases. Admin filter changes skip the Redis blocked set while it is
+  // down, and a restarted Redis without persistence has lost it. The first connection is
+  // covered by aggregationService.start() / initialize().
+  if (redisWasReadyBefore && trieLoaded) void aggregationService.syncBlockedPhrases();
+  redisWasReadyBefore = true;
   redisErrorLogged = false;
 });
 
@@ -112,9 +117,6 @@ const rankingService = new RankingService(redis);
 const suggestionService = new SuggestionService(trie, redis, rankingService);
 const aggregationService = new AggregationService(redis, pgPool, trie);
 
-// Initialize Redis-based idempotency handler
-const idempotencyHandler = createRedisIdempotencyHandler(redis);
-
 // Set once the startup load from Postgres has filled the trie; readiness waits for it
 let trieLoaded = false;
 let shuttingDown = false;
@@ -137,7 +139,6 @@ app.set('trie', trie);
 app.set('suggestionService', suggestionService);
 app.set('rankingService', rankingService);
 app.set('aggregationService', aggregationService);
-app.set('idempotencyHandler', idempotencyHandler);
 app.set('logger', logger);
 app.set('auditLogger', auditLogger);
 

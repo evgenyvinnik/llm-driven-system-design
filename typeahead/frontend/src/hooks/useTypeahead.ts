@@ -141,6 +141,8 @@ export function useTypeahead(options: UseTypeaheadOptions = {}): UseTypeaheadRet
   const inFlight = useRef(false);
   // Query set by selectSuggestion: the effect does not fetch it, so the list stays closed
   const suppressedQuery = useRef<string | null>(null);
+  // The query last selected or submitted (and logged), so a follow-up Enter doesn't log it twice
+  const committedQuery = useRef<string | null>(null);
   // The list was closed explicitly (blur, Escape, Tab, selection, submit) since the user last
   // edited the query: a fetch that completes now refreshes the suggestions but does not reopen it
   const dismissed = useRef(false);
@@ -292,6 +294,7 @@ export function useTypeahead(options: UseTypeaheadOptions = {}): UseTypeaheadRet
         const selected = suggestions[index];
         cancelPending();
         suppressedQuery.current = selected.phrase;
+        committedQuery.current = selected.phrase;
         setQueryState(selected.phrase);
         setIsOpen(false);
         setHighlightedIndex(-1);
@@ -317,6 +320,7 @@ export function useTypeahead(options: UseTypeaheadOptions = {}): UseTypeaheadRet
     cancelPending();
     setIsOpen(false);
     setHighlightedIndex(-1);
+    committedQuery.current = query;
 
     // Track submission (IndexedDB is best-effort)
     addToHistory(query).catch(ignoreIdbError);
@@ -339,9 +343,10 @@ export function useTypeahead(options: UseTypeaheadOptions = {}): UseTypeaheadRet
           setIsOpen(true);
           setHighlightedIndex(0);
           event.preventDefault();
-        } else if (event.key === 'Enter' && query.trim()) {
-          // No list to pick from (no results, dismissed, or after a selection): Enter still
-          // submits. Default is left alone so a surrounding form submits natively too.
+        } else if (event.key === 'Enter' && query.trim() && query !== committedQuery.current) {
+          // No list to pick from (no results or dismissed): Enter still submits. Default is left
+          // alone so a surrounding form submits natively too. A query that was just selected or
+          // submitted is already logged, so only the native submit happens.
           submitQuery();
         }
         return;

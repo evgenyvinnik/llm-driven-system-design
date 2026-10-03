@@ -115,7 +115,7 @@ function getSuggestionCircuit(
  * WHY metrics: Enables ranking optimization and SLO monitoring
  *
  * Query params:
- * - q: The search prefix (required, at most 200 characters)
+ * - q: The search prefix (required; longer than 200 characters returns an empty list)
  * - limit: Max number of suggestions (default: 5, max: 100)
  * - userId: User ID for personalization (optional)
  * - fuzzy: Enable fuzzy matching (default: false)
@@ -132,11 +132,24 @@ router.get('/', suggestionRateLimiter, conditionalCache('suggestions'), async (r
   try {
     const { q: prefix, userId, fuzzy = 'false' } = req.query;
 
-    if (!prefix || typeof prefix !== 'string' || prefix.length > MAX_QUERY_LENGTH) {
+    if (!prefix || typeof prefix !== 'string') {
       timer({ endpoint: 'suggestions', cache_hit: 'false', status: 'error' });
       suggestionRequests.inc({ endpoint: 'suggestions', status: 'validation_error' });
       res.status(400).json({
-        error: `Missing or invalid query parameter "q" (at most ${MAX_QUERY_LENGTH} characters)`,
+        error: 'Missing or invalid query parameter "q"',
+      });
+      return;
+    }
+
+    // No stored phrase is longer than MAX_QUERY_LENGTH, so a longer prefix simply has no
+    // matches. Answer like any other empty result (a 400 would surface as an error in the UI).
+    if (prefix.length > MAX_QUERY_LENGTH) {
+      timer({ endpoint: 'suggestions', cache_hit: 'false', status: 'success' });
+      suggestionRequests.inc({ endpoint: 'suggestions', status: 'too_long' });
+      res.json({
+        prefix,
+        suggestions: [],
+        meta: { count: 0, responseTimeMs: Date.now() - startTime, cached: false, degraded: false },
       });
       return;
     }
@@ -342,15 +355,21 @@ router.get('/trending', cacheTrending, async (req: Request, res: Response) => {
     const limit = parseIntParam(req.query.limit, 10, 1, MAX_LIMIT);
 
     const rankingService = req.app.get('rankingService') as RankingService;
-    const trending = await rankingService.getTopTrending(limit);
+    const { trending, degraded } = await rankingService.getTopTrendingWithStatus(limit);
+
+    if (degraded) {
+      // Redis was unreadable: don't let browsers keep this empty list once it recovers
+      res.locals.noStore = true;
+    }
 
     timer({ endpoint: 'trending', cache_hit: 'false', status: 'success' });
-    suggestionRequests.inc({ endpoint: 'trending', status: 'success' });
+    suggestionRequests.inc({ endpoint: 'trending', status: degraded ? 'degraded' : 'success' });
 
     res.json({
       trending,
       meta: {
         count: trending.length,
+        degraded,
         timestamp: new Date().toISOString(),
       },
     });

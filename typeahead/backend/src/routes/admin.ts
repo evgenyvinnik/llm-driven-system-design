@@ -624,7 +624,18 @@ router.post('/cache/clear', idempotencyMiddleware('cache_clear'), async (req: Re
 
   try {
     const suggestionService = req.app.get('suggestionService') as SuggestionService;
-    await suggestionService.clearCache();
+    const cleared = await suggestionService.clearCache();
+
+    if (!cleared) {
+      // 5xx responses aren't stored by the idempotency middleware, so a retry runs again
+      timer({ endpoint: 'admin_cache_clear', cache_hit: 'false', status: 'error' });
+      suggestionRequests.inc({ endpoint: 'admin_cache_clear', status: 'unavailable' });
+      res.status(503).json({
+        success: false,
+        error: 'Cache unavailable: Redis is not reachable, nothing was cleared',
+      });
+      return;
+    }
 
     auditLogger.logCacheInvalidation('*', 'manual_clear');
 

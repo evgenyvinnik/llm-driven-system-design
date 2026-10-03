@@ -318,15 +318,6 @@ export class Trie {
   }
 
   /**
-   * Increment the count for an existing phrase or insert with count 1.
-   */
-  incrementCount(phrase: string, delta: number = 1): void {
-    const normalizedPhrase = normalizePhrase(phrase);
-    const currentCount = this.phraseMap.get(normalizedPhrase) || 0;
-    this.insert(normalizedPhrase, currentCount + Number(delta));
-  }
-
-  /**
    * Check if a phrase exists in the trie.
    */
   has(phrase: string): boolean {

@@ -39,8 +39,9 @@ const BLOCKED_KEY = 'blocked_phrases';
 const TRENDING_WINDOW_MS = 300000; // 5-minute windows
 const TRENDING_WINDOW_COUNT = 12; // 1 hour of windows
 
-// A letters-only word this long with no vowel (y counts) is a smash: real words and acronyms have one
-const MIN_VOWELLESS_WORD = 6;
+// A letters-only word this long with no vowel (y counts) is a smash. Shorter vowelless words are
+// real searches ("strcmp", "strncmp", "sqlcmd", "dhcpcd"); real words of 8+ letters have a vowel.
+const MIN_VOWELLESS_WORD = 8;
 // Runs of 7 adjacent keys on one QWERTY row, either direction ("asdfghj", "poiuytr").
 // No word contains one, while 6 would already reject "qwerty".
 const KEYBOARD_RUN_LENGTH = 7;
@@ -151,15 +152,18 @@ export class AggregationService {
     if (this.isLowQuality(normalizedQuery)) return this.reject('low_quality');
 
     // Filter inappropriate content; fail closed when the blocklist can't be read at all
-    const blockStatus = await this.checkBlocked(normalizedQuery);
+    const { status: blockStatus, removed } = await this.checkBlocked(normalizedQuery);
     if (blockStatus === 'blocked') return this.reject('inappropriate');
     if (blockStatus === 'unknown') return this.reject('filter_unavailable');
 
     // Update buffer
     this.addToBuffer(normalizedQuery, 1, Date.now());
 
-    // Update trending in real-time
-    await this.updateTrending(normalizedQuery);
+    // Update trending in real-time. A phrase an admin removed from suggestions (DELETE
+    // /admin/phrases) is still counted, so restoring it keeps its count, but must not trend.
+    if (!removed) {
+      await this.updateTrending(normalizedQuery);
+    }
 
     // Log to PostgreSQL (async, non-blocking)
     this.logQuery(normalizedQuery, userId, sessionId).catch((err: Error) => {
@@ -250,36 +254,34 @@ export class AggregationService {
   }
 
   /**
-   * Check if a query contains inappropriate content.
-   * Fails closed: true when the blocklist could not be checked.
-   */
-  async isInappropriate(query: string): Promise<boolean> {
-    return (await this.checkBlocked(query)) !== 'clear';
-  }
-
-  /**
    * Check a phrase against the Redis blocked set (fast path), then filtered_phrases.
    * Each source can block on its own, so an error in one doesn't let a blocked phrase through.
-   * 'unknown' means neither could be read.
+   * status 'unknown' means neither could be read. removed reports a phrase_counts row marked
+   * is_filtered by DELETE /admin/phrases (searchable, but kept out of suggestions and trending).
    */
-  private async checkBlocked(query: string): Promise<BlockStatus> {
+  private async checkBlocked(query: string): Promise<{ status: BlockStatus; removed: boolean }> {
     let redisAnswered = false;
     try {
-      if (await this.withRedis(() => this.redis.sismember(BLOCKED_KEY, query))) return 'blocked';
+      if (await this.withRedis(() => this.redis.sismember(BLOCKED_KEY, query))) {
+        return { status: 'blocked', removed: false };
+      }
       redisAnswered = true;
     } catch (error) {
       console.error('Error checking blocked set:', (error as Error).message);
     }
 
     try {
-      const result = await this.pgPool.query('SELECT 1 FROM filtered_phrases WHERE phrase = $1', [
-        query,
-      ]);
-      return result.rows.length > 0 ? 'blocked' : 'clear';
+      const result = await this.pgPool.query<{ blocked: boolean; removed: boolean }>(
+        `SELECT EXISTS (SELECT 1 FROM filtered_phrases WHERE phrase = $1) AS blocked,
+                EXISTS (SELECT 1 FROM phrase_counts WHERE phrase = $1 AND is_filtered) AS removed`,
+        [query]
+      );
+      const row = result.rows[0];
+      return { status: row?.blocked ? 'blocked' : 'clear', removed: row?.removed === true };
     } catch (error) {
       console.error('Error checking filtered phrases:', (error as Error).message);
       // The Redis set mirrors filtered_phrases (synced on start), so its answer stands alone
-      return redisAnswered ? 'clear' : 'unknown';
+      return { status: redisAnswered ? 'clear' : 'unknown', removed: false };
     }
   }
 
