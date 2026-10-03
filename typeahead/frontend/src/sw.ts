@@ -1,13 +1,16 @@
 /**
  * Service Worker for typeahead offline support.
- * Uses stale-while-revalidate strategy for API requests.
+ * Uses stale-while-revalidate strategy for API requests and network-first for pages,
+ * so a redeploy is picked up on the next load (the cached shell is only an offline fallback).
  */
 
 /// <reference lib="webworker" />
 declare const self: ServiceWorkerGlobalScope;
 
-const CACHE_NAME = 'typeahead-v1';
-const API_CACHE_NAME = 'typeahead-api-v1';
+// Bump CACHE_VERSION whenever the caching scheme changes; activate deletes every other cache.
+const CACHE_VERSION = 'v2';
+const CACHE_NAME = `typeahead-${CACHE_VERSION}`;
+const API_CACHE_NAME = `typeahead-api-${CACHE_VERSION}`;
 
 // URLs to cache on install
 const STATIC_ASSETS = [
@@ -24,6 +27,11 @@ const SWR_API_PATTERNS = [
 
 // Cache TTLs (in milliseconds)
 const API_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+// Oldest response still served as an offline fallback; older entries are deleted, so a phrase
+// filtered by an admin cannot stay servable from here indefinitely
+const API_CACHE_MAX_STALE = 24 * 60 * 60 * 1000; // 24 hours
+// Every keystroke prefix is a distinct URL; cap the entry count so the cache cannot grow forever
+const API_CACHE_MAX_ENTRIES = 200;
 
 self.addEventListener('install', (event) => {
   event.waitUntil(
@@ -55,14 +63,30 @@ function shouldApplySWR(url: URL): boolean {
 }
 
 /**
+ * Age of a cached API response in milliseconds (Infinity if it carries no timestamp).
+ */
+function cacheAge(response: Response): number {
+  const cachedAt = response.headers.get('sw-cached-at');
+  if (!cachedAt) return Infinity;
+  return Date.now() - parseInt(cachedAt, 10);
+}
+
+/**
  * Check if cached response is still fresh.
  */
 function isCacheValid(response: Response): boolean {
-  const cachedAt = response.headers.get('sw-cached-at');
-  if (!cachedAt) return false;
+  return cacheAge(response) < API_CACHE_TTL;
+}
 
-  const age = Date.now() - parseInt(cachedAt, 10);
-  return age < API_CACHE_TTL;
+/**
+ * Evict the oldest entries beyond API_CACHE_MAX_ENTRIES. cache.put() appends (a re-put moves
+ * the entry to the end), so keys() is ordered oldest write first.
+ */
+async function trimApiCache(cache: Cache): Promise<void> {
+  const keys = await cache.keys();
+  const excess = keys.length - API_CACHE_MAX_ENTRIES;
+  if (excess <= 0) return;
+  await Promise.all(keys.slice(0, excess).map((key) => cache.delete(key)));
 }
 
 /**
@@ -83,6 +107,7 @@ async function cacheWithTimestamp(
   });
 
   await cache.put(request, cachedResponse);
+  await trimApiCache(cache);
 }
 
 /**
@@ -91,10 +116,18 @@ async function cacheWithTimestamp(
  */
 async function staleWhileRevalidate(request: Request): Promise<Response> {
   const cache = await caches.open(API_CACHE_NAME);
-  const cachedResponse = await cache.match(request);
+  let cachedResponse = await cache.match(request);
 
-  // Start network request
-  const fetchPromise = fetch(request)
+  // Too old even for an offline fallback: delete instead of serving
+  if (cachedResponse && cacheAge(cachedResponse) > API_CACHE_MAX_STALE) {
+    await cache.delete(request);
+    cachedResponse = undefined;
+  }
+
+  // Start network request. Revalidate past the browser HTTP cache (no-cache sends the ETag,
+  // so an unchanged body costs a 304), otherwise a still-fresh HTTP-cached body would be
+  // re-stamped here as newly fetched.
+  const fetchPromise = fetch(new Request(request, { cache: 'no-cache' }))
     .then(async (networkResponse) => {
       if (networkResponse.ok) {
         await cacheWithTimestamp(cache, request, networkResponse);
@@ -106,8 +139,12 @@ async function staleWhileRevalidate(request: Request): Promise<Response> {
       return null;
     });
 
+  // The page asked to bypass caches (personalized suggestions after a logged search):
+  // never answer from here while the network is reachable
+  const bypassCache = request.cache === 'no-cache' || request.cache === 'no-store' || request.cache === 'reload';
+
   // If we have a valid cached response, return it immediately
-  if (cachedResponse && isCacheValid(cachedResponse)) {
+  if (!bypassCache && cachedResponse && isCacheValid(cachedResponse)) {
     // Revalidate in background
     fetchPromise.catch(() => {});
     return cachedResponse;
@@ -149,6 +186,29 @@ async function networkFirst(request: Request): Promise<Response> {
   }
 }
 
+/**
+ * Network-first for page navigations. Serving the precached index.html cache-first would pin
+ * returning users to the build they first saw: after a redeploy its hashed bundle no longer
+ * exists and the page stays blank. The shell is refreshed on every successful load and is
+ * only served when the network is unreachable (any route, since this is an SPA).
+ */
+async function navigationNetworkFirst(request: Request): Promise<Response> {
+  const cache = await caches.open(CACHE_NAME);
+  try {
+    const response = await fetch(request);
+    if (response.ok) {
+      await cache.put('/index.html', response.clone());
+    }
+    return response;
+  } catch {
+    const cachedResponse = (await cache.match('/index.html')) ?? (await cache.match('/'));
+    if (cachedResponse) {
+      return cachedResponse;
+    }
+    throw new Error('Network error and no cached shell available');
+  }
+}
+
 self.addEventListener('fetch', (event) => {
   const url = new URL(event.request.url);
 
@@ -168,18 +228,14 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  // Network-first for other requests
-  if (url.pathname.startsWith('/api/')) {
-    event.respondWith(networkFirst(event.request));
+  // Network-first for pages, so a new deploy's index.html is used as soon as it exists
+  if (event.request.mode === 'navigate') {
+    event.respondWith(navigationNetworkFirst(event.request));
     return;
   }
 
-  // Cache-first for static assets
-  event.respondWith(
-    caches.match(event.request).then((response) => {
-      return response || fetch(event.request);
-    })
-  );
+  // Network-first for other requests (cached copies are only an offline fallback)
+  event.respondWith(networkFirst(event.request));
 });
 
 // Handle messages from the main thread
@@ -188,8 +244,9 @@ self.addEventListener('message', (event) => {
     self.skipWaiting();
   }
 
+  // Sent by the admin client after rebuild / cache clear / add / filter
   if (event.data?.type === 'CLEAR_API_CACHE') {
-    caches.delete(API_CACHE_NAME);
+    event.waitUntil(caches.delete(API_CACHE_NAME));
   }
 });
 

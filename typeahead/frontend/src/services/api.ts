@@ -7,10 +7,50 @@ import type {
   TopPhrase,
   SystemStatus,
 } from '../types';
+import { v4 as uuidv4 } from 'uuid';
 import { memoryCache } from './cache.js';
 
 const API_BASE = '/api/v1';
 const DEFAULT_TIMEOUT = 5000; // 5 seconds
+
+/**
+ * Mirror of the backend's normalizePrefix (lowercase, no leading whitespace, a trailing
+ * whitespace run kept as one space) so "How" and "how" share one memory-cache entry.
+ */
+function normalizeCachePrefix(prefix: string): string {
+  const lookup = prefix.toLowerCase().trimStart();
+  const trimmed = lookup.trimEnd();
+  return trimmed.length < lookup.length ? `${trimmed} ` : lookup;
+}
+
+/**
+ * Memory-cache key for a suggestions request. The prefix comes first and is JSON-encoded so
+ * every cached variant of one prefix can be dropped with a single invalidatePrefix call.
+ * userId is part of the key because the server's ranking is personalized.
+ */
+function suggestionsCacheKey(prefix: string, userId = '', limit = 5, fuzzy = false): string {
+  return `suggestions:${JSON.stringify(prefix)}:${userId}:${limit}:${fuzzy}`;
+}
+
+/**
+ * Fresh idempotency key for one user action. The backend deduplicates on X-Idempotency-Key,
+ * so a repeated click must not reuse the previous key (or omit it) or it is replayed, not run.
+ */
+function newIdempotencyKey(): string {
+  return uuidv4(); // crypto.randomUUID() where available, also works outside secure contexts
+}
+
+/**
+ * Tell the service worker to drop its API cache after a mutation, or a filtered/added phrase
+ * keeps being served from it.
+ */
+function clearServiceWorkerApiCache(): void {
+  try {
+    navigator.serviceWorker?.controller?.postMessage({ type: 'CLEAR_API_CACHE' });
+  } catch {
+    // No service worker (dev server, unsupported browser): nothing to clear
+  }
+}
 
 /** HTTP client for the typeahead API covering suggestions, trending, analytics, and admin endpoints. */
 class ApiService {
@@ -23,11 +63,13 @@ class ApiService {
     endpoint: string,
     options?: RequestInit & { signal?: AbortSignal }
   ): Promise<T> {
+    // Merge rather than replace, so per-call headers (X-Idempotency-Key) keep the content type
+    const headers = new Headers(options?.headers);
+    if (!headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
+
     const response = await fetch(`${API_BASE}${endpoint}`, {
-      headers: {
-        'Content-Type': 'application/json',
-      },
       ...options,
+      headers,
     });
 
     if (!response.ok) {
@@ -63,10 +105,34 @@ class ApiService {
       return AbortSignal.any([controller.signal, AbortSignal.timeout(timeoutMs)]);
     }
 
-    // Fallback for older browsers: manual timeout
-    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+    // Fallback for older browsers: manual timeout. Abort with a TimeoutError so a timeout is
+    // reported as a failure instead of being mistaken for a superseded (aborted) request.
+    const timeoutId = setTimeout(
+      () => controller.abort(new DOMException('signal timed out', 'TimeoutError')),
+      timeoutMs
+    );
     controller.signal.addEventListener('abort', () => clearTimeout(timeoutId));
     return controller.signal;
+  }
+
+  /**
+   * Abort any in-flight suggestion request (input cleared, suggestion selected, list dismissed).
+   * Callers must still ignore late results themselves: abort is an optimization, not the
+   * ordering guarantee.
+   */
+  cancelSuggestions(): void {
+    this.cancelPendingRequests('suggestions:');
+  }
+
+  /**
+   * Drop memory-cached suggestions for every prefix of a phrase, since a logged search changes
+   * that phrase's personalized ranking under each of them.
+   */
+  private invalidateSuggestionsFor(phrase: string): void {
+    const normalized = phrase.toLowerCase().trim();
+    for (let i = 1; i <= normalized.length; i++) {
+      memoryCache.invalidatePrefix(`suggestions:${JSON.stringify(normalized.slice(0, i))}:`);
+    }
   }
 
   // Suggestions
@@ -74,16 +140,22 @@ class ApiService {
     prefix: string,
     options: { limit?: number; userId?: string; fuzzy?: boolean } = {}
   ): Promise<SuggestionsResponse> {
-    const cacheKey = `suggestions:${prefix}:${options.limit || 5}:${options.fuzzy || false}`;
+    const cacheKey = suggestionsCacheKey(
+      normalizeCachePrefix(prefix),
+      options.userId,
+      options.limit || 5,
+      options.fuzzy || false
+    );
 
-    // Check memory cache first
+    // Cancel any pending suggestion request first, so an older in-flight response cannot
+    // land after this one even when this one is answered from memory
+    this.cancelPendingRequests('suggestions:');
+
+    // Check memory cache
     const cached = memoryCache.get<SuggestionsResponse>(cacheKey);
     if (cached) {
       return { ...cached, meta: { ...cached.meta, cached: true } };
     }
-
-    // Cancel any pending suggestion requests
-    this.cancelPendingRequests('suggestions:');
 
     // Create new abort controller for this request
     const controller = new AbortController();
@@ -108,31 +180,36 @@ class ApiService {
 
       const response = await this.request<SuggestionsResponse>(`/suggestions?${params}`, {
         signal,
+        // Personalized responses change as soon as this user logs a search; revalidate them
+        // (ETag, so usually a 304) instead of letting the HTTP cache answer for minutes.
+        cache: options.userId ? 'no-cache' : 'default',
       });
 
       // Cache the response
       memoryCache.set(cacheKey, response, 60_000); // 60s TTL
 
       return response;
-    } catch (error) {
-      // Don't throw on intentional abort
-      if ((error as Error).name === 'AbortError') {
-        throw error; // Let caller handle abort
-      }
-      throw error;
     } finally {
-      this.abortControllers.delete(requestKey);
+      // Only remove our own controller; a newer request may already own this key
+      if (this.abortControllers.get(requestKey) === controller) {
+        this.abortControllers.delete(requestKey);
+      }
     }
   }
 
   async logSearch(query: string, userId?: string, sessionId?: string): Promise<void> {
-    // Invalidate cache for this query's prefix
-    memoryCache.invalidatePrefix(`suggestions:${query.substring(0, 3)}`);
+    // Invalidate now so retyping refetches, and again once the server has recorded the
+    // search, so a response fetched while the log was in flight is not kept
+    this.invalidateSuggestionsFor(query);
 
-    await this.request('/suggestions/log', {
-      method: 'POST',
-      body: JSON.stringify({ query, userId, sessionId }),
-    });
+    try {
+      await this.request('/suggestions/log', {
+        method: 'POST',
+        body: JSON.stringify({ query, userId, sessionId }),
+      });
+    } finally {
+      this.invalidateSuggestionsFor(query);
+    }
   }
 
   async getTrending(limit = 10): Promise<TrendingResponse> {
@@ -196,41 +273,44 @@ class ApiService {
     return this.request<SystemStatus>('/admin/status');
   }
 
-  async rebuildTrie(): Promise<{ success: boolean; message: string; stats: unknown }> {
-    // Clear all suggestion caches when trie is rebuilt
-    memoryCache.invalidatePrefix('suggestions:');
+  /**
+   * POST an admin mutation with a fresh idempotency key, then drop every client-side copy of
+   * suggestions (memory cache and service worker). Fuzzy results can contain a phrase under
+   * prefixes it does not start with, so mutations invalidate all suggestion entries.
+   */
+  private async adminMutation<T>(endpoint: string, body?: unknown): Promise<T> {
+    try {
+      return await this.request<T>(endpoint, {
+        method: 'POST',
+        headers: { 'X-Idempotency-Key': newIdempotencyKey() },
+        body: body === undefined ? undefined : JSON.stringify(body),
+      });
+    } finally {
+      memoryCache.invalidatePrefix('suggestions:');
+      clearServiceWorkerApiCache();
+    }
+  }
 
-    return this.request('/admin/trie/rebuild', { method: 'POST' });
+  async rebuildTrie(): Promise<{ success: boolean; message: string; stats: unknown }> {
+    return this.adminMutation('/admin/trie/rebuild');
   }
 
   async clearCache(): Promise<{ success: boolean; message: string }> {
     // Clear local cache too
     memoryCache.clear();
 
-    return this.request('/admin/cache/clear', { method: 'POST' });
+    return this.adminMutation('/admin/cache/clear');
   }
 
   async addPhrase(
     phrase: string,
     count = 1
   ): Promise<{ success: boolean; phrase: string; count: number }> {
-    // Invalidate related caches
-    memoryCache.invalidatePrefix(`suggestions:${phrase.substring(0, 3)}`);
-
-    return this.request('/admin/phrases', {
-      method: 'POST',
-      body: JSON.stringify({ phrase, count }),
-    });
+    return this.adminMutation('/admin/phrases', { phrase, count });
   }
 
   async filterPhrase(phrase: string, reason = 'manual'): Promise<{ success: boolean; phrase: string }> {
-    // Invalidate related caches
-    memoryCache.invalidatePrefix(`suggestions:${phrase.substring(0, 3)}`);
-
-    return this.request('/admin/filter', {
-      method: 'POST',
-      body: JSON.stringify({ phrase, reason }),
-    });
+    return this.adminMutation('/admin/filter', { phrase, reason });
   }
 
   async getFilteredPhrases(limit = 100): Promise<{

@@ -1,7 +1,16 @@
 -- Typeahead Seed Data
 -- Sample phrases with popularity counts for autocomplete
+--
+-- Single source of seed data: `npm run seed` (src/seed.ts) runs this file, and so does the
+-- screenshot harness (psql). Re-running it resets the seeded tables to exactly this data.
 
--- Clear and insert phrase counts (search suggestions)
+BEGIN;
+
+-- Clear the seeded tables, plus raw query logs (they would no longer match the counts)
+TRUNCATE TABLE phrase_counts, query_logs, filtered_phrases, analytics_summary, trending_snapshots
+  RESTART IDENTITY;
+
+-- Phrase counts (search suggestions)
 INSERT INTO phrase_counts (phrase, count, last_updated, is_filtered)
 VALUES
   -- Tech searches
@@ -121,8 +130,8 @@ VALUES
   ('zara', 80000, NOW(), false),
   ('zelle', 70000, NOW(), false),
   ('zillow', 90000, NOW(), false),
-  ('xbox', 100000, NOW(), false)
-ON CONFLICT (phrase) DO UPDATE SET count = EXCLUDED.count, last_updated = NOW();
+  ('xbox', 100000, NOW(), false),
+  ('x ray', 50000, NOW(), false);
 
 -- Sample filtered phrases (inappropriate content)
 INSERT INTO filtered_phrases (phrase, reason)
@@ -130,8 +139,7 @@ VALUES
   ('badword1', 'profanity'),
   ('badword2', 'profanity'),
   ('spam123', 'spam'),
-  ('scam offer', 'scam')
-ON CONFLICT (phrase) DO NOTHING;
+  ('scam offer', 'scam');
 
 -- Sample analytics summary
 INSERT INTO analytics_summary (date, total_queries, unique_queries, unique_users, avg_query_length)
@@ -142,12 +150,7 @@ VALUES
   (CURRENT_DATE - 3, 1450000, 52000, 145000, 12.1),
   (CURRENT_DATE - 2, 1380000, 49000, 138000, 12.8),
   (CURRENT_DATE - 1, 1520000, 55000, 152000, 11.9),
-  (CURRENT_DATE, 890000, 32000, 89000, 12.3)
-ON CONFLICT (date) DO UPDATE SET
-  total_queries = EXCLUDED.total_queries,
-  unique_queries = EXCLUDED.unique_queries,
-  unique_users = EXCLUDED.unique_users,
-  avg_query_length = EXCLUDED.avg_query_length;
+  (CURRENT_DATE, 890000, 32000, 89000, 12.3);
 
 -- Sample trending snapshots
 INSERT INTO trending_snapshots (phrase, score, snapshot_time)
@@ -161,5 +164,6 @@ VALUES
   ('election results', 8200.00, NOW() - INTERVAL '1 hour'),
   ('weather alert', 7950.50, NOW() - INTERVAL '1 hour'),
   ('breaking news', 7700.25, NOW() - INTERVAL '1 hour'),
-  ('movie release', 7450.00, NOW() - INTERVAL '1 hour')
-ON CONFLICT DO NOTHING;
+  ('movie release', 7450.00, NOW() - INTERVAL '1 hour');
+
+COMMIT;

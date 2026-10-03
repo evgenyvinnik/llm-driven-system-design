@@ -19,10 +19,11 @@ class MemoryCache {
    * Implements LRU eviction when at capacity.
    */
   set<T>(key: string, data: T, ttl: number = this.DEFAULT_TTL): void {
-    // LRU eviction if at capacity
-    if (this.cache.size >= this.MAX_ENTRIES) {
+    // Re-setting a key must move it to the MRU end (Map.set keeps the old position)
+    // and must not evict an unrelated entry, since the size does not grow.
+    if (!this.cache.delete(key) && this.cache.size >= this.MAX_ENTRIES) {
       const oldestKey = this.cache.keys().next().value;
-      if (oldestKey) this.cache.delete(oldestKey);
+      if (oldestKey !== undefined) this.cache.delete(oldestKey);
     }
 
     this.cache.set(key, { data, timestamp: Date.now(), ttl });

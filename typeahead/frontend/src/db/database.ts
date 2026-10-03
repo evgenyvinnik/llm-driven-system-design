@@ -3,16 +3,13 @@
  * Provides offline caching for suggestions, user history, and trie data.
  */
 import Dexie, { type Table } from 'dexie';
+import type { Suggestion } from '../types';
 
 // Cached suggestion entry
 export interface CachedSuggestion {
   id?: number;
-  prefix: string;
-  suggestions: Array<{
-    phrase: string;
-    count: number;
-    score?: number;
-  }>;
+  prefix: string; // a suggestionCacheKey(), not just the typed prefix
+  suggestions: Suggestion[]; // kept whole so isFuzzy/scores survive a cache hit
   timestamp: number;
   ttl: number; // TTL in milliseconds
 }
@@ -85,7 +82,18 @@ const MAX_HISTORY_ENTRIES = 500;
 const MAX_POPULAR_ENTRIES = 1000;
 
 /**
- * Cache suggestions for a prefix.
+ * IndexedDB key for a suggestion list. The server returns a different ranked list per limit,
+ * fuzzy mode and user, so a key on the prefix alone would show one widget's list in another.
+ */
+export function suggestionCacheKey(
+  prefix: string,
+  variant: { limit: number; fuzzy: boolean; userId?: string }
+): string {
+  return `${variant.limit}|${variant.fuzzy ? 'fuzzy' : 'exact'}|${variant.userId ?? ''}|${prefix}`;
+}
+
+/**
+ * Cache suggestions for a prefix (or a suggestionCacheKey).
  */
 export async function cacheSuggestions(
   prefix: string,

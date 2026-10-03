@@ -102,7 +102,7 @@ export const aggregationMetrics = {
   queriesFiltered: new client.Counter({
     name: 'typeahead_queries_filtered_total',
     help: 'Queries filtered out',
-    labelNames: ['reason'] as const, // low_quality, inappropriate, duplicate
+    labelNames: ['reason'] as const, // invalid, too_long, low_quality, inappropriate, filter_unavailable
     registers: [register],
   }),
 };

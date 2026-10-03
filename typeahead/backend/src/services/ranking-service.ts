@@ -33,11 +33,82 @@ interface TrendingResult {
   score: number;
 }
 
+/**
+ * Longest ranking waits on Redis before degrading a signal to 0. Well under the
+ * suggestions circuit breaker's 100ms budget; a healthy local round trip is ~1ms.
+ */
+const REDIS_TIMEOUT_MS = 30;
+
+const MAX_HISTORY_SIZE = 100;
+const HISTORY_TTL_SECONDS = 90 * 24 * 60 * 60;
+
+/**
+ * Atomically record a search in the user's history blob (a JSON array, most recent
+ * first). Doing the read-modify-write inside Redis means concurrent /log calls for
+ * one user can't overwrite each other's entries or count increments.
+ * KEYS[1] = history key; ARGV = normalized phrase, timestamp (ms), max size, TTL (s).
+ */
+const RECORD_HISTORY_SCRIPT = `
+local history = {}
+local raw = redis.call('GET', KEYS[1])
+if raw then
+  local ok, decoded = pcall(cjson.decode, raw)
+  if ok and type(decoded) == 'table' then history = decoded end
+end
+local count = 0
+local updated = {}
+for _, entry in ipairs(history) do
+  if type(entry) == 'table' and type(entry.phrase) == 'string' then
+    if entry.phrase:lower():match('^%s*(.-)%s*$') == ARGV[1] then
+      count = count + (tonumber(entry.count) or 0)
+    else
+      updated[#updated + 1] = entry
+    end
+  end
+end
+-- Move the phrase to the front so eviction drops the least recently searched phrase
+table.insert(updated, 1, { phrase = ARGV[1], count = count + 1, timestamp = tonumber(ARGV[2]) })
+for i = #updated, tonumber(ARGV[3]) + 1, -1 do updated[i] = nil end
+redis.call('SET', KEYS[1], cjson.encode(updated), 'EX', ARGV[4])
+return count + 1
+`;
+
+/** Same normalization the trie and AggregationService apply to phrases. */
+function normalizePhrase(phrase: string): string {
+  return phrase.toLowerCase().trim();
+}
+
 export class RankingService {
   private redis: Redis;
 
   constructor(redis: Redis) {
     this.redis = redis;
+  }
+
+  /**
+   * Run a Redis call, failing fast when the client isn't connected or the call stalls.
+   * ioredis would otherwise queue the command offline and wait out its reconnect
+   * retries (seconds), so a Redis outage would time out the whole request instead of
+   * just dropping the personal/trending signals.
+   */
+  private async _withRedis<T>(call: () => Promise<T>): Promise<T> {
+    if (this.redis.status !== 'ready') {
+      throw new Error(`Redis not ready (status: ${this.redis.status})`);
+    }
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(
+        () => reject(new Error(`Redis call timed out after ${REDIS_TIMEOUT_MS}ms`)),
+        REDIS_TIMEOUT_MS
+      );
+    });
+
+    try {
+      return await Promise.race([call(), timeout]);
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   /**
@@ -58,14 +129,12 @@ export class RankingService {
         // Recency score (decay older queries)
         const recencyScore = this._calculateRecencyScore(suggestion.lastUpdated);
 
-        // Personalization score (user history)
-        let personalScore = 0;
-        if (userId) {
-          personalScore = await this._getPersonalScore(userId, suggestion.phrase);
-        }
-
-        // Trending boost
-        const trendingBoost = await this._getTrendingBoost(suggestion.phrase);
+        // Personalization score (user history) and trending boost, fetched in parallel
+        // so a slow Redis costs at most one REDIS_TIMEOUT_MS
+        const [personalScore, trendingBoost] = await Promise.all([
+          userId ? this._getPersonalScore(userId, suggestion.phrase) : 0,
+          this._getTrendingBoost(suggestion.phrase),
+        ]);
 
         // Prefix match quality (exact match vs partial)
         const matchQuality = this._calculateMatchQuality(prefix, suggestion.phrase);
@@ -115,13 +184,17 @@ export class RankingService {
   /**
    * Calculate recency score with exponential decay.
    * More recent updates get higher scores.
+   * lastUpdated is epoch ms of the phrase's last count change (phrase_counts.last_updated).
    */
   private _calculateRecencyScore(lastUpdated: number | undefined): number {
-    if (!lastUpdated) return 0.5; // Default if no timestamp
+    // Number() also accepts a numeric string (pg returns EXTRACT(EPOCH ...) as numeric)
+    const timestamp = Number(lastUpdated);
+    if (!lastUpdated || !Number.isFinite(timestamp) || timestamp <= 0) return 0.5; // Default if no timestamp
 
-    const ageInHours = (Date.now() - lastUpdated) / (1000 * 60 * 60);
+    // Clamp so a timestamp in the future (clock skew) can't score above 1
+    const ageInHours = Math.max(0, Date.now() - timestamp) / (1000 * 60 * 60);
 
-    // Exponential decay with half-life of 1 week (168 hours)
+    // Exponential decay with a 1-week (168 hour) time constant, i.e. a half-life of ~116 hours
     return Math.exp(-ageInHours / 168);
   }
 
@@ -163,12 +236,13 @@ export class RankingService {
 
     try {
       const historyKey = `user_history:${userId}`;
-      const userHistory = await this.redis.get(historyKey);
+      const userHistory = await this._withRedis(() => this.redis.get(historyKey));
 
       if (!userHistory) return 0;
 
       const history: UserHistoryEntry[] = JSON.parse(userHistory);
-      const match = history.find((h) => h.phrase.toLowerCase() === phrase.toLowerCase());
+      const normalizedPhrase = normalizePhrase(phrase);
+      const match = history.find((h) => normalizePhrase(h.phrase) === normalizedPhrase);
 
       if (match) {
         // Recency-weighted personal score
@@ -192,7 +266,9 @@ export class RankingService {
    */
   private async _getTrendingBoost(phrase: string): Promise<number> {
     try {
-      const score = await this.redis.zscore('trending_queries', phrase.toLowerCase());
+      const score = await this._withRedis(() =>
+        this.redis.zscore('trending_queries', normalizePhrase(phrase))
+      );
 
       if (!score) return 0;
 
@@ -206,42 +282,30 @@ export class RankingService {
 
   /**
    * Record a user's search for personalization.
+   * The phrase moves to the front of the history (most recent first) with its count
+   * incremented; the least recently searched phrase is evicted past MAX_HISTORY_SIZE.
    */
   async recordUserSearch(userId: string, phrase: string): Promise<void> {
     if (!userId || !phrase) return;
 
+    const normalizedPhrase = normalizePhrase(phrase);
+    if (!normalizedPhrase) return;
+
     try {
       const historyKey = `user_history:${userId}`;
-      const maxHistorySize = 100;
 
-      // Get existing history
-      let history: UserHistoryEntry[] = [];
-      const existing = await this.redis.get(historyKey);
-      if (existing) {
-        history = JSON.parse(existing);
-      }
-
-      // Update or add the phrase
-      const existingIndex = history.findIndex(
-        (h) => h.phrase.toLowerCase() === phrase.toLowerCase()
+      // Read-modify-write runs atomically in Redis; saved with 90-day expiration
+      await this._withRedis(() =>
+        this.redis.eval(
+          RECORD_HISTORY_SCRIPT,
+          1,
+          historyKey,
+          normalizedPhrase,
+          Date.now(),
+          MAX_HISTORY_SIZE,
+          HISTORY_TTL_SECONDS
+        )
       );
-
-      if (existingIndex !== -1) {
-        history[existingIndex].count++;
-        history[existingIndex].timestamp = Date.now();
-      } else {
-        history.unshift({
-          phrase: phrase.toLowerCase(),
-          count: 1,
-          timestamp: Date.now(),
-        });
-      }
-
-      // Trim to max size
-      history = history.slice(0, maxHistorySize);
-
-      // Save with 90-day expiration
-      await this.redis.setex(historyKey, 90 * 24 * 60 * 60, JSON.stringify(history));
     } catch (error) {
       console.error('Error recording user search:', (error as Error).message);
     }
@@ -255,7 +319,7 @@ export class RankingService {
 
     try {
       const historyKey = `user_history:${userId}`;
-      const existing = await this.redis.get(historyKey);
+      const existing = await this._withRedis(() => this.redis.get(historyKey));
 
       if (!existing) return [];
 
@@ -292,7 +356,9 @@ export class RankingService {
    */
   async getTopTrending(limit: number = 10): Promise<TrendingResult[]> {
     try {
-      const trending = await this.redis.zrevrange('trending_queries', 0, limit - 1, 'WITHSCORES');
+      const trending = await this._withRedis(() =>
+        this.redis.zrevrange('trending_queries', 0, limit - 1, 'WITHSCORES')
+      );
 
       const results: TrendingResult[] = [];
       for (let i = 0; i < trending.length; i += 2) {

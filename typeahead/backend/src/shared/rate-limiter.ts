@@ -7,8 +7,8 @@
  * - Ensures fair resource allocation across users
  * - Maintains low latency for legitimate users
  */
-import rateLimit, { type Options } from 'express-rate-limit';
-import type { Request, Response, NextFunction } from 'express';
+import rateLimit, { ipKeyGenerator, type Options, type RateLimitRequestHandler } from 'express-rate-limit';
+import type { Request, Response, NextFunction, RequestHandler } from 'express';
 import type { Redis } from 'ioredis';
 import logger, { auditLogger } from './logger.js';
 import { rateLimitMetrics } from './metrics.js';
@@ -20,23 +20,49 @@ interface RateLimiterOptions {
 }
 
 /**
- * Key generator for rate limiting
- * Uses X-Forwarded-For header or IP address
+ * Key generator for rate limiting: the client IP only.
+ * Client-sent headers (X-User-Id, X-Forwarded-For) are never trusted directly, since a client
+ * could rotate them to get a fresh bucket per request or aim them at another client's bucket.
+ * req.ip honours X-Forwarded-For only when Express's 'trust proxy' is configured (TRUST_PROXY
+ * in index.ts). ipKeyGenerator groups IPv6 addresses by subnet so one host can't rotate addresses.
  */
 function getClientIdentifier(req: Request): string {
-  return (
-    (req.headers['x-user-id'] as string) ||
-    (req.headers['x-forwarded-for'] as string)?.split(',')[0] ||
-    req.ip ||
-    'anonymous'
-  );
+  return req.ip ? ipKeyGenerator(req.ip) : 'anonymous';
+}
+
+/**
+ * Count requests a limiter let through. express-rate-limit calls `skip` before deciding,
+ * so counting there would include rejected requests; the limiter only calls next() when
+ * the request is allowed (its handler answers 429 otherwise).
+ */
+function countAllowed(
+  endpoint: string,
+  limiter: RateLimitRequestHandler,
+  isExempt: (req: Request) => boolean = () => false
+): RequestHandler {
+  return (req: Request, res: Response, next: NextFunction): void => {
+    void limiter(req, res, (err?: unknown) => {
+      if (!err && !isExempt(req)) {
+        rateLimitMetrics.allowed.inc({ endpoint });
+      }
+      next(err);
+    });
+  };
+}
+
+/**
+ * Probe and scrape endpoints exempt from the global limiter, so heavy traffic from the
+ * prober's address can't make an instance look unready.
+ */
+function isHealthOrMetrics(req: Request): boolean {
+  return req.path === '/health' || req.path.startsWith('/health/') || req.path === '/metrics';
 }
 
 /**
  * Rate limiter for suggestion queries
  * More permissive since users type quickly
  */
-export const suggestionRateLimiter = rateLimit({
+export const suggestionRateLimiter: RequestHandler = countAllowed('suggestions', rateLimit({
   windowMs: 1000, // 1 second window
   max: 20, // 20 requests per second (fast typing)
   standardHeaders: true,
@@ -55,18 +81,13 @@ export const suggestionRateLimiter = rateLimit({
       retryAfter: Math.ceil((options.windowMs as number) / 1000),
     });
   },
-  skip: () => {
-    // Count allowed requests
-    rateLimitMetrics.allowed.inc({ endpoint: 'suggestions' });
-    return false;
-  },
-});
+}));
 
 /**
  * Rate limiter for query logging (POST /log)
  * Stricter since it writes to database
  */
-export const logRateLimiter = rateLimit({
+export const logRateLimiter: RequestHandler = countAllowed('log', rateLimit({
   windowMs: 1000, // 1 second window
   max: 5, // 5 log requests per second
   standardHeaders: true,
@@ -84,17 +105,13 @@ export const logRateLimiter = rateLimit({
       retryAfter: Math.ceil((options.windowMs as number) / 1000),
     });
   },
-  skip: () => {
-    rateLimitMetrics.allowed.inc({ endpoint: 'log' });
-    return false;
-  },
-});
+}));
 
 /**
  * Rate limiter for admin operations
  * Very strict since admin operations are expensive
  */
-export const adminRateLimiter = rateLimit({
+export const adminRateLimiter: RequestHandler = countAllowed('admin', rateLimit({
   windowMs: 60000, // 1 minute window
   max: 30, // 30 requests per minute
   standardHeaders: true,
@@ -112,17 +129,13 @@ export const adminRateLimiter = rateLimit({
       retryAfter: Math.ceil((options.windowMs as number) / 1000),
     });
   },
-  skip: () => {
-    rateLimitMetrics.allowed.inc({ endpoint: 'admin' });
-    return false;
-  },
-});
+}));
 
 /**
  * Global rate limiter for all API endpoints
  * Catches any abuse not caught by specific limiters
  */
-export const globalRateLimiter = rateLimit({
+export const globalRateLimiter: RequestHandler = countAllowed('global', rateLimit({
   windowMs: 60000, // 1 minute window
   max: 1000, // 1000 requests per minute globally
   standardHeaders: true,
@@ -140,15 +153,9 @@ export const globalRateLimiter = rateLimit({
       retryAfter: Math.ceil((options.windowMs as number) / 1000),
     });
   },
-  skip: (req: Request) => {
-    // Skip health checks and metrics
-    if (req.path === '/health' || req.path === '/metrics') {
-      return true;
-    }
-    rateLimitMetrics.allowed.inc({ endpoint: 'global' });
-    return false;
-  },
-});
+  // Skip health/readiness probes and metrics scrapes
+  skip: isHealthOrMetrics,
+}), isHealthOrMetrics);
 
 /**
  * Create a Redis-backed rate limiter (for distributed deployments)
