@@ -5,6 +5,7 @@
 export { SearchBox } from './SearchBox';
 export { TrendingList } from './TrendingList';
 export { SearchSettings } from './SearchSettings';
+export { PerformancePanel } from './PerformancePanel';
 
 // Admin components available via './admin'
 export * from './admin';

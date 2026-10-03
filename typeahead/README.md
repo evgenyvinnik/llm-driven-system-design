@@ -161,6 +161,7 @@ If you prefer to run PostgreSQL and Redis natively:
    # Optional
    export CORS_ORIGINS=http://localhost:5173   # comma-separated origins allowed to call the API directly
    export TRUST_PROXY=                          # unset: X-Forwarded-For is ignored (rate-limit keys use the socket IP)
+   export TRIE_SYNC_INTERVAL_MS=5000            # how often each instance re-reads changed phrase_counts rows
    ```
 
 4. Follow steps 2-7 from Option 1.
@@ -180,7 +181,7 @@ npm run dev:server2  # Port 3002
 npm run dev:server3  # Port 3003
 ```
 
-Each instance holds its own trie and its own aggregation buffer, so their suggestions diverge as searches are logged; there is no load balancer or shared trie.
+Each instance holds its own trie and its own aggregation buffer, and the instances stay in step through Postgres: every write to `phrase_counts` (a flush, an admin add, delete, filter or restore) sets `changed_at`, and each instance re-reads the changed rows every `TRIE_SYNC_INTERVAL_MS` (default 5000) and applies their counts and filter state to its trie. A Redis pub/sub message after each write makes the others sync at once, so admin changes show up on every instance within milliseconds; with Redis down they catch up on the next poll. An instance started later loads the current state at startup. There is still no load balancer in front of them, and a count change can take up to the 60 s Redis cache TTL to show in a list that was already cached.
 
 ## API Endpoints
 

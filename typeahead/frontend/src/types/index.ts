@@ -23,6 +23,8 @@ export interface SuggestionsResponse {
     cached: boolean;
     // Circuit-breaker fallback: an empty list served while the suggestion service is unhealthy
     degraded?: boolean;
+    // Set by the client when this tab's memory cache answered (no request was sent)
+    clientCache?: boolean;
   };
 }
 

@@ -1,24 +1,27 @@
 /**
  * Performance monitoring service for typeahead metrics.
- * Tracks latency, interaction timing, and cache effectiveness.
+ * Tracks latency, interaction timing, and cache effectiveness as this browser tab sees them.
+ *
+ * The search store records into it (stores/search-store.ts) and the home page's
+ * PerformancePanel reads it. Everything stays in memory for the current tab.
  */
 
 export interface TypeaheadMetrics {
-  // Latency metrics
+  // Latency metrics (request start to response, as seen by the client)
   avgLatencyMs: number;
   p50LatencyMs: number;
   p95LatencyMs: number;
   p99LatencyMs: number;
 
-  // Request metrics
+  // Request metrics. A cache hit is a response served from this tab's memory cache (no request)
   totalRequests: number;
   cacheHits: number;
   cacheMisses: number;
   cacheHitRate: number;
 
   // Interaction metrics
-  avgKeyToSuggestionMs: number;
-  avgSelectionTimeMs: number;
+  avgKeyToSuggestionMs: number; // last keystroke -> suggestions rendered
+  avgSelectionTimeMs: number; // last keystroke -> suggestion selected
   selectionsCount: number;
 
   // Error metrics
@@ -32,71 +35,70 @@ interface LatencySample {
   cached: boolean;
 }
 
-interface InteractionSample {
-  keyPressTime: number;
-  suggestionTime?: number;
-  selectionTime?: number;
-}
+const MAX_SAMPLES = 1000;
+
+const pushBounded = <T>(samples: T[], sample: T): void => {
+  samples.push(sample);
+  if (samples.length > MAX_SAMPLES) samples.splice(0, samples.length - MAX_SAMPLES);
+};
+
+const average = (values: number[]): number =>
+  values.length === 0 ? 0 : values.reduce((a, b) => a + b, 0) / values.length;
+
+const percentile = (sorted: number[], p: number): number => {
+  if (sorted.length === 0) return 0;
+  const index = Math.ceil((p / 100) * sorted.length) - 1;
+  return sorted[Math.max(0, index)];
+};
 
 class PerformanceMonitor {
   private latencySamples: LatencySample[] = [];
-  private interactions: InteractionSample[] = [];
+  private keyToSuggestionSamples: number[] = [];
+  private selectionSamples: number[] = [];
   private errorCount = 0;
-  private maxSamples = 1000;
-  private currentInteraction: InteractionSample | null = null;
+  // performance.now() of the last keystroke that has not been answered by a render yet
+  private lastKeyPress: number | null = null;
+  // performance.now() of the last keystroke, kept until a selection ends the interaction
+  private interactionStart: number | null = null;
 
   /**
    * Record a suggestion request latency.
    */
   recordLatency(durationMs: number, cached: boolean = false): void {
-    this.latencySamples.push({
-      timestamp: Date.now(),
-      durationMs,
-      cached,
-    });
-
-    // Trim old samples
-    if (this.latencySamples.length > this.maxSamples) {
-      this.latencySamples = this.latencySamples.slice(-this.maxSamples);
-    }
+    pushBounded(this.latencySamples, { timestamp: Date.now(), durationMs, cached });
   }
 
   /**
-   * Record when user starts typing (key press).
+   * Record a keystroke in the search input.
    */
   recordKeyPress(): void {
-    this.currentInteraction = {
-      keyPressTime: performance.now(),
-    };
+    const now = performance.now();
+    this.lastKeyPress = now;
+    this.interactionStart = now;
   }
 
   /**
-   * Record when suggestions are displayed.
+   * Record that suggestions for the latest keystroke were rendered.
+   * Only the first render after a keystroke counts, so a refresh doesn't add a sample.
    */
   recordSuggestionsDisplayed(): void {
-    if (this.currentInteraction) {
-      this.currentInteraction.suggestionTime = performance.now();
-    }
+    if (this.lastKeyPress === null) return;
+    pushBounded(this.keyToSuggestionSamples, performance.now() - this.lastKeyPress);
+    this.lastKeyPress = null;
   }
 
   /**
-   * Record when user selects a suggestion.
+   * Record that the user selected a suggestion, ending the interaction.
    */
   recordSelection(): void {
-    if (this.currentInteraction) {
-      this.currentInteraction.selectionTime = performance.now();
-      this.interactions.push(this.currentInteraction);
-      this.currentInteraction = null;
-
-      // Trim old interactions
-      if (this.interactions.length > this.maxSamples) {
-        this.interactions = this.interactions.slice(-this.maxSamples);
-      }
-    }
+    if (this.interactionStart === null) return;
+    pushBounded(this.selectionSamples, performance.now() - this.interactionStart);
+    this.interactionStart = null;
+    this.lastKeyPress = null;
   }
 
   /**
-   * Record an error.
+   * Record a failed suggestion request (aborted, superseded requests are not errors).
    */
   recordError(): void {
     this.errorCount++;
@@ -108,95 +110,28 @@ class PerformanceMonitor {
   getMetrics(): TypeaheadMetrics {
     const latencies = this.latencySamples.map((s) => s.durationMs).sort((a, b) => a - b);
     const cacheHits = this.latencySamples.filter((s) => s.cached).length;
-    const cacheMisses = this.latencySamples.filter((s) => !s.cached).length;
     const totalRequests = this.latencySamples.length;
-
-    // Latency percentiles
-    const percentile = (arr: number[], p: number): number => {
-      if (arr.length === 0) return 0;
-      const index = Math.ceil((p / 100) * arr.length) - 1;
-      return arr[Math.max(0, index)];
-    };
-
-    // Key-to-suggestion timing
-    const keyToSuggestionTimes = this.interactions
-      .filter((i) => i.suggestionTime !== undefined)
-      .map((i) => i.suggestionTime! - i.keyPressTime);
-
-    // Selection timing (from key press to selection)
-    const selectionTimes = this.interactions
-      .filter((i) => i.selectionTime !== undefined)
-      .map((i) => i.selectionTime! - i.keyPressTime);
-
-    const avg = (arr: number[]): number => {
-      if (arr.length === 0) return 0;
-      return arr.reduce((a, b) => a + b, 0) / arr.length;
-    };
+    // Failed requests never produce a latency sample, so they count toward the total here
+    const attempts = totalRequests + this.errorCount;
 
     return {
-      avgLatencyMs: avg(latencies),
+      avgLatencyMs: average(latencies),
       p50LatencyMs: percentile(latencies, 50),
       p95LatencyMs: percentile(latencies, 95),
       p99LatencyMs: percentile(latencies, 99),
 
       totalRequests,
       cacheHits,
-      cacheMisses,
+      cacheMisses: totalRequests - cacheHits,
       cacheHitRate: totalRequests > 0 ? cacheHits / totalRequests : 0,
 
-      avgKeyToSuggestionMs: avg(keyToSuggestionTimes),
-      avgSelectionTimeMs: avg(selectionTimes),
-      selectionsCount: selectionTimes.length,
+      avgKeyToSuggestionMs: average(this.keyToSuggestionSamples),
+      avgSelectionTimeMs: average(this.selectionSamples),
+      selectionsCount: this.selectionSamples.length,
 
       errorCount: this.errorCount,
-      errorRate: totalRequests > 0 ? this.errorCount / totalRequests : 0,
+      errorRate: attempts > 0 ? this.errorCount / attempts : 0,
     };
-  }
-
-  /**
-   * Get metrics for the last N minutes.
-   */
-  getRecentMetrics(minutes: number = 5): TypeaheadMetrics {
-    const cutoff = Date.now() - minutes * 60 * 1000;
-    const originalSamples = this.latencySamples;
-
-    // Temporarily filter to recent samples
-    this.latencySamples = this.latencySamples.filter((s) => s.timestamp >= cutoff);
-    const metrics = this.getMetrics();
-
-    // Restore original samples
-    this.latencySamples = originalSamples;
-
-    return metrics;
-  }
-
-  /**
-   * Set up PerformanceObserver for resource timing.
-   */
-  observeResourceTiming(): void {
-    if (typeof PerformanceObserver === 'undefined') return;
-
-    try {
-      const observer = new PerformanceObserver((list) => {
-        for (const entry of list.getEntries()) {
-          if (entry.entryType === 'resource') {
-            const resourceEntry = entry as PerformanceResourceTiming;
-            // Track API requests
-            if (resourceEntry.name.includes('/api/v1/suggestions')) {
-              const duration = resourceEntry.responseEnd - resourceEntry.requestStart;
-              // Check if it was served from cache (transferSize === 0)
-              const cached = resourceEntry.transferSize === 0;
-              this.recordLatency(duration, cached);
-            }
-          }
-        }
-      });
-
-      observer.observe({ entryTypes: ['resource'] });
-    } catch {
-      // PerformanceObserver not supported or failed
-      console.warn('[PerfMonitor] PerformanceObserver not available');
-    }
   }
 
   /**
@@ -204,26 +139,11 @@ class PerformanceMonitor {
    */
   reset(): void {
     this.latencySamples = [];
-    this.interactions = [];
+    this.keyToSuggestionSamples = [];
+    this.selectionSamples = [];
     this.errorCount = 0;
-    this.currentInteraction = null;
-  }
-
-  /**
-   * Export metrics as JSON for debugging or analytics.
-   */
-  exportMetrics(): string {
-    return JSON.stringify(
-      {
-        metrics: this.getMetrics(),
-        recentMetrics: this.getRecentMetrics(5),
-        sampleCount: this.latencySamples.length,
-        interactionCount: this.interactions.length,
-        timestamp: new Date().toISOString(),
-      },
-      null,
-      2
-    );
+    this.lastKeyPress = null;
+    this.interactionStart = null;
   }
 }
 
@@ -238,3 +158,4 @@ export const recordSuggestionsDisplayed =
 export const recordSelection = performanceMonitor.recordSelection.bind(performanceMonitor);
 export const recordError = performanceMonitor.recordError.bind(performanceMonitor);
 export const getMetrics = performanceMonitor.getMetrics.bind(performanceMonitor);
+export const resetMetrics = performanceMonitor.reset.bind(performanceMonitor);

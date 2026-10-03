@@ -7,6 +7,7 @@ import { Trie } from './data-structures/trie.js';
 import { SuggestionService } from './services/suggestion-service.js';
 import { RankingService } from './services/ranking-service.js';
 import { AggregationService } from './services/aggregation-service.js';
+import { TrieSyncService } from './services/trie-sync-service.js';
 import suggestionRoutes from './routes/suggestions.js';
 import analyticsRoutes from './routes/analytics.js';
 import adminRoutes from './routes/admin.js';
@@ -116,9 +117,20 @@ const trie = new Trie(10); // Top 10 suggestions per node
 const rankingService = new RankingService(redis);
 const suggestionService = new SuggestionService(trie, redis, rankingService);
 const aggregationService = new AggregationService(redis, pgPool, trie);
+// Keeps this instance's trie in step with writes made by other instances (dev:server1/2/3)
+const trieSync = new TrieSyncService(
+  pgPool,
+  redis,
+  trie,
+  suggestionService,
+  parseInt(process.env.TRIE_SYNC_INTERVAL_MS || '5000')
+);
+aggregationService.setChangeListener(() => trieSync.notifyChanged());
 
 // Set once the startup load from Postgres has filled the trie; readiness waits for it
 let trieLoaded = false;
+// Database time taken just before the startup load; the trie sync starts from it
+let syncWatermark: { text: string; ms: number } | null = null;
 let shuttingDown = false;
 
 /**
@@ -139,6 +151,7 @@ app.set('trie', trie);
 app.set('suggestionService', suggestionService);
 app.set('rankingService', rankingService);
 app.set('aggregationService', aggregationService);
+app.set('trieSync', trieSync);
 app.set('logger', logger);
 app.set('auditLogger', auditLogger);
 
@@ -309,6 +322,7 @@ app.get('/status', async (_req: Request, res: Response) => {
       },
       trie: trie.getStats(),
       aggregation: aggregationService.getStats(),
+      trieSync: trieSync.getStats(),
       circuits: getCircuitStatus(),
       uptime: process.uptime(),
       memory: process.memoryUsage(),
@@ -379,6 +393,16 @@ async function retryUntilSuccess(step: string, fn: () => Promise<void>): Promise
 async function loadTrie(): Promise<void> {
   const startTime = Date.now();
 
+  // Databases created before phrase_counts.changed_at existed (init.sql only runs on a fresh
+  // volume) get the column here; the trie sync between instances polls it
+  await pgPool.query(
+    `ALTER TABLE phrase_counts ADD COLUMN IF NOT EXISTS changed_at TIMESTAMPTZ DEFAULT NOW();
+     CREATE INDEX IF NOT EXISTS idx_phrase_changed_at ON phrase_counts(changed_at);`
+  );
+
+  // Read the clock before the load, so the sync re-reads anything written while it runs
+  syncWatermark = await trieSync.currentDbTime();
+
   // last_updated (epoch ms) feeds the ranking's recency score
   const result = await pgPool.query(
     `SELECT phrase, count, EXTRACT(EPOCH FROM last_updated::timestamptz) * 1000 AS last_updated_ms
@@ -425,6 +449,11 @@ async function initialize(): Promise<void> {
   aggregationService.start();
   logger.info({ event: 'aggregation_service_started' });
 
+  if (syncWatermark) {
+    trieSync.start(syncWatermark);
+    logger.info({ event: 'trie_sync_started', intervalMs: trieSync.getStats().intervalMs });
+  }
+
   if (redisWasReady) {
     logger.info({ event: 'redis_connected' });
     return;
@@ -458,6 +487,7 @@ async function shutdown(signal: string): Promise<void> {
 
   // The final flush writes to Postgres and Redis, so it must finish before they are closed
   await aggregationService.stop();
+  await trieSync.stop();
   cleanupIdempotency();
 
   try {

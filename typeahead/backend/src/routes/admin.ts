@@ -8,9 +8,18 @@ import { suggestionRequests, suggestionLatency } from '../shared/metrics.js';
 import { normalizePhrase } from '../data-structures/trie.js';
 import type { Trie } from '../data-structures/trie.js';
 import type { SuggestionService } from '../services/suggestion-service.js';
+import type { TrieSyncService } from '../services/trie-sync-service.js';
 import type { AggregationService } from '../services/aggregation-service.js';
 
 const router: Router = express.Router();
+
+/**
+ * Tell the other API instances that phrase_counts changed, so they sync their tries now
+ * instead of on their next poll.
+ */
+function notifyPhrasesChanged(req: Request): void {
+  (req.app.get('trieSync') as TrieSyncService | undefined)?.notifyChanged();
+}
 
 // Apply admin rate limiting to all admin routes
 router.use(adminRateLimiter);
@@ -229,12 +238,13 @@ router.post('/phrases', idempotencyMiddleware('phrase_add'), async (req: Request
       WITH previous AS (
         SELECT count, is_filtered FROM phrase_counts WHERE phrase = $1
       )
-      INSERT INTO phrase_counts (phrase, count, last_updated, is_filtered)
-      VALUES ($1, $2, NOW(), false)
+      INSERT INTO phrase_counts (phrase, count, last_updated, is_filtered, changed_at)
+      VALUES ($1, $2, NOW(), false, NOW())
       ON CONFLICT (phrase)
       DO UPDATE SET count = GREATEST(phrase_counts.count, EXCLUDED.count),
                     last_updated = NOW(),
-                    is_filtered = false
+                    is_filtered = false,
+                    changed_at = NOW()
       RETURNING count,
                 EXTRACT(EPOCH FROM last_updated::timestamptz) * 1000 AS last_updated_ms,
                 (SELECT count FROM previous) AS previous_count,
@@ -252,6 +262,7 @@ router.post('/phrases', idempotencyMiddleware('phrase_add'), async (req: Request
 
     // Clear every cached prefix list the phrase can appear in
     await suggestionService.invalidatePhrase(normalizedPhrase);
+    notifyPhrasesChanged(req);
     auditLogger.logCacheInvalidation(normalizedPhrase, 'phrase_added');
 
     logger.info({
@@ -332,7 +343,7 @@ router.delete('/phrases/:phrase', idempotencyMiddleware('phrase_delete'), async 
     const updated = await pgPool.query(
       `
       UPDATE phrase_counts
-      SET is_filtered = true
+      SET is_filtered = true, changed_at = NOW()
       WHERE phrase = $1 AND is_filtered = false
     `,
       [normalizedPhrase]
@@ -345,6 +356,7 @@ router.delete('/phrases/:phrase', idempotencyMiddleware('phrase_delete'), async 
 
     // Clear every cached prefix list the phrase can appear in
     await suggestionService.invalidatePhrase(normalizedPhrase);
+    notifyPhrasesChanged(req);
     auditLogger.logCacheInvalidation(normalizedPhrase, 'phrase_removed');
 
     const result = {
@@ -445,7 +457,7 @@ router.post('/filter', idempotencyMiddleware('filter_add'), async (req: Request,
     await pgPool.query(
       `
       UPDATE phrase_counts
-      SET is_filtered = true
+      SET is_filtered = true, changed_at = NOW()
       WHERE phrase = $1
     `,
       [normalizedPhrase]
@@ -453,6 +465,7 @@ router.post('/filter', idempotencyMiddleware('filter_add'), async (req: Request,
 
     // Clear every cached prefix list the phrase can appear in
     await suggestionService.invalidatePhrase(normalizedPhrase);
+    notifyPhrasesChanged(req);
 
     auditLogger.logFilterChange('add', normalizedPhrase, reason);
     auditLogger.logCacheInvalidation(normalizedPhrase, 'filter_added');
@@ -566,7 +579,7 @@ router.delete('/filter/:phrase', async (req: Request, res: Response) => {
     const unfiltered = await pgPool.query<PhraseCountRow>(
       `
       UPDATE phrase_counts
-      SET is_filtered = false
+      SET is_filtered = false, changed_at = NOW()
       WHERE phrase = $1 AND is_filtered = true
       RETURNING count, EXTRACT(EPOCH FROM last_updated::timestamptz) * 1000 AS last_updated_ms
     `,
@@ -580,6 +593,7 @@ router.delete('/filter/:phrase', async (req: Request, res: Response) => {
 
     // Clear every cached prefix list the phrase can appear in
     await suggestionService.invalidatePhrase(normalizedPhrase);
+    notifyPhrasesChanged(req);
 
     auditLogger.logFilterChange('remove', normalizedPhrase, 'manual_removal');
     auditLogger.logCacheInvalidation(normalizedPhrase, 'filter_removed');

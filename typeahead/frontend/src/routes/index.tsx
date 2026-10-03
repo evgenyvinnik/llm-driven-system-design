@@ -1,5 +1,5 @@
 import { createFileRoute } from '@tanstack/react-router';
-import { SearchBox, TrendingList, SearchSettings } from '../components';
+import { SearchBox, TrendingList, SearchSettings, PerformancePanel } from '../components';
 import { useSearchStore } from '../stores/search-store';
 
 export const Route = createFileRoute('/')({
@@ -126,6 +126,7 @@ function HomePage() {
           <div className="space-y-6">
             <TrendingList onSelect={handleTrendingSelect} />
             <SearchSettings />
+            <PerformancePanel />
           </div>
         </div>
       </div>

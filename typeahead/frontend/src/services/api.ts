@@ -160,7 +160,7 @@ class ApiService {
     // Check memory cache
     const cached = memoryCache.get<SuggestionsResponse>(cacheKey);
     if (cached) {
-      return { ...cached, meta: { ...cached.meta, cached: true } };
+      return { ...cached, meta: { ...cached.meta, cached: true, clientCache: true } };
     }
 
     // Create new abort controller for this request

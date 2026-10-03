@@ -2,6 +2,13 @@ import { create } from 'zustand';
 import { v4 as uuidv4 } from 'uuid';
 import type { Suggestion } from '../types';
 import { api } from '../services/api';
+import {
+  recordError,
+  recordKeyPress,
+  recordLatency,
+  recordSelection,
+  recordSuggestionsDisplayed,
+} from '../services/performance';
 
 interface SearchState {
   // User
@@ -113,6 +120,7 @@ export const useSearchStore = create<SearchState>((set, get) => ({
 
   setQuery: (query: string) => {
     selectedQuery = null;
+    recordKeyPress();
     set({ query });
   },
 
@@ -132,6 +140,8 @@ export const useSearchStore = create<SearchState>((set, get) => ({
 
     set({ isLoading: true, error: null });
 
+    const startedAt = performance.now();
+
     try {
       const { userId, fuzzyEnabled, maxSuggestions } = get();
       const response = await api.getSuggestions(prefix, {
@@ -142,12 +152,15 @@ export const useSearchStore = create<SearchState>((set, get) => ({
 
       if (seq !== searchSeq) return; // superseded
 
+      recordLatency(performance.now() - startedAt, response.meta.clientCache === true);
       set({
         suggestions: response.suggestions,
         isLoading: false,
         error: null,
         responseTime: response.meta.responseTimeMs,
       });
+      // The next frame is when the new list is painted
+      requestAnimationFrame(() => recordSuggestionsDisplayed());
     } catch (error) {
       if (seq !== searchSeq) return; // superseded: its abort is not an error
 
@@ -157,6 +170,7 @@ export const useSearchStore = create<SearchState>((set, get) => ({
         return;
       }
 
+      recordError();
       set({
         error: error instanceof Error ? error.message : 'Failed to fetch suggestions',
         isLoading: false,
@@ -172,6 +186,7 @@ export const useSearchStore = create<SearchState>((set, get) => ({
     searchSeq++;
     selectedQuery = phrase;
     api.cancelSuggestions();
+    recordSelection();
 
     // Update local state
     const updated = saveRecentSearch(phrase, recentSearches);

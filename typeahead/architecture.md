@@ -199,10 +199,14 @@ CREATE TABLE IF NOT EXISTS phrase_counts (
   phrase VARCHAR(200) PRIMARY KEY,
   count BIGINT DEFAULT 0,
   last_updated TIMESTAMP DEFAULT NOW(),
-  is_filtered BOOLEAN DEFAULT FALSE
+  is_filtered BOOLEAN DEFAULT FALSE,
+  -- Set by every write (count, filter, restore); other API instances poll it to sync their tries.
+  -- last_updated is only the count's age (it feeds the recency score), so filter changes don't touch it.
+  changed_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 CREATE INDEX IF NOT EXISTS idx_phrase_count ON phrase_counts(count DESC);
+CREATE INDEX IF NOT EXISTS idx_phrase_changed_at ON phrase_counts(changed_at);
 
 -- Query logs (raw, for aggregation and analytics)
 CREATE TABLE IF NOT EXISTS query_logs (
@@ -502,7 +506,7 @@ Locally, with Redis down the suggestion service skips the cache (a read slower t
 
 ### Horizontal Scaling
 
-1. **Suggestion service**: Stateless instances behind a load balancer; each loads the full trie or queries sharded trie servers
+1. **Suggestion service**: Stateless instances behind a load balancer; each loads the full trie or queries sharded trie servers. Locally, `dev:server1/2/3` each hold a full trie and converge through `phrase_counts.changed_at` polling plus a Redis pub/sub nudge (`trie-sync-service.ts`), the small-scale form of consuming a shared change log
 2. **Trie shards**: Scale shards by splitting character ranges (a-c, d-f, ...) across more servers
 3. **Redis**: Redis Cluster for cache and trending counter distribution
 4. **Kafka**: Add partitions and consumer workers for higher ingestion throughput
@@ -601,12 +605,14 @@ This section maps the production architecture above to the actual local implemen
 | Content filtering | Database-backed + Redis set | `backend/src/services/aggregation-service.ts`, `backend/src/routes/admin.ts` | Blocklist check on logged searches; filtered phrases removed from the trie and trending |
 | Client-side caching | Custom | `frontend/src/services/cache.ts`, `frontend/src/sw.ts` | In-memory LRU suggestion cache; service worker in production builds |
 | Graceful shutdown | Custom | `backend/src/index.ts` | Final aggregation flush on SIGTERM/SIGINT before the pools close |
+| Multi-instance trie sync | Postgres change marker + Redis pub/sub | `backend/src/services/trie-sync-service.ts` | Every write sets `phrase_counts.changed_at`; each instance polls changed rows every 5s and applies absolute counts and filter state, and a pub/sub message triggers an immediate poll |
+| Client performance metrics | Custom | `frontend/src/services/performance.ts`, `frontend/src/components/PerformancePanel.tsx` | Per-tab request latency (p50/p95), tab-cache hit rate, keystroke-to-suggestions and keystroke-to-selection times, shown on the home page |
 
 ### Simplifications and Substitutions
 
 | Production Design | Local Substitute | Reason |
 |-------------------|------------------|--------|
-| Sharded trie across N servers | Single in-memory trie per instance | ~100 seeded phrases (the startup load reads at most 100,000) fit in one process |
+| Sharded trie across N servers | One full in-memory trie per instance, kept in step by polling `phrase_counts.changed_at` | ~100 seeded phrases (the startup load reads at most 100,000) fit in one process |
 | Kafka stream processing | In-memory buffer of `phrase_counts` deltas with 30s flush to PG (each logged search still does a blocklist lookup and a `query_logs` INSERT) | No need for distributed log at this scale |
 | CDN edge caching | Browser cache + HTTP cache headers | No multi-region deployment |
 | API Gateway | Express middleware (rate limit, CORS) | Single process handles routing |
@@ -621,7 +627,7 @@ This section maps the production architecture above to the actual local implemen
 
 - **CDN and edge deployment**: No multi-region trie replication
 - **Kubernetes orchestration**: Docker Compose runs Valkey and PostgreSQL only (no Kafka; `kafkajs` is an unused dependency)
-- **Client-side prefetching**: `frontend/src/services/prefetch.ts` was deleted because nothing imported it; `services/performance.ts` exists but is not wired into any route
+- **Client-side prefetching**: `frontend/src/services/prefetch.ts` was deleted because nothing imported it
 - **Distributed trie sharding**: Single trie instance per server process
 - **ML-based ranking**: Rule-based weighted scoring, no learned models
 - **A/B testing framework**: Single ranking configuration
@@ -688,6 +694,8 @@ The search page runs `SearchBox` → `stores/search-store.ts` → `services/api.
 2. **IndexedDB** (`db/database.ts`, `/widgets` only) -- `useTypeahead` checks it when the memory cache misses and writes it (best effort) after each network response, keyed per prefix/limit/fuzzy/userId variant. Also stores search history and popularity counters.
 3. **Network** (`services/api.ts`) -- `ApiService` class with per-input request cancellation (AbortController), timeout handling (5s default), and cache population on response. Personalized requests use `cache: 'no-cache'`, so the HTTP cache revalidates them (ETag, usually a 304). Admin mutations send a fresh `X-Idempotency-Key` and tell the service worker to drop its API cache.
 4. **Service worker** (`src/sw.ts`, production builds) -- network-first for navigations (cached shell only offline), versioned caches, API cache capped at 200 entries with 24h maximum staleness.
+
+**Client metrics**: `stores/search-store.ts` records each suggestion request's latency (and whether the memory cache answered it), the time from the last keystroke to the first paint of its suggestions, the time to a selection, and failed requests into `services/performance.ts`. The home page's `PerformancePanel` shows them for the current tab, next to the server-side numbers on the admin dashboard.
 
 **Response ordering**: Abort is only an optimization. Ordering is guaranteed by a request sequence number (`searchSeq` in the store, `requestSeq` in `useTypeahead`): every settle of a superseded request is ignored, so a slow response for "co" cannot overwrite "coff", a cleared input, or a selection, even when the newer request was answered synchronously from the memory cache.
 

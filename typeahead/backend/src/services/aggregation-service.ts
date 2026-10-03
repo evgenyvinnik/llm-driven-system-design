@@ -80,6 +80,7 @@ export class AggregationService {
   private flushPromise: Promise<void> | null = null;
   private droppedCounts: number = 0;
   private isRunning: boolean = false;
+  private changeListener: (() => void) | null = null;
 
   constructor(redis: Redis, pgPool: Pool, trie: Trie) {
     this.redis = redis;
@@ -382,6 +383,7 @@ export class AggregationService {
 
     // Phrases blocked since they were buffered must not go back into the trie
     const blocked = await this.blockedMembers(updates.map(([phrase]) => phrase));
+    let written = 0;
 
     for (let i = 0; i < updates.length; i++) {
       const [phrase, entry] = updates[i];
@@ -392,15 +394,17 @@ export class AggregationService {
           is_filtered: boolean;
           last_updated_ms: string;
         }>(
-          `INSERT INTO phrase_counts (phrase, count, last_updated, is_filtered)
-           VALUES ($1::text, $2, NOW(), $3 OR EXISTS (SELECT 1 FROM filtered_phrases WHERE phrase = $1::text))
+          `INSERT INTO phrase_counts (phrase, count, last_updated, is_filtered, changed_at)
+           VALUES ($1::text, $2, NOW(), $3 OR EXISTS (SELECT 1 FROM filtered_phrases WHERE phrase = $1::text), NOW())
            ON CONFLICT (phrase)
            DO UPDATE SET count = phrase_counts.count + EXCLUDED.count, last_updated = NOW(),
-             is_filtered = phrase_counts.is_filtered OR EXCLUDED.is_filtered
+             is_filtered = phrase_counts.is_filtered OR EXCLUDED.is_filtered, changed_at = NOW()
            RETURNING count, is_filtered,
              EXTRACT(EPOCH FROM last_updated::timestamptz) * 1000 AS last_updated_ms`,
           [phrase, entry.count, blocked[i]]
         );
+
+        written++;
 
         // Update trie with the stored total, unless the phrase is filtered
         const row = result.rows[0];
@@ -421,7 +425,16 @@ export class AggregationService {
     }
 
     endTimer();
+    if (written > 0) this.changeListener?.();
     console.log('Flush complete');
+  }
+
+  /**
+   * Register a callback for after a flush has written to phrase_counts (index.ts uses it to
+   * tell other API instances to sync their tries).
+   */
+  setChangeListener(listener: () => void): void {
+    this.changeListener = listener;
   }
 
   /**
