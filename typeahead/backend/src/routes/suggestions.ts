@@ -142,6 +142,11 @@ router.get('/', suggestionRateLimiter, conditionalCache('suggestions'), async (r
     }
 
     const limit = parseIntParam(req.query.limit, 5, 1, MAX_LIMIT);
+    // Personalize only for a single, storable id (a repeated ?userId= arrives as an array)
+    const personalUserId =
+      typeof userId === 'string' && userId.length > 0 && userId.length <= MAX_ID_LENGTH
+        ? userId
+        : undefined;
 
     // Track query prefix length for analytics
     queryAnalytics.prefixLength.observe(prefix.length);
@@ -155,14 +160,14 @@ router.get('/', suggestionRateLimiter, conditionalCache('suggestions'), async (r
     if (fuzzy === 'true') {
       // Fuzzy matching bypasses circuit breaker (less critical); it reports no cache status
       suggestions = (await suggestionService.getFuzzySuggestions(prefix, {
-        userId: userId as string | undefined,
+        userId: personalUserId,
         limit,
       })) as RankedSuggestion[];
     } else {
       // Use circuit breaker for regular suggestions
       try {
         const result = (await circuit.fire(prefix, {
-          userId: userId as string | undefined,
+          userId: personalUserId,
           limit,
         })) as CircuitResult;
         suggestions = result.suggestions;

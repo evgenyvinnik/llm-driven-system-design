@@ -139,9 +139,10 @@ async function staleWhileRevalidate(request: Request): Promise<Response> {
       return null;
     });
 
-  // The page asked to bypass caches (personalized suggestions after a logged search):
-  // never answer from here while the network is reachable
-  const bypassCache = request.cache === 'no-cache' || request.cache === 'no-store' || request.cache === 'reload';
+  // The page asked to bypass caches (api.ts fetches personalized suggestions with no-cache,
+  // since they change as soon as the user logs a search): only answer from here when offline
+  const bypassCache =
+    request.cache === 'no-cache' || request.cache === 'no-store' || request.cache === 'reload';
 
   // If we have a valid cached response, return it immediately
   if (!bypassCache && cachedResponse && isCacheValid(cachedResponse)) {
@@ -196,7 +197,8 @@ async function navigationNetworkFirst(request: Request): Promise<Response> {
   const cache = await caches.open(CACHE_NAME);
   try {
     const response = await fetch(request);
-    if (response.ok) {
+    // Only the app shell may replace the cached shell (not, say, a JSON API URL opened in a tab)
+    if (response.ok && response.headers.get('Content-Type')?.includes('text/html')) {
       await cache.put('/index.html', response.clone());
     }
     return response;

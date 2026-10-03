@@ -54,6 +54,10 @@ const KEYBOARD_RUNS = ['qwertyuiop', 'asdfghjkl', 'zxcvbnm']
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+// Longest a request-path Redis call (blocked check, trending increment) may take before it is
+// treated as failed. A healthy local round trip is ~1ms.
+const REDIS_TIMEOUT_MS = 50;
+
 /**
  * SQLSTATE classes 22 (data exception) and 23 (integrity violation) mean this row can never be
  * written, so retrying it would fail on every flush. Anything else (connection loss, timeouts,
@@ -165,6 +169,29 @@ export class AggregationService {
     return { accepted: true };
   }
 
+  /**
+   * Run a Redis call, failing at once while the client is disconnected and after timeoutMs
+   * when it stalls. ioredis would otherwise queue the command offline through its reconnect
+   * retries, holding POST /log open for seconds during a Redis outage. Callers treat a
+   * failure as "no answer from Redis".
+   */
+  private async withRedis<T>(call: () => Promise<T>, timeoutMs: number = REDIS_TIMEOUT_MS): Promise<T> {
+    if (this.redis.status !== 'ready') {
+      throw new Error(`Redis not ready (status: ${this.redis.status})`);
+    }
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`Redis call timed out after ${timeoutMs}ms`)), timeoutMs);
+    });
+
+    try {
+      return await Promise.race([call(), timeout]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   private reject(reason: string): ProcessQueryResult {
     aggregationMetrics.queriesFiltered.inc({ reason });
     return { accepted: false, reason };
@@ -238,7 +265,7 @@ export class AggregationService {
   private async checkBlocked(query: string): Promise<BlockStatus> {
     let redisAnswered = false;
     try {
-      if (await this.redis.sismember(BLOCKED_KEY, query)) return 'blocked';
+      if (await this.withRedis(() => this.redis.sismember(BLOCKED_KEY, query))) return 'blocked';
       redisAnswered = true;
     } catch (error) {
       console.error('Error checking blocked set:', (error as Error).message);
@@ -257,15 +284,21 @@ export class AggregationService {
   }
 
   /**
-   * Copy filtered_phrases into the Redis blocked set, so the fast-path check and the trending
-   * exclusion also cover phrases filtered directly in Postgres (e.g. by the seed file).
+   * Make the Redis blocked set mirror filtered_phrases exactly, so the fast-path check and the
+   * trending exclusion cover phrases filtered directly in Postgres (e.g. by the seed file) and
+   * drop phrases whose filter was removed there. Called on start and when Redis reconnects.
    */
   async syncBlockedPhrases(): Promise<void> {
     try {
       const result = await this.pgPool.query<{ phrase: string }>('SELECT phrase FROM filtered_phrases');
-      if (result.rows.length > 0) {
-        await this.redis.sadd(BLOCKED_KEY, ...result.rows.map((row) => row.phrase));
-      }
+      const phrases = result.rows.map((row) => row.phrase);
+      await this.withRedis(async () => {
+        const tx = this.redis.multi().del(BLOCKED_KEY);
+        if (phrases.length > 0) tx.sadd(BLOCKED_KEY, ...phrases);
+        const results = await tx.exec();
+        const failed = results?.find(([err]) => err);
+        if (failed) throw failed[0];
+      }, 5000);
     } catch (error) {
       console.error('Error syncing blocked phrases:', (error as Error).message);
     }
@@ -280,8 +313,13 @@ export class AggregationService {
       const now = Date.now();
       const windowKey = `trending_window:${Math.floor(now / TRENDING_WINDOW_MS)}`; // 5-min windows
 
-      await this.redis.zincrby(windowKey, 1, query);
-      await this.redis.expire(windowKey, 3600); // Keep 1 hour of windows
+      await this.withRedis(() =>
+        this.redis
+          .multi()
+          .zincrby(windowKey, 1, query)
+          .expire(windowKey, 3600) // Keep 1 hour of windows
+          .exec()
+      );
 
       // Recent windows are aggregated by aggregateTrendingWindows on its own timer
     } catch (error) {
@@ -390,7 +428,7 @@ export class AggregationService {
    */
   private async blockedMembers(phrases: string[]): Promise<boolean[]> {
     try {
-      const flags = await this.redis.smismember(BLOCKED_KEY, ...phrases);
+      const flags = await this.withRedis(() => this.redis.smismember(BLOCKED_KEY, ...phrases), 1000);
       return flags.map((flag) => flag === 1);
     } catch (error) {
       console.error('Error checking blocked set:', (error as Error).message);
@@ -419,12 +457,16 @@ export class AggregationService {
 
       // Union, then replace trending_queries without blocked phrases in one transaction.
       // An empty result deletes trending_queries, so nothing trends after an hour without searches.
-      const results = await this.redis
-        .multi()
-        .zunionstore(unionKey, windows.length, ...windows, 'WEIGHTS', ...weights)
-        .zdiffstore(TRENDING_KEY, 2, unionKey, BLOCKED_KEY)
-        .del(unionKey)
-        .exec();
+      const results = await this.withRedis(
+        () =>
+          this.redis
+            .multi()
+            .zunionstore(unionKey, windows.length, ...windows, 'WEIGHTS', ...weights)
+            .zdiffstore(TRENDING_KEY, 2, unionKey, BLOCKED_KEY)
+            .del(unionKey)
+            .exec(),
+        5000
+      );
 
       const failed = results?.find(([err]) => err);
       if (failed) throw failed[0];
@@ -446,7 +488,7 @@ export class AggregationService {
       for (const windowKey of this.recentWindowKeys()) {
         pipeline.zrem(windowKey, normalizedPhrase);
       }
-      await pipeline.exec();
+      await this.withRedis(() => pipeline.exec(), 1000);
     } catch (error) {
       console.error('Error discarding phrase from trending:', (error as Error).message);
     }
@@ -467,10 +509,8 @@ export class AggregationService {
          LIMIT 100000`
       );
 
-      // Clear and rebuild
-      this.trie.root = { children: new Map(), suggestions: [], isEndOfWord: false, count: 0, lastUpdated: Date.now() } as typeof this.trie.root;
-      this.trie.size = 0;
-      this.trie.phraseMap.clear();
+      // Clear and rebuild (synchronous, so no request sees a half-built trie)
+      this.trie.clear();
 
       for (const row of result.rows) {
         const lastUpdated = row.last_updated_ms === null ? undefined : Number(row.last_updated_ms);
@@ -479,14 +519,24 @@ export class AggregationService {
 
       console.log(`Trie rebuilt with ${this.trie.size} phrases`);
 
-      // Clear suggestion cache
-      const keys = await this.redis.keys('suggestions:*');
-      if (keys.length > 0) {
-        await this.redis.del(...keys);
-      }
     } catch (error) {
       console.error('Error rebuilding trie:', (error as Error).message);
       throw error;
+    }
+
+    // Clear the suggestion cache (prefix lists and the popular list). Best effort: the trie is
+    // already rebuilt, and with Redis down there is no cache to serve stale lists from.
+    try {
+      await this.withRedis(async () => {
+        let cursor = '0';
+        do {
+          const [next, keys] = await this.redis.scan(cursor, 'MATCH', 'suggestions:*', 'COUNT', 500);
+          if (keys.length > 0) await this.redis.del(...keys);
+          cursor = next;
+        } while (cursor !== '0');
+      }, 5000);
+    } catch (error) {
+      console.error('Error clearing suggestion cache after rebuild:', (error as Error).message);
     }
   }
 

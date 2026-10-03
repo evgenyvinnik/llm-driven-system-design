@@ -58,6 +58,24 @@ function parsePhrase(value: unknown): string | null {
 }
 
 /**
+ * Update the Redis blocked set, which mirrors filtered_phrases (Postgres stays the source of
+ * truth and is checked on every logged search). Skipped while Redis is disconnected, where
+ * ioredis would queue the command through its reconnect retries; AggregationService
+ * re-syncs the set from filtered_phrases when Redis reconnects.
+ */
+async function updateBlockedSet(redis: Redis, call: (redis: Redis) => Promise<unknown>): Promise<void> {
+  if (redis.status !== 'ready') {
+    logger.warn({ event: 'blocked_set_update_skipped', reason: `Redis ${redis.status}` });
+    return;
+  }
+  try {
+    await call(redis);
+  } catch (error) {
+    logger.warn({ event: 'blocked_set_update_failed', error: (error as Error).message });
+  }
+}
+
+/**
  * GET /api/v1/admin/trie/stats
  * Get trie statistics.
  */
@@ -218,7 +236,7 @@ router.post('/phrases', idempotencyMiddleware('phrase_add'), async (req: Request
                     last_updated = NOW(),
                     is_filtered = false
       RETURNING count,
-                EXTRACT(EPOCH FROM last_updated) * 1000 AS last_updated_ms,
+                EXTRACT(EPOCH FROM last_updated::timestamptz) * 1000 AS last_updated_ms,
                 (SELECT count FROM previous) AS previous_count,
                 (SELECT is_filtered FROM previous) AS was_filtered
     `,
@@ -307,6 +325,7 @@ router.delete('/phrases/:phrase', idempotencyMiddleware('phrase_delete'), async 
     const trie = req.app.get('trie') as Trie;
     const pgPool = req.app.get('pgPool') as Pool;
     const suggestionService = req.app.get('suggestionService') as SuggestionService;
+    const aggregationService = req.app.get('aggregationService') as AggregationService;
 
     // Mark as filtered in the database first, so a failed write leaves the phrase visible
     // rather than gone from the trie but back on the next rebuild
@@ -319,9 +338,10 @@ router.delete('/phrases/:phrase', idempotencyMiddleware('phrase_delete'), async 
       [normalizedPhrase]
     );
 
-    // Remove from trie
+    // Remove from trie, and drop its pending count and trending entries
     const removedFromTrie = trie.remove(normalizedPhrase);
     const removed = removedFromTrie || (updated.rowCount ?? 0) > 0;
+    await aggregationService.discardPhrase(normalizedPhrase);
 
     // Clear every cached prefix list the phrase can appear in
     await suggestionService.invalidatePhrase(normalizedPhrase);
@@ -401,6 +421,7 @@ router.post('/filter', idempotencyMiddleware('filter_add'), async (req: Request,
     const redis = req.app.get('redis') as Redis;
     const trie = req.app.get('trie') as Trie;
     const suggestionService = req.app.get('suggestionService') as SuggestionService;
+    const aggregationService = req.app.get('aggregationService') as AggregationService;
 
     // Add to filtered phrases
     await pgPool.query(
@@ -413,10 +434,12 @@ router.post('/filter', idempotencyMiddleware('filter_add'), async (req: Request,
     );
 
     // Add to Redis blocked set for fast lookup
-    await redis.sadd('blocked_phrases', normalizedPhrase);
+    await updateBlockedSet(redis, (client) => client.sadd('blocked_phrases', normalizedPhrase));
 
-    // Remove from trie
+    // Remove from trie, and drop its pending count and trending entries now rather than at
+    // the next trending aggregation
     trie.remove(normalizedPhrase);
+    await aggregationService.discardPhrase(normalizedPhrase);
 
     // Update phrase_counts
     await pgPool.query(
@@ -537,7 +560,7 @@ router.delete('/filter/:phrase', async (req: Request, res: Response) => {
     );
 
     // Remove from Redis blocked set
-    await redis.srem('blocked_phrases', normalizedPhrase);
+    await updateBlockedSet(redis, (client) => client.srem('blocked_phrases', normalizedPhrase));
 
     // Unmark in phrase_counts and reinsert into the trie, which dropped it when filtered
     const unfiltered = await pgPool.query<PhraseCountRow>(
@@ -545,7 +568,7 @@ router.delete('/filter/:phrase', async (req: Request, res: Response) => {
       UPDATE phrase_counts
       SET is_filtered = false
       WHERE phrase = $1 AND is_filtered = true
-      RETURNING count, EXTRACT(EPOCH FROM last_updated) * 1000 AS last_updated_ms
+      RETURNING count, EXTRACT(EPOCH FROM last_updated::timestamptz) * 1000 AS last_updated_ms
     `,
       [normalizedPhrase]
     );
@@ -649,6 +672,8 @@ router.get('/status', async (req: Request, res: Response) => {
     // Check Redis
     let redisStatus = 'unknown';
     try {
+      // Fail at once while disconnected instead of waiting in ioredis's offline queue
+      if (redis.status !== 'ready') throw new Error(`Redis ${redis.status}`);
       const pong = await redis.ping();
       redisStatus = pong === 'PONG' ? 'connected' : 'error';
     } catch {

@@ -2,7 +2,9 @@ import express, { Router, Request, Response } from 'express';
 import type { Pool } from 'pg';
 import type { Trie } from '../data-structures/trie.js';
 import type { AggregationService } from '../services/aggregation-service.js';
-import { cacheSuggestions, cacheTrending } from '../shared/cache-headers.js';
+// Admin dashboard data: the browser revalidates on every poll ('private, no-cache' + ETag,
+// a 304 when unchanged) instead of serving a public copy up to 60s old
+import { cacheUserSpecific } from '../shared/cache-headers.js';
 
 const router: Router = express.Router();
 
@@ -43,7 +45,7 @@ interface HourlyRow {
  * GET /api/v1/analytics/summary
  * Get analytics summary for the typeahead service.
  */
-router.get('/summary', cacheSuggestions, async (req: Request, res: Response) => {
+router.get('/summary', cacheUserSpecific, async (req: Request, res: Response) => {
   try {
     const pgPool = req.app.get('pgPool') as Pool;
     const trie = req.app.get('trie') as Trie;
@@ -121,7 +123,7 @@ router.get('/summary', cacheSuggestions, async (req: Request, res: Response) => 
  * - offset: Pagination offset (default: 0)
  * - search: Filter by query text (optional)
  */
-router.get('/queries', cacheSuggestions, async (req: Request, res: Response) => {
+router.get('/queries', cacheUserSpecific, async (req: Request, res: Response) => {
   try {
     const { search } = req.query;
     const limit = parseIntParam(req.query.limit, 50, 1, MAX_LIMIT);
@@ -182,7 +184,7 @@ router.get('/queries', cacheSuggestions, async (req: Request, res: Response) => 
  * Query params:
  * - limit: Max number of phrases (default: 50, max: 500)
  */
-router.get('/top-phrases', cacheSuggestions, async (req: Request, res: Response) => {
+router.get('/top-phrases', cacheUserSpecific, async (req: Request, res: Response) => {
   try {
     const limit = parseIntParam(req.query.limit, 50, 1, MAX_LIMIT);
     const pgPool = req.app.get('pgPool') as Pool;
@@ -220,7 +222,7 @@ router.get('/top-phrases', cacheSuggestions, async (req: Request, res: Response)
  * GET /api/v1/analytics/hourly
  * Get query volume by hour for the last 24 hours.
  */
-router.get('/hourly', cacheTrending, async (req: Request, res: Response) => {
+router.get('/hourly', cacheUserSpecific, async (req: Request, res: Response) => {
   try {
     const pgPool = req.app.get('pgPool') as Pool;
 

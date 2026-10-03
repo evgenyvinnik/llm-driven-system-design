@@ -91,6 +91,10 @@ const saveRecentSearch = (query: string, existing: string[]): string[] => {
 // dropped, so a slow response can never overwrite newer results, a cleared input, or a selection.
 let searchSeq = 0;
 
+// Phrase just selected or submitted, until the query is edited again. A debounced search for
+// that same text (typed in full, then Enter inside the debounce window) must not reopen the list.
+let selectedQuery: string | null = null;
+
 const isAbortError = (error: unknown): boolean =>
   error instanceof Error && error.name === 'AbortError';
 
@@ -108,6 +112,7 @@ export const useSearchStore = create<SearchState>((set, get) => ({
   maxSuggestions: 5,
 
   setQuery: (query: string) => {
+    selectedQuery = null;
     set({ query });
   },
 
@@ -115,6 +120,7 @@ export const useSearchStore = create<SearchState>((set, get) => ({
     // Callers set the query before searching it. A debounced call that fires after the input
     // was cleared or a suggestion was selected describes a query the user has moved past.
     if (prefix.trim() !== get().query.trim()) return;
+    if (selectedQuery !== null && prefix.trim() === selectedQuery.trim()) return;
 
     const seq = ++searchSeq;
 
@@ -162,8 +168,9 @@ export const useSearchStore = create<SearchState>((set, get) => ({
   selectSuggestion: async (phrase: string) => {
     const { userId, sessionId, recentSearches } = get();
 
-    // Drop any in-flight search so it cannot refill the list after the selection
+    // Drop any in-flight or still-debounced search so it cannot refill the list after the selection
     searchSeq++;
+    selectedQuery = phrase;
     api.cancelSuggestions();
 
     // Update local state

@@ -1,13 +1,16 @@
 /**
  * MobileTypeahead - Full-screen mobile typeahead experience.
+ * The expanded overlay is a modal dialog named by `title`: Tab stays inside it, Escape closes
+ * it, and focus returns to the collapsed search button afterwards.
  */
 import { useRef, useEffect, useState } from 'react';
 import { useTypeahead } from '../../hooks/useTypeahead.js';
 import { getHistory, clearHistory, type HistoryEntry } from '../../db/database.js';
+import { trapTabKey } from './focus.js';
 import type { MobileTypeaheadProps } from './types.js';
 
 export function MobileTypeahead({
-  title: _title = 'Search',
+  title = 'Search',
   showCancel = true,
   cancelText = 'Cancel',
   fullScreen = true,
@@ -26,6 +29,9 @@ export function MobileTypeahead({
   const [isExpanded, setIsExpanded] = useState(false);
   const [recentSearches, setRecentSearches] = useState<HistoryEntry[]>([]);
   const inputRef = useRef<HTMLInputElement>(null);
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const wasExpanded = useRef(false);
 
   const typeahead = useTypeahead({
     debounceMs,
@@ -57,6 +63,14 @@ export function MobileTypeahead({
     }
   }, [isExpanded, autoFocus]);
 
+  // The collapsed button is a new element after closing: move focus back to it
+  useEffect(() => {
+    if (wasExpanded.current && !isExpanded) {
+      triggerRef.current?.focus();
+    }
+    wasExpanded.current = isExpanded;
+  }, [isExpanded]);
+
   // Prevent body scroll when expanded
   useEffect(() => {
     if (fullScreen && isExpanded) {
@@ -82,6 +96,8 @@ export function MobileTypeahead({
   if (!isExpanded) {
     return (
       <button
+        ref={triggerRef}
+        type="button"
         onClick={() => setIsExpanded(true)}
         disabled={disabled}
         className={`flex items-center gap-2 w-full px-4 py-3 bg-gray-100 dark:bg-gray-800 rounded-xl text-gray-500 dark:text-gray-400 ${className}`}
@@ -102,6 +118,17 @@ export function MobileTypeahead({
   // Expanded state - full screen overlay
   return (
     <div
+      ref={dialogRef}
+      role="dialog"
+      aria-modal="true"
+      aria-label={title}
+      onKeyDown={(e) => {
+        // The hook handles (and prevents) Escape while its suggestion list is open
+        if (e.key === 'Escape' && !e.isDefaultPrevented()) {
+          handleCancel();
+        }
+        trapTabKey(e, dialogRef.current);
+      }}
       className={`fixed inset-0 z-50 bg-white dark:bg-gray-900 ${fullScreen ? '' : 'top-0'} ${className}`}
     >
       {/* Header */}
@@ -139,7 +166,12 @@ export function MobileTypeahead({
             {/* Clear button */}
             {typeahead.query && (
               <button
-                onClick={() => typeahead.setQuery('')}
+                type="button"
+                aria-label="Clear search"
+                onClick={() => {
+                  typeahead.setQuery('');
+                  inputRef.current?.focus();
+                }}
                 className="absolute right-3 top-1/2 -translate-y-1/2 p-1 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300"
               >
                 <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 20 20">
@@ -237,6 +269,7 @@ export function MobileTypeahead({
                 Recent Searches
               </span>
               <button
+                type="button"
                 onClick={handleClearHistory}
                 className="text-sm text-blue-600 dark:text-blue-400"
               >
@@ -245,29 +278,33 @@ export function MobileTypeahead({
             </div>
             <ul>
               {recentSearches.map((entry) => (
-                <li
-                  key={entry.phrase}
-                  onClick={() => {
-                    typeahead.setQuery(entry.phrase);
-                  }}
-                  className="flex items-center gap-3 px-4 py-3 border-b border-gray-100 dark:border-gray-800 active:bg-gray-100 dark:active:bg-gray-800"
-                >
-                  <svg
-                    className="w-5 h-5 text-gray-400 flex-shrink-0"
-                    fill="none"
-                    stroke="currentColor"
-                    viewBox="0 0 24 24"
+                <li key={entry.phrase}>
+                  {/* A button, so recent searches can be picked with the keyboard too */}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      typeahead.setQuery(entry.phrase);
+                      inputRef.current?.focus();
+                    }}
+                    className="w-full flex items-center gap-3 px-4 py-3 text-left border-b border-gray-100 dark:border-gray-800 active:bg-gray-100 dark:active:bg-gray-800"
                   >
-                    <path
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      strokeWidth={2}
-                      d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"
-                    />
-                  </svg>
-                  <span className="flex-1 text-gray-900 dark:text-white truncate">
-                    {entry.phrase}
-                  </span>
+                    <svg
+                      className="w-5 h-5 text-gray-400 flex-shrink-0"
+                      fill="none"
+                      stroke="currentColor"
+                      viewBox="0 0 24 24"
+                    >
+                      <path
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        strokeWidth={2}
+                        d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"
+                      />
+                    </svg>
+                    <span className="flex-1 text-gray-900 dark:text-white truncate">
+                      {entry.phrase}
+                    </span>
+                  </button>
                 </li>
               ))}
             </ul>

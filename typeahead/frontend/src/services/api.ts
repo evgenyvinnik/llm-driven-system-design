@@ -73,8 +73,9 @@ class ApiService {
     });
 
     if (!response.ok) {
-      const error = await response.json().catch(() => ({ message: 'Unknown error' }));
-      throw new Error(error.message || `HTTP ${response.status}`);
+      // Backend error bodies are { error: '...' } (validation text, 409 filter conflict)
+      const body = await response.json().catch(() => ({}));
+      throw new Error(body.error || body.message || `HTTP ${response.status}`);
     }
 
     return response.json();
@@ -116,12 +117,12 @@ class ApiService {
   }
 
   /**
-   * Abort any in-flight suggestion request (input cleared, suggestion selected, list dismissed).
-   * Callers must still ignore late results themselves: abort is an optimization, not the
-   * ordering guarantee.
+   * Abort the in-flight suggestion request of one caller (input cleared, suggestion selected,
+   * list dismissed). Callers must still ignore late results themselves: abort is an
+   * optimization, not the ordering guarantee.
    */
-  cancelSuggestions(): void {
-    this.cancelPendingRequests('suggestions:');
+  cancelSuggestions(group = 'default'): void {
+    this.cancelPendingRequests(`suggestions:${group}:`);
   }
 
   /**
@@ -135,11 +136,13 @@ class ApiService {
     }
   }
 
-  // Suggestions
+  // Suggestions. `group` scopes cancellation to one input: a new request aborts only the
+  // previous request of the same group, so two typeahead instances never cancel each other.
   async getSuggestions(
     prefix: string,
-    options: { limit?: number; userId?: string; fuzzy?: boolean } = {}
+    options: { limit?: number; userId?: string; fuzzy?: boolean; group?: string } = {}
   ): Promise<SuggestionsResponse> {
+    const requestGroup = `suggestions:${options.group ?? 'default'}:`;
     const cacheKey = suggestionsCacheKey(
       normalizeCachePrefix(prefix),
       options.userId,
@@ -147,9 +150,9 @@ class ApiService {
       options.fuzzy || false
     );
 
-    // Cancel any pending suggestion request first, so an older in-flight response cannot
+    // Cancel this group's pending request first, so an older in-flight response cannot
     // land after this one even when this one is answered from memory
-    this.cancelPendingRequests('suggestions:');
+    this.cancelPendingRequests(requestGroup);
 
     // Check memory cache
     const cached = memoryCache.get<SuggestionsResponse>(cacheKey);
@@ -159,7 +162,7 @@ class ApiService {
 
     // Create new abort controller for this request
     const controller = new AbortController();
-    const requestKey = `suggestions:${prefix}`;
+    const requestKey = `${requestGroup}${prefix}`;
     this.abortControllers.set(requestKey, controller);
 
     try {
@@ -185,8 +188,11 @@ class ApiService {
         cache: options.userId ? 'no-cache' : 'default',
       });
 
-      // Cache the response
-      memoryCache.set(cacheKey, response, 60_000); // 60s TTL
+      // Cache the response, unless it is a circuit-breaker fallback (an empty list that would
+      // otherwise hide real suggestions for a minute after the backend recovers)
+      if (!response.meta?.degraded) {
+        memoryCache.set(cacheKey, response, 60_000); // 60s TTL
+      }
 
       return response;
     } finally {
@@ -231,40 +237,26 @@ class ApiService {
 
   async getHistory(userId: string, limit = 10): Promise<HistoryResponse> {
     // User-specific data - don't cache in shared memory
-    return this.request<HistoryResponse>(`/suggestions/history?userId=${userId}&limit=${limit}`);
+    return this.request<HistoryResponse>(
+      `/suggestions/history?userId=${encodeURIComponent(userId)}&limit=${limit}`
+    );
   }
 
-  // Analytics
+  // Analytics. Admin dashboard data is not memory-cached: the dashboard polls for live numbers,
+  // and the server sends 'private, no-cache' + ETag, so an unchanged poll is a cheap 304.
   async getAnalyticsSummary(): Promise<AnalyticsSummary> {
-    const cacheKey = 'analytics:summary';
-    const cached = memoryCache.get<AnalyticsSummary>(cacheKey);
-    if (cached) return cached;
-
-    const response = await this.request<AnalyticsSummary>('/analytics/summary');
-    memoryCache.set(cacheKey, response, 30_000); // 30s TTL
-    return response;
+    return this.request<AnalyticsSummary>('/analytics/summary', { cache: 'no-cache' });
   }
 
   async getHourlyStats(): Promise<{ hourly: HourlyStats[] }> {
-    const cacheKey = 'analytics:hourly';
-    const cached = memoryCache.get<{ hourly: HourlyStats[] }>(cacheKey);
-    if (cached) return cached;
-
-    const response = await this.request<{ hourly: HourlyStats[] }>('/analytics/hourly');
-    memoryCache.set(cacheKey, response, 60_000); // 60s TTL
-    return response;
+    return this.request<{ hourly: HourlyStats[] }>('/analytics/hourly', { cache: 'no-cache' });
   }
 
   async getTopPhrases(limit = 50): Promise<{ phrases: TopPhrase[]; meta: { count: number } }> {
-    const cacheKey = `analytics:top-phrases:${limit}`;
-    const cached = memoryCache.get<{ phrases: TopPhrase[]; meta: { count: number } }>(cacheKey);
-    if (cached) return cached;
-
-    const response = await this.request<{ phrases: TopPhrase[]; meta: { count: number } }>(
-      `/analytics/top-phrases?limit=${limit}`
+    return this.request<{ phrases: TopPhrase[]; meta: { count: number } }>(
+      `/analytics/top-phrases?limit=${limit}`,
+      { cache: 'no-cache' }
     );
-    memoryCache.set(cacheKey, response, 60_000);
-    return response;
   }
 
   // Admin
@@ -302,10 +294,23 @@ class ApiService {
     return this.adminMutation('/admin/cache/clear');
   }
 
+  /**
+   * Add a phrase, or raise an existing phrase's count. count in the response is the stored
+   * count (adding never lowers one); restored means a removed phrase is back in suggestions.
+   */
   async addPhrase(
     phrase: string,
     count = 1
-  ): Promise<{ success: boolean; phrase: string; count: number }> {
+  ): Promise<{
+    success: boolean;
+    message: string;
+    phrase: string;
+    count: number;
+    requestedCount: number;
+    created: boolean;
+    previousCount: number | null;
+    restored: boolean;
+  }> {
     return this.adminMutation('/admin/phrases', { phrase, count });
   }
 

@@ -21,6 +21,8 @@ export interface SuggestionsResponse {
     count: number;
     responseTimeMs: number;
     cached: boolean;
+    // Circuit-breaker fallback: an empty list served while the suggestion service is unhealthy
+    degraded?: boolean;
   };
 }
 

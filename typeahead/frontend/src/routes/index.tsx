@@ -7,16 +7,18 @@ export const Route = createFileRoute('/')({
 });
 
 function HomePage() {
-  const { setQuery, search } = useSearchStore();
-
-  const handleTrendingSelect = (phrase: string) => {
-    setQuery(phrase);
-    search(phrase);
-  };
+  const { selectSuggestion } = useSearchStore();
 
   const handleSearch = (query: string) => {
     console.log('Search submitted:', query);
     // In a real app, this would navigate to search results
+  };
+
+  // Picking a trending phrase is a search for it: same path as selecting a suggestion in the
+  // search box (fills the input, records it in recent searches, logs it to the backend)
+  const handleTrendingSelect = (phrase: string) => {
+    selectSuggestion(phrase);
+    handleSearch(phrase);
   };
 
   return (

@@ -53,6 +53,12 @@
         "button:has-text('Management')"
       ],
       "clickDelay": 2200
+    },
+    {
+      "name": "07-widgets",
+      "path": "/widgets",
+      "delay": 1500,
+      "waitFor": "h1"
     }
   ],
   "viewport": {

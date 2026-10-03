@@ -11,7 +11,8 @@ import { CheckCircleIcon, ServerIcon, DatabaseIcon } from '../icons';
 /**
  * OverviewTab - The main dashboard overview tab displaying system status.
  * Shows service health indicators, key metrics, and system resource information.
- * Auto-refreshes data every 10 seconds.
+ * Auto-refreshes data every 10 seconds. Trie and aggregation numbers come from the uncached
+ * /admin/status response; the analytics summary is cached, so only query totals come from it.
  */
 export function OverviewTab() {
   const [status, setStatus] = useState<SystemStatus | null>(null);
@@ -59,10 +60,10 @@ export function OverviewTab() {
       <ServiceStatusSection status={status} />
 
       {/* Key metrics grid */}
-      <MetricsGrid summary={summary} />
+      <MetricsGrid status={status} summary={summary} />
 
       {/* System resources section */}
-      <SystemResourcesSection status={status} summary={summary} />
+      <SystemResourcesSection status={status} />
     </div>
   );
 }
@@ -103,19 +104,20 @@ function ServiceStatusSection({ status }: ServiceStatusSectionProps) {
  * MetricsGrid - Displays key numeric metrics in a grid layout.
  */
 interface MetricsGridProps {
+  status: SystemStatus | null;
   summary: AnalyticsSummary | null;
 }
 
-function MetricsGrid({ summary }: MetricsGridProps) {
+function MetricsGrid({ status, summary }: MetricsGridProps) {
   return (
     <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
       <StatCard
         label="Total Phrases"
-        value={summary?.trie.phraseCount.toLocaleString() || '0'}
+        value={status?.trie.phraseCount.toLocaleString() || '0'}
       />
       <StatCard
         label="Trie Nodes"
-        value={summary?.trie.nodeCount.toLocaleString() || '0'}
+        value={status?.trie.nodeCount.toLocaleString() || '0'}
       />
       <StatCard
         label="Today's Queries"
@@ -134,10 +136,9 @@ function MetricsGrid({ summary }: MetricsGridProps) {
  */
 interface SystemResourcesSectionProps {
   status: SystemStatus | null;
-  summary: AnalyticsSummary | null;
 }
 
-function SystemResourcesSection({ status, summary }: SystemResourcesSectionProps) {
+function SystemResourcesSection({ status }: SystemResourcesSectionProps) {
   return (
     <div className="bg-white rounded-lg shadow p-6">
       <h3 className="font-semibold text-gray-900 mb-4">System Resources</h3>
@@ -157,13 +158,13 @@ function SystemResourcesSection({ status, summary }: SystemResourcesSectionProps
         <div>
           <p className="text-sm text-gray-500">Buffer Size</p>
           <p className="text-lg font-medium">
-            {summary?.aggregation.bufferSize || 0}
+            {status?.aggregation.bufferSize || 0}
           </p>
         </div>
         <div>
           <p className="text-sm text-gray-500">Aggregation</p>
           <p className="text-lg font-medium">
-            {summary?.aggregation.isRunning ? 'Running' : 'Stopped'}
+            {status?.aggregation.isRunning ? 'Running' : 'Stopped'}
           </p>
         </div>
       </div>

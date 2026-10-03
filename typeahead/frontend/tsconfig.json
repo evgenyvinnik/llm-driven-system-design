@@ -10,6 +10,8 @@
     "resolveJsonModule": true,
     "isolatedModules": true,
     "noEmit": true,
+    // Browser code: don't pick up @types/node (installed for vite.config.ts) as globals
+    "types": ["vite/client"],
     "jsx": "react-jsx",
     "strict": true,
     "noUnusedLocals": true,

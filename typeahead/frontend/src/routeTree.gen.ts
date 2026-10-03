@@ -8,49 +8,69 @@
 // You should NOT make any changes in this file as it will be overwritten.
 // Additionally, you should also exclude this file from your linter and/or formatter to prevent it from being checked or modified.
 
-import { Route as rootRouteImport } from './routes/__root'
-import { Route as AdminRouteImport } from './routes/admin'
-import { Route as IndexRouteImport } from './routes/index'
+import { createFileRoute } from '@tanstack/react-router'
 
-const AdminRoute = AdminRouteImport.update({
-  id: '/admin',
-  path: '/admin',
-  getParentRoute: () => rootRouteImport,
-} as any)
+import { Route as rootRouteImport } from './routes/__root'
+import { Route as IndexRouteImport } from './routes/index'
+import { Route as AdminRouteImport } from './routes/admin'
+
+const WidgetsLazyRouteImport = createFileRoute('/widgets')()
+
 const IndexRoute = IndexRouteImport.update({
   id: '/',
   path: '/',
   getParentRoute: () => rootRouteImport,
 } as any)
+const AdminRoute = AdminRouteImport.update({
+  id: '/admin',
+  path: '/admin',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const WidgetsLazyRoute = WidgetsLazyRouteImport.update({
+  id: '/widgets',
+  path: '/widgets',
+  getParentRoute: () => rootRouteImport,
+} as any).lazy(() => import('./routes/widgets.lazy').then((d) => d.Route))
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/admin': typeof AdminRoute
+  '/widgets': typeof WidgetsLazyRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/admin': typeof AdminRoute
+  '/widgets': typeof WidgetsLazyRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/admin': typeof AdminRoute
+  '/widgets': typeof WidgetsLazyRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/admin'
+  fullPaths: '/' | '/admin' | '/widgets'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/admin'
-  id: '__root__' | '/' | '/admin'
+  to: '/' | '/admin' | '/widgets'
+  id: '__root__' | '/' | '/admin' | '/widgets'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   AdminRoute: typeof AdminRoute
+  WidgetsLazyRoute: typeof WidgetsLazyRoute
 }
 
 declare module '@tanstack/react-router' {
   interface FileRoutesByPath {
+    '/': {
+      id: '/'
+      path: '/'
+      fullPath: '/'
+      preLoaderRoute: typeof IndexRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/admin': {
       id: '/admin'
       path: '/admin'
@@ -58,11 +78,11 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AdminRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/': {
-      id: '/'
-      path: '/'
-      fullPath: '/'
-      preLoaderRoute: typeof IndexRouteImport
+    '/widgets': {
+      id: '/widgets'
+      path: '/widgets'
+      fullPath: '/widgets'
+      preLoaderRoute: typeof WidgetsLazyRouteImport
       parentRoute: typeof rootRouteImport
     }
   }
@@ -71,6 +91,7 @@ declare module '@tanstack/react-router' {
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   AdminRoute: AdminRoute,
+  WidgetsLazyRoute: WidgetsLazyRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

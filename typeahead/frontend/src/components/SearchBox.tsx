@@ -1,7 +1,9 @@
-import { useState, useRef, useCallback, useEffect, useId } from 'react';
+import { useState, useRef, useEffect, useId } from 'react';
 import { useSearchStore } from '../stores/search-store';
-import { useDebounce, useClickOutside, useKeyboard } from '../hooks';
+import { useDebounce } from '../hooks';
 import type { Suggestion } from '../types';
+
+const MAX_RECENT_SHOWN = 5;
 
 interface SearchBoxProps {
   placeholder?: string;
@@ -20,6 +22,7 @@ export function SearchBox({ placeholder = 'Search...', onSearch, className = '' 
   // Generate stable IDs for ARIA relationships
   const instanceId = useId();
   const listboxId = `searchbox-listbox-${instanceId}`;
+  const recentLabelId = `searchbox-recent-label-${instanceId}`;
   const getOptionId = (index: number) => `searchbox-option-${instanceId}-${index}`;
 
   const {
@@ -29,7 +32,8 @@ export function SearchBox({ placeholder = 'Search...', onSearch, className = '' 
     error,
     responseTime,
     recentSearches,
-    fuzzyEnabled: _fuzzyEnabled,
+    fuzzyEnabled,
+    maxSuggestions,
     setQuery,
     search,
     selectSuggestion,
@@ -41,21 +45,53 @@ export function SearchBox({ placeholder = 'Search...', onSearch, className = '' 
     search(value);
   }, 150);
 
+  // The popup lists suggestions while there is a query and recent searches while the input is
+  // empty. Keyboard navigation and Enter operate on whichever list is shown.
+  const showingRecent = !query.trim();
+  const options = showingRecent
+    ? recentSearches.slice(0, MAX_RECENT_SHOWN)
+    : suggestions.map(s => s.phrase);
+  // aria-expanded and aria-controls follow whether the listbox is actually rendered
+  const showListbox = isOpen && !error && options.length > 0;
+  const showError = isOpen && !!error;
+  const activeIndex = showListbox && selectedIndex < options.length ? selectedIndex : -1;
+
   // Announce changes to screen readers
   useEffect(() => {
-    if (isOpen && suggestions.length > 0) {
-      setAnnouncement(`${suggestions.length} suggestions available. Use up and down arrows to navigate.`);
-    } else if (isOpen && query.trim() && suggestions.length === 0 && !isLoading) {
+    if (showError) {
+      setAnnouncement(error ?? '');
+    } else if (showListbox) {
+      const what = showingRecent ? 'recent searches' : 'suggestions';
+      setAnnouncement(`${options.length} ${what} available. Use up and down arrows to navigate.`);
+    } else if (isOpen && !showingRecent && !isLoading) {
       setAnnouncement('No suggestions available.');
     }
-  }, [suggestions.length, isOpen, query, isLoading]);
+  }, [showError, error, showListbox, showingRecent, options.length, isOpen, isLoading]);
 
   // Announce selected item
+  const activePhrase = activeIndex >= 0 ? options[activeIndex] : null;
   useEffect(() => {
-    if (selectedIndex >= 0 && suggestions[selectedIndex]) {
-      setAnnouncement(`${suggestions[selectedIndex].phrase}, ${selectedIndex + 1} of ${suggestions.length}`);
+    if (activePhrase !== null) {
+      setAnnouncement(`${activePhrase}, ${activeIndex + 1} of ${options.length}`);
     }
-  }, [selectedIndex, suggestions]);
+  }, [activePhrase, activeIndex, options.length]);
+
+  // Re-run the current query when a search setting changes, so the list reflects the setting
+  const lastSettings = useRef({ fuzzyEnabled, maxSuggestions });
+  useEffect(() => {
+    const last = lastSettings.current;
+    if (last.fuzzyEnabled === fuzzyEnabled && last.maxSuggestions === maxSuggestions) return;
+    lastSettings.current = { fuzzyEnabled, maxSuggestions };
+    if (query.trim()) {
+      setSelectedIndex(-1);
+      search(query);
+    }
+  }, [fuzzyEnabled, maxSuggestions, query, search]);
+
+  const closePopup = () => {
+    setIsOpen(false);
+    setSelectedIndex(-1);
+  };
 
   // Handle input change
   const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -67,66 +103,70 @@ export function SearchBox({ placeholder = 'Search...', onSearch, className = '' 
       debouncedSearch(value);
     } else {
       setIsOpen(false);
+      debouncedSearch.cancel();
       clearSuggestions();
     }
   };
 
-  // Handle suggestion selection
-  const handleSelect = useCallback(
-    (phrase: string) => {
-      selectSuggestion(phrase);
-      setIsOpen(false);
-      setSelectedIndex(-1);
-      onSearch?.(phrase);
-      inputRef.current?.blur();
-    },
-    [selectSuggestion, onSearch]
-  );
+  // Handle suggestion selection. Focus stays on the input (combobox pattern).
+  const handleSelect = (phrase: string) => {
+    debouncedSearch.cancel();
+    selectSuggestion(phrase);
+    closePopup();
+    onSearch?.(phrase);
+  };
 
-  // Handle form submit
+  // Handle form submit (Enter with no highlighted option submits the typed query)
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (selectedIndex >= 0 && suggestions[selectedIndex]) {
-      handleSelect(suggestions[selectedIndex].phrase);
+    if (activeIndex >= 0) {
+      handleSelect(options[activeIndex]);
     } else if (query.trim()) {
       handleSelect(query.trim());
     }
   };
 
-  // Click outside to close
-  useClickOutside(containerRef as React.RefObject<HTMLElement>, () => {
-    setIsOpen(false);
-  });
+  // Keyboard navigation, scoped to the input so other controls keep their keys
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.nativeEvent.isComposing) return;
 
-  // Keyboard navigation
-  useKeyboard(
-    {
-      onArrowDown: () => {
-        setSelectedIndex(prev =>
-          prev < suggestions.length - 1 ? prev + 1 : prev
-        );
-      },
-      onArrowUp: () => {
-        setSelectedIndex(prev => (prev > 0 ? prev - 1 : -1));
-      },
-      onEnter: () => {
-        if (selectedIndex >= 0 && suggestions[selectedIndex]) {
-          handleSelect(suggestions[selectedIndex].phrase);
+    switch (e.key) {
+      case 'ArrowDown':
+        if (options.length === 0) return;
+        e.preventDefault();
+        if (!showListbox) {
+          setIsOpen(true);
+          setSelectedIndex(0);
+        } else {
+          setSelectedIndex(activeIndex < options.length - 1 ? activeIndex + 1 : activeIndex);
         }
-      },
-      onEscape: () => {
-        setIsOpen(false);
-        inputRef.current?.blur();
-      },
-    },
-    isOpen
-  );
+        break;
+      case 'ArrowUp':
+        if (!showListbox) return;
+        e.preventDefault();
+        setSelectedIndex(activeIndex > 0 ? activeIndex - 1 : -1);
+        break;
+      case 'Enter':
+        if (activeIndex >= 0) {
+          e.preventDefault(); // pick the option instead of submitting the typed text
+          handleSelect(options[activeIndex]);
+        }
+        break;
+      case 'Escape':
+        if (isOpen) {
+          e.preventDefault();
+          closePopup();
+        }
+        break;
+      case 'Tab':
+        closePopup();
+        break;
+    }
+  };
 
-  // Focus input to show recent searches
+  // Focus input to show recent searches (empty query) or the current suggestions
   const handleFocus = () => {
-    if (!query.trim() && recentSearches.length > 0) {
-      setIsOpen(true);
-    } else if (suggestions.length > 0) {
+    if (options.length > 0) {
       setIsOpen(true);
     }
   };
@@ -152,7 +192,7 @@ export function SearchBox({ placeholder = 'Search...', onSearch, className = '' 
 
   // Render suggestion item
   const renderSuggestion = (suggestion: Suggestion, index: number) => {
-    const isSelected = index === selectedIndex;
+    const isSelected = index === activeIndex;
 
     return (
       <li
@@ -181,7 +221,7 @@ export function SearchBox({ placeholder = 'Search...', onSearch, className = '' 
             />
           </svg>
           <span className="text-gray-800">
-            {highlightMatch(suggestion.phrase, query)}
+            {highlightMatch(suggestion.phrase, query.trim())}
           </span>
           {suggestion.isFuzzy && (
             <span className="text-xs text-gray-400 italic">(fuzzy match)</span>
@@ -194,38 +234,37 @@ export function SearchBox({ placeholder = 'Search...', onSearch, className = '' 
     );
   };
 
-  // Render recent searches
-  const renderRecentSearches = () => {
-    if (query.trim() || recentSearches.length === 0) return null;
+  // Render recent search item
+  const renderRecentSearch = (search: string, index: number) => {
+    const isSelected = index === activeIndex;
 
     return (
-      <>
-        <div className="px-4 py-2 text-xs text-gray-500 font-medium border-b">
-          Recent Searches
-        </div>
-        {recentSearches.slice(0, 5).map((search, _index) => (
-          <li
-            key={search}
-            className="px-4 py-2 cursor-pointer flex items-center gap-2 hover:bg-gray-50"
-            onClick={() => handleSelect(search)}
-          >
-            <svg
-              className="w-4 h-4 text-gray-400"
-              fill="none"
-              stroke="currentColor"
-              viewBox="0 0 24 24"
-            >
-              <path
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                strokeWidth={2}
-                d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"
-              />
-            </svg>
-            <span className="text-gray-700">{search}</span>
-          </li>
-        ))}
-      </>
+      <li
+        key={search}
+        id={getOptionId(index)}
+        role="option"
+        aria-selected={isSelected}
+        className={`px-4 py-2 cursor-pointer flex items-center gap-2 transition-colors ${
+          isSelected ? 'bg-blue-50' : 'hover:bg-gray-50'
+        }`}
+        onMouseEnter={() => setSelectedIndex(index)}
+        onClick={() => handleSelect(search)}
+      >
+        <svg
+          className="w-4 h-4 text-gray-400"
+          fill="none"
+          stroke="currentColor"
+          viewBox="0 0 24 24"
+        >
+          <path
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            strokeWidth={2}
+            d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"
+          />
+        </svg>
+        <span className="text-gray-700">{search}</span>
+      </li>
     );
   };
 
@@ -239,14 +278,16 @@ export function SearchBox({ placeholder = 'Search...', onSearch, className = '' 
             value={query}
             onChange={handleInputChange}
             onFocus={handleFocus}
+            onBlur={closePopup}
+            onKeyDown={handleKeyDown}
             placeholder={placeholder}
             className="w-full px-4 py-3 pl-12 text-lg border border-gray-300 rounded-full shadow-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-shadow"
             autoComplete="off"
             spellCheck="false"
             role="combobox"
-            aria-expanded={isOpen}
-            aria-controls={listboxId}
-            aria-activedescendant={selectedIndex >= 0 ? getOptionId(selectedIndex) : undefined}
+            aria-expanded={showListbox}
+            aria-controls={showListbox ? listboxId : undefined}
+            aria-activedescendant={activeIndex >= 0 ? getOptionId(activeIndex) : undefined}
             aria-autocomplete="list"
             aria-haspopup="listbox"
             aria-label="Search"
@@ -274,28 +315,40 @@ export function SearchBox({ placeholder = 'Search...', onSearch, className = '' 
         </div>
       </form>
 
-      {/* Dropdown */}
-      {isOpen && (suggestions.length > 0 || recentSearches.length > 0 || error) && (
-        <div className="absolute z-50 w-full mt-2 bg-white border border-gray-200 rounded-lg shadow-lg overflow-hidden animate-fade-in">
-          <ul
-            id={listboxId}
-            role="listbox"
-            aria-label="Search suggestions"
-            className="suggestions-dropdown max-h-80 overflow-y-auto"
-          >
-            {error ? (
-              <li className="px-4 py-3 text-red-500 text-sm">{error}</li>
-            ) : suggestions.length > 0 ? (
-              suggestions.map((suggestion, index) =>
-                renderSuggestion(suggestion, index)
-              )
-            ) : (
-              renderRecentSearches()
-            )}
-          </ul>
+      {/* Dropdown. mousedown is cancelled so clicking an option keeps focus on the input. */}
+      {(showListbox || showError) && (
+        <div
+          className="absolute z-50 w-full mt-2 bg-white border border-gray-200 rounded-lg shadow-lg overflow-hidden animate-fade-in"
+          onMouseDown={e => e.preventDefault()}
+        >
+          {showError ? (
+            <div className="px-4 py-3 text-red-500 text-sm">{error}</div>
+          ) : (
+            <>
+              {showingRecent && (
+                <div
+                  id={recentLabelId}
+                  className="px-4 py-2 text-xs text-gray-500 font-medium border-b"
+                >
+                  Recent Searches
+                </div>
+              )}
+              <ul
+                id={listboxId}
+                role="listbox"
+                aria-label={showingRecent ? undefined : 'Search suggestions'}
+                aria-labelledby={showingRecent ? recentLabelId : undefined}
+                className="suggestions-dropdown max-h-80 overflow-y-auto"
+              >
+                {showingRecent
+                  ? options.map(renderRecentSearch)
+                  : suggestions.map(renderSuggestion)}
+              </ul>
+            </>
+          )}
 
           {/* Footer */}
-          {responseTime !== null && suggestions.length > 0 && (
+          {showListbox && !showingRecent && responseTime !== null && (
             <div className="px-4 py-2 bg-gray-50 border-t text-xs text-gray-400 flex items-center justify-between">
               <span>{suggestions.length} suggestions</span>
               <span>{responseTime}ms</span>

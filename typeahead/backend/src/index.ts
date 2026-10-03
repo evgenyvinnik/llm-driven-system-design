@@ -81,7 +81,11 @@ redis.on('error', (err: Error) => {
   logger.error({ event: 'redis_error', error: err.message });
 });
 redis.on('ready', () => {
-  if (redisErrorLogged) logger.info({ event: 'redis_reconnected' });
+  if (redisErrorLogged) {
+    logger.info({ event: 'redis_reconnected' });
+    // Admin filter changes skip the Redis blocked set while it is down: re-mirror filtered_phrases
+    if (trieLoaded) void aggregationService.syncBlockedPhrases();
+  }
   redisErrorLogged = false;
 });
 
@@ -115,6 +119,17 @@ const idempotencyHandler = createRedisIdempotencyHandler(redis);
 let trieLoaded = false;
 let shuttingDown = false;
 
+/**
+ * PING Redis, failing at once while the client is disconnected. ioredis would otherwise queue
+ * the command through its reconnect retries, holding a probe open for several seconds.
+ */
+async function pingRedis(): Promise<string> {
+  if (redis.status !== 'ready') {
+    throw new Error(`Redis not connected (status: ${redis.status})`);
+  }
+  return redis.ping();
+}
+
 // Make services available to routes
 app.set('redis', redis);
 app.set('pgPool', pgPool);
@@ -125,6 +140,12 @@ app.set('aggregationService', aggregationService);
 app.set('idempotencyHandler', idempotencyHandler);
 app.set('logger', logger);
 app.set('auditLogger', auditLogger);
+
+// Until the trie is loaded every prefix answers [], so keep those answers out of HTTP caches
+app.use((_req: Request, res: Response, next: NextFunction) => {
+  if (!trieLoaded) res.locals.noStore = true;
+  next();
+});
 
 // Routes
 app.use('/api/v1/suggestions', suggestionRoutes);
@@ -210,7 +231,7 @@ app.get('/health/ready', async (_req: Request, res: Response) => {
 
   // Check Redis connectivity
   try {
-    const pong = await redis.ping();
+    const pong = await pingRedis();
     checks.redis = { status: pong === 'PONG' ? 'healthy' : 'unhealthy' };
   } catch (error) {
     checks.redis = { status: 'unhealthy', error: (error as Error).message };
@@ -257,7 +278,7 @@ app.get('/status', async (_req: Request, res: Response) => {
     let redisStatus = 'unknown';
     const redisInfo: RedisInfo = {};
     try {
-      const pong = await redis.ping();
+      const pong = await pingRedis();
       redisStatus = pong === 'PONG' ? 'connected' : 'error';
       const info = await redis.info('memory');
       const memMatch = info.match(/used_memory_human:([^\r\n]+)/);
@@ -296,7 +317,6 @@ app.get('/status', async (_req: Request, res: Response) => {
     logger.error({ event: 'status_error', error: (error as Error).message });
     res.status(500).json({
       error: 'Internal server error',
-      message: (error as Error).message,
     });
   }
 });
@@ -396,18 +416,29 @@ async function loadTrie(): Promise<void> {
 async function initialize(): Promise<void> {
   logger.info({ event: 'initialization_started' });
 
-  if (!(await retryUntilSuccess('load_trie', loadTrie))) return;
+  if (!(await retryUntilSuccess('load_trie', loadTrie)) || shuttingDown) return;
 
-  // Aggregation flushes check the Redis blocked set and start() syncs it, so wait for Redis
+  // Start aggregation once the trie is loaded. Flushes need only Postgres (the upsert checks
+  // filtered_phrases itself), so a Redis outage doesn't leave logged searches unflushed.
+  const redisWasReady = redis.status === 'ready';
+  aggregationService.start();
+  logger.info({ event: 'aggregation_service_started' });
+
+  if (redisWasReady) {
+    logger.info({ event: 'redis_connected' });
+    return;
+  }
+
+  // start() mirrors filtered_phrases into the Redis blocked set and publishes trending; with
+  // Redis down that failed, so redo it once Redis is reachable
   const redisReady = await retryUntilSuccess('redis', async () => {
-    await redis.ping();
+    await pingRedis();
     logger.info({ event: 'redis_connected' });
   });
   if (!redisReady || shuttingDown) return;
 
-  // Start aggregation service only after a successful initialization
-  aggregationService.start();
-  logger.info({ event: 'aggregation_service_started' });
+  await aggregationService.syncBlockedPhrases();
+  await aggregationService.aggregateTrendingWindows();
 }
 
 // Graceful shutdown

@@ -61,7 +61,10 @@ export interface UseTypeaheadReturn {
   isLoading: boolean;
   /** Whether dropdown is open */
   isOpen: boolean;
-  /** Set dropdown open state */
+  /**
+   * Set dropdown open state. Closing it (e.g. on blur) also keeps late fetch results from
+   * reopening it until the query is edited.
+   */
   setIsOpen: (open: boolean) => void;
   /** Currently highlighted index */
   highlightedIndex: number;
@@ -122,10 +125,10 @@ export function useTypeahead(options: UseTypeaheadOptions = {}): UseTypeaheadRet
     onSubmit,
   } = options;
 
-  const [query, setQuery] = useState('');
+  const [query, setQueryState] = useState('');
   const [suggestions, setSuggestions] = useState<Suggestion[]>([]);
   const [isLoading, setIsLoading] = useState(false);
-  const [isOpen, setIsOpen] = useState(false);
+  const [isOpen, setIsOpenState] = useState(false);
   const [highlightedIndex, setHighlightedIndex] = useState(-1);
   const [error, setError] = useState<Error | null>(null);
   const [isCached, setIsCached] = useState(false);
@@ -138,7 +141,26 @@ export function useTypeahead(options: UseTypeaheadOptions = {}): UseTypeaheadRet
   const inFlight = useRef(false);
   // Query set by selectSuggestion: the effect does not fetch it, so the list stays closed
   const suppressedQuery = useRef<string | null>(null);
+  // The list was closed explicitly (blur, Escape, Tab, selection, submit) since the user last
+  // edited the query: a fetch that completes now refreshes the suggestions but does not reopen it
+  const dismissed = useRef(false);
   const listboxId = useUniqueId('typeahead-listbox');
+
+  // Editing the query un-dismisses the list; an explicit close dismisses it
+  const setQuery = useCallback((value: string) => {
+    dismissed.current = false;
+    setQueryState(value);
+  }, []);
+
+  const setIsOpen = useCallback((open: boolean) => {
+    dismissed.current = !open;
+    setIsOpenState(open);
+  }, []);
+
+  // Open state driven by fetch results, which must not override an explicit close
+  const showResults = useCallback((hasResults: boolean) => {
+    if (!dismissed.current) setIsOpenState(hasResults);
+  }, []);
 
   // Drop the pending debounce and the in-flight fetch (input cleared, selection, Escape/Tab)
   const cancelPending = useCallback(() => {
@@ -149,10 +171,10 @@ export function useTypeahead(options: UseTypeaheadOptions = {}): UseTypeaheadRet
     requestSeq.current++;
     if (inFlight.current) {
       inFlight.current = false;
-      api.cancelSuggestions(); // optimization only; the sequence check is the guarantee
+      api.cancelSuggestions(listboxId); // optimization only; the sequence check is the guarantee
     }
     setIsLoading(false);
-  }, []);
+  }, [listboxId]);
 
   // Fetch suggestions with multi-layer caching
   const fetchSuggestions = useCallback(
@@ -161,8 +183,10 @@ export function useTypeahead(options: UseTypeaheadOptions = {}): UseTypeaheadRet
       const isCurrent = () => seq === requestSeq.current;
 
       if (prefix.length < minChars) {
+        // Also drops an older fetch still in flight, whose finally no longer clears isLoading
+        cancelPending();
         setSuggestions([]);
-        setIsOpen(false);
+        setIsOpenState(false);
         return;
       }
 
@@ -180,7 +204,7 @@ export function useTypeahead(options: UseTypeaheadOptions = {}): UseTypeaheadRet
         if (cachedFromDb) {
           setSuggestions(cachedFromDb);
           setIsCached(true);
-          setIsOpen(cachedFromDb.length > 0);
+          showResults(cachedFromDb.length > 0);
           // Continue to fetch fresh data in background
         }
 
@@ -190,12 +214,13 @@ export function useTypeahead(options: UseTypeaheadOptions = {}): UseTypeaheadRet
           limit,
           userId,
           fuzzy,
+          group: listboxId,
         });
         if (!isCurrent()) return;
 
         setSuggestions(response.suggestions);
         setIsCached(response.meta.cached);
-        setIsOpen(response.suggestions.length > 0);
+        showResults(response.suggestions.length > 0);
 
         // Update IndexedDB cache (not awaited: it must not delay or fail the online path)
         void writeIdbCache(cacheKey, response.suggestions);
@@ -211,7 +236,7 @@ export function useTypeahead(options: UseTypeaheadOptions = {}): UseTypeaheadRet
         if (fallback && isCurrent()) {
           setSuggestions(fallback);
           setIsCached(true);
-          setIsOpen(fallback.length > 0);
+          showResults(fallback.length > 0);
         }
       } finally {
         if (isCurrent()) {
@@ -220,7 +245,7 @@ export function useTypeahead(options: UseTypeaheadOptions = {}): UseTypeaheadRet
         }
       }
     },
-    [limit, userId, fuzzy, minChars]
+    [limit, userId, fuzzy, minChars, listboxId, showResults, cancelPending]
   );
 
   // Debounced query effect
@@ -239,12 +264,13 @@ export function useTypeahead(options: UseTypeaheadOptions = {}): UseTypeaheadRet
     if (!query.trim()) {
       cancelPending();
       setSuggestions([]);
-      setIsOpen(false);
+      setIsOpenState(false);
       return;
     }
 
     debounceTimer.current = window.setTimeout(() => {
-      fetchSuggestions(query.trim());
+      // trimStart, not trim: a trailing space marks a word boundary ("java " -> "java spring")
+      fetchSuggestions(query.trimStart());
     }, debounceMs);
 
     return () => {
@@ -266,7 +292,7 @@ export function useTypeahead(options: UseTypeaheadOptions = {}): UseTypeaheadRet
         const selected = suggestions[index];
         cancelPending();
         suppressedQuery.current = selected.phrase;
-        setQuery(selected.phrase);
+        setQueryState(selected.phrase);
         setIsOpen(false);
         setHighlightedIndex(-1);
 
@@ -280,7 +306,7 @@ export function useTypeahead(options: UseTypeaheadOptions = {}): UseTypeaheadRet
         onSelect?.(selected.phrase);
       }
     },
-    [suggestions, userId, onSelect, cancelPending]
+    [suggestions, userId, onSelect, cancelPending, setIsOpen]
   );
 
   // Submit current query
@@ -298,7 +324,7 @@ export function useTypeahead(options: UseTypeaheadOptions = {}): UseTypeaheadRet
     api.logSearch(query, userId).catch(() => {});
 
     onSubmit?.(query);
-  }, [query, userId, onSubmit, cancelPending]);
+  }, [query, userId, onSubmit, cancelPending, setIsOpen]);
 
   // Keyboard navigation handler
   const handleKeyDown = useCallback(
@@ -352,7 +378,16 @@ export function useTypeahead(options: UseTypeaheadOptions = {}): UseTypeaheadRet
           break;
       }
     },
-    [isOpen, suggestions.length, query, highlightedIndex, selectSuggestion, submitQuery, cancelPending]
+    [
+      isOpen,
+      suggestions.length,
+      query,
+      highlightedIndex,
+      selectSuggestion,
+      submitQuery,
+      cancelPending,
+      setIsOpen,
+    ]
   );
 
   // ARIA input props
