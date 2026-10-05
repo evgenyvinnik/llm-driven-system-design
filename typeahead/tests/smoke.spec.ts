@@ -86,4 +86,16 @@ test.describe('typeahead Smoke Tests', () => {
     await expect(page.locator('text=Error boundary')).not.toBeVisible();
   });
 
+  test('08 home full client performance loads correctly', async ({ page }) => {
+    await page.goto('/');
+    await page.waitForTimeout(1200);
+
+    // Verify page content loads
+    await expect(page.locator('main')).toBeVisible({ timeout: 10000 });
+
+    // Verify no React error boundary
+    await expect(page.locator('text=Something went wrong')).not.toBeVisible();
+    await expect(page.locator('text=Error boundary')).not.toBeVisible();
+  });
+
 });

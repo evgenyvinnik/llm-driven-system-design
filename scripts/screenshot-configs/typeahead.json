@@ -59,6 +59,16 @@
       "path": "/widgets",
       "delay": 1500,
       "waitFor": "h1"
+    },
+    {
+      "name": "08-home-full-client-performance",
+      "path": "/",
+      "delay": 1200,
+      "fill": {
+        "input[placeholder='Start typing to search...']": "react"
+      },
+      "fillDelay": 2000,
+      "fullPage": true
     }
   ],
   "viewport": {
