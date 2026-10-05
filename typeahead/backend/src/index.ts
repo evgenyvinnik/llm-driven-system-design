@@ -1,4 +1,4 @@
-import express, { Request, Response } from 'express';
+import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import IORedis from 'ioredis';
 import pg from 'pg';
@@ -7,6 +7,7 @@ import { Trie } from './data-structures/trie.js';
 import { SuggestionService } from './services/suggestion-service.js';
 import { RankingService } from './services/ranking-service.js';
 import { AggregationService } from './services/aggregation-service.js';
+import { TrieSyncService } from './services/trie-sync-service.js';
 import suggestionRoutes from './routes/suggestions.js';
 import analyticsRoutes from './routes/analytics.js';
 import adminRoutes from './routes/admin.js';
@@ -21,13 +22,45 @@ import {
 } from './shared/metrics.js';
 import { getCircuitStatus } from './shared/circuit-breaker.js';
 import { globalRateLimiter } from './shared/rate-limiter.js';
-import { cleanup as cleanupIdempotency, createRedisIdempotencyHandler } from './shared/idempotency.js';
+import { cleanup as cleanupIdempotency } from './shared/idempotency.js';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Startup retries back off 1s, 2s, 4s ... up to this
+const INIT_RETRY_MAX_MS = 30000;
+// Exit even if a shutdown step hangs
+const SHUTDOWN_TIMEOUT_MS = 10000;
+
+/**
+ * Express 'trust proxy' from TRUST_PROXY: a hop count, 'true', or addresses/subnets such as
+ * 'loopback'. Unset, req.ip is the socket address and client-sent X-Forwarded-For is ignored,
+ * which keeps rate-limit keys unspoofable when no proxy is in front.
+ */
+function parseTrustProxy(value: string | undefined): boolean | number | string | undefined {
+  if (!value || value === 'false') return undefined;
+  if (value === 'true') return true;
+  return /^\d+$/.test(value) ? Number(value) : value;
+}
+
+const trustProxy = parseTrustProxy(process.env.TRUST_PROXY);
+if (trustProxy !== undefined) {
+  app.set('trust proxy', trustProxy);
+}
+
+// ETags come only from shared/cache-headers.ts, which hashes stable content and leaves them off
+// errors and no-store responses; Express's automatic body-hash ETag would add one to those too
+app.set('etag', false);
+
+// The UI calls /api through the Vite proxy (same origin), so CORS only matters for pages that call
+// the API directly. Allow just the configured origins (comma-separated CORS_ORIGINS), not every origin.
+const corsOrigins = (process.env.CORS_ORIGINS || 'http://localhost:5173')
+  .split(',')
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+
 // Middleware
-app.use(cors());
+app.use(cors({ origin: corsOrigins }));
 app.use(express.json());
 app.use(httpLogger); // Structured request logging
 app.use(globalRateLimiter); // Global rate limiting
@@ -41,6 +74,27 @@ const redis = new Redis({
   maxRetriesPerRequest: 3,
 });
 
+// ioredis reconnects on its own; log the first error of each outage rather than every retry
+let redisErrorLogged = false;
+let redisWasReadyBefore = false;
+redis.on('error', (err: Error) => {
+  if (redisErrorLogged) return;
+  redisErrorLogged = true;
+  logger.error({ event: 'redis_error', error: err.message });
+});
+redis.on('ready', () => {
+  if (redisErrorLogged) {
+    logger.info({ event: 'redis_reconnected' });
+  }
+  // On every reconnect (not only after a logged error: a quick restart may not emit one),
+  // re-mirror filtered_phrases. Admin filter changes skip the Redis blocked set while it is
+  // down, and a restarted Redis without persistence has lost it. The first connection is
+  // covered by aggregationService.start() / initialize().
+  if (redisWasReadyBefore && trieLoaded) void aggregationService.syncBlockedPhrases();
+  redisWasReadyBefore = true;
+  redisErrorLogged = false;
+});
+
 const pgPool = new pg.Pool({
   host: process.env.PG_HOST || 'localhost',
   port: parseInt(process.env.PG_PORT || '5432'),
@@ -48,6 +102,14 @@ const pgPool = new pg.Pool({
   password: process.env.PG_PASSWORD || 'typeahead_password',
   database: process.env.PG_DATABASE || 'typeahead',
   max: 20,
+  // Fail fast when Postgres is unreachable instead of hanging startup retries and probes
+  connectionTimeoutMillis: 5000,
+});
+
+// An idle pooled client emits 'error' when its connection drops (Postgres restart,
+// pg_terminate_backend). Unhandled, that event crashes the process and the trie with it.
+pgPool.on('error', (err: Error) => {
+  logger.error({ event: 'pg_idle_client_error', error: err.message });
 });
 
 // Initialize services
@@ -55,9 +117,30 @@ const trie = new Trie(10); // Top 10 suggestions per node
 const rankingService = new RankingService(redis);
 const suggestionService = new SuggestionService(trie, redis, rankingService);
 const aggregationService = new AggregationService(redis, pgPool, trie);
+// Keeps this instance's trie in step with writes made by other instances (dev:server1/2/3)
+const trieSync = new TrieSyncService(pgPool, redis, trie, suggestionService, {
+  intervalMs: parseInt(process.env.TRIE_SYNC_INTERVAL_MS || '5000'),
+  // After rows were deleted outright (a reseed): rebuild from Postgres and clear the cache
+  reload: () => aggregationService.rebuildTrie(),
+});
+aggregationService.setChangeListener(() => trieSync.notifyChanged());
 
-// Initialize Redis-based idempotency handler
-const idempotencyHandler = createRedisIdempotencyHandler(redis);
+// Set once the startup load from Postgres has filled the trie; readiness waits for it
+let trieLoaded = false;
+// Read floor taken just before the startup load; the trie sync starts from it
+let syncReadFrom: string | null = null;
+let shuttingDown = false;
+
+/**
+ * PING Redis, failing at once while the client is disconnected. ioredis would otherwise queue
+ * the command through its reconnect retries, holding a probe open for several seconds.
+ */
+async function pingRedis(): Promise<string> {
+  if (redis.status !== 'ready') {
+    throw new Error(`Redis not connected (status: ${redis.status})`);
+  }
+  return redis.ping();
+}
 
 // Make services available to routes
 app.set('redis', redis);
@@ -66,9 +149,15 @@ app.set('trie', trie);
 app.set('suggestionService', suggestionService);
 app.set('rankingService', rankingService);
 app.set('aggregationService', aggregationService);
-app.set('idempotencyHandler', idempotencyHandler);
+app.set('trieSync', trieSync);
 app.set('logger', logger);
 app.set('auditLogger', auditLogger);
+
+// Until the trie is loaded every prefix answers [], so keep those answers out of HTTP caches
+app.use((_req: Request, res: Response, next: NextFunction) => {
+  if (!trieLoaded) res.locals.noStore = true;
+  next();
+});
 
 // Routes
 app.use('/api/v1/suggestions', suggestionRoutes);
@@ -77,6 +166,7 @@ app.use('/api/v1/admin', adminRoutes);
 
 interface HealthCheck {
   status: string;
+  loaded?: boolean;
   phraseCount?: number;
   nodeCount?: number;
   error?: string;
@@ -135,13 +225,17 @@ app.get('/health/ready', async (_req: Request, res: Response) => {
     postgres: { status: 'unknown' },
   };
 
-  // Check trie is loaded
+  // Check trie is loaded: not ready (503) until the startup load has finished with phrases,
+  // so a load balancer never routes to an instance that would answer every prefix with []
   try {
     const stats = trie.getStats();
+    const ready = trieLoaded && stats.phraseCount > 0;
     checks.trie = {
-      status: stats.phraseCount > 0 ? 'healthy' : 'degraded',
+      status: ready ? 'healthy' : 'unhealthy',
+      loaded: trieLoaded,
       phraseCount: stats.phraseCount,
       nodeCount: stats.nodeCount,
+      ...(ready ? {} : { error: trieLoaded ? 'Trie is empty' : 'Trie is still loading' }),
     };
   } catch (error) {
     checks.trie = { status: 'unhealthy', error: (error as Error).message };
@@ -149,7 +243,7 @@ app.get('/health/ready', async (_req: Request, res: Response) => {
 
   // Check Redis connectivity
   try {
-    const pong = await redis.ping();
+    const pong = await pingRedis();
     checks.redis = { status: pong === 'PONG' ? 'healthy' : 'unhealthy' };
   } catch (error) {
     checks.redis = { status: 'unhealthy', error: (error as Error).message };
@@ -196,7 +290,7 @@ app.get('/status', async (_req: Request, res: Response) => {
     let redisStatus = 'unknown';
     const redisInfo: RedisInfo = {};
     try {
-      const pong = await redis.ping();
+      const pong = await pingRedis();
       redisStatus = pong === 'PONG' ? 'connected' : 'error';
       const info = await redis.info('memory');
       const memMatch = info.match(/used_memory_human:([^\r\n]+)/);
@@ -226,6 +320,7 @@ app.get('/status', async (_req: Request, res: Response) => {
       },
       trie: trie.getStats(),
       aggregation: aggregationService.getStats(),
+      trieSync: trieSync.getStats(),
       circuits: getCircuitStatus(),
       uptime: process.uptime(),
       memory: process.memoryUsage(),
@@ -235,73 +330,203 @@ app.get('/status', async (_req: Request, res: Response) => {
     logger.error({ event: 'status_error', error: (error as Error).message });
     res.status(500).json({
       error: 'Internal server error',
-      message: (error as Error).message,
     });
   }
 });
 
-// Initialize and load data
-async function initialize(): Promise<void> {
-  const startTime = Date.now();
-
-  try {
-    logger.info({ event: 'initialization_started' });
-
-    // Wait for database connections
-    await redis.ping();
-    logger.info({ event: 'redis_connected' });
-
-    await pgPool.query('SELECT 1');
-    logger.info({ event: 'postgres_connected' });
-
-    // Load phrases from database into trie
-    const result = await pgPool.query(
-      'SELECT phrase, count FROM phrase_counts WHERE is_filtered = false ORDER BY count DESC LIMIT 100000'
-    );
-
-    logger.info({ event: 'loading_phrases', count: result.rows.length });
-
-    for (const row of result.rows) {
-      trie.insert(row.phrase, parseInt(row.count));
+// Final error handler: JSON instead of Express's default HTML page, which includes the stack
+// trace outside production. Malformed JSON bodies reach it as 400s from express.json().
+app.use(
+  (
+    err: Error & { status?: number; statusCode?: number; expose?: boolean },
+    _req: Request,
+    res: Response,
+    next: NextFunction
+  ) => {
+    if (res.headersSent) {
+      next(err);
+      return;
     }
 
-    const stats = trie.getStats();
-    const durationMs = Date.now() - startTime;
+    const status = err.status ?? err.statusCode ?? 500;
+    const httpStatus = status >= 400 && status < 600 ? status : 500;
+    if (httpStatus >= 500) {
+      logger.error({ event: 'unhandled_error', error: err.message, stack: err.stack });
+    }
 
-    logger.info({
-      event: 'trie_initialized',
-      phraseCount: stats.phraseCount,
-      nodeCount: stats.nodeCount,
-      durationMs,
+    res.status(httpStatus).json({
+      error:
+        httpStatus >= 500 ? 'Internal server error' : err.expose ? err.message : 'Bad request',
     });
+  }
+);
 
-    auditLogger.logTrieRebuild('startup', stats.phraseCount, durationMs);
+/**
+ * Run a startup step until it succeeds, backing off 1s, 2s, 4s ... up to INIT_RETRY_MAX_MS.
+ * Resolves false if shutdown begins first.
+ */
+async function retryUntilSuccess(step: string, fn: () => Promise<void>): Promise<boolean> {
+  for (let attempt = 1; !shuttingDown; attempt++) {
+    try {
+      await fn();
+      return true;
+    } catch (error) {
+      const retryInMs = Math.min(1000 * 2 ** (attempt - 1), INIT_RETRY_MAX_MS);
+      logger.error({
+        event: 'initialization_error',
+        step,
+        attempt,
+        retryInMs,
+        error: (error as Error).message,
+      });
+      await new Promise((resolve) => setTimeout(resolve, retryInMs));
+    }
+  }
+  return false;
+}
 
-    // Update metrics
-    updateTrieMetrics(stats);
+/**
+ * Databases created before phrase_counts.changed_at existed (init.sql only runs on a fresh
+ * volume) get the column here; the trie sync between instances polls it. The ALTER runs only
+ * when the column is missing, since even ADD COLUMN IF NOT EXISTS takes an exclusive lock on
+ * the table, and under a short lock_timeout so a busy table makes startup retry instead of
+ * stalling every other instance's reads and writes behind the queued lock.
+ */
+async function ensureChangedAtColumn(): Promise<void> {
+  const existing = await pgPool.query(
+    `SELECT 1 FROM information_schema.columns
+     WHERE table_name = 'phrase_counts' AND column_name = 'changed_at'`
+  );
+  if (existing.rowCount && existing.rowCount > 0) return;
 
-    // Start aggregation service
-    aggregationService.start();
-    logger.info({ event: 'aggregation_service_started' });
+  const client = await pgPool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(`SET LOCAL lock_timeout = '2s'`);
+    // Existing rows get an old timestamp so no instance re-reads the whole table as "changed";
+    // rows written from now on get NOW()
+    await client.query(
+      `ALTER TABLE phrase_counts ADD COLUMN IF NOT EXISTS changed_at TIMESTAMPTZ DEFAULT 'epoch'`
+    );
+    await client.query(`ALTER TABLE phrase_counts ALTER COLUMN changed_at SET DEFAULT NOW()`);
+    await client.query(
+      'CREATE INDEX IF NOT EXISTS idx_phrase_changed_at ON phrase_counts(changed_at)'
+    );
+    await client.query('COMMIT');
+    logger.info({ event: 'schema_migrated', column: 'phrase_counts.changed_at' });
   } catch (error) {
-    logger.error({
-      event: 'initialization_error',
-      error: (error as Error).message,
-      stack: (error as Error).stack,
-    });
-    logger.info({ event: 'continuing_with_empty_trie' });
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally {
+    client.release();
   }
 }
 
-// Graceful shutdown
-async function shutdown(): Promise<void> {
-  logger.info({ event: 'shutdown_started' });
+/**
+ * Load phrases from Postgres into the trie. Needs only Postgres, not Redis.
+ */
+async function loadTrie(): Promise<void> {
+  const startTime = Date.now();
 
-  aggregationService.stop();
+  await ensureChangedAtColumn();
+
+  // Read the clock before the load, so the sync re-reads anything written while it runs
+  syncReadFrom = await trieSync.startPoint();
+
+  // last_updated (epoch ms) feeds the ranking's recency score
+  const result = await pgPool.query(
+    `SELECT phrase, count, EXTRACT(EPOCH FROM last_updated::timestamptz) * 1000 AS last_updated_ms
+     FROM phrase_counts
+     WHERE is_filtered = false
+     ORDER BY count DESC
+     LIMIT 100000`
+  );
+  logger.info({ event: 'postgres_connected' });
+  logger.info({ event: 'loading_phrases', count: result.rows.length });
+
+  for (const row of result.rows) {
+    const lastUpdated = row.last_updated_ms === null ? undefined : Number(row.last_updated_ms);
+    trie.insert(row.phrase, parseInt(row.count), lastUpdated);
+  }
+
+  const stats = trie.getStats();
+  const durationMs = Date.now() - startTime;
+  trieLoaded = true;
+
+  logger.info({
+    event: 'trie_initialized',
+    phraseCount: stats.phraseCount,
+    nodeCount: stats.nodeCount,
+    durationMs,
+  });
+
+  auditLogger.logTrieRebuild('startup', stats.phraseCount, durationMs);
+
+  // Update metrics
+  updateTrieMetrics(stats);
+}
+
+// Initialize and load data. Each step retries until its dependency is reachable, so a
+// Postgres/Redis that comes up after the API (e.g. right after docker-compose up) is picked up.
+async function initialize(): Promise<void> {
+  logger.info({ event: 'initialization_started' });
+
+  if (!(await retryUntilSuccess('load_trie', loadTrie)) || shuttingDown) return;
+
+  // Start aggregation once the trie is loaded. Flushes need only Postgres (the upsert checks
+  // filtered_phrases itself), so a Redis outage doesn't leave logged searches unflushed.
+  const redisWasReady = redis.status === 'ready';
+  aggregationService.start();
+  logger.info({ event: 'aggregation_service_started' });
+
+  if (syncReadFrom) {
+    trieSync.start(syncReadFrom);
+    logger.info({ event: 'trie_sync_started', intervalMs: trieSync.getStats().intervalMs });
+  }
+
+  if (redisWasReady) {
+    logger.info({ event: 'redis_connected' });
+    return;
+  }
+
+  // start() mirrors filtered_phrases into the Redis blocked set and publishes trending; with
+  // Redis down that failed, so redo it once Redis is reachable
+  const redisReady = await retryUntilSuccess('redis', async () => {
+    await pingRedis();
+    logger.info({ event: 'redis_connected' });
+  });
+  if (!redisReady || shuttingDown) return;
+
+  await aggregationService.syncBlockedPhrases();
+  await aggregationService.aggregateTrendingWindows();
+}
+
+// Graceful shutdown
+async function shutdown(signal: string): Promise<void> {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  logger.info({ event: 'shutdown_started', signal });
+
+  setTimeout(() => {
+    logger.error({ event: 'shutdown_timeout', timeoutMs: SHUTDOWN_TIMEOUT_MS });
+    process.exit(1);
+  }, SHUTDOWN_TIMEOUT_MS).unref();
+
+  // Stop accepting new connections
+  server.close();
+
+  // The final flush writes to Postgres and Redis, so it must finish before they are closed
+  await aggregationService.stop();
+  await trieSync.stop();
   cleanupIdempotency();
 
   try {
-    await redis.quit();
+    // QUIT would wait in the offline queue while Redis is unreachable
+    if (redis.status === 'ready') {
+      await redis.quit();
+    } else {
+      redis.disconnect();
+    }
     logger.info({ event: 'redis_disconnected' });
   } catch (error) {
     logger.error({ event: 'redis_disconnect_error', error: (error as Error).message });
@@ -318,17 +543,17 @@ async function shutdown(): Promise<void> {
   process.exit(0);
 }
 
-process.on('SIGTERM', shutdown);
-process.on('SIGINT', shutdown);
+process.on('SIGTERM', () => void shutdown('SIGTERM'));
+process.on('SIGINT', () => void shutdown('SIGINT'));
 
-// Start server
-app.listen(PORT, async () => {
+// Start server. It answers liveness right away; /health/ready reports 503 until the trie is loaded.
+const server = app.listen(PORT, () => {
   logger.info({
     event: 'server_started',
     port: PORT,
     nodeEnv: process.env.NODE_ENV || 'development',
   });
-  await initialize();
+  void initialize();
 });
 
 export { app, redis, pgPool };

@@ -1,9 +1,16 @@
+import { useId } from 'react';
 import { useSearchStore } from '../stores/search-store';
 
 /** Renders search configuration controls for fuzzy matching toggle and max suggestions count. */
 export function SearchSettings() {
   const { fuzzyEnabled, maxSuggestions, toggleFuzzy, setMaxSuggestions } =
     useSearchStore();
+
+  // IDs that tie each label/description to its control, so both have accessible names
+  const id = useId();
+  const fuzzyId = `${id}-fuzzy`;
+  const fuzzyDescriptionId = `${id}-fuzzy-description`;
+  const maxSuggestionsId = `${id}-max-suggestions`;
 
   return (
     <div className="bg-white rounded-lg shadow p-4">
@@ -13,14 +20,19 @@ export function SearchSettings() {
         {/* Fuzzy matching toggle */}
         <div className="flex items-center justify-between">
           <div>
-            <label className="text-sm font-medium text-gray-700">
+            <label htmlFor={fuzzyId} className="text-sm font-medium text-gray-700">
               Fuzzy Matching
             </label>
-            <p className="text-xs text-gray-500">
+            <p id={fuzzyDescriptionId} className="text-xs text-gray-500">
               Find results with typos or misspellings
             </p>
           </div>
           <button
+            id={fuzzyId}
+            type="button"
+            role="switch"
+            aria-checked={fuzzyEnabled}
+            aria-describedby={fuzzyDescriptionId}
             onClick={toggleFuzzy}
             className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
               fuzzyEnabled ? 'bg-blue-600' : 'bg-gray-200'
@@ -36,10 +48,11 @@ export function SearchSettings() {
 
         {/* Max suggestions */}
         <div>
-          <label className="text-sm font-medium text-gray-700 block mb-2">
+          <label htmlFor={maxSuggestionsId} className="text-sm font-medium text-gray-700 block mb-2">
             Max Suggestions: {maxSuggestions}
           </label>
           <input
+            id={maxSuggestionsId}
             type="range"
             min="3"
             max="10"

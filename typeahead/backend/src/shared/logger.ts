@@ -28,6 +28,36 @@ const logger = pino({
   timestamp: pino.stdTimeFunctions.isoTime,
 });
 
+// Longest query prefix written to request logs (privacy: enough to debug a prefix lookup)
+const MAX_LOGGED_QUERY_LENGTH = 50;
+
+/**
+ * Request path without the query string. The query string holds the user's search text
+ * and userId, which are logged only in truncated or hashed form.
+ */
+function pathOf(req: { originalUrl?: string; url?: string }): string {
+  return (req.originalUrl || req.url || '').split('?')[0];
+}
+
+/**
+ * Truncated search text from the q parameter. Express parses repeated or bracketed
+ * params (q=a&q=b, q[x]=1) into arrays/objects, so anything but a string is dropped.
+ */
+function loggedQuery(query: Record<string, unknown> | undefined): string | undefined {
+  const q = query?.q;
+  return typeof q === 'string' ? q.substring(0, MAX_LOGGED_QUERY_LENGTH) : undefined;
+}
+
+/**
+ * Pseudonymous user id: a short hash that correlates one user's requests without
+ * writing the persistent identifier itself to the logs.
+ */
+function loggedUserId(req: { query?: Record<string, unknown>; headers?: Record<string, unknown> }): string {
+  const raw = req.query?.userId ?? req.headers?.['x-user-id'];
+  if (typeof raw !== 'string' || raw === '') return 'anonymous';
+  return `u_${crypto.createHash('sha256').update(raw).digest('hex').slice(0, 12)}`;
+}
+
 // Use pino-http with explicit any to avoid type conflicts
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const pinoHttpMiddleware = (pinoHttp as any)({
@@ -46,20 +76,20 @@ const pinoHttpMiddleware = (pinoHttp as any)({
   },
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   customSuccessMessage: (req: any) => {
-    return `${req.method} ${req.url} completed`;
+    return `${req.method} ${pathOf(req)} completed`;
   },
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   customErrorMessage: (req: any, _res: ServerResponse, err?: Error) => {
-    return `${req.method} ${req.url} failed: ${err?.message || 'unknown error'}`;
+    return `${req.method} ${pathOf(req)} failed: ${err?.message || 'unknown error'}`;
   },
   serializers: {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     req: (req: any) => ({
       id: req.id,
       method: req.method,
-      url: req.url,
-      query: req.query?.q ? req.query.q.substring(0, 50) : undefined,
-      userId: req.headers?.['x-user-id'] || 'anonymous',
+      path: pathOf(req),
+      query: loggedQuery(req.query),
+      userId: loggedUserId(req),
     }),
     res: (res: ServerResponse) => ({
       statusCode: res.statusCode,

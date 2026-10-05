@@ -5,7 +5,13 @@
     "module": "ESNext",
     "moduleResolution": "bundler",
     "allowSyntheticDefaultImports": true,
-    "strict": true
+    "strict": true,
+    "types": ["node"],
+    // tsc -b only type-checks vite.config.ts (Vite bundles it itself). A referenced project
+    // can't use noEmit, so emit declarations only, outside the source tree.
+    "emitDeclarationOnly": true,
+    "outDir": "./node_modules/.tmp/tsconfig.node",
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.node.tsbuildinfo"
   },
   "include": ["vite.config.ts"]
 }

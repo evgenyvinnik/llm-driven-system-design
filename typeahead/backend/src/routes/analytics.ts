@@ -2,9 +2,25 @@ import express, { Router, Request, Response } from 'express';
 import type { Pool } from 'pg';
 import type { Trie } from '../data-structures/trie.js';
 import type { AggregationService } from '../services/aggregation-service.js';
-import { cacheSuggestions, cacheTrending } from '../shared/cache-headers.js';
+// Admin dashboard data: the browser revalidates on every poll ('private, no-cache' + ETag,
+// a 304 when unchanged) instead of serving a public copy up to 60s old
+import { cacheUserSpecific } from '../shared/cache-headers.js';
 
 const router: Router = express.Router();
+
+const MAX_LIMIT = 500;
+const MAX_OFFSET = 1_000_000;
+
+/**
+ * Parse an integer query parameter, clamped to [min, max].
+ * Missing or non-integer values get the fallback.
+ */
+function parseIntParam(value: unknown, fallback: number, min: number, max: number): number {
+  if (typeof value !== 'string' || !/^\s*-?\d+\s*$/.test(value)) {
+    return fallback;
+  }
+  return Math.min(Math.max(Number(value), min), max);
+}
 
 interface QueryRow {
   query: string;
@@ -29,7 +45,7 @@ interface HourlyRow {
  * GET /api/v1/analytics/summary
  * Get analytics summary for the typeahead service.
  */
-router.get('/summary', cacheSuggestions, async (req: Request, res: Response) => {
+router.get('/summary', cacheUserSpecific, async (req: Request, res: Response) => {
   try {
     const pgPool = req.app.get('pgPool') as Pool;
     const trie = req.app.get('trie') as Trie;
@@ -94,7 +110,6 @@ router.get('/summary', cacheSuggestions, async (req: Request, res: Response) => 
     console.error('Analytics summary error:', error);
     res.status(500).json({
       error: 'Internal server error',
-      message: (error as Error).message,
     });
   }
 });
@@ -104,13 +119,15 @@ router.get('/summary', cacheSuggestions, async (req: Request, res: Response) => 
  * Get recent queries with optional filtering.
  *
  * Query params:
- * - limit: Max number of queries (default: 50)
+ * - limit: Max number of queries (default: 50, max: 500)
  * - offset: Pagination offset (default: 0)
  * - search: Filter by query text (optional)
  */
-router.get('/queries', cacheSuggestions, async (req: Request, res: Response) => {
+router.get('/queries', cacheUserSpecific, async (req: Request, res: Response) => {
   try {
-    const { limit = '50', offset = '0', search } = req.query;
+    const { search } = req.query;
+    const limit = parseIntParam(req.query.limit, 50, 1, MAX_LIMIT);
+    const offset = parseIntParam(req.query.offset, 0, 0, MAX_OFFSET);
     const pgPool = req.app.get('pgPool') as Pool;
 
     let query: string;
@@ -125,7 +142,7 @@ router.get('/queries', cacheSuggestions, async (req: Request, res: Response) => 
         ORDER BY count DESC
         LIMIT $2 OFFSET $3
       `;
-      params = [`%${search}%`, parseInt(limit as string), parseInt(offset as string)];
+      params = [`%${search}%`, limit, offset];
     } else {
       query = `
         SELECT query, COUNT(*) as count, MAX(timestamp) as last_seen
@@ -135,7 +152,7 @@ router.get('/queries', cacheSuggestions, async (req: Request, res: Response) => 
         ORDER BY count DESC
         LIMIT $1 OFFSET $2
       `;
-      params = [parseInt(limit as string), parseInt(offset as string)];
+      params = [limit, offset];
     }
 
     const result = await pgPool.query<QueryRow>(query, params);
@@ -148,15 +165,14 @@ router.get('/queries', cacheSuggestions, async (req: Request, res: Response) => 
       })),
       meta: {
         count: result.rows.length,
-        limit: parseInt(limit as string),
-        offset: parseInt(offset as string),
+        limit,
+        offset,
       },
     });
   } catch (error) {
     console.error('Analytics queries error:', error);
     res.status(500).json({
       error: 'Internal server error',
-      message: (error as Error).message,
     });
   }
 });
@@ -166,11 +182,11 @@ router.get('/queries', cacheSuggestions, async (req: Request, res: Response) => 
  * Get top phrases by count.
  *
  * Query params:
- * - limit: Max number of phrases (default: 50)
+ * - limit: Max number of phrases (default: 50, max: 500)
  */
-router.get('/top-phrases', cacheSuggestions, async (req: Request, res: Response) => {
+router.get('/top-phrases', cacheUserSpecific, async (req: Request, res: Response) => {
   try {
-    const { limit = '50' } = req.query;
+    const limit = parseIntParam(req.query.limit, 50, 1, MAX_LIMIT);
     const pgPool = req.app.get('pgPool') as Pool;
 
     const result = await pgPool.query<PhraseRow>(
@@ -181,7 +197,7 @@ router.get('/top-phrases', cacheSuggestions, async (req: Request, res: Response)
       ORDER BY count DESC
       LIMIT $1
     `,
-      [parseInt(limit as string)]
+      [limit]
     );
 
     res.json({
@@ -198,7 +214,6 @@ router.get('/top-phrases', cacheSuggestions, async (req: Request, res: Response)
     console.error('Analytics top-phrases error:', error);
     res.status(500).json({
       error: 'Internal server error',
-      message: (error as Error).message,
     });
   }
 });
@@ -207,7 +222,7 @@ router.get('/top-phrases', cacheSuggestions, async (req: Request, res: Response)
  * GET /api/v1/analytics/hourly
  * Get query volume by hour for the last 24 hours.
  */
-router.get('/hourly', cacheTrending, async (req: Request, res: Response) => {
+router.get('/hourly', cacheUserSpecific, async (req: Request, res: Response) => {
   try {
     const pgPool = req.app.get('pgPool') as Pool;
 
@@ -235,7 +250,6 @@ router.get('/hourly', cacheTrending, async (req: Request, res: Response) => {
     console.error('Analytics hourly error:', error);
     res.status(500).json({
       error: 'Internal server error',
-      message: (error as Error).message,
     });
   }
 });

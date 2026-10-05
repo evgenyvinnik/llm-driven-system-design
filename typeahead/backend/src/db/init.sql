@@ -3,10 +3,14 @@ CREATE TABLE IF NOT EXISTS phrase_counts (
   phrase VARCHAR(200) PRIMARY KEY,
   count BIGINT DEFAULT 0,
   last_updated TIMESTAMP DEFAULT NOW(),
-  is_filtered BOOLEAN DEFAULT FALSE
+  is_filtered BOOLEAN DEFAULT FALSE,
+  -- Set by every write (count, filter, restore); other API instances poll it to sync their tries.
+  -- last_updated is only the count's age (it feeds the recency score), so filter changes don't touch it.
+  changed_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 CREATE INDEX IF NOT EXISTS idx_phrase_count ON phrase_counts(count DESC);
+CREATE INDEX IF NOT EXISTS idx_phrase_changed_at ON phrase_counts(changed_at);
 
 -- Query logs (raw, for aggregation)
 CREATE TABLE IF NOT EXISTS query_logs (

@@ -21,6 +21,12 @@ export interface SuggestionsResponse {
     count: number;
     responseTimeMs: number;
     cached: boolean;
+    // Circuit-breaker fallback: an empty list served while the suggestion service is unhealthy
+    degraded?: boolean;
+    // Set by the client when this tab's memory cache answered (no request was sent)
+    clientCache?: boolean;
+    // Set by the client: how long the lookup took (memory cache or network), excluding rendering
+    clientLatencyMs?: number;
   };
 }
 

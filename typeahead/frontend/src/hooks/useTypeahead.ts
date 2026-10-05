@@ -7,10 +7,31 @@ import { api } from '../services/api.js';
 import {
   getCachedSuggestions,
   cacheSuggestions,
+  suggestionCacheKey,
   addToHistory,
   updatePopularity,
 } from '../db/database.js';
 import type { Suggestion, SuggestionsResponse } from '../types';
+
+// IndexedDB is a best-effort layer: it can be unavailable (blocked storage, private modes,
+// quota), and a failure there must never keep a request from reaching the network.
+async function readIdbCache(key: string): Promise<Suggestion[] | null> {
+  try {
+    return await getCachedSuggestions(key);
+  } catch {
+    return null;
+  }
+}
+
+async function writeIdbCache(key: string, suggestions: Suggestion[]): Promise<void> {
+  try {
+    await cacheSuggestions(key, suggestions);
+  } catch {
+    // Offline copy not stored; the online result is unaffected
+  }
+}
+
+const ignoreIdbError = () => {};
 
 export interface UseTypeaheadOptions {
   /** Debounce delay in milliseconds */
@@ -40,7 +61,10 @@ export interface UseTypeaheadReturn {
   isLoading: boolean;
   /** Whether dropdown is open */
   isOpen: boolean;
-  /** Set dropdown open state */
+  /**
+   * Set dropdown open state. Closing it (e.g. on blur) also keeps late fetch results from
+   * reopening it until the query is edited.
+   */
   setIsOpen: (open: boolean) => void;
   /** Currently highlighted index */
   highlightedIndex: number;
@@ -101,26 +125,74 @@ export function useTypeahead(options: UseTypeaheadOptions = {}): UseTypeaheadRet
     onSubmit,
   } = options;
 
-  const [query, setQuery] = useState('');
+  const [query, setQueryState] = useState('');
   const [suggestions, setSuggestions] = useState<Suggestion[]>([]);
   const [isLoading, setIsLoading] = useState(false);
-  const [isOpen, setIsOpen] = useState(false);
+  const [isOpen, setIsOpenState] = useState(false);
   const [highlightedIndex, setHighlightedIndex] = useState(-1);
   const [error, setError] = useState<Error | null>(null);
   const [isCached, setIsCached] = useState(false);
 
   const debounceTimer = useRef<number | undefined>(undefined);
+  // Sequence number of the latest fetch; every settle of an older fetch is ignored, so a late
+  // response cannot overwrite newer results or reopen a list that was closed since
+  const requestSeq = useRef(0);
+  // Whether the latest fetch is waiting on the network (so cancelling has something to abort)
+  const inFlight = useRef(false);
+  // Query set by selectSuggestion: the effect does not fetch it, so the list stays closed
+  const suppressedQuery = useRef<string | null>(null);
+  // The query last selected or submitted (and logged), so a follow-up Enter doesn't log it twice
+  const committedQuery = useRef<string | null>(null);
+  // The list was closed explicitly (blur, Escape, Tab, selection, submit) since the user last
+  // edited the query: a fetch that completes now refreshes the suggestions but does not reopen it
+  const dismissed = useRef(false);
   const listboxId = useUniqueId('typeahead-listbox');
+
+  // Editing the query un-dismisses the list; an explicit close dismisses it
+  const setQuery = useCallback((value: string) => {
+    dismissed.current = false;
+    setQueryState(value);
+  }, []);
+
+  const setIsOpen = useCallback((open: boolean) => {
+    dismissed.current = !open;
+    setIsOpenState(open);
+  }, []);
+
+  // Open state driven by fetch results, which must not override an explicit close
+  const showResults = useCallback((hasResults: boolean) => {
+    if (!dismissed.current) setIsOpenState(hasResults);
+  }, []);
+
+  // Drop the pending debounce and the in-flight fetch (input cleared, selection, Escape/Tab)
+  const cancelPending = useCallback(() => {
+    if (debounceTimer.current) {
+      clearTimeout(debounceTimer.current);
+      debounceTimer.current = undefined;
+    }
+    requestSeq.current++;
+    if (inFlight.current) {
+      inFlight.current = false;
+      api.cancelSuggestions(listboxId); // optimization only; the sequence check is the guarantee
+    }
+    setIsLoading(false);
+  }, [listboxId]);
 
   // Fetch suggestions with multi-layer caching
   const fetchSuggestions = useCallback(
     async (prefix: string) => {
+      const seq = ++requestSeq.current;
+      const isCurrent = () => seq === requestSeq.current;
+
       if (prefix.length < minChars) {
+        // Also drops an older fetch still in flight, whose finally no longer clears isLoading
+        cancelPending();
         setSuggestions([]);
-        setIsOpen(false);
+        setIsOpenState(false);
         return;
       }
 
+      const cacheKey = suggestionCacheKey(prefix, { limit, fuzzy, userId });
       setIsLoading(true);
       setError(null);
 
@@ -129,53 +201,53 @@ export function useTypeahead(options: UseTypeaheadOptions = {}): UseTypeaheadRet
         // The api.getSuggestions already checks memoryCache
 
         // Layer 2: IndexedDB (for offline support)
-        const cachedFromDb = await getCachedSuggestions(prefix);
+        const cachedFromDb = await readIdbCache(cacheKey);
+        if (!isCurrent()) return;
         if (cachedFromDb) {
-          setSuggestions(cachedFromDb as Suggestion[]);
+          setSuggestions(cachedFromDb);
           setIsCached(true);
-          setIsOpen(true);
+          showResults(cachedFromDb.length > 0);
           // Continue to fetch fresh data in background
         }
 
         // Layer 3: Network
+        inFlight.current = true;
         const response: SuggestionsResponse = await api.getSuggestions(prefix, {
           limit,
           userId,
           fuzzy,
+          group: listboxId,
         });
+        if (!isCurrent()) return;
 
         setSuggestions(response.suggestions);
         setIsCached(response.meta.cached);
-        setIsOpen(response.suggestions.length > 0);
+        showResults(response.suggestions.length > 0);
 
-        // Update IndexedDB cache
-        await cacheSuggestions(
-          prefix,
-          response.suggestions.map((s) => ({
-            phrase: s.phrase,
-            count: s.count,
-            score: s.score,
-          }))
-        );
+        // Update IndexedDB cache (not awaited: it must not delay or fail the online path)
+        void writeIdbCache(cacheKey, response.suggestions);
       } catch (err) {
-        // Don't show error for abort
-        if ((err as Error).name === 'AbortError') {
+        // Superseded or cancelled requests are not errors
+        if (!isCurrent() || (err as Error).name === 'AbortError') {
           return;
         }
         setError(err as Error);
 
         // Try to use IndexedDB cache as fallback
-        const fallback = await getCachedSuggestions(prefix);
-        if (fallback) {
-          setSuggestions(fallback as Suggestion[]);
+        const fallback = await readIdbCache(cacheKey);
+        if (fallback && isCurrent()) {
+          setSuggestions(fallback);
           setIsCached(true);
-          setIsOpen(true);
+          showResults(fallback.length > 0);
         }
       } finally {
-        setIsLoading(false);
+        if (isCurrent()) {
+          inFlight.current = false;
+          setIsLoading(false);
+        }
       }
     },
-    [limit, userId, fuzzy, minChars]
+    [limit, userId, fuzzy, minChars, listboxId, showResults, cancelPending]
   );
 
   // Debounced query effect
@@ -184,14 +256,23 @@ export function useTypeahead(options: UseTypeaheadOptions = {}): UseTypeaheadRet
       clearTimeout(debounceTimer.current);
     }
 
+    // The query was just set by selecting a suggestion: fetching it would reopen the list
+    const suppressed = suppressedQuery.current;
+    suppressedQuery.current = null;
+    if (suppressed !== null && query === suppressed) {
+      return;
+    }
+
     if (!query.trim()) {
+      cancelPending();
       setSuggestions([]);
-      setIsOpen(false);
+      setIsOpenState(false);
       return;
     }
 
     debounceTimer.current = window.setTimeout(() => {
-      fetchSuggestions(query.trim());
+      // trimStart, not trim: a trailing space marks a word boundary ("java " -> "java spring")
+      fetchSuggestions(query.trimStart());
     }, debounceMs);
 
     return () => {
@@ -199,7 +280,7 @@ export function useTypeahead(options: UseTypeaheadOptions = {}): UseTypeaheadRet
         clearTimeout(debounceTimer.current);
       }
     };
-  }, [query, debounceMs, fetchSuggestions]);
+  }, [query, debounceMs, fetchSuggestions, cancelPending]);
 
   // Reset highlighted index when suggestions change
   useEffect(() => {
@@ -211,13 +292,16 @@ export function useTypeahead(options: UseTypeaheadOptions = {}): UseTypeaheadRet
     (index: number) => {
       if (index >= 0 && index < suggestions.length) {
         const selected = suggestions[index];
-        setQuery(selected.phrase);
+        cancelPending();
+        suppressedQuery.current = selected.phrase;
+        committedQuery.current = selected.phrase;
+        setQueryState(selected.phrase);
         setIsOpen(false);
         setHighlightedIndex(-1);
 
-        // Track in history and popularity
-        addToHistory(selected.phrase);
-        updatePopularity(selected.phrase);
+        // Track in history and popularity (best-effort, IndexedDB may be unavailable)
+        addToHistory(selected.phrase).catch(ignoreIdbError);
+        updatePopularity(selected.phrase).catch(ignoreIdbError);
 
         // Log to backend
         api.logSearch(selected.phrase, userId).catch(() => {});
@@ -225,32 +309,45 @@ export function useTypeahead(options: UseTypeaheadOptions = {}): UseTypeaheadRet
         onSelect?.(selected.phrase);
       }
     },
-    [suggestions, userId, onSelect]
+    [suggestions, userId, onSelect, cancelPending, setIsOpen]
   );
 
   // Submit current query
   const submitQuery = useCallback(() => {
     if (!query.trim()) return;
 
+    // A pending or in-flight fetch would reopen the list after the submit closed it
+    cancelPending();
     setIsOpen(false);
     setHighlightedIndex(-1);
+    committedQuery.current = query;
 
-    // Track submission
-    addToHistory(query);
-    updatePopularity(query);
+    // Track submission (IndexedDB is best-effort)
+    addToHistory(query).catch(ignoreIdbError);
+    updatePopularity(query).catch(ignoreIdbError);
     api.logSearch(query, userId).catch(() => {});
 
     onSubmit?.(query);
-  }, [query, userId, onSubmit]);
+  }, [query, userId, onSubmit, cancelPending, setIsOpen]);
 
   // Keyboard navigation handler
   const handleKeyDown = useCallback(
     (event: React.KeyboardEvent) => {
+      // Dismissing also drops the pending/in-flight fetch, or its result reopens the list
+      if (event.key === 'Escape' || event.key === 'Tab') {
+        cancelPending();
+      }
+
       if (!isOpen) {
         if (event.key === 'ArrowDown' && suggestions.length > 0) {
           setIsOpen(true);
           setHighlightedIndex(0);
           event.preventDefault();
+        } else if (event.key === 'Enter' && query.trim() && query !== committedQuery.current) {
+          // No list to pick from (no results or dismissed): Enter still submits. Default is left
+          // alone so a surrounding form submits natively too. A query that was just selected or
+          // submitted is already logged, so only the native submit happens.
+          submitQuery();
         }
         return;
       }
@@ -286,7 +383,16 @@ export function useTypeahead(options: UseTypeaheadOptions = {}): UseTypeaheadRet
           break;
       }
     },
-    [isOpen, suggestions.length, highlightedIndex, selectSuggestion, submitQuery]
+    [
+      isOpen,
+      suggestions.length,
+      query,
+      highlightedIndex,
+      selectSuggestion,
+      submitQuery,
+      cancelPending,
+      setIsOpen,
+    ]
   );
 
   // ARIA input props

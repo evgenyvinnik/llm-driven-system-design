@@ -76,18 +76,21 @@ export function TrendingList({ onSelect, limit = 10 }: TrendingListProps) {
       </h3>
       <ul className="space-y-2">
         {trending.map((item, index) => (
-          <li
-            key={item.phrase}
-            className="flex items-center gap-3 p-2 rounded hover:bg-gray-50 cursor-pointer transition-colors"
-            onClick={() => onSelect?.(item.phrase)}
-          >
-            <span className="text-gray-400 font-medium text-sm w-6">
-              {index + 1}
-            </span>
-            <span className="text-gray-800 flex-1">{item.phrase}</span>
-            <span className="text-xs text-gray-400">
-              {item.score.toFixed(0)}
-            </span>
+          <li key={item.phrase}>
+            {/* A button, so trending searches are in the tab order and work with Enter/Space */}
+            <button
+              type="button"
+              className="w-full flex items-center gap-3 p-2 rounded text-left hover:bg-gray-50 cursor-pointer transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
+              onClick={() => onSelect?.(item.phrase)}
+            >
+              <span className="text-gray-400 font-medium text-sm w-6">
+                {index + 1}
+              </span>
+              <span className="text-gray-800 flex-1">{item.phrase}</span>
+              <span className="text-xs text-gray-400">
+                {item.score.toFixed(0)}
+              </span>
+            </button>
           </li>
         ))}
       </ul>

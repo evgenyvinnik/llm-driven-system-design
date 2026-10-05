@@ -1,14 +1,17 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 import { TanStackRouterVite } from '@tanstack/router-plugin/vite';
-import path from 'path';
+import { fileURLToPath } from 'node:url';
+
+// The package is ESM ("type": "module"), so there is no __dirname; resolve from this file's URL
+const fromRoot = (relativePath: string) => fileURLToPath(new URL(relativePath, import.meta.url));
 
 // https://vitejs.dev/config/
 export default defineConfig({
   plugins: [TanStackRouterVite(), react()],
   resolve: {
     alias: {
-      '@': path.resolve(__dirname, './src'),
+      '@': fromRoot('./src'),
     },
   },
   server: {
@@ -24,8 +27,8 @@ export default defineConfig({
   build: {
     rollupOptions: {
       input: {
-        main: path.resolve(__dirname, 'index.html'),
-        sw: path.resolve(__dirname, 'src/sw.ts'),
+        main: fromRoot('./index.html'),
+        sw: fromRoot('./src/sw.ts'),
       },
       output: {
         entryFileNames: (chunkInfo) => {

@@ -64,9 +64,17 @@ export function ManagementTab() {
     e.preventDefault();
     if (!newPhrase.trim()) return;
 
+    const requestedCount = Math.max(parseInt(newCount, 10) || 1, 1);
     try {
-      await api.addPhrase(newPhrase.trim(), parseInt(newCount) || 1);
-      showMessage('success', `Added phrase: ${newPhrase}`);
+      // An existing phrase keeps the higher of its count and the requested one, so report the
+      // count that was actually stored rather than implying the phrase is new
+      const result = await api.addPhrase(newPhrase.trim(), requestedCount);
+      const fallback =
+        result.count > requestedCount
+          ? `already exists with a higher count (${result.count.toLocaleString()}), which was kept`
+          : `saved with count ${result.count.toLocaleString()}`;
+      // The server's message also says whether a removed phrase was restored
+      showMessage('success', `"${result.phrase}": ${result.message || fallback}`);
       setNewPhrase('');
       setNewCount('1');
     } catch (err) {
@@ -196,19 +204,26 @@ function AddPhraseSection({
   return (
     <div className="bg-white rounded-lg shadow p-6">
       <h3 className="font-semibold text-gray-900 mb-4">Add Phrase</h3>
+      <p className="text-sm text-gray-500 mb-4">
+        Adds a new phrase, or raises an existing phrase to this count. Counts are never lowered.
+      </p>
       <form onSubmit={onSubmit} className="flex flex-wrap gap-4">
         <input
           type="text"
           value={newPhrase}
           onChange={(e) => onPhraseChange(e.target.value)}
           placeholder="Phrase"
+          aria-label="Phrase"
           className="flex-1 min-w-[200px] px-4 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
         />
         <input
           type="number"
+          min={1}
+          step={1}
           value={newCount}
           onChange={(e) => onCountChange(e.target.value)}
           placeholder="Count"
+          aria-label="Count"
           className="w-24 px-4 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
         />
         <button

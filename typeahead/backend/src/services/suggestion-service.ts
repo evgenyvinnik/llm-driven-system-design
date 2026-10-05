@@ -4,6 +4,7 @@
  * For local development, it uses a single trie with Redis caching.
  */
 import type { Redis } from 'ioredis';
+import { normalizePhrase, normalizePrefix } from '../data-structures/trie.js';
 import type { Trie, Suggestion } from '../data-structures/trie.js';
 import type { RankingService, RankedSuggestion } from './ranking-service.js';
 
@@ -17,17 +18,35 @@ export interface FuzzySuggestionOptions extends SuggestionOptions {
   maxDistance?: number;
 }
 
-interface FuzzyMatch extends Suggestion {
-  distance?: number;
-  fuzzyPenalty?: number;
-  isFuzzy?: boolean;
+export interface SuggestionResult {
+  suggestions: RankedSuggestion[];
+  cached: boolean;
 }
+
+interface FuzzyMatch extends RankedSuggestion {
+  distance: number;
+  isFuzzy: boolean;
+}
+
+const DEFAULT_LIMIT = 5;
+const MAX_LIMIT = 100;
+// phrase_counts.phrase is VARCHAR(200): a longer prefix can't match, so skip the trie and cache
+const MAX_PREFIX_LENGTH = 200;
+// Fuzzy work grows with prefix length; long prefixes aren't worth correcting
+const MAX_FUZZY_PREFIX_LENGTH = 50;
+// Fuzzy candidates passed to the ranker (each costs Redis lookups)
+const FUZZY_CANDIDATES = 20;
+// A cache read slower than this is treated as a miss and served from the trie
+const CACHE_READ_TIMEOUT_MS = 50;
 
 export class SuggestionService {
   private trie: Trie;
   private redis: Redis;
   private rankingService: RankingService;
   private cachePrefix: string = 'suggestions:';
+  // Prefix entries live under their own namespace, so no prefix can collide with the popular key
+  private prefixCachePrefix: string = `${this.cachePrefix}prefix:`;
+  private popularCacheKey: string = `${this.cachePrefix}popular`;
   private cacheTTL: number = 60; // 1 minute cache
 
   constructor(trie: Trie, redis: Redis, rankingService: RankingService) {
@@ -43,38 +62,52 @@ export class SuggestionService {
     prefix: string,
     options: SuggestionOptions = {}
   ): Promise<RankedSuggestion[]> {
-    const { userId = null, limit = 5, skipCache = false } = options;
+    const { suggestions } = await this.getSuggestionsWithMeta(prefix, options);
+    return suggestions;
+  }
 
-    if (!prefix || prefix.trim().length === 0) {
+  /**
+   * Get suggestions for a prefix, reporting whether the base list came from the Redis cache.
+   */
+  async getSuggestionsWithMeta(
+    prefix: string,
+    options: SuggestionOptions = {}
+  ): Promise<SuggestionResult> {
+    const { userId = null, skipCache = false } = options;
+    const limit = this._normalizeLimit(options.limit);
+
+    // Keeps a trailing space, so "java " completes the next word instead of matching "javascript"
+    const normalizedPrefix = normalizePrefix(prefix || '');
+
+    if (normalizedPrefix.length === 0) {
       // Return top popular queries when no prefix
-      const popular = await this._getPopularQueries(limit);
+      const { suggestions: popular, cached } = await this._getPopularQueries(limit);
       // Convert Suggestion[] to RankedSuggestion[]
-      return popular.map(s => ({
-        ...s,
-        score: s.count,
-        scores: { popularity: s.count, recency: 0, personal: 0, trending: 0, match: 0 }
-      }));
+      return {
+        suggestions: popular.map((s) => ({
+          ...s,
+          score: s.count,
+          scores: { popularity: s.count, recency: 0, personal: 0, trending: 0, match: 0 },
+        })),
+        cached,
+      };
     }
 
-    const normalizedPrefix = prefix.toLowerCase().trim();
+    if (normalizedPrefix.length > MAX_PREFIX_LENGTH) {
+      return { suggestions: [], cached: false };
+    }
+
+    const cacheKey = `${this.prefixCachePrefix}${normalizedPrefix}`;
 
     // Try cache first (unless skipped)
-    if (!skipCache) {
-      const cached = await this._getCached(normalizedPrefix);
-      if (cached) {
-        const rankedSuggestions = await this.rankingService.rank(cached, {
-          userId,
-          prefix: normalizedPrefix,
-        });
-        return rankedSuggestions.slice(0, limit);
-      }
+    let baseSuggestions = skipCache ? null : await this._getCached(cacheKey);
+    const cached = baseSuggestions !== null;
+
+    if (baseSuggestions === null) {
+      // Get from trie, and cache the base suggestions without waiting on Redis
+      baseSuggestions = this.trie.getSuggestions(normalizedPrefix);
+      void this._cache(cacheKey, baseSuggestions);
     }
-
-    // Get from trie
-    const baseSuggestions = this.trie.getSuggestions(normalizedPrefix);
-
-    // Cache the base suggestions
-    await this._cache(normalizedPrefix, baseSuggestions);
 
     // Apply ranking
     const rankedSuggestions = await this.rankingService.rank(baseSuggestions, {
@@ -82,50 +115,45 @@ export class SuggestionService {
       prefix: normalizedPrefix,
     });
 
-    return rankedSuggestions.slice(0, limit);
+    return { suggestions: rankedSuggestions.slice(0, limit), cached };
   }
 
   /**
    * Get fuzzy suggestions for typo correction.
-   * Uses Levenshtein distance to find close matches.
+   * Exact prefix matches come first; the rest are phrases whose start is within a small
+   * edit distance of the prefix, ranked with a penalty per edit.
    */
   async getFuzzySuggestions(
     prefix: string,
     options: FuzzySuggestionOptions = {}
   ): Promise<(RankedSuggestion | FuzzyMatch)[]> {
-    const { maxDistance = 2, limit = 5 } = options;
+    const { maxDistance = 2, userId = null } = options;
+    const limit = this._normalizeLimit(options.limit);
 
     // First get exact matches
-    const exactMatches = await this.getSuggestions(prefix, options);
+    const exactMatches = await this.getSuggestions(prefix, { ...options, limit });
 
     if (exactMatches.length >= limit) {
       return exactMatches;
     }
 
     // Get fuzzy matches from nearby prefixes
-    const fuzzyMatches = await this._getFuzzyMatches(prefix, maxDistance);
+    const fuzzyMatches = await this._getFuzzyMatches(
+      normalizePrefix(prefix || ''),
+      maxDistance,
+      limit,
+      userId
+    );
 
-    // Merge and deduplicate
+    // Merge and deduplicate: exact matches first, then fuzzy matches by score
     const allMatches: (RankedSuggestion | FuzzyMatch)[] = [...exactMatches];
+    const seen = new Set(exactMatches.map((m) => m.phrase));
     for (const match of fuzzyMatches) {
-      if (!allMatches.some((m) => m.phrase === match.phrase)) {
-        allMatches.push({
-          ...match,
-          isFuzzy: true,
-        });
+      if (!seen.has(match.phrase)) {
+        seen.add(match.phrase);
+        allMatches.push(match);
       }
     }
-
-    // Sort by score (exact matches first, then fuzzy by count)
-    allMatches.sort((a, b) => {
-      const aFuzzy = 'isFuzzy' in a && a.isFuzzy;
-      const bFuzzy = 'isFuzzy' in b && b.isFuzzy;
-      if (aFuzzy && !bFuzzy) return 1;
-      if (!aFuzzy && bFuzzy) return -1;
-      const aScore = 'score' in a ? a.score : a.count;
-      const bScore = 'score' in b ? b.score : b.count;
-      return bScore - aScore;
-    });
 
     return allMatches.slice(0, limit);
   }
@@ -133,146 +161,91 @@ export class SuggestionService {
   /**
    * Get fuzzy matches using edit distance.
    */
-  private async _getFuzzyMatches(prefix: string, maxDistance: number): Promise<FuzzyMatch[]> {
-    const normalizedPrefix = prefix.toLowerCase().trim();
-    const fuzzyMatches: FuzzyMatch[] = [];
-
-    // Generate variations with 1-character edits
-    const variations = this._generateEditVariations(normalizedPrefix);
-
-    for (const variation of variations) {
-      const suggestions = this.trie.getSuggestions(variation);
-      for (const suggestion of suggestions) {
-        const distance = this._levenshteinDistance(
-          normalizedPrefix,
-          suggestion.phrase.slice(0, normalizedPrefix.length + maxDistance)
-        );
-
-        if (distance <= maxDistance && distance > 0) {
-          fuzzyMatches.push({
-            ...suggestion,
-            distance,
-            fuzzyPenalty: distance * 0.2,
-          });
-        }
-      }
+  private async _getFuzzyMatches(
+    normalizedPrefix: string,
+    maxDistance: number,
+    limit: number,
+    userId: string | null
+  ): Promise<FuzzyMatch[]> {
+    const length = normalizedPrefix.length;
+    if (length === 0 || length > MAX_FUZZY_PREFIX_LENGTH) {
+      return [];
     }
 
-    // Deduplicate and sort by count
-    const seen = new Set<string>();
-    return fuzzyMatches
-      .filter((m) => {
-        if (seen.has(m.phrase)) return false;
-        seen.add(m.phrase);
-        return true;
-      })
-      .sort((a, b) => b.count - a.count);
-  }
-
-  /**
-   * Generate single-character edit variations of a prefix.
-   */
-  private _generateEditVariations(prefix: string): string[] {
-    const variations = new Set<string>();
-    const chars = 'abcdefghijklmnopqrstuvwxyz0123456789 ';
-
-    // Deletions
-    for (let i = 0; i < prefix.length; i++) {
-      variations.add(prefix.slice(0, i) + prefix.slice(i + 1));
+    // Allow 1 edit for 3-5 characters and 2 beyond that: on shorter prefixes nearly
+    // every phrase is within reach, so "corrections" would just be noise
+    const lengthBudget = length <= 2 ? 0 : length <= 5 ? 1 : 2;
+    const distanceBudget = Math.min(Number.isFinite(maxDistance) ? maxDistance : 2, lengthBudget);
+    if (distanceBudget < 1) {
+      return [];
     }
 
-    // Substitutions
-    for (let i = 0; i < prefix.length; i++) {
-      for (const char of chars) {
-        variations.add(prefix.slice(0, i) + char + prefix.slice(i + 1));
-      }
-    }
+    // Distance 0 means an exact prefix match, which getSuggestions already returned
+    const candidates = this.trie
+      .findFuzzy(normalizedPrefix, distanceBudget)
+      .filter((m) => m.distance > 0)
+      .sort((a, b) => a.distance - b.distance || b.count - a.count)
+      .slice(0, Math.max(limit, FUZZY_CANDIDATES))
+      .map((m) => ({ ...m, fuzzyPenalty: m.distance * 0.2 }));
 
-    // Insertions (only at end to limit variations)
-    for (const char of chars) {
-      variations.add(prefix + char);
-    }
+    const ranked = (await this.rankingService.rank(candidates, {
+      userId,
+      prefix: normalizedPrefix,
+    })) as Array<RankedSuggestion & { distance: number }>;
 
-    return Array.from(variations).filter((v) => v.length > 0);
-  }
-
-  /**
-   * Calculate Levenshtein distance between two strings.
-   */
-  private _levenshteinDistance(s1: string, s2: string): number {
-    const m = s1.length;
-    const n = s2.length;
-
-    if (m === 0) return n;
-    if (n === 0) return m;
-    if (s1 === s2) return 0;
-
-    const dp: number[][] = Array(m + 1)
-      .fill(null)
-      .map(() => Array(n + 1).fill(0));
-
-    for (let i = 0; i <= m; i++) dp[i][0] = i;
-    for (let j = 0; j <= n; j++) dp[0][j] = j;
-
-    for (let i = 1; i <= m; i++) {
-      for (let j = 1; j <= n; j++) {
-        if (s1[i - 1] === s2[j - 1]) {
-          dp[i][j] = dp[i - 1][j - 1];
-        } else {
-          dp[i][j] =
-            1 +
-            Math.min(
-              dp[i - 1][j], // deletion
-              dp[i][j - 1], // insertion
-              dp[i - 1][j - 1] // substitution
-            );
-        }
-      }
-    }
-
-    return dp[m][n];
+    return ranked.map((m) => ({ ...m, isFuzzy: true }));
   }
 
   /**
    * Get popular queries when no prefix is provided.
    */
-  private async _getPopularQueries(limit: number): Promise<Suggestion[]> {
-    const cacheKey = `${this.cachePrefix}popular`;
-
-    try {
-      const cached = await this.redis.get(cacheKey);
-      if (cached) {
-        return (JSON.parse(cached) as Suggestion[]).slice(0, limit);
-      }
-    } catch (error) {
-      console.error('Redis error:', (error as Error).message);
+  private async _getPopularQueries(
+    limit: number
+  ): Promise<{ suggestions: Suggestion[]; cached: boolean }> {
+    const cached = await this._getCached(this.popularCacheKey);
+    if (cached) {
+      return { suggestions: cached.slice(0, limit), cached: true };
     }
 
     // Get from trie root
     const popular = this.trie.getSuggestions('');
+    void this._cache(this.popularCacheKey, popular);
 
-    try {
-      await this.redis.setex(cacheKey, this.cacheTTL, JSON.stringify(popular));
-    } catch (error) {
-      console.error('Redis cache error:', (error as Error).message);
-    }
-
-    return popular.slice(0, limit);
+    return { suggestions: popular.slice(0, limit), cached: false };
   }
 
   /**
-   * Get cached suggestions.
+   * Whether the Redis client can serve commands now. While it is reconnecting, ioredis
+   * queues commands and waits out its retries (seconds), so skip the cache instead.
    */
-  private async _getCached(prefix: string): Promise<Suggestion[] | null> {
-    const cacheKey = `${this.cachePrefix}${prefix}`;
+  private _cacheAvailable(): boolean {
+    return !this.redis.status || this.redis.status === 'ready';
+  }
 
+  /**
+   * Get cached suggestions. Any Redis failure or slow read is a miss, never an error.
+   */
+  private async _getCached(cacheKey: string): Promise<Suggestion[] | null> {
+    if (!this._cacheAvailable()) {
+      return null;
+    }
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      const cached = await this.redis.get(cacheKey);
+      const timeout = new Promise<null>((resolve) => {
+        timer = setTimeout(() => resolve(null), CACHE_READ_TIMEOUT_MS);
+      });
+      const cached = await Promise.race([this.redis.get(cacheKey), timeout]);
       if (cached) {
-        return JSON.parse(cached) as Suggestion[];
+        const parsed: unknown = JSON.parse(cached);
+        if (Array.isArray(parsed)) {
+          return parsed as Suggestion[];
+        }
       }
     } catch (error) {
       console.error('Redis error:', (error as Error).message);
+    } finally {
+      clearTimeout(timer);
     }
 
     return null;
@@ -281,8 +254,11 @@ export class SuggestionService {
   /**
    * Cache suggestions.
    */
-  private async _cache(prefix: string, suggestions: Suggestion[]): Promise<void> {
-    const cacheKey = `${this.cachePrefix}${prefix}`;
+  private async _cache(cacheKey: string, suggestions: Suggestion[]): Promise<void> {
+    // An empty trie (still loading, or failed to load) would cache [] for every instance
+    if (this.trie.size === 0 || !this._cacheAvailable()) {
+      return;
+    }
 
     try {
       await this.redis.setex(cacheKey, this.cacheTTL, JSON.stringify(suggestions));
@@ -292,22 +268,72 @@ export class SuggestionService {
   }
 
   /**
-   * Clear cache for a prefix (call when trie is updated).
+   * Invalidate every cached list a phrase can appear in: each of its prefixes and the
+   * popular list. Call after adding, updating or removing the phrase in the trie.
    */
-  async clearCache(prefix: string | null = null): Promise<void> {
+  async invalidatePhrase(phrase: string): Promise<void> {
+    const normalizedPhrase = normalizePhrase(phrase || '');
+    if (normalizedPhrase.length === 0 || !this._cacheAvailable()) {
+      return;
+    }
+
+    const keys = [this.popularCacheKey];
+    let prefix = '';
+    for (const char of normalizedPhrase) {
+      prefix += char;
+      if (prefix.length > MAX_PREFIX_LENGTH) break; // longer prefixes are never cached
+      keys.push(`${this.prefixCachePrefix}${prefix}`);
+    }
+
     try {
-      if (prefix) {
-        await this.redis.del(`${this.cachePrefix}${prefix}`);
-      } else {
-        // Clear all suggestion caches
-        const keys = await this.redis.keys(`${this.cachePrefix}*`);
-        if (keys.length > 0) {
-          await this.redis.del(...keys);
-        }
-      }
+      await this.redis.del(...keys);
+    } catch (error) {
+      console.error('Redis invalidate error:', (error as Error).message);
+    }
+  }
+
+  /**
+   * Clear every suggestion cache entry (admin request, trie rebuild).
+   * Returns false when Redis isn't reachable, so callers don't report a clear that didn't happen.
+   */
+  async clearCache(): Promise<boolean> {
+    if (!this._cacheAvailable()) {
+      console.error('Redis clear cache skipped: Redis not ready');
+      return false;
+    }
+
+    try {
+      await this._deleteMatching(`${this.cachePrefix}*`);
+      return true;
     } catch (error) {
       console.error('Redis clear cache error:', (error as Error).message);
+      return false;
     }
+  }
+
+  /**
+   * Delete keys matching a pattern with SCAN, which doesn't block Redis like KEYS.
+   */
+  private async _deleteMatching(pattern: string): Promise<void> {
+    let cursor = '0';
+    do {
+      const [next, keys] = await this.redis.scan(cursor, 'MATCH', pattern, 'COUNT', 500);
+      if (keys.length > 0) {
+        await this.redis.del(...keys);
+      }
+      cursor = next;
+    } while (cursor !== '0');
+  }
+
+  /**
+   * Coerce limit to an integer in [1, MAX_LIMIT]; anything non-numeric gets the default.
+   */
+  private _normalizeLimit(limit: number | undefined): number {
+    const n = Math.floor(Number(limit));
+    if (!Number.isFinite(n)) {
+      return DEFAULT_LIMIT;
+    }
+    return Math.min(Math.max(n, 1), MAX_LIMIT);
   }
 
   /**

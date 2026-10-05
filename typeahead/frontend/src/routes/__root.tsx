@@ -40,6 +40,13 @@ function RootLayout() {
                 Search
               </Link>
               <Link
+                to="/widgets"
+                className="text-gray-600 hover:text-gray-900 px-3 py-2 rounded-md text-sm font-medium"
+                activeProps={{ className: 'text-blue-600' }}
+              >
+                Widgets
+              </Link>
+              <Link
                 to="/admin"
                 className="text-gray-600 hover:text-gray-900 px-3 py-2 rounded-md text-sm font-medium"
                 activeProps={{ className: 'text-blue-600' }}
