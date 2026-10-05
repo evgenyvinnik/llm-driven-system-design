@@ -143,8 +143,17 @@ class ApiService {
   // previous request of the same group, so two typeahead instances never cancel each other.
   async getSuggestions(
     prefix: string,
-    options: { limit?: number; userId?: string; fuzzy?: boolean; group?: string } = {}
+    options: {
+      limit?: number;
+      userId?: string;
+      fuzzy?: boolean;
+      group?: string;
+      /** Called when the lookup goes to the network (not on a memory-cache hit). */
+      onRequestSent?: () => void;
+    } = {}
   ): Promise<SuggestionsResponse> {
+    // meta.clientLatencyMs times the lookup alone, so a caller's render work isn't counted
+    const startedAt = performance.now();
     const requestGroup = `suggestions:${options.group ?? 'default'}:`;
     const cacheKey = suggestionsCacheKey(
       normalizePrefix(prefix),
@@ -160,7 +169,15 @@ class ApiService {
     // Check memory cache
     const cached = memoryCache.get<SuggestionsResponse>(cacheKey);
     if (cached) {
-      return { ...cached, meta: { ...cached.meta, cached: true, clientCache: true } };
+      return {
+        ...cached,
+        meta: {
+          ...cached.meta,
+          cached: true,
+          clientCache: true,
+          clientLatencyMs: performance.now() - startedAt,
+        },
+      };
     }
 
     // Create new abort controller for this request
@@ -183,6 +200,7 @@ class ApiService {
       }
 
       const signal = this.createSignalWithTimeout(controller);
+      options.onRequestSent?.();
 
       const response = await this.request<SuggestionsResponse>(`/suggestions?${params}`, {
         signal,
@@ -197,7 +215,7 @@ class ApiService {
         memoryCache.set(cacheKey, response, 60_000); // 60s TTL
       }
 
-      return response;
+      return { ...response, meta: { ...response.meta, clientLatencyMs: performance.now() - startedAt } };
     } finally {
       // Only remove our own controller; a newer request may already own this key
       if (this.abortControllers.get(requestKey) === controller) {

@@ -118,19 +118,17 @@ const rankingService = new RankingService(redis);
 const suggestionService = new SuggestionService(trie, redis, rankingService);
 const aggregationService = new AggregationService(redis, pgPool, trie);
 // Keeps this instance's trie in step with writes made by other instances (dev:server1/2/3)
-const trieSync = new TrieSyncService(
-  pgPool,
-  redis,
-  trie,
-  suggestionService,
-  parseInt(process.env.TRIE_SYNC_INTERVAL_MS || '5000')
-);
+const trieSync = new TrieSyncService(pgPool, redis, trie, suggestionService, {
+  intervalMs: parseInt(process.env.TRIE_SYNC_INTERVAL_MS || '5000'),
+  // After rows were deleted outright (a reseed): rebuild from Postgres and clear the cache
+  reload: () => aggregationService.rebuildTrie(),
+});
 aggregationService.setChangeListener(() => trieSync.notifyChanged());
 
 // Set once the startup load from Postgres has filled the trie; readiness waits for it
 let trieLoaded = false;
-// Database time taken just before the startup load; the trie sync starts from it
-let syncWatermark: { text: string; ms: number } | null = null;
+// Read floor taken just before the startup load; the trie sync starts from it
+let syncReadFrom: string | null = null;
 let shuttingDown = false;
 
 /**
@@ -388,20 +386,52 @@ async function retryUntilSuccess(step: string, fn: () => Promise<void>): Promise
 }
 
 /**
+ * Databases created before phrase_counts.changed_at existed (init.sql only runs on a fresh
+ * volume) get the column here; the trie sync between instances polls it. The ALTER runs only
+ * when the column is missing, since even ADD COLUMN IF NOT EXISTS takes an exclusive lock on
+ * the table, and under a short lock_timeout so a busy table makes startup retry instead of
+ * stalling every other instance's reads and writes behind the queued lock.
+ */
+async function ensureChangedAtColumn(): Promise<void> {
+  const existing = await pgPool.query(
+    `SELECT 1 FROM information_schema.columns
+     WHERE table_name = 'phrase_counts' AND column_name = 'changed_at'`
+  );
+  if (existing.rowCount && existing.rowCount > 0) return;
+
+  const client = await pgPool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(`SET LOCAL lock_timeout = '2s'`);
+    // Existing rows get an old timestamp so no instance re-reads the whole table as "changed";
+    // rows written from now on get NOW()
+    await client.query(
+      `ALTER TABLE phrase_counts ADD COLUMN IF NOT EXISTS changed_at TIMESTAMPTZ DEFAULT 'epoch'`
+    );
+    await client.query(`ALTER TABLE phrase_counts ALTER COLUMN changed_at SET DEFAULT NOW()`);
+    await client.query(
+      'CREATE INDEX IF NOT EXISTS idx_phrase_changed_at ON phrase_counts(changed_at)'
+    );
+    await client.query('COMMIT');
+    logger.info({ event: 'schema_migrated', column: 'phrase_counts.changed_at' });
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+/**
  * Load phrases from Postgres into the trie. Needs only Postgres, not Redis.
  */
 async function loadTrie(): Promise<void> {
   const startTime = Date.now();
 
-  // Databases created before phrase_counts.changed_at existed (init.sql only runs on a fresh
-  // volume) get the column here; the trie sync between instances polls it
-  await pgPool.query(
-    `ALTER TABLE phrase_counts ADD COLUMN IF NOT EXISTS changed_at TIMESTAMPTZ DEFAULT NOW();
-     CREATE INDEX IF NOT EXISTS idx_phrase_changed_at ON phrase_counts(changed_at);`
-  );
+  await ensureChangedAtColumn();
 
   // Read the clock before the load, so the sync re-reads anything written while it runs
-  syncWatermark = await trieSync.currentDbTime();
+  syncReadFrom = await trieSync.startPoint();
 
   // last_updated (epoch ms) feeds the ranking's recency score
   const result = await pgPool.query(
@@ -449,8 +479,8 @@ async function initialize(): Promise<void> {
   aggregationService.start();
   logger.info({ event: 'aggregation_service_started' });
 
-  if (syncWatermark) {
-    trieSync.start(syncWatermark);
+  if (syncReadFrom) {
+    trieSync.start(syncReadFrom);
     logger.info({ event: 'trie_sync_started', intervalMs: trieSync.getStats().intervalMs });
   }
 

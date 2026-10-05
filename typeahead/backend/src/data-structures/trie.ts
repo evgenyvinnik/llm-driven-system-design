@@ -332,6 +332,22 @@ export class Trie {
   }
 
   /**
+   * The lastUpdated (epoch ms) stored for a phrase, or undefined when it isn't in the trie.
+   */
+  getLastUpdated(phrase: string): number | undefined {
+    const normalizedPhrase = normalizePhrase(phrase);
+    if (!this.phraseMap.has(normalizedPhrase)) return undefined;
+
+    let node = this.root;
+    for (const char of normalizedPhrase) {
+      const child = node.children.get(char);
+      if (!child) return undefined;
+      node = child;
+    }
+    return node.lastUpdated;
+  }
+
+  /**
    * Remove a phrase from the trie.
    * Refills each ancestor's top-k from its subtree and prunes nodes left with no phrases.
    */

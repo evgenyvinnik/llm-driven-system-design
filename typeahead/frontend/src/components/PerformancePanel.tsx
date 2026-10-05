@@ -5,6 +5,8 @@ const REFRESH_MS = 1000;
 
 const formatMs = (ms: number): string => (ms < 10 ? ms.toFixed(1) : Math.round(ms).toString()) + 'ms';
 const formatPercent = (ratio: number): string => `${Math.round(ratio * 100)}%`;
+// A row with no samples shows a dash rather than a misleading 0
+const NO_DATA = '—';
 
 /**
  * Client-side typeahead metrics for this tab: what the search box actually felt like, as
@@ -23,15 +25,21 @@ export function PerformancePanel() {
     setMetrics(getMetrics());
   };
 
+  const m = metrics;
   const rows: Array<[string, string]> = [
-    ['Requests', metrics.totalRequests.toString()],
-    ['Latency p50 / p95', `${formatMs(metrics.p50LatencyMs)} / ${formatMs(metrics.p95LatencyMs)}`],
-    ['Answered from tab cache', formatPercent(metrics.cacheHitRate)],
-    ['Keystroke to suggestions', formatMs(metrics.avgKeyToSuggestionMs)],
-    ['Keystroke to selection', formatMs(metrics.avgSelectionTimeMs)],
-    ['Selections', metrics.selectionsCount.toString()],
-    ['Errors', metrics.errorCount.toString()],
+    ['Lookups', m.lookups.toString()],
+    ['Answered from tab cache', m.lookups > 0 ? formatPercent(m.cacheHitRate) : NO_DATA],
+    ['Requests sent', m.requestsSent.toString()],
+    [
+      'Network latency p50 / p95',
+      m.networkResponses > 0 ? `${formatMs(m.p50LatencyMs)} / ${formatMs(m.p95LatencyMs)}` : NO_DATA,
+    ],
+    ['Keystroke to suggestions', m.keyToSuggestionSamples > 0 ? formatMs(m.avgKeyToSuggestionMs) : NO_DATA],
+    ['Keystroke to selection', m.selectionTimeSamples > 0 ? formatMs(m.avgSelectionTimeMs) : NO_DATA],
+    ['Selections', m.selectionsCount.toString()],
+    ['Errors', m.errorCount.toString()],
   ];
+  const hasData = m.lookups > 0 || m.requestsSent > 0 || m.errorCount > 0 || m.selectionsCount > 0;
 
   return (
     <section className="bg-white rounded-lg shadow p-4" aria-labelledby="performance-panel-title">
@@ -48,7 +56,7 @@ export function PerformancePanel() {
         </button>
       </div>
 
-      {metrics.totalRequests === 0 && metrics.errorCount === 0 ? (
+      {!hasData ? (
         <p className="text-sm text-gray-500">Type in the search box to collect metrics for this tab.</p>
       ) : (
         <dl className="space-y-1 text-sm">

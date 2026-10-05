@@ -4,8 +4,10 @@ import type { Suggestion } from '../types';
 import { api } from '../services/api';
 import {
   recordError,
+  recordInputCleared,
   recordKeyPress,
-  recordLatency,
+  recordLookup,
+  recordRequestSent,
   recordSelection,
   recordSuggestionsDisplayed,
 } from '../services/performance';
@@ -102,6 +104,27 @@ let searchSeq = 0;
 // that same text (typed in full, then Enter inside the debounce window) must not reopen the list.
 let selectedQuery: string | null = null;
 
+// performance.now() of the keystroke that set the current query (null once cleared), so a
+// search's paint is measured from the keystroke that produced it, not a later one
+let lastKeyAt: number | null = null;
+
+// A frame later than this means the tab was hidden or blocked while the list was painted
+const MAX_PAINT_DELAY_MS = 100;
+
+/**
+ * Record keystroke-to-suggestions once the list for keyAt is painted (the next frame), unless
+ * the tab is hidden (frames are paused) or the query changed in between.
+ */
+const measurePaint = (keyAt: number, prefix: string, getQuery: () => string): void => {
+  if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return;
+  const scheduledAt = performance.now();
+  requestAnimationFrame(() => {
+    if (performance.now() - scheduledAt > MAX_PAINT_DELAY_MS) return;
+    if (getQuery().trim() !== prefix.trim()) return;
+    recordSuggestionsDisplayed(keyAt);
+  });
+};
+
 const isAbortError = (error: unknown): boolean =>
   error instanceof Error && error.name === 'AbortError';
 
@@ -120,7 +143,12 @@ export const useSearchStore = create<SearchState>((set, get) => ({
 
   setQuery: (query: string) => {
     selectedQuery = null;
-    recordKeyPress();
+    if (query.trim()) {
+      lastKeyAt = recordKeyPress();
+    } else {
+      lastKeyAt = null;
+      recordInputCleared();
+    }
     set({ query });
   },
 
@@ -140,7 +168,8 @@ export const useSearchStore = create<SearchState>((set, get) => ({
 
     set({ isLoading: true, error: null });
 
-    const startedAt = performance.now();
+    // The keystroke this search answers (a settings change re-runs the query without one)
+    const keyAt = lastKeyAt;
 
     try {
       const { userId, fuzzyEnabled, maxSuggestions } = get();
@@ -148,19 +177,21 @@ export const useSearchStore = create<SearchState>((set, get) => ({
         userId,
         fuzzy: fuzzyEnabled,
         limit: maxSuggestions,
+        onRequestSent: recordRequestSent,
       });
 
       if (seq !== searchSeq) return; // superseded
 
-      recordLatency(performance.now() - startedAt, response.meta.clientCache === true);
+      recordLookup(response.meta.clientLatencyMs ?? 0, response.meta.clientCache === true);
       set({
         suggestions: response.suggestions,
         isLoading: false,
         error: null,
         responseTime: response.meta.responseTimeMs,
       });
-      // The next frame is when the new list is painted
-      requestAnimationFrame(() => recordSuggestionsDisplayed());
+      if (keyAt !== null && get().query.trim() === prefix.trim()) {
+        measurePaint(keyAt, prefix, () => get().query);
+      }
     } catch (error) {
       if (seq !== searchSeq) return; // superseded: its abort is not an error
 
@@ -180,13 +211,16 @@ export const useSearchStore = create<SearchState>((set, get) => ({
   },
 
   selectSuggestion: async (phrase: string) => {
-    const { userId, sessionId, recentSearches } = get();
+    const { userId, sessionId, recentSearches, query, suggestions } = get();
 
     // Drop any in-flight or still-debounced search so it cannot refill the list after the selection
     searchSeq++;
     selectedQuery = phrase;
     api.cancelSuggestions();
-    recordSelection();
+    // Only a pick from the list for what was typed ends a typed interaction (not a trending or
+    // recent-search pick)
+    recordSelection(query.trim() !== '' && suggestions.some((s) => s.phrase === phrase));
+    lastKeyAt = null;
 
     // Update local state
     const updated = saveRecentSearch(phrase, recentSearches);
