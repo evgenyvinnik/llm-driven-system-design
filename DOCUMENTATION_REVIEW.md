@@ -2,6 +2,128 @@
 
 Started 2026-09-09. Scope: all 92 projects, five documents per project (460 files).
 
+## 2026-10 clarity and implementation pass
+
+Started 2026-10-10 on the owner's request to recheck every implementation against newer patterns, rework
+all three interview answers and every `architecture.md`, and make the high-level architectures easier to
+follow. Earlier passes (below) made the documents more accurate but produced overviews that were hard to
+read: grids of boxes named after abstractions ("mapping authority", "admission + event log"), connected by
+unlabeled or bidirectional arrows, explained by long captions.
+
+**New standard** — see "Drawing Architecture Diagrams" and "Writing System Design Answers" in
+[CLAUDE.md](./CLAUDE.md):
+
+- One layered overview per document (clients → edge → services → data, async to the side) with 6–12
+  concrete, deployable components, labeled arrows and up to three numbered journeys explained directly
+  below it; then a sequence diagram per core flow, rendered with `scripts/seqdiag.mjs`.
+- A shared skeleton for all three answers (frontend labeled with RADIO), spoken first-person delivery in
+  plain language, and a 3,000–4,500-word target instead of a line count.
+- `scripts/audit-documentation.mjs` now flags diagrams wider than 100 columns, emoji inside diagrams,
+  misaligned box edges, missing diagrams, and answers outside the word target. At the start of this pass
+  it reported 61 over-wide diagrams, 30 diagrams containing emoji, 1,700+ misaligned box edges (all in
+  projects not yet covered by the earlier source review) and 85 answers outside the length target.
+
+**Per project:** audit the implementation (the earlier Implementation Notes and each project's CLAUDE.md
+repair log are the starting defect list), fix real defects and implement the system's central mechanism
+or a modern pattern that fits it, verify with type-checks, tests and — where the stack allows — a runtime
+check against local PostgreSQL and Redis; then rewrite `architecture.md` and the three answers, with
+Implementation Notes describing the code as it is after the changes. [bitly](./bitly/) is the exemplar.
+
+| Project | Status | Implementation changes | Verification |
+|---------|--------|------------------------|--------------|
+| [20forms-20designs](./20forms-20designs/architecture.md) | Pending | — | — |
+| [ad-click-aggregator](./ad-click-aggregator/architecture.md) | Pending | — | — |
+| [ai-code-assistant](./ai-code-assistant/architecture.md) | Pending | — | — |
+| [airbnb](./airbnb/architecture.md) | Pending | — | — |
+| [airtag](./airtag/architecture.md) | Pending | — | — |
+| [amazon](./amazon/architecture.md) | Pending | — | — |
+| [apns](./apns/architecture.md) | Pending | — | — |
+| [app-store](./app-store/architecture.md) | Pending | — | — |
+| [apple-maps](./apple-maps/architecture.md) | Pending | — | — |
+| [apple-music](./apple-music/architecture.md) | Pending | — | — |
+| [apple-pay](./apple-pay/architecture.md) | Pending | — | — |
+| [apple-tv](./apple-tv/architecture.md) | Pending | — | — |
+| [bitly](./bitly/architecture.md) | Pending | — | — |
+| [calendly](./calendly/architecture.md) | Pending | — | — |
+| [coinbase](./coinbase/architecture.md) | Pending | — | — |
+| [collaborative-editor](./collaborative-editor/architecture.md) | Pending | — | — |
+| [confluence](./confluence/architecture.md) | Pending | — | — |
+| [dashboarding](./dashboarding/architecture.md) | Pending | — | — |
+| [discord](./discord/architecture.md) | Pending | — | — |
+| [distributed-cache](./distributed-cache/architecture.md) | Pending | — | — |
+| [docusign](./docusign/architecture.md) | Pending | — | — |
+| [doordash](./doordash/architecture.md) | Pending | — | — |
+| [dropbox](./dropbox/architecture.md) | Pending | — | — |
+| [etsy](./etsy/architecture.md) | Pending | — | — |
+| [excalidraw](./excalidraw/architecture.md) | Pending | — | — |
+| [facetime](./facetime/architecture.md) | Pending | — | — |
+| [fb-live-comments](./fb-live-comments/architecture.md) | Pending | — | — |
+| [fb-news-feed](./fb-news-feed/architecture.md) | Pending | — | — |
+| [fb-post-search](./fb-post-search/architecture.md) | Pending | — | — |
+| [figma](./figma/architecture.md) | Pending | — | — |
+| [gallery](./gallery/architecture.md) | Pending | — | — |
+| [github](./github/architecture.md) | Pending | — | — |
+| [gmail](./gmail/architecture.md) | Pending | — | — |
+| [google-calendar](./google-calendar/architecture.md) | Pending | — | — |
+| [google-docs](./google-docs/architecture.md) | Pending | — | — |
+| [google-search](./google-search/architecture.md) | Pending | — | — |
+| [google-sheets](./google-sheets/architecture.md) | Pending | — | — |
+| [health-data-pipeline](./health-data-pipeline/architecture.md) | Pending | — | — |
+| [hotel-booking](./hotel-booking/architecture.md) | Pending | — | — |
+| [icloud](./icloud/architecture.md) | Pending | — | — |
+| [imessage](./imessage/architecture.md) | Pending | — | — |
+| [instagram](./instagram/architecture.md) | Pending | — | — |
+| [jira](./jira/architecture.md) | Pending | — | — |
+| [job-scheduler](./job-scheduler/architecture.md) | Pending | — | — |
+| [kindle-highlights](./kindle-highlights/architecture.md) | Pending | — | — |
+| [leetcode](./leetcode/architecture.md) | Pending | — | — |
+| [linkedin](./linkedin/architecture.md) | Pending | — | — |
+| [local-delivery](./local-delivery/architecture.md) | Pending | — | — |
+| [loom](./loom/architecture.md) | Pending | — | — |
+| [mcplator](./mcplator/architecture.md) | Pending | — | — |
+| [mdreader](./mdreader/architecture.md) | Pending | — | — |
+| [microsoft-teams](./microsoft-teams/architecture.md) | Pending | — | — |
+| [netflix](./netflix/architecture.md) | Pending | — | — |
+| [news-aggregator](./news-aggregator/architecture.md) | Pending | — | — |
+| [notification-system](./notification-system/architecture.md) | Pending | — | — |
+| [notion](./notion/architecture.md) | Pending | — | — |
+| [online-auction](./online-auction/architecture.md) | Pending | — | — |
+| [payment-system](./payment-system/architecture.md) | Pending | — | — |
+| [paypal](./paypal/architecture.md) | Pending | — | — |
+| [pinterest](./pinterest/architecture.md) | Pending | — | — |
+| [plugin-platform](./plugin-platform/architecture.md) | Pending | — | — |
+| [price-tracking](./price-tracking/architecture.md) | Pending | — | — |
+| [r-place](./r-place/architecture.md) | Pending | — | — |
+| [rate-limiter](./rate-limiter/architecture.md) | Pending | — | — |
+| [reddit](./reddit/architecture.md) | Pending | — | — |
+| [retool](./retool/architecture.md) | Pending | — | — |
+| [robinhood](./robinhood/architecture.md) | Pending | — | — |
+| [salesforce](./salesforce/architecture.md) | Pending | — | — |
+| [scalable-api](./scalable-api/architecture.md) | Pending | — | — |
+| [scale-ai](./scale-ai/architecture.md) | Pending | — | — |
+| [shopify](./shopify/architecture.md) | Pending | — | — |
+| [slack](./slack/architecture.md) | Pending | — | — |
+| [splitwise](./splitwise/architecture.md) | Pending | — | — |
+| [spotify](./spotify/architecture.md) | Pending | — | — |
+| [spotlight](./spotlight/architecture.md) | Pending | — | — |
+| [strava](./strava/architecture.md) | Pending | — | — |
+| [stripe](./stripe/architecture.md) | Pending | — | — |
+| [supabase-dashboard](./supabase-dashboard/architecture.md) | Pending | — | — |
+| [ticketmaster](./ticketmaster/architecture.md) | Pending | — | — |
+| [tiktok](./tiktok/architecture.md) | Pending | — | — |
+| [tinder](./tinder/architecture.md) | Pending | — | — |
+| [twitch](./twitch/architecture.md) | Pending | — | — |
+| [twitter](./twitter/architecture.md) | Pending | — | — |
+| [typeahead](./typeahead/architecture.md) | Pending | — | — |
+| [uber](./uber/architecture.md) | Pending | — | — |
+| [venmo](./venmo/architecture.md) | Pending | — | — |
+| [web-crawler](./web-crawler/architecture.md) | Pending | — | — |
+| [whatsapp](./whatsapp/architecture.md) | Pending | — | — |
+| [yelp](./yelp/architecture.md) | Pending | — | — |
+| [youtube](./youtube/architecture.md) | Pending | — | — |
+| [youtube-top-k](./youtube-top-k/architecture.md) | Pending | — | — |
+| [zoom](./zoom/architecture.md) | Pending | — | — |
+
 ## Review standard
 
 - **README:** Explain the learning project, supported user flows, actual stack, setup commands, and limitations. Verify commands and defaults against source and configuration.
