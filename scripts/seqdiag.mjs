@@ -9,7 +9,8 @@
  *   participants: Browser | Link API | Redis | PostgreSQL
  *   Browser -> Link API: POST /api/v1/links       request (arrow points right or left)
  *   Link API --> Browser: 201 {short_url}         response; drawn the same, label says what returns
- *   Link API -> Link API: pick random code        local step, written beside the lifeline
+ *   Link API -> Link API: pick random code        local step, written beside the lifeline (it may cross
+ *                                                  neighbouring lifelines; flips left near the edge)
  *   -- after the 302 is sent --                   divider across all lifelines
  *   # comment                                     ignored
  * Steps are numbered automatically; prefix a label with "!" to leave it unnumbered.
@@ -59,17 +60,26 @@ const need = (left, right, width) => {
 const spans = steps
   .filter((step) => step.kind !== 'divider')
   .map((step) => {
-    if (step.kind === 'local') {
-      return step.from === x.length - 1 ? null : { left: step.from, right: step.from + 1, width: step.label.length + 4 };
-    }
+    // Local steps may run across lifelines to their right instead of widening the diagram.
+    if (step.kind === 'local') return null;
     return { left: Math.min(step.from, step.to), right: Math.max(step.from, step.to), width: step.label.length + 4 };
   })
   .filter(Boolean)
   .sort((p, q) => p.right - p.left - (q.right - q.left));
 for (const span of spans) need(span.left, span.right, span.width);
 
-const lastLabel = Math.max(0, ...steps.filter((s) => s.kind === 'local' && s.from === x.length - 1).map((s) => s.label.length + 2));
-const width = x[x.length - 1] + 1 + lastLabel;
+// A local note that would run past the last lifeline is written to the left of its own instead.
+const last = x[x.length - 1];
+for (const step of steps) {
+  if (step.kind !== 'local') continue;
+  const fitsRight = x[step.from] + step.label.length + 3 <= last;
+  step.left = !fitsRight && x[step.from] - step.label.length - 3 >= 0;
+}
+const overhang = Math.max(
+  0,
+  ...steps.filter((s) => s.kind === 'local' && !s.left).map((s) => x[s.from] + s.label.length + 3 - last),
+);
+const width = last + 1 + overhang;
 const blank = () => {
   const row = Array(width).fill(' ');
   for (const col of x) row[col] = '│';
@@ -95,7 +105,8 @@ for (const step of steps) {
   }
   if (step.kind === 'local') {
     const row = blank();
-    put(row, x[step.from] + 2, step.label);
+    if (step.left) put(row, x[step.from] - step.label.length - 3, ` ${step.label} `);
+    else put(row, x[step.from] + 2, `${step.label} `);
     out.push(row);
     continue;
   }
