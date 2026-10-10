@@ -8,6 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - [Quick Start for Any Project](#quick-start-for-any-project)
 - [Project Structure](#project-structure)
   - [Writing Architecture Documents](#writing-architecture-documents)
+  - [Drawing Architecture Diagrams](#drawing-architecture-diagrams)
   - [Writing System Design Answers](#writing-system-design-answers)
   - [Explaining Trade-offs in Depth](#explaining-trade-offs-in-depth)
 - [Common Commands](#common-commands)
@@ -85,7 +86,7 @@ The `architecture.md` files serve a dual purpose: documenting the **production-s
 
 **Section naming**: Use the names above. The codebase has inconsistencies — older projects use "Data Model" (use "Database Schema" instead), "Monitoring and Observability" (use "Observability"), and "Trade-offs and Alternatives" (use "Trade-offs Summary"). New projects should use the standardized names above.
 
-**Architecture diagrams**: Show the production-ideal architecture (CDN, API Gateway, separate microservices, message queues). Use Unicode box-drawing characters (`┌ ─ ┐ │ └ ┘ ├ ┤ ┬ ┴ ┼ ▼ ▲ ─▶`), not ASCII `+--+`. About 84% of existing projects use Unicode; the remainder are legacy. Don't put `localhost:3001` in the main architecture diagram — local port mappings belong in the README or Implementation Notes.
+**Architecture diagrams**: Show the production-ideal architecture (CDN, API Gateway, separate microservices, message queues) following [Drawing Architecture Diagrams](#drawing-architecture-diagrams): one layered overview with labeled, numbered journeys, then a sequence diagram per core flow under "Core Components / Request Flows". Don't put `localhost:3001` in the main architecture diagram — local port mappings belong in the README or Implementation Notes.
 
 **Requirements**: Write non-functional requirements at production scale. This demonstrates system design knowledge. Local-scale numbers (10 concurrent users, <1 RPS) belong in Capacity Estimation under a "Local Development Scale" subsection.
 
@@ -107,16 +108,99 @@ The `architecture.md` files serve a dual purpose: documenting the **production-s
 
 **Boundary with project CLAUDE.md**: `architecture.md` describes *what* the system is and *why* each design choice was made. The project's `CLAUDE.md` captures *iteration history* — development phases, what was tried, what changed, open questions, and learnings. Don't duplicate design decisions across both files.
 
+### Drawing Architecture Diagrams
+
+The high-level diagram is the first thing a reader looks at and the easiest thing to get wrong. These rules apply to `architecture.md` and all three interview answers. A diagram passes when someone who has never seen the system can trace one request through it in under a minute.
+
+**One overview per document**, placed at the start of the architecture section:
+
+1. **Layer it top to bottom**: clients → edge (CDN, load balancer, API gateway) → services → data stores. Asynchronous work (queue or stream → workers → derived stores) sits to the right or below and flows one way.
+2. **Draw concrete components only.** Every box is something you could deploy or provision, with the technology or main data in a second line: `Redirect Service`, `PostgreSQL · links, users`, `Redis · link cache`, `Kafka · click-events`. Never draw a concept as a box ("mapping authority", "admission + event log", "coverage metadata") — guarantees, revisions, receipts and watermarks belong in the prose and deep dives.
+3. **6–12 boxes.** More than that means the overview is doing a flow diagram's job; split it.
+4. **Label every arrow** with the request or payload (`POST /api/v1/links`, `GET link:{code}`, `publish click`). Arrows point in the request direction; responses are implied unless they go somewhere different. Use `◀──▶` only for genuinely bidirectional channels (WebSocket, replication).
+5. **Number the main journeys** — at most three — with `(1)`, `(2)`, `(3)` on their first arrow, and follow the diagram immediately with a numbered walkthrough of one or two sentences per journey.
+6. **Keep it renderable**: at most 100 columns, Unicode box-drawing characters (`┌ ─ ┐ │ └ ┘ ├ ┤ ┬ ┴ ┼ ▼ ▲ ─▶`) rather than ASCII `+--+`, an unlabeled fence, and no emoji or circled digits inside the fence — they render double-width or fall back to another font and break alignment. `node scripts/audit-documentation.mjs` flags width and emoji problems.
+
+**Then one sequence diagram per core flow** (2–3 per document): the write path, the hot read path, and the asynchronous or background path. Participants are columns, steps are numbered, 4–10 steps each. This is where cache misses, idempotency checks, retries, acknowledgements and failure branches become visible — keep them out of the overview. Generate them with `node scripts/seqdiag.mjs spec.txt` (spec format is documented at the top of the script) instead of aligning columns by hand.
+
+```
+ Visitor      Redirect Service                     Redis   PostgreSQL
+    │                 │                              │          │
+    │ 1 GET /aZ3kq9x  │                              │          │
+    │────────────────▶│                              │          │
+    │                 │ 2 GET link:aZ3kq9x           │          │
+    │                 │─────────────────────────────▶│          │
+    │                 │ 3 miss                       │          │
+    │                 │◀─────────────────────────────│          │
+    │                 │ 4 SELECT … WHERE code = $1              │
+    │                 │────────────────────────────────────────▶│
+    │                 │ 5 url, status, expires_at               │
+    │                 │◀────────────────────────────────────────│
+    │                 │ 6 SET … EX min(24h, expiry)  │          │
+    │                 │─────────────────────────────▶│          │
+    │ 7 302 Location  │                              │          │
+    │◀────────────────│                              │          │
+    │                 │                              │          │
+```
+
+**Frontend overviews** use the same rules with frontend layers: routes/pages → feature components → state (server-state cache, client store, URL state — say which owns what) → data layer (API client, WebSocket/SSE, service worker, IndexedDB) → a single box for the backend API.
+
+A good overview (URL shortener, 9 boxes, three numbered journeys):
+
+```
+  ┌──────────────────────┐                          ┌──────────────────────┐
+  │ Link owner (web app) │                          │ Visitor's browser    │
+  └──────────┬───────────┘                          └──────────┬───────────┘
+             │ (1) POST /api/v1/links                          │ (2) GET /aZ3kq9x
+             ▼                                                 ▼
+  ┌────────────────────────────────────────────────────────────────────────┐
+  │ Load balancer · TLS termination · routes /api/* and /{code}            │
+  └──────────┬─────────────────────────────────────────────────┬───────────┘
+             ▼                                                 ▼
+  ┌──────────────────────┐                          ┌──────────────────────┐
+  │ Link API             │                          │ Redirect Service     │
+  │ create · deactivate  │                          │ lookup → 302         │
+  └──┬───────┬───────┬───┘                          └───┬──────┬───────┬───┘
+     │       │       │ DEL link:{code}  GET link:{code} │      │       │ (3) click
+     │       │       └──────────▶┌──────────────┐◀──────┘      │       ▼
+     │       │                   │ Redis cache  │              │  ┌──────────────┐
+     │       │                   └──────────────┘              │  │ Kafka clicks │
+     │       │ INSERT/UPDATE     ┌──────────────┐  miss:SELECT │  └──────┬───────┘
+     │       └──────────────────▶│ PostgreSQL   │◀─────────────┘         ▼
+     │                           └──────────────┘                 ┌──────────────┐
+     │ query stats               ┌──────────────┐  insert, dedupe │ Click        │
+     └──────────────────────────▶│ ClickHouse   │◀────────────────┤ consumers    │
+                                 └──────────────┘                 └──────────────┘
+```
+
+A bad overview is a grid of boxes named after abstractions, joined by unlabeled or bidirectional connectors between every neighbor, followed by a paragraph explaining what the arrows were supposed to mean.
+
 ### Writing System Design Answers
 
 The `system-design-answer-{frontend,backend,fullstack}.md` files simulate a realistic 45–60 minute system design interview. Each file should read as if you are explaining the system out loud — architectural thinking, trade-off reasoning, and decision justification. Not a reference document.
 
-**Target length**: 350–550 lines. A person needs to be able to walk through the entire answer in ~40–50 minutes. Files over 600 lines are too long to cover. Files under 300 are too shallow.
+**Target length**: about 3,000–4,500 words, which is typically 350–550 lines. A person needs to be able to walk through the entire answer in ~40–50 minutes; much longer can't be covered, much shorter is too shallow. Don't pad to hit a number.
 
 **Three variants**, each with a different emphasis:
 - **`-frontend`**: UI architecture, state management, rendering strategy, client-server interaction, offline/optimistic patterns. Lighter on backend infrastructure.
 - **`-backend`**: Service architecture, data model (described as prose/tables, NOT SQL DDL), API design, scaling, failure handling. Lighter on UI.
 - **`-fullstack`**: Balanced coverage of both, less depth in each. Best for generalist interviews.
+
+**Shared skeleton.** All three variants use the same order so a reader always knows where to look. The frontend variant labels the sections with [RADIO](https://www.greatfrontend.com/front-end-system-design-playbook/framework) (Requirements, Architecture, Data model, Interface, Optimizations).
+
+| Section | Time | Backend | Fullstack | Frontend (RADIO) |
+|---------|------|---------|-----------|------------------|
+| Opening | 1 min | The one or two things that make this problem hard, plus the time-budget table | same | same |
+| Requirements & scale | 5 min | Functional scope, NFR targets with numbers, capacity math, out of scope | Same, plus user-facing latency and UX targets | **R** — features, Core Web Vitals/INP targets, devices, accessibility, offline |
+| High-level architecture | 8–10 min | Overview diagram + numbered walkthrough + component table | End-to-end diagram, client and server | **A** — components, state ownership, data layer |
+| Core flows | (within architecture) | 2–3 sequence diagrams | 2–3 sequence diagrams crossing the client/server seam | Key interactions (submit, live update, navigation) |
+| Data model | 4–5 min | Tables, keys, indexes, partitioning (prose tables, no DDL) | Server tables and the client store shape | **D** — client entities, normalized cache, cache keys |
+| API design | 3–4 min | Endpoints, idempotency, pagination, errors | The contract both sides depend on | **I** — API as the client sees it, component interfaces |
+| Deep dives | 15 min | 2–3 hardest backend problems | 2–3 problems that cross the boundary | **O** — rendering, performance, offline, accessibility, security |
+| Scale & failure | 3–4 min | What breaks first, failure-mode table, observability | Same, end to end | Performance at scale, loading/error/empty states |
+| Wrap-up | 2 min | Trade-offs summary table, what I'd do next | same | same |
+
+**Delivery.** Write the way a strong candidate talks: first person, short paragraphs, concrete numbers, one decision per paragraph. Open each section with a sentence saying what you're about to decide and why it matters. Prefer plain names — "source of truth", "idempotency key", "consumer", "read model", "cache-aside" — and define any term the first time it appears. Don't stack abstract nouns ("authoritative admission receipt coverage"), and don't repeat disclaimers: one sentence near the top saying this is a proposed production design, linking to `architecture.md#implementation-notes` for what the repository actually implements, is enough.
 
 #### Absolutely No Code
 
@@ -270,6 +354,13 @@ docker-compose down -v   # Stop and remove volumes
 Scripts run from the repository root:
 
 ```bash
+# Check documentation structure: diagram width/alignment, emoji in diagrams, answer length
+node scripts/audit-documentation.mjs              # All projects
+node scripts/audit-documentation.mjs bitly        # One project
+
+# Render an aligned sequence diagram from a small text spec
+node scripts/seqdiag.mjs flow.txt
+
 # Count SLOC for entire repository
 npm run sloc
 

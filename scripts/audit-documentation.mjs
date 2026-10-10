@@ -12,6 +12,73 @@ const targets = [
   'system-design-answer-backend.md',
   'system-design-answer-fullstack.md',
 ];
+// See "Drawing Architecture Diagrams" in CLAUDE.md for the rationale behind these limits.
+const MAX_DIAGRAM_WIDTH = 100;
+const INTERVIEW_WORDS = { min: 2800, max: 5200 };
+const INTERVIEW_MAX_LINES = 650;
+const BOX_DRAWING = /[─-╿]/u;
+// Characters that render as emoji (double width, font fallback) and break diagram alignment.
+const EMOJI = /\p{Emoji_Presentation}|️/u;
+const WIDE = /[ᄀ-ᅟ⺀-꓏가-힣豈-﫿︰-﹏＀-｠￠-￦]/u;
+
+/** Approximate monospace display width: emoji and CJK take two columns, combining marks none. */
+function displayWidth(line) {
+  let width = 0;
+  for (const char of line) {
+    if (/\p{Mn}|‍/u.test(char)) continue;
+    width += EMOJI.test(char) || WIDE.test(char) ? 2 : 1;
+  }
+  return width;
+}
+
+/**
+ * Finds boxes whose corners or edges don't line up (usually a miscounted border or a
+ * double-width character). A ┌ is treated as a box only when an edge continues below it
+ * and a ┐ closes its top edge; other corners are connector bends and are ignored.
+ */
+function brokenBoxes(block) {
+  // Index by display column so a double-width character occupies two cells, as rendered.
+  const grid = block.lines.map((line) =>
+    [...line].flatMap((char) => (/\p{Mn}|‍/u.test(char) ? [] : EMOJI.test(char) || WIDE.test(char) ? [char, ''] : [char])),
+  );
+  const at = (row, col) => grid[row]?.[col] ?? ' ';
+  const problems = [];
+  for (let row = 0; row < grid.length; row++) {
+    for (let col = 0; col < grid[row].length; col++) {
+      const edge = '│├┤┼';
+      if (grid[row][col] !== '┌' || !edge.includes(at(row + 1, col))) continue;
+      let right = col + 1;
+      while (right < grid[row].length && !'┐┌'.includes(grid[row][right])) right++;
+      if (at(row, right) !== '┐') continue;
+      const end = (c) => {
+        let r = row + 1;
+        while (r < grid.length && edge.includes(at(r, c))) r++;
+        return r;
+      };
+      const leftEnd = end(col);
+      const rightEnd = end(right);
+      const closedLeft = at(leftEnd, col) === '└';
+      const closedRight = at(rightEnd, right) === '┘';
+      // A fan-out connector (┌──┴──┐ with arrows below) never closes; only real boxes do.
+      if (!closedLeft && !closedRight) continue;
+      const where = `L${block.start + row + 1}`;
+      if (!closedLeft || !closedRight || leftEnd !== rightEnd) {
+        const misaligned = !closedLeft ? leftEnd : !closedRight ? rightEnd : Math.min(leftEnd, rightEnd);
+        problems.push(`${where}: box ${!closedLeft ? 'left' : 'right'} edge misaligned at L${block.start + misaligned + 1}`);
+        continue;
+      }
+      const bottom = leftEnd;
+      for (let c = col + 1; c < right; c++) {
+        if (!'─┬┴┼▲▼◀▶'.includes(at(bottom, c))) {
+          problems.push(`${where}: box bottom edge broken at L${block.start + bottom + 1}`);
+          break;
+        }
+      }
+    }
+  }
+  return problems;
+}
+
 const requested = process.argv.slice(2).filter((arg) => arg !== '--json');
 const projects = [];
 for (const entry of await readdir(root, { withFileTypes: true })) {
@@ -43,26 +110,54 @@ for (const project of projects.sort()) {
     const findings = [];
     const interview = name.startsWith('system-design-answer-');
     let fence = null;
+    let diagrams = 0;
+    const flushFence = () => {
+      if (!fence.diagram) return;
+      diagrams += 1;
+      findings.push(...brokenBoxes(fence.block));
+      if (fence.width > MAX_DIAGRAM_WIDTH) {
+        findings.push(`L${fence.line}: diagram is ${fence.width} columns wide (max ${MAX_DIAGRAM_WIDTH})`);
+      }
+      if (fence.emoji) findings.push(`L${fence.emoji}: emoji inside diagram breaks alignment`);
+    };
     for (const [index, line] of lines.entries()) {
       const delimiter = line.match(/^\s*(`{3,}|~{3,})(.*)$/);
       if (delimiter) {
         if (!fence) {
-          fence = { char: delimiter[1][0], length: delimiter[1].length, line: index + 1 };
+          fence = {
+            char: delimiter[1][0],
+            length: delimiter[1].length,
+            line: index + 1,
+            width: 0,
+            diagram: false,
+            emoji: 0,
+            block: { start: index + 1, lines: [] },
+          };
           if (interview && delimiter[2].trim()) findings.push(`L${index + 1}: tagged interview fence`);
         } else if (delimiter[1][0] === fence.char && delimiter[1].length >= fence.length && !delimiter[2].trim()) {
+          flushFence();
           fence = null;
         }
         continue;
       }
-      if (interview && fence && /\b(?:const\s+\w+\s*=|function\s+\w+\s*\(|CREATE TABLE|import\s+.+\s+from\s+|className=|return\s*\(|interface\s+\w+\s*\{)/.test(line)) {
+      if (!fence) continue;
+      fence.block.lines.push(line);
+      if (BOX_DRAWING.test(line)) fence.diagram = true;
+      fence.width = Math.max(fence.width, displayWidth(line));
+      if (!fence.emoji && EMOJI.test(line)) fence.emoji = index + 1;
+      if (interview && /\b(?:const\s+\w+\s*=|function\s+\w+\s*\(|CREATE TABLE|import\s+.+\s+from\s+|className=|return\s*\(|interface\s+\w+\s*\{)/.test(line)) {
         findings.push(`L${index + 1}: possible implementation code inside diagram`);
       }
     }
     if (fence) findings.push(`L${fence.line}: unclosed fence`);
-    if (interview && (lines.length < 350 || lines.length > 550)) {
-      findings.push('Outside suggested 350–550 lines; review pacing, do not pad');
+    const words = source.split(/\s+/).filter(Boolean).length;
+    if (interview && (words < INTERVIEW_WORDS.min || words > INTERVIEW_WORDS.max || lines.length > INTERVIEW_MAX_LINES)) {
+      findings.push(
+        `${words} words / ${lines.length} lines; target ${INTERVIEW_WORDS.min}–${INTERVIEW_WORDS.max} words and at most ${INTERVIEW_MAX_LINES} lines (pacing signal, do not pad)`,
+      );
     }
-    files.push({ name, lines: lines.length, words: source.split(/\s+/).filter(Boolean).length, findings });
+    if ((interview || name === 'architecture.md') && diagrams === 0) findings.push('No box-drawing diagram found');
+    files.push({ name, lines: lines.length, words, diagrams, findings });
   }
   report.push({ project, files });
 }
@@ -73,7 +168,7 @@ if (process.argv.includes('--json')) {
   for (const { project, files } of report) {
     for (const file of files) {
       if (requested.length || file.findings.length) {
-        console.log(`${project}/${file.name}: ${file.lines ?? 'missing'} lines, ${file.words ?? 0} words`);
+        console.log(`${project}/${file.name}: ${file.lines ?? 'missing'} lines, ${file.words ?? 0} words, ${file.diagrams ?? 0} diagrams`);
         for (const finding of file.findings) console.log(`  ${finding}`);
       }
     }
