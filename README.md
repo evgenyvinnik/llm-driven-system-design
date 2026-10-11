@@ -180,6 +180,25 @@ External projects demonstrating system design concepts (with local architecture 
 | [MCPlator](./mcplator/) | Retro calculator with LLM-powered AI assistant ([source](https://github.com/evgenyvinnik/MCPlator)) | 📝 Design Only |
 | [20 Forms, 40 Designs](./20forms-20designs/) | Form library comparison across 41 React design systems ([source](https://github.com/evgenyvinnik/20forms-20designs)) | 📝 Design Only |
 
+### Future Projects: OpenAI & Anthropic Interview Questions
+
+System design questions candidates report from OpenAI and Anthropic interviews that no existing project covers yet. See [FUTURE_PROJECTS.md](./FUTURE_PROJECTS.md) for each reported prompt, what to cover, a local build sketch, sources, and the reported questions that existing projects already cover.
+
+| Project | Description | Reported at | Status |
+|---------|-------------|-------------|--------|
+| [LLM Inference Batching](./FUTURE_PROJECTS.md#llm-inference-batching) | Batch synchronous requests onto GPUs, then scale to a fleet with failover | Anthropic | 📋 Planned |
+| [LLM Chat Assistant](./FUTURE_PROJECTS.md#llm-chat-assistant) | ChatGPT / Claude.ai-style chat with token streaming and free-tier limits | OpenAI, Anthropic | 📋 Planned |
+| [LLM API Platform](./FUTURE_PROJECTS.md#llm-api-platform) | API keys, token-based rate limits, usage metering and billing, model routing | OpenAI, Anthropic | 📋 Planned |
+| [Prompt Playground](./FUTURE_PROJECTS.md#prompt-playground) | Collaborative prompt workspace with versions and streamed runs | OpenAI, Anthropic | 📋 Planned |
+| [Model Weight Distribution](./FUTURE_PROJECTS.md#model-weight-distribution) | Peer-to-peer distribution of huge files to thousands of hosts | Anthropic | 📋 Planned |
+| [Text-to-Video Generation](./FUTURE_PROJECTS.md#text-to-video-generation) | Sora-style GPU job scheduling with fair queueing and cancellation | OpenAI | 📋 Planned |
+| [Cloud IDE](./FUTURE_PROJECTS.md#cloud-ide) | Multi-tenant browser IDE and on-demand devboxes | OpenAI | 📋 Planned |
+| [Enterprise RAG Search](./FUTURE_PROJECTS.md#enterprise-rag-search) | Hybrid lexical and vector search with permission-aware LLM answers | OpenAI, Anthropic | 📋 Planned |
+| [GitHub Actions](./FUTURE_PROJECTS.md#github-actions) | CI/CD workflow DAGs on ephemeral runners | OpenAI | 📋 Planned |
+| [Online Chess](./FUTURE_PROJECTS.md#online-chess) | Real-time chess with game clocks and Elo matchmaking | OpenAI | 📋 Planned |
+| [Webhook Delivery](./FUTURE_PROJECTS.md#webhook-delivery) | At-least-once webhook delivery with retries, signing, and replay | OpenAI | 📋 Planned |
+| [Fleet Telemetry and Command Dispatch](./FUTURE_PROJECTS.md#fleet-telemetry-and-command-dispatch) | Device telemetry with late and duplicate events, plus commands to offline devices | OpenAI, Anthropic | 📋 Planned |
+
 ## Project Structure
 
 Each project folder contains:
