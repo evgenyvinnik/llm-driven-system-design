@@ -8,16 +8,29 @@
 import express from 'express';
 import cors from 'cors';
 import session from 'express-session';
+import RedisStore from 'connect-redis';
 import cookieParser from 'cookie-parser';
 import crypto from 'crypto';
 
 import { redis } from './utils/redis.js';
-import { initializeElasticsearch } from './utils/elasticsearch.js';
+import { initializeElasticsearch, isSearchAvailable } from './utils/elasticsearch.js';
 import { connectRabbitMQ, isRabbitMQConnected, closeRabbitMQ } from './utils/rabbitmq.js';
 import { logger } from './utils/logger.js';
-import { metricsMiddleware, getMetrics, getMetricsContentType, updateQueueMetrics } from './utils/metrics.js';
+import {
+  metricsMiddleware,
+  getMetrics,
+  getMetricsContentType,
+  updateQueueMetrics,
+  searchIndexBacklog,
+} from './utils/metrics.js';
 import { pool } from './utils/db.js';
 import { attachUserContext } from './middleware/auth.js';
+import {
+  startSearchIndexer,
+  stopSearchIndexer,
+  enqueueFullReindex,
+  getSearchIndexBacklog,
+} from './services/searchIndexer.js';
 
 import authRoutes from './routes/auth.js';
 import userRoutes from './routes/users.js';
@@ -27,6 +40,15 @@ import jobRoutes from './routes/jobs.js';
 
 const app = express();
 const PORT = parseInt(process.env.PORT || '3000');
+
+/** Set when SIGTERM/SIGINT arrives: readiness fails so the load balancer drains us. */
+let shuttingDown = false;
+
+/** Refreshes gauges that are read from RabbitMQ and PostgreSQL rather than counted. */
+async function refreshGauges(): Promise<void> {
+  await updateQueueMetrics();
+  searchIndexBacklog.set(await getSearchIndexBacklog());
+}
 
 // Trust proxy for accurate client IP (needed for rate limiting)
 app.set('trust proxy', 1);
@@ -58,9 +80,11 @@ app.use((req, res, next) => {
 // Metrics middleware (before routes)
 app.use(metricsMiddleware);
 
-// Session configuration using Redis
-// Using a simple in-memory store for development (Redis session store would be used in production)
+// Sessions live in Redis so every API instance (3001-3003 locally, N behind a load
+// balancer in production) sees the same login, and a restart doesn't sign everyone out.
+// The default MemoryStore kept sessions inside one process.
 app.use(session({
+  store: new RedisStore({ client: redis, prefix: 'sess:' }),
   secret: process.env.SESSION_SECRET || 'linkedin-dev-secret-key',
   resave: false,
   saveUninitialized: false,
@@ -100,8 +124,8 @@ app.use((req, res, next) => {
 // Prometheus metrics endpoint
 app.get('/metrics', async (req, res) => {
   try {
-    // Update queue metrics before serving
-    await updateQueueMetrics();
+    // Update queue and backlog gauges before serving
+    await refreshGauges();
     res.set('Content-Type', getMetricsContentType());
     res.end(await getMetrics());
   } catch (error) {
@@ -132,13 +156,17 @@ app.get('/health', async (req, res) => {
     checks.redis = { status: 'unhealthy', error: (error as Error).message };
   }
 
-  // Check RabbitMQ
+  // Optional dependencies: reported, but they don't make the API unhealthy because
+  // search falls back to PostgreSQL and queue publishing is best-effort.
   checks.rabbitmq = {
-    status: isRabbitMQConnected() ? 'healthy' : 'unhealthy',
+    status: isRabbitMQConnected() ? 'healthy' : 'unavailable',
+  };
+  checks.elasticsearch = {
+    status: isSearchAvailable() ? 'healthy' : 'unavailable',
   };
 
-  // Overall status
-  const allHealthy = Object.values(checks).every(c => c.status === 'healthy');
+  // Overall status: the API is healthy when its required stores are
+  const allHealthy = checks.postgres.status === 'healthy' && checks.redis.status === 'healthy';
 
   res.status(allHealthy ? 200 : 503).json({
     status: allHealthy ? 'healthy' : 'degraded',
@@ -156,6 +184,10 @@ app.get('/health/live', (req, res) => {
 
 // Readiness probe (for Kubernetes)
 app.get('/health/ready', async (req, res) => {
+  if (shuttingDown) {
+    res.status(503).json({ status: 'shutting down' });
+    return;
+  }
   try {
     await pool.query('SELECT 1');
     await redis.ping();
@@ -207,9 +239,13 @@ async function start() {
   try {
     logger.info({ port: PORT }, 'Starting LinkedIn API server...');
 
-    // Initialize Elasticsearch indices
-    await initializeElasticsearch();
-    logger.info('Elasticsearch initialized');
+    // Initialize Elasticsearch indices; a freshly created index is backfilled from
+    // PostgreSQL through the search outbox.
+    const createdIndices = await initializeElasticsearch();
+    if (createdIndices.length > 0) {
+      await enqueueFullReindex();
+    }
+    startSearchIndexer();
 
     // Connect to RabbitMQ (optional - server starts even if RabbitMQ is unavailable)
     try {
@@ -220,15 +256,16 @@ async function start() {
     }
 
     // Start metrics update interval
-    setInterval(async () => {
+    const gaugeTimer = setInterval(async () => {
       try {
-        await updateQueueMetrics();
+        await refreshGauges();
       } catch (error) {
-        logger.error({ error }, 'Failed to update queue metrics');
+        logger.error({ error }, 'Failed to update gauges');
       }
     }, 15000); // Every 15 seconds
+    gaugeTimer.unref();
 
-    app.listen(PORT, () => {
+    const server = app.listen(PORT, () => {
       logger.info({
         port: PORT,
         healthCheck: `http://localhost:${PORT}/health`,
@@ -236,22 +273,26 @@ async function start() {
       }, `LinkedIn API server running on port ${PORT}`);
     });
 
-    // Graceful shutdown
-    process.on('SIGTERM', async () => {
-      logger.info('SIGTERM received, shutting down gracefully...');
-      await closeRabbitMQ();
-      await pool.end();
-      redis.disconnect();
-      process.exit(0);
-    });
-
-    process.on('SIGINT', async () => {
-      logger.info('SIGINT received, shutting down gracefully...');
-      await closeRabbitMQ();
-      await pool.end();
-      redis.disconnect();
-      process.exit(0);
-    });
+    // Graceful shutdown: stop accepting connections, let in-flight requests finish,
+    // then close dependencies. A second signal or a 10 s stall forces the exit.
+    const shutdown = (signal: string) => {
+      if (shuttingDown) {
+        process.exit(1);
+      }
+      shuttingDown = true;
+      logger.info({ signal }, 'Shutting down gracefully...');
+      stopSearchIndexer();
+      clearInterval(gaugeTimer);
+      setTimeout(() => process.exit(1), 10_000).unref();
+      server.close(async () => {
+        await closeRabbitMQ();
+        await pool.end();
+        redis.disconnect();
+        process.exit(0);
+      });
+    };
+    process.on('SIGTERM', () => shutdown('SIGTERM'));
+    process.on('SIGINT', () => shutdown('SIGINT'));
   } catch (error) {
     logger.error({ error }, 'Failed to start server');
     process.exit(1);

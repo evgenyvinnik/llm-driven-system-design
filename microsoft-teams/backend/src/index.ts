@@ -1,9 +1,15 @@
 import { app } from './app.js';
 import { config } from './config/index.js';
 import { logger } from './services/logger.js';
-import { connectRedis } from './services/redis.js';
+import { connectRedis, redis } from './services/redis.js';
 import { pool } from './services/db.js';
 import { initPubSub, closePubSub } from './services/pubsub.js';
+import {
+  closeAllStreams,
+  deliverChannelEvent,
+  startHeadChecks,
+  stopHeadChecks,
+} from './services/sseService.js';
 import { ensureBucket } from './services/storageService.js';
 
 async function start() {
@@ -15,8 +21,10 @@ async function start() {
     await pool.query('SELECT 1');
     logger.info('Database connected');
 
-    // Initialize pub/sub for cross-instance messaging
-    await initPubSub();
+    // Every event any instance publishes (this one included) is offered to the local SSE streams,
+    // which drop copies and fill gaps by sequence number.
+    await initPubSub(deliverChannelEvent);
+    startHeadChecks();
 
     // Ensure MinIO bucket exists
     await ensureBucket();
@@ -25,15 +33,28 @@ async function start() {
       logger.info({ port: config.port }, 'Microsoft Teams backend server started');
     });
 
-    // Graceful shutdown
-    const shutdown = async (signal: string) => {
+    // Graceful shutdown. SSE responses never finish on their own, so server.close() would wait
+    // forever; ending them sends every client to another instance, where it resumes from its
+    // Last-Event-ID without losing anything.
+    let shuttingDown = false;
+    const shutdown = (signal: string) => {
+      if (shuttingDown) return;
+      shuttingDown = true;
       logger.info({ signal }, 'Shutting down gracefully');
       server.close(async () => {
-        await closePubSub();
-        await pool.end();
+        await closePubSub().catch(() => {});
+        await redis.quit().catch(() => {});
+        await pool.end().catch(() => {});
         logger.info('Server shut down');
         process.exit(0);
       });
+      stopHeadChecks();
+      closeAllStreams();
+      server.closeIdleConnections();
+      setTimeout(() => {
+        logger.warn('Forcing exit after shutdown timeout');
+        process.exit(1);
+      }, 10_000).unref();
     };
 
     process.on('SIGTERM', () => shutdown('SIGTERM'));

@@ -1,189 +1,57 @@
 import crypto from 'crypto';
-import type { Request, Response, NextFunction } from 'express';
-import { createModuleLogger } from './logger.js';
-import redis from '../db/redis.js';
-
-const logger = createModuleLogger('idempotency');
 
 /**
- * Idempotency middleware for submission handling
+ * Helpers for safe submission retries.
  *
- * Idempotency prevents duplicate executions when:
- * - Client retries due to network issues
- * - User double-clicks submit button
- * - Frontend makes duplicate requests
+ * Two kinds of duplicate reach POST /submissions, and they need different answers:
  *
- * Each submission is identified by a hash of (userId, problemSlug, code, language)
- * If the same submission is made within the TTL window, the existing submission ID is returned.
+ * 1. A retry of the same request: a timeout, a double click, a page refresh. The client sends
+ *    the same `Idempotency-Key` header, and the server returns the original submission instead
+ *    of judging the code twice. The same key with a different body is a client bug: 422.
+ * 2. The same code submitted again while an identical submission is still queued or running.
+ *    Judging it twice teaches nothing, so the in-flight submission is returned.
+ *
+ * Both rules are enforced by unique indexes in PostgreSQL (see db/init.sql) inside the
+ * transaction that creates the submission. The previous version checked a Redis key and wrote it
+ * after the insert, so concurrent identical requests all passed the check and were all judged.
  */
 
-/** TTL for idempotency keys in seconds, preventing duplicate submissions within 5 minutes. */
-export const IDEMPOTENCY_TTL = 300;
+/** Visible ASCII, 1 to 255 characters: UUIDs and similar opaque client-generated tokens. */
+const KEY_PATTERN = /^[\x21-\x7e]{1,255}$/;
 
-// Prefix for Redis keys
-const IDEMPOTENCY_PREFIX = 'idempotency:submission:';
+export type ParsedIdempotencyKey =
+  | { ok: true; key: string | null }
+  | { ok: false; error: string };
 
-/**
- * Generate a unique idempotency key from submission data
- */
-export function generateIdempotencyKey(userId: string, problemSlug: string, code: string, language: string): string {
-  const data = JSON.stringify({
-    userId,
-    problemSlug,
-    code: normalizeCode(code),
-    language
-  });
-
-  return crypto.createHash('sha256').update(data).digest('hex');
+/** Validates the optional Idempotency-Key header; a missing header is allowed. */
+export function parseIdempotencyKey(header: string | string[] | undefined): ParsedIdempotencyKey {
+  if (header === undefined) return { ok: true, key: null };
+  if (Array.isArray(header)) return { ok: false, error: 'Send a single Idempotency-Key header' };
+  const key = header.trim();
+  if (!KEY_PATTERN.test(key)) {
+    return { ok: false, error: 'Idempotency-Key must be 1-255 visible ASCII characters' };
+  }
+  return { ok: true, key };
 }
 
-/**
- * Normalize code for comparison (remove trailing whitespace, normalize line endings)
- */
-function normalizeCode(code: string): string {
+/** Normalizes code so that whitespace-only differences count as the same submission. */
+export function normalizeCode(code: string): string {
   return code
     .replace(/\r\n/g, '\n')
     .replace(/[ \t]+$/gm, '')
     .trim();
 }
 
-/**
- * Check if a submission is a duplicate and get existing submission ID
- * Returns null if not a duplicate
- */
-export async function checkDuplicate(userId: string, problemSlug: string, code: string, language: string): Promise<string | null> {
-  try {
-    const key = IDEMPOTENCY_PREFIX + generateIdempotencyKey(userId, problemSlug, code, language);
-    const existingSubmissionId = await redis.get(key);
-
-    if (existingSubmissionId) {
-      logger.info({
-        userId,
-        problemSlug,
-        existingSubmissionId
-      }, 'Duplicate submission detected');
-      return existingSubmissionId;
-    }
-
-    return null;
-  } catch (error) {
-    logger.error({ error: (error as Error).message }, 'Failed to check idempotency');
-    // On error, allow the submission to proceed (fail open)
-    return null;
-  }
+function sha256(value: string): string {
+  return crypto.createHash('sha256').update(value).digest('hex');
 }
 
-/**
- * Store submission for idempotency checking
- */
-export async function storeSubmission(userId: string, problemSlug: string, code: string, language: string, submissionId: string): Promise<void> {
-  try {
-    const key = IDEMPOTENCY_PREFIX + generateIdempotencyKey(userId, problemSlug, code, language);
-    await redis.setex(key, IDEMPOTENCY_TTL, submissionId);
-
-    logger.debug({
-      userId,
-      problemSlug,
-      submissionId
-    }, 'Stored submission for idempotency');
-  } catch (error) {
-    logger.error({ error: (error as Error).message }, 'Failed to store idempotency key');
-    // Non-critical error, continue processing
-  }
+/** Hash of the normalized code; with user, problem and language it identifies "the same code". */
+export function hashCode(code: string): string {
+  return sha256(normalizeCode(code));
 }
 
-// Extend Request type to include storeIdempotencyKey
-declare global {
-  namespace Express {
-    interface Request {
-      storeIdempotencyKey?: (submissionId: string) => Promise<void>;
-    }
-  }
-}
-
-/**
- * Express middleware for idempotency based on Idempotency-Key header
- * This is an alternative approach using client-provided keys
- */
-export function idempotencyMiddleware(keyPrefix = 'idempotency:'): (req: Request, res: Response, next: NextFunction) => Promise<void> {
-  return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
-    const idempotencyKey = req.headers['idempotency-key'] as string | undefined;
-
-    if (!idempotencyKey) {
-      // No idempotency key provided, proceed normally
-      next();
-      return;
-    }
-
-    const redisKey = `${keyPrefix}${idempotencyKey}`;
-
-    try {
-      // Check if we've already processed this request
-      const cachedResponse = await redis.get(redisKey);
-
-      if (cachedResponse) {
-        const { statusCode, body } = JSON.parse(cachedResponse);
-        logger.info({ idempotencyKey }, 'Returning cached response for idempotent request');
-        res.status(statusCode).json(body);
-        return;
-      }
-
-      // Store the original res.json to intercept the response
-      const originalJson = res.json.bind(res);
-
-      res.json = function(body: unknown) {
-        // Cache the response for future duplicate requests
-        const responseData = {
-          statusCode: res.statusCode,
-          body
-        };
-
-        redis.setex(redisKey, IDEMPOTENCY_TTL, JSON.stringify(responseData))
-          .catch((err: Error) => logger.error({ error: err.message }, 'Failed to cache idempotent response'));
-
-        return originalJson(body);
-      };
-
-      next();
-    } catch (error) {
-      logger.error({ error: (error as Error).message, idempotencyKey }, 'Idempotency check failed');
-      // Fail open - allow request to proceed
-      next();
-    }
-  };
-}
-
-/**
- * Check for duplicate submission based on content hash (without header)
- * Returns middleware that adds duplicateSubmissionId to req if duplicate found
- */
-export function submissionIdempotency(): (req: Request, res: Response, next: NextFunction) => Promise<void> {
-  return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
-    const { problemSlug, language, code } = req.body as { problemSlug?: string; language?: string; code?: string };
-    const userId = req.session?.userId;
-
-    if (!userId || !problemSlug || !code || !language) {
-      next();
-      return;
-    }
-
-    const existingSubmissionId = await checkDuplicate(userId, problemSlug, code, language);
-
-    if (existingSubmissionId) {
-      // Return the existing submission instead of creating a new one
-      res.status(200).json({
-        submissionId: existingSubmissionId,
-        status: 'duplicate',
-        message: 'Identical submission already exists. Returning existing submission ID.'
-      });
-      return;
-    }
-
-    // Store helper for later use after submission is created
-    req.storeIdempotencyKey = async (submissionId: string) => {
-      await storeSubmission(userId, problemSlug, code, language, submissionId);
-    };
-
-    next();
-  };
+/** Hash of the exact request body, used to detect an Idempotency-Key reused for another body. */
+export function hashRequest(body: { problemSlug: string; language: string; code: string }): string {
+  return sha256(JSON.stringify([body.problemSlug, body.language, body.code]));
 }

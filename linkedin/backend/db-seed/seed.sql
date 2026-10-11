@@ -63,6 +63,37 @@ VALUES
    'San Francisco, CA', 'Technology', NULL, 0, 'admin')
 ON CONFLICT DO NOTHING;
 
+-- Extended network beyond the Alice/Bob/Charlie/Diana clique, so second-degree,
+-- third-degree, out-of-network and PYMK cases all exist (from Alice's point of view):
+--   Ethan  - 2nd degree via Bob and Charlie; worked at DataFlow Inc. like Alice
+--   Fiona  - 2nd degree via Diana; works at TechCorp and studied at Berkeley like Alice
+--   Ivan   - 2nd degree via Charlie; Berkeley alum, "Frontend Developer"
+--   George - 3rd degree (Alice -> Bob -> Ethan -> George); DataFlow Inc. colleague of Bob
+--   Hannah - outside Alice's 3-degree network; has a pending invitation to Alice
+INSERT INTO users (id, email, password_hash, first_name, last_name, headline, summary, location, industry, profile_image_url, connection_count, role)
+VALUES
+  (6, 'ethan@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Ethan', 'Brooks',
+   'Platform Engineer at CloudNine Systems',
+   'Platform engineer working on Kubernetes, CI/CD and internal developer tooling. Before CloudNine I built streaming data pipelines at DataFlow Inc.',
+   'Austin, TX', 'Technology', NULL, 0, 'user'),
+  (7, 'fiona@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Fiona', 'Chen',
+   'Engineering Manager at TechCorp',
+   'Engineering manager for the TechCorp payments platform. I care about calm on-call rotations, clear design docs and growing senior engineers.',
+   'San Francisco, CA', 'Technology', NULL, 0, 'user'),
+  (8, 'george@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'George', 'Patel',
+   'Data Engineer at DataFlow Inc.',
+   'Data engineer building Kafka-based ingestion and SQL modeling for the DataFlow analytics product.',
+   'Seattle, WA', 'Technology', NULL, 0, 'user'),
+  (9, 'hannah@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Hannah', 'Lee',
+   'Machine Learning Researcher at MedVision Health',
+   'ML researcher applying deep learning to medical imaging. Interested in model reliability and evaluation under distribution shift.',
+   'Boston, MA', 'Healthcare', NULL, 0, 'user'),
+  (10, 'ivan@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Ivan', 'Novak',
+   'Frontend Developer at GreenLeaf Studios',
+   'Frontend developer turning design systems into accessible React components. Berkeley alum, occasional conference speaker on web performance.',
+   'Portland, OR', 'Design', NULL, 0, 'user')
+ON CONFLICT DO NOTHING;
+
 SELECT setval('users_id_seq', (SELECT COALESCE(MAX(id), 0) FROM users));
 
 -- ============================================================================
@@ -149,6 +180,30 @@ INSERT INTO user_skills (user_id, skill_id, endorsement_count) VALUES
   (4, 11, 10)   -- Data Analysis
 ON CONFLICT DO NOTHING;
 
+-- Extended network skills
+INSERT INTO user_skills (user_id, skill_id, endorsement_count) VALUES
+  (6, 8, 6),    -- Ethan: Docker
+  (6, 9, 7),    -- Kubernetes
+  (6, 7, 4),    -- AWS
+  (6, 3, 2),    -- Python
+  (6, 24, 3),   -- Apache Kafka
+  (7, 19, 9),   -- Fiona: System Design
+  (7, 13, 5),   -- Agile
+  (7, 2, 4),    -- TypeScript
+  (7, 5, 3),    -- Node.js
+  (8, 3, 5),    -- George: Python
+  (8, 17, 6),   -- SQL
+  (8, 24, 8),   -- Apache Kafka
+  (9, 10, 11),  -- Hannah: Machine Learning
+  (9, 20, 9),   -- Deep Learning
+  (9, 21, 6),   -- TensorFlow
+  (9, 3, 7),    -- Python
+  (10, 4, 8),   -- Ivan: React
+  (10, 2, 6),   -- TypeScript
+  (10, 1, 5),   -- JavaScript
+  (10, 15, 3)   -- Figma
+ON CONFLICT DO NOTHING;
+
 -- ============================================================================
 -- EXPERIENCES
 -- ============================================================================
@@ -213,6 +268,23 @@ VALUES
    FALSE)
 ON CONFLICT DO NOTHING;
 
+-- Extended network experience
+INSERT INTO experiences (id, user_id, company_id, company_name, title, location, start_date, end_date, description, is_current)
+VALUES
+  (11, 6, 6, 'CloudNine Systems', 'Platform Engineer', 'Austin, TX', '2022-02-01', NULL,
+   'Runs the Kubernetes platform and CI/CD tooling used by 40 product teams.', TRUE),
+  (12, 6, 2, 'DataFlow Inc.', 'Data Engineer', 'Seattle, WA', '2019-05-01', '2022-01-31',
+   'Built Kafka ingestion pipelines for the analytics product.', FALSE),
+  (13, 7, 1, 'TechCorp', 'Engineering Manager', 'San Francisco, CA', '2019-08-01', NULL,
+   'Leads the payments platform team of nine engineers.', TRUE),
+  (14, 8, 2, 'DataFlow Inc.', 'Data Engineer', 'Seattle, WA', '2021-03-01', NULL,
+   'Owns ingestion and modeling for the analytics warehouse.', TRUE),
+  (15, 9, 5, 'MedVision Health', 'Machine Learning Researcher', 'Boston, MA', '2020-09-01', NULL,
+   'Develops and validates diagnostic imaging models.', TRUE),
+  (16, 10, 3, 'GreenLeaf Studios', 'Frontend Developer', 'Portland, OR', '2021-06-01', NULL,
+   'Builds the studio''s React design system and campaign microsites.', TRUE)
+ON CONFLICT DO NOTHING;
+
 SELECT setval('experiences_id_seq', (SELECT COALESCE(MAX(id), 0) FROM experiences));
 
 -- ============================================================================
@@ -232,7 +304,12 @@ VALUES
   (5, 4, 'Massachusetts Institute of Technology', 'Ph.D.', 'Applied Mathematics', 2014, 2019,
    'Dissertation on stochastic optimization methods for portfolio management. Published 5 papers in top-tier journals. Teaching assistant for graduate probability theory.'),
   (6, 4, 'Stanford University', 'Bachelor of Science', 'Mathematics', 2010, 2014,
-   'Double major in Mathematics and Statistics. Summa cum laude. Research assistant in the computational finance lab.')
+   'Double major in Mathematics and Statistics. Summa cum laude. Research assistant in the computational finance lab.'),
+  (7, 6, 'University of Texas at Austin', 'Bachelor of Science', 'Computer Science', 2015, 2019, NULL),
+  (8, 7, 'University of California, Berkeley', 'Bachelor of Science', 'Electrical Engineering and Computer Science', 2009, 2013, NULL),
+  (9, 8, 'University of Washington', 'Bachelor of Science', 'Informatics', 2016, 2020, NULL),
+  (10, 9, 'Massachusetts Institute of Technology', 'Ph.D.', 'Computer Science', 2015, 2020, NULL),
+  (11, 10, 'University of California, Berkeley', 'Bachelor of Arts', 'Cognitive Science', 2014, 2018, NULL)
 ON CONFLICT DO NOTHING;
 
 SELECT setval('education_id_seq', (SELECT COALESCE(MAX(id), 0) FROM education));
@@ -272,20 +349,31 @@ INSERT INTO connections (user_id, connected_to, connected_at)
 VALUES (3, 4, NOW() - INTERVAL '2 weeks')
 ON CONFLICT DO NOTHING;
 
--- Update denormalized connection counts
-UPDATE users SET connection_count = 3 WHERE id = 1;  -- Alice: Bob, Charlie, Diana
-UPDATE users SET connection_count = 3 WHERE id = 2;  -- Bob: Alice, Charlie, Diana
-UPDATE users SET connection_count = 3 WHERE id = 3;  -- Charlie: Alice, Bob, Diana
-UPDATE users SET connection_count = 3 WHERE id = 4;  -- Diana: Alice, Bob, Charlie
+-- Extended network edges
+INSERT INTO connections (user_id, connected_to, connected_at)
+VALUES
+  (2, 6, NOW() - INTERVAL '5 months'),   -- Bob <-> Ethan
+  (3, 6, NOW() - INTERVAL '3 weeks'),    -- Charlie <-> Ethan
+  (4, 7, NOW() - INTERVAL '7 weeks'),    -- Diana <-> Fiona
+  (6, 8, NOW() - INTERVAL '2 months'),   -- Ethan <-> George
+  (8, 9, NOW() - INTERVAL '9 days'),     -- George <-> Hannah
+  (3, 10, NOW() - INTERVAL '6 weeks')    -- Charlie <-> Ivan
+ON CONFLICT DO NOTHING;
+
+-- Denormalized connection counts, recomputed from the edges (re-runnable)
+UPDATE users u SET connection_count = (
+  SELECT COUNT(*) FROM connections c WHERE c.user_id = u.id OR c.connected_to = u.id
+);
 
 -- ============================================================================
 -- CONNECTION REQUESTS (pending)
 -- ============================================================================
 
--- Diana wants to connect with Admin
+-- Diana wants to connect with Admin; Hannah (outside Alice's network) invited Alice
 INSERT INTO connection_requests (id, from_user_id, to_user_id, message, status)
 VALUES
-  (1, 4, 5, 'Hi Admin, I''d love to connect and learn more about platform operations!', 'pending')
+  (1, 4, 5, 'Hi Admin, I''d love to connect and learn more about platform operations!', 'pending'),
+  (2, 9, 1, 'Hi Alice, I enjoyed your talk on designing for failure. Would love to connect!', 'pending')
 ON CONFLICT DO NOTHING;
 
 SELECT setval('connection_requests_id_seq', (SELECT COALESCE(MAX(id), 0) FROM connection_requests));
@@ -542,3 +630,15 @@ WHERE profile_image_url IS NULL;
 UPDATE companies SET logo_url = 'https://ui-avatars.com/api/?background=0A66C2&color=fff&bold=true&size=200&name='
   || replace(name, ' ', '+')
 WHERE logo_url IS NULL OR logo_url LIKE '%example.com%';
+
+-- ============================================================
+-- Search index outbox: queue every member and job so the relay in
+-- services/searchIndexer.ts (re)builds the Elasticsearch documents.
+-- ============================================================
+INSERT INTO search_index_queue (entity_type, entity_id)
+SELECT 'user', id FROM users
+UNION ALL
+SELECT 'job', id FROM jobs
+ON CONFLICT (entity_type, entity_id) DO UPDATE
+  SET version = search_index_queue.version + 1, enqueued_at = NOW(),
+      attempts = 0, next_attempt_at = NOW(), last_error = NULL;

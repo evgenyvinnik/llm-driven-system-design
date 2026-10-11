@@ -1,11 +1,12 @@
-import { query, queryOne, execute } from '../utils/db.js';
-import { cacheGet as _cacheGet, cacheSet as _cacheSet, cacheDel } from '../utils/redis.js';
+import { query, queryOne, execute, withTransaction } from '../utils/db.js';
+import { ApiError } from '../utils/errors.js';
 import { getFirstDegreeConnections } from './connectionService.js';
 import type { Post, PostComment, User } from '../types/index.js';
 
 /**
  * Creates a new post in the feed.
- * Invalidates feed caches for the author's connections so they see the new post.
+ * The feed is assembled at read time (pull model) from the authors' posts, so a new
+ * post needs no fan-out: connections see it on their next feed request.
  *
  * @param userId - The author's user ID
  * @param content - The text content of the post
@@ -23,13 +24,6 @@ export async function createPost(
      RETURNING *`,
     [userId, content, imageUrl || null]
   );
-
-  // Invalidate feed caches for user's connections
-  const connections = await getFirstDegreeConnections(userId);
-  for (const connId of connections.slice(0, 50)) { // Limit to prevent too many cache ops
-    await cacheDel(`feed:${connId}`);
-  }
-
   return post!;
 }
 
@@ -190,6 +184,8 @@ export async function getFeed(
  * @param postId - The post to like
  */
 export async function likePost(userId: number, postId: number): Promise<void> {
+  const post = await queryOne<{ id: number }>('SELECT id FROM posts WHERE id = $1', [postId]);
+  if (!post) throw new ApiError(404, 'post_not_found', 'Post not found');
   await execute(
     `INSERT INTO post_likes (user_id, post_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
     [userId, postId]
@@ -220,7 +216,7 @@ export async function unlikePost(userId: number, postId: number): Promise<void> 
 
 /**
  * Adds a comment to a post.
- * Increments the post's comment count for display.
+ * The comment and the post's comment_count change in one transaction.
  *
  * @param postId - The post to comment on
  * @param userId - The user writing the comment
@@ -232,19 +228,20 @@ export async function addComment(
   userId: number,
   content: string
 ): Promise<PostComment> {
-  const comment = await queryOne<PostComment>(
-    `INSERT INTO post_comments (post_id, user_id, content)
-     VALUES ($1, $2, $3)
-     RETURNING *`,
-    [postId, userId, content]
-  );
-
-  await execute(
-    `UPDATE posts SET comment_count = comment_count + 1 WHERE id = $1`,
-    [postId]
-  );
-
-  return comment!;
+  return withTransaction(async (client) => {
+    const post = await client.query(
+      'UPDATE posts SET comment_count = comment_count + 1 WHERE id = $1 RETURNING id',
+      [postId]
+    );
+    if (!post.rowCount) throw new ApiError(404, 'post_not_found', 'Post not found');
+    const comment = await client.query<PostComment>(
+      `INSERT INTO post_comments (post_id, user_id, content)
+       VALUES ($1, $2, $3)
+       RETURNING *`,
+      [postId, userId, content]
+    );
+    return comment.rows[0];
+  });
 }
 
 /**
@@ -285,20 +282,19 @@ export async function getPostComments(postId: number, offset = 0, limit = 50): P
  * @returns True if deleted, false if not found/unauthorized
  */
 export async function deleteComment(commentId: number, userId: number): Promise<boolean> {
-  const comment = await queryOne<{ post_id: number }>(
-    `DELETE FROM post_comments WHERE id = $1 AND user_id = $2 RETURNING post_id`,
-    [commentId, userId]
-  );
-
-  if (comment) {
-    await execute(
+  return withTransaction(async (client) => {
+    const deleted = await client.query<{ post_id: number }>(
+      `DELETE FROM post_comments WHERE id = $1 AND user_id = $2 RETURNING post_id`,
+      [commentId, userId]
+    );
+    const comment = deleted.rows[0];
+    if (!comment) return false;
+    await client.query(
       `UPDATE posts SET comment_count = GREATEST(0, comment_count - 1) WHERE id = $1`,
       [comment.post_id]
     );
     return true;
-  }
-
-  return false;
+  });
 }
 
 /**

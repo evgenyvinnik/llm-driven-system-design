@@ -22,10 +22,25 @@ redis.on('connect', () => {
   logger.info('Redis connected');
 });
 
-/** Establishes the Redis connection (used on startup). */
-export async function connectRedis(): Promise<void> {
+/**
+ * Establishes the Redis connection (used on startup). A lazy client connects on its first
+ * command, and the rate-limit store sends one at import time, so the connection may
+ * already be under way; in that case wait for it instead of calling connect() twice.
+ */
+export async function connectRedis(timeoutMs = 5000): Promise<void> {
   try {
-    await redis.connect();
+    if (redis.status === 'wait') {
+      await redis.connect();
+      return;
+    }
+    if (redis.status === 'ready') return;
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('Redis not ready')), timeoutMs);
+      redis.once('ready', () => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
   } catch (err) {
     logger.error({ err }, 'Failed to connect to Redis');
   }

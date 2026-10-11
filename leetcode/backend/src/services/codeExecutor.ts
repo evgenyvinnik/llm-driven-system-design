@@ -7,18 +7,20 @@ import type CircuitBreaker from 'opossum';
 
 import { createModuleLogger } from '../shared/logger.js';
 import { metrics } from '../shared/metrics.js';
-import { createExecutionCircuitBreaker, createFallback, type ExecutionOptions, type ExecutionResult } from '../shared/circuitBreaker.js';
+import { createExecutionCircuitBreaker } from '../shared/circuitBreaker.js';
+import { DockerStreamDemuxer, type OutputLimits } from './dockerStream.js';
 
 const logger = createModuleLogger('code-executor');
 const docker = new Docker();
 
 interface LanguageConfig {
   image: string;
-  extension: string;
   fileName: string;
-  compileCommand?: (file: string) => string[];
-  runCommand: (file: string) => string[];
-  timeout: number;
+  compileCommand?: string[];
+  runCommand: string[];
+  /** Upper bound on the per-test time limit for this language, in milliseconds. */
+  timeoutMs: number;
+  /** Upper bound on the per-test memory limit for this language, in megabytes. */
   memoryMb: number;
 }
 
@@ -26,484 +28,457 @@ interface LanguageConfig {
 const LANGUAGE_CONFIG: Record<string, LanguageConfig> = {
   python: {
     image: 'python:3.11-alpine',
-    extension: '.py',
     fileName: 'solution.py',
-    runCommand: (file: string) => ['python3', file],
-    timeout: 10000,
+    runCommand: ['python3', '/code/solution.py'],
+    timeoutMs: 10000,
     memoryMb: 256
   },
   javascript: {
     image: 'node:20-alpine',
-    extension: '.js',
     fileName: 'solution.js',
-    runCommand: (file: string) => ['node', file],
-    timeout: 8000,
+    runCommand: ['node', '/code/solution.js'],
+    timeoutMs: 8000,
     memoryMb: 256
   },
   cpp: {
     image: 'gcc:13',
-    extension: '.cpp',
     fileName: 'solution.cpp',
-    compileCommand: (_file: string) => ['g++', '-O2', '-std=c++17', '-o', '/code/solution', '/code/solution.cpp'],
-    runCommand: (_file: string) => ['/code/solution'],
-    timeout: 15000,
+    compileCommand: ['g++', '-O2', '-std=c++17', '-o', '/code/solution', '/code/solution.cpp'],
+    runCommand: ['/code/solution'],
+    timeoutMs: 15000,
     memoryMb: 512
   },
   java: {
     image: 'openjdk:21-slim',
-    extension: '.java',
     fileName: 'Solution.java',
-    compileCommand: (_file: string) => ['javac', '/code/Solution.java'],
-    runCommand: (_file: string) => ['java', '-cp', '/code', 'Solution'],
-    timeout: 15000,
+    compileCommand: ['javac', '/code/Solution.java'],
+    runCommand: ['java', '-cp', '/code', 'Solution'],
+    timeoutMs: 15000,
     memoryMb: 512
   }
 };
 
-interface CollectOutputResult {
+/** Languages the sandbox can compile and run. */
+export const SUPPORTED_LANGUAGES = Object.keys(LANGUAGE_CONFIG);
+
+const MB = 1024 * 1024;
+const COMPILE_TIMEOUT_MS = 30000;
+const COMPILE_MEMORY_MB = 512;
+/** Grace period on top of the time limit before a container that will not exit is abandoned. */
+const WAIT_GRACE_MS = 10000;
+/** How long to wait for the last output frames after the process exits. */
+const STREAM_DRAIN_MS = 500;
+const RUN_OUTPUT_LIMITS: OutputLimits = { stdoutBytes: 1 * MB, stderrBytes: 64 * 1024 };
+const COMPILE_OUTPUT_LIMITS: OutputLimits = { stdoutBytes: 64 * 1024, stderrBytes: 64 * 1024 };
+
+/** Unprivileged uid:gid inside the container ("nobody"); the code never runs as root. */
+const SANDBOX_USER = process.env.SANDBOX_USER || '65534:65534';
+/** Optional OCI runtime, e.g. "runsc" to run every container under gVisor. */
+const SANDBOX_RUNTIME = process.env.SANDBOX_RUNTIME || undefined;
+/** Containers this process may run at once, across judging and sample runs. */
+const SANDBOX_MAX_CONTAINERS = parseInt(process.env.SANDBOX_MAX_CONTAINERS || '4', 10);
+
+const LABEL_SANDBOX = 'leetcode.sandbox';
+const LABEL_OWNER = 'leetcode.owner';
+
+const OUT_OF_MEMORY = /java\.lang\.OutOfMemoryError|\bMemoryError\b|JavaScript heap out of memory|std::bad_alloc/;
+
+/** Outcome of one test run, as seen by the judge. */
+export type RunStatus =
+  | 'success'
+  | 'time_limit_exceeded'
+  | 'memory_limit_exceeded'
+  | 'output_limit_exceeded'
+  | 'runtime_error';
+
+export interface RunLimits {
+  timeLimitMs: number;
+  memoryLimitMb: number;
+}
+
+export interface RunResult {
+  status: RunStatus;
   stdout: string;
   stderr: string;
+  exitCode: number;
+  executionTime: number;
+}
+
+/** Code written to disk and, for compiled languages, compiled once for all test cases. */
+export interface PreparedProgram {
+  id: string;
+  language: string;
+  workDir: string;
+  /** Compiler output when compilation failed; the program must not be run. */
+  compileError?: string;
+}
+
+/** Everything one sandbox container needs. */
+export interface ContainerSpec {
+  image: string;
+  cmd: string[];
+  workDir: string;
+  /** Mount /code read-write (compile step) instead of read-only (test runs). */
+  writableCode: boolean;
+  memoryMb: number;
+  timeoutMs: number;
+  stdin: string;
+  outputLimits: OutputLimits;
+}
+
+/** What happened inside one container; turned into a RunStatus by classifyRun. */
+export interface ContainerOutcome {
+  stdout: string;
+  stderr: string;
+  exitCode: number;
   timedOut: boolean;
+  oomKilled: boolean;
+  outputLimitExceeded: boolean;
+  durationMs: number;
+}
+
+/**
+ * The sandbox itself failed (Docker unreachable, image missing, circuit open). This is never
+ * the user's fault, so callers retry later instead of recording a verdict.
+ */
+export class SandboxUnavailableError extends Error {
+  readonly breakerOpen: boolean;
+  readonly retryAfterMs: number;
+
+  constructor(message: string, options: { breakerOpen?: boolean; retryAfterMs?: number } = {}) {
+    super(message);
+    this.name = 'SandboxUnavailableError';
+    this.breakerOpen = options.breakerOpen ?? false;
+    this.retryAfterMs = options.retryAfterMs ?? 5000;
+  }
+}
+
+/** Maps a container outcome to a verdict for one test. Order matters: the first match wins. */
+export function classifyRun(outcome: Pick<ContainerOutcome, 'outputLimitExceeded' | 'timedOut' | 'oomKilled' | 'exitCode' | 'stderr'>): RunStatus {
+  // We killed it for printing too much, or for running too long: those explain the exit code.
+  if (outcome.outputLimitExceeded) return 'output_limit_exceeded';
+  if (outcome.timedOut) return 'time_limit_exceeded';
+  // The kernel OOM killer (exit 137, OOMKilled) or a runtime that reports its own heap exhaustion.
+  if (outcome.oomKilled) return 'memory_limit_exceeded';
+  if (outcome.exitCode !== 0 && OUT_OF_MEMORY.test(outcome.stderr)) return 'memory_limit_exceeded';
+  if (outcome.exitCode !== 0) return 'runtime_error';
+  return 'success';
+}
+
+/** Counting semaphore that bounds concurrent containers on this host. */
+class Semaphore {
+  private available: number;
+  private readonly waiters: Array<() => void> = [];
+
+  constructor(size: number) {
+    this.available = Math.max(1, size);
+  }
+
+  async acquire(): Promise<() => void> {
+    if (this.available > 0) {
+      this.available--;
+    } else {
+      await new Promise<void>((resolve) => this.waiters.push(resolve));
+    }
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const next = this.waiters.shift();
+      if (next) next();
+      else this.available++;
+    };
+  }
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
 /** Executes user code in sandboxed Docker containers with resource limits and circuit breaker protection. */
 class CodeExecutor {
   private tempDir: string;
-  private circuitBreaker: CircuitBreaker<[ExecutionOptions], ExecutionResult> | null;
+  private circuitBreaker: CircuitBreaker<[ContainerSpec], ContainerOutcome> | null;
+  private ownerId = 'local';
+  private readonly slots = new Semaphore(SANDBOX_MAX_CONTAINERS);
+  private readonly pulls = new Map<string, Promise<void>>();
 
   constructor() {
     this.tempDir = path.join(os.tmpdir(), 'leetcode-sandbox');
     this.circuitBreaker = null;
   }
 
-  async init(): Promise<void> {
+  /**
+   * Prepares the executor. `ownerId` labels every container this process starts, so a
+   * restarted process can remove containers its previous incarnation left running.
+   */
+  async init(ownerId = process.env.WORKER_ID || 'local'): Promise<void> {
+    if (this.circuitBreaker) return;
+    this.ownerId = ownerId;
     try {
       await fs.mkdir(this.tempDir, { recursive: true });
-      logger.info({ tempDir: this.tempDir }, 'Code executor initialized');
-
-      // Initialize circuit breaker wrapping the container execution
-      this.circuitBreaker = createExecutionCircuitBreaker(
-        this._runInContainerInternal.bind(this)
-      );
-
-      // Set up fallback for when circuit breaker is open
-      this.circuitBreaker.fallback(createFallback());
-
     } catch (error) {
-      logger.error({ error: (error as Error).message }, 'Failed to initialize code executor');
+      logger.error({ error: (error as Error).message }, 'Failed to create sandbox temp directory');
     }
-  }
-
-  async execute(code: string, language: string, input: string, timeLimit = 5000, memoryLimit = 256): Promise<ExecutionResult> {
-    const config = LANGUAGE_CONFIG[language];
-    if (!config) {
-      return {
-        status: 'system_error',
-        error: `Unsupported language: ${language}`
-      };
-    }
-
-    const executionId = uuidv4();
-    const workDir = path.join(this.tempDir, executionId);
-    const codeFile = config.fileName;
-    const codePath = path.join(workDir, codeFile);
-    const inputPath = path.join(workDir, 'input.txt');
-
-    try {
-      // Create work directory
-      await fs.mkdir(workDir, { recursive: true });
-
-      // Write code and input files
-      await fs.writeFile(codePath, code);
-      await fs.writeFile(inputPath, input);
-
-      const startTime = Date.now();
-
-      // Track active container
-      metrics.activeContainers.inc();
-
-      // Execute in Docker container (through circuit breaker)
-      const result = await this.runInContainer({
-        image: config.image,
-        workDir,
-        codeFile,
-        compileCommand: config.compileCommand ? config.compileCommand(`/code/${codeFile}`) : undefined,
-        runCommand: config.runCommand(`/code/${codeFile}`),
-        timeout: Math.min(timeLimit, config.timeout),
-        memoryMb: Math.min(memoryLimit, config.memoryMb),
-        language
-      });
-
-      const executionTime = Date.now() - startTime;
-
-      // Record execution metrics
-      metrics.codeExecutionsTotal.inc({
-        status: result.status,
-        language
-      });
-
-      metrics.codeExecutionDuration.observe(
-        { language, status: result.status },
-        executionTime / 1000
-      );
-
-      // Decrement active container count
-      metrics.activeContainers.dec();
-
-      logger.debug({
-        executionId,
-        language,
-        status: result.status,
-        executionTimeMs: executionTime
-      }, 'Code execution completed');
-
-      return {
-        ...result,
-        executionTime
-      };
-    } catch (error) {
-      logger.error({
-        error: (error as Error).message,
-        executionId,
-        language
-      }, 'Execution error');
-
-      // Decrement active container on error
-      metrics.activeContainers.dec();
-
-      // Record error metric
-      metrics.codeExecutionsTotal.inc({
-        status: 'system_error',
-        language
-      });
-
-      return {
-        status: 'system_error',
-        error: (error as Error).message,
-        executionTime: 0
-      };
-    } finally {
-      // Cleanup
-      try {
-        await fs.rm(workDir, { recursive: true, force: true });
-      } catch (e) {
-        logger.warn({ error: (e as Error).message, workDir }, 'Cleanup error');
-      }
-    }
-  }
-
-  async runInContainer(options: ExecutionOptions): Promise<ExecutionResult> {
-    // Use circuit breaker to protect against sandbox failures
-    if (this.circuitBreaker) {
-      try {
-        return await this.circuitBreaker.fire(options);
-      } catch (error) {
-        // Circuit breaker is open or execution failed
-        if ((error as { code?: string }).code === 'EOPENBREAKER') {
-          return {
-            status: 'system_error',
-            error: 'Code execution temporarily unavailable. Please try again later.',
-            isCircuitBreakerOpen: true
-          };
-        }
-        throw error;
-      }
-    }
-
-    // Fallback if circuit breaker not initialized
-    return await this._runInContainerInternal(options);
-  }
-
-  async _runInContainerInternal({ image, workDir, compileCommand, runCommand, timeout, memoryMb }: ExecutionOptions): Promise<ExecutionResult> {
-    let container: Docker.Container | null = null;
-
-    try {
-      // Pull image if not exists (with timeout)
-      try {
-        await docker.getImage(image).inspect();
-      } catch {
-        logger.info({ image }, 'Pulling Docker image');
-        await new Promise<void>((resolve, reject) => {
-          docker.pull(image, (err: Error | null, stream: NodeJS.ReadableStream) => {
-            if (err) return reject(err);
-            docker.modem.followProgress(stream, (err: Error | null) => {
-              if (err) return reject(err);
-              resolve();
-            });
-          });
-        });
-      }
-
-      // For compiled languages, we need to compile first
-      if (compileCommand) {
-        const compileResult = await this.runCompileStep(image, workDir, compileCommand, memoryMb);
-        if (compileResult.status !== 'success') {
-          return compileResult;
-        }
-      }
-
-      // Determine bind mode - writable for compiled languages (to read compiled output)
-      const bindMode = compileCommand ? 'rw' : 'ro';
-
-      // Create container with security restrictions
-      container = await docker.createContainer({
-        Image: image,
-        Cmd: runCommand,
-        WorkingDir: '/code',
-        HostConfig: {
-          Binds: [`${workDir}:/code:${bindMode}`],
-          Memory: memoryMb * 1024 * 1024,
-          MemorySwap: memoryMb * 1024 * 1024, // No swap
-          CpuPeriod: 100000,
-          CpuQuota: 50000, // 50% of one CPU
-          PidsLimit: 50,
-          NetworkMode: 'none',
-          ReadonlyRootfs: false,
-          SecurityOpt: ['no-new-privileges'],
-          CapDrop: ['ALL'],
-          AutoRemove: true
-        },
-        OpenStdin: true,
-        StdinOnce: true,
-        AttachStdin: true,
-        AttachStdout: true,
-        AttachStderr: true,
-        Tty: false
-      });
-
-      // Read input file
-      const input = await fs.readFile(path.join(workDir, 'input.txt'), 'utf8');
-
-      // Start container
-      const stream = await container.attach({
-        stream: true,
-        stdin: true,
-        stdout: true,
-        stderr: true
-      });
-
-      await container.start();
-
-      // Send input
-      stream.write(input);
-      stream.end();
-
-      // Collect output with timeout
-      const { stdout, stderr, timedOut } = await this.collectOutput(container, stream, timeout);
-
-      if (timedOut) {
-        logger.warn({ timeout }, 'Code execution timed out');
-        return {
-          status: 'time_limit_exceeded',
-          stdout: stdout.substring(0, 1000),
-          stderr: stderr.substring(0, 1000)
-        };
-      }
-
-      // Wait for container to finish
-      const waitResult = await container.wait();
-
-      if (waitResult.StatusCode !== 0) {
-        return {
-          status: 'runtime_error',
-          stdout: stdout.substring(0, 1000),
-          stderr: stderr.substring(0, 1000),
-          exitCode: waitResult.StatusCode
-        };
-      }
-
-      return {
-        status: 'success',
-        stdout: stdout.trim(),
-        stderr: stderr.substring(0, 1000)
-      };
-    } catch (error) {
-      logger.error({ error: (error as Error).message }, 'Container error');
-
-      // Check for OOM
-      if ((error as Error).message && (error as Error).message.includes('OOMKilled')) {
-        return {
-          status: 'memory_limit_exceeded',
-          error: 'Out of memory'
-        };
-      }
-
-      // Re-throw for circuit breaker to track
-      throw error;
-    } finally {
-      // Ensure container is stopped and removed
-      if (container) {
-        try {
-          await container.stop({ t: 0 }).catch(() => {});
-          await container.remove({ force: true }).catch(() => {});
-        } catch {
-          // Container might already be removed due to AutoRemove
-        }
-      }
-    }
-  }
-
-  /**
-   * Run compilation step for compiled languages (C++, Java)
-   */
-  async runCompileStep(image: string, workDir: string, compileCommand: string[], memoryMb: number): Promise<ExecutionResult> {
-    let container: Docker.Container | null = null;
-
-    try {
-      container = await docker.createContainer({
-        Image: image,
-        Cmd: compileCommand,
-        WorkingDir: '/code',
-        HostConfig: {
-          Binds: [`${workDir}:/code:rw`], // Writable for compilation output
-          Memory: memoryMb * 1024 * 1024,
-          MemorySwap: memoryMb * 1024 * 1024,
-          CpuPeriod: 100000,
-          CpuQuota: 50000,
-          PidsLimit: 50,
-          NetworkMode: 'none',
-          ReadonlyRootfs: false,
-          SecurityOpt: ['no-new-privileges'],
-          CapDrop: ['ALL'],
-          AutoRemove: true
-        },
-        AttachStdout: true,
-        AttachStderr: true,
-        Tty: false
-      });
-
-      const stream = await container.attach({
-        stream: true,
-        stdout: true,
-        stderr: true
-      });
-
-      await container.start();
-
-      // Collect compile output with 30 second timeout
-      const { stdout, stderr, timedOut } = await this.collectOutput(container, stream, 30000);
-
-      if (timedOut) {
-        logger.warn('Compilation timed out');
-        return {
-          status: 'compilation_error',
-          error: 'Compilation timed out',
-          stderr: stderr.substring(0, 2000)
-        };
-      }
-
-      const waitResult = await container.wait();
-
-      if (waitResult.StatusCode !== 0) {
-        return {
-          status: 'compilation_error',
-          stdout: stdout.substring(0, 1000),
-          stderr: stderr.substring(0, 2000),
-          error: 'Compilation failed',
-          exitCode: waitResult.StatusCode
-        };
-      }
-
-      return { status: 'success' };
-    } catch (error) {
-      logger.error({ error: (error as Error).message }, 'Compilation error');
-      return {
-        status: 'compilation_error',
-        error: (error as Error).message
-      };
-    } finally {
-      if (container) {
-        try {
-          await container.stop({ t: 0 }).catch(() => {});
-          await container.remove({ force: true }).catch(() => {});
-        } catch {
-          // Container might already be removed
-        }
-      }
-    }
-  }
-
-  async collectOutput(container: Docker.Container, stream: NodeJS.ReadWriteStream, timeout: number): Promise<CollectOutputResult> {
-    return new Promise((resolve) => {
-      let stdout = '';
-      const stderr = '';
-      let timedOut = false;
-
-      const timeoutId = setTimeout(async () => {
-        timedOut = true;
-        try {
-          await container.stop({ t: 0 });
-        } catch {
-          // Ignore
-        }
-        resolve({ stdout, stderr, timedOut: true });
-      }, timeout);
-
-      // Docker multiplexed stream format
-      stream.on('data', (chunk: Buffer) => {
-        // First 8 bytes are header (stream type + size)
-        // For simplicity, treat all as stdout
-        const text = chunk.toString('utf8');
-        // Remove Docker stream headers (non-printable chars at start)
-        const cleaned = text.replace(/^[\x00-\x08]/g, '');
-        stdout += cleaned;
-      });
-
-      container.wait().then(() => {
-        clearTimeout(timeoutId);
-        if (!timedOut) {
-          resolve({ stdout, stderr, timedOut: false });
-        }
-      }).catch(() => {
-        clearTimeout(timeoutId);
-        if (!timedOut) {
-          resolve({ stdout, stderr, timedOut: false });
-        }
-      });
+    this.circuitBreaker = createExecutionCircuitBreaker((spec: ContainerSpec) => this.runContainerUnprotected(spec));
+    logger.info({ tempDir: this.tempDir, ownerId, runtime: SANDBOX_RUNTIME ?? 'runc' }, 'Code executor initialized');
+    this.removeOrphanedContainers().catch((error: Error) => {
+      logger.warn({ error: error.message }, 'Could not check for orphaned sandbox containers');
     });
   }
 
-  compareOutput(actual: string, expected: string): boolean {
-    // Normalize whitespace
-    const normalize = (s: string) => s.trim().replace(/\r\n/g, '\n').replace(/\s+$/gm, '');
-
-    const actualNorm = normalize(actual);
-    const expectedNorm = normalize(expected);
-
-    if (actualNorm === expectedNorm) {
-      return true;
+  /** Writes the code and compiles it once; test cases then reuse the same build. */
+  async prepare(code: string, language: string): Promise<PreparedProgram> {
+    const config = LANGUAGE_CONFIG[language];
+    if (!config) {
+      throw new Error(`Unsupported language: ${language}`);
     }
 
-    // Try parsing as JSON for array comparison
-    try {
-      const actualJson = JSON.parse(actualNorm);
-      const expectedJson = JSON.parse(expectedNorm);
+    const id = uuidv4();
+    const workDir = path.join(this.tempDir, id);
+    await fs.mkdir(workDir, { recursive: true });
+    // The sandbox user owns nothing on the host: it needs a world-writable directory only
+    // when the compiler has to write its output next to the source.
+    await fs.chmod(workDir, config.compileCommand ? 0o777 : 0o755);
+    await fs.writeFile(path.join(workDir, config.fileName), code, { mode: 0o644 });
 
-      // For arrays, sort if order doesn't matter (for problems like Two Sum)
-      if (Array.isArray(actualJson) && Array.isArray(expectedJson)) {
-        // Try both sorted and unsorted comparison
-        if (JSON.stringify(actualJson) === JSON.stringify(expectedJson)) {
-          return true;
-        }
-        // Sort and compare for problems where order doesn't matter
-        const sortedActual = [...actualJson].sort((a, b) => a - b);
-        const sortedExpected = [...expectedJson].sort((a, b) => a - b);
-        if (JSON.stringify(sortedActual) === JSON.stringify(sortedExpected)) {
-          return true;
+    const program: PreparedProgram = { id, language, workDir };
+    try {
+      await this.ensureImage(config.image);
+      if (config.compileCommand) {
+        const outcome = await this.runContainer({
+          image: config.image,
+          cmd: config.compileCommand,
+          workDir,
+          writableCode: true,
+          memoryMb: COMPILE_MEMORY_MB,
+          timeoutMs: COMPILE_TIMEOUT_MS,
+          stdin: '',
+          outputLimits: COMPILE_OUTPUT_LIMITS
+        });
+        if (outcome.timedOut) {
+          program.compileError = 'Compilation timed out';
+        } else if (outcome.exitCode !== 0) {
+          program.compileError = (outcome.stderr || outcome.stdout || 'Compilation failed').slice(0, 2000);
         }
       }
-    } catch {
-      // Not JSON, continue with string comparison
+      return program;
+    } catch (error) {
+      await this.dispose(program);
+      throw error;
+    }
+  }
+
+  /** Runs a prepared program against one input in a fresh container. */
+  async run(program: PreparedProgram, input: string, limits: RunLimits): Promise<RunResult> {
+    const config = LANGUAGE_CONFIG[program.language];
+    if (program.compileError !== undefined) {
+      throw new Error('Cannot run a program that failed to compile');
     }
 
-    // Handle floating point comparison
-    const actualNum = parseFloat(actualNorm);
-    const expectedNum = parseFloat(expectedNorm);
-    if (!isNaN(actualNum) && !isNaN(expectedNum)) {
-      return Math.abs(actualNum - expectedNum) < 1e-6;
+    const outcome = await this.runContainer({
+      image: config.image,
+      cmd: config.runCommand,
+      workDir: program.workDir,
+      writableCode: false,
+      memoryMb: Math.min(limits.memoryLimitMb, config.memoryMb),
+      timeoutMs: Math.min(limits.timeLimitMs, config.timeoutMs),
+      stdin: input,
+      outputLimits: RUN_OUTPUT_LIMITS
+    });
+
+    const status = classifyRun(outcome);
+    metrics.codeExecutionsTotal.inc({ status, language: program.language });
+    metrics.codeExecutionDuration.observe({ language: program.language, status }, outcome.durationMs / 1000);
+
+    return {
+      status,
+      stdout: outcome.stdout,
+      stderr: outcome.stderr.slice(0, 1000),
+      exitCode: outcome.exitCode,
+      executionTime: outcome.durationMs
+    };
+  }
+
+  /** Removes the program's files from the host. */
+  async dispose(program: Pick<PreparedProgram, 'workDir'>): Promise<void> {
+    try {
+      await fs.rm(program.workDir, { recursive: true, force: true });
+    } catch (error) {
+      logger.warn({ error: (error as Error).message, workDir: program.workDir }, 'Cleanup error');
+    }
+  }
+
+  /** Runs a container through the circuit breaker, turning infrastructure failures into SandboxUnavailableError. */
+  private async runContainer(spec: ContainerSpec): Promise<ContainerOutcome> {
+    if (!this.circuitBreaker) {
+      throw new SandboxUnavailableError('Code executor is not initialized');
+    }
+    try {
+      return await this.circuitBreaker.fire(spec);
+    } catch (error) {
+      if ((error as { code?: string }).code === 'EOPENBREAKER') {
+        throw new SandboxUnavailableError('Code execution is temporarily unavailable', {
+          breakerOpen: true,
+          retryAfterMs: 30000
+        });
+      }
+      throw new SandboxUnavailableError(`Sandbox failure: ${(error as Error).message}`);
+    }
+  }
+
+  private containerOptions(spec: ContainerSpec): Docker.ContainerCreateOptions {
+    return {
+      Image: spec.image,
+      Cmd: spec.cmd,
+      WorkingDir: '/code',
+      User: SANDBOX_USER,
+      Labels: { [LABEL_SANDBOX]: 'true', [LABEL_OWNER]: this.ownerId },
+      NetworkDisabled: true,
+      OpenStdin: true,
+      StdinOnce: true,
+      AttachStdin: true,
+      AttachStdout: true,
+      AttachStderr: true,
+      Tty: false,
+      HostConfig: {
+        Binds: [`${spec.workDir}:/code:${spec.writableCode ? 'rw' : 'ro'}`],
+        Memory: spec.memoryMb * MB,
+        MemorySwap: spec.memoryMb * MB, // No swap
+        CpuPeriod: 100000,
+        CpuQuota: 50000, // 50% of one CPU
+        PidsLimit: 50,
+        NetworkMode: 'none',
+        // Nothing outside /tmp (a small tmpfs) and, while compiling, /code is writable
+        ReadonlyRootfs: true,
+        Tmpfs: { '/tmp': 'rw,nosuid,nodev,size=64m' },
+        SecurityOpt: ['no-new-privileges'],
+        CapDrop: ['ALL'],
+        ...(SANDBOX_RUNTIME ? { Runtime: SANDBOX_RUNTIME } : {})
+        // No AutoRemove: the container must still exist after it exits so we can read its
+        // exit code and OOMKilled flag; it is removed explicitly in runContainerUnprotected.
+      }
+    };
+  }
+
+  private async runContainerUnprotected(spec: ContainerSpec): Promise<ContainerOutcome> {
+    const release = await this.slots.acquire();
+    metrics.activeContainers.inc();
+    let container: Docker.Container | null = null;
+
+    try {
+      container = await docker.createContainer(this.containerOptions(spec));
+      const running = container;
+
+      // Attach before start so no output is lost; stdout and stderr arrive multiplexed.
+      const stream = await running.attach({ stream: true, stdin: true, stdout: true, stderr: true });
+      const demux = new DockerStreamDemuxer(spec.outputLimits);
+      let killedForOutput = false;
+      const streamEnded = new Promise<void>((resolve) => {
+        stream.once('end', () => resolve());
+        stream.once('close', () => resolve());
+        stream.once('error', () => resolve());
+      });
+      stream.on('data', (chunk: Buffer) => {
+        demux.push(chunk);
+        if (demux.stdoutLimitExceeded && !killedForOutput) {
+          killedForOutput = true;
+          running.kill().catch(() => {});
+        }
+      });
+
+      await running.start();
+      const startedAt = Date.now();
+      stream.write(spec.stdin);
+      stream.end();
+
+      let timedOut = false;
+      const timer = setTimeout(() => {
+        timedOut = true;
+        running.kill().catch(() => {});
+      }, spec.timeoutMs);
+
+      let exit: { StatusCode: number };
+      try {
+        exit = await withTimeout(running.wait(), spec.timeoutMs + WAIT_GRACE_MS, 'Sandbox container did not exit after being killed');
+      } finally {
+        clearTimeout(timer);
+      }
+      const durationMs = Date.now() - startedAt;
+
+      await Promise.race([streamEnded, delay(STREAM_DRAIN_MS)]);
+      const info = await running.inspect();
+
+      return {
+        stdout: demux.stdout,
+        stderr: demux.stderr,
+        exitCode: exit.StatusCode,
+        timedOut,
+        oomKilled: info.State.OOMKilled === true,
+        outputLimitExceeded: demux.stdoutLimitExceeded,
+        durationMs
+      };
+    } finally {
+      if (container) {
+        await container.remove({ force: true }).catch(() => {});
+      }
+      metrics.activeContainers.dec();
+      release();
+    }
+  }
+
+  /** Pulls an image once even if many submissions need it at the same moment. */
+  private ensureImage(image: string): Promise<void> {
+    let pending = this.pulls.get(image);
+    if (!pending) {
+      pending = this.inspectOrPull(image).finally(() => this.pulls.delete(image));
+      this.pulls.set(image, pending);
+    }
+    return pending;
+  }
+
+  private async inspectOrPull(image: string): Promise<void> {
+    try {
+      await docker.getImage(image).inspect();
+      return;
+    } catch (error) {
+      // Only "no such image" means pull; anything else (daemon down) is an infrastructure failure.
+      if ((error as { statusCode?: number }).statusCode !== 404) {
+        throw new SandboxUnavailableError(`Docker is unavailable: ${(error as Error).message}`);
+      }
     }
 
-    return false;
+    logger.info({ image }, 'Pulling Docker image');
+    try {
+      await new Promise<void>((resolve, reject) => {
+        docker.pull(image, (err: Error | null, stream: NodeJS.ReadableStream) => {
+          if (err) return reject(err);
+          docker.modem.followProgress(stream, (followErr: Error | null) => (followErr ? reject(followErr) : resolve()));
+        });
+      });
+    } catch (error) {
+      throw new SandboxUnavailableError(`Could not pull ${image}: ${(error as Error).message}`);
+    }
+  }
+
+  /** Removes containers a previous run of this process left behind (for example after a crash mid-test). */
+  private async removeOrphanedContainers(): Promise<void> {
+    const orphans = await docker.listContainers({
+      all: true,
+      filters: { label: [`${LABEL_SANDBOX}=true`, `${LABEL_OWNER}=${this.ownerId}`] }
+    });
+    await Promise.all(orphans.map((info) => docker.getContainer(info.Id).remove({ force: true }).catch(() => {})));
+    if (orphans.length > 0) {
+      logger.warn({ count: orphans.length, ownerId: this.ownerId }, 'Removed orphaned sandbox containers');
+    }
   }
 
   // Get circuit breaker status for monitoring
@@ -512,14 +487,15 @@ class CodeExecutor {
       return { status: 'not_initialized' };
     }
 
+    const breaker = this.circuitBreaker;
     return {
-      status: String(this.circuitBreaker.status),
+      status: breaker.opened ? 'open' : breaker.halfOpen ? 'half_open' : 'closed',
       stats: {
-        fires: this.circuitBreaker.stats.fires,
-        successes: this.circuitBreaker.stats.successes,
-        failures: this.circuitBreaker.stats.failures,
-        rejects: this.circuitBreaker.stats.rejects,
-        timeouts: this.circuitBreaker.stats.timeouts
+        fires: breaker.stats.fires,
+        successes: breaker.stats.successes,
+        failures: breaker.stats.failures,
+        rejects: breaker.stats.rejects,
+        timeouts: breaker.stats.timeouts
       }
     };
   }

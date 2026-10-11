@@ -4,6 +4,8 @@ import session from 'express-session';
 import RedisStore from 'connect-redis';
 import redis from './db/redis.js';
 import pool from './db/pool.js';
+import codeExecutor from './services/codeExecutor.js';
+import { JudgeWorker, judgeWorkerOptionsFromEnv } from './worker/judgeWorker.js';
 
 // Shared modules
 import { logger, requestLogger } from './shared/logger.js';
@@ -19,6 +21,9 @@ import adminRoutes from './routes/admin.js';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+// Judge submissions inside the API process (local default). Set EMBEDDED_WORKER=false when
+// separate workers (npm run dev:worker1) consume the queue.
+const EMBEDDED_WORKER = process.env.EMBEDDED_WORKER !== 'false';
 
 // Trust proxy for rate limiting behind load balancer
 app.set('trust proxy', 1);
@@ -111,7 +116,10 @@ app.get('/health', async (_req: Request, res: Response): Promise<void> => {
     timestamp: new Date().toISOString(),
     version: process.env.npm_package_version || '1.0.0',
     uptime: process.uptime(),
-    checks
+    checks,
+    // Informational: the API keeps serving problems and polls while the sandbox is down
+    sandbox: codeExecutor.getCircuitBreakerStatus(),
+    judgeWorker: judgeWorker ? { embedded: true, activeJobs: judgeWorker.activeJobs } : { embedded: false }
   });
 });
 
@@ -173,22 +181,31 @@ app.use((req: Request, res: Response): void => {
 });
 
 let server: ReturnType<typeof app.listen>;
+let judgeWorker: JudgeWorker | null = null;
+let shuttingDown = false;
 
-// Graceful shutdown handler
+// Graceful shutdown: stop accepting requests, let in-flight requests and judging jobs finish
+// (jobs hand themselves back to the queue at the next test boundary), then close connections.
 const shutdown = async (signal: string): Promise<void> => {
+  if (shuttingDown) return;
+  shuttingDown = true;
   logger.info({ signal }, 'Received shutdown signal');
 
-  // Stop accepting new connections
-  server.close(() => {
-    logger.info('HTTP server closed');
+  const serverClosed = new Promise<void>((resolve) => {
+    server.close(() => {
+      logger.info('HTTP server closed');
+      resolve();
+    });
   });
 
   try {
-    // Close database connections
+    await judgeWorker?.stop();
+    // Don't wait forever on keep-alive connections that never send another request.
+    await Promise.race([serverClosed, new Promise((resolve) => setTimeout(resolve, 10000))]);
+
     await pool.end();
     logger.info('PostgreSQL connection pool closed');
 
-    // Close Redis connection
     await redis.quit();
     logger.info('Redis connection closed');
 
@@ -210,13 +227,21 @@ async function start(): Promise<void> {
     await pool.query('SELECT 1');
     logger.info('PostgreSQL connected');
 
+    const workerId = `api-${PORT}`;
+    await codeExecutor.init(workerId);
+
     server = app.listen(PORT, () => {
-      logger.info({ port: PORT }, 'Server started');
+      logger.info({ port: PORT, embeddedWorker: EMBEDDED_WORKER }, 'Server started');
     });
 
+    if (EMBEDDED_WORKER) {
+      judgeWorker = new JudgeWorker(pool, codeExecutor, judgeWorkerOptionsFromEnv(workerId));
+      await judgeWorker.start();
+    }
+
     // Handle graceful shutdown
-    process.on('SIGTERM', () => shutdown('SIGTERM'));
-    process.on('SIGINT', () => shutdown('SIGINT'));
+    process.on('SIGTERM', () => void shutdown('SIGTERM'));
+    process.on('SIGINT', () => void shutdown('SIGINT'));
 
   } catch (error) {
     logger.error({ error: (error as Error).message }, 'Failed to start server');

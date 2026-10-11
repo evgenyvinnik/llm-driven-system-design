@@ -170,13 +170,17 @@ router.get('/leaderboard', async (req: Request<unknown, unknown, unknown, { limi
 // Clear caches
 router.post('/cache/clear', async (_req: Request, res: Response): Promise<void> => {
   try {
-    // Clear all problem caches
-    const keys = await redis.keys('problem:*');
-    if (keys.length > 0) {
-      await redis.del(...keys);
+    // Clear all problem caches. SCAN walks the keyspace in small batches; KEYS would block
+    // Redis (and every session lookup) for the whole walk.
+    let keysCleared = 0;
+    const stream = redis.scanStream({ match: 'problem:*', count: 100 });
+    for await (const keys of stream) {
+      if ((keys as string[]).length > 0) {
+        keysCleared += await redis.del(...(keys as string[]));
+      }
     }
 
-    res.json({ message: 'Cache cleared', keysCleared: keys.length });
+    res.json({ message: 'Cache cleared', keysCleared });
   } catch (error) {
     console.error('Clear cache error:', error);
     res.status(500).json({ error: 'Failed to clear cache' });

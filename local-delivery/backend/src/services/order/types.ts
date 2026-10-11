@@ -30,17 +30,21 @@ export type {
 export const OFFER_EXPIRY_SECONDS = 30;
 
 /**
- * Maximum number of drivers to try before cancelling an order for lack of driver.
- * @description If all attempts are exhausted without a driver accepting, the order
- * is automatically cancelled with reason "No driver available".
+ * Maximum number of offers made for one order before giving up.
+ * @description Counted from the durable driver_offers table, so the count
+ * survives a matching loop moving to another instance. When it is reached the
+ * order is cancelled with reason "No driver accepted the order". An order that
+ * waits longer than DISPATCH_DEADLINE_SECONDS (dispatch.ts) without any courier
+ * nearby is cancelled with "No driver available".
  * @constant {number}
  */
 export const MAX_OFFER_ATTEMPTS = 5;
 
 /**
- * Circuit breaker timeout for driver matching in milliseconds.
+ * Circuit breaker timeout for one matching run in milliseconds.
  * @description Set to 3 minutes to allow for multiple sequential driver offers
- * (up to MAX_OFFER_ATTEMPTS * OFFER_EXPIRY_SECONDS).
+ * (up to MAX_OFFER_ATTEMPTS * OFFER_EXPIRY_SECONDS plus polling slack). On
+ * timeout the fallback releases the dispatch lease and a sweeper retries later.
  * @constant {number}
  */
 export const DRIVER_MATCHING_TIMEOUT_MS = 180000;

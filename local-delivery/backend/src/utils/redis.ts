@@ -30,8 +30,9 @@ export const publisher = new RedisClient({
 
 /**
  * Creates a new Redis subscriber client for Pub/Sub.
- * Each WebSocket connection needs its own subscriber to receive channel messages.
- * Redis requires dedicated connections for subscriptions.
+ * A connection in subscribe mode cannot run other commands, so it needs its own
+ * client. The WebSocket layer creates exactly one per process and fans messages
+ * out to local sockets (see websocket/channelRegistry.ts).
  *
  * @returns A new Redis client configured for subscription use
  */
@@ -68,95 +69,187 @@ export async function initRedis(): Promise<void> {
 
 /**
  * Redis key for the geospatial index storing all active driver locations.
- * Uses Redis GEO commands (GEOADD, GEORADIUS) for efficient proximity queries.
+ * Queried with GEOSEARCH (GEORADIUS is deprecated since Redis 6.2).
  */
 export const DRIVERS_GEO_KEY = 'drivers:locations';
 
 /**
+ * Sorted set of driver id -> epoch ms of their last location ping.
+ * A GEO set's score is the geohash, so liveness needs its own sorted set.
+ */
+export const DRIVERS_LAST_SEEN_KEY = 'drivers:last_seen';
+
+/**
+ * A courier whose last ping is older than this is not offered orders.
+ * Courier apps send a heartbeat every 10 s even when stationary, so 30 s is
+ * three missed heartbeats. Overridable for demos via LOCATION_STALE_MS.
+ */
+export const LOCATION_STALE_MS = parseInt(process.env.LOCATION_STALE_MS || '30000');
+
+/**
+ * Entries older than this are removed from the geo index entirely by
+ * pruneStaleDrivers(); they re-enter on their next ping.
+ */
+export const LOCATION_PRUNE_AFTER_MS = 2 * 60 * 1000;
+
+/** The per-driver metadata hash expires if a courier vanishes. */
+const DRIVER_HASH_TTL_SECONDS = 10 * 60;
+
+/**
+ * Runs a pipeline and surfaces the first command error (ioredis reports
+ * per-command errors in the result array instead of rejecting).
+ */
+async function execPipeline(pipeline: ReturnType<typeof redis.pipeline>): Promise<void> {
+  const results = await pipeline.exec();
+  const failed = results?.find(([error]) => error);
+  if (failed?.[0]) {
+    throw failed[0];
+  }
+}
+
+/**
  * Updates a driver's location in Redis for real-time tracking.
- * Performs three operations atomically via pipeline:
- * 1. Updates geo-index for proximity searches (GEOADD)
- * 2. Stores driver metadata hash for quick lookups
- * 3. Publishes location update for subscribed clients
+ * One pipeline (one round trip):
+ * 1. GEOADD for proximity searches
+ * 2. ZADD last-seen time, which is what makes the entry "fresh"
+ * 3. Metadata hash with a TTL, for the latest position by id
+ * 4. PUBLISH to the driver's location channel for customers tracking an order
  *
  * @param driverId - The unique identifier of the driver
  * @param lat - Current latitude in decimal degrees
  * @param lng - Current longitude in decimal degrees
+ * @param now - Ping time in epoch ms (injectable for tests)
  */
 export async function updateDriverLocation(
   driverId: string,
   lat: number,
-  lng: number
+  lng: number,
+  now: number = Date.now()
 ): Promise<void> {
   const pipeline = redis.pipeline();
-
-  // GEOADD for spatial indexing
   pipeline.geoadd(DRIVERS_GEO_KEY, lng, lat, driverId);
-
-  // Store driver metadata
+  pipeline.zadd(DRIVERS_LAST_SEEN_KEY, now, driverId);
   pipeline.hset(`driver:${driverId}`, {
     lat: lat.toString(),
     lng: lng.toString(),
-    updated_at: Date.now().toString(),
+    updated_at: now.toString(),
   });
-
-  // Publish location update
-  pipeline.publish(
-    `driver:${driverId}:location`,
-    JSON.stringify({ lat, lng, timestamp: Date.now() })
-  );
-
-  await pipeline.exec();
+  pipeline.expire(`driver:${driverId}`, DRIVER_HASH_TTL_SECONDS);
+  pipeline.publish(`driver:${driverId}:location`, JSON.stringify({ lat, lng, timestamp: now }));
+  await execPipeline(pipeline);
 }
 
 /**
  * Removes a driver from the geo-index when they go offline.
- * Cleans up both the geo-index entry and the driver metadata hash.
+ * Cleans up the geo entry, the last-seen entry and the metadata hash.
  *
  * @param driverId - The unique identifier of the driver to remove
  */
 export async function removeDriverLocation(driverId: string): Promise<void> {
-  await redis.zrem(DRIVERS_GEO_KEY, driverId);
-  await redis.del(`driver:${driverId}`);
+  const pipeline = redis.pipeline();
+  pipeline.zrem(DRIVERS_GEO_KEY, driverId);
+  pipeline.zrem(DRIVERS_LAST_SEEN_KEY, driverId);
+  pipeline.del(`driver:${driverId}`);
+  await execPipeline(pipeline);
 }
 
 /**
- * Finds drivers within a specified radius of a location.
- * Uses Redis GEORADIUS for sub-millisecond proximity queries.
- * Results are sorted by distance ascending (closest first).
+ * Keeps only candidates whose last ping is recent enough.
+ * Pure function: `lastSeen[i]` is the ZMSCORE result for `candidates[i]`.
+ *
+ * @param candidates - Drivers returned by the geo search
+ * @param lastSeen - Last ping time per candidate (null if unknown)
+ * @param now - Current epoch ms
+ * @param staleMs - Maximum age of the last ping
+ */
+export function filterFreshDrivers<T extends { id: string }>(
+  candidates: T[],
+  lastSeen: (string | number | null)[],
+  now: number,
+  staleMs: number
+): T[] {
+  return candidates.filter((_candidate, index) => {
+    const seen = lastSeen[index];
+    return seen !== null && seen !== undefined && now - Number(seen) <= staleMs;
+  });
+}
+
+/**
+ * Finds drivers within a radius whose location is fresh.
+ * GEOSEARCH returns the nearest members first; ZMSCORE then fetches all their
+ * last-seen times in one call, and stale members (phone died, app killed) are
+ * dropped so matching never offers an order to a ghost and waits 30 s for it.
  *
  * @param lat - Center latitude in decimal degrees
  * @param lng - Center longitude in decimal degrees
  * @param radiusKm - Search radius in kilometers
  * @param limit - Maximum number of drivers to return (default 10)
- * @returns Array of driver IDs with their distances in km
+ * @param now - Current epoch ms (injectable for tests)
+ * @returns Driver ids with their distances in km, nearest first
  */
 export async function findNearbyDrivers(
   lat: number,
   lng: number,
   radiusKm: number,
-  limit: number = 10
+  limit: number = 10,
+  now: number = Date.now()
 ): Promise<{ id: string; distance: number }[]> {
-  // GEORADIUS query - returns [member, distance] pairs
-  const results = await redis.georadius(
+  const results = (await redis.call(
+    'GEOSEARCH',
     DRIVERS_GEO_KEY,
+    'FROMLONLAT',
     lng,
     lat,
+    'BYRADIUS',
     radiusKm,
     'km',
-    'WITHDIST',
     'ASC',
     'COUNT',
-    limit
-  );
+    limit,
+    'WITHDIST'
+  )) as [string, string][];
 
-  return (results as [string, string][]).map((result) => {
-    const [id, distance] = result;
-    return {
-      id,
-      distance: parseFloat(distance),
-    };
-  });
+  if (results.length === 0) {
+    return [];
+  }
+
+  const candidates = results.map(([id, distance]) => ({ id, distance: parseFloat(distance) }));
+  const lastSeen = await redis.zmscore(DRIVERS_LAST_SEEN_KEY, ...candidates.map((c) => c.id));
+  return filterFreshDrivers(candidates, lastSeen, now, LOCATION_STALE_MS);
+}
+
+/**
+ * Atomically removes members whose last ping is older than the cutoff from
+ * both the geo index and the last-seen set. A Lua script, so a driver who pings
+ * between the range read and the removal is not removed by mistake.
+ */
+const PRUNE_STALE_SCRIPT = `
+local stale = redis.call('ZRANGEBYSCORE', KEYS[2], '-inf', ARGV[1])
+for _, id in ipairs(stale) do
+  redis.call('ZREM', KEYS[1], id)
+  redis.call('ZREM', KEYS[2], id)
+end
+return stale
+`;
+
+/**
+ * Drops couriers who stopped pinging from the geo index.
+ *
+ * @param maxAgeMs - Remove entries whose last ping is older than this
+ * @param now - Current epoch ms (injectable for tests)
+ * @returns Ids of the removed drivers
+ */
+export async function pruneStaleDrivers(
+  maxAgeMs: number = LOCATION_PRUNE_AFTER_MS,
+  now: number = Date.now()
+): Promise<string[]> {
+  return (await redis.eval(
+    PRUNE_STALE_SCRIPT,
+    2,
+    DRIVERS_GEO_KEY,
+    DRIVERS_LAST_SEEN_KEY,
+    String(now - maxAgeMs)
+  )) as string[];
 }
 
 /**
@@ -180,47 +273,9 @@ export async function getDriverLocationFromRedis(
 }
 
 /**
- * Registers a WebSocket client for order tracking updates.
- * Adds the connection ID to a Redis set for the order.
- *
- * @param orderId - The order being tracked
- * @param connectionId - The WebSocket client's unique identifier
- */
-export async function subscribeToOrderTracking(
-  orderId: string,
-  connectionId: string
-): Promise<void> {
-  await redis.sadd(`order:${orderId}:subscribers`, connectionId);
-}
-
-/**
- * Unregisters a WebSocket client from order tracking updates.
- * Removes the connection ID from the order's subscriber set.
- *
- * @param orderId - The order that was being tracked
- * @param connectionId - The WebSocket client's unique identifier
- */
-export async function unsubscribeFromOrderTracking(
-  orderId: string,
-  connectionId: string
-): Promise<void> {
-  await redis.srem(`order:${orderId}:subscribers`, connectionId);
-}
-
-/**
- * Gets all WebSocket connection IDs subscribed to an order.
- * Used when broadcasting order updates to connected clients.
- *
- * @param orderId - The order to get subscribers for
- * @returns Array of WebSocket connection IDs
- */
-export async function getOrderSubscribers(orderId: string): Promise<string[]> {
-  return redis.smembers(`order:${orderId}:subscribers`);
-}
-
-/**
  * Adds an order to a driver's active orders set.
- * Tracks which orders a driver is currently handling for load balancing.
+ * A cache of the courier's load used by the matching score; PostgreSQL is the
+ * source of truth for which orders a courier holds.
  *
  * @param driverId - The driver's unique identifier
  * @param orderId - The order being assigned to the driver
@@ -244,16 +299,6 @@ export async function removeDriverOrder(
   orderId: string
 ): Promise<void> {
   await redis.srem(`driver:${driverId}:orders`, orderId);
-}
-
-/**
- * Gets all active order IDs for a driver.
- *
- * @param driverId - The driver's unique identifier
- * @returns Array of order IDs the driver is currently handling
- */
-export async function getDriverOrders(driverId: string): Promise<string[]> {
-  return redis.smembers(`driver:${driverId}:orders`);
 }
 
 /**

@@ -64,30 +64,61 @@ export async function getVideoAnalytics(
   }
 }
 
-/** Records a video view event and increments the video's view count. */
-export async function recordViewEvent(
-  videoId: string,
-  viewerId: string | null,
-  sessionId: string,
-  watchDurationSeconds: number,
-  completed: boolean,
-  ipAddress: string,
-  userAgent: string,
-): Promise<void> {
-  try {
-    await pool.query(
-      `INSERT INTO view_events (video_id, viewer_id, session_id, watch_duration_seconds, completed, ip_address, user_agent)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-      [videoId, viewerId, sessionId, watchDurationSeconds, completed, ipAddress, userAgent],
-    );
+export interface ViewReport {
+  /** Client-generated id for one playback session; every heartbeat repeats it. */
+  viewId: string;
+  videoId: string;
+  viewerId: string | null;
+  /** Stable anonymous viewer key, used for unique-viewer counts when there is no account. */
+  sessionId: string;
+  watchDurationSeconds: number;
+  completed: boolean;
+  ipAddress: string;
+  userAgent: string;
+}
 
-    // Increment view count on video
-    await pool.query(
-      'UPDATE videos SET view_count = view_count + 1, updated_at = NOW() WHERE id = $1',
-      [videoId],
-    );
-  } catch (err) {
-    logger.error({ err, videoId }, 'Failed to record view event');
-    throw err;
-  }
+/**
+ * Records a view or a heartbeat for one, in a single statement.
+ *
+ * The first report for a view id inserts the row and bumps `videos.view_count`; every
+ * later report (heartbeats, retries, a beacon on page hide) updates the same row, and
+ * only ever upward: watch time takes the max and `completed` can only turn true. So a
+ * retried or reordered request can neither double-count a view nor shrink its watch
+ * time, and the counter can't drift from the rows because both writes are one statement.
+ * `xmax = 0` is PostgreSQL's tell for "this row was inserted, not updated".
+ */
+export async function recordView(report: ViewReport): Promise<'new' | 'heartbeat' | 'ignored'> {
+  const { rows } = await pool.query(
+    `WITH upsert AS (
+       INSERT INTO view_events
+         (id, video_id, viewer_id, session_id, watch_duration_seconds, completed, ip_address, user_agent)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       ON CONFLICT (id) DO UPDATE
+         SET watch_duration_seconds = GREATEST(view_events.watch_duration_seconds, EXCLUDED.watch_duration_seconds),
+             completed = view_events.completed OR EXCLUDED.completed
+         WHERE view_events.video_id = EXCLUDED.video_id
+       RETURNING (xmax = 0) AS inserted
+     ),
+     bump AS (
+       UPDATE videos SET view_count = view_count + 1
+       WHERE id = $2 AND EXISTS (SELECT 1 FROM upsert WHERE inserted)
+       RETURNING id
+     )
+     SELECT (SELECT inserted FROM upsert) AS inserted`,
+    [
+      report.viewId,
+      report.videoId,
+      report.viewerId,
+      report.sessionId,
+      Math.round(report.watchDurationSeconds),
+      report.completed,
+      report.ipAddress,
+      report.userAgent.slice(0, 512),
+    ],
+  );
+  const inserted = rows[0]?.inserted;
+  if (inserted === true) return 'new';
+  if (inserted === false) return 'heartbeat';
+  // A view id that already belongs to another video: nothing was written.
+  return 'ignored';
 }

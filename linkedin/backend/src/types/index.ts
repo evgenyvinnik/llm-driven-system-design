@@ -1,6 +1,7 @@
 export interface User {
   id: number;
-  email: string;
+  /** Only present on the member's own record (login, /auth/me); never on public projections */
+  email?: string;
   first_name: string;
   last_name: string;
   headline?: string;
@@ -10,9 +11,20 @@ export interface User {
   profile_image_url?: string;
   banner_image_url?: string;
   connection_count: number;
-  role: 'user' | 'admin';
+  role: 'user' | 'recruiter' | 'admin';
   created_at: Date;
   updated_at: Date;
+}
+
+/** Card-sized public view of a member: what feed authors, paths and suggestions show. */
+export interface UserSummary {
+  id: number;
+  first_name: string;
+  last_name: string;
+  headline?: string;
+  location?: string;
+  profile_image_url?: string;
+  connection_count: number;
 }
 
 export interface Company {
@@ -81,9 +93,24 @@ export interface ConnectionRequest {
   from_user_id: number;
   to_user_id: number;
   message?: string;
-  status: 'pending' | 'accepted' | 'rejected';
+  status: 'pending' | 'accepted' | 'rejected' | 'withdrawn';
   created_at: Date;
   updated_at: Date;
+}
+
+/**
+ * How the viewer relates to another member: what the profile header renders.
+ * `status` drives the action button; `degree` and `path` drive the badge and the
+ * "how you're connected" line.
+ */
+export interface Relationship {
+  degree: 0 | 1 | 2 | 3 | null;
+  status: 'self' | 'connected' | 'pending_sent' | 'pending_received' | 'none';
+  /** Id of the pending request in either direction, so the client can accept it */
+  request_id: number | null;
+  mutual_count: number;
+  /** Viewer to target inclusive (2 to 4 members); empty when out of network */
+  path: UserSummary[];
 }
 
 export interface Post {
@@ -152,13 +179,15 @@ export interface ConnectionDegree {
 }
 
 export interface PYMKCandidate {
-  user: User;
+  user: UserSummary;
   score: number;
   mutual_connections: number;
   same_company: boolean;
   same_school: boolean;
   shared_skills: number;
   same_location: boolean;
+  /** Why this person is suggested, strongest reason first */
+  reasons: string[];
 }
 
 declare module 'express-session' {

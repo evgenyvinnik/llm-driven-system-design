@@ -62,6 +62,18 @@ CREATE TABLE IF NOT EXISTS user_skills (
   PRIMARY KEY (user_id, skill_id)
 );
 
+-- Skill endorsements: one row per (endorser, member, skill)
+-- The primary key makes a repeated endorsement a no-op; user_skills.endorsement_count
+-- is incremented in the same transaction only when a row is inserted.
+CREATE TABLE IF NOT EXISTS skill_endorsements (
+  endorser_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  user_id INTEGER NOT NULL,
+  skill_id INTEGER NOT NULL,
+  created_at TIMESTAMP DEFAULT NOW(),
+  PRIMARY KEY (endorser_id, user_id, skill_id),
+  FOREIGN KEY (user_id, skill_id) REFERENCES user_skills(user_id, skill_id) ON DELETE CASCADE
+);
+
 -- ============================================================================
 -- PROFESSIONAL HISTORY
 -- ============================================================================
@@ -120,7 +132,7 @@ CREATE TABLE IF NOT EXISTS connection_requests (
   from_user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
   to_user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
   message TEXT,                        -- Optional personalized invitation message
-  status VARCHAR(20) DEFAULT 'pending', -- 'pending', 'accepted', 'declined', 'withdrawn'
+  status VARCHAR(20) DEFAULT 'pending', -- 'pending', 'accepted', 'rejected', 'withdrawn'
   created_at TIMESTAMP DEFAULT NOW(),
   updated_at TIMESTAMP DEFAULT NOW(),
   UNIQUE(from_user_id, to_user_id)
@@ -231,6 +243,43 @@ CREATE TABLE IF NOT EXISTS audit_logs (
 );
 
 -- ============================================================================
+-- SEARCH
+-- ============================================================================
+
+-- Full-text documents for the PostgreSQL search fallback (used when Elasticsearch is
+-- unreachable). Generated columns stay in sync with the row automatically.
+-- Names and headline words use the 'simple' config so prefixes match ("ali" -> Alice);
+-- headline and summary also go through the 'english' stemmer ("developers" -> develop).
+ALTER TABLE users ADD COLUMN IF NOT EXISTS search_document tsvector
+  GENERATED ALWAYS AS (
+    setweight(to_tsvector('simple', coalesce(first_name, '') || ' ' || coalesce(last_name, '')), 'A') ||
+    setweight(to_tsvector('simple', coalesce(headline, '')), 'B') ||
+    setweight(to_tsvector('english', coalesce(headline, '') || ' ' || coalesce(summary, '')), 'C')
+  ) STORED;
+
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS search_document tsvector
+  GENERATED ALWAYS AS (
+    setweight(to_tsvector('simple', coalesce(title, '')), 'A') ||
+    setweight(to_tsvector('english', coalesce(title, '') || ' ' || coalesce(description, '')), 'C')
+  ) STORED;
+
+-- Search index outbox: one row per user/job whose Elasticsearch document is stale.
+-- Writers upsert it in the same transaction as their change; the relay in
+-- services/searchIndexer.ts claims due rows (FOR UPDATE SKIP LOCKED), rebuilds the
+-- document from PostgreSQL, indexes it, and deletes the row only if `version`
+-- hasn't moved (a newer edit keeps its row). Failures back off exponentially.
+CREATE TABLE IF NOT EXISTS search_index_queue (
+  entity_type VARCHAR(10) NOT NULL,     -- 'user' | 'job'
+  entity_id INTEGER NOT NULL,
+  version BIGINT NOT NULL DEFAULT 1,    -- bumped by every re-enqueue
+  enqueued_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  attempts INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  last_error TEXT,
+  PRIMARY KEY (entity_type, entity_id)
+);
+
+-- ============================================================================
 -- INDEXES FOR PERFORMANCE
 -- ============================================================================
 
@@ -244,9 +293,24 @@ CREATE INDEX IF NOT EXISTS idx_experiences_company_id ON experiences(company_id)
 -- Education indexes
 CREATE INDEX IF NOT EXISTS idx_education_user_id ON education(user_id);
 
+-- Connection graph: the primary key (user_id, connected_to) serves lookups from the
+-- smaller id; this index serves the other side, so "all connections of X" is two
+-- index scans instead of a sequential scan of the whole edge table.
+CREATE INDEX IF NOT EXISTS idx_connections_connected_to ON connections(connected_to, user_id);
+
 -- Post indexes
 CREATE INDEX IF NOT EXISTS idx_posts_user_id ON posts(user_id);
 CREATE INDEX IF NOT EXISTS idx_posts_created_at ON posts(created_at DESC);
+-- Feed pull: recent posts for a set of authors
+CREATE INDEX IF NOT EXISTS idx_posts_user_created ON posts(user_id, created_at DESC);
+-- Like counts are recomputed per post; the primary key (user_id, post_id) can't serve that
+CREATE INDEX IF NOT EXISTS idx_post_likes_post ON post_likes(post_id);
+CREATE INDEX IF NOT EXISTS idx_post_comments_post ON post_comments(post_id, created_at);
+
+-- Search fallback and outbox
+CREATE INDEX IF NOT EXISTS idx_users_search_document ON users USING GIN (search_document);
+CREATE INDEX IF NOT EXISTS idx_jobs_search_document ON jobs USING GIN (search_document);
+CREATE INDEX IF NOT EXISTS idx_search_index_queue_due ON search_index_queue(next_attempt_at);
 
 -- Job indexes
 CREATE INDEX IF NOT EXISTS idx_jobs_company_id ON jobs(company_id);

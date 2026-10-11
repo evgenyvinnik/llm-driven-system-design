@@ -11,7 +11,8 @@ vi.mock('../db/pool.js', () => ({
 }));
 
 vi.mock('../shared/rateLimiter.js', () => ({
-  authRateLimiter: vi.fn((_req, _res, next) => next()),
+  loginRateLimiter: vi.fn((_req, _res, next) => next()),
+  registerRateLimiter: vi.fn((_req, _res, next) => next()),
 }));
 
 import authRouter from './auth.js';

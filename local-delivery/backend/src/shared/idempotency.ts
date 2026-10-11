@@ -6,18 +6,31 @@
  * - Prevents duplicate orders when clients retry on network timeout
  * - Prevents double charges if payment succeeds but response is lost
  * - Enables safe retries without side effects
- * - Maintains exactly-once semantics for critical operations
  *
- * Implementation:
- * 1. Client generates unique idempotency key (UUID v4)
- * 2. Server checks if key exists in idempotency_keys table
- * 3. If exists, return cached response (no duplicate operation)
- * 4. If not, execute operation and store response with key
- * 5. Keys expire after 24 hours via cleanup job
+ * Implementation (one transaction, because the key and the order live in the
+ * same PostgreSQL database):
+ * 1. Client sends `Idempotency-Key` (a UUID per checkout attempt).
+ * 2. BEGIN; INSERT the key ... ON CONFLICT DO NOTHING.
+ *    - Inserted: run the operation on the same transaction, store its response
+ *      on the key row, COMMIT. The key and the order commit together or not at
+ *      all, so a crash mid-request leaves nothing behind and the retry runs.
+ *    - Conflict: the key exists. A concurrent request holding it makes this
+ *      INSERT wait (bounded by lock_timeout) until that request commits. Then:
+ *      same user + same request fingerprint -> return the stored response;
+ *      anything else -> 422, without revealing what the other request was.
+ * 3. Keys expire after 24 hours via the hourly cleanup job.
+ *
+ * The previous version looked keys up without the user, so a second customer
+ * presenting the same key received the first customer's order (address
+ * included), and a crash between creating the order and completing the key
+ * left the key "pending" for 24 hours.
  *
  * @module shared/idempotency
  */
-import { queryOne, execute, pool } from '../utils/db.js';
+import { createHash } from 'crypto';
+import type { PoolClient } from 'pg';
+import { execute, withTransaction } from '../utils/db.js';
+import { HttpError } from './errors.js';
 import { orderLogger } from './logger.js';
 
 /**
@@ -27,6 +40,7 @@ export interface IdempotencyKey {
   key: string;
   user_id: string;
   operation: string;
+  request_hash: string | null;
   response: unknown;
   status: 'pending' | 'completed' | 'failed';
   created_at: Date;
@@ -34,180 +48,157 @@ export interface IdempotencyKey {
 }
 
 /**
- * Result of an idempotency check.
+ * Result of an idempotent call.
  */
 export interface IdempotencyResult<T> {
-  /** Whether the operation was executed (true) or cached response returned (false) */
+  /** True if the operation ran now; false if a stored response was replayed. */
   executed: boolean;
-  /** The response from the operation or cache */
+  /** The response from the operation or the stored one */
   response: T;
 }
 
-/**
- * Idempotency key TTL in hours.
- */
+/** Idempotency key TTL in hours. */
 const IDEMPOTENCY_KEY_TTL_HOURS = 24;
 
+/** How long a duplicate waits for an in-flight request with the same key. */
+const IDEMPOTENCY_LOCK_TIMEOUT = '5s';
+
+/** Accepted key format: UUIDs and similar opaque tokens. */
+export const IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9_-]{8,64}$/;
+
+/** A malformed, reused or busy idempotency key. */
+export class IdempotencyError extends HttpError {
+  constructor(message: string, statusCode: 400 | 409 | 422, code: string) {
+    super(message, statusCode, code);
+  }
+}
+
 /**
- * Executes an operation with idempotency protection.
- * If the key was used before, returns the cached response.
- * Otherwise, executes the operation and caches the result.
- *
- * @param key - Unique idempotency key from client
- * @param userId - User ID for the operation
- * @param operation - Operation type (e.g., 'create_order')
- * @param fn - The operation to execute
- * @returns The operation result (from cache or fresh execution)
- *
- * @example
- * const result = await withIdempotency(
- *   req.headers['x-idempotency-key'],
- *   userId,
- *   'create_order',
- *   async () => createOrder(userId, orderData)
- * );
+ * JSON with object keys sorted at every level, so logically equal requests
+ * fingerprint the same regardless of key order.
  */
-export async function withIdempotency<T>(
-  key: string | undefined,
-  userId: string,
-  operation: string,
-  fn: () => Promise<T>
+export function stableStringify(value: unknown): string {
+  if (value === null || typeof value !== 'object') {
+    return JSON.stringify(value) ?? 'null';
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map(stableStringify).join(',')}]`;
+  }
+  const entries = Object.entries(value as Record<string, unknown>)
+    .filter(([, entry]) => entry !== undefined)
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${stableStringify(v)}`).join(',')}}`;
+}
+
+/**
+ * SHA-256 fingerprint of an operation and its (validated) request.
+ */
+export function hashRequest(operation: string, request: unknown): string {
+  return createHash('sha256').update(`${operation}:${stableStringify(request)}`).digest('hex');
+}
+
+/**
+ * Runs `fn` in a transaction, at most once per (user, idempotency key).
+ *
+ * @param params.key - Client-supplied key; when absent `fn` simply runs in a transaction
+ * @param params.userId - Caller; keys are never shared across users
+ * @param params.operation - Operation name, e.g. 'create_order'
+ * @param params.request - The validated request, fingerprinted to detect key reuse
+ * @param fn - The operation; must do all its database work on the given client
+ * @returns The fresh or replayed response
+ * @throws IdempotencyError 400 (bad key), 409 (same key still in flight), 422 (key reused)
+ */
+export async function withIdempotentTransaction<T>(
+  params: { key?: string; userId: string; operation: string; request: unknown },
+  fn: (client: PoolClient) => Promise<T>
 ): Promise<IdempotencyResult<T>> {
-  // If no key provided, execute without idempotency
+  const { key, userId, operation, request } = params;
+
   if (!key) {
     orderLogger.debug({ operation }, 'No idempotency key provided, executing directly');
-    const response = await fn();
-    return { executed: true, response };
+    return { executed: true, response: await withTransaction(fn) };
   }
 
-  // Validate key format (should be UUID-like)
-  if (!/^[a-zA-Z0-9-]{8,64}$/.test(key)) {
-    throw new Error('Invalid idempotency key format');
+  if (!IDEMPOTENCY_KEY_PATTERN.test(key)) {
+    throw new IdempotencyError(
+      'Idempotency-Key must be 8-64 characters of letters, digits, "-" or "_"',
+      400,
+      'IDEMPOTENCY_KEY_INVALID'
+    );
   }
 
-  // Check for existing key
-  const existing = await getIdempotencyKey(key);
-
-  if (existing) {
-    // Key exists - check status
-    if (existing.status === 'pending') {
-      // Another request is in progress with the same key
-      // This could indicate a race condition
-      orderLogger.warn({ key, operation }, 'Idempotency key in pending state (concurrent request)');
-      throw new Error('Request already in progress');
-    }
-
-    if (existing.status === 'completed') {
-      // Return cached response
-      orderLogger.info({ key, operation }, 'Returning cached response for idempotency key');
-      return { executed: false, response: existing.response as T };
-    }
-
-    if (existing.status === 'failed') {
-      // Previous attempt failed - allow retry
-      orderLogger.info({ key, operation }, 'Previous attempt failed, allowing retry');
-      // Delete the failed key and proceed
-      await deleteIdempotencyKey(key);
-    }
-  }
-
-  // Create pending idempotency key
-  try {
-    await createIdempotencyKey(key, userId, operation);
-  } catch (error) {
-    // If we fail to create (duplicate key), another request got there first
-    orderLogger.warn({ key, operation, error: (error as Error).message }, 'Failed to create idempotency key');
-    throw new Error('Duplicate request detected');
-  }
+  const requestHash = hashRequest(operation, request);
 
   try {
-    // Execute the operation
-    const response = await fn();
+    return await withTransaction(async (client) => {
+      await client.query(`SET LOCAL lock_timeout = '${IDEMPOTENCY_LOCK_TIMEOUT}'`);
 
-    // Mark as completed with response
-    await completeIdempotencyKey(key, response);
+      // Expired keys may be reused; so may rows an older version of this code
+      // committed as pending/failed before crashing.
+      await client.query(
+        `DELETE FROM idempotency_keys WHERE key = $1 AND (expires_at < NOW() OR status <> 'completed')`,
+        [key]
+      );
 
-    orderLogger.info({ key, operation }, 'Operation completed with idempotency key');
-    return { executed: true, response };
+      const claimed = await client.query(
+        `INSERT INTO idempotency_keys (key, user_id, operation, request_hash, status, expires_at)
+         VALUES ($1, $2, $3, $4, 'pending', NOW() + make_interval(hours => $5))
+         ON CONFLICT (key) DO NOTHING
+         RETURNING key`,
+        [key, userId, operation, requestHash, IDEMPOTENCY_KEY_TTL_HOURS]
+      );
+
+      if (claimed.rowCount === 0) {
+        const existing = (
+          await client.query<IdempotencyKey>(
+            `SELECT user_id, operation, request_hash, status, response
+             FROM idempotency_keys WHERE key = $1`,
+            [key]
+          )
+        ).rows[0];
+
+        if (!existing) {
+          throw new IdempotencyError(
+            'A request with this Idempotency-Key just finished; retry',
+            409,
+            'IDEMPOTENCY_IN_PROGRESS'
+          );
+        }
+        const sameRequest =
+          existing.user_id === userId &&
+          existing.operation === operation &&
+          (existing.request_hash === null || existing.request_hash === requestHash);
+        if (!sameRequest || existing.status !== 'completed') {
+          throw new IdempotencyError(
+            'Idempotency-Key was already used for a different request',
+            422,
+            'IDEMPOTENCY_KEY_REUSED'
+          );
+        }
+
+        orderLogger.info({ key, operation }, 'Returning stored response for idempotency key');
+        return { executed: false, response: existing.response as T };
+      }
+
+      const response = await fn(client);
+      await client.query(
+        `UPDATE idempotency_keys SET status = 'completed', response = $2 WHERE key = $1`,
+        [key, JSON.stringify(response)]
+      );
+      orderLogger.info({ key, operation }, 'Operation completed with idempotency key');
+      return { executed: true, response };
+    });
   } catch (error) {
-    // Mark as failed
-    await failIdempotencyKey(key, (error as Error).message);
+    // lock_not_available: the first request with this key is still running.
+    if ((error as { code?: string }).code === '55P03') {
+      throw new IdempotencyError(
+        'A request with this Idempotency-Key is still in progress; retry shortly',
+        409,
+        'IDEMPOTENCY_IN_PROGRESS'
+      );
+    }
     throw error;
   }
-}
-
-/**
- * Gets an existing idempotency key record.
- *
- * @param key - The idempotency key
- * @returns The key record or null if not found
- */
-export async function getIdempotencyKey(key: string): Promise<IdempotencyKey | null> {
-  return queryOne<IdempotencyKey>(
-    `SELECT * FROM idempotency_keys WHERE key = $1 AND expires_at > NOW()`,
-    [key]
-  );
-}
-
-/**
- * Creates a new idempotency key in pending state.
- *
- * @param key - The idempotency key
- * @param userId - User ID for the operation
- * @param operation - Operation type
- */
-async function createIdempotencyKey(
-  key: string,
-  userId: string,
-  operation: string
-): Promise<void> {
-  const expiresAt = new Date();
-  expiresAt.setHours(expiresAt.getHours() + IDEMPOTENCY_KEY_TTL_HOURS);
-
-  await pool.query(
-    `INSERT INTO idempotency_keys (key, user_id, operation, status, expires_at)
-     VALUES ($1, $2, $3, 'pending', $4)`,
-    [key, userId, operation, expiresAt]
-  );
-}
-
-/**
- * Marks an idempotency key as completed with the response.
- *
- * @param key - The idempotency key
- * @param response - The operation response to cache
- */
-async function completeIdempotencyKey(key: string, response: unknown): Promise<void> {
-  await execute(
-    `UPDATE idempotency_keys
-     SET status = 'completed', response = $1
-     WHERE key = $2`,
-    [JSON.stringify(response), key]
-  );
-}
-
-/**
- * Marks an idempotency key as failed.
- *
- * @param key - The idempotency key
- * @param errorMessage - The error message
- */
-async function failIdempotencyKey(key: string, errorMessage: string): Promise<void> {
-  await execute(
-    `UPDATE idempotency_keys
-     SET status = 'failed', response = $1
-     WHERE key = $2`,
-    [JSON.stringify({ error: errorMessage }), key]
-  );
-}
-
-/**
- * Deletes an idempotency key.
- *
- * @param key - The idempotency key to delete
- */
-async function deleteIdempotencyKey(key: string): Promise<void> {
-  await execute(`DELETE FROM idempotency_keys WHERE key = $1`, [key]);
 }
 
 /**
@@ -225,7 +216,6 @@ export async function cleanupExpiredIdempotencyKeys(): Promise<number> {
 }
 
 export default {
-  withIdempotency,
-  getIdempotencyKey,
+  withIdempotentTransaction,
   cleanupExpiredIdempotencyKeys,
 };

@@ -45,10 +45,35 @@ const submissionDuration = new promClient.Histogram({
   registers: [register]
 });
 
-// Submissions in progress (queue depth)
+// Submissions being judged right now by this process
 const submissionsInProgress = new promClient.Gauge({
   name: 'submissions_in_progress',
-  help: 'Number of submissions currently being processed',
+  help: 'Number of submissions currently being judged by this process',
+  registers: [register]
+});
+
+// ============ Judge Queue Metrics ============
+
+// Submissions waiting for a worker (sampled by the worker's poll loop)
+const judgeQueueDepth = new promClient.Gauge({
+  name: 'judge_queue_depth',
+  help: 'Number of pending submissions waiting for a judge worker',
+  registers: [register]
+});
+
+// Time from submission to the moment a worker claimed it
+const judgeQueueWait = new promClient.Histogram({
+  name: 'judge_queue_wait_seconds',
+  help: 'Time a submission waited in the queue before a worker claimed it',
+  buckets: [0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60],
+  registers: [register]
+});
+
+// What happened to each claimed job
+const judgeJobsTotal = new promClient.Counter({
+  name: 'judge_jobs_total',
+  help: 'Judge jobs by outcome (completed, retried, dead_lettered, lease_lost, released)',
+  labelNames: ['outcome'] as const,
   registers: [register]
 });
 
@@ -176,6 +201,9 @@ export const metrics = {
   submissionsTotal,
   submissionDuration,
   submissionsInProgress,
+  judgeQueueDepth,
+  judgeQueueWait,
+  judgeJobsTotal,
   codeExecutionsTotal,
   codeExecutionDuration,
   activeContainers,

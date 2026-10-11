@@ -6,18 +6,21 @@
  * @description Central entry point for order service functionality. Aggregates and
  * re-exports all order-related types, constants, and functions from submodules:
  * - types: Type definitions and configuration constants
- * - create: Order creation from customer cart data
+ * - pricing: Request validation and server-side pricing (integer cents)
+ * - create: Order creation (transactional), quotes, tips
  * - tracking: Order queries and statistics
- * - status: Order status transitions
+ * - stateMachine: Guarded (compare-and-set) status transitions
+ * - cancel: Cancellation that also withdraws live offers
  * - delivery: Delivery completion handling
- * - assignment: Driver offer management
+ * - assignment: Driver offers and the atomic claim
+ * - dispatch: Dispatch leases and the sweeper that resumes orphaned matching
  * - matching: Driver matching with circuit breaker
  *
  * @example
  * import {
  *   createOrder,
  *   getOrderWithDetails,
- *   updateOrderStatus,
+ *   transitionOrder,
  *   startDriverMatchingWithCircuitBreaker
  * } from '../services/order/index.js';
  */
@@ -43,8 +46,16 @@ export {
   CIRCUIT_BREAKER_RESET_TIMEOUT_MS,
 } from './types.js';
 
-// Order creation
-export { createOrder } from './create.js';
+// Order creation, pricing and tips
+export { createOrder, quoteOrder, updateOrderTip } from './create.js';
+export {
+  createOrderSchema,
+  quoteOrderSchema,
+  parseOrderBody,
+  priceOrder,
+  OrderValidationError,
+} from './pricing.js';
+export type { CreateOrderRequest, QuoteOrderRequest, OrderQuote } from './pricing.js';
 
 // Order tracking and queries
 export {
@@ -56,21 +67,41 @@ export {
   getRecentOrders,
 } from './tracking.js';
 
-// Status updates
-export { updateOrderStatus } from './status.js';
+// State machine (guarded status transitions)
+export {
+  ORDER_TRANSITIONS,
+  DISPATCHABLE_STATUSES,
+  ACTIVE_DELIVERY_STATUSES,
+  canTransition,
+  transitionOrder,
+  publishOrderStatus,
+  OrderTransitionError,
+  OrderNotFoundError,
+  OrderAccessError,
+} from './stateMachine.js';
+
+// Cancellation
+export { cancelOrder, CUSTOMER_CANCELLABLE_STATUSES } from './cancel.js';
 
 // Delivery completion
 export { completeDelivery } from './delivery.js';
 
-// Driver assignment and offers
+// Driver offers and the atomic claim
 export {
-  assignDriverToOrder,
   createDriverOffer,
   acceptDriverOffer,
   rejectDriverOffer,
   getPendingOfferForDriver,
   expireOldOffers,
 } from './assignment.js';
+export type { AcceptResult, CreateOfferResult } from './assignment.js';
+
+// Dispatch leases and the sweeper
+export {
+  DISPATCH_OWNER,
+  startDispatchSweeper,
+  releaseAllDispatchLeases,
+} from './dispatch.js';
 
 // Driver matching with circuit breaker
 export {
@@ -78,3 +109,4 @@ export {
   startDriverMatchingWithCircuitBreaker,
   getDriverMatchingCircuitBreakerStatus,
 } from './matching.js';
+export type { MatchOutcome } from './matching.js';

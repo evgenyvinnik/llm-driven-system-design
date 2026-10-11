@@ -3,14 +3,21 @@
  * Manages the professional network graph - connection requests,
  * acceptance/rejection, and network analysis (PYMK, mutual connections).
  *
+ * Every mutation is idempotent: repeating it returns the current state with
+ * `changed: false` instead of an error, so clients can retry safely. Events and
+ * audit entries are emitted only when something actually changed.
+ *
  * @module routes/connections
  */
 import { Router, Request, Response } from 'express';
 import { v4 as uuidv4 } from 'uuid';
 import * as connectionService from '../services/connectionService.js';
+import { getPeopleYouMayKnow } from '../services/pymkService.js';
+import { getUsersByIds } from '../services/userService.js';
 import { requireAuth } from '../middleware/auth.js';
-import { connectionRequestRateLimit, readRateLimit } from '../utils/rateLimiter.js';
+import { connectionRequestRateLimit, readRateLimit, writeRateLimit } from '../utils/rateLimiter.js';
 import { logger } from '../utils/logger.js';
+import { parseId, sendApiError, ApiError } from '../utils/errors.js';
 import {
   connectionRequestsTotal,
   connectionsCreatedTotal,
@@ -29,11 +36,39 @@ import {
 
 const router = Router();
 
+/** LinkedIn caps invitation notes at 300 characters. */
+const MAX_INVITATION_MESSAGE = 300;
+
+function clampLimit(raw: unknown, fallback: number, max: number): number {
+  const value = parseInt(raw as string);
+  return Number.isInteger(value) && value > 0 ? Math.min(value, max) : fallback;
+}
+
+async function publishConnectionCreated(userId: number, connectedUserId: number, actorId: number, recipientId: number) {
+  const connectionEvent: ConnectionEvent = {
+    type: 'connection.created',
+    userId,
+    connectedUserId,
+    idempotencyKey: uuidv4(),
+    timestamp: new Date().toISOString(),
+  };
+  await publishToQueue(QUEUES.PYMK_COMPUTE, connectionEvent);
+
+  const notificationEvent: NotificationEvent = {
+    type: 'notification.connection_accepted',
+    recipientId,
+    actorId,
+    idempotencyKey: uuidv4(),
+    timestamp: new Date().toISOString(),
+  };
+  await publishToQueue(QUEUES.NOTIFICATIONS, notificationEvent);
+}
+
 // Get my connections
 router.get('/', requireAuth, readRateLimit, async (req: Request, res: Response) => {
   try {
-    const offset = parseInt(req.query.offset as string) || 0;
-    const limit = parseInt(req.query.limit as string) || 20;
+    const offset = Math.max(0, parseInt(req.query.offset as string) || 0);
+    const limit = clampLimit(req.query.limit, 20, 100);
 
     const connections = await connectionService.getConnectionsWithData(
       req.session.userId!,
@@ -62,203 +97,155 @@ router.get('/requests', requireAuth, readRateLimit, async (req: Request, res: Re
 // Send connection request (with stricter rate limiting)
 router.post('/request', requireAuth, connectionRequestRateLimit, async (req: Request, res: Response) => {
   try {
-    const { userId, message } = req.body;
-
-    if (!userId) {
-      res.status(400).json({ error: 'User ID required' });
-      return;
+    const fromUserId = req.session.userId!;
+    const toUserId = parseId(req.body?.userId, 'userId');
+    const message = typeof req.body?.message === 'string' ? req.body.message.trim() : undefined;
+    if (message && message.length > MAX_INVITATION_MESSAGE) {
+      throw new ApiError(400, 'message_too_long', `Message must be at most ${MAX_INVITATION_MESSAGE} characters`);
     }
 
-    if (userId === req.session.userId) {
-      res.status(400).json({ error: 'Cannot connect with yourself' });
-      return;
+    const { outcome, request } = await connectionService.sendConnectionRequest(fromUserId, toUserId, message);
+
+    if (outcome === 'sent') {
+      connectionRequestsTotal.inc();
+      const notificationEvent: NotificationEvent = {
+        type: 'notification.connection_request',
+        recipientId: toUserId,
+        actorId: fromUserId,
+        entityId: request.id,
+        idempotencyKey: uuidv4(),
+        timestamp: new Date().toISOString(),
+      };
+      await publishToQueue(QUEUES.NOTIFICATIONS, notificationEvent);
+      await logConnectionEvent(AuditEventType.CONNECTION_REQUEST_SENT, fromUserId, toUserId, req.ip || 'unknown');
+    } else if (outcome === 'accepted_reverse') {
+      connectionsCreatedTotal.inc();
+      await publishConnectionCreated(toUserId, fromUserId, fromUserId, toUserId);
+      await logConnectionEvent(AuditEventType.CONNECTION_REQUEST_ACCEPTED, fromUserId, toUserId, req.ip || 'unknown');
     }
 
-    const request = await connectionService.sendConnectionRequest(
-      req.session.userId!,
-      userId,
-      message
-    );
+    logger.info({ fromUserId, toUserId, outcome }, 'Connection request handled');
 
-    // Track metrics
-    connectionRequestsTotal.inc();
-
-    // Publish notification event
-    const notificationEvent: NotificationEvent = {
-      type: 'notification.connection_request',
-      recipientId: userId,
-      actorId: req.session.userId!,
-      entityId: request.id,
-      idempotencyKey: uuidv4(),
-      timestamp: new Date().toISOString(),
-    };
-    await publishToQueue(QUEUES.NOTIFICATIONS, notificationEvent);
-
-    // Audit log
-    await logConnectionEvent(
-      AuditEventType.CONNECTION_REQUEST_SENT,
-      req.session.userId!,
-      userId,
-      req.ip || 'unknown'
-    );
-
-    logger.info(
-      { fromUserId: req.session.userId, toUserId: userId },
-      'Connection request sent'
-    );
-
-    res.status(201).json({ request });
+    res.status(outcome === 'sent' ? 201 : 200).json({
+      request,
+      outcome,
+      status: outcome === 'accepted_reverse' ? 'connected' : 'pending_sent',
+    });
   } catch (error: unknown) {
-    if (error instanceof Error) {
-      res.status(400).json({ error: error.message });
-      return;
-    }
+    if (sendApiError(res, error)) return;
     logger.error({ error, userId: req.session.userId }, 'Send request error');
     res.status(500).json({ error: 'Failed to send request' });
   }
 });
 
 // Accept connection request
-router.post('/requests/:id/accept', requireAuth, async (req: Request, res: Response) => {
+router.post('/requests/:id/accept', requireAuth, writeRateLimit, async (req: Request, res: Response) => {
   try {
-    const requestId = parseInt(req.params.id);
+    const userId = req.session.userId!;
+    const requestId = parseId(req.params.id);
 
-    // Get request details before accepting (for notification)
-    const pendingRequests = await connectionService.getPendingRequests(req.session.userId!);
-    const request = pendingRequests.find(r => r.id === requestId);
+    const { request, changed } = await connectionService.acceptConnectionRequest(requestId, userId);
 
-    await connectionService.acceptConnectionRequest(requestId, req.session.userId!);
-
-    // Track metrics
-    connectionsCreatedTotal.inc();
-
-    if (request) {
-      // Publish connection event for PYMK recalculation
-      const connectionEvent: ConnectionEvent = {
-        type: 'connection.created',
-        userId: request.from_user_id,
-        connectedUserId: req.session.userId!,
-        idempotencyKey: uuidv4(),
-        timestamp: new Date().toISOString(),
-      };
-      await publishToQueue(QUEUES.PYMK_COMPUTE, connectionEvent);
-
-      // Publish notification to the requester
-      const notificationEvent: NotificationEvent = {
-        type: 'notification.connection_accepted',
-        recipientId: request.from_user_id,
-        actorId: req.session.userId!,
-        idempotencyKey: uuidv4(),
-        timestamp: new Date().toISOString(),
-      };
-      await publishToQueue(QUEUES.NOTIFICATIONS, notificationEvent);
-
-      // Audit log
-      await logConnectionEvent(
-        AuditEventType.CONNECTION_REQUEST_ACCEPTED,
-        req.session.userId!,
-        request.from_user_id,
-        req.ip || 'unknown'
-      );
+    if (changed) {
+      connectionsCreatedTotal.inc();
+      await publishConnectionCreated(request.from_user_id, userId, userId, request.from_user_id);
+      await logConnectionEvent(AuditEventType.CONNECTION_REQUEST_ACCEPTED, userId, request.from_user_id, req.ip || 'unknown');
     }
 
-    logger.info(
-      { requestId, userId: req.session.userId },
-      'Connection request accepted'
-    );
+    logger.info({ requestId, userId, changed }, 'Connection request accepted');
 
-    res.json({ message: 'Connection accepted' });
+    res.json({ message: 'Connection accepted', request, changed });
   } catch (error: unknown) {
-    if (error instanceof Error) {
-      res.status(400).json({ error: error.message });
-      return;
-    }
+    if (sendApiError(res, error)) return;
     logger.error({ error, userId: req.session.userId }, 'Accept request error');
     res.status(500).json({ error: 'Failed to accept request' });
   }
 });
 
 // Reject connection request
-router.post('/requests/:id/reject', requireAuth, async (req: Request, res: Response) => {
+router.post('/requests/:id/reject', requireAuth, writeRateLimit, async (req: Request, res: Response) => {
   try {
-    const requestId = parseInt(req.params.id);
+    const userId = req.session.userId!;
+    const requestId = parseId(req.params.id);
 
-    // Get request details before rejecting (for audit)
-    const pendingRequests = await connectionService.getPendingRequests(req.session.userId!);
-    const request = pendingRequests.find(r => r.id === requestId);
+    const { request, changed } = await connectionService.rejectConnectionRequest(requestId, userId);
 
-    await connectionService.rejectConnectionRequest(requestId, req.session.userId!);
-
-    if (request) {
-      await logConnectionEvent(
-        AuditEventType.CONNECTION_REQUEST_REJECTED,
-        req.session.userId!,
-        request.from_user_id,
-        req.ip || 'unknown'
-      );
+    if (changed) {
+      await logConnectionEvent(AuditEventType.CONNECTION_REQUEST_REJECTED, userId, request.from_user_id, req.ip || 'unknown');
     }
 
-    logger.info(
-      { requestId, userId: req.session.userId },
-      'Connection request rejected'
-    );
+    logger.info({ requestId, userId, changed }, 'Connection request rejected');
 
-    res.json({ message: 'Connection rejected' });
+    res.json({ message: 'Connection rejected', request, changed });
   } catch (error) {
+    if (sendApiError(res, error)) return;
     logger.error({ error, userId: req.session.userId }, 'Reject request error');
     res.status(500).json({ error: 'Failed to reject request' });
   }
 });
 
-// Remove connection
-router.delete('/:userId', requireAuth, async (req: Request, res: Response) => {
+// Withdraw an invitation I sent
+router.post('/requests/:id/withdraw', requireAuth, writeRateLimit, async (req: Request, res: Response) => {
   try {
-    const connectedUserId = parseInt(req.params.userId);
+    const userId = req.session.userId!;
+    const requestId = parseId(req.params.id);
 
-    await connectionService.removeConnection(req.session.userId!, connectedUserId);
+    const { request, changed } = await connectionService.withdrawConnectionRequest(requestId, userId);
 
-    // Track metrics
-    connectionsRemovedTotal.inc();
+    logger.info({ requestId, userId, changed }, 'Connection request withdrawn');
 
-    // Publish connection removed event for PYMK recalculation
-    const connectionEvent: ConnectionEvent = {
-      type: 'connection.removed',
-      userId: req.session.userId!,
-      connectedUserId,
-      idempotencyKey: uuidv4(),
-      timestamp: new Date().toISOString(),
-    };
-    await publishToQueue(QUEUES.PYMK_COMPUTE, connectionEvent);
-
-    // Audit log
-    await logConnectionEvent(
-      AuditEventType.CONNECTION_REMOVED,
-      req.session.userId!,
-      connectedUserId,
-      req.ip || 'unknown'
-    );
-
-    logger.info(
-      { userId: req.session.userId, connectedUserId },
-      'Connection removed'
-    );
-
-    res.json({ message: 'Connection removed' });
+    res.json({ message: 'Invitation withdrawn', request, changed });
   } catch (error) {
+    if (sendApiError(res, error)) return;
+    logger.error({ error, userId: req.session.userId }, 'Withdraw request error');
+    res.status(500).json({ error: 'Failed to withdraw request' });
+  }
+});
+
+// Remove connection
+router.delete('/:userId', requireAuth, writeRateLimit, async (req: Request, res: Response) => {
+  try {
+    const userId = req.session.userId!;
+    const connectedUserId = parseId(req.params.userId, 'userId');
+
+    const removed = await connectionService.removeConnection(userId, connectedUserId);
+
+    if (removed) {
+      connectionsRemovedTotal.inc();
+
+      // Publish connection removed event for PYMK recalculation
+      const connectionEvent: ConnectionEvent = {
+        type: 'connection.removed',
+        userId,
+        connectedUserId,
+        idempotencyKey: uuidv4(),
+        timestamp: new Date().toISOString(),
+      };
+      await publishToQueue(QUEUES.PYMK_COMPUTE, connectionEvent);
+
+      await logConnectionEvent(AuditEventType.CONNECTION_REMOVED, userId, connectedUserId, req.ip || 'unknown');
+    }
+
+    logger.info({ userId, connectedUserId, removed }, 'Connection removal handled');
+
+    res.json({ message: removed ? 'Connection removed' : 'Not connected', removed });
+  } catch (error) {
+    if (sendApiError(res, error)) return;
     logger.error({ error, userId: req.session.userId }, 'Remove connection error');
     res.status(500).json({ error: 'Failed to remove connection' });
   }
 });
 
-// Get connection degree with a user
+// How the viewer relates to another member: degree, invitation state, mutual count, path
 router.get('/degree/:userId', requireAuth, readRateLimit, async (req: Request, res: Response) => {
   try {
-    const degree = await connectionService.getConnectionDegree(
+    const relationship = await connectionService.getRelationship(
       req.session.userId!,
-      parseInt(req.params.userId)
+      parseId(req.params.userId, 'userId')
     );
-    res.json({ degree });
+    res.json(relationship);
   } catch (error) {
+    if (sendApiError(res, error)) return;
     logger.error({ error, userId: req.session.userId }, 'Get degree error');
     res.status(500).json({ error: 'Failed to get connection degree' });
   }
@@ -269,20 +256,13 @@ router.get('/mutual/:userId', requireAuth, readRateLimit, async (req: Request, r
   try {
     const mutualIds = await connectionService.getMutualConnections(
       req.session.userId!,
-      parseInt(req.params.userId)
+      parseId(req.params.userId, 'userId')
     );
+    const mutualConnections = await getUsersByIds(mutualIds.slice(0, 100));
 
-    const users = await connectionService.getConnectionsWithData(
-      req.session.userId!,
-      0,
-      100
-    );
-
-    const mutualSet = new Set(mutualIds);
-    const mutualConnections = users.filter(u => mutualSet.has(u.id));
-
-    res.json({ mutual_connections: mutualConnections });
+    res.json({ mutual_connections: mutualConnections, total: mutualIds.length });
   } catch (error) {
+    if (sendApiError(res, error)) return;
     logger.error({ error, userId: req.session.userId }, 'Get mutual connections error');
     res.status(500).json({ error: 'Failed to get mutual connections' });
   }
@@ -291,8 +271,8 @@ router.get('/mutual/:userId', requireAuth, readRateLimit, async (req: Request, r
 // Get second-degree connections
 router.get('/second-degree', requireAuth, readRateLimit, async (req: Request, res: Response) => {
   try {
-    const secondDegree = await connectionService.getSecondDegreeConnections(req.session.userId!);
-    res.json({ connections: secondDegree.slice(0, 50) });
+    const secondDegree = await connectionService.getSecondDegreeConnections(req.session.userId!, 50);
+    res.json({ connections: secondDegree });
   } catch (error) {
     logger.error({ error, userId: req.session.userId }, 'Get second-degree error');
     res.status(500).json({ error: 'Failed to get second-degree connections' });
@@ -302,8 +282,8 @@ router.get('/second-degree', requireAuth, readRateLimit, async (req: Request, re
 // Get PYMK (People You May Know)
 router.get('/pymk', requireAuth, readRateLimit, async (req: Request, res: Response) => {
   try {
-    const limit = parseInt(req.query.limit as string) || 10;
-    const pymk = await connectionService.getPeopleYouMayKnow(req.session.userId!, limit);
+    const limit = clampLimit(req.query.limit, 10, 50);
+    const pymk = await getPeopleYouMayKnow(req.session.userId!, limit);
     res.json({ people: pymk });
   } catch (error) {
     logger.error({ error, userId: req.session.userId }, 'Get PYMK error');

@@ -3,52 +3,55 @@
  * Handles marking orders as delivered and updating driver state.
  *
  * @module services/order/delivery
- * @description Manages the final stage of order fulfillment, including marking
- * orders as delivered, updating driver statistics, and managing driver availability.
+ * @description Completing a delivery changes three things that must agree: the
+ * order becomes delivered, the courier's delivery count goes up, and the
+ * courier becomes available again if this was their last active order. They
+ * commit together. The courier's availability is decided from the orders table
+ * itself rather than from the Redis load set, which can drift.
  */
+import { withTransaction } from '../../utils/db.js';
 import { removeDriverOrder } from '../../utils/redis.js';
-import { incrementDriverDeliveries, updateDriverStatus } from '../driverService.js';
-import { getOrderById, getDriverOrders } from './tracking.js';
-import { updateOrderStatus } from './status.js';
+import { driverLogger } from '../../shared/logger.js';
+import { ordersCompletedCounter, deliveriesCompletedCounter } from '../../shared/metrics.js';
+import { transitionOrder, publishOrderStatus, ACTIVE_DELIVERY_STATUSES } from './stateMachine.js';
 import type { Order } from './types.js';
 
 /**
- * Marks an order as delivered and updates driver state.
+ * Marks an order as delivered by its assigned courier.
  *
- * @description Completes a delivery by:
- * 1. Setting order status to 'delivered' with timestamp
- * 2. Removing order from driver's active order set in Redis
- * 3. Incrementing driver's total delivery count
- * 4. Setting driver to 'available' if no other active orders remain
- * @param {string} orderId - The order's UUID
- * @returns {Promise<Order | null>} Updated order or null if order not found or has no driver
- * @example
- * const completedOrder = await completeDelivery(orderId);
- * if (completedOrder) {
- *   console.log(`Order ${completedOrder.id} delivered at ${completedOrder.delivered_at}`);
- * } else {
- *   console.log('Order not found or not assigned to driver');
- * }
+ * @param orderId - The order's UUID
+ * @param driverId - The courier completing it (must be the assigned courier)
+ * @returns The delivered order
+ * @throws OrderNotFoundError | OrderAccessError | OrderTransitionError
  */
-export async function completeDelivery(orderId: string): Promise<Order | null> {
-  const order = await getOrderById(orderId);
-  if (!order || !order.driver_id) return null;
+export async function completeDelivery(orderId: string, driverId: string): Promise<Order> {
+  const { order, vehicleType } = await withTransaction(async (client) => {
+    const delivered = await transitionOrder(orderId, 'delivered', { driverId, client });
 
-  const updatedOrder = await updateOrderStatus(orderId, 'delivered');
+    const driver = await client.query<{ vehicle_type: string }>(
+      `UPDATE drivers SET total_deliveries = total_deliveries + 1 WHERE id = $1 RETURNING vehicle_type`,
+      [driverId]
+    );
 
-  if (updatedOrder) {
-    // Remove order from driver's active orders
-    await removeDriverOrder(order.driver_id, orderId);
+    // Available again only if this was the courier's last active order.
+    await client.query(
+      `UPDATE drivers SET status = 'available'
+       WHERE id = $1 AND status = 'busy'
+         AND NOT EXISTS (
+           SELECT 1 FROM orders WHERE driver_id = $1 AND status = ANY($2::text[])
+         )`,
+      [driverId, ACTIVE_DELIVERY_STATUSES]
+    );
 
-    // Increment driver's delivery count
-    await incrementDriverDeliveries(order.driver_id);
+    return { order: delivered, vehicleType: driver.rows[0]?.vehicle_type ?? 'unknown' };
+  });
 
-    // Check if driver has more orders, if not set to available
-    const remainingOrders = await getDriverOrders(order.driver_id);
-    if (remainingOrders.length === 0) {
-      await updateDriverStatus(order.driver_id, 'available');
-    }
-  }
+  await removeDriverOrder(driverId, orderId).catch((error: Error) => {
+    driverLogger.warn({ driverId, orderId, error: error.message }, 'Failed to update cached driver load');
+  });
+  ordersCompletedCounter.inc({ status: 'delivered' });
+  deliveriesCompletedCounter.inc({ vehicle_type: vehicleType });
+  await publishOrderStatus(order);
 
-  return updatedOrder;
+  return order;
 }

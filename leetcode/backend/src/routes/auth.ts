@@ -2,7 +2,7 @@ import { Router, type Request, type Response } from 'express';
 import bcrypt from 'bcryptjs';
 import { v4 as uuidv4 } from 'uuid';
 import pool from '../db/pool.js';
-import { authRateLimiter } from '../shared/rateLimiter.js';
+import { loginRateLimiter, registerRateLimiter } from '../shared/rateLimiter.js';
 import { createModuleLogger } from '../shared/logger.js';
 
 const router = Router();
@@ -20,7 +20,7 @@ interface LoginBody {
 }
 
 // Register - rate limited to prevent abuse
-router.post('/register', authRateLimiter, async (req: Request<unknown, unknown, RegisterBody>, res: Response): Promise<void> => {
+router.post('/register', registerRateLimiter, async (req: Request<unknown, unknown, RegisterBody>, res: Response): Promise<void> => {
   try {
     const { username, email, password } = req.body;
 
@@ -69,7 +69,7 @@ router.post('/register', authRateLimiter, async (req: Request<unknown, unknown, 
 });
 
 // Login - rate limited to prevent brute force attacks
-router.post('/login', authRateLimiter, async (req: Request<unknown, unknown, LoginBody>, res: Response): Promise<void> => {
+router.post('/login', loginRateLimiter, async (req: Request<unknown, unknown, LoginBody>, res: Response): Promise<void> => {
   try {
     const { username, password } = req.body;
 

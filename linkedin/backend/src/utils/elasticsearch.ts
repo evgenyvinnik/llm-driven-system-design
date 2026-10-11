@@ -1,4 +1,5 @@
-import { Client } from '@elastic/elasticsearch';
+import { Client, errors } from '@elastic/elasticsearch';
+import { logger } from './logger.js';
 
 // Using type alias for Elasticsearch query container
 type EsQueryContainer = { [key: string]: unknown };
@@ -6,9 +7,13 @@ type EsQueryContainer = { [key: string]: unknown };
 /**
  * Elasticsearch client configuration.
  * Elasticsearch powers full-text search for users and jobs with fuzzy matching.
+ * Short timeouts and a single retry keep a dead cluster from stalling requests;
+ * callers fall back to PostgreSQL full-text search instead.
  */
 const elasticConfig = {
   node: process.env.ELASTICSEARCH_URL || 'http://localhost:9200',
+  requestTimeout: parseInt(process.env.ELASTICSEARCH_TIMEOUT_MS || '3000'),
+  maxRetries: 1,
 };
 
 /**
@@ -17,12 +22,61 @@ const elasticConfig = {
  */
 export const esClient = new Client(elasticConfig);
 
+/** How long to stop calling Elasticsearch after it fails to answer. */
+const UNAVAILABLE_COOLDOWN_MS = 30_000;
+let unavailableUntil = 0;
+
+/**
+ * Thrown instead of calling Elasticsearch while it is marked unavailable.
+ */
+export class SearchUnavailableError extends Error {
+  constructor() {
+    super('Elasticsearch is unavailable');
+    this.name = 'SearchUnavailableError';
+  }
+}
+
+/**
+ * Whether Elasticsearch should be tried right now. After a connection failure,
+ * timeout or 5xx, calls are skipped for 30 seconds (a minimal circuit breaker)
+ * so searches fall back immediately instead of waiting on timeouts.
+ *
+ * @returns True when the cluster is believed reachable
+ */
+export function isSearchAvailable(): boolean {
+  return Date.now() >= unavailableUntil;
+}
+
+function recordFailure(error: unknown): void {
+  const unreachable =
+    error instanceof errors.ConnectionError ||
+    error instanceof errors.TimeoutError ||
+    error instanceof errors.NoLivingConnectionsError ||
+    (error instanceof errors.ResponseError && (error.statusCode ?? 0) >= 500);
+  if (unreachable && isSearchAvailable()) {
+    unavailableUntil = Date.now() + UNAVAILABLE_COOLDOWN_MS;
+    logger.warn({ cooldownMs: UNAVAILABLE_COOLDOWN_MS }, 'Elasticsearch unreachable; pausing calls');
+  }
+}
+
+/** Runs an Elasticsearch call through the availability guard. */
+async function guarded<T>(call: () => Promise<T>): Promise<T> {
+  if (!isSearchAvailable()) throw new SearchUnavailableError();
+  try {
+    return await call();
+  } catch (error) {
+    recordFailure(error);
+    throw error;
+  }
+}
+
 /**
  * Initializes Elasticsearch indices for users and jobs if they do not exist.
  * Creates optimized mappings for text search with appropriate analyzers.
  * Called once at server startup to ensure search infrastructure is ready.
  */
-export async function initializeElasticsearch(): Promise<void> {
+export async function initializeElasticsearch(): Promise<string[]> {
+  const created: string[] = [];
   try {
     // Create users index
     const usersIndexExists = await esClient.indices.exists({ index: 'users' });
@@ -45,7 +99,8 @@ export async function initializeElasticsearch(): Promise<void> {
           },
         },
       });
-      console.log('Created users index');
+      created.push('users');
+      logger.info('Created users index');
     }
 
     // Create jobs index
@@ -70,13 +125,14 @@ export async function initializeElasticsearch(): Promise<void> {
           },
         },
       });
-      console.log('Created jobs index');
+      created.push('jobs');
+      logger.info('Created jobs index');
     }
-
-    console.log('Elasticsearch initialized');
   } catch (error) {
-    console.error('Error initializing Elasticsearch:', error);
+    recordFailure(error);
+    logger.warn({ error: (error as Error).message }, 'Elasticsearch not reachable at startup; search will use PostgreSQL');
   }
+  return created;
 }
 
 /**
@@ -97,11 +153,13 @@ export async function indexUser(user: {
   skills?: string[];
   companies?: string[];
 }): Promise<void> {
-  await esClient.index({
-    index: 'users',
-    id: String(user.id),
-    document: user,
-  });
+  await guarded(() =>
+    esClient.index({
+      index: 'users',
+      id: String(user.id),
+      document: user,
+    })
+  );
 }
 
 /**
@@ -123,10 +181,29 @@ export async function indexJob(job: {
   skills?: string[];
   status: string;
 }): Promise<void> {
-  await esClient.index({
-    index: 'jobs',
-    id: String(job.id),
-    document: job,
+  await guarded(() =>
+    esClient.index({
+      index: 'jobs',
+      id: String(job.id),
+      document: job,
+    })
+  );
+}
+
+/**
+ * Removes a document whose source row no longer exists. A missing document is fine.
+ *
+ * @param index - 'users' or 'jobs'
+ * @param id - Document id (the row id)
+ */
+export async function deleteSearchDocument(index: 'users' | 'jobs', id: number): Promise<void> {
+  await guarded(async () => {
+    try {
+      await esClient.delete({ index, id: String(id) });
+    } catch (error) {
+      if (error instanceof errors.ResponseError && error.statusCode === 404) return;
+      throw error;
+    }
   });
 }
 
@@ -140,17 +217,19 @@ export async function indexJob(job: {
  * @returns Array of matching user IDs, ordered by relevance
  */
 export async function searchUsers(query: string, limit = 20): Promise<number[]> {
-  const result = await esClient.search({
-    index: 'users',
-    query: {
-      multi_match: {
-        query,
-        fields: ['first_name^2', 'last_name^2', 'headline', 'summary', 'skills', 'companies'],
-        fuzziness: 'AUTO',
+  const result = await guarded(() =>
+    esClient.search({
+      index: 'users',
+      query: {
+        multi_match: {
+          query,
+          fields: ['first_name^2', 'last_name^2', 'headline', 'summary', 'skills', 'companies'],
+          fuzziness: 'AUTO',
+        },
       },
-    },
-    size: limit,
-  });
+      size: limit,
+    })
+  );
 
   return result.hits.hits.map((hit) => parseInt(hit._id!));
 }
@@ -201,16 +280,18 @@ export async function searchJobs(
     filter.push({ term: { experience_level: filters.experience_level } });
   }
 
-  const result = await esClient.search({
-    index: 'jobs',
-    query: {
-      bool: {
-        must,
-        filter,
+  const result = await guarded(() =>
+    esClient.search({
+      index: 'jobs',
+      query: {
+        bool: {
+          must,
+          filter,
+        },
       },
-    },
-    size: limit,
-  });
+      size: limit,
+    })
+  );
 
   return result.hits.hits.map((hit) => parseInt(hit._id!));
 }

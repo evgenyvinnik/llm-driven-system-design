@@ -20,11 +20,20 @@ export const httpRequestTotal = new client.Counter({
   registers: [register],
 });
 
-/** Counter tracking total messages sent per channel. */
+/**
+ * Messages created. Deliberately unlabeled: a channel_id label would create one time series per
+ * channel, which is unbounded cardinality for a metrics backend.
+ */
 export const messagesTotal = new client.Counter({
   name: 'messages_total',
-  help: 'Total number of messages sent',
-  labelNames: ['channel_id'],
+  help: 'Total number of messages created',
+  registers: [register],
+});
+
+/** Sends that matched an earlier clientMessageId and returned the original message. */
+export const messageSendReplaysTotal = new client.Counter({
+  name: 'message_send_replays_total',
+  help: 'Message sends answered from an earlier attempt with the same clientMessageId',
   registers: [register],
 });
 
@@ -32,6 +41,43 @@ export const messagesTotal = new client.Counter({
 export const sseConnectionsGauge = new client.Gauge({
   name: 'sse_connections_active',
   help: 'Number of active SSE connections',
+  registers: [register],
+});
+
+/** Event frames written to SSE clients, live or replayed. */
+export const sseEventsSentTotal = new client.Counter({
+  name: 'sse_events_sent_total',
+  help: 'Channel events written to SSE clients',
+  registers: [register],
+});
+
+/** Events sent to reconnecting clients from the channel_events log. */
+export const sseReplayedEventsTotal = new client.Counter({
+  name: 'sse_replayed_events_total',
+  help: 'Channel events replayed to reconnecting SSE clients',
+  registers: [register],
+});
+
+/** Clients told to reload history because their gap could not be replayed. */
+export const sseResyncsTotal = new client.Counter({
+  name: 'sse_resyncs_total',
+  help: 'Resync instructions sent to SSE clients',
+  labelNames: ['reason'],
+  registers: [register],
+});
+
+/** Times an instance read events from the log that pub/sub had not (yet) delivered. */
+export const sseGapFillsTotal = new client.Counter({
+  name: 'sse_gap_fills_total',
+  help: 'Gaps in pub/sub delivery filled from the channel_events log',
+  labelNames: ['trigger'],
+  registers: [register],
+});
+
+/** Publishes that failed after the write committed (delivery then relies on the log). */
+export const pubsubPublishFailuresTotal = new client.Counter({
+  name: 'pubsub_publish_failures_total',
+  help: 'Redis publishes that failed after the event was committed',
   registers: [register],
 });
 

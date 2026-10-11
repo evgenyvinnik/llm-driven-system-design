@@ -75,8 +75,16 @@ ON CONFLICT (channel_id, user_id) DO NOTHING;
 
 -- ---------------------------------------------------------------------------
 -- Messages (general channel gets a short conversation)
+--
+-- The insert trigger gives each message the next sequence number in its channel
+-- (see init.sql). It fires before ON CONFLICT is checked, so a plain
+-- ON CONFLICT DO NOTHING would consume sequence numbers on every re-run; these
+-- inserts skip rows that already exist instead, and ORDER BY created_at makes
+-- the numbering follow the timestamps.
 -- ---------------------------------------------------------------------------
-INSERT INTO messages (id, channel_id, user_id, content, created_at) VALUES
+INSERT INTO messages (id, channel_id, user_id, content, created_at)
+SELECT v.id::uuid, v.channel_id::uuid, v.user_id::uuid, v.content, v.created_at
+FROM (VALUES
   ('dddddddd-0000-0000-0000-000000000001', 'cccccccc-0000-0000-0000-000000000001', '11111111-1111-1111-1111-111111111111', 'Morning everyone! Welcome to the Engineering general channel.', NOW() - INTERVAL '3 hours'),
   ('dddddddd-0000-0000-0000-000000000002', 'cccccccc-0000-0000-0000-000000000001', '22222222-2222-2222-2222-222222222222', 'Thanks Alice! Excited to be here. Where do we track sprint work?', NOW() - INTERVAL '2 hours 45 minutes'),
   ('dddddddd-0000-0000-0000-000000000003', 'cccccccc-0000-0000-0000-000000000001', '11111111-1111-1111-1111-111111111111', 'We use the board in the #deployments channel for releases and a separate tracker for sprints. I''ll share links shortly.', NOW() - INTERVAL '2 hours 30 minutes'),
@@ -100,7 +108,9 @@ INSERT INTO messages (id, channel_id, user_id, content, created_at) VALUES
   ('dddddddd-0000-0000-0000-00000000000f', 'cccccccc-0000-0000-0000-000000000003', '11111111-1111-1111-1111-111111111111', 'Joining from the eng side - curious how the new empty states landed.', NOW() - INTERVAL '25 minutes'),
   ('dddddddd-0000-0000-0000-000000000010', 'cccccccc-0000-0000-0000-000000000003', '33333333-3333-3333-3333-333333333333', 'Three of them to review today. The tricky one is the "no channels yet" state - it has to teach the hierarchy without a wall of text.', NOW() - INTERVAL '18 minutes'),
   ('dddddddd-0000-0000-0000-000000000011', 'cccccccc-0000-0000-0000-000000000003', '11111111-1111-1111-1111-111111111111', 'Agreed. If someone lands there confused about org vs team vs channel, the empty state is the only thing that can explain it.', NOW() - INTERVAL '12 minutes')
-ON CONFLICT (id) DO NOTHING;
+) AS v(id, channel_id, user_id, content, created_at)
+WHERE NOT EXISTS (SELECT 1 FROM messages m WHERE m.id = v.id::uuid)
+ORDER BY v.created_at;
 
 -- ---------------------------------------------------------------------------
 -- Threaded replies
@@ -108,15 +118,19 @@ ON CONFLICT (id) DO NOTHING;
 -- `parent_message_id` is a self-referencing FK on messages (see the CLAUDE.md
 -- decision on why there is no separate threads table). Replies hang off the
 -- release announcement in #deployments, exactly one level deep - the flatness
--- is a UI convention, not something the schema enforces.
+-- is enforced by the same insert trigger, which rejects a reply to a reply.
 -- ---------------------------------------------------------------------------
-INSERT INTO messages (id, channel_id, user_id, parent_message_id, content, created_at) VALUES
+INSERT INTO messages (id, channel_id, user_id, parent_message_id, content, created_at)
+SELECT v.id::uuid, v.channel_id::uuid, v.user_id::uuid, v.parent_message_id::uuid, v.content, v.created_at
+FROM (VALUES
   ('eeeeeeee-0000-0000-0000-000000000001', 'cccccccc-0000-0000-0000-000000000002', '11111111-1111-1111-1111-111111111111', 'dddddddd-0000-0000-0000-000000000005', 'Holding my merge. Is the payments service included in this cut?', NOW() - INTERVAL '55 minutes'),
   ('eeeeeeee-0000-0000-0000-000000000002', 'cccccccc-0000-0000-0000-000000000002', '22222222-2222-2222-2222-222222222222', 'dddddddd-0000-0000-0000-000000000005', 'Yes - payments, notifications, and the web client. Everything tagged v1.4.0.', NOW() - INTERVAL '52 minutes'),
   ('eeeeeeee-0000-0000-0000-000000000003', 'cccccccc-0000-0000-0000-000000000002', '44444444-4444-4444-4444-444444444444', 'dddddddd-0000-0000-0000-000000000005', 'Infra side is ready - I''ve pre-warmed the new instances so the canary doesn''t start cold.', NOW() - INTERVAL '48 minutes'),
   ('eeeeeeee-0000-0000-0000-000000000004', 'cccccccc-0000-0000-0000-000000000002', '11111111-1111-1111-1111-111111111111', 'dddddddd-0000-0000-0000-000000000005', 'Perfect. Rollback plan is the previous image tag, right?', NOW() - INTERVAL '45 minutes'),
   ('eeeeeeee-0000-0000-0000-000000000005', 'cccccccc-0000-0000-0000-000000000002', '22222222-2222-2222-2222-222222222222', 'dddddddd-0000-0000-0000-000000000005', 'Correct - one command, and the migration is backwards-compatible so no data rollback needed.', NOW() - INTERVAL '42 minutes')
-ON CONFLICT (id) DO NOTHING;
+) AS v(id, channel_id, user_id, parent_message_id, content, created_at)
+WHERE NOT EXISTS (SELECT 1 FROM messages m WHERE m.id = v.id::uuid)
+ORDER BY v.created_at;
 
 -- A couple of reactions to make the UI feel alive
 INSERT INTO message_reactions (message_id, user_id, emoji) VALUES

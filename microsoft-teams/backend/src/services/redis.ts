@@ -24,6 +24,9 @@ redis.on('connect', () => {
 
 /** Establishes the Redis connection (used on startup). */
 export async function connectRedis(): Promise<void> {
+  // A command issued before startup (the rate limiters load their scripts at import time) has
+  // already opened the connection; connecting again would only report "already connecting".
+  if (redis.status !== 'wait') return;
   try {
     await redis.connect();
   } catch (err) {

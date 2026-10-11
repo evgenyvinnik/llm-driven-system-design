@@ -114,32 +114,52 @@ export const generalApiRateLimiter = rateLimit({
   }
 });
 
+// Handler shared by the two auth limiters (always keyed by IP: there is no user yet)
+const authLimitHandler = (message: string) => (req: Request, res: Response, _next: unknown, options: Options): void => {
+  logger.warn({
+    ip: ipKeyGenerator(req.ip || '0.0.0.0'),
+    path: req.path
+  }, 'Auth rate limit exceeded');
+
+  metrics.rateLimitHits.inc({
+    endpoint: '/auth',
+    user_type: 'anonymous'
+  });
+
+  const retryAfter = Math.ceil(options.windowMs / 1000);
+  res.status(429).json({
+    error: 'Too many attempts',
+    message,
+    retryAfter
+  });
+};
+
 /**
- * Auth rate limiter for login/register
- * - Prevents brute force attacks
- * - 5 attempts per 15 minutes per IP
+ * Login rate limiter
+ * - Brute-force protection: 5 failed logins per 15 minutes per IP
+ * - Successful logins are not counted (skipSuccessfulRequests). Counting them locked out
+ *   anyone who simply logged in five times, including the smoke tests and screenshot runs.
  */
-export const authRateLimiter = rateLimit({
+export const loginRateLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 5, // 5 attempts
+  max: 5, // 5 failed attempts
+  skipSuccessfulRequests: true,
   standardHeaders: true,
   legacyHeaders: false,
-  keyGenerator: (req: Request) => `auth:${ipKeyGenerator(req.ip || '0.0.0.0')}`, // Always use IP for auth
-  handler: (req: Request, res: Response) => {
-    logger.warn({
-      ip: ipKeyGenerator(req.ip || '0.0.0.0'),
-      path: req.path
-    }, 'Auth rate limit exceeded');
+  keyGenerator: (req: Request) => `login:${ipKeyGenerator(req.ip || '0.0.0.0')}`,
+  handler: authLimitHandler('Too many failed login attempts. Please wait 15 minutes before trying again.')
+});
 
-    metrics.rateLimitHits.inc({
-      endpoint: '/auth',
-      user_type: 'anonymous'
-    });
-
-    res.status(429).json({
-      error: 'Too many login attempts',
-      message: 'Please wait 15 minutes before trying again.',
-      retryAfter: 900
-    });
-  }
+/**
+ * Registration rate limiter
+ * - Slows down bulk account creation: 5 registrations per hour per IP
+ * - Every attempt counts, successful or not
+ */
+export const registerRateLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, // 1 hour
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req: Request) => `register:${ipKeyGenerator(req.ip || '0.0.0.0')}`,
+  handler: authLimitHandler('Too many registrations from this address. Please try again later.')
 });

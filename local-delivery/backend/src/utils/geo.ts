@@ -47,7 +47,7 @@ function toRad(deg: number): number {
  */
 export function calculateETA(
   distanceKm: number,
-  vehicleType: 'bicycle' | 'motorcycle' | 'car' | 'van' = 'car'
+  vehicleType: VehicleType = 'car'
 ): number {
   // Average speeds in km/h (accounting for traffic, stops, etc.)
   const speeds: Record<string, number> = {
@@ -62,6 +62,64 @@ export function calculateETA(
 
   // Return seconds
   return Math.round(hours * 3600);
+}
+
+/**
+ * Roads are longer than straight lines. 1.3 is a commonly used urban "detour
+ * index"; a routing engine would replace this with real road distance.
+ */
+export const ROAD_DETOUR_FACTOR = 1.3;
+
+/** Vehicle types with an average-speed assumption in calculateETA. */
+export type VehicleType = 'bicycle' | 'motorcycle' | 'car' | 'van';
+
+/**
+ * Everything needed to estimate when the customer will have their order.
+ */
+export interface DeliveryEtaInput {
+  /** Current order status; decides whether the courier still has to reach the merchant. */
+  status: string;
+  /** Where the courier is now. */
+  courier: Location;
+  /** The merchant. */
+  pickup: Location;
+  /** The customer. */
+  dropoff: Location;
+  vehicleType?: VehicleType;
+  /** Epoch ms when the merchant expects the food to be ready (null if unknown). */
+  foodReadyAt?: number | null;
+  /** Epoch ms "now" (injectable for tests). */
+  now?: number;
+}
+
+/**
+ * Stage-aware delivery ETA in seconds.
+ *
+ * Before pickup the courier must still reach the merchant, may have to wait
+ * for the food, and then ride to the customer. After pickup only the last leg
+ * remains. (The previous calculation always used courier-to-customer distance,
+ * which made the ETA too optimistic while the courier was heading to the
+ * restaurant.)
+ *
+ * @param input - Order stage, positions, vehicle and food-ready time
+ * @returns Estimated seconds until delivery
+ */
+export function estimateDeliveryEtaSeconds(input: DeliveryEtaInput): number {
+  const travel = (from: Location, to: Location): number =>
+    calculateETA(haversineDistance(from, to) * ROAD_DETOUR_FACTOR, input.vehicleType);
+
+  if (input.status === 'picked_up' || input.status === 'in_transit') {
+    return travel(input.courier, input.dropoff);
+  }
+
+  const now = input.now ?? Date.now();
+  const toPickup = travel(input.courier, input.pickup);
+  const arriveAtPickup = now + toPickup * 1000;
+  const waitForFood = input.foodReadyAt
+    ? Math.max(0, Math.round((input.foodReadyAt - arriveAtPickup) / 1000))
+    : 0;
+
+  return toPickup + waitForFood + travel(input.pickup, input.dropoff);
 }
 
 /**

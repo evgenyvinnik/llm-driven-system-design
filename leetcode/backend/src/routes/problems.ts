@@ -2,8 +2,18 @@ import { Router, type Request, type Response } from 'express';
 import pool from '../db/pool.js';
 import redis from '../db/redis.js';
 import { requireAuth, requireAdmin } from '../middleware/auth.js';
+import { CHECKER_MODES, type CheckerMode } from '../services/checker.js';
 
 const router = Router();
+
+/**
+ * Cache key for a problem's public view. The version prefix changes whenever the cached shape
+ * changes: v1 entries were built from SELECT p.* and contained the reference solutions, so they
+ * must never be served again (they simply expire unread).
+ */
+const problemCacheKey = (slug: string): string => `problem:v2:${slug}`;
+const PROBLEM_CACHE_TTL_SECONDS = 300;
+const MAX_PAGE_SIZE = 500;
 
 interface ListQuery {
   difficulty?: string;
@@ -27,6 +37,7 @@ interface CreateProblemBody {
   examples?: string;
   constraints?: string;
   difficulty?: string;
+  checker?: string;
   timeLimitMs?: number;
   memoryLimitMb?: number;
   starterCodePython?: string;
@@ -43,8 +54,10 @@ interface CreateProblemBody {
 // List all problems
 router.get('/', async (req: Request<unknown, unknown, unknown, ListQuery>, res: Response): Promise<void> => {
   try {
-    const { difficulty, search, page = '1', limit = '20' } = req.query;
-    const offset = (parseInt(page) - 1) * parseInt(limit);
+    const { difficulty, search } = req.query;
+    const page = Math.max(1, parseInt(req.query.page ?? '1', 10) || 1);
+    const limit = Math.min(MAX_PAGE_SIZE, Math.max(1, parseInt(req.query.limit ?? '20', 10) || 20));
+    const offset = (page - 1) * limit;
 
     let query = `
       SELECT p.id, p.title, p.slug, p.difficulty, p.created_at
@@ -69,8 +82,8 @@ router.get('/', async (req: Request<unknown, unknown, unknown, ListQuery>, res: 
     const total = parseInt(countResult.rows[0].count);
 
     // Add pagination
-    query += ` ORDER BY p.created_at ASC`;
-    params.push(parseInt(limit));
+    query += ` ORDER BY p.created_at ASC, p.id ASC`;
+    params.push(limit);
     query += ` LIMIT $${params.length}`;
     params.push(offset);
     query += ` OFFSET $${params.length}`;
@@ -95,9 +108,9 @@ router.get('/', async (req: Request<unknown, unknown, unknown, ListQuery>, res: 
       problems,
       pagination: {
         total,
-        page: parseInt(page),
-        limit: parseInt(limit),
-        pages: Math.ceil(total / parseInt(limit))
+        page,
+        limit,
+        pages: Math.ceil(total / limit)
       }
     });
   } catch (error) {
@@ -112,7 +125,7 @@ router.get('/:slug', async (req: Request<ProblemParams>, res: Response): Promise
     const { slug } = req.params;
 
     // Try cache first
-    const cached = await redis.get(`problem:${slug}`);
+    const cached = await redis.get(problemCacheKey(slug));
     if (cached) {
       const problem = JSON.parse(cached);
       // Add user status if logged in
@@ -127,8 +140,11 @@ router.get('/:slug', async (req: Request<ProblemParams>, res: Response): Promise
       return;
     }
 
+    // Explicit columns: the reference solutions (solution_*) must never leave the server.
     const result = await pool.query(
-      `SELECT p.*,
+      `SELECT p.id, p.title, p.slug, p.description, p.examples, p.constraints, p.difficulty,
+        p.time_limit_ms, p.memory_limit_mb, p.starter_code_python, p.starter_code_javascript,
+        p.starter_code_cpp, p.starter_code_java, p.created_at, p.updated_at,
         (SELECT COUNT(*) FROM submissions WHERE problem_id = p.id AND status = 'accepted') as accepted_count,
         (SELECT COUNT(*) FROM submissions WHERE problem_id = p.id) as total_submissions
        FROM problems p
@@ -154,8 +170,8 @@ router.get('/:slug', async (req: Request<ProblemParams>, res: Response): Promise
 
     problem.sampleTestCases = testCasesResult.rows;
 
-    // Cache for 5 minutes
-    await redis.setex(`problem:${slug}`, 300, JSON.stringify(problem));
+    // Cache for 5 minutes; acceptance counts in the cached copy may lag by that much
+    await redis.setex(problemCacheKey(slug), PROBLEM_CACHE_TTL_SECONDS, JSON.stringify(problem));
 
     // Add user status if logged in
     if (req.session.userId) {
@@ -200,36 +216,45 @@ router.get('/:slug/submissions', requireAuth, async (req: Request<ProblemParams,
 
 // Admin: Create problem
 router.post('/', requireAdmin, async (req: Request<unknown, unknown, CreateProblemBody>, res: Response): Promise<void> => {
+  const {
+    title,
+    slug,
+    description,
+    examples,
+    constraints,
+    difficulty,
+    checker = 'exact',
+    timeLimitMs,
+    memoryLimitMb,
+    starterCodePython,
+    starterCodeJavascript,
+    solutionPython,
+    solutionJavascript,
+    testCases
+  } = req.body;
+
+  if (!title || !slug || !description || !difficulty) {
+    res.status(400).json({ error: 'Missing required fields' });
+    return;
+  }
+  if (!CHECKER_MODES.includes(checker as CheckerMode)) {
+    res.status(400).json({ error: `checker must be one of: ${CHECKER_MODES.join(', ')}` });
+    return;
+  }
+
+  // The problem and its test cases commit together: a judge must never see a problem
+  // whose test data is half written.
+  const client = await pool.connect();
   try {
-    const {
-      title,
-      slug,
-      description,
-      examples,
-      constraints,
-      difficulty,
-      timeLimitMs,
-      memoryLimitMb,
-      starterCodePython,
-      starterCodeJavascript,
-      solutionPython,
-      solutionJavascript,
-      testCases
-    } = req.body;
-
-    if (!title || !slug || !description || !difficulty) {
-      res.status(400).json({ error: 'Missing required fields' });
-      return;
-    }
-
-    const result = await pool.query(
-      `INSERT INTO problems (title, slug, description, examples, constraints, difficulty,
+    await client.query('BEGIN');
+    const result = await client.query(
+      `INSERT INTO problems (title, slug, description, examples, constraints, difficulty, checker,
         time_limit_ms, memory_limit_mb, starter_code_python, starter_code_javascript,
         solution_python, solution_javascript)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-       RETURNING *`,
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+       RETURNING id, title, slug, difficulty, checker, time_limit_ms, memory_limit_mb, created_at`,
       [
-        title, slug, description, examples, constraints, difficulty,
+        title, slug, description, examples, constraints, difficulty, checker,
         timeLimitMs || 2000, memoryLimitMb || 256,
         starterCodePython, starterCodeJavascript, solutionPython, solutionJavascript
       ]
@@ -237,29 +262,29 @@ router.post('/', requireAdmin, async (req: Request<unknown, unknown, CreateProbl
 
     const problem = result.rows[0];
 
-    // Add test cases
-    if (testCases && testCases.length > 0) {
-      for (let i = 0; i < testCases.length; i++) {
-        const tc = testCases[i];
-        await pool.query(
-          `INSERT INTO test_cases (problem_id, input, expected_output, is_sample, order_index)
-           VALUES ($1, $2, $3, $4, $5)`,
-          [problem.id, tc.input, tc.expectedOutput, tc.isSample || false, i]
-        );
-      }
+    for (const [i, tc] of (testCases ?? []).entries()) {
+      await client.query(
+        `INSERT INTO test_cases (problem_id, input, expected_output, is_sample, order_index)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [problem.id, tc.input, tc.expectedOutput, tc.isSample || false, i]
+      );
     }
+    await client.query('COMMIT');
 
     // Invalidate cache
-    await redis.del(`problem:${slug}`);
+    await redis.del(problemCacheKey(slug));
 
     res.status(201).json(problem);
   } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
     console.error('Create problem error:', error);
     if ((error as { code?: string }).code === '23505') {
       res.status(409).json({ error: 'Problem with this slug already exists' });
       return;
     }
     res.status(500).json({ error: 'Failed to create problem' });
+  } finally {
+    client.release();
   }
 });
 

@@ -1,4 +1,4 @@
-import { Pool, PoolConfig } from 'pg';
+import { Pool, PoolClient, PoolConfig } from 'pg';
 
 /**
  * PostgreSQL connection pool configuration.
@@ -67,4 +67,29 @@ export async function queryOne<T = unknown>(text: string, params?: unknown[]): P
 export async function execute(text: string, params?: unknown[]): Promise<number> {
   const result = await pool.query(text, params);
   return result.rowCount || 0;
+}
+
+/**
+ * Runs a function inside a single database transaction on one pooled client.
+ * Commits when the function resolves and rolls back when it throws, so a
+ * multi-statement write (accept a request, insert the edge, bump both counters)
+ * either happens completely or not at all.
+ *
+ * @template T - The function's result type
+ * @param fn - Work to run; must use the provided client for every statement
+ * @returns The function's result after COMMIT
+ */
+export async function withTransaction<T>(fn: (client: PoolClient) => Promise<T>): Promise<T> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await fn(client);
+    await client.query('COMMIT');
+    return result;
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    throw error;
+  } finally {
+    client.release();
+  }
 }

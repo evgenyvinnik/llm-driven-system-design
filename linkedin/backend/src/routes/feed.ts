@@ -27,14 +27,15 @@ import {
   createAuditLog,
   AuditEventType,
 } from '../utils/audit.js';
+import { parseId, sendApiError } from '../utils/errors.js';
 
 const router = Router();
 
 // Get feed
 router.get('/', requireAuth, readRateLimit, async (req: Request, res: Response) => {
   try {
-    const offset = parseInt(req.query.offset as string) || 0;
-    const limit = parseInt(req.query.limit as string) || 20;
+    const offset = Math.max(0, parseInt(req.query.offset as string) || 0);
+    const limit = Math.min(Math.max(parseInt(req.query.limit as string) || 20, 1), 50);
 
     // Track feed generation time
     const startTime = Date.now();
@@ -185,7 +186,7 @@ router.delete('/:id', requireAuth, async (req: Request, res: Response) => {
 router.post('/:id/like', requireAuth, writeRateLimit, async (req: Request, res: Response) => {
   try {
     const userId = req.session.userId!;
-    const postId = parseInt(req.params.id);
+    const postId = parseId(req.params.id);
 
     await feedService.likePost(userId, postId);
 
@@ -211,6 +212,7 @@ router.post('/:id/like', requireAuth, writeRateLimit, async (req: Request, res: 
 
     res.json({ message: 'Post liked' });
   } catch (error) {
+    if (sendApiError(res, error)) return;
     logger.error({ error, userId: req.session.userId }, 'Like post error');
     res.status(500).json({ error: 'Failed to like post' });
   }
@@ -261,11 +263,11 @@ router.get('/:id/comments', readRateLimit, async (req: Request, res: Response) =
 // Add comment
 router.post('/:id/comments', requireAuth, writeRateLimit, async (req: Request, res: Response) => {
   try {
-    const { content } = req.body;
+    const { content } = req.body ?? {};
     const userId = req.session.userId!;
-    const postId = parseInt(req.params.id);
+    const postId = parseId(req.params.id);
 
-    if (!content) {
+    if (!content || typeof content !== 'string') {
       res.status(400).json({ error: 'Content required' });
       return;
     }
@@ -305,6 +307,7 @@ router.post('/:id/comments', requireAuth, writeRateLimit, async (req: Request, r
 
     res.status(201).json({ comment });
   } catch (error) {
+    if (sendApiError(res, error)) return;
     logger.error({ error, userId: req.session.userId }, 'Add comment error');
     res.status(500).json({ error: 'Failed to add comment' });
   }

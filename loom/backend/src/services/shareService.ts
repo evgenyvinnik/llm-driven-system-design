@@ -1,7 +1,6 @@
 import crypto from 'crypto';
 import bcrypt from 'bcryptjs';
 import { pool } from './db.js';
-import { logger } from './logger.js';
 
 /** Generates a 256-bit cryptographically random share token. */
 export function generateShareToken(): string {
@@ -13,7 +12,7 @@ export async function createShare(
   videoId: string,
   options: {
     password?: string;
-    expiresAt?: string;
+    expiresAt?: Date | null;
     allowDownload?: boolean;
   } = {},
 ): Promise<{ id: string; token: string; expiresAt: string | null; allowDownload: boolean }> {
@@ -28,13 +27,7 @@ export async function createShare(
     `INSERT INTO shares (video_id, token, password_hash, expires_at, allow_download)
      VALUES ($1, $2, $3, $4, $5)
      RETURNING id, token, expires_at, allow_download`,
-    [
-      videoId,
-      token,
-      passwordHash,
-      options.expiresAt || null,
-      options.allowDownload || false,
-    ],
+    [videoId, token, passwordHash, options.expiresAt ?? null, options.allowDownload || false],
   );
 
   const share = result.rows[0];
@@ -46,51 +39,49 @@ export async function createShare(
   };
 }
 
-/** Validates a share token, checking expiry and password, and returns the associated video ID. */
-export async function validateShare(
-  token: string,
-  password?: string,
-): Promise<{ valid: boolean; videoId?: string; allowDownload?: boolean; error?: string }> {
-  try {
-    const result = await pool.query(
-      `SELECT s.*, v.id as vid, v.title, v.status, v.storage_path, v.duration_seconds, v.thumbnail_path,
-              u.username, u.display_name, u.avatar_url
-       FROM shares s
-       JOIN videos v ON v.id = s.video_id
-       JOIN users u ON u.id = v.user_id
-       WHERE s.token = $1`,
-      [token],
-    );
+/** A share link as the access endpoints need it. */
+export interface ShareRecord {
+  id: string;
+  videoId: string;
+  passwordHash: string | null;
+  expiresAt: Date | null;
+  allowDownload: boolean;
+}
 
-    if (result.rows.length === 0) {
-      return { valid: false, error: 'Share link not found' };
-    }
+export type ShareLookup =
+  | { status: 'ok'; share: ShareRecord }
+  | { status: 'not_found' }
+  | { status: 'expired' };
 
-    const share = result.rows[0];
-
-    // Check expiry
-    if (share.expires_at && new Date(share.expires_at) < new Date()) {
-      return { valid: false, error: 'Share link has expired' };
-    }
-
-    // Check password
-    if (share.password_hash) {
-      if (!password) {
-        return { valid: false, error: 'Password required' };
-      }
-      const validPassword = await bcrypt.compare(password, share.password_hash);
-      if (!validPassword) {
-        return { valid: false, error: 'Invalid password' };
-      }
-    }
-
-    return {
-      valid: true,
-      videoId: share.video_id,
-      allowDownload: share.allow_download,
-    };
-  } catch (err) {
-    logger.error({ err, token }, 'Failed to validate share');
-    throw err;
+/** Looks a share up by token. Unknown and revoked tokens are indistinguishable by design. */
+export async function findShareByToken(token: string): Promise<ShareLookup> {
+  if (typeof token !== 'string' || token.length === 0 || token.length > 128) {
+    return { status: 'not_found' };
   }
+  const result = await pool.query(
+    `SELECT id, video_id, password_hash, expires_at, allow_download
+     FROM shares WHERE token = $1`,
+    [token],
+  );
+  const row = result.rows[0];
+  if (!row) return { status: 'not_found' };
+  const expiresAt: Date | null = row.expires_at ? new Date(row.expires_at) : null;
+  if (expiresAt && expiresAt.getTime() <= Date.now()) return { status: 'expired' };
+  return {
+    status: 'ok',
+    share: {
+      id: row.id,
+      videoId: row.video_id,
+      passwordHash: row.password_hash,
+      expiresAt,
+      allowDownload: row.allow_download,
+    },
+  };
+}
+
+/** Verifies a share password. This is the expensive call the share grant exists to avoid repeating. */
+export async function checkSharePassword(share: ShareRecord, password: unknown): Promise<boolean> {
+  if (!share.passwordHash) return true;
+  if (typeof password !== 'string' || password.length === 0 || password.length > 128) return false;
+  return bcrypt.compare(password, share.passwordHash);
 }

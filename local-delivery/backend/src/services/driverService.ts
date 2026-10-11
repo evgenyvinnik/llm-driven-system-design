@@ -1,12 +1,11 @@
-import { query, queryOne, execute } from '../utils/db.js';
+import { query, queryOne, execute, withTransaction } from '../utils/db.js';
 import {
+  redis,
   updateDriverLocation as updateDriverLocationRedis,
   removeDriverLocation,
   findNearbyDrivers as findNearbyDriversRedis,
-  getDriverLocationFromRedis,
   getDriverOrderCount,
 } from '../utils/redis.js';
-import { haversineDistance as _haversineDistance, calculateETA as _calculateETA } from '../utils/geo.js';
 import type {
   Driver,
   CreateDriverInput,
@@ -93,46 +92,122 @@ export async function updateDriverStatus(
 }
 
 /**
- * Updates a driver's current location in both database and Redis.
- * Called frequently (every few seconds) while driver is active.
- * Samples location history at 10-second intervals to reduce storage.
+ * Puts an offline courier online. A courier who is already available or busy
+ * keeps their status, so going "online" again mid-delivery cannot make a busy
+ * courier look free to the matcher.
+ *
+ * @param id - The driver's UUID
+ * @returns The driver row, or null if no such driver
+ */
+export async function goOnline(id: string): Promise<Driver | null> {
+  const updated = await queryOne<Driver>(
+    `UPDATE drivers SET status = 'available' WHERE id = $1 AND status = 'offline' RETURNING *`,
+    [id]
+  );
+  return updated ?? getDriverById(id);
+}
+
+/**
+ * Result of a go-offline request.
+ */
+export type GoOfflineResult =
+  | { status: 'offline'; driver: Driver }
+  | { status: 'has_active_orders' }
+  | { status: 'not_found' };
+
+/**
+ * Takes a courier offline unless they hold an active delivery. The check and
+ * the update are one statement, and outstanding offers are withdrawn in the
+ * same transaction, so an Accept racing this request either loses (offer
+ * withdrawn) or wins (the active order then blocks going offline).
+ *
+ * @param id - The driver's UUID
+ */
+export async function goOffline(id: string): Promise<GoOfflineResult> {
+  const driver = await withTransaction(async (client) => {
+    const result = await client.query<Driver>(
+      `UPDATE drivers SET status = 'offline'
+       WHERE id = $1
+         AND NOT EXISTS (
+           SELECT 1 FROM orders
+           WHERE driver_id = $1 AND status IN ('driver_assigned', 'picked_up', 'in_transit')
+         )
+       RETURNING *`,
+      [id]
+    );
+    if (result.rows[0]) {
+      await client.query(
+        `UPDATE driver_offers SET status = 'expired', responded_at = NOW()
+         WHERE driver_id = $1 AND status = 'pending'`,
+        [id]
+      );
+    }
+    return result.rows[0] ?? null;
+  });
+
+  if (driver) {
+    await removeDriverLocation(id);
+    return { status: 'offline', driver };
+  }
+  return (await getDriverById(id)) ? { status: 'has_active_orders' } : { status: 'not_found' };
+}
+
+/**
+ * At most one durable location write per courier per interval. The live
+ * position always goes to Redis; PostgreSQL gets a sample for the last-known
+ * position and the location history.
+ */
+export const LOCATION_PERSIST_INTERVAL_MS = 10_000;
+
+/**
+ * Updates a driver's current location.
+ * Hot path: Redis only (geo index, last-seen, pub/sub). Every
+ * LOCATION_PERSIST_INTERVAL_MS the first ping in the window also writes
+ * PostgreSQL: one statement updates the last-known position and appends a
+ * history row. The window is a Redis SET NX PX gate, so it holds across API
+ * instances. (Previously every ping wrote PostgreSQL, and the history sampling
+ * compared against the timestamp it had just written, so history was never
+ * recorded.)
  *
  * @param id - The driver's UUID
  * @param lat - Current latitude in decimal degrees
  * @param lng - Current longitude in decimal degrees
+ * @param extras - Optional speed and heading from the device
+ * @returns Whether this ping was also persisted to PostgreSQL
  */
 export async function updateDriverLocation(
   id: string,
   lat: number,
-  lng: number
-): Promise<void> {
-  // Update in PostgreSQL
-  await execute(
-    `UPDATE drivers
-     SET current_lat = $1, current_lng = $2, location_updated_at = NOW()
-     WHERE id = $3`,
-    [lat, lng, id]
-  );
-
-  // Update in Redis for real-time queries
+  lng: number,
+  extras: { speed?: number | null; heading?: number | null } = {}
+): Promise<{ persisted: boolean }> {
   await updateDriverLocationRedis(id, lat, lng);
 
-  // Log to history (sample every 10 seconds to reduce data volume)
-  const _historyKey = `driver:${id}:last_history`;
-  const lastHistory = await getDriverLocationFromRedis(id);
-  if (!lastHistory || Date.now() - lastHistory.updated_at > 10000) {
-    await execute(
-      `INSERT INTO driver_location_history (driver_id, lat, lng)
-       VALUES ($1, $2, $3)`,
-      [id, lat, lng]
-    );
+  const gate = await redis.set(`driver:${id}:persist_gate`, '1', 'PX', LOCATION_PERSIST_INTERVAL_MS, 'NX');
+  if (gate !== 'OK') {
+    return { persisted: false };
   }
+
+  await execute(
+    `WITH moved AS (
+       UPDATE drivers
+       SET current_lat = $2, current_lng = $3, location_updated_at = NOW()
+       WHERE id = $1
+       RETURNING id
+     )
+     INSERT INTO driver_location_history (driver_id, lat, lng, speed, heading)
+     SELECT id, $2, $3, $4, $5 FROM moved`,
+    [id, lat, lng, extras.speed ?? null, extras.heading ?? null]
+  );
+  return { persisted: true };
 }
 
 /**
  * Finds available drivers near a location for order assignment.
- * Uses Redis geo-index for fast proximity search, then enriches with PostgreSQL data.
- * Only returns drivers with 'available' status.
+ * Uses the Redis geo-index for the proximity search (fresh pings only), then
+ * enriches with PostgreSQL. A courier must be both reachable (pinged within
+ * LOCATION_STALE_MS, tracked in Redis) and willing (status 'available' in
+ * PostgreSQL) to be returned.
  *
  * @param location - The pickup location (usually merchant)
  * @param radiusKm - Search radius in kilometers (default 5)
@@ -174,40 +249,38 @@ export async function findNearbyDrivers(
     .slice(0, limit);
 }
 
+/** Weights of the matching score; they sum to 1. */
+export const SCORE_WEIGHTS = {
+  distance: 0.4,
+  rating: 0.25,
+  acceptanceRate: 0.2,
+  load: 0.15,
+} as const;
+
 /**
- * Calculates a matching score for a driver considering multiple factors.
- * Used to rank drivers when deciding who receives an order offer.
+ * Pure matching score in [0, 1] for one candidate.
  * Factors: distance (40%), rating (25%), acceptance rate (20%), current load (15%).
+ * Numeric columns arrive from pg as strings, so every input is coerced.
  *
- * @param driver - Driver with distance already calculated
- * @param maxDistance - Maximum expected distance for normalization (default 5km)
- * @returns Matching score with breakdown of individual factors
+ * @param driver - Candidate with distance (km), rating (0-5) and acceptance rate (0-1)
+ * @param currentOrders - Orders the courier is carrying now
+ * @param maxDistance - Distance at which the distance score reaches 0 (km)
  */
-export async function calculateDriverScore(
-  driver: DriverWithDistance,
+export function scoreDriver(
+  driver: Pick<DriverWithDistance, 'id' | 'distance' | 'rating' | 'acceptance_rate'>,
+  currentOrders: number,
   maxDistance: number = 5
-): Promise<MatchingScore> {
-  // Get current order count
-  const currentOrders = await getDriverOrderCount(driver.id);
-
-  // Distance score (closer is better, normalized 0-1)
-  const distanceScore = Math.max(0, 1 - driver.distance / maxDistance);
-
-  // Rating score (normalized 0-1)
-  const ratingScore = driver.rating / 5;
-
-  // Acceptance rate (already 0-1)
-  const acceptanceScore = driver.acceptance_rate;
-
-  // Load balancing (prefer drivers with fewer orders)
+): MatchingScore {
+  const distanceScore = Math.max(0, 1 - Number(driver.distance) / maxDistance);
+  const ratingScore = Number(driver.rating) / 5;
+  const acceptanceScore = Number(driver.acceptance_rate);
   const loadScore = Math.max(0, 1 - currentOrders / 3);
 
-  // Weighted combination
   const totalScore =
-    distanceScore * 0.4 +
-    ratingScore * 0.25 +
-    acceptanceScore * 0.2 +
-    loadScore * 0.15;
+    distanceScore * SCORE_WEIGHTS.distance +
+    ratingScore * SCORE_WEIGHTS.rating +
+    acceptanceScore * SCORE_WEIGHTS.acceptanceRate +
+    loadScore * SCORE_WEIGHTS.load;
 
   return {
     driver_id: driver.id,
@@ -219,6 +292,21 @@ export async function calculateDriverScore(
       current_orders: currentOrders,
     },
   };
+}
+
+/**
+ * Calculates a matching score for a driver, reading their current load from Redis.
+ *
+ * @param driver - Driver with distance already calculated
+ * @param maxDistance - Maximum expected distance for normalization (default 5km)
+ * @returns Matching score with breakdown of individual factors
+ */
+export async function calculateDriverScore(
+  driver: DriverWithDistance,
+  maxDistance: number = 5
+): Promise<MatchingScore> {
+  const currentOrders = await getDriverOrderCount(driver.id);
+  return scoreDriver(driver, currentOrders, maxDistance);
 }
 
 /**
@@ -280,9 +368,10 @@ export async function updateDriverRating(id: string): Promise<void> {
 }
 
 /**
- * Recalculates a driver's acceptance rate from recent offers.
- * Uses a 7-day rolling window to reflect current behavior.
- * Called after driver accepts or rejects an offer.
+ * Recalculates a driver's acceptance rate from recent answered offers.
+ * Uses a 7-day rolling window to reflect current behavior; offers still
+ * pending are not counted. Called by the matching loop after every offer
+ * settles, so the 20% acceptance factor of the score reflects real behavior.
  *
  * @param id - The driver's UUID
  */
@@ -295,6 +384,7 @@ export async function updateDriverAcceptanceRate(id: string): Promise<void> {
        END as rate
      FROM driver_offers
      WHERE driver_id = $1
+     AND status <> 'pending'
      AND offered_at > NOW() - INTERVAL '7 days'`,
     [id]
   );

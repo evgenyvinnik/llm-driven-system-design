@@ -3,22 +3,43 @@
  * Handles driver matching logic with circuit breaker protection.
  *
  * @module services/order/matching
- * @description Implements the driver matching algorithm that sequentially offers
- * orders to nearby drivers. Includes circuit breaker protection to handle service
- * degradation gracefully and avoid cascading failures.
+ * @description Sequential offers: the best-scoring nearby courier gets an
+ * exclusive 30-second offer; on decline or timeout the next one does. The loop
+ * keeps its state in PostgreSQL rather than in memory:
+ * - who has already been offered the order comes from driver_offers, so a loop
+ *   resumed on another instance does not re-offer to couriers who said no;
+ * - the dispatch lease is renewed before every offer and the loop stops as
+ *   soon as it no longer holds it (assigned, cancelled, or taken over);
+ * - when nobody is nearby the loop releases the lease with a delay and the
+ *   dispatch sweeper (any instance) retries, instead of sleeping in-process.
+ * When the circuit breaker is open, the fallback does the same release with a
+ * longer delay: that is the "retry queue".
  */
-import { queryOne, execute } from '../../utils/db.js';
-import { findBestDriver } from '../driverService.js';
+import { findBestDriver, updateDriverAcceptanceRate } from '../driverService.js';
 import { createCircuitBreaker } from '../../shared/circuitBreaker.js';
 import { matchingLogger } from '../../shared/logger.js';
 import {
   driverAssignmentsCounter,
   driverMatchingDurationHistogram,
+  offersPerAssignmentHistogram,
 } from '../../shared/metrics.js';
 import { getOrderWithDetails } from './tracking.js';
-import { updateOrderStatus } from './status.js';
-import { createDriverOffer } from './assignment.js';
-import type { DriverOffer, Location } from './types.js';
+import {
+  createDriverOffer,
+  waitForOfferResponse,
+  getOfferedDriverIds,
+  OFFER_DEADLINE_GRACE_MS,
+} from './assignment.js';
+import { cancelOrder } from './cancel.js';
+import { DISPATCHABLE_STATUSES, OrderTransitionError } from './stateMachine.js';
+import {
+  DISPATCH_OWNER,
+  DISPATCH_RETRY_DELAY_SECONDS,
+  DISPATCH_FAILURE_BACKOFF_SECONDS,
+  renewDispatchLease,
+  releaseDispatchLease,
+} from './dispatch.js';
+import type { Location } from './types.js';
 import {
   OFFER_EXPIRY_SECONDS,
   MAX_OFFER_ATTEMPTS,
@@ -29,134 +50,118 @@ import {
 } from './types.js';
 
 /**
- * Waits for a driver to respond to an offer.
- *
- * @description Polls the database for offer status changes until the driver
- * accepts, rejects, or the timeout is reached. If timeout occurs, marks the
- * offer as expired.
- * @param {string} offerId - The offer's UUID
- * @param {number} timeoutMs - Maximum time to wait in milliseconds
- * @returns {Promise<'accepted' | 'rejected' | 'expired'>} The final offer status
- * @private
+ * How a matching run ended.
+ * - assigned: a courier accepted
+ * - deferred: lease released with a delay; a sweeper will retry
+ * - cancelled: gave up (deadline or offer limit reached)
+ * - lease_lost: the order no longer needs this loop (assigned, cancelled, or owned elsewhere)
  */
-async function waitForOfferResponse(
-  offerId: string,
-  timeoutMs: number
-): Promise<'accepted' | 'rejected' | 'expired'> {
-  const startTime = Date.now();
+export type MatchOutcome = 'assigned' | 'deferred' | 'cancelled' | 'lease_lost';
 
-  while (Date.now() - startTime < timeoutMs) {
-    const offer = await queryOne<DriverOffer>(
-      `SELECT status FROM driver_offers WHERE id = $1`,
-      [offerId]
-    );
-
-    if (offer?.status === 'accepted') return 'accepted';
-    if (offer?.status === 'rejected') return 'rejected';
-
-    await new Promise((resolve) => setTimeout(resolve, 1000));
+/**
+ * Cancels an order that could not be matched, if it is still unassigned.
+ */
+async function giveUp(orderId: string, reason: string): Promise<MatchOutcome> {
+  try {
+    await cancelOrder(orderId, { from: DISPATCHABLE_STATUSES, reason });
+    driverAssignmentsCounter.inc({ result: 'no_driver' });
+    matchingLogger.warn({ orderId, reason }, 'Order cancelled: no courier');
+    return 'cancelled';
+  } catch (error) {
+    if (error instanceof OrderTransitionError) {
+      // Assigned or cancelled by someone else a moment ago.
+      return 'lease_lost';
+    }
+    throw error;
   }
-
-  await execute(
-    `UPDATE driver_offers SET status = 'expired' WHERE id = $1 AND status = 'pending'`,
-    [offerId]
-  );
-
-  return 'expired';
 }
 
 /**
- * Initiates driver matching for a new order.
+ * Runs the sequential-offer loop for one order while this instance holds its lease.
  *
- * @description Implements a sequential offer algorithm:
- * 1. Finds the best available driver near the merchant location
- * 2. Creates a time-limited offer for that driver
- * 3. Waits for driver response (accept/reject/timeout)
- * 4. On rejection/timeout, repeats with next best driver
- * 5. Cancels order if MAX_OFFER_ATTEMPTS is exhausted
- *
- * Drivers are scored based on proximity, rating, and availability.
- * Each offer expires after OFFER_EXPIRY_SECONDS (30s default).
- * @param {string} orderId - The order's UUID to find a driver for
- * @returns {Promise<boolean>} True if driver was successfully assigned, false if no driver accepted
- * @example
- * const matched = await startDriverMatching(orderId);
- * if (matched) {
- *   console.log('Driver assigned successfully');
- * } else {
- *   console.log('Order cancelled - no drivers available');
- * }
+ * @param orderId - The order's UUID to find a driver for
+ * @param owner - Lease owner id (this instance)
+ * @returns How the run ended
  */
-export async function startDriverMatching(orderId: string): Promise<boolean> {
+export async function startDriverMatching(
+  orderId: string,
+  owner: string = DISPATCH_OWNER
+): Promise<MatchOutcome> {
   const order = await getOrderWithDetails(orderId);
-  if (!order || !order.merchant) return false;
+  if (!order || !order.merchant) return 'lease_lost';
 
-  const merchantLocation: Location = {
-    lat: order.merchant.lat,
-    lng: order.merchant.lng,
+  const pickup: Location = {
+    lat: Number(order.merchant.lat),
+    lng: Number(order.merchant.lng),
   };
 
-  const excludedDrivers = new Set<string>();
-  let attempt = 0;
+  // Couriers who already hold another order's offer during this pass.
+  const busyThisPass = new Set<string>();
 
-  while (attempt < MAX_OFFER_ATTEMPTS) {
-    const driver = await findBestDriver(merchantLocation, excludedDrivers);
+  for (;;) {
+    const lease = await renewDispatchLease(orderId, owner);
+    if (!lease) return 'lease_lost';
+    if (lease.pastDeadline) return giveUp(orderId, 'No driver available');
 
-    if (!driver) {
-      await new Promise((resolve) => setTimeout(resolve, 10000));
-      attempt++;
-      continue;
+    const alreadyOffered = await getOfferedDriverIds(orderId);
+    if (alreadyOffered.size >= MAX_OFFER_ATTEMPTS) {
+      return giveUp(orderId, 'No driver accepted the order');
     }
 
-    const offer = await createDriverOffer(orderId, driver.id);
-    const response = await waitForOfferResponse(offer.id, OFFER_EXPIRY_SECONDS * 1000);
+    const driver = await findBestDriver(pickup, new Set([...alreadyOffered, ...busyThisPass]));
+    if (!driver) {
+      await releaseDispatchLease(orderId, owner, DISPATCH_RETRY_DELAY_SECONDS);
+      return 'deferred';
+    }
 
-    if (response === 'accepted') return true;
+    const created = await createDriverOffer(orderId, driver.id);
+    if (created.status === 'driver_busy') {
+      busyThisPass.add(driver.id);
+      continue;
+    }
+    if (created.status === 'order_has_offer') {
+      // Another loop has an offer out; let it finish.
+      await releaseDispatchLease(orderId, owner, DISPATCH_RETRY_DELAY_SECONDS);
+      return 'deferred';
+    }
 
-    excludedDrivers.add(driver.id);
-    attempt++;
+    matchingLogger.info({ orderId, driverId: driver.id, offerId: created.offer.id }, 'Offer sent');
+    const response = await waitForOfferResponse(
+      created.offer.id,
+      Date.now() + OFFER_EXPIRY_SECONDS * 1000 + OFFER_DEADLINE_GRACE_MS
+    );
+    driverAssignmentsCounter.inc({ result: response });
+    updateDriverAcceptanceRate(driver.id).catch((error: Error) => {
+      matchingLogger.warn({ driverId: driver.id, error: error.message }, 'Acceptance rate update failed');
+    });
+
+    if (response === 'accepted') {
+      offersPerAssignmentHistogram.observe(alreadyOffered.size + 1);
+      return 'assigned';
+    }
   }
-
-  await updateOrderStatus(orderId, 'cancelled', {
-    cancellation_reason: 'No driver available',
-  });
-
-  return false;
 }
 
 /**
  * Circuit breaker instance for driver matching.
  *
- * @description Wraps the driver matching function with circuit breaker protection.
- * Opens when error rate exceeds CIRCUIT_BREAKER_ERROR_THRESHOLD (50%) after
- * CIRCUIT_BREAKER_VOLUME_THRESHOLD (3) requests. When open, uses fallback to
- * queue orders for retry instead of attempting matching.
+ * @description Opens when error rate exceeds CIRCUIT_BREAKER_ERROR_THRESHOLD (50%)
+ * after CIRCUIT_BREAKER_VOLUME_THRESHOLD (3) runs. A "deferred" or "cancelled"
+ * run is a success: only thrown errors (Redis or PostgreSQL failing) count.
  * @private
  */
-const driverMatchingCircuitBreaker = createCircuitBreaker<[string], boolean>(
+const driverMatchingCircuitBreaker = createCircuitBreaker<[string], MatchOutcome>(
   'driver-matching',
-  async (orderId: string): Promise<boolean> => {
+  async (orderId: string): Promise<MatchOutcome> => {
     const startTime = Date.now();
+    const outcome = await startDriverMatching(orderId);
+    const duration = (Date.now() - startTime) / 1000;
 
-    try {
-      const result = await startDriverMatching(orderId);
-      const duration = (Date.now() - startTime) / 1000;
-
+    if (outcome === 'assigned') {
       driverMatchingDurationHistogram.observe(duration);
-
-      if (result) {
-        driverAssignmentsCounter.inc({ result: 'assigned' });
-        matchingLogger.info({ orderId, duration }, 'Driver matching succeeded');
-      } else {
-        driverAssignmentsCounter.inc({ result: 'no_driver' });
-        matchingLogger.warn({ orderId, duration }, 'No driver available for order');
-      }
-
-      return result;
-    } catch (error) {
-      driverAssignmentsCounter.inc({ result: 'error' });
-      throw error;
     }
+    matchingLogger.info({ orderId, outcome, duration }, 'Matching run finished');
+    return outcome;
   },
   {
     timeout: DRIVER_MATCHING_TIMEOUT_MS,
@@ -166,42 +171,35 @@ const driverMatchingCircuitBreaker = createCircuitBreaker<[string], boolean>(
   }
 );
 
-// Fallback: queue order for retry when circuit is open
-driverMatchingCircuitBreaker.fallback(async (orderId: string): Promise<boolean> => {
-  matchingLogger.warn({ orderId }, 'Circuit breaker open, queueing order for retry');
-
-  await updateOrderStatus(orderId, 'pending', { cancellation_reason: null });
-  matchingLogger.error({ orderId }, 'Order queued for retry - circuit breaker open');
-
-  return false;
+// Fallback (circuit open, error, or timeout): hand the order back to the
+// sweepers with a back-off. The order stays unassigned; nothing is overwritten.
+driverMatchingCircuitBreaker.fallback(async (orderId: string): Promise<MatchOutcome> => {
+  matchingLogger.warn({ orderId }, 'Matching unavailable; order will be retried by the dispatch sweeper');
+  await releaseDispatchLease(orderId, DISPATCH_OWNER, DISPATCH_FAILURE_BACKOFF_SECONDS).catch(
+    (error: Error) => {
+      // If even this fails the lease simply expires and a sweeper retries.
+      matchingLogger.error({ orderId, error: error.message }, 'Failed to release dispatch lease');
+    }
+  );
+  return 'deferred';
 });
+
+/** Orders whose matching loop is running in this process. */
+const matchingInProgress = new Set<string>();
 
 /**
  * Starts driver matching with circuit breaker protection.
+ * Safe to call repeatedly for the same order: a second call while a loop is
+ * already running in this process is a no-op.
  *
- * @description Preferred entry point for initiating driver matching. Wraps the
- * matching algorithm with circuit breaker protection to handle failures gracefully:
- * - When circuit is closed: Executes normal matching algorithm
- * - When circuit is open: Uses fallback to queue order for later retry
- * - When circuit is half-open: Allows test request to check recovery
- *
- * Records metrics for monitoring (duration histogram, assignment counters).
- * @param {string} orderId - The order's UUID to find a driver for
- * @returns {Promise<boolean>} True if driver assigned, false if no driver or circuit open
- * @example
- * // Always use this function for new orders
- * const result = await startDriverMatchingWithCircuitBreaker(orderId);
- * if (!result) {
- *   // Order will either be cancelled or queued for retry
- *   const status = getDriverMatchingCircuitBreakerStatus();
- *   if (status.state === 'open') {
- *     console.log('Order queued - matching service degraded');
- *   }
- * }
+ * @param orderId - The order's UUID to find a driver for
+ * @returns How the run ended
  */
-export async function startDriverMatchingWithCircuitBreaker(
-  orderId: string
-): Promise<boolean> {
+export async function startDriverMatchingWithCircuitBreaker(orderId: string): Promise<MatchOutcome> {
+  if (matchingInProgress.has(orderId)) {
+    return 'lease_lost';
+  }
+  matchingInProgress.add(orderId);
   try {
     return await driverMatchingCircuitBreaker.fire(orderId);
   } catch (error) {
@@ -209,24 +207,16 @@ export async function startDriverMatchingWithCircuitBreaker(
       { orderId, error: (error as Error).message },
       'Driver matching circuit breaker error'
     );
-    return false;
+    return 'deferred';
+  } finally {
+    matchingInProgress.delete(orderId);
   }
 }
 
 /**
  * Gets the current status of the driver matching circuit breaker.
  *
- * @description Returns the circuit breaker state and cumulative statistics.
- * Useful for health checks, monitoring dashboards, and debugging.
- * @returns {{state: 'open' | 'halfOpen' | 'closed', stats: {failures: number, successes: number, fallbacks: number, timeouts: number}}} Circuit breaker status object
- * @example
- * const status = getDriverMatchingCircuitBreakerStatus();
- * console.log(`Circuit state: ${status.state}`);
- * console.log(`Failures: ${status.stats.failures}, Successes: ${status.stats.successes}`);
- *
- * if (status.state === 'open') {
- *   console.warn('Driver matching service is degraded');
- * }
+ * @returns Circuit breaker state and cumulative statistics
  */
 export function getDriverMatchingCircuitBreakerStatus() {
   return {
@@ -242,4 +232,9 @@ export function getDriverMatchingCircuitBreakerStatus() {
       timeouts: driverMatchingCircuitBreaker.stats.timeouts,
     },
   };
+}
+
+/** Exposed for tests and shutdown: orders being matched in this process. */
+export function getMatchingInProgress(): ReadonlySet<string> {
+  return matchingInProgress;
 }

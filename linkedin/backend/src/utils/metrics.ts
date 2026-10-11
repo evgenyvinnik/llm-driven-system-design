@@ -158,6 +158,27 @@ export const feedGenerationDuration = new Histogram({
   registers: [metricsRegistry],
 });
 
+// Search index outbox metrics
+export const searchIndexOperationsTotal = new Counter({
+  name: 'search_index_operations_total',
+  help: 'Search index relay outcomes (indexed or scheduled for retry)',
+  labelNames: ['entity', 'result'],
+  registers: [metricsRegistry],
+});
+
+export const searchIndexBacklog = new Gauge({
+  name: 'search_index_backlog',
+  help: 'Rows in search_index_queue waiting to be indexed',
+  registers: [metricsRegistry],
+});
+
+export const searchFallbacksTotal = new Counter({
+  name: 'search_fallbacks_total',
+  help: 'Searches answered by PostgreSQL full-text because Elasticsearch was unavailable',
+  labelNames: ['type'],
+  registers: [metricsRegistry],
+});
+
 // Authentication Metrics
 export const loginAttemptsTotal = new Counter({
   name: 'login_attempts_total',

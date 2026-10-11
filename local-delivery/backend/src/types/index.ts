@@ -118,6 +118,12 @@ export interface Order {
   cancelled_at: Date | null;
   cancellation_reason: string | null;
   updated_at: Date;
+  /** Incremented on every state transition; clients keep the highest version they have seen. */
+  version: number;
+  /** API instance currently running the matching loop (NULL when nobody is). */
+  dispatch_owner?: string | null;
+  /** While in the future, no other instance may dispatch this order. */
+  dispatch_lease_until?: Date | null;
 }
 
 export interface OrderWithDetails extends Order {

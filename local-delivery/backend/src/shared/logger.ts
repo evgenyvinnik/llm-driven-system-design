@@ -12,7 +12,8 @@
  */
 import pino from 'pino';
 
-const isDevelopment = process.env.NODE_ENV !== 'production';
+// Pretty printing runs in a worker thread; skip it in production and in tests.
+const isDevelopment = process.env.NODE_ENV !== 'production' && process.env.NODE_ENV !== 'test';
 
 /**
  * Application logger instance.

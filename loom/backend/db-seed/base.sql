@@ -4,7 +4,7 @@
 -- Login credentials for every seeded user: password123
 -- (bcrypt hash below is $2b$10$BdLsE... == "password123")
 --
--- Usage: psql -U loom -d loom -f backend/db-seed/seed.sql
+-- Usage: psql -U loom -d loom -f backend/db-seed/base.sql (or npm run db:seed, which also fills MinIO)
 -- Safe to re-run: every INSERT is ON CONFLICT DO NOTHING with fixed UUIDs.
 
 -- ============ Users ============
@@ -24,45 +24,48 @@ INSERT INTO folders (id, user_id, name, parent_id) VALUES
 ON CONFLICT (id) DO NOTHING;
 
 -- ============ Videos ============
--- alice owns most of them (she is the screenshot login), spanning every status.
-INSERT INTO videos (id, user_id, title, description, duration_seconds, status, storage_path, thumbnail_path, file_size_bytes, view_count, created_at, updated_at) VALUES
+-- alice owns most of them (she is the screenshot login), spanning every status:
+-- ready, uploading (parts still arriving from the recorder), and failed (abandoned upload).
+INSERT INTO videos (id, user_id, title, description, duration_seconds, status, storage_path, thumbnail_path, file_size_bytes, view_count, created_at, updated_at, upload_activity_at, failure_reason) VALUES
     ('11111111-aaaa-4aaa-8aaa-111111111111', 'a1111111-1111-1111-1111-111111111111',
      'Checkout flow walkthrough', 'Screen recording of the new 3-step checkout, including the coupon edge case we discussed.',
      312, 'ready', 'videos/11111111-aaaa-4aaa-8aaa-111111111111.webm', 'thumbnails/11111111-aaaa-4aaa-8aaa-111111111111.jpg',
-     48210496, 128, NOW() - INTERVAL '2 hours', NOW() - INTERVAL '2 hours'),
+     48210496, 128, NOW() - INTERVAL '2 hours', NOW() - INTERVAL '2 hours', NULL, NULL),
 
     ('22222222-aaaa-4aaa-8aaa-222222222222', 'a1111111-1111-1111-1111-111111111111',
      'Sprint 24 standup', 'Async standup: shipped the search reindex, blocked on the CDN cache purge.',
      94, 'ready', 'videos/22222222-aaaa-4aaa-8aaa-222222222222.webm', 'thumbnails/22222222-aaaa-4aaa-8aaa-222222222222.jpg',
-     14680064, 42, NOW() - INTERVAL '1 day', NOW() - INTERVAL '1 day'),
+     14680064, 42, NOW() - INTERVAL '1 day', NOW() - INTERVAL '1 day', NULL, NULL),
 
     ('33333333-aaaa-4aaa-8aaa-333333333333', 'a1111111-1111-1111-1111-111111111111',
      'Design review: dashboard v2', 'Walking through the three dashboard layouts. Timestamped comments welcome.',
      725, 'ready', 'videos/33333333-aaaa-4aaa-8aaa-333333333333.webm', 'thumbnails/33333333-aaaa-4aaa-8aaa-333333333333.jpg',
-     112590848, 317, NOW() - INTERVAL '3 days', NOW() - INTERVAL '3 days'),
+     112590848, 317, NOW() - INTERVAL '3 days', NOW() - INTERVAL '3 days', NULL, NULL),
 
     ('44444444-aaaa-4aaa-8aaa-444444444444', 'a1111111-1111-1111-1111-111111111111',
      'Onboarding for new engineers', 'Repo tour, local setup, and how to run the test suite.',
      1483, 'ready', 'videos/44444444-aaaa-4aaa-8aaa-444444444444.webm', 'thumbnails/44444444-aaaa-4aaa-8aaa-444444444444.jpg',
-     241172480, 903, NOW() - INTERVAL '9 days', NOW() - INTERVAL '9 days'),
+     241172480, 903, NOW() - INTERVAL '9 days', NOW() - INTERVAL '9 days', NULL, NULL),
 
     ('55555555-aaaa-4aaa-8aaa-555555555555', 'a1111111-1111-1111-1111-111111111111',
-     'Hotfix postmortem (raw)', 'Just uploaded - still encoding.',
-     NULL, 'processing', NULL, NULL, NULL, 0, NOW() - INTERVAL '3 minutes', NOW() - INTERVAL '3 minutes'),
+     'Hotfix postmortem (raw)', 'Still recording - parts are uploading as it goes.',
+     NULL, 'uploading', NULL, NULL, NULL, 0, NOW() - INTERVAL '3 minutes', NOW() - INTERVAL '3 minutes',
+     NOW() - INTERVAL '1 minute', NULL),
 
     ('66666666-aaaa-4aaa-8aaa-666666666666', 'a1111111-1111-1111-1111-111111111111',
-     'Mobile nav prototype', 'Upload interrupted mid-transcode - kept to exercise the failed state.',
-     NULL, 'failed', NULL, NULL, 9437184, 0, NOW() - INTERVAL '5 days', NOW() - INTERVAL '5 days'),
+     'Mobile nav prototype', 'Recorder closed mid-upload - kept to exercise the failed state.',
+     NULL, 'failed', NULL, NULL, 9437184, 0, NOW() - INTERVAL '5 days', NOW() - INTERVAL '5 days',
+     NULL, 'Upload abandoned: no parts received for 30 minutes'),
 
     ('77777777-aaaa-4aaa-8aaa-777777777777', 'a2222222-2222-2222-2222-222222222222',
      'Repro: cart total off by one cent', 'Bob reproducing the rounding bug on staging.',
      201, 'ready', 'videos/77777777-aaaa-4aaa-8aaa-777777777777.webm', 'thumbnails/77777777-aaaa-4aaa-8aaa-777777777777.jpg',
-     31457280, 57, NOW() - INTERVAL '6 hours', NOW() - INTERVAL '6 hours'),
+     31457280, 57, NOW() - INTERVAL '6 hours', NOW() - INTERVAL '6 hours', NULL, NULL),
 
     ('88888888-aaaa-4aaa-8aaa-888888888888', 'a3333333-3333-3333-3333-333333333333',
      'Customer call highlights', 'Carol: the 4 minutes of the Acme call that matter.',
      248, 'ready', 'videos/88888888-aaaa-4aaa-8aaa-888888888888.webm', 'thumbnails/88888888-aaaa-4aaa-8aaa-888888888888.jpg',
-     38797312, 74, NOW() - INTERVAL '2 days', NOW() - INTERVAL '2 days')
+     38797312, 74, NOW() - INTERVAL '2 days', NOW() - INTERVAL '2 days', NULL, NULL)
 ON CONFLICT (id) DO NOTHING;
 
 -- ============ Video <-> Folder ============

@@ -1,8 +1,26 @@
-import { query, queryOne, execute } from '../utils/db.js';
-import { indexJob, searchJobs as esSearchJobs } from '../utils/elasticsearch.js';
+import { query, queryOne, withTransaction } from '../utils/db.js';
+import { isSearchAvailable, searchJobs as esSearchJobs } from '../utils/elasticsearch.js';
+import { ApiError } from '../utils/errors.js';
+import { logger } from '../utils/logger.js';
+import { searchFallbacksTotal } from '../utils/metrics.js';
 import { getFirstDegreeConnections } from './connectionService.js';
 import { getUserSkills, getUserExperiences } from './userService.js';
-import type { Job, JobApplication, Company, Skill, User as _User } from '../types/index.js';
+import { enqueueSearchIndex } from './searchIndexer.js';
+import { toPrefixQuery, type SearchSource } from './searchService.js';
+import type { Job, JobApplication, Company, Skill } from '../types/index.js';
+
+/** Explicit columns: `j.*` would also return the internal search_document tsvector. */
+const JOB_COLUMNS = `j.id, j.company_id, j.posted_by_user_id, j.title, j.description, j.location,
+  j.is_remote, j.employment_type, j.experience_level, j.years_required, j.salary_min,
+  j.salary_max, j.status, j.created_at, j.updated_at`;
+
+/** Optional filters shared by listing, Elasticsearch search and the SQL fallback. */
+export interface JobFilters {
+  location?: string;
+  is_remote?: boolean;
+  employment_type?: string;
+  experience_level?: string;
+}
 
 /**
  * Creates a new company in the system.
@@ -77,7 +95,8 @@ export async function getAllCompanies(offset = 0, limit = 50): Promise<Company[]
 
 /**
  * Creates a new job posting.
- * Links required skills and indexes in Elasticsearch for search.
+ * The job, its skills and its search-index entry commit together; the outbox relay
+ * pushes the document to Elasticsearch (see searchIndexer).
  *
  * @param data - Job details including company, title, description, requirements, and salary
  * @returns The newly created job
@@ -96,53 +115,46 @@ export async function createJob(data: {
   salary_max?: number;
   required_skill_ids?: number[];
 }): Promise<Job> {
-  const job = await queryOne<Job>(
-    `INSERT INTO jobs (company_id, posted_by_user_id, title, description, location, is_remote,
-                       employment_type, experience_level, years_required, salary_min, salary_max)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-     RETURNING *`,
-    [
-      data.company_id,
-      data.posted_by_user_id || null,
-      data.title,
-      data.description,
-      data.location || null,
-      data.is_remote || false,
-      data.employment_type || null,
-      data.experience_level || null,
-      data.years_required || null,
-      data.salary_min || null,
-      data.salary_max || null,
-    ]
-  );
+  if (!data.company_id || !data.title || !data.description) {
+    throw new ApiError(400, 'invalid_job', 'company_id, title and description are required');
+  }
+  return withTransaction(async (client) => {
+    const company = await client.query('SELECT 1 FROM companies WHERE id = $1', [data.company_id]);
+    if (!company.rowCount) throw new ApiError(404, 'company_not_found', 'Company not found');
 
-  // Add required skills
-  if (data.required_skill_ids && data.required_skill_ids.length > 0) {
-    for (const skillId of data.required_skill_ids) {
-      await execute(
-        `INSERT INTO job_skills (job_id, skill_id, is_required) VALUES ($1, $2, true)`,
-        [job!.id, skillId]
+    const result = await client.query<Job>(
+      `INSERT INTO jobs AS j (company_id, posted_by_user_id, title, description, location, is_remote,
+                              employment_type, experience_level, years_required, salary_min, salary_max)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+       RETURNING ${JOB_COLUMNS}`,
+      [
+        data.company_id,
+        data.posted_by_user_id || null,
+        data.title,
+        data.description,
+        data.location || null,
+        data.is_remote || false,
+        data.employment_type || null,
+        data.experience_level || null,
+        data.years_required || null,
+        data.salary_min || null,
+        data.salary_max || null,
+      ]
+    );
+    const job = result.rows[0];
+
+    if (data.required_skill_ids && data.required_skill_ids.length > 0) {
+      await client.query(
+        `INSERT INTO job_skills (job_id, skill_id, is_required)
+         SELECT $1, skill_id, true FROM unnest($2::int[]) AS skill_id
+         ON CONFLICT DO NOTHING`,
+        [job.id, data.required_skill_ids]
       );
     }
-  }
 
-  // Index in Elasticsearch
-  const company = await getCompanyById(data.company_id);
-  const skills = await getJobSkills(job!.id);
-  await indexJob({
-    id: job!.id,
-    title: job!.title,
-    description: job!.description,
-    company_name: company?.name || '',
-    location: job!.location,
-    is_remote: job!.is_remote,
-    employment_type: job!.employment_type,
-    experience_level: job!.experience_level,
-    skills: skills.map(s => s.name),
-    status: job!.status,
+    await enqueueSearchIndex(client, 'job', job.id);
+    return job;
   });
-
-  return job!;
 }
 
 /**
@@ -153,7 +165,7 @@ export async function createJob(data: {
  */
 export async function getJobById(id: number): Promise<Job | null> {
   const job = await queryOne<Job>(
-    `SELECT j.*,
+    `SELECT ${JOB_COLUMNS},
             json_build_object(
               'id', c.id,
               'name', c.name,
@@ -161,7 +173,9 @@ export async function getJobById(id: number): Promise<Job | null> {
               'logo_url', c.logo_url,
               'industry', c.industry,
               'size', c.size,
-              'location', c.location
+              'location', c.location,
+              'description', c.description,
+              'website', c.website
             ) as company
      FROM jobs j
      JOIN companies c ON j.company_id = c.id
@@ -246,7 +260,7 @@ export async function getJobs(
   const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
 
   return query<Job>(
-    `SELECT j.*,
+    `SELECT ${JOB_COLUMNS},
             json_build_object(
               'id', c.id,
               'name', c.name,
@@ -263,71 +277,101 @@ export async function getJobs(
 }
 
 /**
+ * Full-text job search in PostgreSQL (the fallback when Elasticsearch is down).
+ * Title words match by prefix, title and description by English stem, and the
+ * company name at query time; the same filters as the Elasticsearch path apply.
+ */
+async function searchJobsInPostgres(
+  searchQuery: string,
+  filters: JobFilters,
+  offset: number,
+  limit: number
+): Promise<Job[]> {
+  const prefix = toPrefixQuery(searchQuery);
+  if (!prefix) return [];
+  const conditions = [`j.status = 'active'`];
+  const params: unknown[] = [prefix, searchQuery];
+  if (filters.location) {
+    params.push(`%${filters.location}%`);
+    conditions.push(`j.location ILIKE $${params.length}`);
+  }
+  if (filters.is_remote) conditions.push('j.is_remote = true');
+  if (filters.employment_type) {
+    params.push(filters.employment_type);
+    conditions.push(`j.employment_type = $${params.length}`);
+  }
+  if (filters.experience_level) {
+    params.push(filters.experience_level);
+    conditions.push(`j.experience_level = $${params.length}`);
+  }
+  params.push(offset, limit);
+
+  return query<Job>(
+    `WITH q AS (
+       SELECT to_tsquery('simple', $1) || websearch_to_tsquery('english', $2) AS query
+     )
+     SELECT ${JOB_COLUMNS},
+            json_build_object('id', c.id, 'name', c.name, 'slug', c.slug, 'logo_url', c.logo_url) AS company
+     FROM jobs j
+     JOIN companies c ON j.company_id = c.id
+     CROSS JOIN q
+     WHERE ${conditions.join(' AND ')}
+       AND (j.search_document @@ q.query OR to_tsvector('simple', c.name) @@ q.query)
+     ORDER BY ts_rank(j.search_document, q.query) DESC, j.created_at DESC
+     OFFSET $${params.length - 1} LIMIT $${params.length}`,
+    params
+  );
+}
+
+/**
  * Searches for jobs using Elasticsearch with optional filters.
- * Falls back to SQL ILIKE search if Elasticsearch is unavailable.
+ * Falls back to PostgreSQL full-text search if Elasticsearch is unavailable.
  * Preserves relevance ranking from search results.
  *
  * @param searchQuery - The search query string
  * @param filters - Optional filters for location, remote, type, and level
  * @param offset - Number of results to skip (default: 0)
  * @param limit - Maximum results to return (default: 20)
- * @returns Array of matching jobs ordered by relevance
+ * @returns Matching jobs ordered by relevance, and which engine answered
  */
 export async function searchJobs(
   searchQuery: string,
-  filters?: {
-    location?: string;
-    is_remote?: boolean;
-    employment_type?: string;
-    experience_level?: string;
-  },
+  filters: JobFilters = {},
   offset = 0,
   limit = 20
-): Promise<Job[]> {
-  try {
-    const jobIds = await esSearchJobs(searchQuery, filters, limit + offset);
-    if (jobIds.length === 0) return [];
+): Promise<{ jobs: Job[]; source: SearchSource }> {
+  if (isSearchAvailable()) {
+    try {
+      const jobIds = await esSearchJobs(searchQuery, filters, limit + offset);
+      const paginatedIds = jobIds.slice(offset, offset + limit);
+      if (paginatedIds.length === 0) return { jobs: [], source: 'elasticsearch' };
 
-    const paginatedIds = jobIds.slice(offset, offset + limit);
-    const placeholders = paginatedIds.map((_, i) => `$${i + 1}`).join(',');
+      const jobs = await query<Job>(
+        `SELECT ${JOB_COLUMNS},
+                json_build_object(
+                  'id', c.id,
+                  'name', c.name,
+                  'slug', c.slug,
+                  'logo_url', c.logo_url
+                ) as company
+         FROM jobs j
+         JOIN companies c ON j.company_id = c.id
+         WHERE j.id = ANY($1::int[])`,
+        [paginatedIds]
+      );
 
-    const jobs = await query<Job>(
-      `SELECT j.*,
-              json_build_object(
-                'id', c.id,
-                'name', c.name,
-                'slug', c.slug,
-                'logo_url', c.logo_url
-              ) as company
-       FROM jobs j
-       JOIN companies c ON j.company_id = c.id
-       WHERE j.id IN (${placeholders})`,
-      paginatedIds
-    );
-
-    // Preserve search ranking order
-    const jobMap = new Map(jobs.map(j => [j.id, j]));
-    return paginatedIds.map(id => jobMap.get(id)!).filter(Boolean);
-  } catch (error) {
-    console.error('Elasticsearch search failed, falling back to SQL:', error);
-    // Fallback to SQL search
-    return query<Job>(
-      `SELECT j.*,
-              json_build_object(
-                'id', c.id,
-                'name', c.name,
-                'slug', c.slug,
-                'logo_url', c.logo_url
-              ) as company
-       FROM jobs j
-       JOIN companies c ON j.company_id = c.id
-       WHERE j.status = 'active'
-         AND (j.title ILIKE $1 OR j.description ILIKE $1 OR c.name ILIKE $1)
-       ORDER BY j.created_at DESC
-       OFFSET $2 LIMIT $3`,
-      [`%${searchQuery}%`, offset, limit]
-    );
+      // Preserve search ranking order
+      const jobMap = new Map(jobs.map(j => [j.id, j]));
+      return {
+        jobs: paginatedIds.map(id => jobMap.get(id)).filter((job): job is Job => job !== undefined),
+        source: 'elasticsearch',
+      };
+    } catch (error) {
+      logger.warn({ error: (error as Error).message }, 'Job search fell back to PostgreSQL');
+    }
   }
+  searchFallbacksTotal.inc({ type: 'job' });
+  return { jobs: await searchJobsInPostgres(searchQuery, filters, offset, limit), source: 'postgres' };
 }
 
 /**
@@ -416,6 +460,10 @@ export async function applyForJob(
     cover_letter?: string;
   }
 ): Promise<JobApplication> {
+  const job = await queryOne<{ status: string }>('SELECT status FROM jobs WHERE id = $1', [jobId]);
+  if (!job) throw new ApiError(404, 'job_not_found', 'Job not found');
+  if (job.status !== 'active') throw new ApiError(409, 'job_closed', 'This job is no longer accepting applications');
+
   const matchScore = await calculateJobMatchScore(jobId, userId);
 
   const application = await queryOne<JobApplication>(
@@ -533,7 +581,7 @@ export async function getRecommendedJobs(userId: number, limit = 10): Promise<Jo
     // "could not identify an equality operator for type json". De-duplicate with
     // EXISTS on job_skills instead of a LEFT JOIN that multiplies rows — that
     // removes the need for DISTINCT altogether (and is cheaper).
-    `SELECT j.*,
+    `SELECT ${JOB_COLUMNS},
             json_build_object(
               'id', c.id,
               'name', c.name,

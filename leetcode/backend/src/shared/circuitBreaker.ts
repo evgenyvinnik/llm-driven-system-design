@@ -11,49 +11,33 @@ const STATE_MAP: Record<string, number> = {
   'open': 2
 };
 
-export interface ExecutionOptions {
-  image: string;
-  workDir: string;
-  codeFile: string;
-  compileCommand?: string[];
-  runCommand: string[];
-  timeout: number;
-  memoryMb: number;
-  language: string;
-}
-
-export interface ExecutionResult {
-  status: string;
-  stdout?: string;
-  stderr?: string;
-  error?: string;
-  exitCode?: number;
-  executionTime?: number;
-  isCircuitBreakerOpen?: boolean;
-}
-
-type ExecuteFn = (options: ExecutionOptions) => Promise<ExecutionResult>;
-
 /**
- * Create a circuit breaker for code execution
+ * Create a circuit breaker around sandbox container runs.
  *
  * The circuit breaker protects the system from cascading failures when the
- * Docker sandbox is unavailable or experiencing issues.
+ * Docker daemon is unavailable or hanging. Only infrastructure failures reject
+ * the wrapped function; a user's infinite loop or crash is a normal result
+ * (a verdict), so it never trips the breaker.
  *
  * States:
  * - CLOSED: Normal operation, requests pass through
- * - OPEN: Failures exceeded threshold, all requests fail fast
- * - HALF-OPEN: After timeout, allow one request to test if service recovered
+ * - OPEN: Failures exceeded threshold, all requests fail fast with EOPENBREAKER
+ * - HALF-OPEN: After the reset timeout, a trial request tests whether Docker recovered
+ *
+ * No fallback is registered on purpose: opossum calls a fallback for every failure, not
+ * only when the circuit is open, which used to make any Docker error look like "breaker open".
  */
-export function createExecutionCircuitBreaker(executeFn: ExecuteFn): CircuitBreaker<[ExecutionOptions], ExecutionResult> {
+export function createExecutionCircuitBreaker<TArg, TResult>(
+  executeFn: (arg: TArg) => Promise<TResult>
+): CircuitBreaker<[TArg], TResult> {
   const breaker = new CircuitBreaker(executeFn, {
-    // Open circuit after 5 consecutive failures
+    // Open when half of the recent container runs failed...
     errorThresholdPercentage: 50,
-    // Minimum 5 requests before percentage is calculated
+    // ...once at least 5 runs are in the rolling window
     volumeThreshold: 5,
     // Wait 30 seconds before trying again when open
     resetTimeout: 30000,
-    // Request timeout (this is a fallback, actual timeout handled in executor)
+    // Backstop timeout; the executor enforces its own per-container deadlines
     timeout: 60000,
     // Allow 3 concurrent requests during half-open state
     allowWarmUp: true,
@@ -85,10 +69,6 @@ export function createExecutionCircuitBreaker(executeFn: ExecuteFn): CircuitBrea
     metrics.circuitBreakerEvents.inc({ name: 'code-executor', event: 'close' });
   });
 
-  breaker.on('fallback', () => {
-    metrics.circuitBreakerEvents.inc({ name: 'code-executor', event: 'fallback' });
-  });
-
   breaker.on('success', () => {
     metrics.circuitBreakerEvents.inc({ name: 'code-executor', event: 'success' });
   });
@@ -111,33 +91,4 @@ export function createExecutionCircuitBreaker(executeFn: ExecuteFn): CircuitBrea
   metrics.circuitBreakerState.set({ name: 'code-executor' }, STATE_MAP.closed);
 
   return breaker;
-}
-
-/**
- * Error thrown when circuit breaker is open
- */
-export class CircuitBreakerOpenError extends Error {
-  statusCode: number;
-  retryAfter: number;
-
-  constructor(message = 'Code execution temporarily unavailable') {
-    super(message);
-    this.name = 'CircuitBreakerOpenError';
-    this.statusCode = 503;
-    this.retryAfter = 30; // seconds
-  }
-}
-
-/**
- * Fallback function when circuit breaker is open
- */
-export function createFallback(): () => ExecutionResult {
-  return () => {
-    return {
-      status: 'system_error',
-      error: 'Code execution temporarily unavailable. Please try again later.',
-      executionTime: 0,
-      isCircuitBreakerOpen: true
-    };
-  };
 }
