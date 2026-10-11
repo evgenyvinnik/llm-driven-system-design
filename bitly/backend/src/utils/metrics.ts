@@ -163,3 +163,54 @@ export const idempotencyHitsTotal = new Counter({
   help: 'Total number of idempotency key cache hits (duplicate requests)',
   registers: [metricsRegistry],
 });
+
+/**
+ * Key pool reaper counter.
+ * marked_used: unused pool rows whose code already exists in urls.
+ * released: stale leases handed back to the pool after the lease TTL.
+ */
+export const keyPoolReclaimedTotal = new Counter({
+  name: 'key_pool_reclaimed_total',
+  help: 'Key pool rows repaired by the stale-lease reaper',
+  labelNames: ['action'] as const,
+  registers: [metricsRegistry],
+});
+
+/**
+ * Click event dispatch counter.
+ * Shows how often the redirect path falls back from the queue to a direct insert.
+ */
+export const clickEventDispatchTotal = new Counter({
+  name: 'click_event_dispatch_total',
+  help: 'Click events dispatched from the redirect path, by delivery path (queue, sync, failed)',
+  labelNames: ['path'] as const,
+  registers: [metricsRegistry],
+});
+
+/**
+ * Duplicate click deliveries ignored thanks to the event_id unique index.
+ */
+export const clickEventsDuplicateTotal = new Counter({
+  name: 'click_events_duplicate_total',
+  help: 'Click events skipped because their event_id was already recorded',
+  registers: [metricsRegistry],
+});
+
+/**
+ * Click events parked on the retry queue after a failed processing attempt.
+ */
+export const clickEventsRetriedTotal = new Counter({
+  name: 'click_events_retried_total',
+  help: 'Click events re-queued for a delayed retry',
+  registers: [metricsRegistry],
+});
+
+/**
+ * Click events moved to the dead-letter queue, by reason.
+ */
+export const clickEventsDeadLetteredTotal = new Counter({
+  name: 'click_events_dead_lettered_total',
+  help: 'Click events moved to the dead-letter queue',
+  labelNames: ['reason'] as const,
+  registers: [metricsRegistry],
+});

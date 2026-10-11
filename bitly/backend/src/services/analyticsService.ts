@@ -1,74 +1,118 @@
-import { query } from '../utils/database.js';
-import { ClickEvent, ClickEventInput, UrlAnalytics } from '../models/types.js';
-import { ClickEventMessage } from '../utils/queue.js';
-import { incrementClickCount } from './urlService.js';
+import { query, withTransaction } from '../utils/database.js';
+import { ClickEvent, ClickEventMessage, UrlAnalytics } from '../models/types.js';
+import { isQueueConnected, publishClickEvent } from '../utils/queue.js';
+import logger from '../utils/logger.js';
+import { clickEventsTotal, clickEventDispatchTotal, clickEventsDuplicateTotal } from '../utils/metrics.js';
 
 /**
- * Parses a User-Agent string to determine device type.
- * Used for analytics to segment traffic by device category.
- * @param userAgent - The User-Agent header value
- * @returns Device type: 'mobile', 'tablet', 'desktop', 'bot', or 'unknown'
+ * Persists one click event exactly once.
+ * The INSERT is keyed by event_id (unique index) with ON CONFLICT DO NOTHING, and the
+ * denormalized urls.click_count is incremented only when that INSERT actually added a
+ * row, in the same transaction. A redelivered message, a publisher retry, or a sync
+ * fallback racing a late broker confirm therefore never double counts, and a crash can
+ * never leave the event without its counter increment (or vice versa).
+ * Used by both the analytics worker and the synchronous fallback.
+ * @param event - Click event carrying its event_id
+ * @returns true if the click was recorded, false if it was a duplicate
  */
-function parseDeviceType(userAgent: string | undefined): string {
-  if (!userAgent) return 'unknown';
+export async function recordClickEvent(event: ClickEventMessage): Promise<boolean> {
+  const recorded = await withTransaction(async (client) => {
+    const inserted = await client.query(
+      `INSERT INTO click_events
+         (event_id, short_code, referrer, user_agent, ip_address, device_type, clicked_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       ON CONFLICT (event_id) DO NOTHING
+       RETURNING id`,
+      [
+        event.event_id,
+        event.short_code,
+        event.referrer || null,
+        event.user_agent || null,
+        event.ip_address || null,
+        event.device_type,
+        new Date(event.timestamp),
+      ]
+    );
 
-  const ua = userAgent.toLowerCase();
+    if ((inserted.rowCount ?? 0) === 0) {
+      return false; // Already recorded: do not touch the counter again.
+    }
 
-  if (ua.includes('mobile') || ua.includes('android') || ua.includes('iphone')) {
-    return 'mobile';
+    await client.query(
+      `UPDATE urls SET click_count = click_count + 1 WHERE short_code = $1`,
+      [event.short_code]
+    );
+    return true;
+  });
+
+  if (!recorded) {
+    clickEventsDuplicateTotal.inc();
+    logger.info({ event_id: event.event_id, short_code: event.short_code }, 'Duplicate click event ignored');
   }
-  if (ua.includes('tablet') || ua.includes('ipad')) {
-    return 'tablet';
-  }
-  if (ua.includes('bot') || ua.includes('crawler') || ua.includes('spider')) {
-    return 'bot';
-  }
-  return 'desktop';
+  return recorded;
 }
 
 /**
- * Records a click event in the database.
- * Called asynchronously during redirects to capture analytics data.
- * @deprecated Use queue-based recording with publishClickEvent() instead.
- * @param input - Click event data including short code and request metadata
- */
-export async function recordClick(input: ClickEventInput): Promise<void> {
-  const deviceType = parseDeviceType(input.user_agent);
-
-  await query(
-    `INSERT INTO click_events (short_code, referrer, user_agent, ip_address, device_type)
-     VALUES ($1, $2, $3, $4, $5)`,
-    [
-      input.short_code,
-      input.referrer || null,
-      input.user_agent || null,
-      input.ip_address || null,
-      deviceType,
-    ]
-  );
-}
-
-/**
- * Records a click event synchronously (fallback when queue is unavailable).
- * Also increments the URL click count.
+ * Records a click event synchronously (fallback when the queue is unavailable or a
+ * publish was not confirmed). Same idempotent write as the worker.
  * @param event - Click event message data
+ * @returns true if recorded, false if it was a duplicate
  */
-export async function recordClickSync(event: ClickEventMessage): Promise<void> {
-  await query(
-    `INSERT INTO click_events (short_code, referrer, user_agent, ip_address, device_type, clicked_at)
-     VALUES ($1, $2, $3, $4, $5, $6)`,
-    [
-      event.short_code,
-      event.referrer || null,
-      event.user_agent || null,
-      event.ip_address || null,
-      event.device_type,
-      new Date(event.timestamp),
-    ]
-  );
+export async function recordClickSync(event: ClickEventMessage): Promise<boolean> {
+  return recordClickEvent(event);
+}
 
-  // Also increment click count
-  await incrementClickCount(event.short_code);
+/** Click dispatches still running; awaited during graceful shutdown. */
+const pendingDispatches = new Set<Promise<void>>();
+
+/**
+ * Hands a click event to the analytics pipeline without blocking the caller.
+ * Called after the redirect response has been sent. Publishes to RabbitMQ and waits for
+ * the publisher confirm; if the queue is down, the confirm is negative, or it times
+ * out, the click is inserted directly instead. Both paths share the event_id, so a late
+ * confirm plus the fallback still yields one row.
+ * @param event - Click event with event_id assigned at the redirect
+ */
+export function dispatchClickEvent(event: ClickEventMessage): void {
+  const task = (async (): Promise<void> => {
+    try {
+      const queueAvailable = isQueueConnected();
+      if (queueAvailable && (await publishClickEvent(event))) {
+        clickEventDispatchTotal.inc({ path: 'queue' });
+      } else {
+        logger.warn(
+          { short_code: event.short_code, event_id: event.event_id },
+          queueAvailable ? 'Click event not confirmed, using sync recording' : 'Queue unavailable, using sync recording'
+        );
+        await recordClickSync(event);
+        clickEventDispatchTotal.inc({ path: 'sync' });
+      }
+      clickEventsTotal.inc({ device_type: event.device_type });
+    } catch (error) {
+      clickEventDispatchTotal.inc({ path: 'failed' });
+      logger.error({ err: error, short_code: event.short_code, event_id: event.event_id }, 'Failed to record click');
+    }
+  })();
+
+  pendingDispatches.add(task);
+  void task.finally(() => {
+    pendingDispatches.delete(task);
+  });
+}
+
+/**
+ * Waits for in-flight click dispatches (bounded), so a graceful shutdown does not drop
+ * clicks whose redirect was already served.
+ * @param timeoutMs - Maximum time to wait
+ */
+export async function waitForPendingClickDispatches(timeoutMs: number): Promise<void> {
+  if (pendingDispatches.size === 0) {
+    return;
+  }
+  await Promise.race([
+    Promise.allSettled([...pendingDispatches]),
+    new Promise((resolve) => setTimeout(resolve, timeoutMs).unref()),
+  ]);
 }
 
 /**
@@ -174,7 +218,7 @@ export async function getRecentClicks(
 export async function getGlobalAnalytics(): Promise<{
   totalClicks: number;
   clicksToday: number;
-  clicksByHour: { hour: number; count: number }[];
+  clicksByHour: { hour: string; count: number }[];
   topUrls: { short_code: string; count: number }[];
 }> {
   // Total clicks
@@ -188,13 +232,15 @@ export async function getGlobalAnalytics(): Promise<{
      WHERE clicked_at > DATE_TRUNC('day', NOW())`
   );
 
-  // Clicks by hour (last 24 hours)
-  const clicksByHour = await query<{ hour: string; count: string }>(
-    `SELECT EXTRACT(HOUR FROM clicked_at) as hour, COUNT(*) as count
+  // Clicks by hour (last 24 hours). Bucket by the full timestamp truncated to the hour:
+  // grouping by hour-of-day alone merged today's 14:00 with yesterday's 14:00 at the
+  // edges of the window and sorted by clock hour instead of time.
+  const clicksByHour = await query<{ hour: Date; count: string }>(
+    `SELECT date_trunc('hour', clicked_at) AS hour, COUNT(*) AS count
      FROM click_events
      WHERE clicked_at > NOW() - INTERVAL '24 hours'
-     GROUP BY EXTRACT(HOUR FROM clicked_at)
-     ORDER BY hour`
+     GROUP BY 1
+     ORDER BY 1`
   );
 
   // Top URLs today
@@ -211,7 +257,7 @@ export async function getGlobalAnalytics(): Promise<{
     totalClicks: parseInt(totalResult[0].count, 10),
     clicksToday: parseInt(todayResult[0].count, 10),
     clicksByHour: clicksByHour.map((row) => ({
-      hour: parseInt(row.hour, 10),
+      hour: new Date(row.hour).toISOString(), // start of the hour bucket
       count: parseInt(row.count, 10),
     })),
     topUrls: topUrls.map((row) => ({

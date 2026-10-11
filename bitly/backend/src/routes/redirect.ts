@@ -1,10 +1,11 @@
+import crypto from 'crypto';
 import { Router, Request, Response } from 'express';
 import { asyncHandler } from '../middleware/errorHandler.js';
-import { getUrlByShortCode as _getUrlByShortCode } from '../services/urlService.js';
-import { publishClickEvent, isQueueConnected, ClickEventMessage } from '../utils/queue.js';
-import { recordClickSync } from '../services/analyticsService.js';
+import { resolveShortCode } from '../services/urlService.js';
+import { dispatchClickEvent } from '../services/analyticsService.js';
+import { ClickEventMessage } from '../models/types.js';
 import logger from '../utils/logger.js';
-import { urlRedirectsTotal, clickEventsTotal } from '../utils/metrics.js';
+import { urlRedirectsTotal } from '../utils/metrics.js';
 
 /**
  * Redirect router.
@@ -14,9 +15,16 @@ import { urlRedirectsTotal, clickEventsTotal } from '../utils/metrics.js';
 const router = Router();
 
 /**
+ * Responses on this route must not be stored by shared caches (a CDN would serve a
+ * deactivated link, or a stale 404 for a code created later) and should not be reused
+ * by browsers either: every click has to reach us to be counted.
+ */
+const REDIRECT_CACHE_CONTROL = 'private, no-store';
+
+/**
  * GET /:shortCode - Redirect to the original long URL
  * Uses 302 (temporary) redirect to ensure analytics are captured.
- * Records click events asynchronously via RabbitMQ to avoid blocking the redirect.
+ * Records click events after the response via RabbitMQ (with a direct-insert fallback).
  */
 router.get(
   '/:shortCode',
@@ -24,70 +32,40 @@ router.get(
     const { shortCode } = req.params;
     const startTime = Date.now();
 
-    // Track whether this was a cache hit (set by urlService)
-    const result = await getUrlByShortCodeWithCacheInfo(shortCode);
+    const result = await resolveShortCode(shortCode);
+    // 'skipped': the code is syntactically impossible and never reached a cache.
+    const cached = result.source === 'database' ? 'miss' : result.source === 'cache' ? 'hit' : 'skipped';
 
-    if (!result) {
-      urlRedirectsTotal.inc({ cached: 'miss', status: 'not_found' });
-      logger.info({ short_code: shortCode }, 'Redirect failed - URL not found');
+    res.set('Cache-Control', REDIRECT_CACHE_CONTROL);
+
+    if (!result.found) {
+      urlRedirectsTotal.inc({ cached, status: 'not_found' });
+      logger.info({ short_code: shortCode, source: result.source }, 'Redirect failed - URL not found');
       res.status(404).json({ error: 'Short URL not found or has expired' });
       return;
     }
 
-    const { longUrl, cacheHit } = result;
-
     // Increment redirect metric
-    urlRedirectsTotal.inc({ cached: cacheHit ? 'hit' : 'miss', status: 'success' });
+    urlRedirectsTotal.inc({ cached, status: 'success' });
 
     // Parse device type for metrics and analytics
     const userAgent = req.get('User-Agent');
-    const deviceType = parseDeviceType(userAgent);
 
-    // Build click event data
+    // The event_id is the idempotency key for the whole analytics pipeline.
     const clickEvent: ClickEventMessage = {
+      event_id: crypto.randomUUID(),
       short_code: shortCode,
       referrer: req.get('Referer'),
       user_agent: userAgent,
       ip_address: req.ip,
-      device_type: deviceType,
+      device_type: parseDeviceType(userAgent),
       timestamp: new Date().toISOString(),
     };
-
-    // Record click asynchronously via queue (non-blocking)
-    // If queue is unavailable, fall back to direct database insert
-    setImmediate(async () => {
-      try {
-        if (isQueueConnected()) {
-          // Publish to queue for async processing by worker
-          await publishClickEvent(clickEvent);
-        } else {
-          // Fallback: sync insert if queue unavailable
-          logger.warn({ short_code: shortCode }, 'Queue unavailable, using sync recording');
-          await recordClickSync(clickEvent);
-        }
-
-        // Track click event by device type
-        clickEventsTotal.inc({ device_type: deviceType });
-
-        logger.debug(
-          {
-            short_code: shortCode,
-            device_type: deviceType,
-            referrer: req.get('Referer'),
-            duration_ms: Date.now() - startTime,
-            queue_available: isQueueConnected(),
-          },
-          'Click event recorded'
-        );
-      } catch (error) {
-        logger.error({ err: error, short_code: shortCode }, 'Failed to record click');
-      }
-    });
 
     logger.info(
       {
         short_code: shortCode,
-        cache_hit: cacheHit,
+        cache_hit: result.source === 'cache',
         duration_ms: Date.now() - startTime,
       },
       'Redirect successful'
@@ -95,54 +73,13 @@ router.get(
 
     // Use 302 (temporary) redirect to ensure analytics tracking
     // 301 would be cached by browsers and we'd miss analytics
-    res.redirect(302, longUrl);
+    res.redirect(302, result.longUrl);
+
+    // Record the click only after the response is on its way: publishing (and any
+    // fallback insert) never adds latency to the redirect.
+    dispatchClickEvent(clickEvent);
   })
 );
-
-/**
- * Extended version of getUrlByShortCode that returns cache hit information.
- * Used to track cache performance in metrics.
- */
-async function getUrlByShortCodeWithCacheInfo(
-  shortCode: string
-): Promise<{ longUrl: string; cacheHit: boolean } | null> {
-  // Import here to avoid circular dependency
-  const { urlCache } = await import('../utils/cache.js');
-  const { query } = await import('../utils/database.js');
-
-  // Check cache first
-  const cached = await urlCache.get(shortCode);
-  if (cached) {
-    return { longUrl: cached, cacheHit: true };
-  }
-
-  // Cache miss - query database
-  interface UrlRow {
-    short_code: string;
-    long_url: string;
-    is_active: boolean;
-    expires_at: Date | null;
-  }
-
-  const result = await query<UrlRow>(
-    `SELECT * FROM urls
-     WHERE short_code = $1
-     AND is_active = true
-     AND (expires_at IS NULL OR expires_at > NOW())`,
-    [shortCode]
-  );
-
-  if (result.length === 0) {
-    return null;
-  }
-
-  const url = result[0];
-
-  // Update cache
-  await urlCache.set(shortCode, url.long_url);
-
-  return { longUrl: url.long_url, cacheHit: false };
-}
 
 /**
  * Parses a User-Agent string to determine device type.

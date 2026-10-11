@@ -40,12 +40,15 @@ pool.on('error', (err) => {
  * Used by health check endpoints.
  */
 export async function isDatabaseConnected(): Promise<boolean> {
+  let client: PoolClient | undefined;
   try {
-    const client = await pool.connect();
+    client = await pool.connect();
     await client.query('SELECT 1');
     client.release();
     return true;
-  } catch {
+  } catch (error) {
+    // Release (and discard) the client if the query failed, instead of leaking it
+    client?.release(error instanceof Error ? error : true);
     return false;
   }
 }
@@ -147,7 +150,11 @@ export async function withTransaction<T>(
     logger.debug('Transaction committed');
     return result;
   } catch (error) {
-    await client.query('ROLLBACK');
+    // A failed ROLLBACK (e.g. dead connection) must not replace the original error:
+    // callers branch on its SQLSTATE (unique violations, data errors).
+    await client.query('ROLLBACK').catch((rollbackError) => {
+      logger.error({ err: rollbackError }, 'Transaction rollback failed');
+    });
     logger.error({ err: error }, 'Transaction rolled back');
     throw error;
   } finally {

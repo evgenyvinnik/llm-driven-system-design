@@ -1,5 +1,6 @@
 import { Request, Response, NextFunction, RequestHandler } from 'express';
 import logger from '../utils/logger.js';
+import { HttpError } from '../utils/errors.js';
 
 /**
  * Global error handler middleware.
@@ -17,6 +18,11 @@ export function errorHandler(
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
   next: NextFunction
 ): void {
+  if (err instanceof HttpError) {
+    res.status(err.status).json({ error: err.message });
+    return;
+  }
+
   logger.error(
     {
       err,

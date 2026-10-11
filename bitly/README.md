@@ -2,7 +2,7 @@
 
 A local learning project for creating short links, resolving them through a cache, and processing click events in a separate worker. It includes a React dashboard and administrative controls. It is an independent implementation, not a description of Bitly's private infrastructure.
 
-The useful system-design questions are who owns the short-code namespace, how expiration interacts with caching, and what an analytics count actually guarantees. The implementation demonstrates these paths but has correctness gaps described below and in [architecture.md](./architecture.md#implementation-notes).
+The useful system-design questions are who owns the short-code namespace, how expiration interacts with caching, and what an analytics count actually guarantees. The implementation demonstrates these paths; its remaining limits are listed below and in [architecture.md](./architecture.md#implementation-notes).
 
 ## What you can try
 
@@ -20,7 +20,7 @@ The UI uses simple tables and bars. There is no live analytics subscription, ali
 | Browser | React 18, TypeScript, Vite 5, TanStack Router, Zustand 4, Tailwind CSS |
 | API | Node.js 20+, Express 4, TypeScript through tsx in development |
 | Data | PostgreSQL 16; Valkey 7 for mapping and session caches |
-| Analytics | RabbitMQ and a separate Node worker; individual SQL writes |
+| Analytics | RabbitMQ (publisher confirms, retry queue, dead-letter queue) and a separate Node worker; clicks deduplicated by `event_id` |
 | Operations | Pino, prom-client, Opossum database breaker, health endpoints |
 
 The backend package does not declare ESM; its NodeNext TypeScript build currently emits CommonJS. Source imports still use `.js` suffixes.
@@ -150,7 +150,7 @@ npm run dev
 
 Open [localhost:5173](http://localhost:5173). The API listens on port 3000, and Vite proxies `/api` there. Generated short URLs point directly to port 3000. Registration is available if you skipped the fixture; use the seeded Alice account for the existing smoke tests.
 
-The API can start without RabbitMQ and attempts click writes after the response when no queue connection exists. Use the worker for the normal queued path. This fallback is best effort and does not make analytics lossless.
+The API can start without RabbitMQ: when no confirmed publish is possible it inserts the click directly after the response. Every click carries an `event_id`, so the fallback and the worker never count the same click twice. A process crash between the response and the dispatch still loses that click.
 
 ### Environment variables
 
@@ -182,17 +182,17 @@ curl -s -X POST http://localhost:3000/api/v1/urls \
   -d '{"long_url":"https://example.com"}'
 ```
 
-Request the returned `short_url` with `curl -i` to inspect its 302 and `Location` header without following the target. Open an owned link's analytics after a redirect to exercise the worker. Queue reconnection currently does not reattach a consumer; restart the worker after a broker interruption.
+Request the returned `short_url` with `curl -i` to inspect its 302, `Location` and `Cache-Control: private, no-store` headers without following the target. Open an owned link's analytics after a redirect to exercise the worker. Send the same `Idempotency-Key` header twice with the creation request to see the stored response replayed (`Idempotent-Replayed: true`). The worker re-attaches its consumer after a broker interruption.
 
-Both backend and frontend provide `npm run build`, `npm run type-check`, and `npm run lint`. The backend has no unit-test script. From the repository root, `npm run test:smoke bitly` runs four Playwright page checks against a running backend and seeded Alice account. Its admin check logs in as Alice and accepts a rendered `main` after redirection; it does not establish administrator access. Page smoke checks do not verify cache invalidation or analytics recovery.
+Both backend and frontend provide `npm run build`, `npm run type-check`, and `npm run lint`. `npm test` in `backend/` runs 132 offline vitest unit tests (Redis, PostgreSQL and amqplib are mocked). From the repository root, `npm run test:smoke bitly` runs four Playwright page checks against a running backend and seeded Alice account. Its admin check logs in as Alice and accepts a rendered `main` after redirection; it does not establish administrator access. Page smoke checks do not verify cache invalidation or analytics recovery.
 
 ## Important implementation limits
 
-- Cached mappings contain only the destination for 24 hours. They bypass expiration and active-status checks. Owner deletion invalidates the cache, but expiration edits and administrator changes do not consistently do so; a concurrent old lookup can also refill a deleted entry.
-- The UI/API accept custom codes of 4–20 characters, but the database accepts at most 10. Use 4–10 and avoid `metrics` and `ready`, which collide with backend routes. The configured 365-day default expiration is unused; omission means no expiration.
-- The creation-specific limiter and idempotency middleware are mounted after the creation handler and do not protect ordinary creation requests. Only the general, per-process 200 API requests/minute limiter is active.
-- Queued clicks can be lost or counted more than once. There are no publisher confirms, event IDs, deduplication, transactional event-plus-counter writes, or restored consumers after reconnect.
-- Analytics endpoints require login but do not check link ownership, including the raw event endpoint. Anonymous detail lookups can expose inactive or expired mappings. This is not a private analytics deployment.
-- Deletion is a soft update. The owner's list still includes inactive rows and omits their status, so a deleted row can reappear after reload. Cached auth and outstanding browser requests also have incomplete expiry, logout, and account-change handling.
+- Short codes come from a pre-generated key pool leased in batches with 60-minute leases; every API instance must use the same `KEY_LEASE_TTL_MS`. Custom codes are 4–10 characters and cannot be reserved route names.
+- Idempotency and rate limiting live in Redis and fail open: during a Redis outage a retried creation can create a duplicate link, and limits are not enforced. Rate limits are per IP and `trust proxy` is not configured.
+- Cache invalidation happens inline after each write (with a 10-second guard against racing refills), not through an outbox; a failed invalidation leaves the cached entry until its TTL, which never exceeds the link's expiry.
+- Click analytics aggregate raw `click_events` rows in PostgreSQL at query time; there are no rollups. Dead-lettered clicks are replayed by hand, and the retry/dead-letter path has only been tested against a fake broker channel.
+- There is no optimistic concurrency (`version`/`If-Match`) on link updates: the last write wins.
+- The seeded `admin@bitly.local` password hash matches no known password; reset it as shown above before using the admin dashboard.
 
-The documentation review checked source, configuration, seed hashes, and document structure. It did not start this application's infrastructure, run its browser suite, or measure production targets. See [Implementation Notes](./architecture.md#implementation-notes) for the precise behavior behind these limits.
+The 2026-10-10 review ran the unit tests, type-checks and builds, and exercised the API against real PostgreSQL 16 and Redis without RabbitMQ. It did not run the browser suite or measure production targets. See [Implementation Notes](./architecture.md#implementation-notes) for the precise behavior behind these limits.

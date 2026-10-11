@@ -8,22 +8,69 @@
 /** Base URL for API endpoints */
 const API_BASE = '/api/v1';
 
-/** Standard API error response structure */
-interface ApiError {
-  error: string;
+/**
+ * Error thrown for failed API calls.
+ * status is the HTTP status, or 0 when no response arrived at all (offline, connection
+ * reset) - in that case the request may or may not have been processed by the server.
+ */
+export class ApiError extends Error {
+  readonly status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+  }
+
+  /** True when the request never got an HTTP response. */
+  get isNetworkError(): boolean {
+    return this.status === 0;
+  }
+}
+
+/**
+ * Whether an error came from an aborted request (AbortController), which callers ignore.
+ * @param error - Any thrown value
+ */
+export function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === 'AbortError';
+}
+
+/**
+ * fetch wrapper that turns transport failures into ApiError(status 0).
+ * Aborts are rethrown unchanged so callers can tell them apart.
+ */
+async function request(input: string, init?: RequestInit): Promise<Response> {
+  try {
+    return await fetch(input, init);
+  } catch (error) {
+    if (isAbortError(error)) {
+      throw error;
+    }
+    throw new ApiError('Network error - check your connection and try again', 0);
+  }
 }
 
 /**
  * Processes fetch responses and handles errors.
- * Parses JSON for success responses, throws Error for failures.
+ * Parses JSON for success responses, throws ApiError for failures (including error
+ * bodies that are not JSON, e.g. a proxy's HTML 502 page).
  * @param response - Fetch Response object
  * @returns Parsed JSON response data
- * @throws Error with message from API or generic error
+ * @throws ApiError with the API's message or a generic one
  */
 async function handleResponse<T>(response: Response): Promise<T> {
   if (!response.ok) {
-    const error: ApiError = await response.json();
-    throw new Error(error.error || 'An error occurred');
+    let message = `Request failed (${response.status})`;
+    try {
+      const body = (await response.json()) as { error?: string };
+      if (body?.error) {
+        message = body.error;
+      }
+    } catch {
+      // Non-JSON error body: keep the generic message
+    }
+    throw new ApiError(message, response.status);
   }
 
   // Handle 204 No Content
@@ -44,7 +91,7 @@ export const api = {
    */
   auth: {
     async login(email: string, password: string) {
-      const response = await fetch(`${API_BASE}/auth/login`, {
+      const response = await request(`${API_BASE}/auth/login`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'include',
@@ -54,7 +101,7 @@ export const api = {
     },
 
     async register(email: string, password: string) {
-      const response = await fetch(`${API_BASE}/auth/register`, {
+      const response = await request(`${API_BASE}/auth/register`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email, password }),
@@ -63,7 +110,7 @@ export const api = {
     },
 
     async logout() {
-      const response = await fetch(`${API_BASE}/auth/logout`, {
+      const response = await request(`${API_BASE}/auth/logout`, {
         method: 'POST',
         credentials: 'include',
       });
@@ -71,7 +118,7 @@ export const api = {
     },
 
     async me() {
-      const response = await fetch(`${API_BASE}/auth/me`, {
+      const response = await request(`${API_BASE}/auth/me`, {
         credentials: 'include',
       });
       return handleResponse<import('../types').User>(response);
@@ -82,10 +129,18 @@ export const api = {
    * URL management endpoints for creating, listing, and managing shortened URLs.
    */
   urls: {
-    async create(data: import('../types').CreateUrlInput) {
-      const response = await fetch(`${API_BASE}/urls`, {
+    /**
+     * Creates a short link. Pass the same idempotencyKey when retrying the same draft:
+     * the server then replays the original result instead of creating a second link.
+     */
+    async create(data: import('../types').CreateUrlInput, options: { idempotencyKey?: string } = {}) {
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (options.idempotencyKey) {
+        headers['Idempotency-Key'] = options.idempotencyKey;
+      }
+      const response = await request(`${API_BASE}/urls`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         credentials: 'include',
         body: JSON.stringify(data),
       });
@@ -93,21 +148,21 @@ export const api = {
     },
 
     async list(limit = 50, offset = 0) {
-      const response = await fetch(`${API_BASE}/urls?limit=${limit}&offset=${offset}`, {
+      const response = await request(`${API_BASE}/urls?limit=${limit}&offset=${offset}`, {
         credentials: 'include',
       });
       return handleResponse<import('../types').UrlsResponse>(response);
     },
 
     async get(shortCode: string) {
-      const response = await fetch(`${API_BASE}/urls/${shortCode}`, {
+      const response = await request(`${API_BASE}/urls/${shortCode}`, {
         credentials: 'include',
       });
       return handleResponse<import('../types').Url>(response);
     },
 
     async update(shortCode: string, data: { is_active?: boolean; expires_at?: string | null }) {
-      const response = await fetch(`${API_BASE}/urls/${shortCode}`, {
+      const response = await request(`${API_BASE}/urls/${shortCode}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'include',
@@ -117,7 +172,7 @@ export const api = {
     },
 
     async delete(shortCode: string) {
-      const response = await fetch(`${API_BASE}/urls/${shortCode}`, {
+      const response = await request(`${API_BASE}/urls/${shortCode}`, {
         method: 'DELETE',
         credentials: 'include',
       });
@@ -129,9 +184,10 @@ export const api = {
    * Analytics endpoints for viewing URL click statistics.
    */
   analytics: {
-    async get(shortCode: string) {
-      const response = await fetch(`${API_BASE}/analytics/${shortCode}`, {
+    async get(shortCode: string, signal?: AbortSignal) {
+      const response = await request(`${API_BASE}/analytics/${shortCode}`, {
         credentials: 'include',
+        signal,
       });
       return handleResponse<import('../types').UrlAnalytics>(response);
     },
@@ -143,14 +199,14 @@ export const api = {
    */
   admin: {
     async getStats() {
-      const response = await fetch(`${API_BASE}/admin/stats`, {
+      const response = await request(`${API_BASE}/admin/stats`, {
         credentials: 'include',
       });
       return handleResponse<import('../types').SystemStats>(response);
     },
 
     async getAnalytics() {
-      const response = await fetch(`${API_BASE}/admin/analytics`, {
+      const response = await request(`${API_BASE}/admin/analytics`, {
         credentials: 'include',
       });
       return handleResponse<import('../types').GlobalAnalytics>(response);
@@ -162,14 +218,14 @@ export const api = {
       if (filters?.is_custom !== undefined) params.set('is_custom', String(filters.is_custom));
       if (filters?.search) params.set('search', filters.search);
 
-      const response = await fetch(`${API_BASE}/admin/urls?${params}`, {
+      const response = await request(`${API_BASE}/admin/urls?${params}`, {
         credentials: 'include',
       });
       return handleResponse<import('../types').UrlsResponse>(response);
     },
 
     async deactivateUrl(shortCode: string) {
-      const response = await fetch(`${API_BASE}/admin/urls/${shortCode}/deactivate`, {
+      const response = await request(`${API_BASE}/admin/urls/${shortCode}/deactivate`, {
         method: 'POST',
         credentials: 'include',
       });
@@ -177,7 +233,7 @@ export const api = {
     },
 
     async reactivateUrl(shortCode: string) {
-      const response = await fetch(`${API_BASE}/admin/urls/${shortCode}/reactivate`, {
+      const response = await request(`${API_BASE}/admin/urls/${shortCode}/reactivate`, {
         method: 'POST',
         credentials: 'include',
       });
@@ -185,14 +241,14 @@ export const api = {
     },
 
     async getUsers(limit = 50, offset = 0) {
-      const response = await fetch(`${API_BASE}/admin/users?limit=${limit}&offset=${offset}`, {
+      const response = await request(`${API_BASE}/admin/users?limit=${limit}&offset=${offset}`, {
         credentials: 'include',
       });
       return handleResponse<import('../types').UsersResponse>(response);
     },
 
     async updateUserRole(userId: string, role: 'user' | 'admin') {
-      const response = await fetch(`${API_BASE}/admin/users/${userId}/role`, {
+      const response = await request(`${API_BASE}/admin/users/${userId}/role`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'include',
@@ -202,14 +258,14 @@ export const api = {
     },
 
     async getKeyPoolStats() {
-      const response = await fetch(`${API_BASE}/admin/key-pool`, {
+      const response = await request(`${API_BASE}/admin/key-pool`, {
         credentials: 'include',
       });
       return handleResponse<import('../types').KeyPoolStats>(response);
     },
 
     async repopulateKeyPool(count = 1000) {
-      const response = await fetch(`${API_BASE}/admin/key-pool/repopulate`, {
+      const response = await request(`${API_BASE}/admin/key-pool/repopulate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'include',

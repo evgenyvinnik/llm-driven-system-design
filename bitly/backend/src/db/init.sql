@@ -35,6 +35,8 @@ CREATE INDEX IF NOT EXISTS idx_unused_keys ON key_pool(is_used) WHERE is_used = 
 -- Click events table: stores detailed click analytics
 CREATE TABLE IF NOT EXISTS click_events (
     id BIGSERIAL PRIMARY KEY,
+    -- Assigned once at the redirect; makes queue redelivery and fallback retries idempotent
+    event_id UUID,
     short_code VARCHAR(10) NOT NULL REFERENCES urls(short_code),
     clicked_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     referrer TEXT,
@@ -44,6 +46,13 @@ CREATE TABLE IF NOT EXISTS click_events (
     city VARCHAR(100),
     device_type VARCHAR(20)
 );
+
+-- Databases created before event_id existed get the column here (no-op on fresh ones).
+-- Seeded and legacy rows keep NULL, which the unique index allows any number of times.
+ALTER TABLE click_events ADD COLUMN IF NOT EXISTS event_id UUID;
+
+-- Deduplication key for INSERT ... ON CONFLICT (event_id) DO NOTHING
+CREATE UNIQUE INDEX IF NOT EXISTS idx_click_events_event_id ON click_events(event_id);
 
 -- Index for analytics queries by short code
 CREATE INDEX IF NOT EXISTS idx_click_events_short_code ON click_events(short_code);
@@ -108,7 +117,14 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- Populate initial key pool with 10,000 keys
-SELECT populate_key_pool(10000);
+-- Populate the key pool with 10,000 keys, but only when it is running low, so that
+-- re-running this script against an existing database does not keep adding keys.
+DO $$
+BEGIN
+    IF (SELECT COUNT(*) FROM key_pool WHERE is_used = false AND allocated_to IS NULL) < 1000 THEN
+        PERFORM populate_key_pool(10000);
+    END IF;
+END
+$$;
 
 -- Seed data is in db-seed/seed.sql

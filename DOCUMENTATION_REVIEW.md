@@ -43,7 +43,7 @@ Implementation Notes describing the code as it is after the changes. [bitly](./b
 | [apple-music](./apple-music/architecture.md) | Pending | — | — |
 | [apple-pay](./apple-pay/architecture.md) | Pending | — | — |
 | [apple-tv](./apple-tv/architecture.md) | Pending | — | — |
-| [bitly](./bitly/architecture.md) | Pending | — | — |
+| [bitly](./bitly/architecture.md) | Done | Creation middleware actually applied; Idempotency-Key with NX claim/409/422/replay; atomic insert + key mark with 23505 retry; expiring key leases + reaper; expiry-bounded cache with invalidation on every write, guard key, negative cache, singleflight; owner-or-admin analytics (IDOR fix); event_id-deduplicated clicks with publisher confirms, retry queue and DLQ; session TTL bound; Redis rate limits; graceful shutdown; frontend idempotency key, store reset, aborts | 132 vitest tests; backend+frontend tsc, lint, build; runtime against PostgreSQL 16 + Redis (no RabbitMQ) |
 | [calendly](./calendly/architecture.md) | Pending | — | — |
 | [coinbase](./coinbase/architecture.md) | Pending | — | — |
 | [collaborative-editor](./collaborative-editor/architecture.md) | Pending | — | — |

@@ -4,29 +4,36 @@
  * This is the main application file that configures and starts the Express server.
  * It sets up middleware, routes, metrics, and handles graceful shutdown.
  */
+import type { Server } from 'http';
 import express, { Request, Response } from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
 import cookieParser from 'cookie-parser';
-import rateLimit from 'express-rate-limit';
 import pinoHttp from 'pino-http';
 
-import { SERVER_CONFIG, RATE_LIMIT_CONFIG } from './config.js';
+import { SERVER_CONFIG, SERVER_ID, SHUTDOWN_TIMEOUT_MS } from './config.js';
 import { testConnection, closePool, isDatabaseConnected, getCircuitBreakerStatus } from './utils/database.js';
 import { closeRedis, isRedisConnected } from './utils/cache.js';
 import { connectQueue, closeQueue, isQueueConnected } from './utils/queue.js';
-import { initKeyService, getLocalCacheCount, getKeyPoolStats } from './services/keyService.js';
+import {
+  initKeyService,
+  getLocalCacheCount,
+  getKeyPoolStats,
+  reclaimStaleKeys,
+  startKeyReclaimer,
+  stopKeyReclaimer,
+} from './services/keyService.js';
+import { waitForPendingClickDispatches } from './services/analyticsService.js';
 import { errorHandler, notFoundHandler } from './middleware/errorHandler.js';
+import { generalLimiter } from './middleware/rateLimit.js';
 import logger from './utils/logger.js';
 import {
   metricsRegistry,
   httpRequestsTotal,
   httpRequestDuration,
-  rateLimitHitsTotal,
   keyPoolAvailable,
   localKeyCacheCount,
 } from './utils/metrics.js';
-import { idempotencyMiddleware } from './utils/idempotency.js';
 
 import authRoutes from './routes/auth.js';
 import urlRoutes from './routes/urls.js';
@@ -102,28 +109,8 @@ app.use((req: Request, res: Response, next) => {
   next();
 });
 
-// Rate limiting
-const generalLimiter = rateLimit({
-  windowMs: RATE_LIMIT_CONFIG.general.windowMs,
-  max: RATE_LIMIT_CONFIG.general.max,
-  message: { error: 'Too many requests, please try again later' },
-  handler: (req, res) => {
-    rateLimitHitsTotal.inc({ endpoint: req.path });
-    res.status(429).json({ error: 'Too many requests, please try again later' });
-  },
-});
-
-const createUrlLimiter = rateLimit({
-  windowMs: RATE_LIMIT_CONFIG.createUrl.windowMs,
-  max: RATE_LIMIT_CONFIG.createUrl.max,
-  message: { error: 'Too many URLs created, please try again later' },
-  handler: (req, res) => {
-    rateLimitHitsTotal.inc({ endpoint: 'create_url' });
-    res.status(429).json({ error: 'Too many URLs created, please try again later' });
-  },
-});
-
-// Apply general rate limit to API routes
+// Apply general rate limit to API routes (Redis-backed, shared by all instances).
+// URL creation has its own stricter limiter inside the urls router.
 app.use('/api', generalLimiter);
 
 /**
@@ -131,12 +118,17 @@ app.use('/api', generalLimiter);
  * Exposes application metrics for scraping by Prometheus.
  */
 app.get('/metrics', async (req: Request, res: Response) => {
+  localKeyCacheCount.set(getLocalCacheCount());
   try {
     // Update key pool metrics before scraping
     const keyStats = await getKeyPoolStats();
     keyPoolAvailable.set(keyStats.available);
-    localKeyCacheCount.set(getLocalCacheCount());
+  } catch (error) {
+    // A database outage must not hide every other metric.
+    logger.warn({ err: error }, 'Key pool stats unavailable for metrics scrape');
+  }
 
+  try {
     res.set('Content-Type', metricsRegistry.contentType);
     res.end(await metricsRegistry.metrics());
   } catch (error) {
@@ -170,7 +162,7 @@ app.get('/health/detailed', async (req: Request, res: Response) => {
   res.status(statusCode).json({
     status,
     timestamp: new Date().toISOString(),
-    server_id: process.env.SERVER_ID || `server-${process.pid}`,
+    server_id: SERVER_ID,
     uptime: process.uptime(),
     dependencies: {
       database: {
@@ -213,13 +205,13 @@ app.get('/ready', async (req: Request, res: Response) => {
 });
 
 // API routes
+// POST /api/v1/urls attaches its creation limiter, auth, and Idempotency-Key handling in
+// the urls router itself: middleware registered after a router that already responded
+// never runs.
 app.use('/api/v1/auth', authRoutes);
 app.use('/api/v1/urls', urlRoutes);
 app.use('/api/v1/analytics', analyticsRoutes);
 app.use('/api/v1/admin', adminRoutes);
-
-// Apply stricter rate limit and idempotency to URL creation
-app.post('/api/v1/urls', createUrlLimiter, idempotencyMiddleware);
 
 // Redirect route (must be last - catches /:shortCode)
 app.use('/', redirectRoutes);
@@ -228,15 +220,38 @@ app.use('/', redirectRoutes);
 app.use(notFoundHandler);
 app.use(errorHandler);
 
+/** HTTP server handle, set once listening. */
+let server: Server | null = null;
+let shuttingDown = false;
+
 /**
  * Handles graceful shutdown of the server.
- * Closes database, Redis, and RabbitMQ connections before exiting.
+ * Stops accepting connections and lets in-flight requests finish, stops the key reaper,
+ * waits for click events whose redirect was already served, then closes RabbitMQ,
+ * PostgreSQL, and Redis. Forces exit if this takes longer than SHUTDOWN_TIMEOUT_MS.
  * @param signal - The signal that triggered the shutdown (SIGTERM or SIGINT)
  */
 async function shutdown(signal: string): Promise<void> {
+  if (shuttingDown) return;
+  shuttingDown = true;
+
   logger.info({ signal }, 'Shutdown signal received, starting graceful shutdown');
+  setTimeout(() => {
+    logger.error({ timeout_ms: SHUTDOWN_TIMEOUT_MS }, 'Graceful shutdown timed out, forcing exit');
+    process.exit(1);
+  }, SHUTDOWN_TIMEOUT_MS).unref();
 
   try {
+    stopKeyReclaimer();
+
+    if (server) {
+      const httpServer = server;
+      // close() stops new connections and resolves once in-flight requests complete
+      // (Node >= 19 also closes idle keep-alive sockets as part of close()).
+      await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+    }
+
+    await waitForPendingClickDispatches(SHUTDOWN_TIMEOUT_MS / 2);
     await closeQueue();
     await closePool();
     await closeRedis();
@@ -248,12 +263,13 @@ async function shutdown(signal: string): Promise<void> {
   }
 }
 
-process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => void shutdown('SIGTERM'));
+process.on('SIGINT', () => void shutdown('SIGINT'));
 
 /**
  * Initializes and starts the HTTP server.
- * Tests database connection, initializes the key service, and connects to RabbitMQ.
+ * Tests the database connection, repairs the key pool, initializes the key service,
+ * and connects to RabbitMQ.
  */
 async function start(): Promise<void> {
   try {
@@ -264,17 +280,24 @@ async function start(): Promise<void> {
       process.exit(1);
     }
 
+    // Release leases stranded by crashed instances before leasing our own batch.
+    try {
+      await reclaimStaleKeys();
+    } catch (error) {
+      logger.error({ err: error }, 'Startup key pool reclaim failed; continuing');
+    }
+
     // Initialize key service
     await initKeyService();
 
-    // Connect to RabbitMQ (optional - will use sync fallback if unavailable)
+    // Connect to RabbitMQ (optional - sync fallback until it is available; reconnects in background)
     const queueConnected = await connectQueue();
     if (!queueConnected) {
       logger.warn('RabbitMQ not available. Click events will be recorded synchronously.');
     }
 
     // Start listening
-    app.listen(SERVER_CONFIG.port, SERVER_CONFIG.host, () => {
+    server = app.listen(SERVER_CONFIG.port, SERVER_CONFIG.host, () => {
       logger.info(
         {
           port: SERVER_CONFIG.port,
@@ -286,6 +309,8 @@ async function start(): Promise<void> {
         'Server started'
       );
     });
+
+    startKeyReclaimer();
   } catch (error) {
     logger.error({ err: error }, 'Failed to start server');
     process.exit(1);

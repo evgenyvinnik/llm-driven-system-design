@@ -1,4 +1,5 @@
 import { query } from '../utils/database.js';
+import { urlCache } from '../utils/cache.js';
 import { getKeyPoolStats } from './keyService.js';
 import { SystemStats, Url } from '../models/types.js';
 
@@ -132,7 +133,13 @@ export async function adminDeactivateUrl(shortCode: string): Promise<boolean> {
     [shortCode]
   );
 
-  return result.length > 0;
+  if (result.length === 0) {
+    return false;
+  }
+
+  // Stop redirects now, not when the cached entry's TTL runs out.
+  await urlCache.invalidate(shortCode);
+  return true;
 }
 
 /**
@@ -147,7 +154,13 @@ export async function adminReactivateUrl(shortCode: string): Promise<boolean> {
     [shortCode]
   );
 
-  return result.length > 0;
+  if (result.length === 0) {
+    return false;
+  }
+
+  // Drop any negative ("not found") entry so the link resolves again immediately.
+  await urlCache.invalidate(shortCode);
+  return true;
 }
 
 /**
@@ -171,14 +184,15 @@ export async function getExpiredUrls(limit: number = 1000): Promise<Url[]> {
  * @returns Promise resolving to the number of URLs deactivated
  */
 export async function cleanupExpiredUrls(): Promise<number> {
-  const result = await query<{ count: string }>(
-    `WITH updated AS (
-       UPDATE urls SET is_active = false
-       WHERE expires_at IS NOT NULL AND expires_at < NOW() AND is_active = true
-       RETURNING *
-     )
-     SELECT COUNT(*) as count FROM updated`
+  const result = await query<{ short_code: string }>(
+    `UPDATE urls SET is_active = false
+     WHERE expires_at IS NOT NULL AND expires_at < NOW() AND is_active = true
+     RETURNING short_code`
   );
 
-  return parseInt(result[0].count, 10);
+  // Cached entries already expire with the link; invalidate anyway so every lifecycle
+  // write goes through the same path.
+  await urlCache.invalidate(result.map((row) => row.short_code));
+
+  return result.length;
 }

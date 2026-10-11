@@ -2,6 +2,7 @@ import { Request, Response, NextFunction } from 'express';
 import { getUserByToken } from '../services/authService.js';
 import { AUTH_CONFIG } from '../config.js';
 import { UserPublic } from '../models/types.js';
+import logger from '../utils/logger.js';
 
 /**
  * Extends the Express Request interface to include an optional user property.
@@ -13,6 +14,15 @@ declare global {
       user?: UserPublic;
     }
   }
+}
+
+/**
+ * Extracts the session token from the session cookie or a Bearer Authorization header.
+ * @param req - Express request object
+ * @returns The token, or undefined when none was presented
+ */
+export function getRequestToken(req: Request): string | undefined {
+  return req.cookies?.[AUTH_CONFIG.cookieName] || req.headers.authorization?.replace('Bearer ', '') || undefined;
 }
 
 /**
@@ -28,17 +38,23 @@ export async function optionalAuth(
   res: Response,
   next: NextFunction
 ): Promise<void> {
-  try {
-    const token = req.cookies?.[AUTH_CONFIG.cookieName] || req.headers.authorization?.replace('Bearer ', '');
+  const token = getRequestToken(req);
+  if (!token) {
+    next();
+    return;
+  }
 
-    if (token) {
-      const user = await getUserByToken(token);
-      if (user) {
-        req.user = user;
-      }
+  try {
+    const user = await getUserByToken(token);
+    if (user) {
+      req.user = user;
     }
-  } catch (_error) {
-    // Ignore auth errors for optional auth
+  } catch (error) {
+    // A credential was presented but could not be checked. Continuing anonymously would
+    // e.g. create an unowned link for a logged-in user, so fail the request instead.
+    logger.error({ err: error }, 'Optional authentication failed');
+    res.status(503).json({ error: 'Authentication service unavailable, please retry' });
+    return;
   }
 
   next();
@@ -58,7 +74,7 @@ export async function requireAuth(
   next: NextFunction
 ): Promise<void> {
   try {
-    const token = req.cookies?.[AUTH_CONFIG.cookieName] || req.headers.authorization?.replace('Bearer ', '');
+    const token = getRequestToken(req);
 
     if (!token) {
       res.status(401).json({ error: 'Authentication required' });
@@ -75,8 +91,8 @@ export async function requireAuth(
     req.user = user;
     next();
   } catch (error) {
-    console.error('Auth error:', error);
-    res.status(500).json({ error: 'Authentication failed' });
+    logger.error({ err: error }, 'Authentication failed');
+    res.status(503).json({ error: 'Authentication service unavailable, please retry' });
   }
 }
 
@@ -94,7 +110,7 @@ export async function requireAdmin(
   next: NextFunction
 ): Promise<void> {
   try {
-    const token = req.cookies?.[AUTH_CONFIG.cookieName] || req.headers.authorization?.replace('Bearer ', '');
+    const token = getRequestToken(req);
 
     if (!token) {
       res.status(401).json({ error: 'Authentication required' });
@@ -116,7 +132,7 @@ export async function requireAdmin(
     req.user = user;
     next();
   } catch (error) {
-    console.error('Auth error:', error);
-    res.status(500).json({ error: 'Authentication failed' });
+    logger.error({ err: error }, 'Authentication failed');
+    res.status(503).json({ error: 'Authentication service unavailable, please retry' });
   }
 }

@@ -1,8 +1,25 @@
-import { query } from '../utils/database.js';
-import { urlCache } from '../utils/cache.js';
+import { query, withTransaction } from '../utils/database.js';
+import { urlCache, isCachedUrlLive, CachedUrl } from '../utils/cache.js';
 import { SERVER_CONFIG, URL_CONFIG } from '../config.js';
-import { Url, CreateUrlInput, UrlResponse } from '../models/types.js';
+import { Url, CreateUrlInput, UrlResponse, UserPublic } from '../models/types.js';
 import { getNextKey, markKeyAsUsed, isCodeAvailable } from './keyService.js';
+import { HttpError, PG_UNIQUE_VIOLATION, pgErrorCode } from '../utils/errors.js';
+import logger from '../utils/logger.js';
+
+/**
+ * Shape every stored short code has (generated codes are 7 base62 characters, custom
+ * codes 4-10 of [A-Za-z0-9_-]; the column is VARCHAR(10)). Anything else cannot exist,
+ * so the redirect path rejects it without touching Redis or PostgreSQL.
+ */
+const SHORT_CODE_PATTERN = /^[A-Za-z0-9_-]{1,10}$/;
+
+/**
+ * Checks whether a string could be a stored short code.
+ * @param code - Candidate code from the request path
+ */
+export function isWellFormedShortCode(code: string): boolean {
+  return SHORT_CODE_PATTERN.test(code);
+}
 
 /**
  * Validates that a string is a properly formatted HTTP/HTTPS URL.
@@ -20,15 +37,18 @@ function isValidUrl(url: string): boolean {
 
 /**
  * Validates a custom short code against format and policy rules.
+ * Length matches the urls.short_code VARCHAR(10) column; reserved words are checked
+ * case-insensitively because Express routes match case-insensitively.
  * @param code - The custom code to validate
  * @returns Object with valid flag and optional error message
  */
-function isValidCustomCode(code: string): { valid: boolean; error?: string } {
-  if (code.length < 4) {
-    return { valid: false, error: 'Custom code must be at least 4 characters' };
+export function validateCustomCode(code: string): { valid: boolean; error?: string } {
+  const { customCodeMinLength, customCodeMaxLength } = URL_CONFIG;
+  if (code.length < customCodeMinLength) {
+    return { valid: false, error: `Custom code must be at least ${customCodeMinLength} characters` };
   }
-  if (code.length > 20) {
-    return { valid: false, error: 'Custom code must be at most 20 characters' };
+  if (code.length > customCodeMaxLength) {
+    return { valid: false, error: `Custom code must be at most ${customCodeMaxLength} characters` };
   }
   if (!/^[a-zA-Z0-9_-]+$/.test(code)) {
     return { valid: false, error: 'Custom code can only contain letters, numbers, underscores, and hyphens' };
@@ -37,6 +57,29 @@ function isValidCustomCode(code: string): { valid: boolean; error?: string } {
     return { valid: false, error: 'This short code is reserved' };
   }
   return { valid: true };
+}
+
+/**
+ * Validates the optional expires_in field (seconds from now).
+ * Absent/null means "never expires"; anything else must be a positive, bounded number,
+ * so a link can never be created already expired.
+ * @param expiresIn - Raw value from the request body
+ * @returns Parsed seconds (or null for no expiry), or a validation error
+ */
+export function validateExpiresIn(
+  expiresIn: unknown
+): { valid: true; seconds: number | null } | { valid: false; error: string } {
+  if (expiresIn === undefined || expiresIn === null) {
+    return { valid: true, seconds: null };
+  }
+  const seconds = typeof expiresIn === 'string' && expiresIn.trim() !== '' ? Number(expiresIn) : expiresIn;
+  if (typeof seconds !== 'number' || !Number.isFinite(seconds) || seconds <= 0) {
+    return { valid: false, error: 'expires_in must be a positive number of seconds' };
+  }
+  if (seconds > URL_CONFIG.maxExpiresInSeconds) {
+    return { valid: false, error: `expires_in must be at most ${URL_CONFIG.maxExpiresInSeconds} seconds` };
+  }
+  return { valid: true, seconds };
 }
 
 /**
@@ -52,9 +95,84 @@ function toUrlResponse(url: Url): UrlResponse {
     long_url: url.long_url,
     created_at: url.created_at.toISOString(),
     expires_at: url.expires_at ? url.expires_at.toISOString() : null,
-    click_count: url.click_count,
+    // BIGINT arrives from node-postgres as a string
+    click_count: Number(url.click_count),
     is_custom: url.is_custom,
+    is_active: url.is_active,
   };
+}
+
+/**
+ * Builds the redirect cache entry for a row.
+ * @param url - Row with destination and expiry
+ */
+function toCachedUrl(url: Pick<Url, 'long_url' | 'expires_at'>): CachedUrl {
+  return {
+    url: url.long_url,
+    expiresAt: url.expires_at ? url.expires_at.getTime() : null,
+  };
+}
+
+/**
+ * Inserts the urls row and, for pool keys, marks the key used, in ONE transaction.
+ * Either both happen or neither does, so a failure can no longer leave a live link whose
+ * key is still leasable (or report an error for a link that was actually created).
+ * @returns The inserted row
+ * @throws The pg error (code 23505 on a short code collision)
+ */
+async function insertUrl(
+  shortCode: string,
+  longUrl: string,
+  userId: string | null,
+  expiresAt: Date | null,
+  isCustom: boolean
+): Promise<Url> {
+  return withTransaction(async (client) => {
+    const result = await client.query<Url>(
+      `INSERT INTO urls (short_code, long_url, user_id, expires_at, is_custom)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING *`,
+      [shortCode, longUrl, userId, expiresAt, isCustom]
+    );
+
+    if (!isCustom) {
+      await markKeyAsUsed(shortCode, client);
+    }
+
+    return result.rows[0];
+  });
+}
+
+/**
+ * Creates a link with a pool-generated code, retrying with a fresh code when the
+ * urls primary key reports a collision (a custom code, random fallback, or reclaimed
+ * lease that is already taken). Bounded by URL_CONFIG.maxCreateAttempts.
+ */
+async function insertWithGeneratedCode(
+  longUrl: string,
+  userId: string | null,
+  expiresAt: Date | null
+): Promise<Url> {
+  for (let attempt = 1; ; attempt++) {
+    const shortCode = await getNextKey();
+    try {
+      return await insertUrl(shortCode, longUrl, userId, expiresAt, false);
+    } catch (error) {
+      if (pgErrorCode(error) !== PG_UNIQUE_VIOLATION) {
+        throw error;
+      }
+
+      logger.warn({ short_code: shortCode, attempt }, 'Generated short code collided, retrying');
+      // The code exists in urls already: make sure no instance leases it again.
+      await markKeyAsUsed(shortCode).catch((markError) => {
+        logger.error({ err: markError, short_code: shortCode }, 'Failed to retire collided key');
+      });
+
+      if (attempt >= URL_CONFIG.maxCreateAttempts) {
+        throw new HttpError(503, 'Could not allocate a unique short code, please retry');
+      }
+    }
+  }
 }
 
 /**
@@ -63,101 +181,144 @@ function toUrlResponse(url: Url): UrlResponse {
  * Validates input, persists to database, and caches the mapping.
  * @param input - URL creation parameters
  * @returns Promise resolving to the created URL response
- * @throws Error if validation fails or custom code is taken
+ * @throws HttpError(400) on invalid input, HttpError(409) if the custom code is taken
  */
 export async function createUrl(input: CreateUrlInput): Promise<UrlResponse> {
   const { long_url, custom_code, expires_in, user_id } = input;
 
   // Validate URL
-  if (!isValidUrl(long_url)) {
-    throw new Error('Invalid URL format');
+  if (typeof long_url !== 'string' || !isValidUrl(long_url)) {
+    throw new HttpError(400, 'Invalid URL format');
   }
 
   if (long_url.length > URL_CONFIG.maxUrlLength) {
-    throw new Error(`URL exceeds maximum length of ${URL_CONFIG.maxUrlLength} characters`);
+    throw new HttpError(400, `URL exceeds maximum length of ${URL_CONFIG.maxUrlLength} characters`);
   }
 
-  let shortCode: string;
-  let isCustom = false;
+  const expiry = validateExpiresIn(expires_in);
+  if (!expiry.valid) {
+    throw new HttpError(400, expiry.error);
+  }
+  const expiresAt = expiry.seconds === null ? null : new Date(Date.now() + expiry.seconds * 1000);
 
-  if (custom_code) {
-    // Validate custom code
-    const validation = isValidCustomCode(custom_code);
-    if (!validation.valid) {
-      throw new Error(validation.error);
+  let created: Url;
+
+  if (custom_code !== undefined && custom_code !== null && custom_code !== '') {
+    if (typeof custom_code !== 'string') {
+      throw new HttpError(400, 'custom_code must be a string');
     }
 
-    // Check availability
+    const validation = validateCustomCode(custom_code);
+    if (!validation.valid) {
+      throw new HttpError(400, validation.error ?? 'Invalid custom code');
+    }
+
+    // Friendly pre-check (also rejects codes still sitting in the key pool); the primary
+    // key below is what actually closes the check-then-insert race.
     const available = await isCodeAvailable(custom_code);
     if (!available) {
-      throw new Error('This custom code is already taken');
+      throw new HttpError(409, 'This custom code is already taken');
     }
 
-    shortCode = custom_code;
-    isCustom = true;
+    try {
+      created = await insertUrl(custom_code, long_url, user_id ?? null, expiresAt, true);
+    } catch (error) {
+      if (pgErrorCode(error) === PG_UNIQUE_VIOLATION) {
+        throw new HttpError(409, 'This custom code is already taken');
+      }
+      throw error;
+    }
   } else {
-    // Get a key from the pool
-    shortCode = await getNextKey();
+    created = await insertWithGeneratedCode(long_url, user_id ?? null, expiresAt);
   }
 
-  // Calculate expiration
-  let expiresAt: Date | null = null;
-  if (expires_in) {
-    expiresAt = new Date(Date.now() + expires_in * 1000);
-  }
+  // Warm the redirect cache and clear any "not found" entry left by earlier probes.
+  await urlCache.prime(created.short_code, toCachedUrl(created));
 
-  // Insert into database
-  const result = await query<Url>(
-    `INSERT INTO urls (short_code, long_url, user_id, expires_at, is_custom)
-     VALUES ($1, $2, $3, $4, $5)
-     RETURNING *`,
-    [shortCode, long_url, user_id || null, expiresAt, isCustom]
-  );
-
-  // Mark key as used if from pool
-  if (!isCustom) {
-    await markKeyAsUsed(shortCode);
-  }
-
-  // Cache the URL mapping
-  await urlCache.set(shortCode, long_url);
-
-  return toUrlResponse(result[0]);
+  return toUrlResponse(created);
 }
 
 /**
- * Retrieves the long URL for a short code (used for redirects).
- * Checks cache first, falls back to database on cache miss.
- * Returns null for inactive or expired URLs.
- * @param shortCode - The short code to look up
- * @returns Promise resolving to the long URL or null if not found
+ * Outcome of resolving a short code on the redirect path.
+ * `source` says which tier answered: Redis (positive or negative entry), PostgreSQL,
+ * or the syntax check for codes that cannot exist.
  */
-export async function getUrlByShortCode(shortCode: string): Promise<string | null> {
-  // Check cache first
-  const cached = await urlCache.get(shortCode);
-  if (cached) {
-    return cached;
+export type RedirectResolution =
+  | { found: true; longUrl: string; source: 'cache' | 'database' }
+  | { found: false; source: 'cache' | 'database' | 'invalid' };
+
+/**
+ * Database reads in flight on this instance, keyed by short code (single-flight).
+ */
+const inflightLookups = new Map<string, Promise<CachedUrl | null>>();
+
+/**
+ * Reads a redirectable link from PostgreSQL and back-fills the cache.
+ * Concurrent misses for the same code on this instance share one query, so a hot link
+ * whose cache entry just expired produces one database read, not one per request.
+ * Cache writes are fire-and-forget: they never delay the redirect.
+ * @param shortCode - Code to load
+ * @returns Destination and expiry, or null if the code does not resolve
+ */
+function loadForRedirect(shortCode: string): Promise<CachedUrl | null> {
+  const existing = inflightLookups.get(shortCode);
+  if (existing) {
+    return existing;
   }
 
-  // Cache miss - query database
-  const result = await query<Url>(
-    `SELECT * FROM urls
-     WHERE short_code = $1
-     AND is_active = true
-     AND (expires_at IS NULL OR expires_at > NOW())`,
-    [shortCode]
-  );
+  const lookup = (async (): Promise<CachedUrl | null> => {
+    const rows = await query<Pick<Url, 'long_url' | 'expires_at'>>(
+      `SELECT long_url, expires_at FROM urls
+       WHERE short_code = $1
+       AND is_active = true
+       AND (expires_at IS NULL OR expires_at > NOW())`,
+      [shortCode]
+    );
 
-  if (result.length === 0) {
-    return null;
+    if (rows.length === 0) {
+      void urlCache.fillNegative(shortCode);
+      return null;
+    }
+
+    const entry = toCachedUrl(rows[0]);
+    void urlCache.fill(shortCode, entry);
+    return entry;
+  })().finally(() => {
+    inflightLookups.delete(shortCode);
+  });
+
+  inflightLookups.set(shortCode, lookup);
+  return lookup;
+}
+
+/**
+ * Resolves a short code for a redirect. This is the only lookup the redirect route uses.
+ * Order: syntax check, Redis (positive entry with expiry enforced, then negative entry),
+ * then a single-flight PostgreSQL read that only returns active, unexpired links.
+ * @param shortCode - The short code to look up
+ * @returns Resolution with the destination when found
+ */
+export async function resolveShortCode(shortCode: string): Promise<RedirectResolution> {
+  if (!isWellFormedShortCode(shortCode)) {
+    return { found: false, source: 'invalid' };
   }
 
-  const url = result[0];
+  const cached = await urlCache.lookup(shortCode);
+  if (cached.entry) {
+    if (isCachedUrlLive(cached.entry, Date.now())) {
+      return { found: true, longUrl: cached.entry.url, source: 'cache' };
+    }
+    // Cached before it expired; the TTL is about to remove it.
+    return { found: false, source: 'cache' };
+  }
+  if (cached.negative) {
+    return { found: false, source: 'cache' };
+  }
 
-  // Update cache
-  await urlCache.set(shortCode, url.long_url);
-
-  return url.long_url;
+  const entry = await loadForRedirect(shortCode);
+  return entry
+    ? { found: true, longUrl: entry.url, source: 'database' }
+    : { found: false, source: 'database' };
 }
 
 /**
@@ -183,6 +344,35 @@ export async function getUrlDetails(shortCode: string, userId?: string): Promise
   }
 
   return toUrlResponse(result[0]);
+}
+
+/**
+ * Looks up who owns a link (null for links created anonymously).
+ * @param shortCode - The short code to look up
+ * @returns The owner row, or null if the code does not exist
+ */
+export async function getUrlOwner(shortCode: string): Promise<{ user_id: string | null } | null> {
+  const rows = await query<{ user_id: string | null }>(
+    `SELECT user_id FROM urls WHERE short_code = $1`,
+    [shortCode]
+  );
+  return rows[0] ?? null;
+}
+
+/**
+ * Owner-or-admin rule for per-link data such as analytics (which include raw IPs and
+ * user agents). Anonymous links have no owner, so only admins can read them.
+ * @param ownerId - The link's user_id
+ * @param user - The authenticated user
+ */
+export function canAccessUrl(ownerId: string | null, user: Pick<UserPublic, 'id' | 'role'> | undefined): boolean {
+  if (!user) {
+    return false;
+  }
+  if (user.role === 'admin') {
+    return true;
+  }
+  return ownerId !== null && ownerId === user.id;
 }
 
 /**
@@ -219,10 +409,11 @@ export async function getUserUrls(
 
 /**
  * Updates a URL's active status or expiration.
- * Invalidates cache when URL is deactivated.
+ * Any change invalidates the redirect cache: deactivation must stop redirects, and an
+ * expiry change alters what the cached entry is allowed to serve.
  * @param shortCode - The short code of the URL to update
  * @param userId - The owner's user ID (for authorization)
- * @param updates - Object with optional is_active and expires_at fields
+ * @param updates - Object with optional is_active and expires_at (null clears the expiry)
  * @returns Promise resolving to updated URL or null if not found/unauthorized
  */
 export async function updateUrl(
@@ -262,10 +453,7 @@ export async function updateUrl(
     return null;
   }
 
-  // Invalidate cache
-  if (updates.is_active === false) {
-    await urlCache.delete(shortCode);
-  }
+  await urlCache.invalidate(shortCode);
 
   return toUrlResponse(result[0]);
 }
@@ -284,21 +472,9 @@ export async function deleteUrl(shortCode: string, userId: string): Promise<bool
   );
 
   if (result.length > 0) {
-    await urlCache.delete(shortCode);
+    await urlCache.invalidate(shortCode);
     return true;
   }
 
   return false;
-}
-
-/**
- * Increments the click count for a URL.
- * Called asynchronously during redirects to avoid blocking.
- * @param shortCode - The short code that was clicked
- */
-export async function incrementClickCount(shortCode: string): Promise<void> {
-  await query(
-    `UPDATE urls SET click_count = click_count + 1 WHERE short_code = $1`,
-    [shortCode]
-  );
 }

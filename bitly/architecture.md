@@ -318,10 +318,10 @@ The local API is mounted under `/api/v1` with the redirect at the root; see [Imp
 |--------|------|---------|
 | POST | `/api/v1/auth/register`, `/login`, `/logout` | Session auth (cookie, also returns a bearer token) |
 | GET | `/api/v1/auth/me` | Current user |
-| POST | `/api/v1/urls` | Create a link (optional auth, custom code, `expires_in` seconds) |
-| GET | `/api/v1/urls` | Owner's links (`limit`/`offset`) |
-| GET, PATCH, DELETE | `/api/v1/urls/:shortCode` | Details, update `is_active`/`expires_at`, soft delete |
-| GET | `/api/v1/analytics/:shortCode`, `/clicks` | Aggregates and raw events |
+| POST | `/api/v1/urls` | Create a link (optional auth, custom code, `expires_in` seconds, optional `Idempotency-Key`) → `201`, `400` invalid, `409` code taken or key in flight, `422` key reused with another body |
+| GET | `/api/v1/urls` | Owner's links (`limit`/`offset`, clamped) |
+| GET, PATCH, DELETE | `/api/v1/urls/:shortCode` | Details, update `is_active`/`expires_at` (`null` clears it), soft delete |
+| GET | `/api/v1/analytics/:shortCode`, `/clicks` | Aggregates and raw events; owner or admin only (`403` otherwise) |
 | GET, POST, PATCH | `/api/v1/admin/...` | Stats, URL/user management, key pool, expired-link cleanup |
 | GET | `/:shortCode` | `302` redirect |
 | GET | `/health`, `/health/detailed`, `/ready`, `/metrics` | Operations |
@@ -409,97 +409,96 @@ Read-your-writes for a brand-new link holds because creation writes the cache, a
 
 ## Implementation Notes
 
-### Actual runtime and data setup
+The local project runs all three journeys — create, redirect, count — on a single-node stack: one Express process, one analytics worker, PostgreSQL 16, Valkey 7 and RabbitMQ 3 from [`docker-compose.yml`](./docker-compose.yml), and a React 18 + TanStack Router + Zustand dashboard. This section maps the production design above to what the code does today (last reviewed 2026-10-10).
 
-[The API entry point](./backend/src/index.ts) serves authentication, URL management, analytics, administration, redirects, and operational endpoints in one Express process. [The worker](./backend/src/workers/analytics-worker.ts) is separate. The browser runs React 18 and uses Zustand plus direct fetch calls; there is no server-query cache library or live event transport.
+### Production design → local implementation
 
-[Compose](./docker-compose.yml) starts PostgreSQL 16, Valkey 7 with AOF, and RabbitMQ 3 management. Only PostgreSQL and Valkey have named data volumes. The schema initializes fresh PostgreSQL volumes, and each manual schema execution attempts to add more keys. There are no automatic users or migrations. The optional SQL fixture has nine links and 1,146 events; repeated seeding appends events while retaining existing counters. The administrator hash requires an explicit local reset for a known password, as shown in the README.
+| Production design | Local implementation | Where |
+|-------------------|----------------------|-------|
+| Link API and Redirect Service as separate pools | One Express app; `/api/v1/*` routers plus the root-mounted redirect | [index.ts](./backend/src/index.ts), [routes/](./backend/src/routes/) |
+| Random code + unique insert | Pre-generated key pool leased in batches of 100, with expiring leases and a reaper | [keyService.ts](./backend/src/services/keyService.ts) |
+| L1 + Redis + read replicas | Redis cache-aside with expiry-bounded TTLs, a negative cache and per-process request coalescing; no in-process L1, no replicas | [urlService.ts](./backend/src/services/urlService.ts), [cache.ts](./backend/src/utils/cache.ts) |
+| Outbox + pub/sub + versioned tombstones | Inline invalidation after every lifecycle write, plus a 10-second guard key that blocks racing refills | [cache.ts](./backend/src/utils/cache.ts) |
+| Kafka → consumers → ClickHouse | RabbitMQ with publisher confirms → worker → `click_events` in PostgreSQL, deduplicated by `event_id`; retry queue and dead-letter queue | [queue.ts](./backend/src/utils/queue.ts), [clickEvents.ts](./backend/src/utils/clickEvents.ts), [analytics-worker.ts](./backend/src/workers/analytics-worker.ts) |
+| `Idempotency-Key` on create | Implemented as described in [Consistency and Idempotency](#consistency-and-idempotency) | [idempotency.ts](./backend/src/utils/idempotency.ts) |
+| Rate limits in Redis | Redis fixed-window store for express-rate-limit, `RateLimit` draft-7 headers | [rateLimit.ts](./backend/src/middleware/rateLimit.ts) |
+| `version` + `If-Match` | Not implemented: last write wins | — |
+| Rollups with `as_of` | Aggregation queries over raw `click_events` at read time | [analyticsService.ts](./backend/src/services/analyticsService.ts) |
 
-[Configuration](./backend/src/config.ts) defaults to API port 3000 and independently defaults `BASE_URL` to that address. Server variants use ports 3001–3003 without adjusting generated URLs or the Vite proxy. There is no load balancer, `.env` loader, or background cleanup service.
+### Short codes: why the local build uses a key pool
 
-### Creation and the actual key pool
-
-[The key service](./backend/src/services/keyService.ts) stores a batch in a process-local array. Allocation uses one transactional `UPDATE` over rows selected with `FOR UPDATE SKIP LOCKED`, preventing two current allocators from claiming the same pool row. The similarly named Redis `keyPoolCache` helper is unused.
+The production design argues for random codes; the local build deliberately implements the key-pool alternative because its failure modes are the interesting part to study. An instance leases 100 unused codes in one statement, and `SKIP LOCKED` lets concurrent instances refill without queueing behind each other:
 
 ```sql
-SELECT short_code FROM key_pool
-WHERE is_used = false AND allocated_to IS NULL
-LIMIT $1 FOR UPDATE SKIP LOCKED
+UPDATE key_pool SET is_used = false, allocated_to = $1, allocated_at = NOW()
+WHERE short_code IN (
+  SELECT short_code FROM key_pool
+  WHERE is_used = false AND allocated_to IS NULL
+  LIMIT $2 FOR UPDATE SKIP LOCKED)
+RETURNING short_code
 ```
 
-This pattern amortizes reservation across a batch; it still coordinates in PostgreSQL. Startup claims 100 keys. Every request awaits refill below 50 remaining keys, so refill is synchronous on that path, not a background task. Concurrent refill calls are not coalesced. There is no automatic pool generator or allocated-key expiry/reaper. Crashed processes strand unused reservations; reclaiming by age alone would be unsafe if a previous holder resumed.
+- **Leases expire.** A lease lasts `KEY_LEASE_TTL_MS` (60 min). Each instance stamps the batch before leasing and discards local keys 10 minutes before expiry, so a paused process doesn't use a code that may have been handed out again. `reclaimStaleKeys()` runs at startup and every 5 minutes: it marks pool rows already present in `urls` as used, and releases unused leases older than the TTL. The TTL must be identical on every instance.
+- **Creation is atomic.** The `urls` insert and marking the key used share one transaction. A unique violation (`23505`) on a generated code retires that key and retries with a fresh one, up to three times, then returns `503`. The empty-pool fallback draws from `crypto.randomInt`.
+- **Custom codes** are 4–10 characters from `[A-Za-z0-9_-]` (the column is `VARCHAR(10)`), not a reserved word (`api`, `admin`, `metrics`, `ready`, `dashboard`, …), and checked against both `urls` and `key_pool`; the primary key still decides races, returning `409`.
+- **Remaining limits:** custom codes are not registered in `key_pool`, so the generator can still mint one (the `23505` retry handles it); the reaper's "mark used" step scans all unused pool rows, fine for 10,000 keys but not for billions.
 
-When both local and database pools are empty, generation falls back to `Math.random` without reservation or collision retry. SQL pool generation uses `random()` and checks only pool uniqueness. Custom-alias preflight checks both tables, but races with subsequent generation remain; the final URL primary key can reject a collision. A generated/custom common namespace is not enforced as one atomic claim.
+### Redirect path
 
-[URL creation](./backend/src/services/urlService.ts) commits the mapping, then marks a generated key used, then awaits a cache write whose errors are swallowed. A key-mark failure can report 400 after the link already exists. The configured 365-day default expiration is unused; absent or zero duration means no expiration, and negative values can create already-expired rows that are nevertheless cached.
-
-URL validation checks HTTP(S) syntax and 2,048 JavaScript string units, not reachability or reputation. It lacks a complete input schema. Custom codes allow 4–20 characters while both tables allow 10; `metrics` and `ready` are not reserved and collide with earlier routes. Destinations are stored as supplied. PATCH cannot clear expiration with null because the route converts null to undefined.
-
-### Redirect cache and lifecycle gaps
-
-[The redirect router](./backend/src/routes/redirect.ts) uses its own lookup helper; the similar URL-service lookup is not the called implementation. [Mapping cache](./backend/src/utils/cache.ts) reads a destination string, with no expiry, active flag, or revision:
+`resolveShortCode()` is the only lookup the redirect route uses. One `MGET` reads the positive entry `url:{code}` and the negative entry `url:neg:{code}`; a positive hit is served only if its `expiresAt` hasn't passed. On a miss, concurrent requests for the same code in one process share a single PostgreSQL query. Fills never outlive the link:
 
 ```typescript
-const result = await redis.get(`url:${shortCode}`);
-await redis.setex(`url:${shortCode}`, ttl || CACHE_CONFIG.urlTTL, longUrl);
+// backend/src/utils/ttl.ts — 0 means "don't cache"
+if (expiresAtMs === null) return maxTtlSeconds;
+const remainingSeconds = Math.floor((expiresAtMs - nowMs) / 1000);
+return remainingSeconds <= 0 ? 0 : Math.min(maxTtlSeconds, remainingSeconds);
 ```
 
-The default TTL is 86,400 seconds. Only a miss reaches SQL's active/expiration predicates. Creation warms this cache regardless of expiration. Owner deletion or an explicit owner `is_active: false` update deletes it; expiry changes and [administrator status/cleanup writes](./backend/src/services/adminService.ts) do not. An in-flight old SQL read can refill after deletion. The current cache therefore has neither correct expiration nor the proposed five-second deactivation bound.
+- Unknown, inactive and expired codes are cached negatively for 60 seconds. Codes that cannot exist (wrong length or characters, such as `favicon.ico`) return `404` without touching Redis or PostgreSQL.
+- Every lifecycle write — owner update or delete, admin deactivate or reactivate, expired-link cleanup — deletes both cache entries and sets a 10-second guard key `url:inv:{code}` in one `MULTI`. Fills are Lua scripts that write only while no guard exists, so a lookup that read the old row cannot put it back.
+- Both `302` and `404` responses carry `Cache-Control: private, no-store`.
+- **Remaining limits:** coalescing works within one process only; a failed invalidation is logged and the entry lives until its TTL; a lookup stalled for more than 10 seconds could still write a stale entry; for 10 seconds after a write, misses for that code go to PostgreSQL.
 
-The response uses 302 without explicit Cache-Control. No human-visit proof follows from that status. Invalid, inactive, and expired cold lookups all return 404; dependency failures can return 500. Redis mapping errors become misses only after client retry behavior, and an awaited failed cache set can also delay a response.
+### Click pipeline
 
-### Click delivery and aggregation
+The redirect assigns `event_id = crypto.randomUUID()` and dispatches the click after `res.redirect()`. Publishing uses a RabbitMQ confirm channel; a broker nack, a closed channel or a 5-second timeout falls back to inserting directly, and a full socket buffer waits up to 2 seconds for `drain` before falling back. Both paths persist through one function, so a redelivery, or a late confirm racing the fallback, never double counts:
 
-The router schedules both queue publication and its SQL fallback with `setImmediate`, after choosing the redirect response. The fallback named `recordClickSync` is deferred too; it does not synchronously delay that response, though it consumes shared database capacity. A process failure before the callback loses the observation.
+```sql
+-- backend/src/services/analyticsService.ts, inside one transaction
+INSERT INTO click_events (event_id, short_code, referrer, user_agent, ip_address, device_type, clicked_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7)
+ON CONFLICT (event_id) DO NOTHING RETURNING id;
+-- only if a row was inserted:
+UPDATE urls SET click_count = click_count + 1 WHERE short_code = $1;
+```
 
-[Queue wiring](./backend/src/utils/queue.ts) declares durable `click-events` with a 24-hour message TTL and sends persistent messages through a plain channel. It uses no publisher confirms. Publisher confirmation and consumer acknowledgement cover different legs of delivery. [RabbitMQ's acknowledgement guide](https://www.rabbitmq.com/docs/confirms) explains that distinction.
+- **Retries without poison loops.** The main `click-events` queue keeps its original arguments (changing them would break `assertQueue` on existing brokers). A transient failure republishes a copy to `click-events.retry` with `x-retry-count + 1` and a 10-second per-message expiration that dead-letters it back to `click-events`; after five attempts — or immediately for malformed messages and SQLSTATE class 22/23 errors — it goes to `click-events.dlq` with the reason in its headers.
+- **Reconnects.** Connection attempts back off from 5 to 60 seconds, a closed channel recycles the connection, and the consumer is re-attached after every reconnect. The worker waits for the broker indefinitely instead of exiting.
+- **Reports** aggregate raw `click_events` at query time; hourly buckets use `date_trunc('hour', clicked_at)`. Analytics endpoints require the link's owner or an administrator (`403` otherwise).
+- **Remaining limits:** a crash between responding and dispatching loses that click (there is no outbox); retries use a fixed delay; dead letters are replayed by hand; seeded rows have a null `event_id`. The retry and dead-letter logic is covered by tests against a fake amqplib channel but was not run against a live broker in the 2026-10 review.
 
-The router ignores the publisher's boolean result when a connection appeared available, so publication failure does not trigger its SQL fallback. The underlying `sendToQueue` boolean is a buffer-flow signal, not a durable receipt; false requires handling backpressure, not assuming the event was never sent. See the [amqplib channel API](https://amqp-node.github.io/amqplib/channel_api.html#channel_sendToQueue).
+### Creation and idempotency
 
-Events contain code, timestamp, referrer, user agent, raw request IP, and a heuristic device type. There is no event ID, deduplication, IP hashing, geolocation, or unique-visitor algorithm. Country/city columns are not populated by this path.
+`POST /api/v1/urls` runs the creation rate limiter, optional authentication, then the idempotency middleware. With an `Idempotency-Key` header, the key is claimed in Redis with `SET … NX EX 60` under `idempotency:{user or anonymous}:{key}`, storing a SHA-256 fingerprint of the method, path and body. A completed key replays the stored `2xx` response with `Idempotent-Replayed: true`; a key still in flight returns `409` with `Retry-After: 1`; the same key with a different body returns `422`; a non-`2xx` result releases the claim so the client can retry. Without the header, two identical requests create two links. **Limit:** the middleware fails open — during a Redis outage a retried create can produce a duplicate.
 
-The worker prefetches 10 messages but processes each with separate click INSERT and counter UPDATE statements. This is concurrent delivery, not batch insertion. Failure between writes leaves divergent counts; redelivery can duplicate an insert or both effects. Poisoned messages are requeued without backoff, attempt limits, or a dead-letter destination and can churn until TTL expiry.
+The dashboard generates one key per submitted draft and reuses it when the same draft is resubmitted after a failure; a changed draft gets a new key.
 
-Initial worker connection retries are bounded. A later connection-close callback reconnects the channel but does not restore the consumer. Broker connectivity can appear healthy while the worker no longer drains events. There is no automatic replay from another retained source.
+### Authentication, authorization and rate limiting
 
-[Analytics queries](./backend/src/services/analyticsService.ts) read raw PostgreSQL events directly. Total/referrer/device counts are all-time; daily activity covers the recent 30-day window and omits empty days. Queries run separately without a common snapshot. Global hourly grouping uses hour number without date, merging partial hours across the last-24-hour boundary and sorting by clock hour. There are no rollups, analytics cache, ClickHouse instance, or raw-event retention job.
+- bcrypt (10 rounds) and UUID session tokens stored in PostgreSQL and cached in Valkey with a TTL equal to the session's remaining lifetime; the cookie is `HttpOnly`, `SameSite=Lax`, `Secure` in production. Logout evicts Redis, deletes the SQL row, then evicts again, returning `503` if revocation could not be confirmed.
+- Owner checks on list, update, delete and analytics; administrators can manage any link.
+- Two Redis-backed limiters shared across instances: 200 requests/minute on `/api` and 100 creations/hour, per IP, with `RateLimit-Policy` and `RateLimit` headers. They skip limiting while Redis is down. `trust proxy` is not configured, so behind a proxy every client would share one IP.
+- The seeded `admin@bitly.local` hash matches no known password; reset it before using the admin dashboard (see the [README](./README.md)).
 
-The admin total-click statistic sums denormalized URL counters, while other totals count events. Active URL statistics ignore expiration. Pool-used counts do not include custom links. These quantities can disagree even without a display bug.
+### Operations
 
-### Authentication, authorization, and browser behavior
+[metrics.ts](./backend/src/utils/metrics.ts) exports request latency, cache hits and misses, redirect outcomes, key-pool state (`key_pool_reclaimed_total`), click dispatch path (`click_event_dispatch_total`), duplicates, retries and dead letters (the worker serves its own metrics on `WORKER_METRICS_PORT`). Pino writes structured logs. `/health`, `/health/detailed`, `/ready` and `/metrics` are served by the API. Plain queries go through an Opossum circuit breaker; transactions bypass it. Shutdown stops the reaper, closes the HTTP server, waits for pending click dispatches, then closes RabbitMQ, PostgreSQL and Redis, with a forced exit after 10 seconds.
 
-[Authentication](./backend/src/services/authService.ts) uses bcrypt with 10 rounds and UUID session tokens. SQL sessions expire after seven days; Redis maps tokens to user IDs for seven days. The cookie is HttpOnly, SameSite=Lax, and Secure only in production mode. Login also returns the token for bearer use.
+### Verification (2026-10-10)
 
-A warm session still reads the current user from PostgreSQL, so role changes and user deactivation take effect on the next authenticated request. It does not recheck the SQL session's expiry or deletion. A cache miss reloads an unexpired SQL session but grants a full new seven-day cache TTL instead of the remaining lifetime; bearer use can outlive SQL expiry. Logout deletes SQL first, then Redis; a cache failure can leave cached access and prevent cookie clearing. There is no coordinated protection from concurrent cache repopulation.
+- `npm test` in `backend/` runs 132 offline vitest tests (TTL and cache logic, idempotency, rate limiting, key leasing, URL service, click events, queue retry/DLQ routing against a fake channel, analytics and auth services). Backend `tsc`, lint and build, and frontend `tsc`, lint and build, are clean.
+- Against real PostgreSQL 16 and Redis with RabbitMQ absent (the sync-fallback path): `init.sql` loads twice without errors; idempotent replay, `409` and `422` behave as described, and five parallel requests with one key create one row; a link with a 2-second expiry returns `404` after expiry even though it was cached; deactivation and reactivation take effect on the next request; 25 concurrent redirects produce exactly 25 click rows; analytics return `200` to the owner and admin, `403` to another user; `SIGTERM` during a burst loses no dispatched clicks.
 
-Session-cache errors propagate instead of using the mapping cache's fail-open behavior. [Optional authentication](./backend/src/middleware/auth.ts) catches such failures and continues anonymously, so even a browser with a cookie can create an unowned link during an authentication dependency failure.
+### Simplified or omitted
 
-Owned list/update/delete routes check the owner. Anonymous details are unrestricted, including inactive and expired rows; an authenticated details request is filtered to its owner. Both analytics routes require authentication but omit ownership checks, including raw events with IPs and user agents. Admin role changes have no last-administrator or self-demotion protection.
-
-[Frontend authentication](./frontend/src/stores/authStore.ts) persists user state. Route guards call the server check only when no stored user exists. There is no universal expired-session interceptor, and logout does not reset [URL state](./frontend/src/stores/urlStore.ts) or invalidate outstanding requests. Older account/query responses can replace newer state.
-
-Creation waits for a response before adding the returned link, but uses no operation key. Its shared loading/error state also covers list/delete operations. Inputs remain editable during submission, and success clears the current draft even if the user changed it. Copy failures only log to the console.
-
-[The link list](./frontend/src/components/UrlList.tsx) fetches 50 rows without paging controls. Delete removes a row after server success, but reload returns inactive rows and the formatter omits status. Analytics fetches have no cancellation/context guard or freshness watermark. [Admin tables](./frontend/src/components/AdminDashboard.tsx) also fetch one page; searches are submitted explicitly, with no debounce or stale-response protection. There is no virtualization or automatic analytics refresh.
-
-### Operational patterns actually wired
-
-This project keeps shared helpers under `backend/src/utils/`, rather than `src/shared/`.
-
-| Pattern | Actual wiring and purpose | Practical limit |
-|---------|---------------------------|-----------------|
-| Database breaker | [database.ts](./backend/src/utils/database.ts) wraps normal queries through [circuitBreaker.ts](./backend/src/utils/circuitBreaker.ts) to reduce repeated failing calls | Transactions and health queries bypass it; fallback replaces all failures with a generic open-circuit error |
-| Prometheus metrics | [metrics.ts](./backend/src/utils/metrics.ts) and HTTP completion hooks record latency, counts, cache outcomes, and breaker state | No queue-depth metric; raw fallback paths can create unbounded labels; successful SQL durations exclude failures/transaction queries |
-| Structured logs | [logger.ts](./backend/src/utils/logger.ts) and Pino HTTP record requests and service events | Most service logs do not use request context; URL error logs can include query secrets; no durable admin audit trail |
-| General API limiter | Entry point applies 200 requests/minute by IP | Process-local store; creation's intended 100/hour middleware is after the terminal router; redirect limiter is unused |
-| Health/readiness | `/health`, `/health/detailed`, and `/ready` inspect liveness, SQL, Redis status, and optional queue connection | No consumer-progress proof or active Redis PING; failed SQL health queries can leak a checked-out client |
-
-The database breaker has a five-second timeout, 50% threshold after a minimum volume of 10, and a 30-second reset period. A timed-out query is not canceled and may commit after the caller sees failure. Its fallback can label ordinary query errors as circuit-open errors even when the circuit remains closed.
-
-`dbConnectionsActive` counts open pool connections, not currently busy queries. `/metrics` first queries pool statistics in PostgreSQL, so a database outage can prevent scraping otherwise useful process metrics. Helmet's CSP is disabled unconditionally. Shutdown handlers close dependencies and exit without stopping HTTP admission or draining in-flight consumers.
-
-### Simplified and omitted production capabilities
-
-The demo uses one PostgreSQL database for mappings, users, sessions, and raw click history; one shared Valkey; and RabbitMQ instead of a large retained analytics log and dedicated warehouse. It omits region ownership, sharding, outbox propagation, durable operation receipts, revision-aware caches, event deduplication, dead-letter recovery, retention, abuse scanning, and CDN configuration.
-
-[Four page smoke checks](./tests/smoke.spec.ts) and screenshot configuration establish only limited rendering coverage. The admin check uses Alice's ordinary user account and can pass after a redirect to another page. No cache-race, queue-recovery, transactional analytics, or production-load result was established by this documentation review; implementation defects are documented rather than repaired here.
+There is no in-process L1 cache, read replica, outbox relay, Kafka, ClickHouse, rollup table, `version` column, multi-region deployment, CDN, or malicious-URL screening. Analytics share the PostgreSQL instance with link data. Four Playwright smoke tests (`npm run test:smoke bitly` from the repository root) check page rendering only.

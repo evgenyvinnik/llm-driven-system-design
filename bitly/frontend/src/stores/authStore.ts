@@ -8,6 +8,7 @@ import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import { User } from '../types';
 import { api } from '../services/api';
+import { useUrlStore } from './urlStore';
 
 /**
  * Authentication state interface.
@@ -40,6 +41,8 @@ export const useAuthStore = create<AuthState>()(
         set({ isLoading: true, error: null });
         try {
           const { user } = await api.auth.login(email, password);
+          // Never show links cached for a previous account in this tab.
+          useUrlStore.getState().reset();
           set({ user, isLoading: false });
           return true;
         } catch (error) {
@@ -64,10 +67,12 @@ export const useAuthStore = create<AuthState>()(
 
       logout: async () => {
         set({ isLoading: true });
+        // Clear per-user data first; this also discards responses still in flight.
+        useUrlStore.getState().reset();
         try {
           await api.auth.logout();
         } catch {
-          // Ignore logout errors
+          // Ignore logout errors (the server clears the cookie regardless)
         }
         set({ user: null, isLoading: false });
       },
@@ -78,6 +83,7 @@ export const useAuthStore = create<AuthState>()(
           const user = await api.auth.me();
           set({ user, isLoading: false });
         } catch {
+          useUrlStore.getState().reset();
           set({ user: null, isLoading: false });
         }
       },

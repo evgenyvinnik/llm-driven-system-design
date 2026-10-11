@@ -17,7 +17,8 @@ export interface Url {
   expires_at: string | null;
   click_count: number;
   is_custom: boolean;
-  is_active?: boolean;
+  /** false once the owner deletes the link or an admin deactivates it */
+  is_active: boolean;
 }
 
 /**
@@ -86,7 +87,8 @@ export interface SystemStats {
 export interface GlobalAnalytics {
   totalClicks: number;
   clicksToday: number;
-  clicksByHour: { hour: number; count: number }[];
+  /** One bucket per hour of the last 24h; hour is the bucket start (ISO timestamp) */
+  clicksByHour: { hour: string; count: number }[];
   topUrls: { short_code: string; count: number }[];
 }
 

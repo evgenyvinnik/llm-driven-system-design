@@ -1,6 +1,8 @@
 import { Router, Request, Response } from 'express';
 import { asyncHandler } from '../middleware/errorHandler.js';
+import { getRequestToken } from '../middleware/auth.js';
 import { AUTH_CONFIG } from '../config.js';
+import logger from '../utils/logger.js';
 import {
   createUser,
   loginUser,
@@ -76,18 +78,27 @@ router.post(
 
 /**
  * POST /logout - Invalidate current session
- * Clears session cookie and removes session from database/cache.
+ * Clears the session cookie (always: the browser asked to log out) and revokes the
+ * session in cache and database. If revocation cannot be confirmed the response is 503,
+ * so the client knows the server-side session may still be valid.
  */
 router.post(
   '/logout',
   asyncHandler(async (req: Request, res: Response): Promise<void> => {
-    const token = req.cookies?.[AUTH_CONFIG.cookieName] || req.headers.authorization?.replace('Bearer ', '');
-
-    if (token) {
-      await logoutUser(token);
-    }
+    const token = getRequestToken(req);
 
     res.clearCookie(AUTH_CONFIG.cookieName);
+
+    if (token) {
+      try {
+        await logoutUser(token);
+      } catch (error) {
+        logger.error({ err: error }, 'Logout could not revoke the session');
+        res.status(503).json({ error: 'Logout could not be completed on the server, please retry' });
+        return;
+      }
+    }
+
     res.json({ message: 'Logged out successfully' });
   })
 );
@@ -99,7 +110,7 @@ router.post(
 router.get(
   '/me',
   asyncHandler(async (req: Request, res: Response): Promise<void> => {
-    const token = req.cookies?.[AUTH_CONFIG.cookieName] || req.headers.authorization?.replace('Bearer ', '');
+    const token = getRequestToken(req);
 
     if (!token) {
       res.status(401).json({ error: 'Not authenticated' });

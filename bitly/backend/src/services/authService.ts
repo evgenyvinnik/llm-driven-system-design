@@ -2,8 +2,10 @@ import bcrypt from 'bcrypt';
 import { v4 as uuidv4 } from 'uuid';
 import { query } from '../utils/database.js';
 import { sessionCache } from '../utils/cache.js';
-import { AUTH_CONFIG } from '../config.js';
+import { AUTH_CONFIG, CACHE_CONFIG } from '../config.js';
 import { User, UserPublic, CreateUserInput, Session } from '../models/types.js';
+import { boundedTtlSeconds } from '../utils/ttl.js';
+import logger from '../utils/logger.js';
 
 /**
  * Hashes a password using bcrypt.
@@ -37,6 +39,30 @@ function toPublicUser(user: User): UserPublic {
     role: user.role,
     created_at: user.created_at.toISOString(),
   };
+}
+
+/**
+ * Seconds a session may live in the Redis cache: its remaining lifetime, capped by
+ * CACHE_CONFIG.sessionTTL. A cache fill must never extend a session past its SQL expiry
+ * (previously every fill granted a fresh 7 days, so a bearer token could outlive it).
+ * @param expiresAt - The session's expires_at
+ * @param nowMs - Current epoch ms
+ * @returns TTL in seconds; 0 when the session has (nearly) expired
+ */
+export function sessionCacheTtlSeconds(expiresAt: Date, nowMs: number = Date.now()): number {
+  return boundedTtlSeconds(expiresAt.getTime(), nowMs, CACHE_CONFIG.sessionTTL);
+}
+
+/**
+ * Caches a session best-effort: PostgreSQL stays authoritative, so a Redis failure only
+ * costs the next request a database lookup.
+ */
+async function cacheSession(token: string, userId: string, expiresAt: Date): Promise<void> {
+  try {
+    await sessionCache.set(token, userId, sessionCacheTtlSeconds(expiresAt));
+  } catch (error) {
+    logger.warn({ err: error }, 'Session cache write failed');
+  }
 }
 
 /**
@@ -113,8 +139,8 @@ export async function loginUser(
     [user.id, token, expiresAt]
   );
 
-  // Cache session
-  await sessionCache.set(token, user.id);
+  // Cache session (TTL = remaining session lifetime)
+  await cacheSession(token, user.id, expiresAt);
 
   return {
     user: toPublicUser(user),
@@ -124,12 +150,20 @@ export async function loginUser(
 
 /**
  * Logs out a user by invalidating their session.
- * Removes the session from both database and cache.
+ * Order matters. The cached entry is evicted first: if Redis cannot confirm that, this
+ * throws before touching SQL, so the caller reports a failed logout instead of a
+ * "successful" one that the cached entry would quietly keep alive until its TTL. The SQL
+ * row is deleted next, then the cache is evicted once more, best-effort, in case a
+ * concurrent request re-cached the session between the two steps.
  * @param token - The session token to invalidate
+ * @throws If the cache eviction or the SQL delete fails
  */
 export async function logoutUser(token: string): Promise<void> {
-  await query(`DELETE FROM sessions WHERE token = $1`, [token]);
   await sessionCache.delete(token);
+  await query(`DELETE FROM sessions WHERE token = $1`, [token]);
+  await sessionCache.delete(token).catch((error) => {
+    logger.warn({ err: error }, 'Second session cache eviction failed');
+  });
 }
 
 /**
@@ -139,8 +173,13 @@ export async function logoutUser(token: string): Promise<void> {
  * @returns Promise resolving to user (public format) or null if invalid
  */
 export async function getUserByToken(token: string): Promise<UserPublic | null> {
-  // Check cache first
-  const cachedUserId = await sessionCache.get(token);
+  // Check cache first; a Redis failure falls back to PostgreSQL instead of failing auth
+  let cachedUserId: string | null = null;
+  try {
+    cachedUserId = await sessionCache.get(token);
+  } catch (error) {
+    logger.warn({ err: error }, 'Session cache read failed, using PostgreSQL');
+  }
 
   if (cachedUserId) {
     const users = await query<User>(
@@ -172,8 +211,8 @@ export async function getUserByToken(token: string): Promise<UserPublic | null> 
     return null;
   }
 
-  // Update cache
-  await sessionCache.set(token, users[0].id);
+  // Update cache, bounded by the session's remaining lifetime
+  await cacheSession(token, users[0].id, sessions[0].expires_at);
 
   return toPublicUser(users[0]);
 }

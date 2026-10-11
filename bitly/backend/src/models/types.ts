@@ -34,6 +34,7 @@ export interface UrlResponse {
   expires_at: string | null;
   click_count: number;
   is_custom: boolean;
+  is_active: boolean;
 }
 
 /**
@@ -42,6 +43,7 @@ export interface UrlResponse {
  */
 export interface ClickEvent {
   id: number;
+  event_id: string | null;
   short_code: string;
   clicked_at: Date;
   referrer: string | null;
@@ -53,13 +55,19 @@ export interface ClickEvent {
 }
 
 /**
- * Input data for recording a click event.
+ * Click event as published by the redirect path and consumed by the analytics worker.
+ * event_id is assigned once, at the redirect, and is the idempotency key for the whole
+ * pipeline: publisher retries, the sync fallback, and broker redeliveries all carry the
+ * same id, and the click_events unique index records it at most once.
  */
-export interface ClickEventInput {
+export interface ClickEventMessage {
+  event_id: string;
   short_code: string;
   referrer?: string;
   user_agent?: string;
   ip_address?: string;
+  device_type: string;
+  timestamp: string;
 }
 
 /**

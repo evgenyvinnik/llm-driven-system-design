@@ -8,6 +8,9 @@ import {
   updateUrl,
   deleteUrl,
 } from '../services/urlService.js';
+import { createUrlLimiter } from '../middleware/rateLimit.js';
+import { idempotencyMiddleware } from '../utils/idempotency.js';
+import { HttpError } from '../utils/errors.js';
 import logger from '../utils/logger.js';
 import { urlShorteningTotal } from '../utils/metrics.js';
 
@@ -22,12 +25,16 @@ const router = Router();
  * POST / - Create a new shortened URL
  * Accepts long_url, optional custom_code, and optional expires_in.
  * Optionally associates URL with authenticated user.
+ * Middleware order: creation rate limit, then authentication (the idempotency key is
+ * scoped by user), then Idempotency-Key handling, then the handler.
  */
 router.post(
   '/',
+  createUrlLimiter,
   optionalAuth,
+  idempotencyMiddleware,
   asyncHandler(async (req: Request, res: Response): Promise<void> => {
-    const { long_url, custom_code, expires_in } = req.body;
+    const { long_url, custom_code, expires_in } = req.body ?? {};
 
     if (!long_url) {
       urlShorteningTotal.inc({ status: 'error' });
@@ -48,24 +55,23 @@ router.post(
         {
           short_code: url.short_code,
           user_id: req.user?.id,
-          is_custom: !!custom_code,
+          is_custom: url.is_custom,
         },
         'URL created successfully'
       );
 
       res.status(201).json(url);
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Failed to create URL';
-
       // Track different error types
-      if (message.includes('already taken')) {
-        urlShorteningTotal.inc({ status: 'duplicate' });
-      } else {
-        urlShorteningTotal.inc({ status: 'error' });
-      }
+      urlShorteningTotal.inc({ status: error instanceof HttpError && error.status === 409 ? 'duplicate' : 'error' });
 
-      logger.warn({ err: error, long_url: long_url.substring(0, 100) }, 'URL creation failed');
-      res.status(400).json({ error: message });
+      if (error instanceof HttpError) {
+        logger.warn({ err: error, long_url: String(long_url).substring(0, 100) }, 'URL creation rejected');
+        res.status(error.status).json({ error: error.message });
+        return;
+      }
+      // Infrastructure failures are 500s, not client errors.
+      throw error;
     }
   })
 );
@@ -79,8 +85,8 @@ router.get(
   '/',
   requireAuth,
   asyncHandler(async (req: Request, res: Response): Promise<void> => {
-    const limit = parseInt(req.query.limit as string, 10) || 50;
-    const offset = parseInt(req.query.offset as string, 10) || 0;
+    const limit = Math.min(Math.max(parseInt(req.query.limit as string, 10) || 50, 1), 100);
+    const offset = Math.max(parseInt(req.query.offset as string, 10) || 0, 0);
 
     const result = await getUserUrls(req.user!.id, limit, offset);
 
@@ -112,7 +118,7 @@ router.get(
 
 /**
  * PATCH /:shortCode - Update URL properties
- * Allows updating is_active and expires_at.
+ * Allows updating is_active and expires_at (null clears the expiration).
  * Requires authentication and URL ownership.
  */
 router.patch(
@@ -120,11 +126,27 @@ router.patch(
   requireAuth,
   asyncHandler(async (req: Request, res: Response): Promise<void> => {
     const { shortCode } = req.params;
-    const { is_active, expires_at } = req.body;
+    const { is_active, expires_at } = req.body ?? {};
+
+    if (is_active !== undefined && typeof is_active !== 'boolean') {
+      res.status(400).json({ error: 'is_active must be a boolean' });
+      return;
+    }
+
+    let expiresAt: Date | null | undefined;
+    if (expires_at === null) {
+      expiresAt = null;
+    } else if (expires_at !== undefined) {
+      expiresAt = new Date(expires_at);
+      if (typeof expires_at !== 'string' || Number.isNaN(expiresAt.getTime())) {
+        res.status(400).json({ error: 'expires_at must be an ISO-8601 timestamp or null' });
+        return;
+      }
+    }
 
     const url = await updateUrl(shortCode, req.user!.id, {
       is_active,
-      expires_at: expires_at ? new Date(expires_at) : undefined,
+      expires_at: expiresAt,
     });
 
     if (!url) {
