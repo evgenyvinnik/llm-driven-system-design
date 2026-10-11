@@ -180,6 +180,28 @@ External projects demonstrating system design concepts (with local architecture 
 | [MCPlator](./mcplator/) | Retro calculator with LLM-powered AI assistant ([source](https://github.com/evgenyvinnik/MCPlator)) | 📝 Design Only |
 | [20 Forms, 40 Designs](./20forms-20designs/) | Form library comparison across 41 React design systems ([source](https://github.com/evgenyvinnik/20forms-20designs)) | 📝 Design Only |
 
+### Planned Projects
+
+The next round, focused on AI products and developer platforms. See [ROADMAP.md](./ROADMAP.md) for each project's scope, core entities, hard problems and interview follow-ups.
+
+| Project | Description | Status |
+|---------|-------------|--------|
+| [Prompt Playground](./ROADMAP.md#1-prompt-playground) | Edit, version, run, and share prompts against a model API | 📋 Planned |
+| [ChatGPT](./ROADMAP.md#2-chatgpt) | Streaming assistant with branching history, cancellation, and multi-device sync | 📋 Planned |
+| [Settings Service](./ROADMAP.md#3-settings-service) | Backend for an existing preferences UI: precise APIs, concurrency, and org policies | 📋 Planned |
+| [LLM Chat Analytics](./ROADMAP.md#4-llm-chat-analytics) | Near-real-time usage, latency, and token dashboards with late-data handling | 📋 Planned |
+| [LLM Inference API](./ROADMAP.md#5-llm-inference-api) | Multi-tenant model API with admission control, batching, and backend routing | 📋 Planned |
+| [Webhook Platform](./ROADMAP.md#6-webhook-platform) | Signed, retried, replayable HTTP event delivery with per-endpoint isolation | 📋 Planned |
+| [Workspace Permissions](./ROADMAP.md#7-workspace-permissions) | Organizations, roles, invitations, and revocable share links | 📋 Planned |
+| [Document Q&A](./ROADMAP.md#8-document-qa) | Upload, process, index, retrieve, and delete documents for an assistant | 📋 Planned |
+| [Experimentation Platform](./ROADMAP.md#9-experimentation-platform) | Feature flags, A/B assignment, exposure logging, and kill switches | 📋 Planned |
+| [LLM Eval Dashboard](./ROADMAP.md#10-llm-eval-dashboard) | Versioned datasets, async eval runs, and provenance-aware comparisons | 📋 Planned |
+| [CI/CD Platform](./ROADMAP.md#11-cicd-platform) | GitHub Actions-like workflows with job DAGs, runners, and live logs | 📋 Planned |
+| [AI Code Review](./ROADMAP.md#12-ai-code-review) | Design critique and rebuild of an agentic PR auto-approval system | 📋 Planned |
+| [File Cache](./ROADMAP.md#13-file-cache) | Byte-bounded cache for large files with single-flight fills | 📋 Planned |
+| [Model Distribution](./ROADMAP.md#14-model-distribution) | Peer-assisted distribution of a huge file to a fleet, then safe activation | 📋 Planned |
+| [Online Chess](./ROADMAP.md#15-online-chess) | Real-time games with authoritative state, clocks, matchmaking, and spectators | 📋 Planned |
+
 ## Project Structure
 
 Each project folder contains:

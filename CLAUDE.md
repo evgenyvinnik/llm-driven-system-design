@@ -592,6 +592,8 @@ Python dependencies are managed via `requirements.txt` with PyTorch, NumPy, and 
 
 ## Creating New Projects
 
+Planned projects are listed in [ROADMAP.md](./ROADMAP.md). Before starting one, read its entry for scope, core entities, hard problems and the follow-up questions its answers must cover. Also read the shared decisions for LLM projects, such as the per-project mock model service. When the project is done, move its README row out of **Planned Projects** and remove its roadmap entry.
+
 ### New Frontend Setup
 ```bash
 npm create vite@latest frontend -- --template react-ts
