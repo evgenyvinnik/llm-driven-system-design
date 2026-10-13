@@ -1,7 +1,8 @@
 /**
  * Redis client module for the job scheduler.
- * Provides a shared Redis connection for queuing, leader election, and caching.
- * Uses ioredis with automatic retry logic.
+ * Provides the shared connection for coordination state that can be rebuilt if lost:
+ * the scheduler leader lease, sessions and users, idempotency records, and the worker
+ * liveness registry. Executions are not queued here; they live in PostgreSQL.
  * @module queue/redis
  */
 

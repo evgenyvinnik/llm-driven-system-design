@@ -9,19 +9,16 @@ import {
   QUEUES,
   IssueEventMessage
 } from '../config/messageQueue.js';
-import {
-  esClient,
-  ISSUE_INDEX,
-  initializeElasticsearch,
-  indexIssue,
-  deleteIssueFromIndex
-} from '../config/elasticsearch.js';
-import { pool, query } from '../config/database.js';
+import { initializeElasticsearch, deleteIssueFromIndex } from '../config/elasticsearch.js';
+import { pool } from '../config/database.js';
 import { logger } from '../config/logger.js';
+import { indexIssueById } from '../services/issue/afterCommit.js';
 
 /**
  * Process search index update events.
- * Syncs issue data from PostgreSQL to Elasticsearch.
+ * The event only identifies the issue; the document is rebuilt from PostgreSQL, the
+ * source of truth, and indexed with the issue's version so a redelivered or reordered
+ * event cannot overwrite a newer document.
  */
 async function processSearchIndexEvent(event: IssueEventMessage): Promise<void> {
   const { event_id, event_type, issue_id, issue_key } = event;
@@ -30,84 +27,15 @@ async function processSearchIndexEvent(event: IssueEventMessage): Promise<void> 
 
   try {
     if (event_type === 'deleted') {
-      // Remove from index
-      await deleteIssueFromIndex(issue_id);
+      await deleteIssueFromIndex(issue_id).catch((error: { meta?: { statusCode?: number } }) => {
+        // Already gone (for example, removed by the API right after the delete).
+        if (error.meta?.statusCode !== 404) throw error;
+      });
       logger.info({ issue_key }, 'Removed issue from search index');
       return;
     }
 
-    // Fetch full issue data for indexing
-    const result = await query(`
-      SELECT
-        i.id,
-        i.key,
-        i.project_id,
-        p.key as project_key,
-        i.summary,
-        i.description,
-        i.issue_type,
-        s.name as status,
-        s.category as status_category,
-        i.priority,
-        i.assignee_id,
-        a.display_name as assignee_name,
-        i.reporter_id,
-        r.display_name as reporter_name,
-        i.sprint_id,
-        sp.name as sprint_name,
-        i.epic_id,
-        ep.key as epic_key,
-        i.story_points,
-        i.labels,
-        i.components,
-        i.custom_fields,
-        i.created_at,
-        i.updated_at
-      FROM issues i
-      LEFT JOIN projects p ON i.project_id = p.id
-      LEFT JOIN statuses s ON i.status_id = s.id
-      LEFT JOIN users a ON i.assignee_id = a.id
-      LEFT JOIN users r ON i.reporter_id = r.id
-      LEFT JOIN sprints sp ON i.sprint_id = sp.id
-      LEFT JOIN issues ep ON i.epic_id = ep.id
-      WHERE i.id = $1
-    `, [issue_id]);
-
-    if (result.rows.length === 0) {
-      logger.warn({ issue_id }, 'Issue not found for indexing, may have been deleted');
-      return;
-    }
-
-    const issue = result.rows[0];
-
-    // Index the issue document
-    await indexIssue({
-      id: issue.id,
-      key: issue.key,
-      project_id: issue.project_id,
-      project_key: issue.project_key,
-      summary: issue.summary,
-      description: issue.description || '',
-      issue_type: issue.issue_type,
-      status: issue.status,
-      status_category: issue.status_category,
-      priority: issue.priority,
-      assignee_id: issue.assignee_id,
-      assignee_name: issue.assignee_name,
-      reporter_id: issue.reporter_id,
-      reporter_name: issue.reporter_name,
-      sprint_id: issue.sprint_id,
-      sprint_name: issue.sprint_name,
-      epic_id: issue.epic_id,
-      epic_key: issue.epic_key,
-      story_points: issue.story_points,
-      labels: issue.labels || [],
-      components: issue.components || [],
-      custom_fields: issue.custom_fields || {},
-      created_at: issue.created_at,
-      updated_at: issue.updated_at,
-    });
-
+    await indexIssueById(issue_id);
     logger.info({ issue_key, event_type }, 'Issue indexed successfully');
   } catch (error) {
     logger.error({ error, event_id, issue_key }, 'Failed to process search index event');

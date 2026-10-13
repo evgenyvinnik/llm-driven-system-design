@@ -1,4 +1,4 @@
-import { useState, useRef } from 'react';
+import { useState, useRef, useEffect } from 'react';
 import { createFileRoute, useNavigate, Navigate } from '@tanstack/react-router';
 import { useAuthStore } from '../stores/authStore';
 import { postsApi, storiesApi } from '../services/api';
@@ -22,6 +22,13 @@ function CreatePage() {
   const [isStory, setIsStory] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  // One idempotency key per draft: every retry of the same draft reuses it, so a request that
+  // timed out but succeeded on the server returns the original post instead of a duplicate.
+  const idempotencyKeyRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    idempotencyKeyRef.current = null; // the draft changed, so it is a new request
+  }, [files, filters, caption, location, isStory]);
 
   if (!isAuthenticated) {
     return <Navigate to="/login" />;
@@ -84,7 +91,11 @@ function CreatePage() {
         formData.append('caption', caption);
         if (location) formData.append('location', location);
         formData.append('filters', JSON.stringify(filters));
-        await postsApi.create(formData);
+        if (!idempotencyKeyRef.current) idempotencyKeyRef.current = crypto.randomUUID();
+        const { post } = await postsApi.create(formData, idempotencyKeyRef.current);
+        // The post exists now but its images are still being processed; its page says so.
+        navigate({ to: '/post/$postId', params: { postId: post.id } });
+        return;
       }
 
       navigate({ to: '/' });
@@ -264,7 +275,9 @@ function CreatePage() {
 
           {/* Submit */}
           <div className="p-4 border-t border-border-gray">
-            {error && <p className="text-like-red text-sm text-center mb-3">{error}</p>}
+            <p role="alert" className="text-like-red text-sm text-center mb-3 empty:hidden">
+              {error}
+            </p>
             <Button
               onClick={handleSubmit}
               loading={loading}
@@ -279,7 +292,7 @@ function CreatePage() {
       <input
         ref={fileInputRef}
         type="file"
-        accept="image/*,video/*"
+        accept="image/*"
         multiple={!isStory}
         onChange={handleFileSelect}
         className="hidden"

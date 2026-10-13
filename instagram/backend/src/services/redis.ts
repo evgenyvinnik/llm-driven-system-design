@@ -33,22 +33,14 @@ export const cacheDel = async (key: string): Promise<void> => {
   await redis.del(key);
 };
 
-// Timeline cache (sorted sets for feed)
-/** Adds a post to a user's feed timeline sorted set, capping at 500 entries. */
-export const timelineAdd = async (userId: string, postId: string, timestamp: number): Promise<void> => {
-  await redis.zadd(`timeline:${userId}`, timestamp, postId);
-  // Keep only last 500 posts in timeline
-  await redis.zremrangebyrank(`timeline:${userId}`, 0, -501);
-};
+// Post detail cache. Entries carry the post's status and its author's privacy flag so the
+// visibility check still runs on a cache hit. Only published posts are cached.
+/** Cache key for a post detail entry. */
+export const postCacheKey = (postId: string): string => `post:v2:${postId}`;
 
-/** Retrieves paginated post IDs from a user's feed timeline in reverse chronological order. */
-export const timelineGet = async (userId: string, offset: number = 0, limit: number = 20): Promise<string[]> => {
-  return redis.zrevrange(`timeline:${userId}`, offset, offset + limit - 1);
-};
-
-/** Removes a post from a user's feed timeline. */
-export const timelineRemove = async (userId: string, postId: string): Promise<void> => {
-  await redis.zrem(`timeline:${userId}`, postId);
+/** Drops a cached post; call on every write that changes what GET /posts/:id returns. */
+export const invalidatePostCache = async (postId: string): Promise<void> => {
+  await redis.del(postCacheKey(postId));
 };
 
 // Story tray cache
@@ -62,19 +54,27 @@ export interface StoryTrayUser {
   latestStoryTime: string;
 }
 
-/** Caches the story tray data for a user with a 5-minute TTL. */
+const storyTrayKey = (userId: string): string => `story_tray:${userId}`;
+
+/** Caches the story tray data for a user (default 60 s; callers bound it by the earliest expiry). */
 export const storyTraySet = async (
   userId: string,
   stories: StoryTrayUser[],
-  ttlSeconds: number = 300
+  ttlSeconds: number = 60
 ): Promise<void> => {
-  await redis.set(`story_tray:${userId}`, JSON.stringify(stories), 'EX', ttlSeconds);
+  await redis.set(storyTrayKey(userId), JSON.stringify(stories), 'EX', Math.max(1, ttlSeconds));
 };
 
 /** Retrieves cached story tray data for a user. */
 export const storyTrayGet = async (userId: string): Promise<StoryTrayUser[] | null> => {
-  const data = await redis.get(`story_tray:${userId}`);
+  const data = await redis.get(storyTrayKey(userId));
   return data ? (JSON.parse(data) as StoryTrayUser[]) : null;
+};
+
+/** Drops cached story trays (e.g. the author's followers after a new story). */
+export const invalidateStoryTrays = async (userIds: string[]): Promise<void> => {
+  if (userIds.length === 0) return;
+  await redis.del(...userIds.map(storyTrayKey));
 };
 
 export default redis;

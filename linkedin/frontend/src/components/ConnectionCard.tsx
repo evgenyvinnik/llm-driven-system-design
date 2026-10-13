@@ -6,7 +6,7 @@
  * @module components/ConnectionCard
  */
 import { Link } from '@tanstack/react-router';
-import type { User, PYMKCandidate } from '../types';
+import type { UserSummary, PYMKCandidate } from '../types';
 import { connectionsApi } from '../services/api';
 import { useState } from 'react';
 
@@ -14,7 +14,7 @@ import { useState } from 'react';
  * Props for the ConnectionCard component.
  */
 interface ConnectionCardProps {
-  user: User;
+  user: UserSummary;
   pymkData?: PYMKCandidate;
   onConnect?: () => void;
   showConnectButton?: boolean;
@@ -43,16 +43,18 @@ export function ConnectionCard({
   onRemove,
 }: ConnectionCardProps) {
   const [connecting, setConnecting] = useState(false);
-  const [connected, setConnected] = useState(false);
+  const [sentStatus, setSentStatus] = useState<'pending_sent' | 'connected' | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
   const handleConnect = async () => {
     setConnecting(true);
+    setError(null);
     try {
-      await connectionsApi.sendRequest(user.id);
-      setConnected(true);
+      const result = await connectionsApi.sendRequest(user.id);
+      setSentStatus(result.status);
       onConnect?.();
-    } catch (error) {
-      console.error('Failed to send connection request:', error);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not send invitation');
     }
     setConnecting(false);
   };
@@ -96,15 +98,13 @@ export function ConnectionCard({
 
       {pymkData && (
         <div className="mt-2 text-xs text-gray-500 space-y-1">
-          {pymkData.mutual_connections > 0 && (
-            <div>{pymkData.mutual_connections} mutual connection{pymkData.mutual_connections > 1 ? 's' : ''}</div>
-          )}
-          {pymkData.same_company && <div>Works at same company</div>}
-          {pymkData.same_school && <div>Same school</div>}
+          {(pymkData.reasons ?? []).slice(0, 2).map((reason) => (
+            <div key={reason}>{reason}</div>
+          ))}
         </div>
       )}
 
-      {showConnectButton && !connected && (
+      {showConnectButton && !sentStatus && (
         <button
           onClick={handleConnect}
           disabled={connecting}
@@ -114,9 +114,11 @@ export function ConnectionCard({
         </button>
       )}
 
-      {connected && (
-        <div className="mt-4 text-sm text-gray-600">Request sent</div>
-      )}
+      <div role="status" aria-live="polite" className="mt-2 text-sm">
+        {sentStatus === 'pending_sent' && <span className="text-gray-600">Request sent</span>}
+        {sentStatus === 'connected' && <span className="text-green-700">Connected</span>}
+        {error && <span className="text-red-600">{error}</span>}
+      </div>
 
       {showRemoveButton && (
         <button

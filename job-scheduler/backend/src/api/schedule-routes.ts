@@ -11,7 +11,6 @@ import { metricsHandler, updateQueueMetrics } from '../shared/metrics';
 import { getCircuitBreakerStates } from '../shared/circuit-breaker';
 import { healthCheck as dbHealthCheck } from '../db/pool';
 import { healthCheck as redisHealthCheck, redis } from '../queue/redis';
-import { queue } from '../queue/reliable-queue';
 import * as db from '../db/repository';
 import { ApiResponse } from '../types/index';
 import { HealthCheckData, WorkerData } from './types';
@@ -145,7 +144,7 @@ router.get(
   asyncHandler(async (_req, res) => {
     const [dbMetrics, queueStats] = await Promise.all([
       db.getSystemMetrics(),
-      queue.getStats(),
+      db.getQueueStats(),
     ]);
 
     // Update queue metrics for Prometheus
@@ -248,8 +247,9 @@ router.get(
 /**
  * GET /api/v1/dead-letter - Get items from the dead letter queue.
  *
- * @description Retrieves failed executions that have exhausted all retry attempts
- * and been moved to the dead letter queue. These items require manual intervention.
+ * @description Retrieves executions in the DEAD_LETTER state: runs that exhausted their
+ * retries or failed with a non-retryable error. Each needs an operator to fix the cause
+ * and redrive it (POST /api/v1/executions/:id/retry).
  * Requires authentication.
  *
  * @route GET /api/v1/dead-letter
@@ -270,10 +270,10 @@ router.get(
   '/api/v1/dead-letter',
   authenticate,
   asyncHandler(async (req, res) => {
-    const start = parseInt(req.query.start as string) || 0;
-    const count = parseInt(req.query.count as string) || 100;
+    const start = Math.max(parseInt(req.query.start as string) || 0, 0);
+    const count = Math.min(Math.max(parseInt(req.query.count as string) || 100, 1), 500);
 
-    const items = await queue.getDeadLetterItems(start, start + count - 1);
+    const items = await db.listDeadLetter(count, start);
 
     res.json({
       success: true,

@@ -5,10 +5,25 @@
  *
  * @module services/api
  */
-import type { ApiResponse, AuthResponse, User } from '@/types';
+import type { ApiResponse, AuthResponse, User, OrderQuote, PendingOfferResponse } from '@/types';
 
 /** Base URL for all API requests */
 const API_BASE = '/api/v1';
+
+/**
+ * An API failure with the HTTP status and the server's machine-readable code,
+ * so callers can react to a 409 differently from a 500.
+ */
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    public readonly status: number,
+    public readonly code?: string
+  ) {
+    super(message);
+    this.name = 'ApiError';
+  }
+}
 
 /**
  * Generic request wrapper that handles authentication and JSON parsing.
@@ -39,10 +54,10 @@ async function request<T>(
     headers,
   });
 
-  const data = await response.json();
+  const data = await response.json().catch(() => ({}));
 
   if (!response.ok) {
-    throw new Error(data.error || 'Request failed');
+    throw new ApiError(data.error || 'Request failed', response.status, data.code);
   }
 
   return data;
@@ -198,22 +213,55 @@ export const api = {
   // ==================== Orders ====================
 
   /**
+   * Asks the server to price a cart. The cart shows these numbers so the
+   * total on the button is the total that will be charged.
+   *
+   * @param quoteData - Merchant, items, tip and delivery coordinates
+   * @param signal - Aborts a quote superseded by a newer cart
+   * @returns Server-computed subtotal, delivery fee, tip and total
+   */
+  async quoteOrder(
+    quoteData: {
+      merchant_id: string;
+      delivery_lat: number;
+      delivery_lng: number;
+      items: { menu_item_id: string; quantity: number }[];
+      tip?: number;
+    },
+    signal?: AbortSignal
+  ): Promise<OrderQuote> {
+    const res = await request<OrderQuote>('/orders/quote', {
+      method: 'POST',
+      body: JSON.stringify(quoteData),
+      signal,
+    });
+    return res.data!;
+  },
+
+  /**
    * Creates a new order from the cart.
    *
    * @param orderData - Order details including items, address, and tip
+   * @param idempotencyKey - One key per checkout attempt; resending the same
+   *   key (after a timeout, a double click or a reload) returns the original
+   *   order instead of creating a second one
    * @returns Created order with details
    */
-  async createOrder(orderData: {
-    merchant_id: string;
-    delivery_address: string;
-    delivery_lat: number;
-    delivery_lng: number;
-    delivery_instructions?: string;
-    items: { menu_item_id: string; quantity: number; special_instructions?: string }[];
-    tip?: number;
-  }) {
+  async createOrder(
+    orderData: {
+      merchant_id: string;
+      delivery_address: string;
+      delivery_lat: number;
+      delivery_lng: number;
+      delivery_instructions?: string;
+      items: { menu_item_id: string; quantity: number; special_instructions?: string }[];
+      tip?: number;
+    },
+    idempotencyKey: string
+  ) {
     const res = await request('/orders', {
       method: 'POST',
+      headers: { 'Idempotency-Key': idempotencyKey },
       body: JSON.stringify(orderData),
     });
     return res.data;
@@ -356,9 +404,9 @@ export const api = {
    *
    * @returns Pending offer or null
    */
-  async getPendingOffer() {
-    const res = await request('/driver/offers/pending');
-    return res.data;
+  async getPendingOffer(): Promise<PendingOfferResponse | null> {
+    const res = await request<PendingOfferResponse | null>('/driver/offers/pending');
+    return res.data ?? null;
   },
 
   /**

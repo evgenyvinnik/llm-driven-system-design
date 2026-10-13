@@ -1,7 +1,12 @@
 /**
  * Scheduler service for the job scheduler system.
- * Scans for due jobs, creates executions, and enqueues them for worker processing.
- * Uses leader election to ensure only one scheduler is active at a time.
+ *
+ * Runs two leader-only loops:
+ * - the tick: fire every due job (insert its execution, advance next_run_time) in one
+ *   PostgreSQL transaction per batch;
+ * - the reaper: reclaim executions whose worker stopped renewing its lease.
+ * Every instance also refreshes the queue gauges. Standby instances try to take the
+ * leader lease on every tick, so failover takes at most the lease TTL plus one tick.
  * @module scheduler
  */
 
@@ -9,10 +14,10 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 import { LeaderElection } from '../queue/leader-election';
-import { queue } from '../queue/reliable-queue';
+import { disconnect as disconnectRedis } from '../queue/redis';
+import { pool } from '../db/pool';
 import * as db from '../db/repository';
 import { createChildLogger } from '../utils/logger';
-import { JobStatus, ExecutionStatus } from '../types';
 import { migrate } from '../db/migrate';
 
 // Import shared modules
@@ -20,282 +25,210 @@ import {
   schedulerIsLeader,
   stalledJobsRecovered,
   jobsScheduledTotal,
+  misfiresTotal,
   updateQueueMetrics,
+  startMetricsServer,
 } from '../shared/metrics';
 
-/** Unique instance ID for this scheduler, used in leader election */
-const INSTANCE_ID = process.env.SCHEDULER_INSTANCE_ID || `scheduler-${Date.now()}`;
-/** How often to scan for due jobs in milliseconds */
+/** Unique instance ID for this scheduler, used as the leader lease value */
+const INSTANCE_ID = process.env.SCHEDULER_INSTANCE_ID || `scheduler-${process.pid}`;
+/** How often to look for due jobs, in milliseconds */
 const SCAN_INTERVAL_MS = parseInt(process.env.SCAN_INTERVAL_MS || '1000', 10);
-/** Leader lock TTL in seconds */
-const LEADER_LOCK_TTL = parseInt(process.env.LEADER_LOCK_TTL || '30', 10);
-/** How often to check for stalled jobs in milliseconds */
-const STALE_RECOVERY_INTERVAL_MS = 60000; // 1 minute
+/** Leader lease TTL; LEADER_LOCK_TTL is in seconds for backwards compatibility */
+const LEADER_LOCK_TTL_MS = parseInt(process.env.LEADER_LOCK_TTL || '30', 10) * 1000;
+/** Maximum due jobs fired per transaction */
+const SCAN_BATCH_SIZE = parseInt(process.env.SCAN_BATCH_SIZE || '500', 10);
+/** Passes per tick when every pass comes back full (catch-up after an outage) */
+const MAX_PASSES_PER_TICK = 10;
+/**
+ * How late a recurring slot may be and still count as on time. It must exceed the
+ * worst-case failover (lease TTL + one tick), or every failover produces misfires.
+ */
+const MISFIRE_GRACE_MS = parseInt(process.env.MISFIRE_GRACE_MS || '60000', 10);
+/** How often the leader reclaims executions whose lease lapsed */
+const REAPER_INTERVAL_MS = parseInt(process.env.REAPER_INTERVAL_MS || '5000', 10);
+/** Maximum leases reclaimed per reaper transaction */
+const REAPER_BATCH_SIZE = 100;
+/** How often to refresh the queue gauges */
+const METRICS_INTERVAL_MS = 10000;
 
 /** Scheduler-specific logger */
 const schedulerLogger = createChildLogger({ instanceId: INSTANCE_ID });
 
 /**
- * Main scheduler class that coordinates job scheduling.
- * Runs three loops: scan for due jobs, recover stalled executions, and process retries.
- * Only the leader instance actively schedules; others wait for failover.
+ * Coordinates firing and lease recovery. Only the leader does either; the others keep
+ * trying to take the lease.
  */
 class Scheduler {
   private leaderElection: LeaderElection;
   private running: boolean = false;
-  private scanLoopHandle: NodeJS.Timeout | null = null;
-  private recoveryLoopHandle: NodeJS.Timeout | null = null;
-  private retryLoopHandle: NodeJS.Timeout | null = null;
-  private metricsLoopHandle: NodeJS.Timeout | null = null;
+  private tickLoop: Promise<void> | null = null;
+  private reaperHandle: NodeJS.Timeout | null = null;
+  private metricsHandle: NodeJS.Timeout | null = null;
+  private reaping: boolean = false;
 
   /** Initializes the scheduler with leader election configuration */
   constructor() {
     this.leaderElection = new LeaderElection(
       INSTANCE_ID,
       'job_scheduler:scheduler:leader',
-      LEADER_LOCK_TTL
+      LEADER_LOCK_TTL_MS
     );
   }
 
   /**
    * Starts the scheduler service.
-   * Runs migrations, then starts the scan, recovery, and retry loops.
+   * Runs migrations, then starts the tick, reaper, and metrics loops.
    */
   async start(): Promise<void> {
     schedulerLogger.info({
       scanInterval: SCAN_INTERVAL_MS,
-      leaderLockTTL: LEADER_LOCK_TTL,
+      leaderLockTtlMs: LEADER_LOCK_TTL_MS,
+      misfireGraceMs: MISFIRE_GRACE_MS,
+      reaperInterval: REAPER_INTERVAL_MS,
     }, `Starting scheduler instance: ${INSTANCE_ID}`);
     this.running = true;
 
-    // Run migrations first
     await migrate();
 
-    // Start the main scheduling loop
-    this.runScanLoop();
-
-    // Start the stale job recovery loop
-    this.runRecoveryLoop();
-
-    // Start the retry scheduling loop
-    this.runRetryLoop();
-
-    // Start metrics update loop
-    this.startMetricsLoop();
+    startMetricsServer(parseInt(process.env.METRICS_PORT || '', 10));
+    this.tickLoop = this.runTickLoop();
+    this.reaperHandle = setInterval(() => void this.reap(), REAPER_INTERVAL_MS);
+    this.metricsHandle = setInterval(() => void this.refreshQueueMetrics(), METRICS_INTERVAL_MS);
 
     schedulerLogger.info('Scheduler started');
   }
 
   /**
-   * Stops the scheduler service gracefully.
-   * Clears all loop timers and releases leadership.
+   * Stops the scheduler service gracefully: finishes the current tick, stops the
+   * loops, and releases the lease so a standby can take over immediately.
    */
   async stop(): Promise<void> {
     schedulerLogger.info('Stopping scheduler...');
     this.running = false;
 
-    if (this.scanLoopHandle) {
-      clearTimeout(this.scanLoopHandle);
-      this.scanLoopHandle = null;
+    if (this.reaperHandle) {
+      clearInterval(this.reaperHandle);
+      this.reaperHandle = null;
+    }
+    if (this.metricsHandle) {
+      clearInterval(this.metricsHandle);
+      this.metricsHandle = null;
     }
 
-    if (this.recoveryLoopHandle) {
-      clearInterval(this.recoveryLoopHandle);
-      this.recoveryLoopHandle = null;
-    }
-
-    if (this.retryLoopHandle) {
-      clearInterval(this.retryLoopHandle);
-      this.retryLoopHandle = null;
-    }
-
-    if (this.metricsLoopHandle) {
-      clearInterval(this.metricsLoopHandle);
-      this.metricsLoopHandle = null;
-    }
-
-    await this.leaderElection.releaseLeadership();
-
-    // Update leader metric
+    await this.tickLoop;
+    await this.leaderElection.release();
     schedulerIsLeader.set({ instance_id: INSTANCE_ID }, 0);
 
     schedulerLogger.info('Scheduler stopped');
   }
 
-  /**
-   * Main scheduling loop that scans for due jobs.
-   * Tries to acquire leadership, then processes due jobs if leader.
-   */
-  private async runScanLoop(): Promise<void> {
+  /** Main loop: one tick every SCAN_INTERVAL_MS. */
+  private async runTickLoop(): Promise<void> {
     while (this.running) {
       try {
-        // Try to become or maintain leadership
-        const wasLeader = this.leaderElection.getIsLeader();
-        if (!wasLeader) {
-          const acquired = await this.leaderElection.tryBecomeLeader();
-          if (acquired) {
-            schedulerLogger.info('Became leader');
-            schedulerIsLeader.set({ instance_id: INSTANCE_ID }, 1);
-          } else {
-            schedulerIsLeader.set({ instance_id: INSTANCE_ID }, 0);
-            await this.sleep(SCAN_INTERVAL_MS);
-            continue;
-          }
-        }
-
-        // Only the leader scans for due jobs
-        await this.scanDueJobs();
+        await this.tick();
       } catch (error) {
-        schedulerLogger.error({ err: error }, 'Error in scheduler scan loop');
+        schedulerLogger.error({ err: error }, 'Error in scheduler tick');
       }
-
       await this.sleep(SCAN_INTERVAL_MS);
     }
   }
 
   /**
-   * Scans for jobs that are due to run and enqueues them.
-   * Creates execution records and updates job status.
+   * One tick: make sure we lead, then fire due jobs in batches. Leadership is
+   * re-checked before every batch, so a leader that loses its lease mid-catch-up
+   * stops within one batch.
    */
-  private async scanDueJobs(): Promise<void> {
-    const dueJobs = await db.getDueJobs(100);
+  private async tick(): Promise<void> {
+    if (!this.leaderElection.isLeader()) {
+      const acquired = await this.leaderElection.tryAcquire();
+      schedulerIsLeader.set({ instance_id: INSTANCE_ID }, acquired ? 1 : 0);
+      if (!acquired) {
+        return;
+      }
+    }
 
-    if (dueJobs.length === 0) {
+    for (let pass = 0; pass < MAX_PASSES_PER_TICK; pass++) {
+      if (!this.running || !this.leaderElection.isLeader()) {
+        schedulerIsLeader.set({ instance_id: INSTANCE_ID }, 0);
+        return;
+      }
+
+      const summary = await db.fireDueJobs(SCAN_BATCH_SIZE, MISFIRE_GRACE_MS);
+      this.recordFiring(summary);
+
+      if (summary.jobs < SCAN_BATCH_SIZE) {
+        return;
+      }
+    }
+  }
+
+  /** Logs and counts what a firing pass did. */
+  private recordFiring(summary: db.FiringSummary): void {
+    for (const fired of summary.firedSlots) {
+      jobsScheduledTotal.inc({ handler: fired.handler, priority: fired.priority.toString() });
+      schedulerLogger.info({
+        jobId: fired.jobId,
+        jobName: fired.jobName,
+        slot: fired.slot.toISOString(),
+      }, `Fired ${fired.jobName} for slot ${fired.slot.toISOString()}`);
+    }
+
+    if (summary.misfired > 0) {
+      // `skipped` only counts misfired jobs whose policy is skip; the rest fired once.
+      const firedOnce = summary.misfired - summary.skipped;
+      if (firedOnce > 0) misfiresTotal.inc({ policy: 'fire_once' }, firedOnce);
+      if (summary.skipped > 0) misfiresTotal.inc({ policy: 'skip' }, summary.skipped);
+      schedulerLogger.warn({
+        misfired: summary.misfired,
+        skipped: summary.skipped,
+      }, 'Due jobs were later than the misfire grace window');
+    }
+
+    if (summary.duplicates > 0) {
+      schedulerLogger.warn(
+        { duplicates: summary.duplicates },
+        'Slots already had an execution (another scheduler fired them); nothing inserted'
+      );
+    }
+  }
+
+  /**
+   * Leader-only: reclaims executions whose lease lapsed. Each reclaimed lease counts as
+   * a failed attempt, so it is retried with backoff or dead-lettered.
+   */
+  private async reap(): Promise<void> {
+    if (this.reaping || !this.running || !this.leaderElection.isLeader()) {
       return;
     }
 
-    schedulerLogger.info({ count: dueJobs.length }, `Found ${dueJobs.length} due jobs`);
-
-    for (const job of dueJobs) {
-      try {
-        // Create execution record
-        const execution = await db.createExecution(
-          job.id,
-          job.next_run_time || new Date()
-        );
-
-        // Enqueue for worker processing
-        await queue.enqueue(execution.id, job.id, job.priority);
-
-        // Update job status to queued
-        await db.updateJobStatus(job.id, JobStatus.QUEUED);
-
-        // Schedule next run for recurring jobs
-        if (job.schedule) {
-          await db.scheduleNextRun(job.id);
-        }
-
-        // Update metrics
-        jobsScheduledTotal.inc({
-          handler: job.handler,
-          priority: job.priority.toString(),
-        });
-
-        schedulerLogger.info({
-          executionId: execution.id,
-          jobId: job.id,
-          jobName: job.name,
-        }, `Scheduled execution ${execution.id} for job ${job.name}`);
-      } catch (error) {
-        schedulerLogger.error({ err: error, jobId: job.id }, `Error scheduling job ${job.id}`);
+    this.reaping = true;
+    try {
+      const reaped = await db.reapExpiredLeases(REAPER_BATCH_SIZE);
+      for (const lease of reaped) {
+        stalledJobsRecovered.inc({ outcome: lease.outcome.outcome });
+        schedulerLogger.warn({
+          executionId: lease.executionId,
+          jobId: lease.jobId,
+          workerId: lease.workerId,
+          outcome: lease.outcome,
+        }, `Reclaimed expired lease on execution ${lease.executionId}`);
       }
+    } catch (error) {
+      schedulerLogger.error({ err: error }, 'Error in lease reaper');
+    } finally {
+      this.reaping = false;
     }
   }
 
-  /**
-   * Recovery loop that finds and re-enqueues stalled executions.
-   * Runs periodically to handle worker crashes or timeouts.
-   */
-  private runRecoveryLoop(): void {
-    this.recoveryLoopHandle = setInterval(async () => {
-      if (!this.running || !this.leaderElection.getIsLeader()) {
-        return;
-      }
-
-      try {
-        const recoveredIds = await queue.recoverStalled();
-
-        for (const executionId of recoveredIds) {
-          const execution = await db.getExecution(executionId);
-          if (execution) {
-            const job = await db.getJob(execution.job_id);
-            if (job) {
-              // Re-enqueue the recovered job
-              await queue.enqueue(executionId, job.id, job.priority);
-              stalledJobsRecovered.inc();
-              schedulerLogger.warn({ executionId, jobId: job.id }, `Re-enqueued stalled execution ${executionId}`);
-            }
-          }
-        }
-
-        if (recoveredIds.length > 0) {
-          schedulerLogger.info({ count: recoveredIds.length }, `Recovered ${recoveredIds.length} stalled executions`);
-        }
-      } catch (error) {
-        schedulerLogger.error({ err: error }, 'Error in recovery loop');
-      }
-    }, STALE_RECOVERY_INTERVAL_MS);
-  }
-
-  /**
-   * Retry loop that schedules pending retries.
-   * Checks for executions ready for retry and enqueues them.
-   */
-  private runRetryLoop(): void {
-    this.retryLoopHandle = setInterval(async () => {
-      if (!this.running || !this.leaderElection.getIsLeader()) {
-        return;
-      }
-
-      try {
-        const retryableExecutions = await db.getRetryableExecutions(50);
-
-        for (const execution of retryableExecutions) {
-          const job = await db.getJob(execution.job_id);
-          if (!job) {
-            continue;
-          }
-
-          // Create a new execution for the retry
-          const newExecution = await db.createExecution(
-            job.id,
-            new Date(),
-            execution.attempt + 1
-          );
-
-          // Update the old execution to mark it as superseded
-          await db.updateExecution(execution.id, {
-            status: ExecutionStatus.FAILED,
-          });
-
-          // Enqueue the retry
-          await queue.enqueue(newExecution.id, job.id, job.priority);
-
-          schedulerLogger.info({
-            jobName: job.name,
-            attempt: newExecution.attempt,
-            oldExecutionId: execution.id,
-            newExecutionId: newExecution.id,
-          }, `Scheduled retry for job ${job.name}, attempt ${newExecution.attempt}`);
-        }
-      } catch (error) {
-        schedulerLogger.error({ err: error }, 'Error in retry loop');
-      }
-    }, 5000); // Check every 5 seconds
-  }
-
-  /**
-   * Starts a loop to periodically update queue metrics.
-   */
-  private startMetricsLoop(): void {
-    this.metricsLoopHandle = setInterval(async () => {
-      try {
-        const stats = await queue.getStats();
-        await updateQueueMetrics(stats);
-      } catch (error) {
-        schedulerLogger.error({ err: error }, 'Error updating queue metrics');
-      }
-    }, 10000); // Every 10 seconds
+  /** Refreshes the queue gauges from PostgreSQL. */
+  private async refreshQueueMetrics(): Promise<void> {
+    try {
+      await updateQueueMetrics(await db.getQueueStats());
+    } catch (error) {
+      schedulerLogger.error({ err: error }, 'Error updating queue metrics');
+    }
   }
 
   /**
@@ -308,10 +241,10 @@ class Scheduler {
 
   /**
    * Checks if this scheduler instance is the current leader.
-   * @returns True if this instance holds the leader lock
+   * @returns True while this instance holds an unexpired leader lease
    */
   isLeader(): boolean {
-    return this.leaderElection.getIsLeader();
+    return this.leaderElection.isLeader();
   }
 
   /**
@@ -327,21 +260,28 @@ class Scheduler {
 const scheduler = new Scheduler();
 
 /**
- * Graceful shutdown handlers for SIGTERM and SIGINT signals.
- * Ensures the scheduler releases leadership before exiting.
+ * Graceful shutdown: release the lease so a standby takes over without waiting for the
+ * TTL, then close connections.
  */
-// Graceful shutdown
-process.on('SIGTERM', async () => {
-  schedulerLogger.info('Received SIGTERM, shutting down...');
-  await scheduler.stop();
+let shuttingDown = false;
+async function shutdown(signal: string): Promise<void> {
+  if (shuttingDown) {
+    return;
+  }
+  shuttingDown = true;
+  schedulerLogger.info(`Received ${signal}, shutting down...`);
+  try {
+    await scheduler.stop();
+    await pool.end();
+    await disconnectRedis();
+  } catch (error) {
+    schedulerLogger.error({ err: error }, 'Error during shutdown');
+  }
   process.exit(0);
-});
+}
 
-process.on('SIGINT', async () => {
-  schedulerLogger.info('Received SIGINT, shutting down...');
-  await scheduler.stop();
-  process.exit(0);
-});
+process.on('SIGTERM', () => void shutdown('SIGTERM'));
+process.on('SIGINT', () => void shutdown('SIGINT'));
 
 // Start the scheduler
 scheduler.start().catch((error) => {

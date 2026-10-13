@@ -32,10 +32,6 @@ interface RunBody extends SubmitBody {
   customInput?: unknown;
 }
 
-interface SubmissionParams {
-  id: string;
-}
-
 interface TestCase {
   input: string;
   expected_output: string | null;
@@ -263,7 +259,7 @@ router.post('/run', requireAuth, codeRunRateLimiter, async (req: Request<unknown
 });
 
 // Get submission details (owner or admin only)
-router.get('/:id', requireAuth, async (req: Request<SubmissionParams>, res: Response): Promise<void> => {
+router.get('/:id', requireAuth, async (req: Request, res: Response): Promise<void> => {
   const { id } = req.params;
   if (!UUID.test(id)) {
     res.status(404).json({ error: 'Submission not found' });
@@ -301,7 +297,7 @@ router.get('/:id', requireAuth, async (req: Request<SubmissionParams>, res: Resp
  * Poll submission status. Reads the Redis status cache first (written by the judge worker after
  * each test case) and falls back to PostgreSQL, the source of truth, on a miss.
  */
-router.get('/:id/status', requireAuth, async (req: Request<SubmissionParams>, res: Response): Promise<void> => {
+router.get('/:id/status', requireAuth, async (req: Request, res: Response): Promise<void> => {
   const { id } = req.params;
   if (!UUID.test(id)) {
     res.status(404).json({ error: 'Submission not found' });

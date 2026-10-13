@@ -1,335 +1,372 @@
 import { WebSocketServer, WebSocket, RawData } from 'ws';
 import { Server as HttpServer, IncomingMessage } from 'http';
-import { v4 as uuid } from 'uuid';
-import { authenticateWs, User } from '../middleware/auth.js';
-import { sendMessage, markAsRead, addReaction, removeReaction, getMessage } from '../services/messages.js';
-import { isParticipant, getParticipantIds } from '../services/conversations.js';
+import { randomUUID } from 'crypto';
+import { authenticateWs, User, WsAuthResult } from '../middleware/auth.js';
 import {
-  pubClient,
-  subClient,
-  setPresence,
-  deletePresence,
-  setTyping,
-  addConnection,
-  removeConnection,
-  getUserConnections,
-  getOfflineMessages,
-  queueOfflineMessage,
-  OfflineMessage,
-} from '../redis.js';
-import { query } from '../db.js';
+  sendMessage,
+  markAsRead,
+  addReaction,
+  removeReaction,
+  getMessage,
+  getInboxBatch,
+  acknowledgeDelivery,
+  NotParticipantError,
+  IdempotencyConflictError,
+  MAX_CONTENT_LENGTH,
+} from './messages.js';
+import { isParticipant, getParticipantIds, getConversationPeerIds } from './conversations.js';
+import { subClient, setTyping, touchPresence, dropPresence } from '../redis.js';
+import {
+  CHANNELS,
+  publishNewMessage,
+  publishTyping,
+  publishReadReceipt,
+  publishDeliveryReceipts,
+  publishReaction,
+  publishPresence,
+  NewMessageEvent,
+  TypingEvent,
+  ReadReceiptEvent,
+  DeliveryReceiptEvent,
+  ReactionEvent,
+  PresenceEvent,
+  ControlEvent,
+} from './realtime.js';
+import { ConnectionRegistry } from '../shared/connection-registry.js';
+import rateLimiter, { MESSAGE_RATE_LIMIT, messageRateKey } from '../shared/rate-limiter.js';
+import { createLogger } from '../shared/logger.js';
+import { websocketConnections, rateLimitExceeded } from '../shared/metrics.js';
 
-interface ExtendedWebSocket extends WebSocket {
+const logger = createLogger('websocket');
+
+interface ClientSocket extends WebSocket {
   isAlive: boolean;
+  /** Unique per socket; a device with two tabs has two connections. */
+  connectionId: string;
+  /** Inbound frames are processed one at a time, in arrival order. */
+  queue: Promise<void>;
 }
 
-interface SendMessagePayload {
-  conversationId: string;
-  content: string;
-  contentType?: string;
-  replyToId?: string;
-  clientMessageId?: string;
-}
-
-interface TypingPayload {
-  conversationId: string;
-  isTyping: boolean;
-}
-
-interface ReadPayload {
-  conversationId: string;
-  messageId: string;
-}
-
-interface ReactionPayload {
-  messageId: string;
-  reaction: string;
-  remove?: boolean;
-}
-
-interface ClientMessage {
+interface ClientFrame {
   type: string;
   [key: string]: unknown;
 }
 
-interface PubSubMessageData {
-  type?: string;
-  message?: unknown;
-  participantIds?: string[];
-  senderId?: string;
-  senderDeviceId?: string;
-  conversationId?: string;
-  userId?: string;
-  username?: string;
-  displayName?: string;
-  isTyping?: boolean;
-  messageId?: string;
-  reaction?: string;
-  remove?: boolean;
-  status?: string;
+const MAX_ACK_IDS = 500;
+const CLIENT_CONTENT_TYPES = new Set(['text', 'image', 'video', 'file']);
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+const isUuid = (value: unknown): value is string => typeof value === 'string' && UUID_PATTERN.test(value);
+
+// Sockets held by this instance: userId -> deviceId -> sockets
+const registry = new ConnectionRegistry<ClientSocket>();
+let heartbeatInterval: ReturnType<typeof setInterval> | null = null;
+
+function send(ws: ClientSocket, payload: object): void {
+  if (ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(payload));
+  }
 }
 
-// Store active connections: userId -> Map<deviceId, ws>
-const connections = new Map<string, Map<string, ExtendedWebSocket>>();
-
-// Server ID for distributed routing
-const SERVER_ID = process.env.PORT || uuid();
-
-/** Initializes WebSocket server with authentication, presence tracking, and real-time message delivery. */
+/** Initializes the WebSocket server: authentication, delivery, receipts, presence. */
 export function setupWebSocket(server: HttpServer): WebSocketServer {
-  const wss = new WebSocketServer({ server, path: '/ws' });
+  const wss = new WebSocketServer({ server, path: '/ws', maxPayload: 64 * 1024 });
 
-  // Subscribe to Redis channels for cross-server messaging
-  subClient.subscribe('messages', 'typing', 'presence', 'read_receipts', 'reactions');
-
-  subClient.on('message', (channel: string, message: string) => {
-    const data = JSON.parse(message) as PubSubMessageData;
-    handlePubSubMessage(channel, data);
+  // Every instance hears every event and forwards it to the sockets it holds
+  subClient.subscribe(...CHANNELS).catch((error: Error) => {
+    logger.error({ error }, 'Failed to subscribe to pub/sub channels');
+  });
+  subClient.on('message', (channel: string, raw: string) => {
+    try {
+      handlePubSubMessage(channel, JSON.parse(raw));
+    } catch (error) {
+      logger.error({ error, channel }, 'Invalid pub/sub payload');
+    }
   });
 
-  wss.on('connection', async (ws: WebSocket, req: IncomingMessage) => {
-    const extWs = ws as ExtendedWebSocket;
+  wss.on('connection', (rawWs: WebSocket, req: IncomingMessage) => {
+    const ws = rawWs as ClientSocket;
+    ws.isAlive = true;
+    ws.connectionId = randomUUID();
+
     const url = new URL(req.url || '', `http://${req.headers.host}`);
-    const token = url.searchParams.get('token');
-
-    const authResult = await authenticateWs(token);
-    if (!authResult) {
-      ws.close(4001, 'Unauthorized');
-      return;
-    }
-
-    const { user, deviceId } = authResult;
-
-    // Store connection
-    if (!connections.has(user.id)) {
-      connections.set(user.id, new Map());
-    }
-    connections.get(user.id)!.set(deviceId, extWs);
-
-    // Register connection in Redis for distributed routing
-    await addConnection(user.id, deviceId, SERVER_ID as string);
-    await setPresence(user.id, deviceId, 'online');
-
-    console.log(`User ${user.username} connected on device ${deviceId}`);
-
-    // Send connection confirmation
-    ws.send(JSON.stringify({
-      type: 'connected',
-      userId: user.id,
-      deviceId,
-    }));
-
-    // Deliver offline messages
-    const offlineMessages = await getOfflineMessages(user.id, deviceId);
-    if (offlineMessages.length > 0) {
-      ws.send(JSON.stringify({
-        type: 'offline_messages',
-        messages: offlineMessages,
-      }));
-    }
-
-    // Setup heartbeat
-    extWs.isAlive = true;
-    ws.on('pong', () => {
-      extWs.isAlive = true;
-      setPresence(user.id, deviceId, 'online');
-    });
-
-    // Handle messages
-    ws.on('message', async (data: RawData) => {
-      try {
-        const message = JSON.parse(data.toString()) as ClientMessage;
-        await handleClientMessage(extWs, user, deviceId, message);
-      } catch (error) {
-        console.error('WebSocket message error:', error);
-        ws.send(JSON.stringify({
-          type: 'error',
-          error: 'Invalid message format',
-        }));
+    const ready: Promise<WsAuthResult | null> = authenticateWs(url.searchParams.get('token')).catch(
+      (error: Error) => {
+        logger.error({ error }, 'WebSocket authentication failed');
+        return null;
       }
-    });
+    );
 
-    // Handle disconnect
-    ws.on('close', async () => {
-      console.log(`User ${user.username} disconnected from device ${deviceId}`);
-
-      const userConnections = connections.get(user.id);
-      if (userConnections) {
-        userConnections.delete(deviceId);
-        if (userConnections.size === 0) {
-          connections.delete(user.id);
+    // Start the per-socket queue with authentication and the initial sync.
+    ws.queue = ready
+      .then(async (auth) => {
+        if (!auth) {
+          ws.close(4001, 'Unauthorized');
+          return;
         }
-      }
+        await onAuthenticated(ws, auth);
+      })
+      .catch((error: Error) => logger.error({ error }, 'WebSocket setup failed'));
 
-      await removeConnection(user.id, deviceId);
-      await deletePresence(user.id);
+    // Attach the frame handler now, not after the async authentication: the
+    // client flushes queued sends the moment the socket opens, and ws drops
+    // frames that arrive before a 'message' listener exists. Chaining every
+    // frame on ws.queue also keeps one device's sends in order, so its
+    // messages get seq numbers in the order the user typed them.
+    ws.on('message', (data: RawData) => {
+      ws.queue = ws.queue
+        .then(async () => {
+          const auth = await ready;
+          if (!auth || ws.readyState !== WebSocket.OPEN) return;
+          await handleFrame(ws, auth.user, auth.deviceId, data);
+        })
+        .catch((error: Error) => logger.error({ error }, 'WebSocket frame handling failed'));
+    });
 
-      // Broadcast offline status
-      await pubClient.publish('presence', JSON.stringify({
-        userId: user.id,
-        status: 'offline',
-      }));
+    ws.on('pong', () => {
+      ws.isAlive = true;
+      ready
+        .then((auth) => auth && touchPresence(auth.user.id, ws.connectionId))
+        .catch(() => undefined);
+    });
+
+    ws.on('close', () => {
+      ws.queue = ws.queue
+        .then(async () => {
+          const auth = await ready;
+          if (auth) await onClose(ws, auth);
+        })
+        .catch((error: Error) => logger.error({ error }, 'WebSocket cleanup failed'));
     });
   });
 
-  // Heartbeat interval
-  const heartbeatInterval = setInterval(() => {
-    wss.clients.forEach((ws) => {
-      const extWs = ws as ExtendedWebSocket;
-      if (!extWs.isAlive) {
-        return ws.terminate();
+  // Heartbeat: a socket to a device that dropped off the network stays
+  // "open" on the server until a ping goes unanswered.
+  heartbeatInterval = setInterval(() => {
+    wss.clients.forEach((client) => {
+      const ws = client as ClientSocket;
+      if (!ws.isAlive) {
+        ws.terminate();
+        return;
       }
-      extWs.isAlive = false;
+      ws.isAlive = false;
       ws.ping();
     });
   }, parseInt(process.env.WS_HEARTBEAT_INTERVAL || '30000'));
 
   wss.on('close', () => {
-    clearInterval(heartbeatInterval);
+    if (heartbeatInterval) clearInterval(heartbeatInterval);
   });
 
   return wss;
 }
 
-async function handleClientMessage(
-  ws: ExtendedWebSocket,
-  user: User,
-  deviceId: string,
-  message: ClientMessage
-): Promise<void> {
-  const { type, ...payload } = message;
+async function onAuthenticated(ws: ClientSocket, { user, deviceId }: WsAuthResult): Promise<void> {
+  if (ws.readyState !== WebSocket.OPEN) return;
 
-  switch (type) {
-    case 'send_message':
-      await handleSendMessage(ws, user, deviceId, payload as unknown as SendMessagePayload);
-      break;
+  registry.add(user.id, deviceId, ws);
+  websocketConnections.set(registry.size());
+  logger.info({ userId: user.id, deviceId, connectionId: ws.connectionId }, 'Device connected');
 
-    case 'typing':
-      await handleTyping(user, payload as unknown as TypingPayload);
-      break;
+  send(ws, { type: 'connected', userId: user.id, deviceId });
 
-    case 'read':
-      await handleRead(user, deviceId, payload as unknown as ReadPayload);
-      break;
+  const liveConnections = await touchPresence(user.id, ws.connectionId).catch(() => 0);
+  if (liveConnections === 1) {
+    await announcePresence(user.id, 'online');
+  }
 
-    case 'reaction':
-      await handleReaction(user, payload as unknown as ReactionPayload);
-      break;
+  // Catch up: everything queued for this device while it was away
+  await sendInboxBatch(ws, deviceId);
+}
 
-    case 'sync':
-      await handleSync(ws);
-      break;
+async function onClose(ws: ClientSocket, { user, deviceId }: WsAuthResult): Promise<void> {
+  registry.remove(user.id, deviceId, ws);
+  websocketConnections.set(registry.size());
+  logger.info({ userId: user.id, deviceId, connectionId: ws.connectionId }, 'Device disconnected');
 
-    default:
-      ws.send(JSON.stringify({
-        type: 'error',
-        error: `Unknown message type: ${type}`,
-      }));
+  // Offline only when the user's last connection anywhere is gone
+  const remaining = await dropPresence(user.id, ws.connectionId).catch(() => 1);
+  if (remaining === 0) {
+    await announcePresence(user.id, 'offline');
   }
 }
 
-async function handleSendMessage(
-  ws: ExtendedWebSocket,
-  user: User,
-  deviceId: string,
-  payload: SendMessagePayload
-): Promise<void> {
-  const { conversationId, content, contentType, replyToId, clientMessageId } = payload;
+async function announcePresence(userId: string, status: 'online' | 'offline'): Promise<void> {
+  const peerIds = await getConversationPeerIds(userId);
+  if (peerIds.length > 0) {
+    await publishPresence({ userId, status, peerIds });
+  }
+}
 
-  // Verify user is participant
-  if (!(await isParticipant(conversationId, user.id))) {
-    ws.send(JSON.stringify({
-      type: 'error',
-      error: 'Not a participant of this conversation',
-      clientMessageId,
-    }));
+/** Sends the oldest undelivered inbox rows; the client acks them, then asks again if hasMore. */
+async function sendInboxBatch(ws: ClientSocket, deviceId: string): Promise<void> {
+  const { messages, hasMore } = await getInboxBatch(deviceId);
+  send(ws, { type: 'sync_batch', messages, hasMore });
+}
+
+async function handleFrame(ws: ClientSocket, user: User, deviceId: string, data: RawData): Promise<void> {
+  let frame: ClientFrame;
+  try {
+    frame = JSON.parse(data.toString()) as ClientFrame;
+  } catch {
+    send(ws, { type: 'error', code: 'invalid', error: 'Invalid message format' });
     return;
   }
 
-  // Save message
-  const message = await sendMessage(conversationId, user.id, content, {
-    contentType,
-    replyToId,
-  });
+  try {
+    switch (frame.type) {
+      case 'send_message':
+        await handleSendMessage(ws, user, deviceId, frame);
+        break;
+      case 'ack':
+        await handleAck(user, deviceId, frame);
+        break;
+      case 'sync':
+        await sendInboxBatch(ws, deviceId);
+        break;
+      case 'typing':
+        await handleTyping(user, frame);
+        break;
+      case 'read':
+        await handleRead(ws, user, deviceId, frame);
+        break;
+      case 'reaction':
+        await handleReaction(user, frame);
+        break;
+      default:
+        send(ws, { type: 'error', code: 'invalid', error: `Unknown message type: ${String(frame.type)}` });
+    }
+  } catch (error) {
+    logger.error({ error, type: frame.type, userId: user.id }, 'WebSocket handler failed');
+    send(ws, {
+      type: 'error',
+      code: 'server_error',
+      error: 'Request failed',
+      clientMessageId: typeof frame.clientMessageId === 'string' ? frame.clientMessageId : undefined,
+    });
+  }
+}
 
-  // Acknowledge to sender
-  ws.send(JSON.stringify({
+async function handleSendMessage(ws: ClientSocket, user: User, deviceId: string, frame: ClientFrame): Promise<void> {
+  const { conversationId, content, contentType, replyToId, clientMessageId } = frame;
+  const fail = (code: string, error: string, extra: object = {}) =>
+    send(ws, { type: 'error', code, error, clientMessageId, ...extra });
+
+  if (!isUuid(conversationId)) return fail('invalid', 'conversationId is required');
+  if (typeof content !== 'string' || content.trim().length === 0 || content.length > MAX_CONTENT_LENGTH) {
+    return fail('invalid', `content must be 1-${MAX_CONTENT_LENGTH} characters`);
+  }
+  if (clientMessageId !== undefined && (typeof clientMessageId !== 'string' || clientMessageId.length === 0 || clientMessageId.length > 64)) {
+    return fail('invalid', 'clientMessageId must be a string of at most 64 characters');
+  }
+  if (contentType !== undefined && (typeof contentType !== 'string' || !CLIENT_CONTENT_TYPES.has(contentType))) {
+    return fail('invalid', 'unsupported contentType');
+  }
+  if (replyToId !== undefined && replyToId !== null && !isUuid(replyToId)) {
+    return fail('invalid', 'replyToId must be a message ID');
+  }
+
+  // Same per-user budget as the REST send route (one Redis key for both)
+  const verdict = await rateLimiter.checkLimit(
+    messageRateKey(user.id),
+    MESSAGE_RATE_LIMIT.limit,
+    MESSAGE_RATE_LIMIT.windowSeconds
+  );
+  if (!verdict.allowed) {
+    rateLimitExceeded.inc({ endpoint: 'messages_ws' });
+    return fail('rate_limited', 'Rate limit exceeded', { retryAfter: verdict.retryAfter });
+  }
+
+  let result;
+  try {
+    result = await sendMessage({
+      conversationId,
+      senderId: user.id,
+      senderDeviceId: deviceId,
+      content,
+      contentType: contentType as string | undefined,
+      replyToId: (replyToId as string | null | undefined) ?? null,
+      clientMessageId: (clientMessageId as string | undefined) ?? null,
+    });
+  } catch (error) {
+    if (error instanceof NotParticipantError) return fail('forbidden', error.message);
+    if (error instanceof IdempotencyConflictError) return fail('idempotency_conflict', error.message);
+    throw error;
+  }
+
+  // The ack carries the server's seq; a duplicate gets the original message
+  send(ws, {
     type: 'message_sent',
     clientMessageId,
-    message,
-  }));
+    message: result.message,
+    isDuplicate: result.isDuplicate,
+  });
 
-  // Get all participants
-  const participantIds = await getParticipantIds(conversationId);
-
-  // Broadcast to all participants
-  await pubClient.publish('messages', JSON.stringify({
-    type: 'new_message',
-    message,
-    participantIds,
-    senderId: user.id,
-    senderDeviceId: deviceId,
-  }));
+  // A duplicate was already published when it was first accepted, and its
+  // inbox rows exist either way, so only new messages are pushed.
+  if (!result.isDuplicate) {
+    await publishNewMessage({
+      message: result.message,
+      participantIds: result.participantIds,
+      senderConnectionId: ws.connectionId,
+    });
+  }
 }
 
-async function handleTyping(user: User, payload: TypingPayload): Promise<void> {
-  const { conversationId, isTyping } = payload;
+async function handleAck(user: User, deviceId: string, frame: ClientFrame): Promise<void> {
+  const ids = Array.isArray(frame.messageIds)
+    ? (frame.messageIds as unknown[]).filter(isUuid).slice(0, MAX_ACK_IDS)
+    : [];
+  if (ids.length === 0) return;
 
-  // Verify user is participant
-  if (!(await isParticipant(conversationId, user.id))) {
-    return;
-  }
+  const acked = await acknowledgeDelivery(deviceId, ids);
+  await publishDeliveryReceipts(user.id, deviceId, acked);
+}
 
-  // Update Redis
+async function handleTyping(user: User, frame: ClientFrame): Promise<void> {
+  const { conversationId, isTyping } = frame;
+  if (!isUuid(conversationId) || typeof isTyping !== 'boolean') return;
+  if (!(await isParticipant(conversationId, user.id))) return;
+
   await setTyping(conversationId, user.id, isTyping);
-
-  // Get all participants
   const participantIds = await getParticipantIds(conversationId);
-
-  // Broadcast typing status
-  await pubClient.publish('typing', JSON.stringify({
+  await publishTyping({
     conversationId,
     userId: user.id,
     username: user.username,
     displayName: user.display_name,
     isTyping,
     participantIds,
-  }));
+  });
 }
 
-async function handleRead(user: User, deviceId: string, payload: ReadPayload): Promise<void> {
-  const { conversationId, messageId } = payload;
+async function handleRead(ws: ClientSocket, user: User, deviceId: string, frame: ClientFrame): Promise<void> {
+  const { conversationId, messageId } = frame;
+  if (!isUuid(conversationId) || !isUuid(messageId)) return;
+  if (!(await isParticipant(conversationId, user.id))) return;
 
-  // Verify user is participant
-  if (!(await isParticipant(conversationId, user.id))) {
-    return;
-  }
+  const result = await markAsRead(conversationId, user.id, deviceId, messageId);
+  if (!result || !result.advanced) return;
 
-  // Update read receipt
-  await markAsRead(conversationId, user.id, deviceId, messageId);
-
-  // Get all participants
   const participantIds = await getParticipantIds(conversationId);
-
-  // Broadcast read receipt
-  await pubClient.publish('read_receipts', JSON.stringify({
+  await publishReadReceipt({
     conversationId,
     userId: user.id,
+    deviceId,
+    seq: result.seq,
     messageId,
     participantIds,
-  }));
+    senderConnectionId: ws.connectionId,
+  });
 }
 
-async function handleReaction(user: User, payload: ReactionPayload): Promise<void> {
-  const { messageId, reaction, remove } = payload;
+async function handleReaction(user: User, frame: ClientFrame): Promise<void> {
+  const { messageId, reaction, remove } = frame;
+  if (!isUuid(messageId) || typeof reaction !== 'string' || reaction.length === 0 || reaction.length > 50) return;
 
   const message = await getMessage(messageId);
   if (!message) return;
-
-  // Verify user is participant
-  if (!(await isParticipant(message.conversation_id, user.id))) {
-    return;
-  }
+  if (!(await isParticipant(message.conversation_id, user.id))) return;
 
   if (remove) {
     await removeReaction(messageId, user.id, reaction);
@@ -337,179 +374,108 @@ async function handleReaction(user: User, payload: ReactionPayload): Promise<voi
     await addReaction(messageId, user.id, reaction);
   }
 
-  // Get all participants
   const participantIds = await getParticipantIds(message.conversation_id);
-
-  // Broadcast reaction update
-  await pubClient.publish('reactions', JSON.stringify({
+  await publishReaction({
     conversationId: message.conversation_id,
     messageId,
     userId: user.id,
     reaction,
-    remove,
+    remove: Boolean(remove),
     participantIds,
-  }));
+  });
 }
 
-async function handleSync(ws: ExtendedWebSocket): Promise<void> {
-  // Client requests sync after reconnection
-  // This is handled by the offline message queue
-  ws.send(JSON.stringify({
-    type: 'sync_complete',
-  }));
+/** Writes one frame to every local socket of the given users, optionally skipping one connection. */
+function deliverToUsers(userIds: unknown, payload: object, exceptConnectionId?: string | null): void {
+  if (!Array.isArray(userIds) || userIds.length === 0) return;
+  const frame = JSON.stringify(payload);
+  for (const ws of registry.socketsForUsers(userIds as string[])) {
+    if (ws.connectionId === exceptConnectionId) continue;
+    if (ws.readyState === WebSocket.OPEN) ws.send(frame);
+  }
 }
 
-function handlePubSubMessage(channel: string, data: PubSubMessageData): void {
+function handlePubSubMessage(channel: string, data: unknown): void {
   switch (channel) {
-    case 'messages':
-      deliverMessage(data);
+    case 'messages': {
+      const event = data as NewMessageEvent;
+      deliverToUsers(event.participantIds, { type: 'new_message', message: event.message }, event.senderConnectionId);
       break;
-
-    case 'typing':
-      deliverTyping(data);
-      break;
-
-    case 'read_receipts':
-      deliverReadReceipt(data);
-      break;
-
-    case 'reactions':
-      deliverReaction(data);
-      break;
-
-    case 'presence':
-      deliverPresence(data);
-      break;
-  }
-}
-
-async function deliverMessage(data: PubSubMessageData): Promise<void> {
-  const { message, participantIds, senderId, senderDeviceId } = data;
-
-  if (!participantIds) return;
-
-  for (const participantId of participantIds) {
-    const userConnections = connections.get(participantId);
-
-    if (userConnections) {
-      for (const [deviceId, ws] of userConnections) {
-        // Skip the sender's device that sent the message
-        if (participantId === senderId && deviceId === senderDeviceId) {
-          continue;
-        }
-
-        ws.send(JSON.stringify({
-          type: 'new_message',
-          message,
-        }));
-      }
-    } else if (participantId !== senderId) {
-      // User not connected on this server, check if connected elsewhere
-      const remoteConnections = await getUserConnections(participantId);
-
-      if (Object.keys(remoteConnections).length === 0) {
-        // User is offline, queue message
-        const devices = await getUserDevicesFromDb(participantId);
-        for (const device of devices) {
-          await queueOfflineMessage(participantId, device.id, {
-            type: 'new_message',
-            message,
-          } as OfflineMessage);
-        }
-      }
-      // If connected to another server, they'll receive via their own pub/sub
     }
-  }
-}
-
-async function deliverTyping(data: PubSubMessageData): Promise<void> {
-  const { conversationId, userId, username, displayName, isTyping, participantIds } = data;
-
-  if (!participantIds) return;
-
-  for (const participantId of participantIds) {
-    if (participantId === userId) continue;
-
-    const userConnections = connections.get(participantId);
-    if (userConnections) {
-      for (const [, ws] of userConnections) {
-        ws.send(JSON.stringify({
+    case 'typing': {
+      const event = data as TypingEvent;
+      deliverToUsers(
+        event.participantIds?.filter((id) => id !== event.userId),
+        {
           type: 'typing',
-          conversationId,
-          userId,
-          username,
-          displayName,
-          isTyping,
-        }));
-      }
+          conversationId: event.conversationId,
+          userId: event.userId,
+          username: event.username,
+          displayName: event.displayName,
+          isTyping: event.isTyping,
+        }
+      );
+      break;
     }
-  }
-}
-
-async function deliverReadReceipt(data: PubSubMessageData): Promise<void> {
-  const { conversationId, userId, messageId, participantIds } = data;
-
-  if (!participantIds) return;
-
-  for (const participantId of participantIds) {
-    if (participantId === userId) continue;
-
-    const userConnections = connections.get(participantId);
-    if (userConnections) {
-      for (const [, ws] of userConnections) {
-        ws.send(JSON.stringify({
+    case 'read_receipts': {
+      const event = data as ReadReceiptEvent;
+      deliverToUsers(
+        event.participantIds,
+        {
           type: 'read_receipt',
-          conversationId,
-          userId,
-          messageId,
-        }));
+          conversationId: event.conversationId,
+          userId: event.userId,
+          deviceId: event.deviceId,
+          seq: event.seq,
+          messageId: event.messageId,
+        },
+        event.senderConnectionId
+      );
+      break;
+    }
+    case 'delivery_receipts': {
+      const event = data as DeliveryReceiptEvent;
+      deliverToUsers(event.targetUserIds, {
+        type: 'delivery_receipt',
+        conversationId: event.conversationId,
+        messageIds: event.messageIds,
+        seq: event.seq,
+        userId: event.userId,
+        deviceId: event.deviceId,
+      });
+      break;
+    }
+    case 'reactions': {
+      const event = data as ReactionEvent;
+      deliverToUsers(event.participantIds, {
+        type: 'reaction_update',
+        conversationId: event.conversationId,
+        messageId: event.messageId,
+        userId: event.userId,
+        reaction: event.reaction,
+        remove: event.remove,
+      });
+      break;
+    }
+    case 'presence': {
+      const event = data as PresenceEvent;
+      deliverToUsers(event.peerIds, { type: 'presence', userId: event.userId, status: event.status });
+      break;
+    }
+    case 'control': {
+      const event = data as ControlEvent;
+      if (event.type === 'device_revoked') {
+        for (const ws of registry.socketsForDevice(event.userId, event.deviceId)) {
+          ws.close(4003, 'Device revoked');
+        }
       }
+      break;
     }
   }
 }
 
-async function deliverReaction(data: PubSubMessageData): Promise<void> {
-  const { conversationId, messageId, userId, reaction, remove, participantIds } = data;
-
-  if (!participantIds) return;
-
-  for (const participantId of participantIds) {
-    const userConnections = connections.get(participantId);
-    if (userConnections) {
-      for (const [, ws] of userConnections) {
-        ws.send(JSON.stringify({
-          type: 'reaction_update',
-          conversationId,
-          messageId,
-          userId,
-          reaction,
-          remove,
-        }));
-      }
-    }
-  }
-}
-
-function deliverPresence(data: PubSubMessageData): void {
-  const { userId, status } = data;
-
-  // Broadcast to all connected users who have conversations with this user
-  for (const [, userConnections] of connections) {
-    for (const [, ws] of userConnections) {
-      ws.send(JSON.stringify({
-        type: 'presence',
-        userId,
-        status,
-      }));
-    }
-  }
-}
-
-// Helper to get user devices from database
-async function getUserDevicesFromDb(userId: string): Promise<{ id: string }[]> {
-  const result = await query<{ id: string }>(
-    'SELECT id FROM devices WHERE user_id = $1 AND is_active = true',
-    [userId]
-  );
-  return result.rows;
+/** Closes every socket on this instance so clients reconnect elsewhere (graceful shutdown). */
+export function closeAllConnections(wss: WebSocketServer): void {
+  if (heartbeatInterval) clearInterval(heartbeatInterval);
+  wss.clients.forEach((client) => client.close(1001, 'Server shutting down'));
 }

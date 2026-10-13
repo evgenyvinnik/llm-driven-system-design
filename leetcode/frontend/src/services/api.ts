@@ -1,11 +1,22 @@
 const API_BASE = '/api/v1';
 
+/** Non-2xx response from the API; `status` lets callers tell client errors from server errors. */
+export class ApiError extends Error {
+  status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+  }
+}
+
 /** Error thrown when API returns 429, includes retry-after seconds for backoff. */
-export class RateLimitError extends Error {
+export class RateLimitError extends ApiError {
   retryAfter: number;
 
   constructor(message: string, retryAfter: number) {
-    super(message);
+    super(message, 429);
     this.name = 'RateLimitError';
     this.retryAfter = retryAfter;
   }
@@ -33,10 +44,23 @@ async function request<T>(
       throw new RateLimitError(error.message || 'Rate limit exceeded. Please wait before trying again.', retryAfter);
     }
 
-    throw new Error(error.error || 'Request failed');
+    throw new ApiError(error.error || 'Request failed', response.status);
   }
 
   return response.json();
+}
+
+/**
+ * A new Idempotency-Key for one submit attempt. crypto.randomUUID only exists in secure
+ * contexts (https or localhost), so fall back to getRandomValues for other dev hosts.
+ */
+export function newIdempotencyKey(): string {
+  if (typeof crypto.randomUUID === 'function') return crypto.randomUUID();
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
 /** Authentication API methods for login, registration, logout, and session validation. */
@@ -125,9 +149,11 @@ export const problemsApi = {
 
 /** Submissions API for submitting code, running against test cases, and polling execution status. */
 export const submissionsApi = {
-  submit: (problemSlug: string, language: string, code: string) =>
-    request<{ submissionId: string; status: string; message: string }>('/submissions', {
+  /** The same key must be sent on every retry of one submit attempt; the server dedupes on it. */
+  submit: (problemSlug: string, language: string, code: string, idempotencyKey: string) =>
+    request<{ submissionId: string; status: string; message: string; duplicate?: boolean }>('/submissions', {
       method: 'POST',
+      headers: { 'Idempotency-Key': idempotencyKey },
       body: JSON.stringify({ problemSlug, language, code }),
     }),
 
@@ -163,17 +189,19 @@ export const submissionsApi = {
       problem_title: string;
     }>(`/submissions/${id}`),
 
-  getStatus: (id: string) =>
-    request<{
-      status: string;
-      runtime_ms?: number;
-      memory_kb?: number;
-      test_cases_passed: number;
-      test_cases_total: number;
-      error_message?: string;
-      current_test?: number;
-    }>(`/submissions/${id}/status`),
+  getStatus: (id: string, signal?: AbortSignal) =>
+    request<SubmissionStatusResponse>(`/submissions/${id}/status`, { signal }),
 };
+
+export interface SubmissionStatusResponse {
+  status: string;
+  runtime_ms?: number | null;
+  memory_kb?: number | null;
+  test_cases_passed?: number;
+  test_cases_total?: number;
+  error_message?: string | null;
+  current_test?: number;
+}
 
 /** Users API for profiles, submission history, and problem-solving progress tracking. */
 export const usersApi = {

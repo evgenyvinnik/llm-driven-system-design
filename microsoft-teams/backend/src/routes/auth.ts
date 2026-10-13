@@ -6,6 +6,29 @@ import { logger } from '../services/logger.js';
 
 const router = Router();
 
+/**
+ * Issues a fresh session id before storing the user in it. Reusing the pre-login id would let
+ * anyone who planted or observed that cookie (session fixation) ride the authenticated session.
+ */
+function startSession(
+  req: Request,
+  user: { id: string; username: string; role: string; display_name: string | null },
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    req.session.regenerate((err) => {
+      if (err) {
+        reject(err);
+        return;
+      }
+      req.session.userId = user.id;
+      req.session.username = user.username;
+      req.session.displayName = user.display_name ?? user.username;
+      req.session.role = user.role;
+      resolve();
+    });
+  });
+}
+
 // POST /api/auth/register
 router.post('/register', authLimiter, async (req: Request, res: Response) => {
   try {
@@ -47,9 +70,7 @@ router.post('/register', authLimiter, async (req: Request, res: Response) => {
 
     const user = result.rows[0];
 
-    req.session.userId = user.id;
-    req.session.username = user.username;
-    req.session.role = user.role;
+    await startSession(req, user);
 
     res.status(201).json({
       user: {
@@ -94,9 +115,7 @@ router.post('/login', authLimiter, async (req: Request, res: Response) => {
       return;
     }
 
-    req.session.userId = user.id;
-    req.session.username = user.username;
-    req.session.role = user.role;
+    await startSession(req, user);
 
     res.json({
       user: {
@@ -137,6 +156,7 @@ router.get('/me', (req: Request, res: Response) => {
     user: {
       id: req.session.userId,
       username: req.session.username,
+      displayName: req.session.displayName,
       role: req.session.role,
     },
   });

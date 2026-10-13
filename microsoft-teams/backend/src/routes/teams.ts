@@ -1,17 +1,41 @@
 import { Router, Request, Response } from 'express';
-import { pool } from '../services/db.js';
+import { pool, withTransaction } from '../services/db.js';
 import { requireAuth } from '../middleware/auth.js';
+import {
+  ASSIGNABLE_TEAM_ROLES,
+  canManageTeam,
+  canSeeTeam,
+  getOrgRole,
+  getTeamAccess,
+  isUuid,
+  type TeamAccess,
+} from '../services/access.js';
 import { logger } from '../services/logger.js';
 
 const router = Router();
 
-// GET /api/teams?orgId=xxx - list teams in org
+/** The team if the caller can see it; otherwise answers 404 and returns null. */
+async function visibleTeam(req: Request, res: Response): Promise<TeamAccess | null> {
+  const team = await getTeamAccess(req.session.userId!, req.params.teamId);
+  if (!team || !canSeeTeam(team)) {
+    res.status(404).json({ error: 'Team not found' });
+    return null;
+  }
+  return team;
+}
+
+// GET /api/teams?orgId=xxx - list teams in org (org members only)
 router.get('/', requireAuth, async (req: Request, res: Response) => {
   try {
     const { orgId } = req.query;
 
-    if (!orgId) {
+    if (!orgId || typeof orgId !== 'string') {
       res.status(400).json({ error: 'orgId query parameter is required' });
+      return;
+    }
+
+    if (!(await getOrgRole(req.session.userId!, orgId))) {
+      res.status(404).json({ error: 'Organization not found' });
       return;
     }
 
@@ -30,24 +54,26 @@ router.get('/', requireAuth, async (req: Request, res: Response) => {
   }
 });
 
-// POST /api/teams - create team
+// POST /api/teams - create team (org members only)
 router.post('/', requireAuth, async (req: Request, res: Response) => {
   try {
     const { orgId, name, description, isPrivate } = req.body;
 
-    if (!orgId || !name) {
-      res.status(400).json({ error: 'orgId and name are required' });
+    if (!orgId || typeof name !== 'string' || !name.trim() || name.length > 100) {
+      res.status(400).json({ error: 'orgId and name (max 100 characters) are required' });
       return;
     }
 
-    const client = await pool.connect();
-    try {
-      await client.query('BEGIN');
+    if (!(await getOrgRole(req.session.userId!, orgId))) {
+      res.status(404).json({ error: 'Organization not found' });
+      return;
+    }
 
+    const created = await withTransaction(async (client) => {
       const teamResult = await client.query(
         `INSERT INTO teams (org_id, name, description, is_private, created_by)
          VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-        [orgId, name, description || null, isPrivate || false, req.session.userId],
+        [orgId, name.trim(), description || null, isPrivate === true, req.session.userId],
       );
       const team = teamResult.rows[0];
 
@@ -66,19 +92,14 @@ router.post('/', requireAuth, async (req: Request, res: Response) => {
       const channel = channelResult.rows[0];
 
       // Add creator to the default channel
-      await client.query(
-        `INSERT INTO channel_members (channel_id, user_id) VALUES ($1, $2)`,
-        [channel.id, req.session.userId],
-      );
+      await client.query(`INSERT INTO channel_members (channel_id, user_id) VALUES ($1, $2)`, [
+        channel.id,
+        req.session.userId,
+      ]);
+      return { team, defaultChannel: channel };
+    });
 
-      await client.query('COMMIT');
-      res.status(201).json({ team, defaultChannel: channel });
-    } catch (err) {
-      await client.query('ROLLBACK');
-      throw err;
-    } finally {
-      client.release();
-    }
+    res.status(201).json(created);
   } catch (err) {
     logger.error({ err }, 'Failed to create team');
     res.status(500).json({ error: 'Internal server error' });
@@ -88,11 +109,9 @@ router.post('/', requireAuth, async (req: Request, res: Response) => {
 // GET /api/teams/:teamId - get team details
 router.get('/:teamId', requireAuth, async (req: Request, res: Response) => {
   try {
-    const result = await pool.query('SELECT * FROM teams WHERE id = $1', [req.params.teamId]);
-    if (result.rows.length === 0) {
-      res.status(404).json({ error: 'Team not found' });
-      return;
-    }
+    const team = await visibleTeam(req, res);
+    if (!team) return;
+    const result = await pool.query('SELECT * FROM teams WHERE id = $1', [team.teamId]);
     res.json({ team: result.rows[0] });
   } catch (err) {
     logger.error({ err }, 'Failed to get team');
@@ -103,13 +122,15 @@ router.get('/:teamId', requireAuth, async (req: Request, res: Response) => {
 // GET /api/teams/:teamId/members - list team members
 router.get('/:teamId/members', requireAuth, async (req: Request, res: Response) => {
   try {
+    const team = await visibleTeam(req, res);
+    if (!team) return;
     const result = await pool.query(
       `SELECT u.id, u.username, u.display_name, u.avatar_url, tm.role, tm.joined_at
        FROM team_members tm
        JOIN users u ON tm.user_id = u.id
        WHERE tm.team_id = $1
        ORDER BY u.display_name`,
-      [req.params.teamId],
+      [team.teamId],
     );
     res.json({ members: result.rows });
   } catch (err) {
@@ -118,13 +139,24 @@ router.get('/:teamId/members', requireAuth, async (req: Request, res: Response) 
   }
 });
 
-// POST /api/teams/:teamId/members - add member to team
+// POST /api/teams/:teamId/members - add an org member to the team (team owners, org owners/admins)
 router.post('/:teamId/members', requireAuth, async (req: Request, res: Response) => {
   try {
-    const { userId, role } = req.body;
+    const { userId, role = 'member' } = req.body;
 
-    if (!userId) {
-      res.status(400).json({ error: 'userId is required' });
+    if (!isUuid(userId) || !ASSIGNABLE_TEAM_ROLES.has(role)) {
+      res.status(400).json({ error: 'userId is required and role must be member or owner' });
+      return;
+    }
+
+    const team = await visibleTeam(req, res);
+    if (!team) return;
+    if (!canManageTeam(team)) {
+      res.status(403).json({ error: 'Only team owners and organization admins can add members' });
+      return;
+    }
+    if (!(await getOrgRole(userId, team.orgId))) {
+      res.status(400).json({ error: 'User must be a member of the organization first' });
       return;
     }
 
@@ -132,7 +164,7 @@ router.post('/:teamId/members', requireAuth, async (req: Request, res: Response)
       `INSERT INTO team_members (team_id, user_id, role)
        VALUES ($1, $2, $3)
        ON CONFLICT (team_id, user_id) DO NOTHING`,
-      [req.params.teamId, userId, role || 'member'],
+      [team.teamId, userId, role],
     );
 
     res.status(201).json({ message: 'Member added' });

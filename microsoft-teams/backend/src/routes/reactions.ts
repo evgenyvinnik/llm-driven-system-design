@@ -1,82 +1,87 @@
 import { Router, Request, Response } from 'express';
-import { pool } from '../services/db.js';
 import { requireAuth } from '../middleware/auth.js';
+import { requireMessageAccess } from '../middleware/access.js';
 import { logger } from '../services/logger.js';
-import { publishToChannel } from '../services/pubsub.js';
+import { addReaction, removeReaction } from '../services/reactionService.js';
+import { broadcastChannelEvent } from '../services/sseService.js';
 
 const router = Router();
 
-// POST /api/reactions - add reaction
-router.post('/', requireAuth, async (req: Request, res: Response) => {
-  try {
-    const { messageId, emoji } = req.body;
+/** One emoji, possibly with modifiers or joiners; the column is VARCHAR(20). */
+function isValidEmoji(emoji: unknown): emoji is string {
+  return typeof emoji === 'string' && emoji.length > 0 && emoji.length <= 20;
+}
 
-    if (!messageId || !emoji) {
-      res.status(400).json({ error: 'messageId and emoji are required' });
-      return;
-    }
+// POST /api/reactions - add reaction. Repeating it is a no-op that emits no event.
+router.post(
+  '/',
+  requireAuth,
+  requireMessageAccess((req) => req.body?.messageId),
+  async (req: Request, res: Response) => {
+    try {
+      const { emoji } = req.body;
+      const access = req.messageAccess!;
 
-    await pool.query(
-      `INSERT INTO message_reactions (message_id, user_id, emoji)
-       VALUES ($1, $2, $3)
-       ON CONFLICT (message_id, user_id, emoji) DO NOTHING`,
-      [messageId, req.session.userId, emoji],
-    );
+      if (!isValidEmoji(emoji)) {
+        res.status(400).json({ error: 'emoji is required' });
+        return;
+      }
+      if (access.deleted) {
+        res.status(404).json({ error: 'Message not found' });
+        return;
+      }
 
-    // Get the channel_id for broadcasting
-    const msgResult = await pool.query('SELECT channel_id FROM messages WHERE id = $1', [
-      messageId,
-    ]);
-    if (msgResult.rows.length > 0) {
-      await publishToChannel(msgResult.rows[0].channel_id, 'reaction_added', {
-        messageId,
+      const event = await addReaction({
+        channelId: access.channelId,
+        messageId: access.messageId,
+        userId: req.session.userId!,
+        username: req.session.username!,
         emoji,
-        userId: req.session.userId,
-        username: req.session.username,
       });
+
+      if (!event) {
+        res.json({ message: 'Reaction already present', changed: false });
+        return;
+      }
+      void broadcastChannelEvent(event);
+      res.status(201).json({ message: 'Reaction added', changed: true });
+    } catch (err) {
+      logger.error({ err }, 'Failed to add reaction');
+      res.status(500).json({ error: 'Internal server error' });
     }
+  },
+);
 
-    res.status(201).json({ message: 'Reaction added' });
-  } catch (err) {
-    logger.error({ err }, 'Failed to add reaction');
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
+// DELETE /api/reactions - remove reaction. Removing one that isn't there emits no event.
+router.delete(
+  '/',
+  requireAuth,
+  requireMessageAccess((req) => req.body?.messageId),
+  async (req: Request, res: Response) => {
+    try {
+      const { emoji } = req.body;
+      const access = req.messageAccess!;
 
-// DELETE /api/reactions - remove reaction
-router.delete('/', requireAuth, async (req: Request, res: Response) => {
-  try {
-    const { messageId, emoji } = req.body;
+      if (!isValidEmoji(emoji)) {
+        res.status(400).json({ error: 'emoji is required' });
+        return;
+      }
 
-    if (!messageId || !emoji) {
-      res.status(400).json({ error: 'messageId and emoji are required' });
-      return;
-    }
-
-    await pool.query(
-      `DELETE FROM message_reactions
-       WHERE message_id = $1 AND user_id = $2 AND emoji = $3`,
-      [messageId, req.session.userId, emoji],
-    );
-
-    // Get the channel_id for broadcasting
-    const msgResult = await pool.query('SELECT channel_id FROM messages WHERE id = $1', [
-      messageId,
-    ]);
-    if (msgResult.rows.length > 0) {
-      await publishToChannel(msgResult.rows[0].channel_id, 'reaction_removed', {
-        messageId,
+      const event = await removeReaction({
+        channelId: access.channelId,
+        messageId: access.messageId,
+        userId: req.session.userId!,
+        username: req.session.username!,
         emoji,
-        userId: req.session.userId,
-        username: req.session.username,
       });
-    }
 
-    res.json({ message: 'Reaction removed' });
-  } catch (err) {
-    logger.error({ err }, 'Failed to remove reaction');
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
+      if (event) void broadcastChannelEvent(event);
+      res.json({ message: event ? 'Reaction removed' : 'Reaction not present', changed: !!event });
+    } catch (err) {
+      logger.error({ err }, 'Failed to remove reaction');
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  },
+);
 
 export default router;

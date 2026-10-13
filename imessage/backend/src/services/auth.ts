@@ -1,8 +1,15 @@
 import { v4 as uuid } from 'uuid';
 import bcrypt from 'bcryptjs';
-import { PoolClient } from 'pg';
+import { PoolClient, QueryResult, QueryResultRow } from 'pg';
 import { query, transaction } from '../db.js';
 import { setSession, deleteSession, SessionData } from '../redis.js';
+
+const INSTALL_ID_PATTERN = /^[A-Za-z0-9-]{8,64}$/;
+
+/** Anything that can run a query: the pool wrapper or a transaction client. */
+interface Queryable {
+  query<T extends QueryResultRow>(text: string, params?: unknown[]): Promise<QueryResult<T>>;
+}
 
 const SESSION_EXPIRY_HOURS = parseInt(process.env.SESSION_EXPIRY_HOURS || '720');
 
@@ -32,13 +39,44 @@ interface AuthResult {
   expiresAt: Date;
 }
 
+/**
+ * Finds or creates the device row for this (user, installation).
+ *
+ * WHY: delivery, receipts and the inbox are per device, so two browsers of one
+ * user must be two devices, and the same browser must stay one device across
+ * logins. The old lookup matched on device_name (a user-agent prefix), which
+ * merged every identical browser into one device. The client now sends a
+ * random installation ID kept in localStorage; the unique (user_id,
+ * install_id) index makes the find-or-create a single atomic upsert. Requests
+ * without an installation ID always get a fresh device.
+ */
+async function upsertDevice(
+  client: Queryable,
+  userId: string,
+  deviceName: string | undefined,
+  deviceType: string | undefined,
+  installId: string | undefined
+): Promise<Device> {
+  const validInstallId = installId && INSTALL_ID_PATTERN.test(installId) ? installId : null;
+  const result = await client.query<Device>(
+    `INSERT INTO devices (user_id, device_name, device_type, install_id)
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT (user_id, install_id)
+       DO UPDATE SET last_active = NOW(), is_active = true, device_name = EXCLUDED.device_name
+     RETURNING id, device_name, device_type`,
+    [userId, (deviceName || 'Web Browser').slice(0, 100), (deviceType || 'web').slice(0, 50), validInstallId]
+  );
+  return result.rows[0];
+}
+
 export async function register(
   username: string,
   email: string,
   password: string,
   displayName?: string,
   deviceName?: string,
-  deviceType?: string
+  deviceType?: string,
+  installId?: string
 ): Promise<AuthResult> {
   const passwordHash = await bcrypt.hash(password, 12);
 
@@ -53,15 +91,8 @@ export async function register(
 
     const user = userResult.rows[0];
 
-    // Create device
-    const deviceResult = await client.query<Device>(
-      `INSERT INTO devices (user_id, device_name, device_type)
-       VALUES ($1, $2, $3)
-       RETURNING id, device_name, device_type`,
-      [user.id, deviceName || 'Web Browser', deviceType || 'web']
-    );
-
-    const device = deviceResult.rows[0];
+    // Create the device this installation will use
+    const device = await upsertDevice(client, user.id, deviceName, deviceType, installId);
 
     // Create session
     const token = uuid();
@@ -94,7 +125,8 @@ export async function login(
   usernameOrEmail: string,
   password: string,
   deviceName?: string,
-  deviceType?: string
+  deviceType?: string,
+  installId?: string
 ): Promise<AuthResult> {
   // Find user
   const userResult = await query<User & { password_hash: string }>(
@@ -116,29 +148,8 @@ export async function login(
     throw new Error('Invalid credentials');
   }
 
-  // Find or create device
-  let deviceResult = await query<Device>(
-    `SELECT id, device_name, device_type FROM devices
-     WHERE user_id = $1 AND device_name = $2 AND is_active = true`,
-    [user.id, deviceName || 'Web Browser']
-  );
-
-  let device: Device;
-  if (deviceResult.rows.length === 0) {
-    deviceResult = await query<Device>(
-      `INSERT INTO devices (user_id, device_name, device_type)
-       VALUES ($1, $2, $3)
-       RETURNING id, device_name, device_type`,
-      [user.id, deviceName || 'Web Browser', deviceType || 'web']
-    );
-  }
-  device = deviceResult.rows[0];
-
-  // Update device last active
-  await query(
-    'UPDATE devices SET last_active = NOW() WHERE id = $1',
-    [device.id]
-  );
+  // Find or create this installation's device (also refreshes last_active)
+  const device = await upsertDevice({ query }, user.id, deviceName, deviceType, installId);
 
   // Create session
   const token = uuid();
@@ -187,16 +198,32 @@ export async function getUserDevices(userId: string): Promise<Device[]> {
   return result.rows;
 }
 
-export async function deactivateDevice(userId: string, deviceId: string): Promise<void> {
-  // Delete sessions for this device
-  await query(
-    'DELETE FROM sessions WHERE device_id = $1 AND user_id = $2',
-    [deviceId, userId]
-  );
+/**
+ * Revokes a device: it stops receiving inbox rows, its pending inbox is
+ * dropped, and every session token it holds is deleted from both PostgreSQL
+ * and Redis. Authentication reads Redis, so deleting only the SQL rows (as
+ * before) left a "revoked" device fully logged in until the token expired.
+ * Returns false when the device does not belong to the user.
+ */
+export async function deactivateDevice(userId: string, deviceId: string): Promise<boolean> {
+  return await transaction(async (client: PoolClient) => {
+    const device = await client.query(
+      'UPDATE devices SET is_active = false WHERE id = $1 AND user_id = $2 RETURNING id',
+      [deviceId, userId]
+    );
+    if (device.rowCount === 0) return false;
 
-  // Mark device as inactive
-  await query(
-    'UPDATE devices SET is_active = false WHERE id = $1 AND user_id = $2',
-    [deviceId, userId]
-  );
+    const sessions = await client.query<{ token: string }>(
+      'DELETE FROM sessions WHERE device_id = $1 AND user_id = $2 RETURNING token',
+      [deviceId, userId]
+    );
+    await client.query('DELETE FROM device_inbox WHERE device_id = $1', [deviceId]);
+
+    // Inside the transaction on purpose: if Redis fails, the device stays
+    // active rather than looking revoked while its tokens still work.
+    for (const { token } of sessions.rows) {
+      await deleteSession(token);
+    }
+    return true;
+  });
 }

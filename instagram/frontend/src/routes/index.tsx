@@ -37,6 +37,8 @@ function HomePage() {
   const [storyUsers, setStoryUsers] = useState<StoryUser[]>([]);
   const [loading, setLoading] = useState(true);
   const [nextCursor, setNextCursor] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [degraded, setDegraded] = useState(false);
   const parentRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -49,15 +51,22 @@ function HomePage() {
   const loadFeed = async (cursor?: string) => {
     try {
       setLoading(true);
+      setError(null);
       const response = await feedApi.getFeed(cursor);
+      setDegraded(Boolean(response.degraded));
       if (cursor) {
-        setPosts((prev) => [...prev, ...response.posts]);
+        // The cursor is a keyset position, so pages shouldn't overlap; de-duplicate anyway so a
+        // retried page can never render the same post twice.
+        setPosts((prev) => {
+          const seen = new Set(prev.map((p) => p.id));
+          return [...prev, ...response.posts.filter((p) => !seen.has(p.id))];
+        });
       } else {
         setPosts(response.posts);
       }
       setNextCursor(response.nextCursor);
-    } catch (error) {
-      console.error('Error loading feed:', error);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not load your feed');
     } finally {
       setLoading(false);
     }
@@ -94,13 +103,14 @@ function HomePage() {
 
   // Infinite scroll: load more when near bottom
   const handleScroll = useCallback(() => {
-    if (!parentRef.current || loading || !nextCursor) return;
+    // After an error, wait for an explicit retry instead of re-requesting on every scroll event.
+    if (!parentRef.current || loading || !nextCursor || error) return;
 
     const { scrollTop, scrollHeight, clientHeight } = parentRef.current;
     if (scrollHeight - scrollTop - clientHeight < 500) {
       loadFeed(nextCursor);
     }
-  }, [loading, nextCursor]);
+  }, [loading, nextCursor, error]);
 
   useEffect(() => {
     const parent = parentRef.current;
@@ -134,8 +144,25 @@ function HomePage() {
         <StoryTray users={storyUsers} onStoryViewed={handleStoryViewed} />
       )}
 
+      {degraded && (
+        <div role="status" className="mb-4 p-3 text-sm bg-yellow-50 border border-yellow-200 rounded-lg">
+          Your feed is temporarily unavailable.{' '}
+          <button type="button" className="font-semibold text-primary" onClick={() => loadFeed()}>
+            Try again
+          </button>
+        </div>
+      )}
+
       {/* Feed - Virtualized */}
-      {loading && posts.length === 0 ? (
+      {error && posts.length === 0 ? (
+        <div role="alert" className="text-center py-12 bg-white border border-border-gray rounded-lg">
+          <p className="mb-3">We couldn't load your feed.</p>
+          <p className="text-sm text-text-secondary mb-4">{error}</p>
+          <button type="button" className="font-semibold text-primary" onClick={() => loadFeed()}>
+            Try again
+          </button>
+        </div>
+      ) : loading && posts.length === 0 ? (
         <div className="space-y-4">
           {Array.from({ length: 3 }).map((_, i) => (
             <div key={i} className="bg-white border border-border-gray rounded-lg">
@@ -153,7 +180,7 @@ function HomePage() {
             </div>
           ))}
         </div>
-      ) : posts.length === 0 ? (
+      ) : posts.length === 0 && !degraded ? (
         <div className="text-center py-12 bg-white border border-border-gray rounded-lg">
           <svg
             className="w-16 h-16 mx-auto mb-4 text-text-secondary"
@@ -202,6 +229,16 @@ function HomePage() {
               </div>
             );
           })}
+        </div>
+      )}
+
+      {/* Paging error: keep what's loaded, offer a retry */}
+      {error && posts.length > 0 && (
+        <div role="alert" className="py-4 text-center text-sm">
+          Couldn't load more posts.{' '}
+          <button type="button" className="font-semibold text-primary" onClick={() => loadFeed(nextCursor ?? undefined)}>
+            Retry
+          </button>
         </div>
       )}
 

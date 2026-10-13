@@ -29,6 +29,17 @@ interface AppState {
   setSelectedBookId: (id: string | null) => void
   searchQuery: string
   setSearchQuery: (query: string) => void
+
+  // Sync (not persisted)
+  /** live: socket open; offline: reconnecting with backoff; idle: logged out */
+  syncStatus: 'idle' | 'connecting' | 'live' | 'offline'
+  setSyncStatus: (status: AppState['syncStatus']) => void
+  /** Highest feed position another device reported; pages refetch when it moves. */
+  remoteSeq: number
+  noteRemoteSeq: (seq: number) => void
+  /** Operations waiting in this browser's outbox. */
+  pendingOps: number
+  setPendingOps: (count: number) => void
 }
 
 /** Global application state with authentication and UI preferences. */
@@ -41,7 +52,7 @@ export const useStore = create<AppState>()(
       setUser: (user) => set({ user, isAuthenticated: !!user }),
       logout: () => {
         localStorage.removeItem('sessionId')
-        set({ user: null, isAuthenticated: false, highlights: [], library: [] })
+        set({ user: null, isAuthenticated: false, highlights: [], library: [], remoteSeq: 0 })
       },
 
       // Highlights
@@ -69,6 +80,14 @@ export const useStore = create<AppState>()(
       setSelectedBookId: (selectedBookId) => set({ selectedBookId }),
       searchQuery: '',
       setSearchQuery: (searchQuery) => set({ searchQuery }),
+
+      // Sync
+      syncStatus: 'idle',
+      setSyncStatus: (syncStatus) => set({ syncStatus }),
+      remoteSeq: 0,
+      noteRemoteSeq: (seq) => set((state) => (seq > state.remoteSeq ? { remoteSeq: seq } : state)),
+      pendingOps: 0,
+      setPendingOps: (pendingOps) => set({ pendingOps }),
     }),
     {
       name: 'kindle-highlights-storage',

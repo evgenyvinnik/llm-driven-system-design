@@ -2,63 +2,74 @@ import { useState } from 'react';
 import { Link } from '@tanstack/react-router';
 import type { Post } from '../types';
 import { Avatar } from './Avatar';
-import { postsApi } from '../services/api';
+import { postsApi, commentsApi } from '../services/api';
 import { formatTimeAgo, formatNumber } from '../utils/format';
 import { useAuthStore } from '../stores/authStore';
+import { useOptimisticToggle } from '../hooks/useOptimisticToggle';
 
 interface PostCardProps {
   post: Post;
-  onUpdate?: (post: Post) => void;
 }
 
 /** Renders a full post card with image, like/comment actions, and caption. */
-export function PostCard({ post, onUpdate }: PostCardProps) {
+export function PostCard({ post }: PostCardProps) {
   const { isAuthenticated } = useAuthStore();
   const [currentMediaIndex, setCurrentMediaIndex] = useState(0);
   const [showLikeAnimation, setShowLikeAnimation] = useState(false);
-  const [isLiked, setIsLiked] = useState(post.isLiked || false);
-  const [isSaved, setIsSaved] = useState(post.isSaved || false);
-  const [likeCount, setLikeCount] = useState(post.likeCount);
   const [showCommentInput, setShowCommentInput] = useState(false);
   const [commentText, setCommentText] = useState('');
+  const [commentCount, setCommentCount] = useState(post.commentCount);
+  const [commentError, setCommentError] = useState<string | null>(null);
+  const [postingComment, setPostingComment] = useState(false);
 
-  const handleLike = async () => {
+  // Likes and saves are optimistic: the heart fills on tap and rolls back if the server says no.
+  const like = useOptimisticToggle({
+    initialActive: post.isLiked || false,
+    initialCount: post.likeCount,
+    activate: () => postsApi.like(post.id),
+    deactivate: () => postsApi.unlike(post.id),
+  });
+  const save = useOptimisticToggle({
+    initialActive: post.isSaved || false,
+    activate: () => postsApi.save(post.id),
+    deactivate: () => postsApi.unsave(post.id),
+  });
+  const isLiked = like.active;
+  const isSaved = save.active;
+  const likeCount = like.count;
+  const actionError = like.error || save.error || commentError;
+
+  const handleLike = () => {
     if (!isAuthenticated) return;
-    try {
-      if (isLiked) {
-        await postsApi.unlike(post.id);
-        setIsLiked(false);
-        setLikeCount((prev) => prev - 1);
-      } else {
-        await postsApi.like(post.id);
-        setIsLiked(true);
-        setLikeCount((prev) => prev + 1);
-      }
-      onUpdate?.({ ...post, isLiked: !isLiked, likeCount: isLiked ? likeCount - 1 : likeCount + 1 });
-    } catch (error) {
-      console.error('Like error:', error);
-    }
+    void like.toggle();
   };
 
-  const handleDoubleClick = async () => {
+  const handleDoubleClick = () => {
     if (!isAuthenticated || isLiked) return;
     setShowLikeAnimation(true);
     setTimeout(() => setShowLikeAnimation(false), 800);
-    await handleLike();
+    void like.toggle();
   };
 
-  const handleSave = async () => {
+  const handleSave = () => {
     if (!isAuthenticated) return;
+    void save.toggle();
+  };
+
+  const handleComment = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const content = commentText.trim();
+    if (!content || postingComment) return;
+    setPostingComment(true);
+    setCommentError(null);
     try {
-      if (isSaved) {
-        await postsApi.unsave(post.id);
-        setIsSaved(false);
-      } else {
-        await postsApi.save(post.id);
-        setIsSaved(true);
-      }
-    } catch (error) {
-      console.error('Save error:', error);
+      await commentsApi.addComment(post.id, content);
+      setCommentText('');
+      setCommentCount((count) => count + 1);
+    } catch (err) {
+      setCommentError(err instanceof Error ? err.message : 'Could not post comment');
+    } finally {
+      setPostingComment(false);
     }
   };
 
@@ -161,7 +172,12 @@ export function PostCard({ post, onUpdate }: PostCardProps) {
       <div className="px-4 py-3">
         <div className="flex items-center justify-between mb-2">
           <div className="flex items-center gap-4">
-            <button onClick={handleLike}>
+            <button
+              type="button"
+              onClick={handleLike}
+              aria-label={isLiked ? 'Unlike' : 'Like'}
+              aria-pressed={isLiked}
+            >
               <svg
                 className={`w-6 h-6 ${isLiked ? 'text-like-red fill-current' : ''}`}
                 fill={isLiked ? 'currentColor' : 'none'}
@@ -197,7 +213,12 @@ export function PostCard({ post, onUpdate }: PostCardProps) {
               </svg>
             </button>
           </div>
-          <button onClick={handleSave}>
+          <button
+            type="button"
+            onClick={handleSave}
+            aria-label={isSaved ? 'Remove from saved' : 'Save'}
+            aria-pressed={isSaved}
+          >
             <svg
               className={`w-6 h-6 ${isSaved ? 'fill-current' : ''}`}
               fill={isSaved ? 'currentColor' : 'none'}
@@ -234,13 +255,13 @@ export function PostCard({ post, onUpdate }: PostCardProps) {
         )}
 
         {/* Comments link */}
-        {post.commentCount > 0 && (
+        {commentCount > 0 && (
           <Link
             to="/post/$postId"
             params={{ postId: post.id }}
             className="text-sm text-text-secondary mb-1 block hover:text-text-primary transition-colors"
           >
-            View all {post.commentCount} comments
+            View all {commentCount} comments
           </Link>
         )}
 
@@ -251,22 +272,32 @@ export function PostCard({ post, onUpdate }: PostCardProps) {
 
         {/* Comment input */}
         {showCommentInput && (
-          <div className="mt-3 flex items-center gap-2 border-t border-border-gray pt-3">
+          <form
+            onSubmit={handleComment}
+            className="mt-3 flex items-center gap-2 border-t border-border-gray pt-3"
+          >
             <input
               type="text"
+              aria-label="Add a comment"
               placeholder="Add a comment..."
               value={commentText}
               onChange={(e) => setCommentText(e.target.value)}
               className="flex-1 text-sm outline-none"
             />
             <button
-              disabled={!commentText.trim()}
+              type="submit"
+              disabled={!commentText.trim() || postingComment}
               className="text-primary font-semibold text-sm disabled:opacity-50 hover:text-primary-hover transition-colors"
             >
               Post
             </button>
-          </div>
+          </form>
         )}
+
+        {/* Failed optimistic actions are announced, not just logged */}
+        <p role="status" aria-live="polite" className="text-xs text-like-red mt-1 min-h-0">
+          {actionError}
+        </p>
       </div>
     </article>
   );

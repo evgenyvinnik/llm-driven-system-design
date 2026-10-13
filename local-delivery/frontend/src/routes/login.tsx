@@ -82,9 +82,9 @@ function LoginPage() {
           <div className="mt-6 pt-6 border-t border-gray-200">
             <p className="text-sm text-gray-500 text-center mb-3">Demo Accounts:</p>
             <div className="space-y-2 text-xs text-gray-500">
-              <p>Customer: customer1@test.com / password</p>
-              <p>Driver: driver1@test.com / password</p>
-              <p>Admin: admin@delivery.local / password</p>
+              <p>Customer: customer1@test.com / password123</p>
+              <p>Driver: driver1@test.com / password123</p>
+              <p>Admin: admin@delivery.local / password123</p>
             </div>
           </div>
         </div>

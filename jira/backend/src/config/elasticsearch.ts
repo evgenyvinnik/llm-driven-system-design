@@ -71,6 +71,7 @@ export async function initializeElasticsearch(): Promise<void> {
               labels: { type: 'keyword' },
               components: { type: 'keyword' },
               custom_fields: { type: 'object', enabled: true },
+              version: { type: 'integer' },
               created_at: { type: 'date' },
               updated_at: { type: 'date' },
             },
@@ -88,17 +89,29 @@ export async function initializeElasticsearch(): Promise<void> {
 
 /**
  * Indexes an issue document in Elasticsearch for search.
- * Called when issues are created or updated to keep the search index in sync.
+ * Called after issues are created or updated to keep the search index in sync.
+ *
+ * When the document carries the issue's version it is written with external versioning
+ * (version_type external_gte): Elasticsearch keeps whichever write has the highest
+ * version, so a retried or out-of-order event cannot regress a newer document.
  *
  * @param issue - Issue data to index (denormalized for search)
  */
 export async function indexIssue(issue: Record<string, unknown>): Promise<void> {
-  await esClient.index({
-    index: ISSUE_INDEX,
-    id: String(issue.id),
-    body: issue,
-    refresh: true,
-  });
+  const version = typeof issue.version === 'number' ? issue.version : undefined;
+  try {
+    await esClient.index({
+      index: ISSUE_INDEX,
+      id: String(issue.id),
+      body: issue,
+      refresh: true,
+      ...(version !== undefined ? { version, version_type: 'external_gte' as const } : {}),
+    });
+  } catch (error) {
+    // 409: a newer version of this issue is already indexed, so this write is stale.
+    if ((error as { meta?: { statusCode?: number } }).meta?.statusCode === 409) return;
+    throw error;
+  }
 }
 
 /**

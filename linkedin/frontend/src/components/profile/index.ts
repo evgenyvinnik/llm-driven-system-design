@@ -12,3 +12,5 @@ export { ExperienceSection } from './ExperienceSection';
 export { EducationSection } from './EducationSection';
 export { SkillsSection } from './SkillsSection';
 export { ActivitySection } from './ActivitySection';
+export { ConnectionActions } from './ConnectionActions';
+export { ConnectionPath } from './ConnectionPath';

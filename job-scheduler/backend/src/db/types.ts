@@ -95,28 +95,3 @@ export interface SystemMetrics {
   /** Failed executions in the last 24 hours */
   failed_24h: number;
 }
-
-/**
- * Field mapping for execution updates.
- *
- * @description Maps update input keys to database column names for the
- * job_executions table. Used by updateExecution() to build dynamic UPDATE queries.
- *
- * @example
- * // Internal use in updateExecution
- * for (const [key, column] of Object.entries(EXECUTION_FIELD_MAP)) {
- *   if (key in updates) {
- *     updateFields.push(`${column} = $${paramIndex}`);
- *   }
- * }
- */
-export const EXECUTION_FIELD_MAP: Record<string, string> = {
-  status: 'status',
-  attempt: 'attempt',
-  started_at: 'started_at',
-  completed_at: 'completed_at',
-  next_retry_at: 'next_retry_at',
-  result: 'result',
-  error: 'error',
-  worker_id: 'worker_id',
-};

@@ -1,148 +1,210 @@
 import { Router, Request, Response } from 'express';
 import { requireAuth } from '../middleware/auth.js';
+import { requireChannelAccess, requireMessageAccess } from '../middleware/access.js';
+import { isUuid } from '../services/access.js';
 import { logger } from '../services/logger.js';
 import { messageLimiter } from '../services/rateLimiter.js';
-import { messagesTotal } from '../services/metrics.js';
+import { messagesTotal, messageSendReplaysTotal } from '../services/metrics.js';
 import {
-  getChannelMessages,
+  getChannelHistory,
   getThreadMessages,
   createMessage,
   editMessage,
   deleteMessage,
-  getMessageReactions,
 } from '../services/messageService.js';
-import { publishToChannel } from '../services/pubsub.js';
+import { broadcastChannelEvent } from '../services/sseService.js';
 
 const router = Router();
 
-// GET /api/messages?channelId=xxx&before=xxx&limit=50 - get channel messages
-router.get('/', requireAuth, async (req: Request, res: Response) => {
-  try {
-    const { channelId, before, limit } = req.query;
+const MAX_CONTENT_LENGTH = 10000;
+const DEFAULT_PAGE_SIZE = 50;
+const MAX_PAGE_SIZE = 100;
 
-    if (!channelId) {
-      res.status(400).json({ error: 'channelId query parameter is required' });
-      return;
+/** Positive integer query value: undefined when absent, null when malformed. */
+function parsePositiveInt(value: unknown): number | undefined | null {
+  if (value === undefined || value === '') return undefined;
+  if (typeof value !== 'string' || !/^\d+$/.test(value)) return null;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
+}
+
+function isValidContent(content: unknown): content is string {
+  return (
+    typeof content === 'string' &&
+    content.trim().length > 0 &&
+    content.length <= MAX_CONTENT_LENGTH
+  );
+}
+
+// GET /api/messages?channelId=xxx&before=<seq>&limit=50 - one page of history, newest first.
+// `before` is the seq of the oldest message the client already has; `latestSeq` in the response
+// is where the client's event stream should start (GET /api/sse/:channelId?after=latestSeq).
+router.get(
+  '/',
+  requireAuth,
+  requireChannelAccess((req) => req.query.channelId),
+  async (req: Request, res: Response) => {
+    try {
+      const before = parsePositiveInt(req.query.before);
+      const limit = parsePositiveInt(req.query.limit);
+      if (before === null || limit === null) {
+        res.status(400).json({ error: 'before and limit must be positive integers' });
+        return;
+      }
+
+      const page = await getChannelHistory(req.channelAccess!.channelId, {
+        before,
+        limit: Math.min(limit ?? DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE),
+      });
+      res.json(page);
+    } catch (err) {
+      logger.error({ err }, 'Failed to get messages');
+      res.status(500).json({ error: 'Internal server error' });
     }
+  },
+);
 
-    const messages = await getChannelMessages(
-      channelId as string,
-      parseInt(limit as string) || 50,
-      before as string | undefined,
-    );
-
-    // Fetch reactions for all messages
-    const messageIds = messages.map((m) => m.id);
-    const reactions = await getMessageReactions(messageIds);
-
-    const messagesWithReactions = messages.map((m) => ({
-      ...m,
-      reactions: reactions[m.id] || [],
-    }));
-
-    res.json({ messages: messagesWithReactions });
-  } catch (err) {
-    logger.error({ err }, 'Failed to get messages');
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// GET /api/messages/:messageId/thread - get thread messages
-router.get('/:messageId/thread', requireAuth, async (req: Request, res: Response) => {
-  try {
-    const messages = await getThreadMessages(req.params.messageId);
-
-    const messageIds = messages.map((m) => m.id);
-    const reactions = await getMessageReactions(messageIds);
-
-    const messagesWithReactions = messages.map((m) => ({
-      ...m,
-      reactions: reactions[m.id] || [],
-    }));
-
-    res.json({ messages: messagesWithReactions });
-  } catch (err) {
-    logger.error({ err }, 'Failed to get thread');
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// POST /api/messages - send message
-router.post('/', requireAuth, messageLimiter, async (req: Request, res: Response) => {
-  try {
-    const { channelId, content, parentMessageId } = req.body;
-
-    if (!channelId || !content) {
-      res.status(400).json({ error: 'channelId and content are required' });
-      return;
+// GET /api/messages/:messageId/thread - a thread's root and replies (from any message in it)
+router.get(
+  '/:messageId/thread',
+  requireAuth,
+  requireMessageAccess((req) => req.params.messageId),
+  async (req: Request, res: Response) => {
+    try {
+      const access = req.messageAccess!;
+      const messages = await getThreadMessages(access.parentMessageId ?? access.messageId);
+      res.json({ messages });
+    } catch (err) {
+      logger.error({ err }, 'Failed to get thread');
+      res.status(500).json({ error: 'Internal server error' });
     }
+  },
+);
 
-    if (content.length > 10000) {
-      res.status(400).json({ error: 'Message too long (max 10000 characters)' });
-      return;
+// POST /api/messages - send a message or thread reply. clientMessageId is a UUID the client
+// generates once per message and reuses on every retry; a repeat returns the original message
+// (200 + Idempotent-Replayed) instead of posting it twice.
+router.post(
+  '/',
+  requireAuth,
+  messageLimiter,
+  requireChannelAccess((req) => req.body?.channelId),
+  async (req: Request, res: Response) => {
+    try {
+      const { content, parentMessageId, clientMessageId } = req.body;
+
+      if (!isValidContent(content)) {
+        res
+          .status(400)
+          .json({ error: `content is required (max ${MAX_CONTENT_LENGTH} characters)` });
+        return;
+      }
+      if (parentMessageId != null && !isUuid(parentMessageId)) {
+        res.status(400).json({ error: 'parentMessageId must be a UUID' });
+        return;
+      }
+      if (clientMessageId != null && !isUuid(clientMessageId)) {
+        res.status(400).json({ error: 'clientMessageId must be a UUID' });
+        return;
+      }
+
+      const result = await createMessage({
+        channelId: req.channelAccess!.channelId,
+        userId: req.session.userId!,
+        content,
+        parentMessageId: parentMessageId ?? null,
+        clientMessageId: clientMessageId ?? null,
+      });
+
+      switch (result.kind) {
+        case 'invalid_parent':
+          res
+            .status(400)
+            .json({ error: 'parentMessageId must be a top-level message in this channel' });
+          return;
+        case 'key_conflict':
+          res
+            .status(422)
+            .json({ error: 'clientMessageId was already used for a different message' });
+          return;
+        case 'replayed':
+          messageSendReplaysTotal.inc();
+          res.set('Idempotent-Replayed', 'true').status(200).json({ message: result.message });
+          return;
+        case 'created':
+          messagesTotal.inc();
+          // Fire and forget: the event is committed, and delivery never fails the request.
+          void broadcastChannelEvent(result.event);
+          res.status(201).json({ message: result.message });
+          return;
+      }
+    } catch (err) {
+      logger.error({ err }, 'Failed to send message');
+      res.status(500).json({ error: 'Internal server error' });
     }
+  },
+);
 
-    const message = await createMessage(
-      channelId,
-      req.session.userId!,
-      content,
-      parentMessageId,
-    );
+// PUT /api/messages/:messageId - edit own message
+router.put(
+  '/:messageId',
+  requireAuth,
+  requireMessageAccess((req) => req.params.messageId),
+  async (req: Request, res: Response) => {
+    try {
+      const { content } = req.body;
 
-    messagesTotal.inc({ channel_id: channelId });
+      if (!isValidContent(content)) {
+        res
+          .status(400)
+          .json({ error: `content is required (max ${MAX_CONTENT_LENGTH} characters)` });
+        return;
+      }
 
-    // Broadcast via pub/sub
-    await publishToChannel(channelId, 'new_message', message);
+      const access = req.messageAccess!;
+      const result = await editMessage(
+        access.channelId,
+        access.messageId,
+        req.session.userId!,
+        content,
+      );
 
-    res.status(201).json({ message });
-  } catch (err) {
-    logger.error({ err }, 'Failed to send message');
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
+      if (!result) {
+        res.status(404).json({ error: 'Message not found or not yours' });
+        return;
+      }
 
-// PUT /api/messages/:messageId - edit message
-router.put('/:messageId', requireAuth, async (req: Request, res: Response) => {
-  try {
-    const { content } = req.body;
-
-    if (!content) {
-      res.status(400).json({ error: 'content is required' });
-      return;
+      void broadcastChannelEvent(result.event);
+      res.json({ message: result.message });
+    } catch (err) {
+      logger.error({ err }, 'Failed to edit message');
+      res.status(500).json({ error: 'Internal server error' });
     }
+  },
+);
 
-    const message = await editMessage(req.params.messageId, req.session.userId!, content);
+// DELETE /api/messages/:messageId - delete own message (kept as a tombstone)
+router.delete(
+  '/:messageId',
+  requireAuth,
+  requireMessageAccess((req) => req.params.messageId),
+  async (req: Request, res: Response) => {
+    try {
+      const access = req.messageAccess!;
+      const event = await deleteMessage(access.channelId, access.messageId, req.session.userId!);
 
-    if (!message) {
-      res.status(404).json({ error: 'Message not found or not yours' });
-      return;
+      if (!event) {
+        res.status(404).json({ error: 'Message not found or not yours' });
+        return;
+      }
+
+      void broadcastChannelEvent(event);
+      res.json({ message: 'Message deleted' });
+    } catch (err) {
+      logger.error({ err }, 'Failed to delete message');
+      res.status(500).json({ error: 'Internal server error' });
     }
-
-    // Broadcast edit
-    await publishToChannel(message.channel_id, 'message_edited', message);
-
-    res.json({ message });
-  } catch (err) {
-    logger.error({ err }, 'Failed to edit message');
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// DELETE /api/messages/:messageId - delete message
-router.delete('/:messageId', requireAuth, async (req: Request, res: Response) => {
-  try {
-    const deleted = await deleteMessage(req.params.messageId, req.session.userId!);
-
-    if (!deleted) {
-      res.status(404).json({ error: 'Message not found or not yours' });
-      return;
-    }
-
-    res.json({ message: 'Message deleted' });
-  } catch (err) {
-    logger.error({ err }, 'Failed to delete message');
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
+  },
+);
 
 export default router;

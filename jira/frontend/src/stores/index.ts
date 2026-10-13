@@ -87,6 +87,8 @@ interface ProjectState {
   workflow: Workflow | null;
   sprints: Sprint[];
   boards: Board[];
+  /** Permissions the user holds in the current project (e.g. "edit_issue"). */
+  permissions: string[];
   isLoading: boolean;
   fetchProjects: () => Promise<void>;
   setCurrentProject: (project: Project | null) => void;
@@ -109,6 +111,8 @@ export const useProjectStore = create<ProjectState>((set) => ({
   sprints: [],
   /** Boards for current project */
   boards: [],
+  /** Current user's permissions in the current project; only used to hide controls */
+  permissions: [],
   /** Whether project data is being loaded */
   isLoading: false,
 
@@ -141,17 +145,19 @@ export const useProjectStore = create<ProjectState>((set) => ({
   fetchProjectDetails: async (projectId: string) => {
     set({ isLoading: true });
     try {
-      const [project, workflow, sprints, boards] = await Promise.all([
+      const [project, workflow, sprints, boards, permissions] = await Promise.all([
         api.getProject(projectId),
         api.getProjectWorkflow(projectId),
         api.getProjectSprints(projectId),
         api.getProjectBoards(projectId),
+        api.getProjectPermissions(projectId),
       ]);
       set({
         currentProject: project,
         workflow,
         sprints,
         boards,
+        permissions,
         isLoading: false,
       });
     } catch (error) {
@@ -170,9 +176,13 @@ interface IssueState {
   currentIssue: IssueWithDetails | null;
   backlog: IssueWithDetails[];
   isLoading: boolean;
-  fetchProjectIssues: (projectId: string, options?: { sprintId?: number }) => Promise<void>;
+  fetchProjectIssues: (
+    projectId: string,
+    options?: { sprintId?: number; statusId?: number; issueType?: string }
+  ) => Promise<void>;
   fetchBacklog: (projectId: string) => Promise<void>;
   fetchSprintIssues: (sprintId: number) => Promise<void>;
+  setIssues: (issues: IssueWithDetails[]) => void;
   setCurrentIssue: (issue: IssueWithDetails | null) => void;
   updateIssueInList: (issue: IssueWithDetails) => void;
   removeIssueFromList: (issueId: number) => void;
@@ -237,6 +247,12 @@ export const useIssueStore = create<IssueState>((set, get) => ({
       set({ isLoading: false });
     }
   },
+
+  /**
+   * Replaces the current view's issues, e.g. to apply an optimistic board move or to
+   * roll it back.
+   */
+  setIssues: (issues) => set({ issues }),
 
   /**
    * Sets the current issue for the detail modal.

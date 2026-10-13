@@ -28,7 +28,11 @@ export function VideoCard({ video, onDelete }: VideoCardProps) {
     >
       {/* Thumbnail */}
       <div className="relative aspect-video bg-gray-100">
-        {video.status === 'processing' ? (
+        {video.status === 'uploading' ? (
+          <div className="absolute inset-0 flex items-center justify-center">
+            <div className="text-sm text-loom-secondary">Uploading...</div>
+          </div>
+        ) : video.status === 'processing' ? (
           <div className="absolute inset-0 flex items-center justify-center">
             <div className="text-sm text-loom-secondary">Processing...</div>
           </div>

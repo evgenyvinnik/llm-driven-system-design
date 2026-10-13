@@ -7,7 +7,7 @@
 import { useEffect } from 'react';
 import { useParams, Link } from '@tanstack/react-router';
 import { useJobsStore, useExecutionsStore } from '../stores';
-import { Button, Spinner, StatusBadge, Pagination } from '../components/UI';
+import { Button, Spinner, StatusBadge, Pagination, ErrorBanner } from '../components/UI';
 import { ExecutionList } from '../components/ExecutionList';
 import { JobStatus } from '../types';
 
@@ -17,16 +17,37 @@ import { JobStatus } from '../types';
  */
 export function JobDetailPage() {
   const { jobId } = useParams({ from: '/jobs/$jobId' });
-  const { selectedJob, loading: jobLoading, fetchJob, pauseJob, resumeJob, triggerJob, deleteJob } = useJobsStore();
+  const {
+    selectedJob,
+    loading: jobLoading,
+    error: jobError,
+    triggering,
+    fetchJob,
+    pauseJob,
+    resumeJob,
+    triggerJob,
+    deleteJob,
+    clearError: clearJobError,
+  } = useJobsStore();
   const {
     executions,
     loading: executionsLoading,
+    error: executionError,
     page,
     totalPages,
     fetchExecutions,
     cancelExecution,
     retryExecution,
+    clearError: clearExecutionError,
   } = useExecutionsStore();
+
+  // Triggering adds an execution; show it without waiting for a manual refresh.
+  const handleTrigger = async () => {
+    const execution = await triggerJob(jobId);
+    if (execution) {
+      await fetchExecutions(jobId, 1);
+    }
+  };
 
   useEffect(() => {
     fetchJob(jobId);
@@ -54,6 +75,9 @@ export function JobDetailPage() {
         <span className="text-gray-400">/</span>
         <span className="text-gray-900 font-medium">{selectedJob.name}</span>
       </div>
+
+      <ErrorBanner message={jobError} onDismiss={clearJobError} />
+      <ErrorBanner message={executionError} onDismiss={clearExecutionError} />
 
       {/* Job Details */}
       <div className="bg-white shadow rounded-lg">
@@ -99,6 +123,14 @@ export function JobDetailPage() {
               <dt className="text-sm text-gray-500">Timeout</dt>
               <dd className="text-sm text-gray-900">{selectedJob.timeout_ms}ms</dd>
             </div>
+            {selectedJob.schedule && (
+              <div>
+                <dt className="text-sm text-gray-500">Missed runs</dt>
+                <dd className="text-sm text-gray-900">
+                  {selectedJob.misfire_policy === 'skip' ? 'Skipped' : 'Run once to catch up'}
+                </dd>
+              </div>
+            )}
             <div>
               <dt className="text-sm text-gray-500">Created</dt>
               <dd className="text-sm text-gray-900">
@@ -134,10 +166,10 @@ export function JobDetailPage() {
             )}
             <Button
               variant="primary"
-              onClick={() => triggerJob(jobId)}
-              disabled={selectedJob.status === JobStatus.PAUSED}
+              onClick={() => void handleTrigger()}
+              disabled={selectedJob.status === JobStatus.PAUSED || triggering.includes(jobId)}
             >
-              Trigger Now
+              {triggering.includes(jobId) ? 'Triggering…' : 'Trigger Now'}
             </Button>
             <Button
               variant="danger"

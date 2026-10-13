@@ -32,7 +32,7 @@ function fakeDeps(overrides: Partial<ProcessorDeps> = {}): ProcessorDeps {
 
 function transactionClient(jobDoneRowCount: number) {
   const client = {
-    query: vi.fn(async (sql: string) =>
+    query: vi.fn(async (sql: string, _params?: unknown[]) =>
       sql.includes('UPDATE video_jobs') ? { rowCount: jobDoneRowCount, rows: [] } : { rowCount: 1, rows: [] },
     ),
     release: vi.fn(),

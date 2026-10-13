@@ -1,42 +1,13 @@
 import { Router, Response } from 'express';
 import { query } from '../services/db.js';
-import { timelineGet, cacheGet, cacheSet } from '../services/redis.js';
 import { requireAuth, optionalAuth, AuthenticatedRequest } from '../middleware/auth.js';
 import { feedRateLimiter } from '../services/rateLimiter.js';
 import { createCircuitBreaker, fallbackWithDefault } from '../services/circuitBreaker.js';
+import { getFeedPage, decodeFeedCursor, FeedCursor, FeedPage } from '../services/feedService.js';
 import logger from '../services/logger.js';
-import {
-  feedGenerationDuration,
-  feedCacheHits,
-  feedCacheMisses,
-} from '../services/metrics.js';
+import { feedGenerationDuration, feedCacheHits, feedCacheMisses } from '../services/metrics.js';
 
 const router = Router();
-
-// Database row types
-interface PostRow {
-  id: string;
-  user_id: string;
-  username: string;
-  display_name: string;
-  profile_picture_url: string | null;
-  caption: string;
-  location: string | null;
-  like_count: number;
-  comment_count: number;
-  created_at: Date;
-}
-
-interface MediaRow {
-  id: string;
-  media_type: string;
-  media_url: string;
-  thumbnail_url: string | null;
-  filter_applied: string;
-  width: number;
-  height: number;
-  order_index: number;
-}
 
 interface ExplorePostRow {
   id: string;
@@ -45,332 +16,140 @@ interface ExplorePostRow {
   comment_count: number;
   media_count: string;
   created_at: Date;
+  score: number;
+  created_ms: string;
 }
 
-// Response types
-interface MediaItem {
-  id: string;
-  mediaType: string;
-  mediaUrl: string;
-  thumbnailUrl: string | null;
-  filterApplied: string;
-  width: number;
-  height: number;
-  orderIndex: number;
-}
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-interface FeedPost {
-  id: string;
-  userId: string;
-  username: string;
-  displayName: string;
-  profilePictureUrl: string | null;
-  caption: string;
-  location: string | null;
-  likeCount: number;
-  commentCount: number;
-  createdAt: Date;
-  isLiked: boolean;
-  isSaved: boolean;
-  media: MediaItem[];
-}
-
-interface FeedResult {
-  posts: FeedPost[];
-  hasMore: boolean;
-  offset: number;
-  limit: number;
-  cacheHit: boolean;
-  fallback?: boolean;
-}
+/** Parses ?limit= into [1, max], falling back to the default for missing or invalid values. */
+const parseLimit = (raw: unknown, fallback: number, max: number): number => {
+  const parsed = parseInt(typeof raw === 'string' ? raw : '', 10);
+  if (!Number.isFinite(parsed) || parsed < 1) return fallback;
+  return Math.min(parsed, max);
+};
 
 /**
  * Circuit breaker for feed generation
  *
- * WHY CIRCUIT BREAKER FOR FEED GENERATION:
- *
- * Feed generation involves:
- * - Fetching followed users' posts from database
- * - Joining with user data and media
- * - Checking like/save status for each post
- *
- * This can be expensive and slow when:
- * - Database is under heavy load
- * - User follows many accounts
- * - Network issues between API and database
- *
- * The circuit breaker:
- * - Returns cached/empty feed when database is struggling
- * - Prevents request pile-up that could crash the service
- * - Automatically recovers when database load decreases
+ * A feed page is one Redis round trip, one celebrity query, and one hydration query. When
+ * PostgreSQL or Redis is struggling those calls slow down together; the breaker fails fast with
+ * an empty, explicitly degraded page instead of letting requests pile up behind a sick
+ * dependency, and closes again once probes succeed.
  */
 const feedGenerationBreaker = createCircuitBreaker(
   'feed_generation',
-  async (userId: string, offset: number, limit: number): Promise<FeedResult> => {
-    // Get post IDs from Redis timeline cache
-    const postIds = await timelineGet(userId, offset, limit);
-
-    if (postIds.length === 0) {
-      // If no cached timeline, generate from database
-      let queryText = `
-        SELECT p.*, u.username, u.display_name, u.profile_picture_url
-        FROM posts p
-        JOIN users u ON p.user_id = u.id
-        WHERE p.user_id IN (
-          SELECT following_id FROM follows WHERE follower_id = $1
-          UNION
-          SELECT $1
-        )
-      `;
-      const params: (string | number)[] = [userId];
-
-      queryText += ` ORDER BY p.created_at DESC LIMIT $${params.length + 1}`;
-      params.push(limit + 1);
-
-      const result = await query<PostRow>(queryText, params);
-
-      const hasMore = result.rows.length > limit;
-      const posts = result.rows.slice(0, limit);
-
-      // Get media for each post
-      const postsWithMedia: FeedPost[] = await Promise.all(
-        posts.map(async (post: PostRow) => {
-          const mediaResult = await query<MediaRow>(
-            'SELECT * FROM post_media WHERE post_id = $1 ORDER BY order_index',
-            [post.id]
-          );
-
-          // Check if current user liked/saved
-          const likeCheck = await query(
-            'SELECT 1 FROM likes WHERE user_id = $1 AND post_id = $2',
-            [userId, post.id]
-          );
-          const savedCheck = await query(
-            'SELECT 1 FROM saved_posts WHERE user_id = $1 AND post_id = $2',
-            [userId, post.id]
-          );
-
-          return {
-            id: post.id,
-            userId: post.user_id,
-            username: post.username,
-            displayName: post.display_name,
-            profilePictureUrl: post.profile_picture_url,
-            caption: post.caption,
-            location: post.location,
-            likeCount: post.like_count,
-            commentCount: post.comment_count,
-            createdAt: post.created_at,
-            isLiked: likeCheck.rows.length > 0,
-            isSaved: savedCheck.rows.length > 0,
-            media: mediaResult.rows.map((m: MediaRow) => ({
-              id: m.id,
-              mediaType: m.media_type,
-              mediaUrl: m.media_url,
-              thumbnailUrl: m.thumbnail_url,
-              filterApplied: m.filter_applied,
-              width: m.width,
-              height: m.height,
-              orderIndex: m.order_index,
-            })),
-          };
-        })
-      );
-
-      return { posts: postsWithMedia, hasMore, offset, limit, cacheHit: false };
-    }
-
-    // Fetch posts from database using cached IDs
-    const postResult = await query<PostRow>(
-      `SELECT p.*, u.username, u.display_name, u.profile_picture_url
-       FROM posts p
-       JOIN users u ON p.user_id = u.id
-       WHERE p.id = ANY($1)`,
-      [postIds]
-    );
-
-    // Order by the timeline order
-    const postsMap = new Map(postResult.rows.map((p: PostRow) => [p.id, p]));
-    const orderedPosts = postIds.map((id) => postsMap.get(id)).filter((p): p is PostRow => p !== undefined);
-
-    // Get media and user-specific data for each post
-    const postsWithMedia: FeedPost[] = await Promise.all(
-      orderedPosts.map(async (post: PostRow) => {
-        const mediaResult = await query<MediaRow>(
-          'SELECT * FROM post_media WHERE post_id = $1 ORDER BY order_index',
-          [post.id]
-        );
-
-        const likeCheck = await query(
-          'SELECT 1 FROM likes WHERE user_id = $1 AND post_id = $2',
-          [userId, post.id]
-        );
-        const savedCheck = await query(
-          'SELECT 1 FROM saved_posts WHERE user_id = $1 AND post_id = $2',
-          [userId, post.id]
-        );
-
-        return {
-          id: post.id,
-          userId: post.user_id,
-          username: post.username,
-          displayName: post.display_name,
-          profilePictureUrl: post.profile_picture_url,
-          caption: post.caption,
-          location: post.location,
-          likeCount: post.like_count,
-          commentCount: post.comment_count,
-          createdAt: post.created_at,
-          isLiked: likeCheck.rows.length > 0,
-          isSaved: savedCheck.rows.length > 0,
-          media: mediaResult.rows.map((m: MediaRow) => ({
-            id: m.id,
-            mediaType: m.media_type,
-            mediaUrl: m.media_url,
-            thumbnailUrl: m.thumbnail_url,
-            filterApplied: m.filter_applied,
-            width: m.width,
-            height: m.height,
-            orderIndex: m.order_index,
-          })),
-        };
-      })
-    );
-
-    return {
-      posts: postsWithMedia,
-      hasMore: postIds.length === limit,
-      offset,
-      limit,
-      cacheHit: true,
-    };
-  },
+  (viewerId: string, cursor: FeedCursor | null, limit: number): Promise<FeedPage> =>
+    getFeedPage(viewerId, cursor, limit),
   {
-    timeout: 15000, // 15 seconds timeout
+    timeout: 15000,
     errorThresholdPercentage: 50,
-    resetTimeout: 30000, // 30 seconds before testing recovery
+    resetTimeout: 30000,
     volumeThreshold: 5,
   }
 );
 
-// Fallback returns empty feed when circuit is open
 feedGenerationBreaker.fallback(
-  fallbackWithDefault({ posts: [], hasMore: false, offset: 0, limit: 20, cacheHit: false, fallback: true })
+  fallbackWithDefault<FeedPage>({
+    posts: [],
+    nextCursor: null,
+    timelineRebuilt: false,
+    pushedCount: 0,
+    pulledCount: 0,
+    degraded: true,
+  })
 );
 
 /**
- * Get home feed
+ * Home feed: GET /api/v1/feed?cursor=<opaque>&limit=20
  *
- * WHY FEED CACHING REDUCES DATABASE LOAD:
- *
- * Without caching:
- * - Each feed request queries: posts, users, follows, media, likes, saves
- * - With 10K DAU making 10 feed requests/day = 100K complex queries/day
- * - Each query can involve 5-6 JOIN operations
- *
- * With caching:
- * - Timeline stored in Redis sorted sets (fast O(log N) access)
- * - Feed data cached per user with 60s TTL
- * - Cache hit rate typically 80-90% during active browsing
- * - Database only queried on cache miss or new content
- *
- * This caching strategy:
- * - Reduces database CPU by 80%+
- * - Provides consistent <50ms feed load times
- * - Allows database to focus on write operations
+ * Pages are keyed by (created_ms, post id) rather than an offset, so posts that arrive while
+ * the user scrolls never shift later pages. There is deliberately no response cache: the Redis
+ * timeline already makes the expensive part (which posts) cheap, and a cached page would serve
+ * stale like/save state for its whole TTL.
  */
 router.get('/', requireAuth, feedRateLimiter, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   const startTime = Date.now();
+  const userId = req.session.userId!;
+  const limit = parseLimit(req.query.limit, 20, 50);
 
-  try {
-    const userId = req.session.userId!;
-    const { cursor, limit = '20' } = req.query as { cursor?: string; limit?: string };
-    const offset = cursor ? parseInt(cursor) : 0;
-    const parsedLimit = parseInt(limit);
-
-    // Check feed cache first
-    const cacheKey = `feed:${userId}:${offset}:${parsedLimit}`;
-    const cached = await cacheGet<FeedResult>(cacheKey);
-
-    if (cached) {
-      feedCacheHits.inc();
-      feedGenerationDuration.labels('hit').observe((Date.now() - startTime) / 1000);
-
-      logger.debug({
-        type: 'feed_cache_hit',
-        userId,
-        offset,
-        limit: parsedLimit,
-        durationMs: Date.now() - startTime,
-      }, 'Feed cache hit');
-
-      res.json({
-        posts: cached.posts,
-        nextCursor: cached.hasMore ? offset + parsedLimit : null,
-      });
+  let cursor: FeedCursor | null = null;
+  if (typeof req.query.cursor === 'string' && req.query.cursor.length > 0) {
+    cursor = decodeFeedCursor(req.query.cursor);
+    if (!cursor) {
+      res.status(400).json({ error: 'Invalid cursor' });
       return;
     }
+  }
 
-    feedCacheMisses.inc();
+  try {
+    const page = (await feedGenerationBreaker.fire(userId, cursor, limit)) as FeedPage;
 
-    // Use circuit breaker for feed generation
-    const result = await feedGenerationBreaker.fire(userId, offset, parsedLimit) as FeedResult;
+    const cacheStatus = page.timelineRebuilt ? 'miss' : 'hit';
+    (page.timelineRebuilt ? feedCacheMisses : feedCacheHits).inc();
+    feedGenerationDuration.labels(cacheStatus).observe((Date.now() - startTime) / 1000);
 
-    // Track metrics
-    feedGenerationDuration.labels('miss').observe((Date.now() - startTime) / 1000);
-
-    // Log feed generation
-    logger.info({
-      type: 'feed_generated',
-      userId,
-      offset,
-      limit: parsedLimit,
-      postCount: result.posts.length,
-      cacheHit: result.cacheHit,
-      fallback: result.fallback || false,
-      durationMs: Date.now() - startTime,
-    }, `Feed generated: ${result.posts.length} posts in ${Date.now() - startTime}ms`);
-
-    // Cache the result for 60 seconds (unless it's a fallback response)
-    if (!result.fallback) {
-      await cacheSet(cacheKey, result, 60);
-    }
+    logger.info(
+      {
+        type: 'feed_generated',
+        userId,
+        limit,
+        postCount: page.posts.length,
+        pushed: page.pushedCount,
+        pulled: page.pulledCount,
+        timelineRebuilt: page.timelineRebuilt,
+        degraded: page.degraded || false,
+        durationMs: Date.now() - startTime,
+      },
+      `Feed generated: ${page.posts.length} posts in ${Date.now() - startTime}ms`
+    );
 
     res.json({
-      posts: result.posts,
-      nextCursor: result.hasMore ? offset + parsedLimit : null,
+      posts: page.posts,
+      nextCursor: page.nextCursor,
+      ...(page.degraded ? { degraded: true } : {}),
     });
   } catch (error) {
     const err = error as Error;
-    logger.error({
-      type: 'feed_error',
-      error: err.message,
-      userId: req.session.userId,
-      durationMs: Date.now() - startTime,
-    }, `Get feed error: ${err.message}`);
+    logger.error(
+      {
+        type: 'feed_error',
+        error: err.message,
+        userId,
+        durationMs: Date.now() - startTime,
+      },
+      `Get feed error: ${err.message}`
+    );
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// Explore page - discover new content
+/**
+ * Explore page - discover popular posts from public accounts the viewer doesn't follow.
+ *
+ * Ordered by (engagement score, created_ms, id). The cursor carries all three, so the next page
+ * starts exactly where this one ended; a created_at-only cursor against a score ordering repeated
+ * some posts and silently skipped others.
+ */
 router.get('/explore', optionalAuth, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
     const userId = req.session?.userId;
-    const { cursor, limit = '24' } = req.query as { cursor?: string; limit?: string };
-    const parsedLimit = parseInt(limit);
+    const parsedLimit = parseLimit(req.query.limit, 24, 60);
+    const rawCursor = typeof req.query.cursor === 'string' ? req.query.cursor : '';
 
-    // Get popular posts (not from followed users)
+    const params: (string | number)[] = [];
     let queryText = `
       SELECT p.id, p.like_count, p.comment_count, p.created_at,
+             (p.like_count + p.comment_count * 2) AS score,
+             FLOOR(EXTRACT(EPOCH FROM p.created_at) * 1000)::bigint AS created_ms,
              (SELECT media_url FROM post_media WHERE post_id = p.id ORDER BY order_index LIMIT 1) as thumbnail,
              (SELECT COUNT(*) FROM post_media WHERE post_id = p.id) as media_count
       FROM posts p
       JOIN users u ON p.user_id = u.id
-      WHERE u.is_private = false
+      WHERE u.is_private = false AND p.status = 'published'
     `;
-    const params: (string | number)[] = [];
 
-    // Exclude posts from users we already follow
+    // Exclude posts from users we already follow, and our own
     if (userId) {
       params.push(userId);
       queryText += ` AND p.user_id NOT IN (
@@ -378,19 +157,26 @@ router.get('/explore', optionalAuth, async (req: AuthenticatedRequest, res: Resp
       ) AND p.user_id != $${params.length}`;
     }
 
-    if (cursor) {
-      params.push(cursor);
-      queryText += ` AND p.created_at < $${params.length}`;
+    if (rawCursor) {
+      const [score, createdMs, id] = rawCursor.split('_');
+      if (!/^\d+$/.test(score || '') || !/^\d+$/.test(createdMs || '') || !UUID_RE.test(id || '')) {
+        res.status(400).json({ error: 'Invalid cursor' });
+        return;
+      }
+      params.push(Number(score), Number(createdMs), id);
+      const n = params.length;
+      queryText += ` AND ((p.like_count + p.comment_count * 2), FLOOR(EXTRACT(EPOCH FROM p.created_at) * 1000)::bigint, p.id)
+                     < ($${n - 2}::int, $${n - 1}::bigint, $${n}::uuid)`;
     }
 
-    // Order by engagement score (simple: likes + comments) and recency
-    queryText += ` ORDER BY (p.like_count + p.comment_count * 2) DESC, p.created_at DESC LIMIT $${params.length + 1}`;
+    queryText += ` ORDER BY score DESC, created_ms DESC, p.id DESC LIMIT $${params.length + 1}`;
     params.push(parsedLimit + 1);
 
     const result = await query<ExplorePostRow>(queryText, params);
 
     const hasMore = result.rows.length > parsedLimit;
     const posts = result.rows.slice(0, parsedLimit);
+    const last = posts[posts.length - 1];
 
     res.json({
       posts: posts.map((p: ExplorePostRow) => ({
@@ -401,7 +187,7 @@ router.get('/explore', optionalAuth, async (req: AuthenticatedRequest, res: Resp
         mediaCount: parseInt(p.media_count),
         createdAt: p.created_at,
       })),
-      nextCursor: hasMore ? posts[posts.length - 1].created_at : null,
+      nextCursor: hasMore && last ? `${last.score}_${last.created_ms}_${last.id}` : null,
     });
   } catch (error) {
     const err = error as Error;

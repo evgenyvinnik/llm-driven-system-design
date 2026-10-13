@@ -2,10 +2,13 @@ import { Router } from 'express';
 import * as workflowService from '../services/workflowService.js';
 import * as projectService from '../services/projectService.js';
 import { requireAuth } from '../middleware/auth.js';
+import { authorizeProject, authorizeSystemAdmin } from '../middleware/authorize.js';
 
 /**
  * Workflow management routes.
  * Handles CRUD for workflows, statuses, transitions, sprints, and boards.
+ * A workflow can be shared by many projects, so editing one is reserved to system
+ * administrators; sprint and board routes check the owning project's permissions.
  */
 const router = Router();
 
@@ -49,6 +52,8 @@ router.get('/:id', requireAuth, async (req, res) => {
  */
 router.get('/project/:projectId', requireAuth, async (req, res) => {
   try {
+    if (!(await authorizeProject(req, res, req.params.projectId, 'view_issue'))) return;
+
     const workflow = await workflowService.getWorkflowByProject(req.params.projectId);
 
     if (!workflow) {
@@ -68,6 +73,7 @@ router.get('/project/:projectId', requireAuth, async (req, res) => {
  */
 router.post('/', requireAuth, async (req, res) => {
   try {
+    if (!authorizeSystemAdmin(req, res, 'create workflows')) return;
     const { name, description } = req.body;
 
     if (!name) {
@@ -88,6 +94,7 @@ router.post('/', requireAuth, async (req, res) => {
  */
 router.post('/:id/statuses', requireAuth, async (req, res) => {
   try {
+    if (!authorizeSystemAdmin(req, res, 'change workflows')) return;
     const workflowId = parseInt(req.params.id, 10);
     const { name, category, color, position } = req.body;
 
@@ -121,6 +128,7 @@ router.post('/:id/statuses', requireAuth, async (req, res) => {
  */
 router.patch('/statuses/:id', requireAuth, async (req, res) => {
   try {
+    if (!authorizeSystemAdmin(req, res, 'change workflows')) return;
     const statusId = parseInt(req.params.id, 10);
     const { name, category, color, position } = req.body;
 
@@ -148,6 +156,7 @@ router.patch('/statuses/:id', requireAuth, async (req, res) => {
  */
 router.post('/:id/transitions', requireAuth, async (req, res) => {
   try {
+    if (!authorizeSystemAdmin(req, res, 'change workflows')) return;
     const workflowId = parseInt(req.params.id, 10);
     const { name, fromStatusId, toStatusId, conditions, validators, postFunctions } = req.body;
 
@@ -167,6 +176,9 @@ router.post('/:id/transitions', requireAuth, async (req, res) => {
 
     res.status(201).json({ transition });
   } catch (error) {
+    if (error instanceof workflowService.WorkflowDefinitionError) {
+      return res.status(422).json({ error: error.message, code: 'invalid_workflow' });
+    }
     console.error('Create transition error:', error);
     res.status(500).json({ error: 'Failed to create transition' });
   }
@@ -195,10 +207,7 @@ router.get('/sprints/:id', requireAuth, async (req, res) => {
   try {
     const sprintId = parseInt(req.params.id, 10);
     const sprint = await projectService.getSprintById(sprintId);
-
-    if (!sprint) {
-      return res.status(404).json({ error: 'Sprint not found' });
-    }
+    if (!(await authorizeProject(req, res, sprint?.project_id, 'view_issue'))) return;
 
     res.json({ sprint });
   } catch (error) {
@@ -214,6 +223,9 @@ router.get('/sprints/:id', requireAuth, async (req, res) => {
 router.patch('/sprints/:id', requireAuth, async (req, res) => {
   try {
     const sprintId = parseInt(req.params.id, 10);
+    const existing = await projectService.getSprintById(sprintId);
+    if (!(await authorizeProject(req, res, existing?.project_id, 'manage_sprints'))) return;
+
     const { name, goal, start_date, end_date, status } = req.body;
 
     const sprint = await projectService.updateSprint(sprintId, {
@@ -242,6 +254,9 @@ router.patch('/sprints/:id', requireAuth, async (req, res) => {
 router.post('/sprints/:id/start', requireAuth, async (req, res) => {
   try {
     const sprintId = parseInt(req.params.id, 10);
+    const existing = await projectService.getSprintById(sprintId);
+    if (!(await authorizeProject(req, res, existing?.project_id, 'manage_sprints'))) return;
+
     const sprint = await projectService.startSprint(sprintId);
 
     if (!sprint) {
@@ -262,6 +277,9 @@ router.post('/sprints/:id/start', requireAuth, async (req, res) => {
 router.post('/sprints/:id/complete', requireAuth, async (req, res) => {
   try {
     const sprintId = parseInt(req.params.id, 10);
+    const existing = await projectService.getSprintById(sprintId);
+    if (!(await authorizeProject(req, res, existing?.project_id, 'manage_sprints'))) return;
+
     const sprint = await projectService.completeSprint(sprintId);
 
     if (!sprint) {
@@ -283,10 +301,7 @@ router.get('/boards/:id', requireAuth, async (req, res) => {
   try {
     const boardId = parseInt(req.params.id, 10);
     const board = await projectService.getBoardById(boardId);
-
-    if (!board) {
-      return res.status(404).json({ error: 'Board not found' });
-    }
+    if (!(await authorizeProject(req, res, board?.project_id, 'view_issue'))) return;
 
     res.json({ board });
   } catch (error) {

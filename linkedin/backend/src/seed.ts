@@ -9,7 +9,7 @@
  */
 import { pool, query as _query, queryOne, execute } from './utils/db.js';
 import bcrypt from 'bcryptjs';
-import { indexUser, indexJob } from './utils/elasticsearch.js';
+import { enqueueFullReindex } from './services/searchIndexer.js';
 
 /**
  * Seeds the database with sample data for development.
@@ -25,7 +25,7 @@ async function seed() {
   console.log('Seeding database...');
 
   // Clear existing data
-  await execute('TRUNCATE TABLE job_applications, job_skills, jobs, post_comments, post_likes, posts, connection_requests, connections, user_skills, education, experiences, skills, users, companies RESTART IDENTITY CASCADE');
+  await execute('TRUNCATE TABLE job_applications, job_skills, jobs, post_comments, post_likes, posts, connection_requests, connections, skill_endorsements, user_skills, education, experiences, skills, users, companies, search_index_queue RESTART IDENTITY CASCADE');
 
   // Create skills
   const skillNames = [
@@ -79,16 +79,6 @@ async function seed() {
       [u.email, passwordHash, u.first_name, u.last_name, u.headline, u.location, u.industry, u.role]
     );
     userIds.push(result!.id);
-
-    // Index in Elasticsearch
-    await indexUser({
-      id: result!.id,
-      first_name: u.first_name,
-      last_name: u.last_name,
-      headline: u.headline,
-      location: u.location,
-      industry: u.industry,
-    });
   }
   console.log('Created users');
 
@@ -211,22 +201,13 @@ async function seed() {
       }
     }
 
-    // Index in Elasticsearch
-    const company = companies.find((_, i) => companyIds[i] === j.company_id);
-    await indexJob({
-      id: result!.id,
-      title: j.title,
-      description: j.description,
-      company_name: company?.name || '',
-      location: j.location,
-      is_remote: j.is_remote,
-      employment_type: j.employment_type,
-      experience_level: j.experience_level,
-      skills: j.skills,
-      status: 'active',
-    });
   }
   console.log('Created jobs');
+
+  // Elasticsearch documents are built by the outbox relay when the API runs,
+  // so seeding works without Elasticsearch.
+  await enqueueFullReindex();
+  console.log('Queued search reindex');
 
   console.log('\nSeed complete!');
   console.log('\nTest accounts (all use password: password123):');

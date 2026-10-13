@@ -71,7 +71,7 @@ export async function optionalAuthMiddleware(
  * @param userId - User ID
  * @returns Session ID
  */
-/** Creates a new session in Redis with a 24-hour TTL and returns the session ID. */
+/** Creates a new session in Redis with a 7-day TTL and returns the session ID. */
 export async function createSession(userId: string): Promise<string> {
   const sessionId = crypto.randomUUID()
   await redis.setEx(

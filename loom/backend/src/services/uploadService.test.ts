@@ -113,7 +113,9 @@ describe('presignPart', () => {
 describe('completeUpload', () => {
   function transactionClient(updateRows: unknown[]) {
     const client = {
-      query: vi.fn(async (sql: string) => (sql.startsWith('UPDATE videos') ? { rows: updateRows } : { rows: [] })),
+      query: vi.fn(async (sql: string, _params?: unknown[]) =>
+        sql.startsWith('UPDATE videos') ? { rows: updateRows } : { rows: [] },
+      ),
       release: vi.fn(),
     };
     connect.mockResolvedValueOnce(client);

@@ -9,6 +9,24 @@ import type { User, Project, IssueWithDetails, Sprint, Workflow, Board, Label, C
 const API_BASE = '/api';
 
 /**
+ * Error thrown for any non-2xx response. `status` and `code` let callers branch on the
+ * failure class (403 permission, 409 conflict, 412 stale version, 422 rule failure)
+ * instead of string-matching messages; `body` keeps extra fields such as the current
+ * issue that comes back with a 412.
+ */
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    public readonly status: number,
+    public readonly code?: string,
+    public readonly body: Record<string, unknown> = {}
+  ) {
+    super(message);
+    this.name = 'ApiError';
+  }
+}
+
+/**
  * Generic fetch wrapper with error handling and JSON parsing.
  * Automatically includes credentials and content-type headers.
  *
@@ -16,7 +34,7 @@ const API_BASE = '/api';
  * @param endpoint - API endpoint path (e.g., "/projects")
  * @param options - Fetch options (method, body, headers, etc.)
  * @returns Parsed JSON response
- * @throws Error with server error message on failure
+ * @throws ApiError with the server's message, status and code on failure
  */
 async function fetchApi<T>(
   endpoint: string,
@@ -32,11 +50,16 @@ async function fetchApi<T>(
   });
 
   if (!response.ok) {
-    const error = await response.json().catch(() => ({ error: 'Request failed' }));
-    throw new Error(error.error || 'Request failed');
+    const body = await response.json().catch(() => ({}));
+    throw new ApiError(body.error || `Request failed (${response.status})`, response.status, body.code, body);
   }
 
   return response.json();
+}
+
+/** True when the request may or may not have run, so a retry should reuse its key. */
+export function isUncertainFailure(error: unknown): boolean {
+  return !(error instanceof ApiError) || error.status >= 500;
 }
 
 /**
@@ -154,22 +177,27 @@ export async function getIssue(idOrKey: string | number): Promise<IssueWithDetai
  * Creates a new issue in a project.
  *
  * @param issueData - Issue creation data
+ * @param idempotencyKey - One key per submitted form; reuse it when retrying that submit
  * @returns Newly created issue with full details
  */
-export async function createIssue(issueData: {
-  projectId: string;
-  summary: string;
-  description?: string;
-  issueType: string;
-  priority?: string;
-  assigneeId?: string;
-  sprintId?: number;
-  epicId?: number;
-  storyPoints?: number;
-  labels?: string[];
-}): Promise<IssueWithDetails> {
+export async function createIssue(
+  issueData: {
+    projectId: string;
+    summary: string;
+    description?: string;
+    issueType: string;
+    priority?: string;
+    assigneeId?: string;
+    sprintId?: number;
+    epicId?: number;
+    storyPoints?: number;
+    labels?: string[];
+  },
+  idempotencyKey: string
+): Promise<IssueWithDetails> {
   const data = await fetchApi<{ issue: IssueWithDetails }>('/issues', {
     method: 'POST',
+    headers: { 'Idempotency-Key': idempotencyKey },
     body: JSON.stringify(issueData),
   });
   return data.issue;
@@ -180,23 +208,27 @@ export async function createIssue(issueData: {
  *
  * @param issueId - ID of the issue to update
  * @param updates - Partial issue data to update
+ * @param version - The version the user edited; the server answers 412 if it moved on
  * @returns Updated issue with full details
+ * @throws ApiError 412 (code version_conflict) with the current issue in body.issue
  */
 export async function updateIssue(
   issueId: number,
   updates: Partial<{
     summary: string;
-    description: string;
+    description: string | null;
     priority: string;
     assigneeId: string | null;
     sprintId: number | null;
     epicId: number | null;
     storyPoints: number | null;
     labels: string[];
-  }>
+  }>,
+  version?: number
 ): Promise<IssueWithDetails> {
   const data = await fetchApi<{ issue: IssueWithDetails }>(`/issues/${issueId}`, {
     method: 'PATCH',
+    headers: version !== undefined ? { 'If-Match': `"${version}"` } : {},
     body: JSON.stringify(updates),
   });
   return data.issue;
@@ -303,14 +335,45 @@ export async function getIssueComments(issueId: number): Promise<Comment[]> {
  *
  * @param issueId - ID of the issue
  * @param body - Comment text
+ * @param idempotencyKey - One key per comment draft; reuse it when retrying that draft
  * @returns Newly created comment
  */
-export async function addComment(issueId: number, body: string): Promise<Comment> {
+export async function addComment(issueId: number, body: string, idempotencyKey: string): Promise<Comment> {
   const data = await fetchApi<{ comment: Comment }>(`/issues/${issueId}/comments`, {
     method: 'POST',
+    headers: { 'Idempotency-Key': idempotencyKey },
     body: JSON.stringify({ body }),
   });
   return data.comment;
+}
+
+/**
+ * Moves an issue in its project's board and backlog order.
+ *
+ * @param issueId - ID of the issue being moved
+ * @param placement - afterId: the issue now directly above it; beforeId: directly below
+ */
+export async function rankIssue(
+  issueId: number,
+  placement: { afterId?: number | null; beforeId?: number | null }
+): Promise<{ id: number; key: string; rank: string }> {
+  const data = await fetchApi<{ issue: { id: number; key: string; rank: string } }>(`/issues/${issueId}/rank`, {
+    method: 'PUT',
+    body: JSON.stringify(placement),
+  });
+  return data.issue;
+}
+
+/**
+ * Gets the permissions the current user holds in a project, used to hide actions the
+ * server would refuse. The server still checks every request.
+ *
+ * @param projectIdOrKey - Project UUID or key
+ * @returns Permission names such as "edit_issue"
+ */
+export async function getProjectPermissions(projectIdOrKey: string): Promise<string[]> {
+  const data = await fetchApi<{ permissions: string[] }>(`/projects/${projectIdOrKey}/permissions`);
+  return data.permissions;
 }
 
 /**

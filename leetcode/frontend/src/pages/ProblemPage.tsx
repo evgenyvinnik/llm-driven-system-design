@@ -1,13 +1,38 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { useParams, Link } from 'react-router-dom';
 import ReactMarkdown from 'react-markdown';
-import { problemsApi, submissionsApi } from '../services/api';
+import { ApiError, newIdempotencyKey, problemsApi, submissionsApi, type SubmissionStatusResponse } from '../services/api';
 import { CodeEditor } from '../components/CodeEditor';
 import { DifficultyBadge } from '../components/DifficultyBadge';
 import { TestResults } from '../components/TestResults';
 import { StatusBadge } from '../components/StatusBadge';
 import { useAuthStore } from '../stores/authStore';
+import { draftKey, useEditorStore, type Language } from '../stores/editorStore';
+import { useSubmissionStatus } from '../hooks/useSubmissionStatus';
 import { RunResult } from '../types';
+
+/** How long typing must pause before the draft is written to localStorage. */
+const DRAFT_SAVE_DELAY_MS = 500;
+/** Retries of one submit attempt after a network error or 5xx; all reuse the same key. */
+const SUBMIT_RETRY_DELAYS_MS = [500, 1500];
+
+function describeStatus(status: SubmissionStatusResponse): string {
+  switch (status.status) {
+    case 'pending':
+      return status.error_message || 'Waiting for a judge...';
+    case 'running':
+      return `Running test ${status.current_test || '?'} of ${status.test_cases_total || '?'}...`;
+    case 'accepted':
+      return `Accepted! Runtime: ${status.runtime_ms}ms`;
+    default:
+      return status.error_message || status.status.replace(/_/g, ' ');
+  }
+}
+
+/** Retries only failures that may succeed on a second try; the server dedupes on the key. */
+function isRetryable(error: unknown): boolean {
+  return error instanceof TypeError || (error instanceof ApiError && error.status >= 500);
+}
 
 interface Problem {
   id: string;
@@ -35,8 +60,6 @@ interface Submission {
   created_at: string;
 }
 
-type Language = 'python' | 'javascript';
-
 /** Renders the problem workspace with description, code editor, test runner, and submission history. */
 export function ProblemPage() {
   const { slug } = useParams<{ slug: string }>();
@@ -46,8 +69,12 @@ export function ProblemPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  const [language, setLanguage] = useState<Language>('python');
+  const language = useEditorStore((state) => state.language);
+  const setLanguage = useEditorStore((state) => state.setLanguage);
+  const saveDraft = useEditorStore((state) => state.saveDraft);
+  const clearDraft = useEditorStore((state) => state.clearDraft);
   const [code, setCode] = useState('');
+  const saveTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
   const [activeTab, setActiveTab] = useState<'description' | 'submissions'>('description');
   const [submissions, setSubmissions] = useState<Submission[]>([]);
@@ -55,41 +82,61 @@ export function ProblemPage() {
   const [testResults, setTestResults] = useState<RunResult[]>([]);
   const [isRunning, setIsRunning] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
-  const [submissionStatus, setSubmissionStatus] = useState<{
-    id: string;
-    status: string;
-    message?: string;
-  } | null>(null);
+  const [submitError, setSubmitError] = useState<string | null>(null);
+  const [submissionId, setSubmissionId] = useState<string | null>(null);
 
   useEffect(() => {
-    if (slug) {
-      loadProblem();
-    }
+    if (!slug) return;
+    let cancelled = false;
+    setLoading(true);
+    problemsApi.get(slug)
+      .then((data) => {
+        if (cancelled) return;
+        setProblem(data as Problem);
+        setError(null);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setError('Failed to load problem');
+        console.error(err);
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [slug]);
 
-  useEffect(() => {
-    if (problem) {
-      const starterCode = language === 'python'
-        ? problem.starter_code_python
-        : problem.starter_code_javascript;
-      setCode(starterCode || '');
-    }
-  }, [problem, language]);
+  const starterFor = useCallback((lang: Language) => {
+    if (!problem) return '';
+    return (lang === 'python' ? problem.starter_code_python : problem.starter_code_javascript) || '';
+  }, [problem]);
 
-  const loadProblem = async () => {
-    if (!slug) return;
-    try {
-      setLoading(true);
-      const data = await problemsApi.get(slug);
-      setProblem(data as Problem);
-      setError(null);
-    } catch (err) {
-      setError('Failed to load problem');
-      console.error(err);
-    } finally {
-      setLoading(false);
-    }
+  // Load the saved draft for this problem and language, falling back to the starter code.
+  // Reads the store directly so typing (which updates drafts) does not re-run this effect.
+  useEffect(() => {
+    if (!problem) return;
+    const saved = useEditorStore.getState().drafts[draftKey(problem.slug, language)];
+    setCode(saved ?? starterFor(language));
+  }, [problem, language, starterFor]);
+
+  const handleCodeChange = (value: string) => {
+    setCode(value);
+    if (!problem) return;
+    clearTimeout(saveTimer.current);
+    const problemSlug = problem.slug;
+    saveTimer.current = setTimeout(() => saveDraft(problemSlug, language, value), DRAFT_SAVE_DELAY_MS);
   };
+
+  const handleLanguageChange = (next: Language) => {
+    // Flush the pending save so the draft for the current language is not lost.
+    clearTimeout(saveTimer.current);
+    if (problem) saveDraft(problem.slug, language, code);
+    setLanguage(next);
+  };
+
+  useEffect(() => () => clearTimeout(saveTimer.current), []);
 
   const loadSubmissions = useCallback(async () => {
     if (!isAuthenticated || !slug) return;
@@ -136,66 +183,50 @@ export function ProblemPage() {
     if (!problem || !isAuthenticated) return;
 
     setIsSubmitting(true);
-    setSubmissionStatus(null);
+    setSubmitError(null);
+    setSubmissionId(null);
 
-    try {
-      const response = await submissionsApi.submit(problem.slug, language, code);
-      setSubmissionStatus({
-        id: response.submissionId,
-        status: 'pending',
-        message: 'Submission received, processing...'
-      });
-
-      // Poll for result
-      pollSubmissionStatus(response.submissionId);
-    } catch (err) {
-      console.error('Submit failed:', err);
-      setSubmissionStatus({
-        id: '',
-        status: 'error',
-        message: err instanceof Error ? err.message : 'Submission failed'
-      });
-      setIsSubmitting(false);
+    // One key per submit attempt: a retry after a timeout returns the same submission
+    // instead of judging the code twice.
+    const idempotencyKey = newIdempotencyKey();
+    for (let attempt = 0; ; attempt++) {
+      try {
+        const response = await submissionsApi.submit(problem.slug, language, code, idempotencyKey);
+        setSubmissionId(response.submissionId);
+        return;
+      } catch (err) {
+        if (attempt < SUBMIT_RETRY_DELAYS_MS.length && isRetryable(err)) {
+          await new Promise((resolve) => setTimeout(resolve, SUBMIT_RETRY_DELAYS_MS[attempt]));
+          continue;
+        }
+        console.error('Submit failed:', err);
+        setSubmitError(err instanceof Error ? err.message : 'Submission failed');
+        setIsSubmitting(false);
+        return;
+      }
     }
   };
 
-  const pollSubmissionStatus = useCallback(async (submissionId: string) => {
-    const maxAttempts = 60;
-    let attempts = 0;
-
-    const poll = async () => {
-      try {
-        const status = await submissionsApi.getStatus(submissionId);
-
-        setSubmissionStatus({
-          id: submissionId,
-          status: status.status,
-          message: status.status === 'running'
-            ? `Running test ${status.current_test || '?'} of ${status.test_cases_total || '?'}...`
-            : status.status === 'accepted'
-            ? `Accepted! Runtime: ${status.runtime_ms}ms`
-            : status.error_message || status.status.replace(/_/g, ' ')
-        });
-
-        if (status.status === 'pending' || status.status === 'running') {
-          attempts++;
-          if (attempts < maxAttempts) {
-            setTimeout(poll, 1000);
-          } else {
-            setIsSubmitting(false);
-          }
-        } else {
-          setIsSubmitting(false);
-          loadSubmissions();
-        }
-      } catch (err) {
-        console.error('Poll failed:', err);
-        setIsSubmitting(false);
-      }
-    };
-
-    poll();
+  const onVerdict = useCallback(() => {
+    setIsSubmitting(false);
+    loadSubmissions();
   }, [loadSubmissions]);
+
+  const polled = useSubmissionStatus(submissionId, onVerdict);
+
+  useEffect(() => {
+    if (polled.stalled) setIsSubmitting(false);
+  }, [polled.stalled]);
+
+  const submissionStatus = submitError
+    ? { status: 'error', message: submitError }
+    : submissionId
+    ? polled.data
+      ? { status: polled.data.status, message: describeStatus(polled.data) }
+      : { status: 'pending', message: 'Submission received, waiting for a judge...' }
+    : null;
+  // Polling gives up after a few minutes; the verdict still lands in the Submissions tab.
+  const stalledNote = polled.stalled ? ' Still judging - check the Submissions tab for the verdict.' : '';
 
   if (loading) {
     return (
@@ -320,7 +351,8 @@ export function ProblemPage() {
         <div className="flex items-center justify-between px-4 py-2 border-b border-dark-100">
           <select
             value={language}
-            onChange={(e) => setLanguage(e.target.value as Language)}
+            onChange={(e) => handleLanguageChange(e.target.value as Language)}
+            aria-label="Language"
             className="px-3 py-1.5 bg-dark-300 border border-dark-100 rounded text-sm text-white focus:outline-none focus:border-primary-500"
           >
             <option value="python">Python</option>
@@ -329,10 +361,9 @@ export function ProblemPage() {
 
           <button
             onClick={() => {
-              const starterCode = language === 'python'
-                ? problem.starter_code_python
-                : problem.starter_code_javascript;
-              setCode(starterCode || '');
+              clearTimeout(saveTimer.current);
+              clearDraft(problem.slug, language);
+              setCode(starterFor(language));
             }}
             className="text-sm text-gray-400 hover:text-white transition-colors"
           >
@@ -344,7 +375,7 @@ export function ProblemPage() {
         <div className="flex-1 overflow-hidden">
           <CodeEditor
             value={code}
-            onChange={setCode}
+            onChange={handleCodeChange}
             language={language}
             height="100%"
           />
@@ -357,18 +388,21 @@ export function ProblemPage() {
           </div>
           <TestResults results={testResults} isLoading={isRunning} />
 
-          {submissionStatus && (
-            <div className={`p-4 ${
-              submissionStatus.status === 'accepted' ? 'bg-green-900/20' :
-              submissionStatus.status === 'running' || submissionStatus.status === 'pending' ? 'bg-yellow-900/20' :
-              'bg-red-900/20'
-            }`}>
-              <div className="flex items-center gap-2">
-                <StatusBadge status={submissionStatus.status} />
-                <span className="text-sm text-gray-300">{submissionStatus.message}</span>
+          {/* Polite live region: screen readers announce progress and the verdict without a focus change */}
+          <div role="status" aria-live="polite">
+            {submissionStatus && (
+              <div className={`p-4 ${
+                submissionStatus.status === 'accepted' ? 'bg-green-900/20' :
+                submissionStatus.status === 'running' || submissionStatus.status === 'pending' ? 'bg-yellow-900/20' :
+                'bg-red-900/20'
+              }`}>
+                <div className="flex items-center gap-2">
+                  <StatusBadge status={submissionStatus.status} />
+                  <span className="text-sm text-gray-300">{submissionStatus.message}{stalledNote}</span>
+                </div>
               </div>
-            </div>
-          )}
+            )}
+          </div>
         </div>
 
         {/* Action Buttons */}

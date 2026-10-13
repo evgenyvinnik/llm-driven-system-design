@@ -32,18 +32,23 @@ function SearchPage() {
       return;
     }
 
+    // Abort the previous search when the query changes, so a slow response for an
+    // older query can never overwrite newer results.
+    const controller = new AbortController();
     const search = async () => {
       setLoading(true);
       try {
-        const { users: results } = await usersApi.search(q);
+        const { users: results } = await usersApi.search(q, controller.signal);
         setUsers(results);
       } catch (error) {
+        if (controller.signal.aborted) return;
         console.error('Search failed:', error);
       }
       setLoading(false);
     };
 
     search();
+    return () => controller.abort();
   }, [q, isAuthenticated, navigate]);
 
   const handleSearch = (e: React.FormEvent) => {
@@ -95,6 +100,7 @@ function SearchPage() {
                 to="/profile/$userId"
                 params={{ userId: String(user.id) }}
                 className="flex items-center gap-4 p-4 hover:bg-gray-50"
+                aria-label={`View ${user.first_name} ${user.last_name}'s profile`}
               >
                 <div className="w-16 h-16 rounded-full bg-gray-300 flex items-center justify-center text-xl font-bold flex-shrink-0">
                   {user.profile_image_url ? (
@@ -114,7 +120,7 @@ function SearchPage() {
                   <div className="text-sm text-gray-600 truncate">{user.headline}</div>
                   <div className="text-sm text-gray-500">{user.location}</div>
                 </div>
-                <button className="btn-secondary text-sm">Connect</button>
+                <span className="btn-secondary text-sm" aria-hidden="true">View</span>
               </Link>
             ))}
           </div>

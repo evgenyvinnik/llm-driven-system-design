@@ -8,18 +8,6 @@ export interface SessionData {
   expiresAt: string;
 }
 
-export interface PresenceData {
-  status: string;
-  deviceId: string;
-  lastSeen: number;
-}
-
-export interface OfflineMessage {
-  type: string;
-  message?: unknown;
-  [key: string]: unknown;
-}
-
 const redis = new Redis(process.env.REDIS_URL || 'redis://localhost:6379', {
   maxRetriesPerRequest: 3,
   lazyConnect: true,
@@ -57,30 +45,39 @@ export async function deleteSession(token: string): Promise<void> {
   await redis.del(`session:${token}`);
 }
 
-/** Stores user presence (online/offline) status with automatic expiry. */
-export async function setPresence(
-  userId: string,
-  deviceId: string,
-  status: string = 'online'
-): Promise<void> {
+/**
+ * Presence is tracked per connection, not per user: `presence:{userId}` is a
+ * sorted set of connection IDs scored by their last heartbeat. A user is
+ * online while at least one connection has a fresh heartbeat, so closing one
+ * tab or device no longer marks a user with other live devices as offline,
+ * and connections on a crashed server age out instead of staying "online".
+ */
+export const PRESENCE_STALE_MS = 90_000;
+
+/** Records a heartbeat for a connection; returns the user's live connection count. */
+export async function touchPresence(userId: string, connectionId: string): Promise<number> {
   const key = `presence:${userId}`;
-  const data = JSON.stringify({
-    status,
-    deviceId,
-    lastSeen: Date.now(),
-  });
-  await redis.setex(key, 60, data); // 60 seconds TTL, refreshed by heartbeat
+  const now = Date.now();
+  const results = await redis
+    .multi()
+    .zadd(key, now, connectionId)
+    .zremrangebyscore(key, 0, now - PRESENCE_STALE_MS)
+    .pexpire(key, PRESENCE_STALE_MS * 2)
+    .zcard(key)
+    .exec();
+  return Number(results?.[3]?.[1] ?? 0);
 }
 
-/** Retrieves current presence data for a user including status and last seen time. */
-export async function getPresence(userId: string): Promise<PresenceData | null> {
-  const data = await redis.get(`presence:${userId}`);
-  return data ? JSON.parse(data) : null;
-}
-
-/** Removes a user's presence data from Redis on disconnect. */
-export async function deletePresence(userId: string): Promise<void> {
-  await redis.del(`presence:${userId}`);
+/** Removes a connection; returns how many live connections the user still has. */
+export async function dropPresence(userId: string, connectionId: string): Promise<number> {
+  const key = `presence:${userId}`;
+  const results = await redis
+    .multi()
+    .zrem(key, connectionId)
+    .zremrangebyscore(key, 0, Date.now() - PRESENCE_STALE_MS)
+    .zcard(key)
+    .exec();
+  return Number(results?.[2]?.[1] ?? 0);
 }
 
 /** Sets or clears a typing indicator for a user in a conversation with 5-second TTL. */
@@ -112,47 +109,6 @@ export async function getTypingUsers(conversationId: string): Promise<string[]> 
   }
 
   return activeTypers;
-}
-
-/** Queues a message for offline delivery to a specific user device with 7-day TTL. */
-export async function queueOfflineMessage(
-  userId: string,
-  deviceId: string,
-  message: OfflineMessage
-): Promise<void> {
-  const key = `offline:${userId}:${deviceId}`;
-  await redis.rpush(key, JSON.stringify(message));
-  await redis.expire(key, 7 * 24 * 60 * 60); // 7 days TTL
-}
-
-/** Retrieves and clears all queued offline messages for a user device. */
-export async function getOfflineMessages(
-  userId: string,
-  deviceId: string
-): Promise<OfflineMessage[]> {
-  const key = `offline:${userId}:${deviceId}`;
-  const messages = await redis.lrange(key, 0, -1);
-  await redis.del(key);
-  return messages.map((msg: string) => JSON.parse(msg) as OfflineMessage);
-}
-
-/** Registers a WebSocket connection mapping user device to server instance. */
-export async function addConnection(
-  userId: string,
-  deviceId: string,
-  serverId: string
-): Promise<void> {
-  await redis.hset(`connections:${userId}`, deviceId, serverId);
-}
-
-/** Removes a WebSocket connection record for a user device on disconnect. */
-export async function removeConnection(userId: string, deviceId: string): Promise<void> {
-  await redis.hdel(`connections:${userId}`, deviceId);
-}
-
-/** Returns all active WebSocket connections for a user as a device-to-server mapping. */
-export async function getUserConnections(userId: string): Promise<Record<string, string>> {
-  return await redis.hgetall(`connections:${userId}`);
 }
 
 export default redis;

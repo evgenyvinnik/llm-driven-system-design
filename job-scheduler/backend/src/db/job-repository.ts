@@ -5,12 +5,12 @@
  */
 
 import { v4 as uuidv4 } from 'uuid';
-import cronParser from 'cron-parser';
 import { query, queryOne } from './pool';
 import { Job, JobWithStats, PaginatedResponse, CountResult } from './types';
 import { calculateOffset } from './queries';
 import { JobStatus, CreateJobInput, UpdateJobInput } from '../types/index';
 import { logger } from '../utils/logger';
+import { nextCronTime } from '../scheduler/cron';
 
 /**
  * Creates a new job in the database.
@@ -56,20 +56,20 @@ export async function createJob(input: CreateJobInput): Promise<Job> {
 
   if (input.schedule) {
     try {
-      const interval = cronParser.parseExpression(input.schedule);
-      nextRunTime = interval.next().toDate();
+      nextRunTime = nextCronTime(input.schedule, new Date());
     } catch (_error) {
       throw new Error(`Invalid cron expression: ${input.schedule}`);
     }
   } else if (input.scheduled_at) {
-    nextRunTime = input.scheduled_at;
+    nextRunTime = new Date(input.scheduled_at);
   }
 
   const result = await queryOne<Job>(
     `INSERT INTO jobs (
       id, name, description, handler, payload, schedule, next_run_time,
-      priority, max_retries, initial_backoff_ms, max_backoff_ms, timeout_ms, status
-    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+      priority, max_retries, initial_backoff_ms, max_backoff_ms, timeout_ms, status,
+      misfire_policy
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
     RETURNING *`,
     [
       id,
@@ -85,6 +85,7 @@ export async function createJob(input: CreateJobInput): Promise<Job> {
       input.max_backoff_ms ?? 3600000,
       input.timeout_ms ?? 300000,
       JobStatus.SCHEDULED,
+      input.misfire_policy ?? 'fire_once',
     ]
   );
 
@@ -243,7 +244,7 @@ export async function listJobsWithStats(
       SELECT
         COUNT(*) as total_executions,
         COUNT(*) FILTER (WHERE status = 'COMPLETED') as successful_executions,
-        COUNT(*) FILTER (WHERE status = 'FAILED') as failed_executions,
+        COUNT(*) FILTER (WHERE status IN ('FAILED', 'DEAD_LETTER')) as failed_executions,
         MAX(completed_at) as last_execution_at,
         AVG(EXTRACT(EPOCH FROM (completed_at - started_at)) * 1000) FILTER (WHERE completed_at IS NOT NULL AND started_at IS NOT NULL) as avg_duration_ms
       FROM job_executions
@@ -310,6 +311,7 @@ export async function updateJob(id: string, input: UpdateJobInput): Promise<Job 
     'initial_backoff_ms',
     'max_backoff_ms',
     'timeout_ms',
+    'misfire_policy',
   ];
 
   for (const field of fields) {
@@ -323,9 +325,8 @@ export async function updateJob(id: string, input: UpdateJobInput): Promise<Job 
   // Update next_run_time if schedule changed
   if (input.schedule && input.schedule !== existingJob.schedule) {
     try {
-      const interval = cronParser.parseExpression(input.schedule);
       updates.push(`next_run_time = $${paramIndex}`);
-      params.push(interval.next().toDate());
+      params.push(nextCronTime(input.schedule, new Date()));
       paramIndex++;
     } catch (_error) {
       throw new Error(`Invalid cron expression: ${input.schedule}`);
@@ -372,30 +373,4 @@ export async function deleteJob(id: string): Promise<boolean> {
     return true;
   }
   return false;
-}
-
-/**
- * Updates the status of a job.
- *
- * @description Changes a job's status without modifying other fields.
- * Common status transitions include SCHEDULED to PAUSED, or PAUSED to SCHEDULED.
- *
- * @param {string} id - UUID of the job
- * @param {JobStatus} status - New status value (e.g., 'SCHEDULED', 'PAUSED', 'COMPLETED')
- * @returns {Promise<Job | null>} Updated job or null if not found
- * @throws {Error} Database errors from the underlying query
- *
- * @example
- * // Pause a job
- * await updateJobStatus(jobId, JobStatus.PAUSED);
- *
- * @example
- * // Mark job as completed
- * await updateJobStatus(jobId, JobStatus.COMPLETED);
- */
-export async function updateJobStatus(id: string, status: JobStatus): Promise<Job | null> {
-  return queryOne<Job>(
-    'UPDATE jobs SET status = $1 WHERE id = $2 RETURNING *',
-    [status, id]
-  );
 }

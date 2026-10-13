@@ -19,6 +19,18 @@ function HomePage() {
   const [newPostContent, setNewPostContent] = useState('');
   const [loadingPosts, setLoadingPosts] = useState(true);
   const [posting, setPosting] = useState(false);
+  // Optimistic per-suggestion state: 'pending' while in flight, then the server's answer
+  const [invited, setInvited] = useState<Record<number, 'pending' | 'sent' | 'connected' | 'error'>>({});
+
+  const handleConnect = async (candidateId: number) => {
+    setInvited((prev) => ({ ...prev, [candidateId]: 'pending' }));
+    try {
+      const result = await connectionsApi.sendRequest(candidateId);
+      setInvited((prev) => ({ ...prev, [candidateId]: result.status === 'connected' ? 'connected' : 'sent' }));
+    } catch {
+      setInvited((prev) => ({ ...prev, [candidateId]: 'error' }));
+    }
+  };
 
   useEffect(() => {
     if (!isAuthenticated) {
@@ -199,14 +211,22 @@ function HomePage() {
                       <div className="text-xs text-gray-600 truncate">
                         {candidate.user.headline}
                       </div>
-                      {candidate.mutual_connections > 0 && (
-                        <div className="text-xs text-gray-500 mt-1">
-                          {candidate.mutual_connections} mutual
-                        </div>
+                      {candidate.reasons?.[0] && (
+                        <div className="text-xs text-gray-500 mt-1">{candidate.reasons[0]}</div>
                       )}
-                      <button className="btn-secondary text-xs mt-2 py-1 px-3">
-                        Connect
-                      </button>
+                      {invited[candidate.user.id] === 'sent' || invited[candidate.user.id] === 'connected' ? (
+                        <div role="status" className="text-xs text-gray-600 mt-2">
+                          {invited[candidate.user.id] === 'connected' ? 'Connected' : 'Pending'}
+                        </div>
+                      ) : (
+                        <button
+                          onClick={() => handleConnect(candidate.user.id)}
+                          disabled={invited[candidate.user.id] === 'pending'}
+                          className="btn-secondary text-xs mt-2 py-1 px-3 disabled:opacity-50"
+                        >
+                          {invited[candidate.user.id] === 'error' ? 'Retry' : 'Connect'}
+                        </button>
+                      )}
                     </div>
                   </div>
                 ))}

@@ -1,236 +1,203 @@
-import { query } from '../../config/database.js';
-import { deleteIssueFromIndex } from '../../config/elasticsearch.js';
-import { cacheDel } from '../../config/redis.js';
+import { withTransaction } from '../../config/database.js';
 import { logger } from '../../config/logger.js';
-import { publishIssueEvent } from '../../config/messageQueue.js';
+import { concurrencyConflictsCounter } from '../../config/metrics.js';
 import { Issue, User } from '../../types/index.js';
 import { UpdateIssueData, HistoryRecord } from './types.js';
-import { getIssueById } from './queries.js';
-import { indexIssueForSearch, invalidateProjectBoardCache } from './create.js';
+import { assertReferencesInProject } from './references.js';
+import { insertHistory, describeValue } from './history.js';
+import { afterIssueCommitted } from './afterCommit.js';
+
+/** API field, column it writes, and the name it gets in the audit trail. */
+const UPDATABLE_FIELDS: { key: keyof UpdateIssueData; column: string; label: string }[] = [
+  { key: 'summary', column: 'summary', label: 'summary' },
+  { key: 'description', column: 'description', label: 'description' },
+  { key: 'issueType', column: 'issue_type', label: 'issue_type' },
+  { key: 'priority', column: 'priority', label: 'priority' },
+  { key: 'assigneeId', column: 'assignee_id', label: 'assignee' },
+  { key: 'epicId', column: 'epic_id', label: 'epic' },
+  { key: 'sprintId', column: 'sprint_id', label: 'sprint' },
+  { key: 'storyPoints', column: 'story_points', label: 'story_points' },
+  { key: 'labels', column: 'labels', label: 'labels' },
+  { key: 'components', column: 'components', label: 'components' },
+  { key: 'customFields', column: 'custom_fields', label: 'custom_fields' },
+];
+
+/** One field whose value an update actually changes. */
+export interface FieldChange {
+  column: string;
+  label: string;
+  oldValue: unknown;
+  newValue: unknown;
+}
 
 /**
- * Updates an existing issue with partial data.
+ * Lists the fields of an update that differ from the current row. Fields that are absent
+ * or unchanged are skipped, so a no-op save writes nothing and bumps no version.
+ * Custom fields are shallow-merged into the existing object.
+ */
+export function diffIssue(current: Issue, data: UpdateIssueData): FieldChange[] {
+  const row = current as unknown as Record<string, unknown>;
+  const changes: FieldChange[] = [];
+  for (const { key, column, label } of UPDATABLE_FIELDS) {
+    const incoming = data[key];
+    if (incoming === undefined) continue;
+    const oldValue = row[column] ?? null;
+    const newValue =
+      key === 'customFields'
+        ? { ...(current.custom_fields ?? {}), ...(incoming as Record<string, unknown>) }
+        : incoming ?? null;
+    if (JSON.stringify(oldValue) === JSON.stringify(newValue)) continue;
+    changes.push({ column, label, oldValue, newValue });
+  }
+  return changes;
+}
+
+export type UpdateIssueResult =
+  | { ok: true; issue: Issue; changed: string[] }
+  | { ok: false; reason: 'not_found' }
+  | { ok: false; reason: 'version_conflict'; currentVersion: number };
+
+/**
+ * Updates an issue's fields.
  *
- * @description Performs a partial update of an issue, only modifying the fields
- * provided in the update data. For each changed field:
- * 1. Compares new value against current value
- * 2. Records the change in issue_history table for audit trail
- * 3. Updates the issue record in the database
- * 4. Asynchronously updates the Elasticsearch index
- * 5. Publishes an update event for notifications/webhooks
- * 6. Invalidates relevant caches
+ * Concurrency: the caller may pass the version the user edited (from If-Match). The row
+ * is locked with SELECT ... FOR UPDATE for the length of this short transaction; if its
+ * version differs from the expected one, nothing is written and the caller answers 412.
+ * Optimistic across the user's think time, pessimistic for the few milliseconds of the
+ * write, which keeps the audit trail's old values exact.
  *
- * If sprint assignment changes, also invalidates the project board cache.
+ * In the same transaction: the UPDATE (version + 1) and one history row per changed
+ * field. After COMMIT: search indexing and the 'updated' event.
  *
  * @param issueId - Numeric ID of the issue to update
  * @param data - Partial issue data with fields to update
- * @param user - User making the update (used for history tracking)
- * @returns Promise resolving to the updated issue, or null if not found
- *
- * @example
- * ```typescript
- * const updated = await updateIssue(
- *   123,
- *   {
- *     priority: 'highest',
- *     assigneeId: 'user-uuid',
- *     storyPoints: 8
- *   },
- *   currentUser
- * );
- *
- * if (updated) {
- *   console.log(`Issue ${updated.key} updated successfully`);
- * }
- * ```
+ * @param user - User making the update (recorded in history)
+ * @param expectedVersion - Version from If-Match; omit to skip the precondition
  */
 export async function updateIssue(
   issueId: number,
   data: UpdateIssueData,
-  user: User
-): Promise<Issue | null> {
+  user: User,
+  expectedVersion?: number
+): Promise<UpdateIssueResult> {
   const log = logger.child({ operation: 'updateIssue', issueId, userId: user.id });
 
-  // Get current issue for history
-  const current = await getIssueById(issueId);
-  if (!current) {
-    log.warn('Issue not found');
-    return null;
-  }
+  const outcome = await withTransaction(async (client) => {
+    const { rows } = await client.query<Issue>('SELECT * FROM issues WHERE id = $1 FOR UPDATE', [issueId]);
+    const current = rows[0];
+    if (!current) return { result: { ok: false, reason: 'not_found' } as UpdateIssueResult };
 
-  const updates: string[] = [];
-  const values: unknown[] = [];
-  const historyRecords: HistoryRecord[] = [];
-  const changes: Record<string, { old: unknown; new: unknown }> = {};
-  let paramIndex = 1;
-
-  const addUpdate = (field: string, dbField: string, newValue: unknown, oldValue: unknown) => {
-    updates.push(`${dbField} = $${paramIndex++}`);
-    values.push(newValue);
-    if (JSON.stringify(newValue) !== JSON.stringify(oldValue)) {
-      historyRecords.push({
-        field,
-        oldValue: oldValue ? String(oldValue) : null,
-        newValue: newValue ? String(newValue) : null,
-      });
-      changes[field] = { old: oldValue, new: newValue };
+    if (expectedVersion !== undefined && current.version !== expectedVersion) {
+      return {
+        result: { ok: false, reason: 'version_conflict', currentVersion: current.version } as UpdateIssueResult,
+      };
     }
-  };
 
-  if (data.summary !== undefined) addUpdate('summary', 'summary', data.summary, current.summary);
-  if (data.description !== undefined) addUpdate('description', 'description', data.description, current.description);
-  if (data.issueType !== undefined) addUpdate('issue_type', 'issue_type', data.issueType, current.issue_type);
-  if (data.priority !== undefined) addUpdate('priority', 'priority', data.priority, current.priority);
-  if (data.assigneeId !== undefined) addUpdate('assignee', 'assignee_id', data.assigneeId, current.assignee_id);
-  if (data.epicId !== undefined) addUpdate('epic', 'epic_id', data.epicId, current.epic_id);
-  if (data.sprintId !== undefined) addUpdate('sprint', 'sprint_id', data.sprintId, current.sprint_id);
-  if (data.storyPoints !== undefined) addUpdate('story_points', 'story_points', data.storyPoints, current.story_points);
-  if (data.labels !== undefined) addUpdate('labels', 'labels', data.labels, current.labels);
-  if (data.components !== undefined) addUpdate('components', 'components', data.components, current.components);
-  if (data.customFields !== undefined) addUpdate('custom_fields', 'custom_fields', JSON.stringify(data.customFields), JSON.stringify(current.custom_fields));
+    const changes = diffIssue(current, data);
+    if (changes.length === 0) {
+      return { result: { ok: true, issue: current, changed: [] } as UpdateIssueResult };
+    }
 
-  if (updates.length === 0) return current;
+    const changedKeys = new Set(changes.map((c) => c.column));
+    await assertReferencesInProject(client, current.project_id, {
+      assigneeId: changedKeys.has('assignee_id') ? data.assigneeId : undefined,
+      sprintId: changedKeys.has('sprint_id') ? data.sprintId : undefined,
+      epicId: changedKeys.has('epic_id') ? data.epicId : undefined,
+    });
 
-  updates.push('updated_at = NOW()');
-  values.push(issueId);
-
-  const { rows } = await query<Issue>(
-    `UPDATE issues SET ${updates.join(', ')} WHERE id = $${paramIndex} RETURNING *`,
-    values
-  );
-
-  if (rows.length === 0) return null;
-
-  // Record history
-  for (const record of historyRecords) {
-    await query(
-      `INSERT INTO issue_history (issue_id, user_id, field, old_value, new_value)
-       VALUES ($1, $2, $3, $4, $5)`,
-      [issueId, user.id, record.field, record.oldValue, record.newValue]
+    // Column names come from UPDATABLE_FIELDS, never from the request.
+    const assignments = changes.map((change, i) => `${change.column} = $${i + 1}`);
+    const values = changes.map((change) =>
+      change.column === 'custom_fields' ? JSON.stringify(change.newValue) : change.newValue
     );
+    const { rows: updatedRows } = await client.query<Issue>(
+      `UPDATE issues SET ${assignments.join(', ')}, version = version + 1, updated_at = NOW()
+       WHERE id = $${changes.length + 1}
+       RETURNING *`,
+      [...values, issueId]
+    );
+
+    const history: HistoryRecord[] = [];
+    for (const change of changes) {
+      history.push({
+        field: change.label,
+        oldValue: await describeValue(client, change.label, change.oldValue),
+        newValue: await describeValue(client, change.label, change.newValue),
+      });
+    }
+    await insertHistory(client, issueId, user.id, history);
+
+    const { rows: projectRows } = await client.query<{ key: string }>(
+      'SELECT key FROM projects WHERE id = $1',
+      [current.project_id]
+    );
+
+    return {
+      result: { ok: true, issue: updatedRows[0], changed: changes.map((c) => c.label) } as UpdateIssueResult,
+      event: {
+        projectKey: projectRows[0]?.key ?? '',
+        changes: Object.fromEntries(history.map((h) => [h.field, { old: h.oldValue, new: h.newValue }])),
+      },
+    };
+  });
+
+  const { result } = outcome;
+  if (!result.ok) {
+    if (result.reason === 'version_conflict') {
+      concurrencyConflictsCounter.inc({ operation: 'edit' });
+      log.info({ expectedVersion, currentVersion: result.currentVersion }, 'Rejected stale issue update');
+    }
+    return result;
   }
 
-  log.info({ changedFields: Object.keys(changes) }, 'Issue updated');
-
-  // Update Elasticsearch index (async)
-  indexIssueForSearch(rows[0]).catch((error) => {
-    log.error({ err: error }, 'Failed to update issue in Elasticsearch');
-  });
-
-  // Publish update event
-  publishIssueEvent({
-    event_type: 'updated',
-    issue_id: issueId,
-    issue_key: current.key,
-    project_id: current.project_id,
-    project_key: current.project.key,
-    changes,
-    actor_id: user.id,
-  }).catch((error) => {
-    log.error({ err: error }, 'Failed to publish issue updated event');
-  });
-
-  // Invalidate caches
-  invalidateIssueCache(issueId, current.key).catch((error) => {
-    log.error({ err: error }, 'Failed to invalidate issue cache');
-  });
-
-  // If sprint changed, invalidate board cache
-  if (data.sprintId !== undefined) {
-    invalidateProjectBoardCache(current.project_id).catch((error) => {
-      log.error({ err: error }, 'Failed to invalidate board cache');
+  if (outcome.event) {
+    log.info({ changedFields: result.changed, version: result.issue.version }, 'Issue updated');
+    afterIssueCommitted({
+      event_type: 'updated',
+      issue_id: issueId,
+      issue_key: result.issue.key,
+      project_id: result.issue.project_id,
+      project_key: outcome.event.projectKey,
+      changes: outcome.event.changes,
+      actor_id: user.id,
     });
   }
 
-  return rows[0];
+  return result;
 }
 
 /**
- * Deletes an issue from the database and search index.
- *
- * @description Permanently removes an issue from the system. This operation:
- * 1. Retrieves issue details before deletion for event publishing
- * 2. Deletes the issue record from the database (cascades to related records)
- * 3. Removes the issue from Elasticsearch search index
- * 4. Publishes a delete event for notifications/webhooks
- * 5. Invalidates issue and board caches
- *
- * Note: This is a destructive operation that cannot be undone. Consider
- * implementing soft-delete if issue recovery is needed.
+ * Deletes an issue (cascading to its history and comments), then removes it from the
+ * search index and publishes the 'deleted' event.
  *
  * @param issueId - Numeric ID of the issue to delete
- * @returns Promise resolving to true if issue was deleted, false if not found
- *
- * @example
- * ```typescript
- * const deleted = await deleteIssue(123);
- * if (deleted) {
- *   console.log('Issue successfully deleted');
- * } else {
- *   console.log('Issue not found');
- * }
- * ```
+ * @param user - User deleting the issue (recorded as the event's actor)
+ * @returns True if the issue was deleted, false if it did not exist
  */
-export async function deleteIssue(issueId: number): Promise<boolean> {
-  const log = logger.child({ operation: 'deleteIssue', issueId });
+export async function deleteIssue(issueId: number, user: User): Promise<boolean> {
+  const log = logger.child({ operation: 'deleteIssue', issueId, userId: user.id });
 
-  // Get issue details before deletion for event publishing
-  const issue = await getIssueById(issueId);
+  const deleted = await withTransaction(async (client) => {
+    const { rows } = await client.query<{ key: string; project_id: string; project_key: string }>(
+      `DELETE FROM issues i
+       USING projects p
+       WHERE i.id = $1 AND p.id = i.project_id
+       RETURNING i.key, i.project_id, p.key AS project_key`,
+      [issueId]
+    );
+    return rows[0] ?? null;
+  });
 
-  const { rowCount } = await query('DELETE FROM issues WHERE id = $1', [issueId]);
+  if (!deleted) return false;
 
-  if (rowCount && rowCount > 0) {
-    log.info('Issue deleted');
-
-    // Remove from Elasticsearch
-    deleteIssueFromIndex(issueId).catch((error) => {
-      log.error({ err: error }, 'Failed to delete issue from Elasticsearch');
-    });
-
-    // Publish delete event
-    if (issue) {
-      publishIssueEvent({
-        event_type: 'deleted',
-        issue_id: issueId,
-        issue_key: issue.key,
-        project_id: issue.project_id,
-        project_key: issue.project.key,
-        actor_id: 'system', // Would need to pass user context
-      }).catch((error) => {
-        log.error({ err: error }, 'Failed to publish issue deleted event');
-      });
-
-      // Invalidate caches
-      invalidateIssueCache(issueId, issue.key).catch(() => {});
-      invalidateProjectBoardCache(issue.project_id).catch(() => {});
-    }
-
-    return true;
-  }
-
-  return false;
-}
-
-/**
- * Invalidates cache entries for a specific issue.
- *
- * @description Clears all Redis cache entries related to a specific issue.
- * This includes both the ID-based cache key and the human-readable key-based
- * cache entry. Should be called after any issue modification.
- *
- * @param issueId - Numeric ID of the issue
- * @param issueKey - Human-readable issue key (e.g., "PROJ-123")
- * @returns Promise that resolves when cache invalidation is complete
- *
- * @example
- * ```typescript
- * // After updating an issue
- * await invalidateIssueCache(123, 'PROJ-123');
- * ```
- */
-export async function invalidateIssueCache(issueId: number, issueKey: string): Promise<void> {
-  await Promise.all([
-    cacheDel(`issue:${issueId}`),
-    cacheDel(`issue:key:${issueKey}`),
-  ]);
+  log.info({ issueKey: deleted.key }, 'Issue deleted');
+  afterIssueCommitted({
+    event_type: 'deleted',
+    issue_id: issueId,
+    issue_key: deleted.key,
+    project_id: deleted.project_id,
+    project_key: deleted.project_key,
+    actor_id: user.id,
+  });
+  return true;
 }

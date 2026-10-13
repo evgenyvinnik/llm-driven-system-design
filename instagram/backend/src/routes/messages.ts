@@ -7,6 +7,7 @@ import { Router, Request, Response, NextFunction } from 'express';
 import { requireAuth, AuthenticatedRequest } from '../middleware/auth.js';
 import {
   getOrCreateConversation,
+  isConversationParticipant,
   sendMessage,
   getMessages,
   getConversations,
@@ -47,6 +48,36 @@ function requireCassandra(req: Request, res: Response, next: NextFunction): void
   next();
 }
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Only participants may read, write, react in, or mark a conversation as read.
+ * Non-participants get 404 rather than 403 so conversation ids can't be probed.
+ */
+async function requireParticipant(req: AuthenticatedRequest, res: Response, next: NextFunction): Promise<void> {
+  const conversationId = req.params.conversationId as string;
+  try {
+    if (!UUID_RE.test(conversationId) || !(await isConversationParticipant(conversationId, req.session.userId!))) {
+      logger.warn(
+        { type: 'auth', result: 'denied', reason: 'not_participant', userId: req.session.userId, conversationId },
+        'Conversation access denied'
+      );
+      res.status(404).json({ error: 'Conversation not found' });
+      return;
+    }
+    next();
+  } catch (error) {
+    const err = error as Error;
+    logger.error({ error: err.message, conversationId }, 'Participant check failed');
+    res.status(500).json({ error: 'Failed to load conversation' });
+  }
+}
+
+// Every route under /conversations/:conversationId is participant-only.
+router.use('/conversations/:conversationId', requireAuth, requireCassandra, (req, res, next) => {
+  void requireParticipant(req as AuthenticatedRequest, res, next);
+});
+
 /**
  * GET /api/messages/conversations
  * Get user's inbox (list of conversations)
@@ -82,6 +113,11 @@ router.post('/conversations', requireAuth, requireCassandra, async (req: Authent
 
     if (!recipientId) {
       res.status(400).json({ error: 'recipientId is required' });
+      return;
+    }
+
+    if (!UUID_RE.test(recipientId)) {
+      res.status(400).json({ error: 'recipientId must be a user id' });
       return;
     }
 

@@ -1,6 +1,7 @@
 export interface User {
   id: number;
-  email: string;
+  /** Present only on your own record (login, /auth/me, your own profile) */
+  email?: string;
   first_name: string;
   last_name: string;
   headline?: string;
@@ -10,9 +11,32 @@ export interface User {
   profile_image_url?: string;
   banner_image_url?: string;
   connection_count: number;
-  role: 'user' | 'admin';
+  role: 'user' | 'recruiter' | 'admin';
   created_at: string;
   updated_at: string;
+}
+
+/** Card-sized public view of a member (paths, suggestions). */
+export interface UserSummary {
+  id: number;
+  first_name: string;
+  last_name: string;
+  headline?: string;
+  location?: string;
+  profile_image_url?: string;
+  connection_count: number;
+}
+
+/**
+ * How the signed-in member relates to another member. `status` decides the action
+ * button; `degree` and `path` drive the badge and "how you're connected".
+ */
+export interface Relationship {
+  degree: 0 | 1 | 2 | 3 | null;
+  status: 'self' | 'connected' | 'pending_sent' | 'pending_received' | 'none';
+  request_id: number | null;
+  mutual_count: number;
+  path: UserSummary[];
 }
 
 export interface Company {
@@ -68,9 +92,16 @@ export interface ConnectionRequest {
   from_user_id: number;
   to_user_id: number;
   message?: string;
-  status: 'pending' | 'accepted' | 'rejected';
+  status: 'pending' | 'accepted' | 'rejected' | 'withdrawn';
   created_at: string;
   from_user?: User;
+}
+
+/** Result of POST /connections/request: a crossing invitation connects immediately. */
+export interface SendRequestResult {
+  request: ConnectionRequest;
+  outcome: 'sent' | 'already_pending' | 'accepted_reverse';
+  status: 'pending_sent' | 'connected';
 }
 
 export interface Post {
@@ -127,11 +158,13 @@ export interface JobApplication {
 }
 
 export interface PYMKCandidate {
-  user: User;
+  user: UserSummary;
   score: number;
   mutual_connections: number;
   same_company: boolean;
   same_school: boolean;
   shared_skills: number;
   same_location: boolean;
+  /** Why this person is suggested, strongest first ("2 mutual connections") */
+  reasons: string[];
 }

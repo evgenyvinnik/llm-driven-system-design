@@ -1,17 +1,10 @@
 interface UploadProgressProps {
   progress: number;
+  label: string;
 }
 
-/** Displays a 5-stage upload progress indicator with percentage bar. */
-export function UploadProgress({ progress }: UploadProgressProps) {
-  const getLabel = () => {
-    if (progress < 15) return 'Creating video...';
-    if (progress < 25) return 'Preparing upload...';
-    if (progress < 85) return 'Uploading video...';
-    if (progress < 100) return 'Finalizing...';
-    return 'Upload complete!';
-  };
-
+/** Circular and linear progress for the part of the upload still running after Stop. */
+export function UploadProgress({ progress, label }: UploadProgressProps) {
   return (
     <div className="bg-white rounded-lg border border-loom-border p-8">
       <div className="max-w-md mx-auto text-center">
@@ -44,9 +37,15 @@ export function UploadProgress({ progress }: UploadProgressProps) {
           </div>
         </div>
 
-        <h3 className="text-lg font-medium text-loom-text mb-2">{getLabel()}</h3>
+        <h3 className="text-lg font-medium text-loom-text mb-2" aria-live="polite">{label}</h3>
 
-        <div className="w-full bg-gray-200 rounded-full h-2 mt-4">
+        <div
+          className="w-full bg-gray-200 rounded-full h-2 mt-4"
+          role="progressbar"
+          aria-valuemin={0}
+          aria-valuemax={100}
+          aria-valuenow={progress}
+        >
           <div
             className="bg-loom-primary h-2 rounded-full upload-progress-bar"
             style={{ width: `${progress}%` }}

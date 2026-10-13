@@ -5,6 +5,7 @@
 import { app } from './app.js'
 import { initRedis } from '../shared/cache.js'
 import { createLogger } from '../shared/logger.js'
+import { closeServer, onShutdown } from '../shared/lifecycle.js'
 
 const logger = createLogger('aggregation-service')
 const PORT = process.env.AGGREGATION_PORT || 3003
@@ -12,10 +13,12 @@ const PORT = process.env.AGGREGATION_PORT || 3003
 async function start(): Promise<void> {
   await initRedis()
 
-  app.listen(PORT, () => {
+  const server = app.listen(PORT, () => {
     logger.info({ event: 'server_started', port: PORT })
     console.log(`Aggregation service running on port ${PORT}`)
   })
+
+  onShutdown(logger, () => closeServer(server))
 }
 
 start().catch((err) => {

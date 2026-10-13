@@ -2,7 +2,9 @@ import { useState, useEffect } from 'react';
 import type { User, IssueType } from '../types';
 import { Button, Input, Textarea, Select, IssueTypeIcon, Modal } from './ui';
 import * as api from '../services/api';
+import { isUncertainFailure } from '../services/api';
 import { useProjectStore, useIssueStore } from '../stores';
+import { newIdempotencyKey } from '../utils/idempotency';
 
 interface CreateIssueModalProps {
   isOpen: boolean;
@@ -24,6 +26,13 @@ export function CreateIssueModal({ isOpen, onClose }: CreateIssueModalProps) {
   const [users, setUsers] = useState<User[]>([]);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState('');
+  // One key per version of the form. A retry after a timeout or 5xx reuses it, so the
+  // server returns the issue it already created instead of creating a duplicate.
+  const [draftKey, setDraftKey] = useState(newIdempotencyKey);
+
+  useEffect(() => {
+    setDraftKey(newIdempotencyKey());
+  }, [isOpen, summary, description, issueType, priority, assigneeId, sprintId, storyPoints]);
 
   useEffect(() => {
     if (isOpen) {
@@ -66,21 +75,26 @@ export function CreateIssueModal({ isOpen, onClose }: CreateIssueModalProps) {
     setError('');
 
     try {
-      await api.createIssue({
-        projectId: currentProject.id,
-        summary: summary.trim(),
-        description: description.trim() || undefined,
-        issueType,
-        priority,
-        assigneeId: assigneeId || undefined,
-        sprintId: sprintId ? parseInt(sprintId, 10) : undefined,
-        storyPoints: storyPoints ? parseInt(storyPoints, 10) : undefined,
-      });
+      await api.createIssue(
+        {
+          projectId: currentProject.id,
+          summary: summary.trim(),
+          description: description.trim() || undefined,
+          issueType,
+          priority,
+          assigneeId: assigneeId || undefined,
+          sprintId: sprintId ? parseInt(sprintId, 10) : undefined,
+          storyPoints: storyPoints ? parseInt(storyPoints, 10) : undefined,
+        },
+        draftKey
+      );
 
       // Refresh issues
       await fetchProjectIssues(currentProject.id);
       onClose();
     } catch (err) {
+      // A definite answer (4xx) ends this attempt; only an unknown outcome keeps the key.
+      if (!isUncertainFailure(err)) setDraftKey(newIdempotencyKey());
       setError((err as Error).message || 'Failed to create issue');
     }
 
@@ -93,7 +107,7 @@ export function CreateIssueModal({ isOpen, onClose }: CreateIssueModalProps) {
     <Modal isOpen={isOpen} onClose={onClose} title="Create Issue" size="lg">
       <form onSubmit={handleSubmit} className="space-y-4">
         {error && (
-          <div className="p-3 bg-red-50 text-red-700 rounded text-sm">{error}</div>
+          <div role="alert" className="p-3 bg-red-50 text-red-700 rounded text-sm">{error}</div>
         )}
 
         {/* Project */}

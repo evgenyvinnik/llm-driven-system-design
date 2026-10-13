@@ -1,7 +1,8 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import type { IssueWithDetails } from '../types';
 import { Spinner } from './ui';
 import { useIssueDetail } from '../hooks/useIssueDetail';
+import { useAuthStore } from '../stores';
 import {
   IssueDetailHeader,
   IssueDetailSidebar,
@@ -47,6 +48,15 @@ interface IssueDetailProps {
 export function IssueDetail({ issue: initialIssue, onClose }: IssueDetailProps) {
   const { state, actions } = useIssueDetail(initialIssue);
   const [activeTab, setActiveTab] = useState<IssueDetailTabType>('comments');
+  const currentUser = useAuthStore((auth) => auth.user);
+
+  useEffect(() => {
+    const closeOnEscape = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', closeOnEscape);
+    return () => window.removeEventListener('keydown', closeOnEscape);
+  }, [onClose]);
 
   const {
     issue,
@@ -59,6 +69,7 @@ export function IssueDetail({ issue: initialIssue, onClose }: IssueDetailProps) 
     isEditing,
     editedSummary,
     editedDescription,
+    error,
   } = state;
 
   return (
@@ -67,8 +78,22 @@ export function IssueDetail({ issue: initialIssue, onClose }: IssueDetailProps) 
       <div className="absolute inset-0 bg-black bg-opacity-50" onClick={onClose} />
 
       {/* Panel */}
-      <div className="absolute inset-y-0 right-0 w-full max-w-4xl bg-white shadow-xl flex flex-col">
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-label={`Issue ${issue.key}`}
+        className="absolute inset-y-0 right-0 w-full max-w-4xl bg-white shadow-xl flex flex-col"
+      >
         <IssueDetailHeader issueType={issue.issue_type} issueKey={issue.key} onClose={onClose} />
+
+        {error && (
+          <div role="alert" className="mx-6 mt-4 p-3 bg-red-50 text-red-700 rounded text-sm flex items-start gap-3">
+            <span className="flex-1">{error}</span>
+            <button onClick={actions.dismissError} className="text-red-500 hover:text-red-700" aria-label="Dismiss">
+              Dismiss
+            </button>
+          </div>
+        )}
 
         {isLoading ? (
           <LoadingState />
@@ -94,7 +119,7 @@ export function IssueDetail({ issue: initialIssue, onClose }: IssueDetailProps) 
                   onTabChange={setActiveTab}
                   comments={comments}
                   history={history}
-                  currentUser={issue.reporter}
+                  currentUser={currentUser ?? undefined}
                   onAddComment={actions.addComment}
                 />
               </div>

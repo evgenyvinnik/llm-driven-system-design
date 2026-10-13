@@ -110,6 +110,29 @@ export const messagesConsumedCounter = new Counter({
 });
 
 /**
+ * Counter for requests refused by the permission scheme.
+ * Labels: permission (view_issue denials are answered with 404)
+ */
+export const permissionDenialsCounter = new Counter({
+  name: 'jira_permission_denials_total',
+  help: 'Total number of requests denied by permission checks',
+  labelNames: ['permission'],
+  registers: [metricsRegistry],
+});
+
+/**
+ * Counter for optimistic-concurrency conflicts (stale If-Match, issue moved under a
+ * transition, rank collision). A rising rate means automation is fighting users.
+ * Labels: operation (edit, transition, rank)
+ */
+export const concurrencyConflictsCounter = new Counter({
+  name: 'jira_concurrency_conflicts_total',
+  help: 'Total number of writes rejected or retried because the issue changed concurrently',
+  labelNames: ['operation'],
+  registers: [metricsRegistry],
+});
+
+/**
  * Counter for HTTP requests.
  * Labels: method, path, status_code
  */

@@ -13,14 +13,22 @@ import { circuitBreakerState, circuitBreakerTrips } from './metrics';
  * Circuit breaker options for job execution.
  */
 export interface CircuitBreakerOptions {
-  /** Time in milliseconds to wait before a request is considered failed */
-  timeout?: number;
+  /**
+   * Time in milliseconds to wait before a request is considered failed, or false to
+   * disable (the worker enforces each job's own timeout_ms instead)
+   */
+  timeout?: number | false;
   /** Error percentage threshold to trip the circuit */
   errorThresholdPercentage?: number;
   /** Time in milliseconds to wait before testing the circuit again */
   resetTimeout?: number;
-  /** Number of requests allowed in half-open state */
+  /** Minimum number of requests in the window before the circuit can trip */
   volumeThreshold?: number;
+  /**
+   * Returns true for errors that should not count against the dependency's health
+   * (a bad payload, a cancelled attempt), so they can't open the circuit
+   */
+  errorFilter?: (error: unknown) => boolean;
 }
 
 /**
@@ -58,6 +66,7 @@ export function createCircuitBreaker<T, R>(
     errorThresholdPercentage: mergedOptions.errorThresholdPercentage,
     resetTimeout: mergedOptions.resetTimeout,
     volumeThreshold: mergedOptions.volumeThreshold,
+    errorFilter: mergedOptions.errorFilter,
     name: handlerName,
   });
 

@@ -61,6 +61,8 @@ app.use((req, res, next) => {
 app.use(cors({
   origin: ['http://localhost:5173', 'http://localhost:5174'],
   credentials: true,
+  // ETag carries the issue version the client echoes back in If-Match.
+  exposedHeaders: ['ETag', 'Idempotent-Replayed', 'Retry-After'],
 }));
 app.use(express.json());
 app.use(cookieParser());
@@ -163,7 +165,7 @@ app.get('/ready', async (req, res) => {
   }
 });
 
-// Apply idempotency middleware to mutating API routes
+// Idempotency-Key handling for writes; after the session so keys are scoped per user
 app.use('/api', idempotencyMiddleware);
 
 // API routes

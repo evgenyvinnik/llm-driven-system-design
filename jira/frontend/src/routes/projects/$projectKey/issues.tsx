@@ -21,7 +21,10 @@ function IssuesPage() {
 
   useEffect(() => {
     if (currentProject) {
-      fetchProjectIssues(currentProject.id);
+      fetchProjectIssues(currentProject.id, {
+        statusId: statusFilter ? parseInt(statusFilter, 10) : undefined,
+        issueType: typeFilter || undefined,
+      });
     }
   }, [currentProject, statusFilter, typeFilter, fetchProjectIssues]);
 

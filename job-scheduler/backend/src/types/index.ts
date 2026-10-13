@@ -20,10 +20,21 @@ export enum ExecutionStatus {
   RUNNING = 'RUNNING',
   COMPLETED = 'COMPLETED',
   FAILED = 'FAILED',
+  /** Legacy: rows written before retries became a new PENDING attempt row. */
   PENDING_RETRY = 'PENDING_RETRY',
   CANCELLED = 'CANCELLED',
+  /** Legacy: rows written by the old per-job Redis lock, kept so history still renders. */
   DEDUPLICATED = 'DEDUPLICATED',
+  /** Final attempt failed with no retries left (or a non-retryable error); parked for an operator. */
+  DEAD_LETTER = 'DEAD_LETTER',
 }
+
+/**
+ * What the scheduler does when it finds a recurring job later than the misfire
+ * grace window (for example after an outage): run the missed slot once, or drop it.
+ * Either way next_run_time jumps to the first slot after now.
+ */
+export type MisfirePolicy = 'fire_once' | 'skip';
 
 /**
  * Priority levels for job scheduling.
@@ -54,6 +65,7 @@ export interface Job {
   max_backoff_ms: number;
   timeout_ms: number;
   status: JobStatus;
+  misfire_policy: MisfirePolicy;
   created_at: Date;
   updated_at: Date;
 }
@@ -74,6 +86,7 @@ export interface CreateJobInput {
   initial_backoff_ms?: number;
   max_backoff_ms?: number;
   timeout_ms?: number;
+  misfire_policy?: MisfirePolicy;
 }
 
 /**
@@ -91,6 +104,7 @@ export interface UpdateJobInput {
   initial_backoff_ms?: number;
   max_backoff_ms?: number;
   timeout_ms?: number;
+  misfire_policy?: MisfirePolicy;
 }
 
 /**
@@ -110,17 +124,18 @@ export interface JobExecution {
   error: string | null;
   worker_id: string | null;
   created_at: Date;
-}
-
-/**
- * Item in the Redis priority queue awaiting worker pickup.
- * Used internally by the reliable queue implementation.
- */
-export interface QueueItem {
-  execution_id: string;
-  job_id: string;
+  /** Copied from the job at creation so the claim query orders by one index. */
   priority: number;
-  enqueued_at: number;
+  /** Earliest time a PENDING row may be claimed (now, or now + backoff for a retry). */
+  run_at: Date;
+  /** Lease deadline while RUNNING; a worker that stops renewing loses the execution. */
+  lease_expires_at: Date | null;
+  /**
+   * Token issued by the claim that currently owns this row (BIGINT, so pg returns a string).
+   * Every later write by a worker is conditional on it, so a stale worker cannot
+   * overwrite the outcome after its lease was reclaimed.
+   */
+  fencing_token: string | null;
 }
 
 /**

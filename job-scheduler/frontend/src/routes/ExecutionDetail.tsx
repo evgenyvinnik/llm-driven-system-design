@@ -7,7 +7,7 @@
 import { useEffect } from 'react';
 import { useParams, Link } from '@tanstack/react-router';
 import { useExecutionsStore } from '../stores';
-import { Spinner } from '../components/UI';
+import { Spinner, ErrorBanner } from '../components/UI';
 import { ExecutionDetail } from '../components/ExecutionList';
 
 /**
@@ -19,9 +19,11 @@ export function ExecutionDetailPage() {
   const {
     selectedExecution,
     loading,
+    error,
     fetchExecution,
     cancelExecution,
     retryExecution,
+    clearError,
   } = useExecutionsStore();
 
   useEffect(() => {
@@ -60,6 +62,8 @@ export function ExecutionDetailPage() {
           Execution {selectedExecution.id.substring(0, 8)}...
         </span>
       </div>
+
+      <ErrorBanner message={error} onDismiss={clearError} />
 
       <ExecutionDetail
         execution={selectedExecution}

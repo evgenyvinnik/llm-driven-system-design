@@ -2,10 +2,13 @@ import { Router, Response, NextFunction as _NextFunction, Request as _Request } 
 import multer from 'multer';
 import { query } from '../services/db.js';
 import { processAndUploadImage } from '../services/storage.js';
-import { storyTrayGet, storyTraySet, StoryTrayUser } from '../services/redis.js';
+import { storyTrayGet, storyTraySet, invalidateStoryTrays, StoryTrayUser } from '../services/redis.js';
 import { requireAuth, optionalAuth as _optionalAuth, AuthenticatedRequest } from '../middleware/auth.js';
 import { storyRateLimiter } from '../services/rateLimiter.js';
 import { createCircuitBreaker, fallbackWithError } from '../services/circuitBreaker.js';
+import { canViewAuthor, isUuid } from '../services/visibility.js';
+import { forEachFollowerBatch, isCelebrity } from '../services/feedService.js';
+import config from '../config/index.js';
 import logger from '../services/logger.js';
 import { storiesCreatedTotal, storyViewsTotal, imageProcessingDuration } from '../services/metrics.js';
 
@@ -41,6 +44,21 @@ interface StoryTrayRow {
   latest_story_time: Date;
   story_count: string;
   has_seen: boolean;
+  seconds_to_first_expiry: number;
+}
+
+const STORY_TRAY_TTL_SECONDS = 60;
+
+/**
+ * Drops the story trays that show `authorId`'s ring: the author's own and (below the celebrity
+ * threshold) every follower's, in pipelined batches. Celebrity followers rely on the short tray
+ * TTL instead - deleting millions of keys per story is the fan-out problem again.
+ */
+async function invalidateTraysForAuthor(authorId: string): Promise<void> {
+  await invalidateStoryTrays([authorId]);
+  const result = await query<{ follower_count: number }>('SELECT follower_count FROM users WHERE id = $1', [authorId]);
+  if (isCelebrity(result.rows[0]?.follower_count ?? 0)) return;
+  await forEachFollowerBatch(authorId, config.feed.fanoutBatchSize, (followerIds) => invalidateStoryTrays(followerIds));
 }
 
 interface ViewerRow {
@@ -125,6 +143,10 @@ router.post('/', requireAuth, storyRateLimiter, upload.single('media'), async (r
     // Track metrics
     storiesCreatedTotal.inc();
 
+    await invalidateTraysForAuthor(userId!).catch((err: Error) =>
+      logger.warn({ error: err.message, userId }, 'Story tray invalidation failed')
+    );
+
     logger.info({
       type: 'story_created',
       storyId: story.id,
@@ -171,16 +193,18 @@ router.get('/tray', requireAuth, async (req: AuthenticatedRequest, res: Response
       return;
     }
 
-    // Get users we follow who have active stories
+    // Users we follow (and ourselves) with active stories. A ring counts as seen only when
+    // every active story in it has been viewed - one viewed story doesn't make the ring grey.
     const result = await query<StoryTrayRow>(
-      `SELECT DISTINCT u.id, u.username, u.display_name, u.profile_picture_url,
+      `SELECT u.id, u.username, u.display_name, u.profile_picture_url,
               MAX(s.created_at) as latest_story_time,
-              (SELECT COUNT(*) FROM stories WHERE user_id = u.id AND expires_at > NOW()) as story_count,
-              EXISTS(
-                SELECT 1 FROM story_views sv
-                JOIN stories st ON sv.story_id = st.id
-                WHERE st.user_id = u.id AND sv.viewer_id = $1 AND st.expires_at > NOW()
-              ) as has_seen
+              COUNT(s.id) as story_count,
+              NOT EXISTS(
+                SELECT 1 FROM stories st
+                WHERE st.user_id = u.id AND st.expires_at > NOW()
+                  AND NOT EXISTS (SELECT 1 FROM story_views sv WHERE sv.story_id = st.id AND sv.viewer_id = $1)
+              ) as has_seen,
+              CEIL(EXTRACT(EPOCH FROM (MIN(s.expires_at) - NOW())))::int as seconds_to_first_expiry
        FROM users u
        JOIN stories s ON u.id = s.user_id
        WHERE s.expires_at > NOW()
@@ -200,8 +224,9 @@ router.get('/tray', requireAuth, async (req: AuthenticatedRequest, res: Response
       latestStoryTime: u.latest_story_time.toISOString(),
     }));
 
-    // Cache for 5 minutes
-    await storyTraySet(userId, users, 300);
+    // Cache briefly, and never past the moment the first story in the tray expires
+    const firstExpiry = Math.min(...result.rows.map((row) => row.seconds_to_first_expiry), STORY_TRAY_TTL_SECONDS);
+    await storyTraySet(userId, users, firstExpiry);
 
     res.json({ users });
   } catch (error) {
@@ -218,8 +243,19 @@ router.get('/tray', requireAuth, async (req: AuthenticatedRequest, res: Response
 // Get user's stories
 router.get('/user/:userId', requireAuth, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
-    const { userId: targetUserId } = req.params;
+    const targetUserId = req.params.userId as string;
     const currentUserId = req.session.userId;
+
+    const author = isUuid(targetUserId)
+      ? await query<{ is_private: boolean }>('SELECT is_private FROM users WHERE id = $1', [targetUserId])
+      : { rows: [] as { is_private: boolean }[] };
+    if (
+      author.rows.length === 0 ||
+      !(await canViewAuthor({ userId: currentUserId, role: req.session.role }, targetUserId, author.rows[0].is_private))
+    ) {
+      res.status(404).json({ error: 'User not found' });
+      return;
+    }
 
     // Get active stories for user
     const result = await query<StoryRow>(
@@ -280,13 +316,19 @@ router.post('/:storyId/view', requireAuth, async (req: AuthenticatedRequest, res
     const { storyId } = req.params;
     const viewerId = req.session.userId!;
 
-    // Check story exists and is active
-    const storyCheck = await query<{ user_id: string }>(
-      'SELECT user_id FROM stories WHERE id = $1 AND expires_at > NOW()',
-      [storyId]
-    );
+    // Check story exists, is active, and its author is visible to us
+    const storyCheck = isUuid(storyId)
+      ? await query<{ user_id: string; is_private: boolean }>(
+          `SELECT s.user_id, u.is_private FROM stories s JOIN users u ON u.id = s.user_id
+           WHERE s.id = $1 AND s.expires_at > NOW()`,
+          [storyId]
+        )
+      : { rows: [] as { user_id: string; is_private: boolean }[] };
 
-    if (storyCheck.rows.length === 0) {
+    if (
+      storyCheck.rows.length === 0 ||
+      !(await canViewAuthor({ userId: viewerId, role: req.session.role }, storyCheck.rows[0].user_id, storyCheck.rows[0].is_private))
+    ) {
       res.status(404).json({ error: 'Story not found or expired' });
       return;
     }
@@ -304,8 +346,9 @@ router.post('/:storyId/view', requireAuth, async (req: AuthenticatedRequest, res
     );
 
     if (result.rows.length > 0) {
-      // New view - track metric
+      // New view - track metric; our tray's "seen" state for this author may have changed
       storyViewsTotal.inc();
+      await invalidateStoryTrays([viewerId]);
 
       logger.debug({
         type: 'story_viewed',
@@ -392,11 +435,13 @@ router.get('/:storyId/viewers', requireAuth, async (req: AuthenticatedRequest, r
 // Delete story
 router.delete('/:storyId', requireAuth, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
-    const { storyId } = req.params;
+    const storyId = req.params.storyId as string;
     const userId = req.session.userId;
 
     // Check ownership
-    const storyCheck = await query<{ user_id: string }>('SELECT user_id FROM stories WHERE id = $1', [storyId]);
+    const storyCheck = isUuid(storyId)
+      ? await query<{ user_id: string }>('SELECT user_id FROM stories WHERE id = $1', [storyId])
+      : { rows: [] as { user_id: string }[] };
     if (storyCheck.rows.length === 0) {
       res.status(404).json({ error: 'Story not found' });
       return;
@@ -407,6 +452,9 @@ router.delete('/:storyId', requireAuth, async (req: AuthenticatedRequest, res: R
     }
 
     await query('DELETE FROM stories WHERE id = $1', [storyId]);
+    await invalidateTraysForAuthor(storyCheck.rows[0].user_id).catch((err: Error) =>
+      logger.warn({ error: err.message, storyId }, 'Story tray invalidation failed')
+    );
 
     logger.info({
       type: 'story_deleted',

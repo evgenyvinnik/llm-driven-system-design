@@ -1,53 +1,14 @@
 /**
- * Execution repository module for job execution records.
- * Handles creating, reading, updating executions and execution logs.
+ * Execution repository module: read paths for execution records and execution logs.
+ * State changes (claim, complete, fail, retry, cancel) live in execution-queue.ts,
+ * where every write is fenced on the lease that owns the attempt.
  * @module db/execution-repository
  */
 
 import { query, queryOne } from './pool';
-import { JobExecution, Job, ExecutionLog, PaginatedResponse, CountResult, EXECUTION_FIELD_MAP } from './types';
+import { JobExecution, ExecutionLog, PaginatedResponse, CountResult } from './types';
 import { calculateOffset, buildWhereClause } from './queries';
 import { ExecutionStatus } from '../types/index';
-
-/**
- * Creates a new execution record for a job.
- *
- * @description Inserts a new execution record to track an individual job run.
- * Each execution captures timing, status, attempt number, and results.
- * Initial status is always PENDING.
- *
- * @param {string} jobId - UUID of the job being executed
- * @param {Date} [scheduledAt=new Date()] - When the execution was scheduled (defaults to now)
- * @param {number} [attempt=1] - Attempt number for retry tracking (defaults to 1)
- * @returns {Promise<JobExecution>} The created execution record with generated ID
- * @throws {Error} If database insert fails
- *
- * @example
- * // Create initial execution
- * const execution = await createExecution(job.id);
- *
- * @example
- * // Create retry execution with attempt number
- * const retry = await createExecution(job.id, new Date(), 2);
- */
-export async function createExecution(
-  jobId: string,
-  scheduledAt: Date = new Date(),
-  attempt: number = 1
-): Promise<JobExecution> {
-  const result = await queryOne<JobExecution>(
-    `INSERT INTO job_executions (job_id, status, attempt, scheduled_at)
-     VALUES ($1, $2, $3, $4)
-     RETURNING *`,
-    [jobId, ExecutionStatus.PENDING, attempt, scheduledAt]
-  );
-
-  if (!result) {
-    throw new Error('Failed to create execution');
-  }
-
-  return result;
-}
 
 /**
  * Retrieves an execution by its unique identifier.
@@ -66,34 +27,6 @@ export async function createExecution(
  */
 export async function getExecution(id: string): Promise<JobExecution | null> {
   return queryOne<JobExecution>('SELECT * FROM job_executions WHERE id = $1', [id]);
-}
-
-/**
- * Retrieves an execution with its associated job data.
- *
- * @description Fetches an execution record along with the complete job definition.
- * Used when workers need both execution state and job configuration (handler, payload, etc.).
- *
- * @param {string} id - UUID of the execution
- * @returns {Promise<(JobExecution & { job: Job }) | null>} Execution with embedded job, or null if not found
- * @throws {Error} Database errors from the underlying query
- *
- * @example
- * const executionWithJob = await getExecutionWithJob(executionId);
- * if (executionWithJob) {
- *   const { job } = executionWithJob;
- *   console.log(`Executing ${job.name} with handler ${job.handler}`);
- * }
- */
-export async function getExecutionWithJob(id: string): Promise<(JobExecution & { job: Job }) | null> {
-  const result = await queryOne<JobExecution & { job: Job }>(
-    `SELECT e.*, row_to_json(j.*) as job
-     FROM job_executions e
-     JOIN jobs j ON j.id = e.job_id
-     WHERE e.id = $1`,
-    [id]
-  );
-  return result;
 }
 
 /**
@@ -169,100 +102,6 @@ export async function listExecutions(
     limit,
     total_pages: Math.ceil(total / limit),
   };
-}
-
-/**
- * Updates an execution record with new values.
- *
- * @description Modifies an execution's state during processing. Used to update
- * status transitions, timing information, results, and error details.
- * Only specified fields are updated; others remain unchanged.
- *
- * @param {string} id - UUID of the execution
- * @param {Partial<Omit<JobExecution, 'id' | 'job_id' | 'created_at'>>} updates - Fields to update:
- *   - status: New execution status
- *   - attempt: Current attempt number
- *   - started_at: When execution began
- *   - completed_at: When execution finished
- *   - next_retry_at: When to retry (for PENDING_RETRY status)
- *   - result: Execution result data (serialized to JSON)
- *   - error: Error message if failed
- *   - worker_id: ID of the worker processing this execution
- * @returns {Promise<JobExecution | null>} Updated execution or null if not found
- * @throws {Error} Database errors from the underlying query
- *
- * @example
- * // Mark execution as started
- * await updateExecution(executionId, {
- *   status: ExecutionStatus.RUNNING,
- *   started_at: new Date(),
- *   worker_id: 'worker-1'
- * });
- *
- * @example
- * // Mark execution as completed
- * await updateExecution(executionId, {
- *   status: ExecutionStatus.COMPLETED,
- *   completed_at: new Date(),
- *   result: { itemsProcessed: 150 }
- * });
- */
-export async function updateExecution(
-  id: string,
-  updates: Partial<Omit<JobExecution, 'id' | 'job_id' | 'created_at'>>
-): Promise<JobExecution | null> {
-  const updateFields: string[] = [];
-  const params: unknown[] = [];
-  let paramIndex = 1;
-
-  for (const [key, column] of Object.entries(EXECUTION_FIELD_MAP)) {
-    if (key in updates) {
-      updateFields.push(`${column} = $${paramIndex}`);
-      const value = updates[key as keyof typeof updates];
-      params.push(key === 'result' && value ? JSON.stringify(value) : value);
-      paramIndex++;
-    }
-  }
-
-  if (updateFields.length === 0) {
-    return getExecution(id);
-  }
-
-  params.push(id);
-  return queryOne<JobExecution>(
-    `UPDATE job_executions SET ${updateFields.join(', ')} WHERE id = $${paramIndex} RETURNING *`,
-    params
-  );
-}
-
-/**
- * Retrieves executions in PENDING_RETRY status that are ready for retry.
- *
- * @description Fetches executions that have failed but are scheduled for retry
- * and whose retry time has arrived. Uses FOR UPDATE SKIP LOCKED for safe
- * concurrent processing by multiple worker instances.
- *
- * @param {number} [limit=50] - Maximum number of executions to retrieve
- * @returns {Promise<JobExecution[]>} Array of executions ready for retry
- * @throws {Error} Database errors from the underlying query
- *
- * @example
- * // Retry processor loop
- * const retryable = await getRetryableExecutions(25);
- * for (const execution of retryable) {
- *   await requeueExecution(execution);
- * }
- */
-export async function getRetryableExecutions(limit: number = 50): Promise<JobExecution[]> {
-  return query<JobExecution>(
-    `SELECT * FROM job_executions
-     WHERE status = 'PENDING_RETRY'
-       AND next_retry_at <= NOW()
-     ORDER BY next_retry_at ASC
-     LIMIT $1
-     FOR UPDATE SKIP LOCKED`,
-    [limit]
-  );
 }
 
 /**

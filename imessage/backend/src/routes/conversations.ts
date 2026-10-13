@@ -102,6 +102,10 @@ router.post('/:id/participants', async (req: Request, res: Response): Promise<vo
       res.status(403).json({ error: (error as Error).message });
       return;
     }
+    if ((error as Error).message.includes('group conversations')) {
+      res.status(400).json({ error: (error as Error).message });
+      return;
+    }
     res.status(500).json({ error: 'Failed to add participant' });
   }
 });

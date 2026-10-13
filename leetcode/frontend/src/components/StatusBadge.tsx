@@ -11,6 +11,7 @@ const statusConfig: Record<string, { label: string; className: string }> = {
   wrong_answer: { label: 'Wrong Answer', className: 'text-red-400 bg-red-400/10' },
   time_limit_exceeded: { label: 'Time Limit Exceeded', className: 'text-orange-400 bg-orange-400/10' },
   memory_limit_exceeded: { label: 'Memory Limit Exceeded', className: 'text-orange-400 bg-orange-400/10' },
+  output_limit_exceeded: { label: 'Output Limit Exceeded', className: 'text-orange-400 bg-orange-400/10' },
   runtime_error: { label: 'Runtime Error', className: 'text-red-500 bg-red-500/10' },
   compile_error: { label: 'Compile Error', className: 'text-red-500 bg-red-500/10' },
   system_error: { label: 'System Error', className: 'text-gray-500 bg-gray-500/10' },

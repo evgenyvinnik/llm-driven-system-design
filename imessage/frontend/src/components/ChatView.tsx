@@ -4,6 +4,7 @@ import { useChatStore } from '@/stores/chatStore';
 import { useAuthStore } from '@/stores/authStore';
 import { MessageBubble } from './MessageBubble';
 import { TypingIndicator } from './TypingIndicator';
+import { ConnectionBanner } from './ConnectionBanner';
 
 /**
  * Props for the ChatView component.
@@ -48,6 +49,10 @@ export function ChatView({ conversation }: ChatViewProps) {
   const sendMessage = useChatStore((state) => state.sendMessage);
   const setTypingIndicator = useChatStore((state) => state.setTyping);
   const isLoadingMessages = useChatStore((state) => state.isLoadingMessages);
+  const isLoadingOlder = useChatStore((state) => state.isLoadingOlder);
+  const historyComplete = useChatStore((state) => state.historyComplete.has(conversation.id));
+  const loadOlderMessages = useChatStore((state) => state.loadOlderMessages);
+  const retryMessage = useChatStore((state) => state.retryMessage);
 
   /**
    * Determines the display name for the conversation header.
@@ -63,10 +68,12 @@ export function ChatView({ conversation }: ChatViewProps) {
     return otherParticipant?.display_name || otherParticipant?.username || 'Unknown';
   };
 
-  // Scroll to bottom when new messages arrive
+  // Scroll to bottom when a new message arrives at the end (not when an
+  // older page is prepended at the top)
+  const lastMessageId = messages.length > 0 ? messages[messages.length - 1].id : null;
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages]);
+  }, [lastMessageId]);
 
   // Focus input on mount
   useEffect(() => {
@@ -166,8 +173,15 @@ export function ChatView({ conversation }: ChatViewProps) {
         </div>
       </div>
 
-      {/* Messages */}
-      <div className="flex-1 overflow-y-auto p-4 space-y-2 scrollbar-thin">
+      <ConnectionBanner />
+
+      {/* Messages: a live log, so screen readers announce new arrivals */}
+      <div
+        role="log"
+        aria-live="polite"
+        aria-label="Messages"
+        className="flex-1 overflow-y-auto p-4 space-y-2 scrollbar-thin"
+      >
         {isLoadingMessages ? (
           <div className="flex items-center justify-center h-full">
             <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-imessage-blue"></div>
@@ -178,6 +192,18 @@ export function ChatView({ conversation }: ChatViewProps) {
           </div>
         ) : (
           <>
+            {!historyComplete && (
+              <div className="flex justify-center">
+                <button
+                  type="button"
+                  onClick={() => loadOlderMessages(conversation.id)}
+                  disabled={isLoadingOlder}
+                  className="text-xs text-imessage-blue hover:underline disabled:opacity-50"
+                >
+                  {isLoadingOlder ? 'Loading…' : 'Load earlier messages'}
+                </button>
+              </div>
+            )}
             {messageGroups.map((group) => (
               <div key={group.date}>
                 <div className="flex justify-center my-4">
@@ -194,10 +220,15 @@ export function ChatView({ conversation }: ChatViewProps) {
 
                   return (
                     <MessageBubble
-                      key={message.id}
+                      key={message.clientMessageId ?? message.id}
                       message={message}
                       isOwn={isOwnMessage}
                       showAvatar={showAvatar}
+                      onRetry={
+                        message.clientMessageId
+                          ? () => retryMessage(conversation.id, message.clientMessageId!)
+                          : undefined
+                      }
                     />
                   );
                 })}

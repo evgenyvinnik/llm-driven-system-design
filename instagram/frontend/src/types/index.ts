@@ -38,6 +38,8 @@ export interface Post {
   createdAt: string;
   isLiked?: boolean;
   isSaved?: boolean;
+  /** 'processing' until the image worker finishes; only the author ever sees non-published posts. */
+  status?: 'processing' | 'published' | 'failed';
   media: Media[];
 }
 

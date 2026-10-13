@@ -4,10 +4,12 @@ interface CommentItemProps {
   comment: Comment;
   canDelete: boolean;
   onDelete: () => void;
+  /** Jumps the player to the comment's anchor. */
+  onSeek?: (seconds: number) => void;
 }
 
 /** Renders a single comment with author info, optional timestamp anchor, and delete action. */
-export function CommentItem({ comment, canDelete, onDelete }: CommentItemProps) {
+export function CommentItem({ comment, canDelete, onDelete, onSeek }: CommentItemProps) {
   const displayName = comment.author.displayName || comment.author.username;
 
   return (
@@ -18,11 +20,19 @@ export function CommentItem({ comment, canDelete, onDelete }: CommentItemProps) 
             {displayName.charAt(0).toUpperCase()}
           </div>
           <span className="text-xs font-medium text-loom-text">{displayName}</span>
-          {comment.timestampSeconds !== null && (
-            <span className="timestamp-badge">
-              {formatTime(comment.timestampSeconds)}
-            </span>
-          )}
+          {comment.timestampSeconds !== null &&
+            (onSeek ? (
+              <button
+                type="button"
+                className="timestamp-badge"
+                onClick={() => onSeek(comment.timestampSeconds!)}
+                aria-label={`Jump to ${formatTime(comment.timestampSeconds)}`}
+              >
+                {formatTime(comment.timestampSeconds)}
+              </button>
+            ) : (
+              <span className="timestamp-badge">{formatTime(comment.timestampSeconds)}</span>
+            ))}
         </div>
         {canDelete && (
           <button

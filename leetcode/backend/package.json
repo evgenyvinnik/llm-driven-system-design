@@ -17,7 +17,7 @@
     "db:migrate": "tsx src/db/migrate.ts",
     "db:seed": "tsx src/db/seed.ts",
     "format": "prettier --write src/**/*.ts",
-    "lint": "eslint src/**/*.ts",
+    "lint": "eslint src",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage"
@@ -31,7 +31,6 @@
     "express-rate-limit": "^8.2.1",
     "express-session": "^1.17.3",
     "ioredis": "^5.3.2",
-    "kafkajs": "^2.2.4",
     "opossum": "^9.0.0",
     "pg": "^8.11.3",
     "pino": "^10.2.0",

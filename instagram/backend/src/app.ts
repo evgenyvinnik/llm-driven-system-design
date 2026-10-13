@@ -5,14 +5,15 @@ import cors from 'cors';
 import { v4 as uuidv4 } from 'uuid';
 import config from './config/index.js';
 import redis from './services/redis.js';
-import { ensureBucket } from './services/storage.js';
-import logger, { logRequest, logError, ExtendedRequest } from './services/logger.js';
+import { checkBucket } from './services/storage.js';
+import { logRequest, logError, ExtendedRequest } from './services/logger.js';
 import { register, metricsMiddleware } from './services/metrics.js';
 import { attachUserContext, AuthenticatedRequest } from './middleware/auth.js';
 import { generalRateLimiter } from './services/rateLimiter.js';
 import pool from './services/db.js';
 import { isCassandraConnected } from './services/cassandra.js';
 import { isQueueReady } from './services/queue.js';
+import { getOutboxBacklog } from './services/outbox.js';
 
 // Import routes
 import authRoutes from './routes/auth.js';
@@ -24,6 +25,16 @@ import storyRoutes from './routes/stories.js';
 import messageRoutes from './routes/messages.js';
 
 const app = express();
+
+// Set when the process receives SIGTERM: readiness fails first so a load balancer stops
+// routing new requests here while in-flight ones finish.
+let shuttingDown = false;
+export const markShuttingDown = (): void => {
+  shuttingDown = true;
+};
+
+/** An outbox event older than this means jobs are not reaching RabbitMQ. */
+const OUTBOX_STALE_SECONDS = 300;
 
 // Trust proxy for rate limiting behind load balancer
 app.set('trust proxy', 1);
@@ -107,10 +118,12 @@ interface HealthResponse {
 }
 
 interface ComponentHealth {
-  status: 'ok' | 'error' | 'unavailable';
+  status: 'ok' | 'error' | 'unavailable' | 'degraded';
   latencyMs?: number;
   error?: string;
   note?: string;
+  pending?: number;
+  oldestAgeSeconds?: number | null;
 }
 
 /**
@@ -182,10 +195,10 @@ app.get('/api/health/detailed', async (_req: Request, res: Response) => {
     };
   }
 
-  // Check MinIO - just check if bucket exists
+  // Check MinIO - the bucket must be reachable
   try {
     const start = Date.now();
-    await ensureBucket();
+    await checkBucket();
     health.components!.storage = {
       status: 'ok',
       latencyMs: Date.now() - start,
@@ -211,6 +224,21 @@ app.get('/api/health/detailed', async (_req: Request, res: Response) => {
     note: 'Async image processing',
   };
 
+  // Outbox backlog: media jobs committed with their posts but not yet handed to RabbitMQ
+  try {
+    const backlog = await getOutboxBacklog();
+    const stale = (backlog.oldestAgeSeconds ?? 0) > OUTBOX_STALE_SECONDS;
+    if (stale) health.status = 'degraded';
+    health.components!.outbox = {
+      status: stale ? 'degraded' : 'ok',
+      pending: backlog.pending,
+      oldestAgeSeconds: backlog.oldestAgeSeconds,
+      note: 'Media jobs waiting to be published',
+    };
+  } catch (error) {
+    health.components!.outbox = { status: 'error', error: (error as Error).message };
+  }
+
   // Memory usage
   const memUsage = process.memoryUsage();
   health.memory = {
@@ -234,6 +262,10 @@ app.get('/api/health/live', (_req: Request, res: Response) => {
  * Readiness probe - returns 200 if ready to accept traffic
  */
 app.get('/api/health/ready', async (_req: Request, res: Response) => {
+  if (shuttingDown) {
+    res.status(503).json({ status: 'shutting_down' });
+    return;
+  }
   try {
     // Quick checks that we can handle traffic
     await Promise.all([pool.query('SELECT 1'), redis.ping()]);

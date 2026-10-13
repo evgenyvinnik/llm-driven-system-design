@@ -16,8 +16,8 @@ import cors from 'cors';
 import { createServer } from 'http';
 
 import { pool } from './utils/db.js';
-import { redis, publisher, initRedis } from './utils/redis.js';
-import { setupWebSocket } from './websocket/handler.js';
+import { redis, publisher, initRedis, pruneStaleDrivers } from './utils/redis.js';
+import { setupWebSocket, closeWebSocket, getConnectedClientCount } from './websocket/handler.js';
 
 import authRoutes from './routes/auth.js';
 import merchantRoutes from './routes/merchants.js';
@@ -28,12 +28,23 @@ import adminRoutes from './routes/admin.js';
 // Shared modules
 import logger from './shared/logger.js';
 import { registry, httpRequestDurationHistogram, httpRequestsTotal } from './shared/metrics.js';
-import { getDriverMatchingCircuitBreakerStatus } from './services/order/index.js';
+import {
+  getDriverMatchingCircuitBreakerStatus,
+  startDriverMatchingWithCircuitBreaker,
+  startDispatchSweeper,
+  releaseAllDispatchLeases,
+  expireOldOffers,
+  DISPATCH_OWNER,
+} from './services/order/index.js';
+import type { DispatchSweeper } from './services/order/dispatch.js';
 import { cleanupExpiredIdempotencyKeys } from './shared/idempotency.js';
 
 const app = express();
 const PORT = parseInt(process.env.PORT || '3000');
 const startTime = Date.now();
+
+/** Set when shutdown begins: readiness fails so the load balancer stops routing here. */
+let shuttingDown = false;
 
 /**
  * CORS and JSON body parsing middleware.
@@ -104,10 +115,16 @@ app.get('/health/live', (_req, res) => {
 
 /**
  * Readiness check endpoint for load balancer and monitoring.
- * Verifies database and Redis connectivity.
+ * Verifies database and Redis connectivity; returns 503 while shutting down
+ * so traffic drains to other instances.
  * Returns detailed status of all dependencies.
  */
 app.get('/health', async (_req, res) => {
+  if (shuttingDown) {
+    res.status(503).json({ status: 'shutting_down' });
+    return;
+  }
+
   const healthCheck = {
     status: 'healthy' as 'healthy' | 'unhealthy' | 'degraded',
     timestamp: new Date().toISOString(),
@@ -120,6 +137,8 @@ app.get('/health', async (_req, res) => {
     circuitBreakers: {
       driverMatching: getDriverMatchingCircuitBreakerStatus(),
     },
+    instance: DISPATCH_OWNER,
+    websocketClients: getConnectedClientCount(),
   };
 
   try {
@@ -203,13 +222,17 @@ const server = createServer(app);
 setupWebSocket(server);
 
 /**
- * Periodic cleanup of expired idempotency keys.
- * Runs every hour to prevent database bloat.
+ * Background jobs:
+ * - hourly cleanup of expired idempotency keys;
+ * - every 30 s, couriers who stopped pinging are pruned from the geo index;
+ * - the dispatch sweeper resumes matching for unassigned orders whose lease
+ *   lapsed (owner crashed or backed off), on whichever instance claims them.
  */
-let cleanupInterval: NodeJS.Timeout;
+let cleanupInterval: NodeJS.Timeout | undefined;
+let pruneInterval: NodeJS.Timeout | undefined;
+let dispatchSweeper: DispatchSweeper | undefined;
 
-function startPeriodicCleanup() {
-  // Run cleanup every hour
+function startBackgroundJobs() {
   cleanupInterval = setInterval(async () => {
     try {
       await cleanupExpiredIdempotencyKeys();
@@ -217,6 +240,22 @@ function startPeriodicCleanup() {
       logger.error({ error: (error as Error).message }, 'Idempotency key cleanup failed');
     }
   }, 60 * 60 * 1000); // 1 hour
+
+  pruneInterval = setInterval(async () => {
+    try {
+      const pruned = await pruneStaleDrivers();
+      if (pruned.length > 0) {
+        logger.info({ count: pruned.length }, 'Pruned couriers with stale locations');
+      }
+    } catch (error) {
+      logger.error({ error: (error as Error).message }, 'Geo index prune failed');
+    }
+  }, 30 * 1000);
+
+  dispatchSweeper = startDispatchSweeper({
+    dispatch: (orderId) => startDriverMatchingWithCircuitBreaker(orderId),
+    beforeSweep: () => expireOldOffers(),
+  });
 }
 
 /**
@@ -233,9 +272,8 @@ async function start() {
     await pool.query('SELECT 1');
     logger.info('Connected to PostgreSQL');
 
-    // Start periodic cleanup
-    startPeriodicCleanup();
-    logger.info('Started periodic cleanup jobs');
+    startBackgroundJobs();
+    logger.info({ instance: DISPATCH_OWNER }, 'Started background jobs (cleanup, geo prune, dispatch sweeper)');
 
     server.listen(PORT, () => {
       logger.info({
@@ -253,24 +291,37 @@ async function start() {
 }
 
 /**
- * Graceful shutdown handlers.
- * Closes all connections cleanly when receiving termination signals.
+ * Graceful shutdown:
+ * 1. Fail readiness and stop accepting new HTTP connections.
+ * 2. Close WebSockets with "going away" so clients reconnect elsewhere.
+ * 3. Release this instance's dispatch leases so another instance resumes
+ *    matching on its next sweep instead of waiting for the leases to expire.
+ * 4. Wait (bounded) for in-flight HTTP requests, then close PostgreSQL and Redis.
  */
 async function shutdown(signal: string) {
+  if (shuttingDown) return;
+  shuttingDown = true;
   logger.info({ signal }, 'Shutdown signal received');
 
-  // Stop cleanup interval
-  if (cleanupInterval) {
-    clearInterval(cleanupInterval);
+  clearInterval(cleanupInterval);
+  clearInterval(pruneInterval);
+  dispatchSweeper?.stop();
+
+  const httpClosed = new Promise<void>((resolve) => server.close(() => resolve()));
+
+  try {
+    await closeWebSocket();
+    const released = await releaseAllDispatchLeases();
+    logger.info({ released }, 'Released dispatch leases');
+  } catch (error) {
+    logger.error({ error: (error as Error).message }, 'Shutdown step failed');
   }
 
-  // Close server
-  server.close();
+  await Promise.race([httpClosed, new Promise((resolve) => setTimeout(resolve, 10_000))]);
 
-  // Close connections
-  await pool.end();
-  await redis.quit();
-  await publisher.quit();
+  await pool.end().catch(() => undefined);
+  await redis.quit().catch(() => undefined);
+  await publisher.quit().catch(() => undefined);
 
   logger.info('Shutdown complete');
   process.exit(0);

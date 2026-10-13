@@ -6,10 +6,10 @@
  * @module routes/profile.$userId
  */
 import { createFileRoute, useNavigate } from '@tanstack/react-router';
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { useAuthStore } from '../stores/authStore';
 import { usersApi, feedApi, connectionsApi } from '../services/api';
-import type { User, Experience, Education, UserSkill, Post } from '../types';
+import type { User, Experience, Education, UserSkill, Post, Relationship } from '../types';
 import {
   ProfileHeader,
   EditProfileModal,
@@ -45,9 +45,10 @@ function ProfilePage() {
   const [posts, setPosts] = useState<Post[]>([]);
   const [loading, setLoading] = useState(true);
 
-  // Connection state
-  const [connectionDegree, setConnectionDegree] = useState<number | null>(null);
-  const [mutualConnections, setMutualConnections] = useState<User[]>([]);
+  // Relationship with the viewer: degree, invitation state, mutual count, path
+  const [relationship, setRelationship] = useState<Relationship | null>(null);
+  const [actionPending, setActionPending] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
 
   // Edit modal state
   const [editingProfile, setEditingProfile] = useState(false);
@@ -79,14 +80,11 @@ function ProfilePage() {
         setSkills(profileData.skills);
         setPosts(postsData.posts);
 
-        // Load connection info for other users' profiles
+        // Load the relationship for other users' profiles
+        setRelationship(null);
+        setActionError(null);
         if (!isOwnProfile) {
-          const [degreeData, mutualData] = await Promise.all([
-            connectionsApi.getConnectionDegree(parseInt(userId)),
-            connectionsApi.getMutualConnections(parseInt(userId)),
-          ]);
-          setConnectionDegree(degreeData.degree);
-          setMutualConnections(mutualData.mutual_connections);
+          setRelationship(await connectionsApi.getRelationship(parseInt(userId)));
         }
       } catch (error) {
         console.error('Failed to load profile:', error);
@@ -177,27 +175,49 @@ function ProfilePage() {
   };
 
   /**
-   * Sends a connection request to the profile user.
+   * Runs a connection mutation, then re-reads the relationship from the server so
+   * the button, badge and path all reflect what actually happened. An optimistic
+   * status can be shown first; it is rolled back if the call fails.
    */
-  const handleConnect = async () => {
-    try {
-      await connectionsApi.sendRequest(parseInt(userId));
-      setConnectionDegree(-1); // -1 = pending
-    } catch (error) {
-      console.error('Failed to send connection request:', error);
-    }
+  const runConnectionAction = useCallback(
+    async (action: () => Promise<unknown>, optimistic?: Relationship['status']) => {
+      const previous = relationship;
+      setActionPending(true);
+      setActionError(null);
+      if (optimistic && previous) setRelationship({ ...previous, status: optimistic });
+      try {
+        await action();
+        setRelationship(await connectionsApi.getRelationship(parseInt(userId)));
+      } catch (error) {
+        setRelationship(previous);
+        setActionError(error instanceof Error ? error.message : 'Something went wrong');
+      }
+      setActionPending(false);
+    },
+    [relationship, userId]
+  );
+
+  const handleConnect = () =>
+    runConnectionAction(() => connectionsApi.sendRequest(parseInt(userId)), 'pending_sent');
+
+  const handleWithdraw = () => {
+    const requestId = relationship?.request_id;
+    if (requestId) runConnectionAction(() => connectionsApi.withdrawRequest(requestId), 'none');
   };
 
-  /**
-   * Removes the connection with the profile user.
-   */
-  const handleRemoveConnection = async () => {
-    try {
-      await connectionsApi.removeConnection(parseInt(userId));
-      setConnectionDegree(null);
-    } catch (error) {
-      console.error('Failed to remove connection:', error);
-    }
+  const handleAccept = () => {
+    const requestId = relationship?.request_id;
+    if (requestId) runConnectionAction(() => connectionsApi.acceptRequest(requestId), 'connected');
+  };
+
+  const handleIgnore = () => {
+    const requestId = relationship?.request_id;
+    if (requestId) runConnectionAction(() => connectionsApi.rejectRequest(requestId), 'none');
+  };
+
+  const handleRemoveConnection = () => {
+    if (!profile || !window.confirm(`Remove ${profile.first_name} from your connections?`)) return;
+    runConnectionAction(() => connectionsApi.removeConnection(parseInt(userId)));
   };
 
   // Loading state
@@ -224,10 +244,14 @@ function ProfilePage() {
       <ProfileHeader
         profile={profile}
         isOwnProfile={isOwnProfile}
-        connectionDegree={connectionDegree}
-        mutualConnections={mutualConnections}
+        relationship={relationship}
+        actionPending={actionPending}
+        actionError={actionError}
         onEditProfile={handleOpenEditModal}
         onConnect={handleConnect}
+        onWithdraw={handleWithdraw}
+        onAccept={handleAccept}
+        onIgnore={handleIgnore}
         onRemoveConnection={handleRemoveConnection}
       />
 

@@ -62,7 +62,7 @@ declare module 'amqplib' {
     consumerCount: number;
   }
 
-  export interface Channel {
+  export interface Channel extends EventEmitter {
     close(): Promise<void>;
     assertQueue(queue: string, options?: Options): Promise<Replies>;
     assertExchange(exchange: string, type: string, options?: Options): Promise<{ exchange: string }>;
@@ -83,8 +83,27 @@ declare module 'amqplib' {
     unbindQueue(queue: string, source: string, pattern: string, args?: Record<string, unknown>): Promise<void>;
   }
 
+  /** Channel in confirm mode: the broker acks (or nacks) every publish, reported via the callback. */
+  export interface ConfirmChannel extends Channel {
+    sendToQueue(
+      queue: string,
+      content: Buffer,
+      options?: PublishOptions,
+      callback?: (err: unknown, ok: unknown) => void
+    ): boolean;
+    publish(
+      exchange: string,
+      routingKey: string,
+      content: Buffer,
+      options?: PublishOptions,
+      callback?: (err: unknown, ok: unknown) => void
+    ): boolean;
+    waitForConfirms(): Promise<void>;
+  }
+
   export interface Connection extends EventEmitter {
     createChannel(): Promise<Channel>;
+    createConfirmChannel(): Promise<ConfirmChannel>;
     close(): Promise<void>;
   }
 

@@ -5,6 +5,7 @@
 import { app } from './app.js'
 import { initRedis } from '../shared/cache.js'
 import { createLogger } from '../shared/logger.js'
+import { closeServer, onShutdown } from '../shared/lifecycle.js'
 
 const logger = createLogger('highlight-service')
 const PORT = process.env.HIGHLIGHT_PORT || 3000
@@ -12,10 +13,12 @@ const PORT = process.env.HIGHLIGHT_PORT || 3000
 async function start(): Promise<void> {
   await initRedis()
 
-  app.listen(PORT, () => {
+  const server = app.listen(PORT, () => {
     logger.info({ event: 'server_started', port: PORT })
     console.log(`Highlight service running on port ${PORT}`)
   })
+
+  onShutdown(logger, () => closeServer(server))
 }
 
 start().catch((err) => {

@@ -7,7 +7,6 @@
 
 import { Job, JobExecution } from '../types';
 import { logger } from '../utils/logger';
-import * as _db from '../db/repository';
 
 /**
  * Job handler function signature.
@@ -24,13 +23,42 @@ type JobHandler = (
 
 /**
  * Execution context provided to handlers.
- * Contains utilities for logging and accessing worker information.
+ * Contains utilities for logging, cancellation, and the identifiers a handler should
+ * forward to downstream systems.
  */
 export interface ExecutionContext {
   /** Logs a message to the execution log */
   log: (level: 'info' | 'warn' | 'error', message: string, metadata?: Record<string, unknown>) => Promise<void>;
   /** ID of the worker executing this job */
   workerId: string;
+  /**
+   * Aborted when the attempt must stop: its timeout fired, it was cancelled, its lease
+   * was lost, or the worker is shutting down. Handlers should pass it to fetch/spawn
+   * and stop starting new side effects once it fires.
+   */
+  signal: AbortSignal;
+  /**
+   * Token of the lease this attempt runs under. Strictly greater than any earlier lease
+   * on the same run, so a downstream service that remembers the highest token it has
+   * seen can reject writes from a stale attempt.
+   */
+  fencingToken: string;
+  /**
+   * Stable across retries of the same scheduled run (job id + slot), so a downstream
+   * service can de-duplicate the side effect of an attempt that ran twice.
+   */
+  idempotencyKey: string;
+}
+
+/**
+ * Thrown by a handler for failures that will not change on retry (bad payload,
+ * unknown handler). The run is dead-lettered immediately instead of burning retries.
+ */
+export class NonRetryableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'NonRetryableError';
+  }
 }
 
 /** Registry mapping handler names to their implementations */
@@ -89,42 +117,48 @@ registerHandler('http.webhook', async (job, execution, context) => {
     timeout?: number;
   };
 
+  if (typeof url !== 'string' || !/^https?:\/\//.test(url)) {
+    throw new NonRetryableError('http.webhook payload needs an http(s) "url"');
+  }
+
   await context.log('info', `Calling webhook: ${method} ${url}`);
 
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), timeout);
+  // Stop on whichever comes first: the request timeout or the attempt's own signal
+  // (job timeout, cancellation, lost lease, shutdown).
+  const signal = AbortSignal.any([context.signal, AbortSignal.timeout(timeout)]);
 
-  try {
-    const response = await fetch(url, {
-      method,
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Job-ID': job.id,
-        'X-Execution-ID': execution.id,
-        ...headers,
-      },
-      body: method !== 'GET' ? JSON.stringify(job.payload) : undefined,
-      signal: controller.signal,
-    });
+  const response = await fetch(url, {
+    method,
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Job-ID': job.id,
+      'X-Execution-ID': execution.id,
+      // Lets the receiver reject a write from an attempt whose lease was reclaimed.
+      'X-Fencing-Token': context.fencingToken,
+      // Same value on every retry of this scheduled run, for receiver-side dedupe.
+      'Idempotency-Key': context.idempotencyKey,
+      ...headers,
+    },
+    body: method !== 'GET' ? JSON.stringify(job.payload) : undefined,
+    signal,
+  });
 
-    clearTimeout(timeoutId);
+  const responseBody = await response.text();
 
-    const responseBody = await response.text();
-
-    if (!response.ok) {
-      throw new Error(`Webhook returned ${response.status}: ${responseBody}`);
-    }
-
-    await context.log('info', `Webhook completed with status ${response.status}`);
-
-    return {
-      status: response.status,
-      body: responseBody,
-    };
-  } catch (error) {
-    clearTimeout(timeoutId);
-    throw error;
+  if (!response.ok) {
+    const message = `Webhook returned ${response.status}: ${responseBody}`;
+    // 4xx other than 408/429 means the request itself is wrong; retrying won't help.
+    const permanent = response.status >= 400 && response.status < 500
+      && response.status !== 408 && response.status !== 429;
+    throw permanent ? new NonRetryableError(message) : new Error(message);
   }
+
+  await context.log('info', `Webhook completed with status ${response.status}`);
+
+  return {
+    status: response.status,
+    body: responseBody,
+  };
 });
 
 /**
@@ -150,6 +184,7 @@ registerHandler('shell.command', async (job, execution, context) => {
       cwd,
       env: { ...process.env, ...env },
       shell: true,
+      signal: context.signal,
     });
 
     let stdout = '';
@@ -194,7 +229,14 @@ registerHandler('test.delay', async (job, execution, context) => {
 
   await context.log('info', `Delaying for ${durationMs}ms`);
 
-  await new Promise((resolve) => setTimeout(resolve, durationMs));
+  // Resolve early when the attempt is aborted, as a well-behaved handler should.
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(resolve, durationMs);
+    context.signal.addEventListener('abort', () => {
+      clearTimeout(timer);
+      reject(context.signal.reason);
+    }, { once: true });
+  });
 
   if (shouldFail) {
     throw new Error(failMessage);

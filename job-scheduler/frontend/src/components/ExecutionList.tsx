@@ -122,7 +122,8 @@ export function ExecutionList({ executions, showJobLink, onCancel, onRetry }: Ex
                     </button>
                   )}
                   {(execution.status === ExecutionStatus.FAILED ||
-                    execution.status === ExecutionStatus.CANCELLED) && (
+                    execution.status === ExecutionStatus.CANCELLED ||
+                    execution.status === ExecutionStatus.DEAD_LETTER) && (
                     <button
                       onClick={() => onRetry?.(execution.id)}
                       className="text-blue-600 hover:text-blue-900"
@@ -213,6 +214,20 @@ export function ExecutionDetail({ execution, onCancel, onRetry }: ExecutionDetai
               {duration !== null ? `${duration}ms` : '-'}
             </dd>
           </div>
+          {execution.fencing_token && (
+            <div>
+              <dt className="text-gray-500">Fencing token</dt>
+              <dd className="font-mono text-gray-900">{execution.fencing_token}</dd>
+            </div>
+          )}
+          {execution.status === ExecutionStatus.RUNNING && execution.lease_expires_at && (
+            <div>
+              <dt className="text-gray-500">Lease expires</dt>
+              <dd className="text-gray-900">
+                {new Date(execution.lease_expires_at).toLocaleTimeString()}
+              </dd>
+            </div>
+          )}
         </dl>
 
         {execution.error && (
@@ -268,7 +283,8 @@ export function ExecutionDetail({ execution, onCancel, onRetry }: ExecutionDetai
             </Button>
           )}
           {(execution.status === ExecutionStatus.FAILED ||
-            execution.status === ExecutionStatus.CANCELLED) && (
+            execution.status === ExecutionStatus.CANCELLED ||
+            execution.status === ExecutionStatus.DEAD_LETTER) && (
             <Button variant="primary" onClick={onRetry}>
               Retry
             </Button>

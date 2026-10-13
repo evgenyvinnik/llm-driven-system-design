@@ -27,6 +27,12 @@ export const ensureBucket = async (): Promise<void> => {
   }
 };
 
+/** Throws when the bucket can't be reached (unlike ensureBucket, which only logs). Used by health checks. */
+export const checkBucket = async (): Promise<void> => {
+  const exists = await minioClient.bucketExists(BUCKET_NAME);
+  if (!exists) throw new Error(`Bucket ${BUCKET_NAME} does not exist`);
+};
+
 interface ImageDimensions {
   width: number;
   height: number;
@@ -83,19 +89,28 @@ export interface ProcessedImageResult {
 }
 
 // Process and upload image
-/** Processes an image through Sharp to generate multiple resolutions and uploads them. */
+/**
+ * Processes an image through Sharp to generate multiple resolutions and uploads them.
+ *
+ * `keyPrefix` makes the object keys deterministic (the worker passes `images/{postId}/{index}`),
+ * so a retried or duplicate job overwrites the same objects instead of orphaning a second set.
+ * Without a prefix a random id is used (stories, which are processed inline).
+ */
 export const processAndUploadImage = async (
   fileBuffer: Buffer,
   originalName: string,
-  filterName: string = 'none'
+  filterName: string = 'none',
+  keyPrefix?: string
 ): Promise<ProcessedImageResult> => {
   const fileId = uuidv4();
+  const prefix = keyPrefix || `images/${fileId}`;
   const ext = 'jpg';
   const results: Record<string, string> = {};
 
   // Process image at different sizes
   for (const [sizeName, dimensions] of Object.entries(IMAGE_SIZES)) {
-    let processed = sharp(fileBuffer).jpeg({ quality: 85 });
+    // rotate() applies the EXIF orientation; sharp drops EXIF metadata (GPS included) on output.
+    let processed = sharp(fileBuffer).rotate().jpeg({ quality: 85 });
 
     if (dimensions) {
       processed = processed.resize(dimensions.width, dimensions.height, {
@@ -105,7 +120,7 @@ export const processAndUploadImage = async (
     }
 
     const buffer = await processed.toBuffer();
-    const key = `images/${fileId}/${sizeName}.${ext}`;
+    const key = `${prefix}/${sizeName}.${ext}`;
     results[sizeName] = await uploadBuffer(buffer, key, 'image/jpeg');
   }
 
@@ -177,13 +192,17 @@ export interface StoredOriginalResult {
 }
 
 // Store original image for async processing
-export const storeOriginalImage = async (fileBuffer: Buffer, originalName: string): Promise<StoredOriginalResult> => {
+export const storeOriginalImage = async (
+  fileBuffer: Buffer,
+  originalName: string,
+  contentType: string = 'image/jpeg'
+): Promise<StoredOriginalResult> => {
   const fileId = uuidv4();
-  const ext = originalName.split('.').pop() || 'jpg';
+  const ext = (originalName.split('.').pop() || 'jpg').replace(/[^A-Za-z0-9]/g, '').slice(0, 8) || 'jpg';
   const key = `originals/${fileId}.${ext}`;
 
   await minioClient.putObject(BUCKET_NAME, key, fileBuffer, fileBuffer.length, {
-    'Content-Type': 'image/jpeg',
+    'Content-Type': contentType,
   });
 
   return { key, fileId };
@@ -202,10 +221,11 @@ export const fetchOriginalImage = async (key: string): Promise<Buffer> => {
 // Process image from stored original (for worker)
 export const processStoredImage = async (
   originalKey: string,
-  filterName: string = 'none'
+  filterName: string = 'none',
+  keyPrefix?: string
 ): Promise<ProcessedImageResult> => {
   const fileBuffer = await fetchOriginalImage(originalKey);
-  return processAndUploadImage(fileBuffer, originalKey, filterName);
+  return processAndUploadImage(fileBuffer, originalKey, filterName, keyPrefix);
 };
 
 export default minioClient;

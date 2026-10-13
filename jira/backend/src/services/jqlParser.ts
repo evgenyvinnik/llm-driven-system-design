@@ -1,25 +1,43 @@
 /**
- * JQL (Jira Query Language) Parser
+ * JQL (Jira Query Language) parser.
  *
- * Parses JQL queries into an AST and converts them to Elasticsearch queries.
- * Supports queries like: project = DEMO AND status = "In Progress" AND assignee = currentUser()
+ * Parses queries such as
+ *   project = DEMO AND status IN ("To Do", "In Progress") AND assignee = currentUser()
+ *   ORDER BY priority DESC
+ * into an AST, then translates the AST into an Elasticsearch bool query.
  *
- * Features:
- * - Boolean operators: AND, OR with parentheses for grouping
- * - Comparison operators: =, !=, ~, >, <, >=, <=, IN, NOT IN, IS, IS NOT
- * - Functions: currentUser(), now(), startOfDay(), endOfDay(), empty(), null()
- * - Field types: project, status, assignee, priority, type, labels, etc.
+ * Grammar (AND binds tighter than OR, as in Jira; keywords are case-insensitive):
+ *   query    := [ orExpr ] [ ORDER BY sortKey ( , sortKey )* ] EOF
+ *   orExpr   := andExpr ( OR andExpr )*
+ *   andExpr  := notExpr ( AND notExpr )*
+ *   notExpr  := NOT notExpr | primary
+ *   primary  := ( orExpr ) | clause
+ *   clause   := field operator operand
+ *   operator := = | != | ~ | !~ | > | < | >= | <= | IN | NOT IN | IS | IS NOT
+ *   operand  := value | function | ( value ( , value )* )      lists only after IN / NOT IN
+ *   value    := quoted string | bare word | EMPTY | NULL
+ *   function := name ( )        currentUser, now, startOfDay, endOfDay, startOfWeek, endOfWeek
+ *   sortKey  := field [ ASC | DESC ]
+ *
+ * Every syntax problem raises JQLSyntaxError with the character position; nothing is
+ * silently ignored, because a filter that quietly drops a clause returns wrong issues.
  */
 
-/** Comparison operators supported by JQL */
 export type JQLOperator = '=' | '!=' | '~' | '!~' | '>' | '<' | '>=' | '<=' | 'IN' | 'NOT IN' | 'IS' | 'IS NOT';
 
-/** Logical operators for combining clauses */
 export type JQLLogical = 'AND' | 'OR';
 
-/**
- * A single field comparison clause in a JQL query.
- */
+/** A function call in a value position, e.g. currentUser(). */
+export interface JQLFunction {
+  type: 'function';
+  name: string;
+  args: string[];
+}
+
+/** A clause value: literal text, a function, EMPTY/NULL (null), or a list for IN. */
+export type JQLValue = string | null | JQLFunction | (string | JQLFunction)[];
+
+/** A single field comparison clause. */
 export interface JQLClause {
   type: 'clause';
   field: string;
@@ -27,535 +45,507 @@ export interface JQLClause {
   value: JQLValue;
 }
 
-/**
- * A group of clauses combined with a logical operator.
- */
+/** Clauses combined with AND or OR. */
 export interface JQLGroup {
   type: 'group';
   logical: JQLLogical;
   clauses: JQLNode[];
 }
 
-/** Union type for any node in the JQL AST */
-export type JQLNode = JQLClause | JQLGroup;
-
-/** Possible value types in a JQL clause */
-export type JQLValue = string | number | boolean | null | string[] | JQLFunction;
-
-/**
- * A function call in a JQL value position (e.g., currentUser()).
- */
-export interface JQLFunction {
-  type: 'function';
-  name: string;
-  args: string[];
+/** NOT applied to a clause or group. */
+export interface JQLNot {
+  type: 'not';
+  operand: JQLNode;
 }
 
-/** Internal token representation for the tokenizer */
-interface Token {
-  type: 'field' | 'operator' | 'value' | 'logical' | 'lparen' | 'rparen' | 'function' | 'comma';
-  value: string;
+export type JQLNode = JQLClause | JQLGroup | JQLNot;
+
+export interface JQLSort {
+  field: string;
+  direction: 'asc' | 'desc';
 }
 
-/** Map of operator strings to canonical JQLOperator values */
-const _OPERATORS: Record<string, JQLOperator> = {
-  '=': '=',
-  '!=': '!=',
-  '~': '~',
-  '!~': '!~',
-  '>': '>',
-  '<': '<',
-  '>=': '>=',
-  '<=': '<=',
-  'in': 'IN',
-  'not in': 'NOT IN',
-  'is': 'IS',
-  'is not': 'IS NOT',
+export interface JQLQuery {
+  /** Null when the query has only ORDER BY (or is empty): match every issue. */
+  where: JQLNode | null;
+  orderBy: JQLSort[];
+}
+
+/** Invalid query. position is the character offset, or -1 for errors about a value. */
+export class JQLSyntaxError extends Error {
+  constructor(message: string, public readonly position: number = -1) {
+    super(position >= 0 ? `${message} (at position ${position})` : message);
+    this.name = 'JQLSyntaxError';
+  }
+}
+
+type FieldType = 'keyword' | 'text' | 'number' | 'date' | 'user';
+
+interface FieldSpec {
+  type: FieldType;
+  /** Elasticsearch field holding the value. */
+  es: string;
+  /** For user fields: the id field that currentUser() is compared against. */
+  idField?: string;
+  /** For text fields: a keyword sub-field used by = and sorting. */
+  exact?: string;
+}
+
+/** JQL field name (lowercase) to its type and index field. Aliases share a spec. */
+const FIELDS: Record<string, FieldSpec> = {
+  project: { type: 'keyword', es: 'project_key' },
+  key: { type: 'keyword', es: 'key' },
+  issuekey: { type: 'keyword', es: 'key' },
+  status: { type: 'keyword', es: 'status' },
+  statuscategory: { type: 'keyword', es: 'status_category' },
+  priority: { type: 'keyword', es: 'priority' },
+  type: { type: 'keyword', es: 'issue_type' },
+  issuetype: { type: 'keyword', es: 'issue_type' },
+  sprint: { type: 'keyword', es: 'sprint_name' },
+  epic: { type: 'keyword', es: 'epic_key' },
+  labels: { type: 'keyword', es: 'labels' },
+  label: { type: 'keyword', es: 'labels' },
+  component: { type: 'keyword', es: 'components' },
+  components: { type: 'keyword', es: 'components' },
+  assignee: { type: 'user', es: 'assignee_name', idField: 'assignee_id' },
+  reporter: { type: 'user', es: 'reporter_name', idField: 'reporter_id' },
+  summary: { type: 'text', es: 'summary', exact: 'summary.keyword' },
+  description: { type: 'text', es: 'description' },
+  text: { type: 'text', es: 'text' },
+  created: { type: 'date', es: 'created_at' },
+  updated: { type: 'date', es: 'updated_at' },
+  storypoints: { type: 'number', es: 'story_points' },
+  story_points: { type: 'number', es: 'story_points' },
 };
 
-/** Fields recognized by the JQL parser */
-const FIELDS = [
-  'project', 'status', 'assignee', 'reporter', 'priority', 'type', 'issuetype',
-  'sprint', 'epic', 'labels', 'component', 'summary', 'description', 'key',
-  'created', 'updated', 'storypoints', 'story_points'
-];
+/** Canonical names for aliases, so the AST uses one spelling per field. */
+const CANONICAL: Record<string, string> = {
+  issuekey: 'key',
+  issuetype: 'type',
+  label: 'labels',
+  components: 'component',
+  storypoints: 'story_points',
+};
 
-/** Built-in functions available in JQL */
-const FUNCTIONS = ['currentUser', 'now', 'startOfDay', 'endOfDay', 'startOfWeek', 'endOfWeek', 'empty', 'null'];
+const FUNCTIONS = ['currentuser', 'now', 'startofday', 'endofday', 'startofweek', 'endofweek'];
 
-/**
- * JQL Parser class.
- * Converts JQL query strings into an AST and then to Elasticsearch queries.
- */
-export class JQLParser {
-  private tokens: Token[] = [];
+const OPERATORS_BY_TYPE: Record<FieldType, JQLOperator[]> = {
+  keyword: ['=', '!=', 'IN', 'NOT IN', 'IS', 'IS NOT'],
+  user: ['=', '!=', 'IN', 'NOT IN', 'IS', 'IS NOT'],
+  text: ['~', '!~', '=', 'IS', 'IS NOT'],
+  number: ['=', '!=', '>', '<', '>=', '<=', 'IN', 'NOT IN', 'IS', 'IS NOT'],
+  date: ['=', '!=', '>', '<', '>=', '<=', 'IS', 'IS NOT'],
+};
+
+type TokenKind = 'word' | 'string' | 'op' | 'lparen' | 'rparen' | 'comma';
+
+interface Token {
+  kind: TokenKind;
+  text: string;
+  position: number;
+}
+
+function tokenize(input: string): Token[] {
+  const tokens: Token[] = [];
+  let i = 0;
+
+  while (i < input.length) {
+    const char = input[i];
+
+    if (/\s/.test(char)) {
+      i++;
+      continue;
+    }
+    if (char === '(' || char === ')' || char === ',') {
+      tokens.push({ kind: char === '(' ? 'lparen' : char === ')' ? 'rparen' : 'comma', text: char, position: i });
+      i++;
+      continue;
+    }
+
+    const twoChar = input.slice(i, i + 2);
+    if (['!=', '>=', '<=', '!~'].includes(twoChar)) {
+      tokens.push({ kind: 'op', text: twoChar, position: i });
+      i += 2;
+      continue;
+    }
+    if (['=', '>', '<', '~'].includes(char)) {
+      tokens.push({ kind: 'op', text: char, position: i });
+      i++;
+      continue;
+    }
+
+    if (char === '"' || char === "'") {
+      const start = i;
+      let value = '';
+      i++;
+      while (i < input.length && input[i] !== char) {
+        if (input[i] === '\\' && i + 1 < input.length) i++;
+        value += input[i];
+        i++;
+      }
+      if (i >= input.length) throw new JQLSyntaxError('Unterminated string', start);
+      i++;
+      tokens.push({ kind: 'string', text: value, position: start });
+      continue;
+    }
+
+    const wordMatch = input.slice(i).match(/^(cf\[[^\]]+\]|[A-Za-z0-9_.:@/-]+)/);
+    if (!wordMatch) throw new JQLSyntaxError(`Unexpected character "${char}"`, i);
+    tokens.push({ kind: 'word', text: wordMatch[0], position: i });
+    i += wordMatch[0].length;
+  }
+
+  return tokens;
+}
+
+/** Recursive-descent parser over the token list for one query. */
+class Parser {
   private position = 0;
 
-  /**
-   * Parses a JQL query string into an AST.
-   *
-   * @param jql - JQL query string
-   * @returns Parsed AST node (clause or group)
-   * @throws Error if the query syntax is invalid
-   */
-  parse(jql: string): JQLNode {
-    this.tokens = this.tokenize(jql);
-    this.position = 0;
+  constructor(private readonly tokens: Token[], private readonly length: number) {}
 
-    if (this.tokens.length === 0) {
-      return { type: 'group', logical: 'AND', clauses: [] };
+  parseQuery(): JQLQuery {
+    let where: JQLNode | null = null;
+    if (this.peek() && !this.peekKeyword('ORDER')) {
+      where = this.parseOr();
     }
-
-    return this.parseExpression();
+    const orderBy = this.peekKeyword('ORDER') ? this.parseOrderBy() : [];
+    const extra = this.peek();
+    if (extra) throw new JQLSyntaxError(`Unexpected "${extra.text}"`, extra.position);
+    return { where, orderBy };
   }
 
-  private tokenize(jql: string): Token[] {
-    const tokens: Token[] = [];
-    let i = 0;
-    const input = jql.trim();
-
-    while (i < input.length) {
-      // Skip whitespace
-      if (/\s/.test(input[i])) {
-        i++;
-        continue;
-      }
-
-      // Parentheses
-      if (input[i] === '(') {
-        tokens.push({ type: 'lparen', value: '(' });
-        i++;
-        continue;
-      }
-      if (input[i] === ')') {
-        tokens.push({ type: 'rparen', value: ')' });
-        i++;
-        continue;
-      }
-
-      // Comma
-      if (input[i] === ',') {
-        tokens.push({ type: 'comma', value: ',' });
-        i++;
-        continue;
-      }
-
-      // Multi-character operators
-      const twoChar = input.substring(i, i + 2);
-      if (['!=', '>=', '<=', '!~'].includes(twoChar)) {
-        tokens.push({ type: 'operator', value: twoChar });
-        i += 2;
-        continue;
-      }
-
-      // Single-character operators
-      if (['=', '>', '<', '~'].includes(input[i])) {
-        tokens.push({ type: 'operator', value: input[i] });
-        i++;
-        continue;
-      }
-
-      // Quoted string
-      if (input[i] === '"' || input[i] === "'") {
-        const quote = input[i];
-        i++;
-        let value = '';
-        while (i < input.length && input[i] !== quote) {
-          if (input[i] === '\\' && i + 1 < input.length) {
-            i++;
-          }
-          value += input[i];
-          i++;
-        }
-        i++; // Skip closing quote
-        tokens.push({ type: 'value', value });
-        continue;
-      }
-
-      // Word (field, operator keyword, value, function, or logical)
-      let word = '';
-      while (i < input.length && /[a-zA-Z0-9_\-.]/.test(input[i])) {
-        word += input[i];
-        i++;
-      }
-
-      if (word) {
-        const lowerWord = word.toLowerCase();
-
-        // Check for "NOT IN" (two words)
-        if (lowerWord === 'not') {
-          // Look ahead for 'in'
-          let j = i;
-          while (j < input.length && /\s/.test(input[j])) j++;
-          const nextWord = input.substring(j).match(/^in\b/i);
-          if (nextWord) {
-            tokens.push({ type: 'operator', value: 'NOT IN' });
-            i = j + 2;
-            continue;
-          }
-        }
-
-        // Check for "IS NOT" (two words)
-        if (lowerWord === 'is') {
-          let j = i;
-          while (j < input.length && /\s/.test(input[j])) j++;
-          const nextWord = input.substring(j).match(/^not\b/i);
-          if (nextWord) {
-            tokens.push({ type: 'operator', value: 'IS NOT' });
-            i = j + 3;
-            continue;
-          }
-          tokens.push({ type: 'operator', value: 'IS' });
-          continue;
-        }
-
-        // Logical operators
-        if (lowerWord === 'and' || lowerWord === 'or') {
-          tokens.push({ type: 'logical', value: lowerWord.toUpperCase() });
-          continue;
-        }
-
-        // Operators
-        if (lowerWord === 'in') {
-          tokens.push({ type: 'operator', value: 'IN' });
-          continue;
-        }
-
-        // Functions (word followed by parentheses)
-        if (input[i] === '(' && FUNCTIONS.some(f => f.toLowerCase() === lowerWord)) {
-          tokens.push({ type: 'function', value: word });
-          continue;
-        }
-
-        // Fields
-        if (FIELDS.includes(lowerWord)) {
-          tokens.push({ type: 'field', value: lowerWord });
-          continue;
-        }
-
-        // Custom field (cf[xxx])
-        if (lowerWord === 'cf' && input[i] === '[') {
-          i++; // skip [
-          let cfId = '';
-          while (i < input.length && input[i] !== ']') {
-            cfId += input[i];
-            i++;
-          }
-          i++; // skip ]
-          tokens.push({ type: 'field', value: `cf_${cfId}` });
-          continue;
-        }
-
-        // Otherwise it's a value
-        tokens.push({ type: 'value', value: word });
-      }
-    }
-
-    return tokens;
+  private peek(offset = 0): Token | undefined {
+    return this.tokens[this.position + offset];
   }
 
-  private parseExpression(): JQLNode {
-    let left = this.parsePrimary();
+  private peekKeyword(keyword: string, offset = 0): boolean {
+    const token = this.peek(offset);
+    return token?.kind === 'word' && token.text.toUpperCase() === keyword;
+  }
 
-    while (this.position < this.tokens.length) {
-      const token = this.tokens[this.position];
+  private next(expected: string): Token {
+    const token = this.tokens[this.position++];
+    if (!token) throw new JQLSyntaxError(`Expected ${expected} but the query ended`, this.length);
+    return token;
+  }
 
-      if (token.type === 'logical') {
-        const logical = token.value as JQLLogical;
-        this.position++;
-        const right = this.parsePrimary();
-
-        if (left.type === 'group' && left.logical === logical) {
-          left.clauses.push(right);
-        } else {
-          left = {
-            type: 'group',
-            logical,
-            clauses: [left, right],
-          };
-        }
-      } else {
-        break;
-      }
+  private parseOr(): JQLNode {
+    const clauses = [this.parseAnd()];
+    while (this.peekKeyword('OR')) {
+      this.position++;
+      clauses.push(this.parseAnd());
     }
+    return clauses.length === 1 ? clauses[0] : { type: 'group', logical: 'OR', clauses };
+  }
 
-    return left;
+  private parseAnd(): JQLNode {
+    const clauses = [this.parseNot()];
+    while (this.peekKeyword('AND')) {
+      this.position++;
+      clauses.push(this.parseNot());
+    }
+    return clauses.length === 1 ? clauses[0] : { type: 'group', logical: 'AND', clauses };
+  }
+
+  private parseNot(): JQLNode {
+    if (this.peekKeyword('NOT')) {
+      this.position++;
+      return { type: 'not', operand: this.parseNot() };
+    }
+    return this.parsePrimary();
   }
 
   private parsePrimary(): JQLNode {
-    const token = this.tokens[this.position];
-
-    if (token?.type === 'lparen') {
+    const token = this.peek();
+    if (token?.kind === 'lparen') {
       this.position++;
-      const expr = this.parseExpression();
-      if (this.tokens[this.position]?.type === 'rparen') {
-        this.position++;
-      }
-      return expr;
+      const inner = this.parseOr();
+      const close = this.next('")"');
+      if (close.kind !== 'rparen') throw new JQLSyntaxError(`Expected ")" but found "${close.text}"`, close.position);
+      return inner;
     }
-
     return this.parseClause();
   }
 
+  private parseField(): string {
+    const token = this.next('a field name');
+    if (token.kind !== 'word') throw new JQLSyntaxError(`Expected a field name but found "${token.text}"`, token.position);
+    const raw = token.text.toLowerCase();
+    if (/^cf\[[^\]]+\]$/.test(raw)) return raw;
+    if (!FIELDS[raw]) throw new JQLSyntaxError(`Unknown field "${token.text}"`, token.position);
+    return CANONICAL[raw] ?? raw;
+  }
+
+  private parseOperator(): JQLOperator {
+    const token = this.next('an operator');
+    if (token.kind === 'op') return token.text as JQLOperator;
+    const word = token.kind === 'word' ? token.text.toUpperCase() : '';
+    if (word === 'IN') return 'IN';
+    if (word === 'NOT' && this.peekKeyword('IN')) {
+      this.position++;
+      return 'NOT IN';
+    }
+    if (word === 'IS') {
+      if (this.peekKeyword('NOT')) {
+        this.position++;
+        return 'IS NOT';
+      }
+      return 'IS';
+    }
+    throw new JQLSyntaxError(`Expected an operator but found "${token.text}"`, token.position);
+  }
+
   private parseClause(): JQLClause {
-    const fieldToken = this.tokens[this.position++];
-    if (!fieldToken || fieldToken.type !== 'field') {
-      throw new Error(`Expected field, got: ${fieldToken?.value}`);
+    const fieldToken = this.peek();
+    const field = this.parseField();
+    const operator = this.parseOperator();
+    const spec = specFor(field);
+
+    if (!OPERATORS_BY_TYPE[spec.type].includes(operator)) {
+      throw new JQLSyntaxError(`Operator ${operator} is not supported for ${field}`, fieldToken?.position ?? 0);
     }
 
-    const operatorToken = this.tokens[this.position++];
-    if (!operatorToken || operatorToken.type !== 'operator') {
-      throw new Error(`Expected operator, got: ${operatorToken?.value}`);
+    let value: JQLValue;
+    if (operator === 'IN' || operator === 'NOT IN') {
+      value = this.parseList();
+    } else if (operator === 'IS' || operator === 'IS NOT') {
+      const token = this.next('EMPTY or NULL');
+      const word = token.kind === 'word' ? token.text.toUpperCase() : '';
+      if (word !== 'EMPTY' && word !== 'NULL') {
+        throw new JQLSyntaxError(`${operator} must be followed by EMPTY or NULL`, token.position);
+      }
+      value = null;
+    } else {
+      value = this.parseValue();
     }
 
-    const value = this.parseValue();
-
-    return {
-      type: 'clause',
-      field: this.normalizeField(fieldToken.value),
-      operator: operatorToken.value as JQLOperator,
-      value,
-    };
+    return { type: 'clause', field, operator, value };
   }
 
-  private parseValue(): JQLValue {
-    const token = this.tokens[this.position];
-
-    if (!token) {
-      throw new Error('Expected value');
+  private parseList(): (string | JQLFunction)[] {
+    const open = this.next('"("');
+    if (open.kind !== 'lparen') throw new JQLSyntaxError('IN needs a list such as ("A", "B")', open.position);
+    const values: (string | JQLFunction)[] = [];
+    for (;;) {
+      const value = this.parseValue();
+      if (value === null) throw new JQLSyntaxError('EMPTY is not allowed in a list', open.position);
+      values.push(value);
+      const separator = this.next('"," or ")"');
+      if (separator.kind === 'rparen') return values;
+      if (separator.kind !== 'comma') {
+        throw new JQLSyntaxError(`Expected "," or ")" but found "${separator.text}"`, separator.position);
+      }
     }
+  }
 
-    // Function
-    if (token.type === 'function') {
+  private parseValue(): string | JQLFunction | null {
+    const token = this.next('a value');
+    if (token.kind === 'string') return token.text;
+    if (token.kind !== 'word') throw new JQLSyntaxError(`Expected a value but found "${token.text}"`, token.position);
+
+    const upper = token.text.toUpperCase();
+    if (upper === 'EMPTY' || upper === 'NULL') return null;
+
+    if (this.peek()?.kind === 'lparen') {
+      const name = token.text.toLowerCase();
+      if (!FUNCTIONS.includes(name)) throw new JQLSyntaxError(`Unknown function "${token.text}()"`, token.position);
       this.position++;
-      const funcName = token.value;
-      const args: string[] = [];
-
-      // Skip lparen
-      if (this.tokens[this.position]?.type === 'lparen') {
-        this.position++;
-      }
-
-      // Parse arguments
-      while (this.tokens[this.position] && this.tokens[this.position].type !== 'rparen') {
-        if (this.tokens[this.position].type === 'comma') {
-          this.position++;
-          continue;
-        }
-        args.push(this.tokens[this.position].value);
-        this.position++;
-      }
-
-      // Skip rparen
-      if (this.tokens[this.position]?.type === 'rparen') {
-        this.position++;
-      }
-
-      return { type: 'function', name: funcName, args };
+      const close = this.next('")"');
+      if (close.kind !== 'rparen') throw new JQLSyntaxError(`${token.text}() takes no arguments`, close.position);
+      return { type: 'function', name, args: [] };
     }
 
-    // List (for IN operator)
-    if (token.type === 'lparen') {
-      this.position++;
-      const values: string[] = [];
-
-      while (this.tokens[this.position] && this.tokens[this.position].type !== 'rparen') {
-        if (this.tokens[this.position].type === 'comma') {
-          this.position++;
-          continue;
-        }
-        values.push(this.tokens[this.position].value);
-        this.position++;
-      }
-
-      if (this.tokens[this.position]?.type === 'rparen') {
-        this.position++;
-      }
-
-      return values;
+    if (['AND', 'OR', 'NOT', 'ORDER'].includes(upper)) {
+      throw new JQLSyntaxError(`Expected a value but found the keyword ${upper}`, token.position);
     }
+    return token.text;
+  }
 
-    // Single value
+  private parseOrderBy(): JQLSort[] {
     this.position++;
-
-    // Check for special values
-    const lowerValue = token.value.toLowerCase();
-    if (lowerValue === 'empty' || lowerValue === 'null') {
-      return null;
+    if (!this.peekKeyword('BY')) {
+      const token = this.peek();
+      throw new JQLSyntaxError('Expected BY after ORDER', token?.position ?? this.length);
     }
-    if (lowerValue === 'true') return true;
-    if (lowerValue === 'false') return false;
-
-    // Try to parse as number
-    const num = Number(token.value);
-    if (!isNaN(num)) return num;
-
-    return token.value;
-  }
-
-  private normalizeField(field: string): string {
-    const fieldMap: Record<string, string> = {
-      'type': 'issue_type',
-      'issuetype': 'issue_type',
-      'storypoints': 'story_points',
-      'component': 'components',
-    };
-    return fieldMap[field] || field;
-  }
-
-  /**
-   * Converts a JQL AST to an Elasticsearch query DSL object.
-   *
-   * @param ast - Parsed JQL AST node
-   * @param context - Context object with currentUserId for function resolution
-   * @returns Elasticsearch query DSL object
-   */
-  toElasticsearch(ast: JQLNode, context: { currentUserId?: string } = {}): Record<string, unknown> {
-    if (ast.type === 'group') {
-      const esClauseList = ast.clauses.map(c => this.toElasticsearch(c, context));
-
-      if (ast.logical === 'AND') {
-        return { bool: { must: esClauseList } };
-      } else {
-        return { bool: { should: esClauseList, minimum_should_match: 1 } };
+    this.position++;
+    const sorts: JQLSort[] = [];
+    for (;;) {
+      const field = this.parseField();
+      let direction: 'asc' | 'desc' = 'asc';
+      if (this.peekKeyword('ASC') || this.peekKeyword('DESC')) {
+        direction = this.next('a direction').text.toLowerCase() as 'asc' | 'desc';
       }
-    }
-
-    return this.clauseToES(ast as JQLClause, context);
-  }
-
-  private clauseToES(clause: JQLClause, context: { currentUserId?: string }): Record<string, unknown> {
-    const field = this.esFieldName(clause.field);
-    const value = this.resolveValue(clause.value, context);
-
-    switch (clause.operator) {
-      case '=':
-        if (value === null) {
-          return { bool: { must_not: { exists: { field } } } };
-        }
-        return { term: { [field]: value } };
-
-      case '!=':
-        if (value === null) {
-          return { exists: { field } };
-        }
-        return { bool: { must_not: { term: { [field]: value } } } };
-
-      case '~':
-        return { match: { [field]: value } };
-
-      case '!~':
-        return { bool: { must_not: { match: { [field]: value } } } };
-
-      case '>':
-        return { range: { [field]: { gt: value } } };
-
-      case '<':
-        return { range: { [field]: { lt: value } } };
-
-      case '>=':
-        return { range: { [field]: { gte: value } } };
-
-      case '<=':
-        return { range: { [field]: { lte: value } } };
-
-      case 'IN':
-        return { terms: { [field]: value } };
-
-      case 'NOT IN':
-        return { bool: { must_not: { terms: { [field]: value } } } };
-
-      case 'IS':
-        if (value === null) {
-          return { bool: { must_not: { exists: { field } } } };
-        }
-        return { term: { [field]: value } };
-
-      case 'IS NOT':
-        if (value === null) {
-          return { exists: { field } };
-        }
-        return { bool: { must_not: { term: { [field]: value } } } };
-
-      default:
-        return { term: { [field]: value } };
+      sorts.push({ field, direction });
+      if (this.peek()?.kind !== 'comma') return sorts;
+      this.position++;
     }
   }
+}
 
-  private esFieldName(field: string): string {
-    const fieldMap: Record<string, string> = {
-      'project': 'project_key',
-      'status': 'status',
-      'assignee': 'assignee_name',
-      'reporter': 'reporter_name',
-      'priority': 'priority',
-      'issue_type': 'issue_type',
-      'sprint': 'sprint_name',
-      'epic': 'epic_key',
-      'labels': 'labels',
-      'components': 'components',
-      'summary': 'summary',
-      'description': 'description',
-      'key': 'key',
-      'created': 'created_at',
-      'updated': 'updated_at',
-      'story_points': 'story_points',
+function specFor(field: string): FieldSpec {
+  if (field.startsWith('cf[')) {
+    return { type: 'keyword', es: `custom_fields.${field.slice(3, -1)}` };
+  }
+  return FIELDS[field];
+}
+
+/** Context used to resolve functions such as currentUser() at query time. */
+export interface JQLContext {
+  currentUserId?: string;
+  now?: Date;
+}
+
+type Resolved = { kind: 'user'; id: string } | { kind: 'literal'; value: string };
+
+function resolve(value: string | JQLFunction, context: JQLContext): Resolved {
+  if (typeof value === 'string') return { kind: 'literal', value };
+  const now = context.now ?? new Date();
+  const day = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+  switch (value.name) {
+    case 'currentuser':
+      return { kind: 'user', id: context.currentUserId ?? '' };
+    case 'now':
+      return { kind: 'literal', value: now.toISOString() };
+    case 'startofday':
+      return { kind: 'literal', value: day.toISOString() };
+    case 'endofday':
+      return { kind: 'literal', value: new Date(day.getTime() + 86_400_000 - 1).toISOString() };
+    case 'startofweek': {
+      const start = new Date(day.getTime() - day.getUTCDay() * 86_400_000);
+      return { kind: 'literal', value: start.toISOString() };
+    }
+    case 'endofweek': {
+      const end = new Date(day.getTime() + (7 - day.getUTCDay()) * 86_400_000 - 1);
+      return { kind: 'literal', value: end.toISOString() };
+    }
+    default:
+      throw new JQLSyntaxError(`Unknown function "${value.name}()"`);
+  }
+}
+
+/** Jira-style relative dates ("-7d", "-2w", "+4h") become Elasticsearch date math. */
+function dateValue(raw: string): string {
+  return /^[-+]\d+[mhdw]$/.test(raw) ? `now${raw}` : raw;
+}
+
+/** One equality test, case-insensitive for keyword fields like status names. */
+function equals(spec: FieldSpec, value: Resolved): Record<string, unknown> {
+  if (value.kind === 'user') {
+    return { term: { [spec.idField ?? spec.es]: value.id } };
+  }
+  if (spec.type === 'number') {
+    const number = Number(value.value);
+    if (Number.isNaN(number)) throw new JQLSyntaxError(`"${value.value}" is not a number`);
+    return { term: { [spec.es]: number } };
+  }
+  if (spec.type === 'date') {
+    return { term: { [spec.es]: dateValue(value.value) } };
+  }
+  if (spec.type === 'text') {
+    if (!spec.exact) throw new JQLSyntaxError('Use ~ to search this text field');
+    return { term: { [spec.exact]: { value: value.value, case_insensitive: true } } };
+  }
+  return { term: { [spec.es]: { value: value.value, case_insensitive: true } } };
+}
+
+function not(query: Record<string, unknown>): Record<string, unknown> {
+  return { bool: { must_not: [query] } };
+}
+
+function clauseToElasticsearch(clause: JQLClause, context: JQLContext): Record<string, unknown> {
+  const spec = specFor(clause.field);
+  const exists = { exists: { field: spec.type === 'user' ? spec.es : spec.exact ?? spec.es } };
+
+  if (clause.value === null) {
+    // = EMPTY, IS EMPTY, != EMPTY, IS NOT EMPTY
+    return clause.operator === '=' || clause.operator === 'IS' ? not(exists) : exists;
+  }
+
+  if (Array.isArray(clause.value)) {
+    const anyOf = {
+      bool: {
+        should: clause.value.map((v) => equals(spec, resolve(v, context))),
+        minimum_should_match: 1,
+      },
     };
-    return fieldMap[field] || field;
+    return clause.operator === 'IN' ? anyOf : not(anyOf);
   }
 
-  private resolveValue(value: JQLValue, context: { currentUserId?: string }): unknown {
-    if (value === null || typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
-      return value;
+  const value = resolve(clause.value, context);
+
+  switch (clause.operator) {
+    case '=':
+      return equals(spec, value);
+    case '!=':
+      return not(equals(spec, value));
+    case '~':
+    case '!~': {
+      const text = value.kind === 'literal' ? value.value : value.id;
+      const match =
+        clause.field === 'text'
+          ? { multi_match: { query: text, fields: ['summary^3', 'description'] } }
+          : { match: { [spec.es]: { query: text, operator: 'and' } } };
+      return clause.operator === '~' ? match : not(match);
     }
-
-    if (Array.isArray(value)) {
-      return value;
-    }
-
-    // Handle functions
-    if (typeof value === 'object' && value.type === 'function') {
-      const funcName = value.name.toLowerCase();
-
-      switch (funcName) {
-        case 'currentuser':
-          return context.currentUserId || '';
-
-        case 'now':
-          return new Date().toISOString();
-
-        case 'startofday':
-          const startOfDay = new Date();
-          startOfDay.setHours(0, 0, 0, 0);
-          return startOfDay.toISOString();
-
-        case 'endofday':
-          const endOfDay = new Date();
-          endOfDay.setHours(23, 59, 59, 999);
-          return endOfDay.toISOString();
-
-        case 'startofweek':
-          const startOfWeek = new Date();
-          startOfWeek.setDate(startOfWeek.getDate() - startOfWeek.getDay());
-          startOfWeek.setHours(0, 0, 0, 0);
-          return startOfWeek.toISOString();
-
-        case 'endofweek':
-          const endOfWeek = new Date();
-          endOfWeek.setDate(endOfWeek.getDate() + (6 - endOfWeek.getDay()));
-          endOfWeek.setHours(23, 59, 59, 999);
-          return endOfWeek.toISOString();
-
-        case 'empty':
-        case 'null':
-          return null;
-
-        default:
-          return null;
+    case '>':
+    case '<':
+    case '>=':
+    case '<=': {
+      const bound = { '>': 'gt', '<': 'lt', '>=': 'gte', '<=': 'lte' }[clause.operator];
+      const raw = value.kind === 'literal' ? value.value : value.id;
+      const comparable = spec.type === 'number' ? Number(raw) : spec.type === 'date' ? dateValue(raw) : raw;
+      if (spec.type === 'number' && Number.isNaN(comparable)) {
+        throw new JQLSyntaxError(`"${raw}" is not a number`);
       }
+      return { range: { [spec.es]: { [bound]: comparable } } };
     }
+    default:
+      throw new JQLSyntaxError(`Unsupported operator ${clause.operator}`);
+  }
+}
 
-    return value;
+/**
+ * JQL parser facade: parse once, translate per request (functions resolve at translation
+ * time, so a saved filter using currentUser() is correct for whoever runs it).
+ */
+export class JQLParser {
+  /** Parses a full query, including ORDER BY. */
+  parseQuery(jql: string): JQLQuery {
+    return new Parser(tokenize(jql), jql.length).parseQuery();
+  }
+
+  /** Parses the filter part only; an empty query becomes an empty AND group. */
+  parse(jql: string): JQLNode {
+    return this.parseQuery(jql).where ?? { type: 'group', logical: 'AND', clauses: [] };
+  }
+
+  /** Translates an AST node into an Elasticsearch query. */
+  toElasticsearch(ast: JQLNode, context: JQLContext = {}): Record<string, unknown> {
+    switch (ast.type) {
+      case 'group': {
+        const children = ast.clauses.map((child) => this.toElasticsearch(child, context));
+        return ast.logical === 'AND'
+          ? { bool: { must: children } }
+          : { bool: { should: children, minimum_should_match: 1 } };
+      }
+      case 'not':
+        return not(this.toElasticsearch(ast.operand, context));
+      case 'clause':
+        return clauseToElasticsearch(ast, context);
+    }
+  }
+
+  /** Translates ORDER BY into an Elasticsearch sort list. */
+  toElasticsearchSort(orderBy: JQLSort[]): Record<string, unknown>[] {
+    return orderBy.map(({ field, direction }) => {
+      const spec = specFor(field);
+      if (spec.type === 'text' && !spec.exact) {
+        throw new JQLSyntaxError(`Cannot sort by ${field}`);
+      }
+      const sortField = spec.type === 'text' ? spec.exact! : spec.es;
+      return { [sortField]: { order: direction } };
+    });
   }
 }
 

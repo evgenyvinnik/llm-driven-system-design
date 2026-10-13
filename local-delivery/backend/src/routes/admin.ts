@@ -213,7 +213,8 @@ router.get('/analytics/hourly', async (_req: Request, res: Response) => {
 // Get daily order trends
 router.get('/analytics/daily', async (req: Request, res: Response) => {
   try {
-    const days = parseInt(req.query.days as string) || 7;
+    // Bounded and passed as a parameter rather than interpolated into the SQL.
+    const days = Math.min(Math.max(parseInt(req.query.days as string) || 7, 1), 90);
 
     const dailyData = await query<{
       date: string;
@@ -229,10 +230,10 @@ router.get('/analytics/daily', async (req: Request, res: Response) => {
         COUNT(*) FILTER (WHERE status = 'cancelled')::text as cancelled,
         COALESCE(SUM(total) FILTER (WHERE status = 'delivered'), 0)::text as revenue
       FROM orders
-      WHERE created_at > NOW() - INTERVAL '${days} days'
+      WHERE created_at > NOW() - make_interval(days => $1)
       GROUP BY DATE(created_at)
       ORDER BY date
-    `);
+    `, [days]);
 
     res.json({
       success: true,

@@ -11,6 +11,7 @@ interface Participant {
 
 interface LastMessage {
   id: string;
+  seq: number;
   content: string;
   content_type: string;
   sender_id: string;
@@ -45,6 +46,7 @@ export async function getConversations(userId: string): Promise<Conversation[]> 
       (
         SELECT json_build_object(
           'id', m.id,
+          'seq', m.seq,
           'content', m.content,
           'content_type', m.content_type,
           'sender_id', m.sender_id,
@@ -52,21 +54,24 @@ export async function getConversations(userId: string): Promise<Conversation[]> 
         )
         FROM messages m
         WHERE m.conversation_id = c.id AND m.deleted_at IS NULL
-        ORDER BY m.created_at DESC
+        ORDER BY m.seq DESC
         LIMIT 1
       ) as last_message,
+      -- Unread = messages from others above the user's read watermark (the
+      -- highest seq read on any of their devices), not "newer than the time
+      -- I last read something", which miscounts messages that arrived
+      -- while an older one was being read.
       (
         SELECT COUNT(*)::int
         FROM messages m
         WHERE m.conversation_id = c.id
           AND m.deleted_at IS NULL
-          AND m.created_at > COALESCE(
-            (SELECT last_read_at FROM read_receipts rr
-             WHERE rr.conversation_id = c.id AND rr.user_id = $1
-             ORDER BY last_read_at DESC LIMIT 1),
-            '1970-01-01'
+          AND m.sender_id IS DISTINCT FROM $1
+          AND m.seq > COALESCE(
+            (SELECT MAX(rr.last_read_seq) FROM read_receipts rr
+             WHERE rr.conversation_id = c.id AND rr.user_id = $1),
+            0
           )
-          AND m.sender_id != $1
       ) as unread_count,
       (
         SELECT json_agg(json_build_object(
@@ -124,24 +129,34 @@ export async function getConversation(
   return result.rows[0] || null;
 }
 
+const FIND_DIRECT_SQL = `SELECT c.id FROM conversations c
+  JOIN conversation_participants cp1 ON cp1.conversation_id = c.id AND cp1.user_id = $1
+  JOIN conversation_participants cp2 ON cp2.conversation_id = c.id AND cp2.user_id = $2
+  WHERE c.type = 'direct' AND cp1.left_at IS NULL AND cp2.left_at IS NULL
+  LIMIT 1`;
+
 export async function createDirectConversation(
   userId: string,
   otherUserId: string
 ): Promise<Conversation | null> {
-  // Check if direct conversation already exists
-  const existing = await query<{ id: string }>(
-    `SELECT c.id FROM conversations c
-     JOIN conversation_participants cp1 ON cp1.conversation_id = c.id AND cp1.user_id = $1
-     JOIN conversation_participants cp2 ON cp2.conversation_id = c.id AND cp2.user_id = $2
-     WHERE c.type = 'direct' AND cp1.left_at IS NULL AND cp2.left_at IS NULL`,
-    [userId, otherUserId]
-  );
-
+  // Fast path: the conversation usually exists already
+  const existing = await query<{ id: string }>(FIND_DIRECT_SQL, [userId, otherUserId]);
   if (existing.rows.length > 0) {
     return await getConversation(existing.rows[0].id, userId);
   }
 
-  return await transaction(async (client: PoolClient) => {
+  type Outcome = { existingId: string } | { conversation: Conversation };
+  const created = await transaction<Outcome>(async (client: PoolClient) => {
+    // Check-then-insert races when both people start the chat at once. A
+    // transaction-scoped advisory lock on the (sorted) pair serializes the
+    // two requests, and the second one finds the first one's conversation.
+    const pairKey = [userId, otherUserId].sort().join(':');
+    await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [pairKey]);
+    const again = await client.query<{ id: string }>(FIND_DIRECT_SQL, [userId, otherUserId]);
+    if (again.rows.length > 0) {
+      return { existingId: again.rows[0].id };
+    }
+
     const conversationResult = await client.query<Conversation>(
       `INSERT INTO conversations (type, created_by)
        VALUES ('direct', $1)
@@ -166,10 +181,17 @@ export async function createDirectConversation(
     );
 
     return {
-      ...conversation,
-      participants: participantsResult.rows,
+      conversation: {
+        ...conversation,
+        participants: participantsResult.rows,
+      },
     };
   });
+
+  if ('existingId' in created) {
+    return await getConversation(created.existingId, userId);
+  }
+  return created.conversation;
 }
 
 export async function createGroupConversation(
@@ -242,6 +264,15 @@ export async function addParticipant(
     throw new Error('Only admins can add participants');
   }
 
+  // Direct conversations have exactly two members by definition
+  const typeCheck = await query<{ type: string }>(
+    'SELECT type FROM conversations WHERE id = $1',
+    [conversationId]
+  );
+  if (typeCheck.rows[0]?.type !== 'group') {
+    throw new Error('Participants can only be added to group conversations');
+  }
+
   await query(
     `INSERT INTO conversation_participants (conversation_id, user_id, role)
      VALUES ($1, $2, 'member')
@@ -303,6 +334,19 @@ export async function getParticipantIds(conversationId: string): Promise<string[
     `SELECT user_id FROM conversation_participants
      WHERE conversation_id = $1 AND left_at IS NULL`,
     [conversationId]
+  );
+  return result.rows.map(r => r.user_id);
+}
+
+/** Users who share at least one active conversation with this user (presence audience). */
+export async function getConversationPeerIds(userId: string): Promise<string[]> {
+  const result = await query<{ user_id: string }>(
+    `SELECT DISTINCT peer.user_id
+     FROM conversation_participants mine
+     JOIN conversation_participants peer
+       ON peer.conversation_id = mine.conversation_id AND peer.left_at IS NULL
+     WHERE mine.user_id = $1 AND mine.left_at IS NULL AND peer.user_id <> $1`,
+    [userId]
   );
   return result.rows.map(r => r.user_id);
 }

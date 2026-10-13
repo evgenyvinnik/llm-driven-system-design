@@ -227,6 +227,33 @@ export function Spinner({ size = 'md' }: { size?: 'sm' | 'md' | 'lg' }) {
   );
 }
 
+/** Props for the ErrorBanner component */
+interface ErrorBannerProps {
+  /** Message to show; nothing renders when null */
+  message: string | null;
+  /** Called when the user dismisses the banner */
+  onDismiss?: () => void;
+}
+
+/**
+ * Inline error for a failed action (trigger, pause, retry). role="alert" makes screen
+ * readers announce it, since the failure is otherwise only a missing state change.
+ */
+export function ErrorBanner({ message, onDismiss }: ErrorBannerProps) {
+  if (!message) return null;
+
+  return (
+    <div role="alert" className="flex items-start justify-between rounded-md bg-red-50 p-3 text-sm text-red-700">
+      <span>{message}</span>
+      {onDismiss && (
+        <button onClick={onDismiss} className="ml-4 font-medium text-red-800 hover:text-red-900">
+          Dismiss
+        </button>
+      )}
+    </div>
+  );
+}
+
 /** Props for the Modal component */
 interface ModalProps {
   /** Controls modal visibility */

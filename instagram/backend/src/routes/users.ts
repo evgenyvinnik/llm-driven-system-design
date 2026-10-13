@@ -3,7 +3,7 @@ import multer from 'multer';
 import { query } from '../services/db.js';
 import { uploadProfilePicture } from '../services/storage.js';
 import { requireAuth, optionalAuth, AuthenticatedRequest } from '../middleware/auth.js';
-import { timelineAdd } from '../services/redis.js';
+import { backfillAfterFollow, removeAuthorFromTimeline } from '../services/feedService.js';
 import { followRateLimitMiddleware } from '../services/rateLimiter.js';
 import logger from '../services/logger.js';
 import { followsTotal } from '../services/metrics.js';
@@ -100,7 +100,7 @@ router.get('/me/saved', requireAuth as RequestHandler, async (req: Request, res:
              (SELECT COUNT(*) FROM post_media WHERE post_id = p.id) as media_count
       FROM saved_posts sp
       JOIN posts p ON sp.post_id = p.id
-      WHERE sp.user_id = $1
+      WHERE sp.user_id = $1 AND p.status = 'published'
     `;
     const params: unknown[] = [userId];
 
@@ -338,7 +338,7 @@ router.get('/:username/posts', optionalAuth as RequestHandler, async (req: Reque
              (SELECT media_url FROM post_media WHERE post_id = p.id ORDER BY order_index LIMIT 1) as thumbnail,
              (SELECT COUNT(*) FROM post_media WHERE post_id = p.id) as media_count
       FROM posts p
-      WHERE p.user_id = $1
+      WHERE p.user_id = $1 AND p.status = 'published'
     `;
     const params: unknown[] = [user.id];
 
@@ -432,15 +432,12 @@ router.post(
         `User ${currentUserId} followed ${targetUserId}`
       );
 
-      // Add target user's recent posts to follower's timeline
-      const recentPosts = await query<{ id: string; created_at: Date }>(
-        `SELECT id, created_at FROM posts WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50`,
-        [targetUserId]
+      // Copy the account's recent posts into our cached timeline (skipped for celebrity accounts,
+      // whose posts are merged at read time). The follow itself is already committed, so a cache
+      // failure here only delays those posts until the next timeline rebuild.
+      await backfillAfterFollow(currentUserId, targetUserId as string).catch((err: Error) =>
+        logger.warn({ error: err.message, followerId: currentUserId, followingId: targetUserId }, 'Timeline backfill failed')
       );
-
-      for (const post of recentPosts.rows) {
-        await timelineAdd(currentUserId, post.id, new Date(post.created_at).getTime());
-      }
 
       res.json({ message: 'User followed', idempotent: false });
     } catch (error) {
@@ -486,6 +483,11 @@ router.delete('/:userId/follow', requireAuth as RequestHandler, async (req: Requ
         followingId: targetUserId,
       },
       `User ${currentUserId} unfollowed ${targetUserId}`
+    );
+
+    // Without this the unfollowed account's posts stay in our precomputed timeline.
+    await removeAuthorFromTimeline(currentUserId, targetUserId as string).catch((err: Error) =>
+      logger.warn({ error: err.message, followerId: currentUserId, followingId: targetUserId }, 'Timeline cleanup failed')
     );
 
     res.json({ message: 'User unfollowed', idempotent: false });

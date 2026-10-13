@@ -1,7 +1,7 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useSyncExternalStore } from 'react';
 import { wsService } from '@/services/websocket';
 import { useChatStore } from '@/stores/chatStore';
-import type { WebSocketMessage } from '@/types';
+import type { ConnectionStatus, WebSocketMessage } from '@/types';
 
 /**
  * React hook that bridges the WebSocket service with the chat store.
@@ -44,4 +44,15 @@ export function useWebSocket() {
     sendReaction: wsService.sendReaction.bind(wsService),
     isConnected: wsService.isConnected(),
   };
+}
+
+/**
+ * Current WebSocket connection status, re-rendering on every change. Used to
+ * tell the user that messages are queued while the connection is down.
+ */
+export function useConnectionStatus(): ConnectionStatus {
+  return useSyncExternalStore(
+    (onChange) => wsService.subscribeStatus(onChange),
+    () => wsService.getStatus()
+  );
 }

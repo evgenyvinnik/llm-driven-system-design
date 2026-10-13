@@ -17,8 +17,6 @@ export interface Problem {
   memory_limit_mb: number;
   starter_code_python: string;
   starter_code_javascript: string;
-  solution_python?: string;
-  solution_javascript?: string;
   sampleTestCases: TestCase[];
   accepted_count: number;
   total_submissions: number;
@@ -68,6 +66,7 @@ export type SubmissionStatus =
   | 'wrong_answer'
   | 'time_limit_exceeded'
   | 'memory_limit_exceeded'
+  | 'output_limit_exceeded'
   | 'runtime_error'
   | 'compile_error'
   | 'system_error';

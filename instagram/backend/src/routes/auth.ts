@@ -8,6 +8,15 @@ import type { AuthenticatedRequest } from '../middleware/auth.js';
 
 const router = Router();
 
+/**
+ * Issues a fresh session id at every privilege change (login, registration). Reusing the
+ * pre-login id lets anyone who planted or observed that id ride the authenticated session.
+ */
+const regenerateSession = (req: { session: Request['session'] }): Promise<void> =>
+  new Promise((resolve, reject) => {
+    req.session.regenerate((err?: unknown) => (err ? reject(err) : resolve()));
+  });
+
 interface RegisterBody {
   username: string;
   email: string;
@@ -82,7 +91,8 @@ router.post('/register', async (req: Request<unknown, unknown, RegisterBody>, re
 
     const user = result.rows[0];
 
-    // Set session
+    // Set session (on a newly issued session id)
+    await regenerateSession(req);
     const session = (req as AuthenticatedRequest).session;
     session.userId = user.id;
     session.username = user.username;
@@ -117,8 +127,13 @@ router.post('/register', async (req: Request<unknown, unknown, RegisterBody>, re
       },
     });
   } catch (error) {
-    const err = error as Error;
+    const err = error as Error & { code?: string };
     authAttempts.labels('register', 'failure').inc();
+    if (err.code === '23505') {
+      // Two sign-ups raced past the existence check; the unique constraint decided.
+      res.status(409).json({ error: 'Username or email already exists' });
+      return;
+    }
     logger.error(
       {
         type: 'registration_error',
@@ -183,7 +198,8 @@ router.post('/login', loginRateLimiter, async (req: Request<unknown, unknown, Lo
       return;
     }
 
-    // Set session with role information
+    // Set session with role information (on a newly issued session id)
+    await regenerateSession(req);
     const session = (req as AuthenticatedRequest).session;
     session.userId = user.id;
     session.username = user.username;

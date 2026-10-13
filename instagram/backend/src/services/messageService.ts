@@ -158,6 +158,24 @@ export async function getOrCreateConversation(
 }
 
 /**
+ * True when `userId` is a participant of the conversation. Every conversation-scoped route
+ * checks this first; a conversation id alone must never grant access to its messages.
+ */
+export async function isConversationParticipant(conversationId: string, userId: string): Promise<boolean> {
+  if (!isCassandraConnected()) {
+    throw new Error('Cassandra not connected');
+  }
+
+  const client = getCassandraClient()!;
+  const result = await client.execute(
+    'SELECT user_id FROM conversation_participants WHERE conversation_id = ? AND user_id = ?',
+    [toUuid(conversationId), toUuid(userId)],
+    { prepare: true }
+  );
+  return result.rows.length > 0;
+}
+
+/**
  * Send a message in a conversation.
  */
 export async function sendMessage({
@@ -199,8 +217,9 @@ export async function sendMessage({
     { prepare: true }
   );
 
-  // Get all participants to update their conversation view
-  const participantsQuery = 'SELECT user_id FROM conversation_participants WHERE conversation_id = ?';
+  // Get all participants (with their denormalized display info) to update each inbox row
+  const participantsQuery =
+    'SELECT user_id, username, profile_picture FROM conversation_participants WHERE conversation_id = ?';
   const participantsResult = await client.execute(participantsQuery, [toUuid(conversationId)], { prepare: true });
 
   // Update conversation for each participant
@@ -208,9 +227,10 @@ export async function sendMessage({
   for (const row of participantsResult.rows) {
     const participantId = row.user_id.toString();
 
-    // Delete old entry (need to find it first by querying)
+    // The inbox row is clustered by last_message_at, so moving it to the top is delete + insert.
+    // Find the old row (one partition, bounded by the user's conversation count).
     const findOldQuery = `
-      SELECT last_message_at FROM conversations_by_user
+      SELECT last_message_at, unread_count FROM conversations_by_user
       WHERE user_id = ? AND conversation_id = ?
       ALLOW FILTERING
     `;
@@ -226,7 +246,8 @@ export async function sendMessage({
       });
     }
 
-    // Get other user info for this participant
+    // The row shows the OTHER participant's name and picture; carry them over from the
+    // participants table instead of blanking them on every message.
     const otherParticipant = participantsResult.rows.find((p) => p.user_id.toString() !== participantId);
 
     // Insert updated entry with new timestamp
@@ -238,7 +259,8 @@ export async function sendMessage({
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `;
 
-    const unreadCount = participantId === senderId ? 0 : 1; // Sender has 0 unread
+    const previousUnread = Number(oldEntry.rows[0]?.unread_count ?? 0);
+    const unreadCount = participantId === senderId ? 0 : previousUnread + 1;
 
     await client.execute(
       insertConv,
@@ -247,8 +269,8 @@ export async function sendMessage({
         now,
         toUuid(conversationId),
         otherParticipant?.user_id || null,
-        '',
-        '', // Username/profile will be fetched from participants table
+        otherParticipant?.username ?? '',
+        otherParticipant?.profile_picture ?? null,
         preview,
         toUuid(senderId),
         unreadCount,
@@ -376,8 +398,21 @@ export async function markConversationRead(
     { prepare: true }
   );
 
-  // Reset unread count - need to update the conversation entry
-  // This is a simplification; in production, you'd update the specific row
+  // Reset the unread badge on this user's inbox row (the full primary key is needed to update it)
+  const findRow = `
+    SELECT last_message_at FROM conversations_by_user
+    WHERE user_id = ? AND conversation_id = ?
+    ALLOW FILTERING
+  `;
+  const row = await client.execute(findRow, [toUuid(userId), toUuid(conversationId)], { prepare: true });
+  if (row.rows.length > 0) {
+    await client.execute(
+      'UPDATE conversations_by_user SET unread_count = 0 WHERE user_id = ? AND last_message_at = ? AND conversation_id = ?',
+      [toUuid(userId), row.rows[0].last_message_at, toUuid(conversationId)],
+      { prepare: true }
+    );
+  }
+
   logger.info({ conversationId, userId }, 'Marked conversation as read');
 }
 

@@ -7,11 +7,11 @@
 import { Router, Response } from 'express';
 import { asyncHandler } from './types';
 import { authenticate, authorize } from '../shared/auth';
-import { idempotencyMiddleware, markJobCreated, clearJobIdempotency } from '../shared/idempotency';
+import { idempotencyMiddleware } from '../shared/idempotency';
 import { jobsScheduledTotal } from '../shared/metrics';
 import * as db from '../db/repository';
-import { queue } from '../queue/reliable-queue';
-import { ApiResponse, CreateJobInput, UpdateJobInput, JobStatus } from '../types/index';
+import { ApiResponse, JobStatus } from '../types/index';
+import { validateCreateJob, validateUpdateJob } from './validation';
 
 const router = Router();
 
@@ -26,6 +26,16 @@ function notFound(res: Response): void {
   res.status(404).json({ success: false, error: 'Job not found' } as ApiResponse<never>);
 }
 
+/** Sends a 400 with the validation problems found in the request body. */
+function invalid(res: Response, errors: string[]): void {
+  res.status(400).json({ success: false, error: 'Invalid job definition', details: errors });
+}
+
+/** True for a PostgreSQL unique-constraint violation (here: jobs.name). */
+function isUniqueViolation(error: unknown): boolean {
+  return (error as { code?: string })?.code === '23505';
+}
+
 /**
  * POST /api/v1/jobs - Create a new scheduled job.
  *
@@ -38,43 +48,48 @@ function notFound(res: Response): void {
  *
  * @param {CreateJobInput} req.body - Job creation parameters
  * @param {string} req.body.name - Unique job name
- * @param {string} req.body.handler - Handler function identifier
- * @param {string} [req.body.cron_expression] - Cron schedule expression
- * @param {number} [req.body.priority] - Job priority (higher = more urgent)
+ * @param {string} req.body.handler - Registered handler identifier
+ * @param {string} [req.body.schedule] - Cron expression (UTC) for a recurring job
+ * @param {string} [req.body.scheduled_at] - ISO timestamp for a one-time job
+ * @param {number} [req.body.priority] - Job priority 0-100 (higher = more urgent)
  * @param {object} [req.body.payload] - JSON payload passed to handler
+ * @param {string} [req.body.misfire_policy] - 'fire_once' (default) or 'skip'
  *
  * @returns {ApiResponse<Job>} 201 - Created job object
- * @returns {ApiResponse} 400 - Missing required fields
+ * @returns {ApiResponse} 400 - Invalid definition (details lists each problem)
  * @returns {ApiResponse} 409 - Job with same name already exists
  *
  * @example
  * ```bash
  * curl -X POST /api/v1/jobs \
- *   -H "Idempotency-Key: unique-key-123" \
- *   -d '{"name": "daily-report", "handler": "email", "cron_expression": "0 9 * * *"}'
+ *   -H "Idempotency-Key: 4f9c2a1e-..." \
+ *   -d '{"name": "daily-report", "handler": "http.webhook", "schedule": "0 9 * * *"}'
  * ```
  */
 router.post('/', authenticate, authorize('admin'), idempotencyMiddleware(), asyncHandler(async (req, res) => {
-  const input: CreateJobInput = req.body;
-  if (!input.name || !input.handler) {
-    res.status(400).json({ success: false, error: 'Name and handler are required' } as ApiResponse<never>);
-    return;
-  }
+  const validation = validateCreateJob(req.body);
+  if (!validation.ok) { invalid(res, validation.errors); return; }
+  const input = validation.value;
 
-  const existingJob = await db.getJobByName(input.name);
-  if (existingJob) {
+  const conflict = (existingJobId?: string) => {
     res.status(409).json({
       success: false,
       error: `Job with name "${input.name}" already exists`,
-      data: { existingJobId: existingJob.id },
+      data: existingJobId ? { existingJobId } : undefined,
     } as ApiResponse<{ existingJobId: string }>);
-    return;
-  }
+  };
 
-  const job = await db.createJob(input);
-  await markJobCreated(input.name, job.id);
-  jobsScheduledTotal.inc({ handler: job.handler, priority: job.priority.toString() });
-  res.status(201).json({ success: true, data: job, message: 'Job created successfully' } as ApiResponse<typeof job>);
+  const existingJob = await db.getJobByName(input.name);
+  if (existingJob) { conflict(existingJob.id); return; }
+
+  try {
+    const job = await db.createJob(input);
+    res.status(201).json({ success: true, data: job, message: 'Job created successfully' } as ApiResponse<typeof job>);
+  } catch (error) {
+    // Two concurrent creates can both pass the lookup; the unique index decides.
+    if (isUniqueViolation(error)) { conflict(); return; }
+    throw error;
+  }
 }));
 
 /**
@@ -147,21 +162,32 @@ router.get('/:id', authenticate, asyncHandler(async (req, res) => {
  * @param {UpdateJobInput} req.body - Fields to update
  * @param {string} [req.body.name] - Updated job name
  * @param {string} [req.body.handler] - Updated handler identifier
- * @param {string} [req.body.cron_expression] - Updated cron schedule
+ * @param {string} [req.body.schedule] - Updated cron schedule (next run recomputed)
  * @param {number} [req.body.priority] - Updated priority
  * @param {object} [req.body.payload] - Updated payload
  *
  * @returns {ApiResponse<Job>} 200 - Updated job object
+ * @returns {ApiResponse} 400 - Invalid field values
  * @returns {ApiResponse} 404 - Job not found
  *
  * @example
  * curl -X PUT /api/v1/jobs/550e8400-e29b-41d4-a716-446655440000 -d '{"priority": 10}'
  */
 router.put('/:id', authenticate, authorize('admin'), asyncHandler(async (req, res) => {
-  const input: UpdateJobInput = req.body;
-  const job = await db.updateJob(req.params.id, input);
-  if (!job) { notFound(res); return; }
-  res.json({ success: true, data: job, message: 'Job updated successfully' } as ApiResponse<typeof job>);
+  const validation = validateUpdateJob(req.body);
+  if (!validation.ok) { invalid(res, validation.errors); return; }
+
+  try {
+    const job = await db.updateJob(req.params.id, validation.value);
+    if (!job) { notFound(res); return; }
+    res.json({ success: true, data: job, message: 'Job updated successfully' } as ApiResponse<typeof job>);
+  } catch (error) {
+    if (isUniqueViolation(error)) {
+      res.status(409).json({ success: false, error: `Job with name "${validation.value.name}" already exists` });
+      return;
+    }
+    throw error;
+  }
 }));
 
 /**
@@ -187,8 +213,7 @@ router.delete('/:id', authenticate, authorize('admin'), asyncHandler(async (req,
   const job = await db.getJob(req.params.id);
   if (!job) { notFound(res); return; }
 
-  const deleted = await db.deleteJob(req.params.id);
-  if (deleted) await clearJobIdempotency(job.name);
+  await db.deleteJob(req.params.id);
   res.json({ success: true, message: 'Job deleted successfully' } as ApiResponse<never>);
 }));
 
@@ -214,7 +239,12 @@ router.delete('/:id', authenticate, authorize('admin'), asyncHandler(async (req,
  */
 router.post('/:id/pause', authenticate, authorize('admin'), asyncHandler(async (req, res) => {
   const job = await db.pauseJob(req.params.id);
-  if (!job) { notFound(res); return; }
+  if (!job) {
+    const existing = await db.getJob(req.params.id);
+    if (!existing) { notFound(res); return; }
+    res.status(409).json({ success: false, error: `Job cannot be paused while ${existing.status}` } as ApiResponse<never>);
+    return;
+  }
   res.json({ success: true, data: job, message: 'Job paused successfully' } as ApiResponse<typeof job>);
 }));
 
@@ -267,13 +297,18 @@ router.post('/:id/resume', authenticate, authorize('admin'), asyncHandler(async 
  * curl -X POST /api/v1/jobs/550e8400-e29b-41d4-a716-446655440000/trigger
  * ```
  */
-router.post('/:id/trigger', authenticate, asyncHandler(async (req, res) => {
+router.post('/:id/trigger', authenticate, idempotencyMiddleware(), asyncHandler(async (req, res) => {
   const job = await db.getJob(req.params.id);
   if (!job) { notFound(res); return; }
+  if (job.status === JobStatus.PAUSED) {
+    // Executions of a paused job are held by the claim query; queuing one would only
+    // make it run later, on resume, which is not what "Trigger now" means.
+    res.status(409).json({ success: false, error: 'Job is paused; resume it before triggering' } as ApiResponse<never>);
+    return;
+  }
 
-  const execution = await db.createExecution(job.id, new Date());
-  await queue.enqueue(execution.id, job.id, job.priority);
-  await db.updateJobStatus(job.id, JobStatus.QUEUED);
+  // The execution row is the queue entry; workers claim it from PostgreSQL.
+  const execution = await db.enqueueManualRun(job.id, job.priority);
   jobsScheduledTotal.inc({ handler: job.handler, priority: job.priority.toString() });
 
   res.json({

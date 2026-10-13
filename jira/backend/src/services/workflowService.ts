@@ -82,6 +82,8 @@ export async function getWorkflowByProject(projectId: string): Promise<WorkflowW
 /**
  * Gets all transitions available for an issue from its current status.
  * Checks transition conditions against the user and their project roles.
+ * The list only decides which buttons to render; executing a transition evaluates the
+ * same rules again, so a stale list can never authorize anything.
  *
  * @param issue - The issue to get transitions for
  * @param user - User requesting the transitions
@@ -96,259 +98,101 @@ export async function getAvailableTransitions(
   const workflow = await getWorkflowByProject(issue.project_id);
   if (!workflow) return [];
 
-  const availableTransitions: Transition[] = [];
-
-  for (const transition of workflow.transitions) {
-    // Check if transition is valid from current status
-    if (
-      transition.from_status_id !== null &&
-      transition.from_status_id !== issue.status_id
-    ) {
-      continue;
-    }
-
-    // Check conditions
-    let conditionsPassed = true;
-    for (const condition of transition.conditions) {
-      const passed = await checkCondition(condition, issue, user, projectRoles);
-      if (!passed) {
-        conditionsPassed = false;
-        break;
-      }
-    }
-
-    if (conditionsPassed) {
-      availableTransitions.push(transition);
-    }
-  }
-
-  return availableTransitions;
-}
-
-/**
- * Executes a workflow transition on an issue.
- * Validates conditions and validators, updates the issue status,
- * records history, and runs post-functions.
- *
- * @param issue - Issue to transition
- * @param transitionId - ID of the transition to execute
- * @param user - User executing the transition
- * @param projectRoles - Roles the user has in the project
- * @param updateData - Additional data for validators
- * @returns Result object with success status and error message or new status ID
- */
-export async function executeTransition(
-  issue: Issue,
-  transitionId: number,
-  user: User,
-  projectRoles: string[],
-  updateData?: Record<string, unknown>
-): Promise<{ success: boolean; error?: string; newStatusId?: number }> {
-  const workflow = await getWorkflowByProject(issue.project_id);
-  if (!workflow) {
-    return { success: false, error: 'Workflow not found' };
-  }
-
-  const transition = workflow.transitions.find((t) => t.id === transitionId);
-  if (!transition) {
-    return { success: false, error: 'Transition not found' };
-  }
-
-  // Check if transition is valid from current status
-  if (
-    transition.from_status_id !== null &&
-    transition.from_status_id !== issue.status_id
-  ) {
-    return {
-      success: false,
-      error: 'Transition not allowed from current status',
-    };
-  }
-
-  // Check conditions
-  for (const condition of transition.conditions) {
-    const passed = await checkCondition(condition, issue, user, projectRoles);
-    if (!passed) {
-      return {
-        success: false,
-        error: `Condition failed: ${condition.type}`,
-      };
-    }
-  }
-
-  // Run validators
-  for (const validator of transition.validators) {
-    const valid = await runValidator(validator, issue, updateData);
-    if (!valid.passed) {
-      return {
-        success: false,
-        error: `Validation failed: ${valid.message}`,
-      };
-    }
-  }
-
-  // Update issue status
-  const previousStatusId = issue.status_id;
-  await query(
-    'UPDATE issues SET status_id = $1, updated_at = NOW() WHERE id = $2',
-    [transition.to_status_id, issue.id]
+  return workflow.transitions.filter(
+    (transition) =>
+      (transition.from_status_id === null || transition.from_status_id === issue.status_id) &&
+      evaluateConditions(transition.conditions, issue, user, projectRoles) === null
   );
-
-  // Record history
-  await recordStatusHistory(issue.id, user.id, previousStatusId, transition.to_status_id);
-
-  // Run post-functions
-  for (const postFunc of transition.post_functions) {
-    await runPostFunction(postFunc, issue, user, transition);
-  }
-
-  return { success: true, newStatusId: transition.to_status_id };
 }
 
 /**
- * Checks if a transition condition is satisfied.
- * Supports: always, user_in_role, issue_assignee, user_in_group.
+ * Evaluates a transition's conditions: may this user attempt it?
+ * Returns null when every condition passes, otherwise the reason it is blocked.
+ * Fails closed: a condition type the engine cannot evaluate (unknown type, or groups,
+ * which this project has no directory for) blocks the transition instead of allowing it.
  *
- * @param condition - Condition to check
+ * @param conditions - Conditions configured on the transition
  * @param issue - Issue being transitioned
  * @param user - User attempting the transition
  * @param projectRoles - User's roles in the project
- * @returns True if condition is satisfied
  */
-async function checkCondition(
-  condition: TransitionCondition,
+export function evaluateConditions(
+  conditions: TransitionCondition[],
   issue: Issue,
   user: User,
   projectRoles: string[]
-): Promise<boolean> {
-  switch (condition.type) {
-    case 'always':
-      return true;
-
-    case 'user_in_role':
-      const requiredRole = condition.config.role as string;
-      return projectRoles.includes(requiredRole);
-
-    case 'issue_assignee':
-      return issue.assignee_id === user.id;
-
-    case 'user_in_group':
-      // For simplicity, we'll skip group checking in this implementation
-      return true;
-
-    default:
-      return true;
+): string | null {
+  for (const condition of conditions) {
+    switch (condition.type) {
+      case 'always':
+        break;
+      case 'user_in_role': {
+        const role = String(condition.config?.role ?? '');
+        if (!projectRoles.includes(role)) return `Only users with the ${role} role can do this`;
+        break;
+      }
+      case 'issue_assignee':
+        if (issue.assignee_id !== user.id) return 'Only the assignee can do this';
+        break;
+      case 'user_in_group':
+        return 'Group conditions are not supported, so this transition is blocked';
+      default:
+        return `Unknown condition "${(condition as { type: string }).type}" blocks this transition`;
+    }
   }
+  return null;
+}
+
+/** Issue fields a validator may inspect. */
+const VALIDATABLE_FIELDS = new Set([
+  'summary', 'description', 'issue_type', 'priority', 'assignee_id', 'reporter_id',
+  'epic_id', 'sprint_id', 'story_points', 'labels', 'components',
+]);
+
+function readField(issue: Issue, field: string): unknown {
+  if (field.startsWith('custom_fields.')) {
+    return issue.custom_fields?.[field.slice('custom_fields.'.length)];
+  }
+  return VALIDATABLE_FIELDS.has(field) ? (issue as unknown as Record<string, unknown>)[field] : undefined;
 }
 
 /**
- * Runs a transition validator to check issue data.
- * Supports: field_required, field_value.
+ * Evaluates a transition's validators against the issue as stored: is it fit to move?
+ * Returns null when all pass, otherwise the failing field and message (answered with 422
+ * so the client can point at the field). Unknown validator types fail closed.
  *
- * @param validator - Validator to run
- * @param issue - Issue being validated
- * @param updateData - Additional data provided during transition
- * @returns Object with passed status and optional error message
+ * @param validators - Validators configured on the transition
+ * @param issue - Issue being transitioned
  */
-async function runValidator(
-  validator: TransitionValidator,
-  issue: Issue,
-  updateData?: Record<string, unknown>
-): Promise<{ passed: boolean; message?: string }> {
-  switch (validator.type) {
-    case 'field_required':
-      const fieldName = validator.config.field as string;
-      const fieldValue = updateData?.[fieldName] ?? (issue as unknown as Record<string, unknown>)[fieldName];
-      if (!fieldValue || (typeof fieldValue === 'string' && fieldValue.trim() === '')) {
-        return { passed: false, message: `Field '${fieldName}' is required` };
+export function evaluateValidators(
+  validators: TransitionValidator[],
+  issue: Issue
+): { field: string; message: string } | null {
+  for (const validator of validators) {
+    const field = String(validator.config?.field ?? '');
+    switch (validator.type) {
+      case 'field_required': {
+        const value = readField(issue, field);
+        const empty =
+          value === null ||
+          value === undefined ||
+          (typeof value === 'string' && value.trim() === '') ||
+          (Array.isArray(value) && value.length === 0);
+        if (empty) return { field, message: `${field} is required for this transition` };
+        break;
       }
-      return { passed: true };
-
-    case 'field_value':
-      const checkField = validator.config.field as string;
-      const expectedValue = validator.config.value;
-      const actualValue = updateData?.[checkField] ?? (issue as unknown as Record<string, unknown>)[checkField];
-      if (actualValue !== expectedValue) {
-        return { passed: false, message: `Field '${checkField}' must be '${expectedValue}'` };
+      case 'field_value': {
+        const expected = validator.config?.value;
+        if (readField(issue, field) !== expected) {
+          return { field, message: `${field} must be ${JSON.stringify(expected)} for this transition` };
+        }
+        break;
       }
-      return { passed: true };
-
-    default:
-      return { passed: true };
+      default:
+        return { field, message: `Unknown validator "${validator.type}" blocks this transition` };
+    }
   }
-}
-
-/**
- * Runs a post-function after a successful transition.
- * Supports: assign_to_current_user, clear_field, update_field, send_notification.
- *
- * @param postFunc - Post-function to run
- * @param issue - Issue that was transitioned
- * @param user - User who executed the transition
- * @param transition - The transition that was executed
- */
-async function runPostFunction(
-  postFunc: TransitionPostFunction,
-  issue: Issue,
-  user: User,
-  _transition: Transition
-): Promise<void> {
-  switch (postFunc.type) {
-    case 'assign_to_current_user':
-      await query('UPDATE issues SET assignee_id = $1 WHERE id = $2', [user.id, issue.id]);
-      break;
-
-    case 'clear_field':
-      const fieldToClear = postFunc.config.field as string;
-      if (fieldToClear === 'assignee_id') {
-        await query('UPDATE issues SET assignee_id = NULL WHERE id = $1', [issue.id]);
-      }
-      break;
-
-    case 'update_field':
-      const fieldToUpdate = postFunc.config.field as string;
-      const newValue = postFunc.config.value;
-      // For safety, only allow certain fields
-      const allowedFields = ['priority', 'story_points'];
-      if (allowedFields.includes(fieldToUpdate)) {
-        await query(`UPDATE issues SET ${fieldToUpdate} = $1 WHERE id = $2`, [newValue, issue.id]);
-      }
-      break;
-
-    case 'send_notification':
-      // TODO: Implement notification sending
-      console.log(`Would send notification for issue ${issue.key}: ${postFunc.config.message}`);
-      break;
-  }
-}
-
-/**
- * Records a status change in issue history for audit trail.
- *
- * @param issueId - ID of the issue
- * @param userId - ID of the user who made the change
- * @param oldStatusId - Previous status ID
- * @param newStatusId - New status ID
- */
-async function recordStatusHistory(
-  issueId: number,
-  userId: string,
-  oldStatusId: number,
-  newStatusId: number
-): Promise<void> {
-  // Get status names for history
-  const { rows: statuses } = await query<{ id: number; name: string }>(
-    'SELECT id, name FROM statuses WHERE id = ANY($1)',
-    [[oldStatusId, newStatusId]]
-  );
-
-  const statusMap = new Map(statuses.map((s) => [s.id, s.name]));
-
-  await query(
-    `INSERT INTO issue_history (issue_id, user_id, field, old_value, new_value)
-     VALUES ($1, $2, 'status', $3, $4)`,
-    [issueId, userId, statusMap.get(oldStatusId), statusMap.get(newStatusId)]
-  );
+  return null;
 }
 
 /**
@@ -397,8 +241,46 @@ export async function createStatus(
   return rows[0];
 }
 
+/** Thrown when a workflow definition is invalid; routes answer it with 422. */
+export class WorkflowDefinitionError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'WorkflowDefinitionError';
+  }
+}
+
+const CONDITION_TYPES = new Set(['always', 'user_in_role', 'issue_assignee']);
+const VALIDATOR_TYPES = new Set(['field_required', 'field_value']);
+const POST_FUNCTION_TYPES = new Set(['assign_to_current_user', 'clear_field', 'update_field', 'send_notification']);
+
+/**
+ * Checks transition rules when the workflow is saved, so a typo in an admin's config is
+ * rejected once instead of blocking every issue that later tries the transition.
+ * Returns the problems found (empty when valid).
+ */
+export function findRuleProblems(
+  conditions: TransitionCondition[],
+  validators: TransitionValidator[],
+  postFunctions: TransitionPostFunction[]
+): string[] {
+  const problems: string[] = [];
+  for (const c of conditions) {
+    if (!CONDITION_TYPES.has(c?.type)) problems.push(`Unsupported condition "${c?.type}"`);
+  }
+  for (const v of validators) {
+    if (!VALIDATOR_TYPES.has(v?.type)) problems.push(`Unsupported validator "${v?.type}"`);
+    else if (!v.config?.field) problems.push(`Validator "${v.type}" needs config.field`);
+  }
+  for (const p of postFunctions) {
+    if (!POST_FUNCTION_TYPES.has(p?.type)) problems.push(`Unsupported post-function "${p?.type}"`);
+  }
+  return problems;
+}
+
 /**
  * Creates a transition between statuses in a workflow.
+ * Rejects definitions that would strand issues: both statuses must belong to this
+ * workflow and every rule type must be one the engine can evaluate.
  * Invalidates the workflow cache.
  *
  * @param workflowId - ID of the workflow
@@ -409,6 +291,7 @@ export async function createStatus(
  * @param validators - Array of validators to run
  * @param postFunctions - Array of post-functions to execute
  * @returns Newly created transition
+ * @throws WorkflowDefinitionError - If the definition is invalid
  */
 export async function createTransition(
   workflowId: number,
@@ -419,6 +302,19 @@ export async function createTransition(
   validators: TransitionValidator[] = [],
   postFunctions: TransitionPostFunction[] = []
 ): Promise<Transition> {
+  const problems = findRuleProblems(conditions, validators, postFunctions);
+  const statusIds = [toStatusId, ...(fromStatusId === null ? [] : [fromStatusId])];
+  const { rows: owned } = await query<{ id: number }>(
+    'SELECT id FROM statuses WHERE workflow_id = $1 AND id = ANY($2::int[])',
+    [workflowId, statusIds]
+  );
+  if (owned.length !== new Set(statusIds).size) {
+    problems.push('Both statuses must belong to this workflow');
+  }
+  if (problems.length > 0) {
+    throw new WorkflowDefinitionError(problems.join('; '));
+  }
+
   const { rows } = await query<Transition>(
     `INSERT INTO transitions (workflow_id, name, from_status_id, to_status_id, conditions, validators, post_functions)
      VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,

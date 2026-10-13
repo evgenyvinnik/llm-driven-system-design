@@ -83,8 +83,11 @@ export const usersApi = {
       body: JSON.stringify(data),
     }),
 
-  search: (query: string) =>
-    request<{ users: import('../types').User[] }>(`/users?q=${encodeURIComponent(query)}`),
+  search: (query: string, signal?: AbortSignal) =>
+    request<{ users: import('../types').User[]; source: 'elasticsearch' | 'postgres' }>(
+      `/users?q=${encodeURIComponent(query)}`,
+      { signal }
+    ),
 
   addExperience: (data: Partial<import('../types').Experience>) =>
     request<{ experience: import('../types').Experience }>('/users/me/experiences', {
@@ -129,7 +132,7 @@ export const connectionsApi = {
     request<{ requests: import('../types').ConnectionRequest[] }>('/connections/requests'),
 
   sendRequest: (userId: number, message?: string) =>
-    request<{ request: import('../types').ConnectionRequest }>('/connections/request', {
+    request<import('../types').SendRequestResult>('/connections/request', {
       method: 'POST',
       body: JSON.stringify({ userId, message }),
     }),
@@ -140,11 +143,15 @@ export const connectionsApi = {
   rejectRequest: (requestId: number) =>
     request<{ message: string }>(`/connections/requests/${requestId}/reject`, { method: 'POST' }),
 
+  withdrawRequest: (requestId: number) =>
+    request<{ message: string }>(`/connections/requests/${requestId}/withdraw`, { method: 'POST' }),
+
   removeConnection: (userId: number) =>
     request<{ message: string }>(`/connections/${userId}`, { method: 'DELETE' }),
 
-  getConnectionDegree: (userId: number) =>
-    request<{ degree: number | null }>(`/connections/degree/${userId}`),
+  /** Degree, invitation state, mutual count and the "how you're connected" path */
+  getRelationship: (userId: number) =>
+    request<import('../types').Relationship>(`/connections/degree/${userId}`),
 
   getMutualConnections: (userId: number) =>
     request<{ mutual_connections: import('../types').User[] }>(`/connections/mutual/${userId}`),

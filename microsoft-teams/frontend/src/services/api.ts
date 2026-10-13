@@ -31,7 +31,10 @@ export const authApi = {
       body: JSON.stringify({ username, email, password }),
     }),
   logout: () => request('/auth/logout', { method: 'POST' }),
-  me: () => request<{ user: { id: string; username: string; role: string } }>('/auth/me'),
+  me: () =>
+    request<{ user: { id: string; username: string; displayName?: string; role: string } }>(
+      '/auth/me',
+    ),
 };
 
 /** Organization API client for listing, creating, and managing org membership. */
@@ -100,18 +103,20 @@ export const channelApi = {
 
 /** Message API client for listing, sending, editing, deleting, and thread retrieval. */
 export const messageApi = {
-  list: (channelId: string, before?: string, limit?: number) => {
-    let url = `/messages?channelId=${channelId}`;
-    if (before) url += `&before=${before}`;
-    if (limit) url += `&limit=${limit}`;
-    return request<{ messages: import('../types').Message[] }>(url);
+  /** Newest page when `beforeSeq` is omitted; otherwise the page of messages older than it. */
+  list: (channelId: string, beforeSeq?: number, limit?: number) => {
+    const params = new URLSearchParams({ channelId });
+    if (beforeSeq) params.set('before', String(beforeSeq));
+    if (limit) params.set('limit', String(limit));
+    return request<import('../types').MessagePage>(`/messages?${params}`);
   },
   getThread: (messageId: string) =>
     request<{ messages: import('../types').Message[] }>(`/messages/${messageId}/thread`),
-  send: (channelId: string, content: string, parentMessageId?: string) =>
+  /** `clientMessageId` must be reused on every retry of the same message. */
+  send: (channelId: string, content: string, clientMessageId: string, parentMessageId?: string) =>
     request<{ message: import('../types').Message }>('/messages', {
       method: 'POST',
-      body: JSON.stringify({ channelId, content, parentMessageId }),
+      body: JSON.stringify({ channelId, content, clientMessageId, parentMessageId }),
     }),
   edit: (messageId: string, content: string) =>
     request<{ message: import('../types').Message }>(`/messages/${messageId}`, {

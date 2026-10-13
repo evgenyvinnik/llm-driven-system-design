@@ -9,9 +9,9 @@ import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { authenticate, requireDriver } from '../middleware/auth.js';
 import {
-  getDriverById as _getDriverById,
   getDriverWithUser,
-  updateDriverStatus,
+  goOnline,
+  goOffline,
   updateDriverLocation,
   getDriverStats,
 } from '../services/driverService.js';
@@ -20,13 +20,30 @@ import {
   getOrderWithDetails,
   acceptDriverOffer,
   rejectDriverOffer,
-  updateOrderStatus,
+  transitionOrder,
   completeDelivery,
   getPendingOfferForDriver,
 } from '../services/order/index.js';
-import { publisher as _publisher } from '../utils/redis.js';
+import { locationUpdateSchema } from '../shared/schemas.js';
+import { sendError } from '../shared/errors.js';
 
 const router = Router();
+
+/**
+ * Parses a location body, answering 422 itself when it is invalid.
+ */
+function parseLocation(req: Request, res: Response) {
+  const parsed = locationUpdateSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(422).json({
+      success: false,
+      error: 'Location (lat, lng) is required and must be in range',
+      code: 'LOCATION_INVALID',
+    });
+    return null;
+  }
+  return parsed.data;
+}
 
 // Get driver profile
 router.get('/profile', authenticate, requireDriver, async (req: Request, res: Response) => {
@@ -51,33 +68,22 @@ router.get('/profile', authenticate, requireDriver, async (req: Request, res: Re
       },
     });
   } catch (error) {
-    console.error('Get driver profile error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to get driver profile',
-    });
+    sendError(res, error, 'Failed to get driver profile');
   }
 });
 
-// Go online
+// Go online: offline -> available (a busy courier stays busy), then record the position
 router.post('/go-online', authenticate, requireDriver, async (req: Request, res: Response) => {
   try {
-    const { lat, lng } = req.body;
+    const location = parseLocation(req, res);
+    if (!location) return;
 
-    if (!lat || !lng) {
-      res.status(400).json({
-        success: false,
-        error: 'Location (lat, lng) is required',
-      });
+    const driver = await goOnline(req.userId!);
+    if (!driver) {
+      res.status(404).json({ success: false, error: 'Driver profile not found' });
       return;
     }
-
-    // Update status and location
-    const driver = await updateDriverStatus(req.userId!, 'available');
-
-    if (driver) {
-      await updateDriverLocation(req.userId!, lat, lng);
-    }
+    await updateDriverLocation(req.userId!, location.lat, location.lng);
 
     res.json({
       success: true,
@@ -85,69 +91,56 @@ router.post('/go-online', authenticate, requireDriver, async (req: Request, res:
       message: 'You are now online',
     });
   } catch (error) {
-    console.error('Go online error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to go online',
-    });
+    sendError(res, error, 'Failed to go online');
   }
 });
 
-// Go offline
+// Go offline: refused while the courier holds an active delivery (checked in the same UPDATE)
 router.post('/go-offline', authenticate, requireDriver, async (req: Request, res: Response) => {
   try {
-    // Check if driver has active orders
-    const activeOrders = await getDriverOrders(req.userId!);
+    const result = await goOffline(req.userId!);
 
-    if (activeOrders.length > 0) {
-      res.status(400).json({
+    if (result.status === 'has_active_orders') {
+      res.status(409).json({
         success: false,
         error: 'Cannot go offline with active deliveries',
+        code: 'ACTIVE_DELIVERIES',
       });
       return;
     }
-
-    const driver = await updateDriverStatus(req.userId!, 'offline');
+    if (result.status === 'not_found') {
+      res.status(404).json({ success: false, error: 'Driver profile not found' });
+      return;
+    }
 
     res.json({
       success: true,
-      data: driver,
+      data: result.driver,
       message: 'You are now offline',
     });
   } catch (error) {
-    console.error('Go offline error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to go offline',
-    });
+    sendError(res, error, 'Failed to go offline');
   }
 });
 
-// Update location
+// Update location: Redis on every ping, PostgreSQL at most every 10 s
 router.post('/location', authenticate, requireDriver, async (req: Request, res: Response) => {
   try {
-    const { lat, lng, _speed, _heading } = req.body;
+    const location = parseLocation(req, res);
+    if (!location) return;
 
-    if (!lat || !lng) {
-      res.status(400).json({
-        success: false,
-        error: 'Location (lat, lng) is required',
-      });
-      return;
-    }
-
-    await updateDriverLocation(req.userId!, lat, lng);
+    const { persisted } = await updateDriverLocation(req.userId!, location.lat, location.lng, {
+      speed: location.speed,
+      heading: location.heading,
+    });
 
     res.json({
       success: true,
+      data: { persisted },
       message: 'Location updated',
     });
   } catch (error) {
-    console.error('Update location error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to update location',
-    });
+    sendError(res, error, 'Failed to update location');
   }
 });
 
@@ -161,15 +154,11 @@ router.get('/orders', authenticate, requireDriver, async (req: Request, res: Res
       data: orders,
     });
   } catch (error) {
-    console.error('Get orders error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to get orders',
-    });
+    sendError(res, error, 'Failed to get orders');
   }
 });
 
-// Get pending offer
+// Get pending offer (the app calls this on every (re)connect, so a missed push is recovered)
 router.get('/offers/pending', authenticate, requireDriver, async (req: Request, res: Response) => {
   try {
     const offer = await getPendingOfferForDriver(req.userId!);
@@ -192,28 +181,28 @@ router.get('/offers/pending', authenticate, requireDriver, async (req: Request, 
       },
     });
   } catch (error) {
-    console.error('Get pending offer error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to get pending offer',
-    });
+    sendError(res, error, 'Failed to get pending offer');
   }
 });
 
-// Accept offer
+/** Response for each way an Accept can fail; all are 409 Conflict. */
+const ACCEPT_FAILURES = {
+  offer_unavailable: { error: 'Offer expired or already answered', code: 'OFFER_UNAVAILABLE' },
+  order_unavailable: { error: 'Order is no longer available', code: 'ORDER_UNAVAILABLE' },
+  driver_offline: { error: 'Go online before accepting offers', code: 'DRIVER_OFFLINE' },
+} as const;
+
+// Accept offer: the atomic claim (offer, order and courier change in one transaction)
 router.post('/offers/:id/accept', authenticate, requireDriver, async (req: Request, res: Response) => {
   try {
-    const order = await acceptDriverOffer(req.params.id as string, req.userId!);
+    const result = await acceptDriverOffer(req.params.id as string, req.userId!);
 
-    if (!order) {
-      res.status(400).json({
-        success: false,
-        error: 'Offer expired or already responded',
-      });
+    if (result.status !== 'accepted') {
+      res.status(409).json({ success: false, ...ACCEPT_FAILURES[result.status] });
       return;
     }
 
-    const orderWithDetails = await getOrderWithDetails(order.id);
+    const orderWithDetails = await getOrderWithDetails(result.order.id);
 
     res.json({
       success: true,
@@ -221,11 +210,7 @@ router.post('/offers/:id/accept', authenticate, requireDriver, async (req: Reque
       message: 'Order accepted',
     });
   } catch (error) {
-    console.error('Accept offer error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to accept offer',
-    });
+    sendError(res, error, 'Failed to accept offer');
   }
 });
 
@@ -235,9 +220,10 @@ router.post('/offers/:id/reject', authenticate, requireDriver, async (req: Reque
     const success = await rejectDriverOffer(req.params.id as string, req.userId!);
 
     if (!success) {
-      res.status(400).json({
+      res.status(409).json({
         success: false,
-        error: 'Offer not found or already responded',
+        error: 'Offer not found or already answered',
+        code: 'OFFER_UNAVAILABLE',
       });
       return;
     }
@@ -247,146 +233,49 @@ router.post('/offers/:id/reject', authenticate, requireDriver, async (req: Reque
       message: 'Offer rejected',
     });
   } catch (error) {
-    console.error('Reject offer error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to reject offer',
-    });
+    sendError(res, error, 'Failed to reject offer');
   }
 });
 
-// Mark order as picked up
+// Mark order as picked up (only the assigned courier, only from driver_assigned)
 router.post('/orders/:id/picked-up', authenticate, requireDriver, async (req: Request, res: Response) => {
   try {
-    const order = await getOrderWithDetails(req.params.id as string);
-
-    if (!order) {
-      res.status(404).json({
-        success: false,
-        error: 'Order not found',
-      });
-      return;
-    }
-
-    if (order.driver_id !== req.userId) {
-      res.status(403).json({
-        success: false,
-        error: 'Access denied',
-      });
-      return;
-    }
-
-    if (!['driver_assigned', 'ready_for_pickup'].includes(order.status)) {
-      res.status(400).json({
-        success: false,
-        error: 'Order is not ready for pickup',
-      });
-      return;
-    }
-
-    const updatedOrder = await updateOrderStatus(req.params.id as string, 'picked_up');
-
+    const order = await transitionOrder(req.params.id as string, 'picked_up', { driverId: req.userId! });
     res.json({
       success: true,
-      data: updatedOrder,
+      data: order,
       message: 'Order marked as picked up',
     });
   } catch (error) {
-    console.error('Pickup order error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to pickup order',
-    });
+    sendError(res, error, 'Failed to pickup order');
   }
 });
 
-// Mark order as in transit
+// Mark order as in transit (only the assigned courier, only from picked_up)
 router.post('/orders/:id/in-transit', authenticate, requireDriver, async (req: Request, res: Response) => {
   try {
-    const order = await getOrderWithDetails(req.params.id as string);
-
-    if (!order) {
-      res.status(404).json({
-        success: false,
-        error: 'Order not found',
-      });
-      return;
-    }
-
-    if (order.driver_id !== req.userId) {
-      res.status(403).json({
-        success: false,
-        error: 'Access denied',
-      });
-      return;
-    }
-
-    if (order.status !== 'picked_up') {
-      res.status(400).json({
-        success: false,
-        error: 'Order must be picked up first',
-      });
-      return;
-    }
-
-    const updatedOrder = await updateOrderStatus(req.params.id as string, 'in_transit');
-
+    const order = await transitionOrder(req.params.id as string, 'in_transit', { driverId: req.userId! });
     res.json({
       success: true,
-      data: updatedOrder,
+      data: order,
       message: 'Order in transit',
     });
   } catch (error) {
-    console.error('In transit error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to update order',
-    });
+    sendError(res, error, 'Failed to update order');
   }
 });
 
-// Mark order as delivered
+// Mark order as delivered (order, courier stats and availability commit together)
 router.post('/orders/:id/delivered', authenticate, requireDriver, async (req: Request, res: Response) => {
   try {
-    const order = await getOrderWithDetails(req.params.id as string);
-
-    if (!order) {
-      res.status(404).json({
-        success: false,
-        error: 'Order not found',
-      });
-      return;
-    }
-
-    if (order.driver_id !== req.userId) {
-      res.status(403).json({
-        success: false,
-        error: 'Access denied',
-      });
-      return;
-    }
-
-    if (!['picked_up', 'in_transit'].includes(order.status)) {
-      res.status(400).json({
-        success: false,
-        error: 'Order must be picked up first',
-      });
-      return;
-    }
-
-    const updatedOrder = await completeDelivery(req.params.id as string);
-
+    const order = await completeDelivery(req.params.id as string, req.userId!);
     res.json({
       success: true,
-      data: updatedOrder,
+      data: order,
       message: 'Order delivered successfully',
     });
   } catch (error) {
-    console.error('Deliver order error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to deliver order',
-    });
+    sendError(res, error, 'Failed to deliver order');
   }
 });
 
@@ -400,11 +289,7 @@ router.get('/stats', authenticate, requireDriver, async (req: Request, res: Resp
       data: stats,
     });
   } catch (error) {
-    console.error('Get stats error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to get stats',
-    });
+    sendError(res, error, 'Failed to get stats');
   }
 });
 

@@ -1,36 +1,16 @@
-import { StrictMode, useEffect } from 'react';
+import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
-import {
-  createBrowserRouter,
-  RouterProvider,
-  Outlet,
-} from 'react-router-dom';
-import { useAuthStore } from './stores/authStore';
-import { Navbar } from './components/Navbar';
+import { createBrowserRouter, RouterProvider } from 'react-router-dom';
+import { RootLayout } from './components/RootLayout';
 import { HomePage } from './pages/HomePage';
 import { ProblemsPage } from './pages/ProblemsPage';
-import { ProblemPage } from './pages/ProblemPage';
 import { LoginPage } from './pages/LoginPage';
 import { RegisterPage } from './pages/RegisterPage';
 import { ProgressPage } from './pages/ProgressPage';
-import { AdminPage } from './pages/AdminPage';
 import './index.css';
 
-function RootLayout() {
-  const { checkAuth } = useAuthStore();
-
-  useEffect(() => {
-    checkAuth();
-  }, [checkAuth]);
-
-  return (
-    <div className="min-h-screen bg-dark-400">
-      <Navbar />
-      <Outlet />
-    </div>
-  );
-}
-
+// The problem workspace (CodeMirror + markdown) and the admin dashboard are separate chunks,
+// so the catalog and login pages don't download the editor.
 const router = createBrowserRouter([
   {
     path: '/',
@@ -38,11 +18,17 @@ const router = createBrowserRouter([
     children: [
       { index: true, element: <HomePage /> },
       { path: 'problems', element: <ProblemsPage /> },
-      { path: 'problems/:slug', element: <ProblemPage /> },
+      {
+        path: 'problems/:slug',
+        lazy: () => import('./pages/ProblemPage').then((module) => ({ Component: module.ProblemPage })),
+      },
       { path: 'login', element: <LoginPage /> },
       { path: 'register', element: <RegisterPage /> },
       { path: 'progress', element: <ProgressPage /> },
-      { path: 'admin', element: <AdminPage /> },
+      {
+        path: 'admin',
+        lazy: () => import('./pages/AdminPage').then((module) => ({ Component: module.AdminPage })),
+      },
     ],
   },
 ]);

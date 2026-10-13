@@ -1,212 +1,12 @@
-import { useState, useMemo } from 'react';
+import { useState } from 'react';
 import { clsx } from 'clsx';
-import type { IssueWithDetails, Status, Workflow } from '../types';
+import type { IssueWithDetails } from '../types';
 import { IssueTypeIcon, PriorityIcon, Avatar, Spinner, EmptyState } from './ui';
 import * as api from '../services/api';
+import { ApiError } from '../services/api';
 import { useIssueStore } from '../stores';
 
-interface BoardProps {
-  issues: IssueWithDetails[];
-  workflow: Workflow;
-  onIssueClick: (issue: IssueWithDetails) => void;
-  isLoading?: boolean;
-}
-
-/** Renders a Kanban board with drag-and-drop issue cards across workflow status columns. */
-export function KanbanBoard({ issues, workflow, onIssueClick, isLoading }: BoardProps) {
-  const { updateIssueInList } = useIssueStore();
-  const [draggedIssue, setDraggedIssue] = useState<IssueWithDetails | null>(null);
-  const [dragOverColumn, setDragOverColumn] = useState<number | null>(null);
-
-  // Group issues by status
-  const issuesByStatus = useMemo(() => {
-    const grouped: Record<number, IssueWithDetails[]> = {};
-    workflow.statuses.forEach((status) => {
-      grouped[status.id] = [];
-    });
-    issues.forEach((issue) => {
-      if (grouped[issue.status_id]) {
-        grouped[issue.status_id].push(issue);
-      }
-    });
-    return grouped;
-  }, [issues, workflow.statuses]);
-
-  const handleDragStart = (e: React.DragEvent, issue: IssueWithDetails) => {
-    setDraggedIssue(issue);
-    e.dataTransfer.effectAllowed = 'move';
-  };
-
-  const handleDragEnd = () => {
-    setDraggedIssue(null);
-    setDragOverColumn(null);
-  };
-
-  const handleDragOver = (e: React.DragEvent, statusId: number) => {
-    e.preventDefault();
-    setDragOverColumn(statusId);
-  };
-
-  const handleDrop = async (e: React.DragEvent, targetStatusId: number) => {
-    e.preventDefault();
-    setDragOverColumn(null);
-
-    if (!draggedIssue || draggedIssue.status_id === targetStatusId) {
-      setDraggedIssue(null);
-      return;
-    }
-
-    try {
-      // Find the transition to the target status
-      const transitions = await api.getIssueTransitions(draggedIssue.id);
-      const transition = transitions.find((t) => t.to_status_id === targetStatusId);
-
-      if (transition) {
-        const updatedIssue = await api.executeTransition(draggedIssue.id, transition.id);
-        updateIssueInList(updatedIssue);
-      }
-    } catch (error) {
-      console.error('Failed to move issue:', error);
-    }
-
-    setDraggedIssue(null);
-  };
-
-  if (isLoading) {
-    return (
-      <div className="flex items-center justify-center h-96">
-        <Spinner size="lg" />
-      </div>
-    );
-  }
-
-  return (
-    <div className="flex gap-4 overflow-x-auto pb-4">
-      {workflow.statuses.map((status) => (
-        <BoardColumn
-          key={status.id}
-          status={status}
-          issues={issuesByStatus[status.id] || []}
-          onIssueClick={onIssueClick}
-          onDragStart={handleDragStart}
-          onDragEnd={handleDragEnd}
-          onDragOver={(e) => handleDragOver(e, status.id)}
-          onDrop={(e) => handleDrop(e, status.id)}
-          isDragOver={dragOverColumn === status.id}
-        />
-      ))}
-    </div>
-  );
-}
-
-interface BoardColumnProps {
-  status: Status;
-  issues: IssueWithDetails[];
-  onIssueClick: (issue: IssueWithDetails) => void;
-  onDragStart: (e: React.DragEvent, issue: IssueWithDetails) => void;
-  onDragEnd: () => void;
-  onDragOver: (e: React.DragEvent) => void;
-  onDrop: (e: React.DragEvent) => void;
-  isDragOver: boolean;
-}
-
-function BoardColumn({
-  status,
-  issues,
-  onIssueClick,
-  onDragStart,
-  onDragEnd,
-  onDragOver,
-  onDrop,
-  isDragOver,
-}: BoardColumnProps) {
-  const categoryColors: Record<string, string> = {
-    todo: 'bg-gray-400',
-    in_progress: 'bg-blue-500',
-    done: 'bg-green-500',
-  };
-
-  return (
-    <div
-      className={clsx(
-        // Grow to share the available width so a typical 4-status workflow fills
-        // the board, but never shrink below a readable card width — past that the
-        // parent's overflow-x takes over, as it must for longer workflows.
-        'flex-1 min-w-[17rem] bg-gray-100 rounded-lg',
-        isDragOver && 'ring-2 ring-blue-400'
-      )}
-      onDragOver={onDragOver}
-      onDrop={onDrop}
-    >
-      <div className="p-3 flex items-center gap-2">
-        <div className={clsx('w-3 h-3 rounded', categoryColors[status.category])} />
-        <h3 className="font-medium text-gray-700">{status.name}</h3>
-        <span className="ml-auto text-sm text-gray-500">{issues.length}</span>
-      </div>
-
-      <div className="p-2 space-y-2 min-h-[200px] max-h-[calc(100vh-250px)] overflow-y-auto">
-        {issues.length === 0 ? (
-          <div className="text-center text-gray-400 py-8 text-sm">No issues</div>
-        ) : (
-          issues.map((issue) => (
-            <BoardCard
-              key={issue.id}
-              issue={issue}
-              onClick={() => onIssueClick(issue)}
-              onDragStart={(e) => onDragStart(e, issue)}
-              onDragEnd={onDragEnd}
-            />
-          ))
-        )}
-      </div>
-    </div>
-  );
-}
-
-interface BoardCardProps {
-  issue: IssueWithDetails;
-  onClick: () => void;
-  onDragStart: (e: React.DragEvent) => void;
-  onDragEnd: () => void;
-}
-
-function BoardCard({ issue, onClick, onDragStart, onDragEnd }: BoardCardProps) {
-  return (
-    <div
-      draggable
-      data-testid="issue-card"
-      onDragStart={onDragStart}
-      onDragEnd={onDragEnd}
-      onClick={onClick}
-      className="bg-white rounded shadow-sm p-3 cursor-pointer hover:shadow-md transition-shadow border border-gray-200"
-    >
-      <div className="text-sm text-gray-900 mb-2 line-clamp-2">{issue.summary}</div>
-
-      <div className="flex items-center gap-2 text-xs text-gray-500">
-        <IssueTypeIcon type={issue.issue_type} className="w-4 h-4" />
-        <span className="font-medium">{issue.key}</span>
-      </div>
-
-      <div className="flex items-center justify-between mt-2">
-        <div className="flex items-center gap-1">
-          <PriorityIcon priority={issue.priority} />
-          {issue.story_points && (
-            <span className="ml-1 px-1.5 py-0.5 bg-gray-100 rounded text-xs text-gray-600">
-              {issue.story_points}
-            </span>
-          )}
-        </div>
-        {issue.assignee && <Avatar user={issue.assignee} size="sm" />}
-      </div>
-
-      {issue.epic && (
-        <div className="mt-2 text-xs px-2 py-0.5 bg-purple-100 text-purple-700 rounded inline-block">
-          {issue.epic.key}
-        </div>
-      )}
-    </div>
-  );
-}
+export { KanbanBoard } from './board/KanbanBoard';
 
 // Backlog component
 interface BacklogProps {
@@ -228,25 +28,25 @@ export function Backlog({
   isLoading,
 }: BacklogProps) {
   const { updateIssueInList } = useIssueStore();
+  const [error, setError] = useState<string | null>(null);
 
-  const handleMoveToSprint = async (issue: IssueWithDetails) => {
-    if (!sprintId) return;
+  /** Moves an issue in or out of the sprint, guarded by the version the user saw. */
+  const moveIssue = async (issue: IssueWithDetails, target: number | null) => {
+    setError(null);
     try {
-      const updated = await api.updateIssue(issue.id, { sprintId });
+      const updated = await api.updateIssue(issue.id, { sprintId: target }, issue.version);
       updateIssueInList(updated);
-    } catch (error) {
-      console.error('Failed to move to sprint:', error);
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 412 && err.body.issue) {
+        // Someone changed the issue first: show what it looks like now; the user can retry.
+        updateIssueInList(err.body.issue as IssueWithDetails);
+      }
+      setError(err instanceof Error ? err.message : 'Failed to move the issue');
     }
   };
 
-  const handleMoveToBacklog = async (issue: IssueWithDetails) => {
-    try {
-      const updated = await api.updateIssue(issue.id, { sprintId: null });
-      updateIssueInList(updated);
-    } catch (error) {
-      console.error('Failed to move to backlog:', error);
-    }
-  };
+  const handleMoveToSprint = (issue: IssueWithDetails) => (sprintId ? moveIssue(issue, sprintId) : undefined);
+  const handleMoveToBacklog = (issue: IssueWithDetails) => moveIssue(issue, null);
 
   if (isLoading) {
     return (
@@ -258,6 +58,12 @@ export function Backlog({
 
   return (
     <div className="space-y-6">
+      {error && (
+        <div role="alert" className="p-3 bg-red-50 text-red-700 rounded text-sm">
+          {error}
+        </div>
+      )}
+
       {/* Active Sprint */}
       {sprintId && (
         <div className="bg-white rounded-lg shadow-sm">
@@ -333,7 +139,7 @@ function BacklogItem({ issue, onClick, onMoveToSprint, onMoveToBacklog }: Backlo
 
       <PriorityIcon priority={issue.priority} />
 
-      {issue.story_points && (
+      {issue.story_points != null && (
         <span className="px-1.5 py-0.5 bg-gray-100 rounded text-xs text-gray-600">
           {issue.story_points}
         </span>

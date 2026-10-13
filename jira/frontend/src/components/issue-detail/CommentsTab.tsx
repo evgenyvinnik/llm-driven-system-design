@@ -11,8 +11,8 @@ interface CommentsTabProps {
   comments: Comment[];
   /** The current user for the avatar */
   currentUser?: User;
-  /** Callback when a comment is submitted */
-  onAddComment: (body: string) => void;
+  /** Callback when a comment is submitted; resolves to true once it is saved */
+  onAddComment: (body: string) => Promise<boolean>;
 }
 
 /**
@@ -26,15 +26,19 @@ interface CommentsTabProps {
  */
 export function CommentsTab({ comments, currentUser, onAddComment }: CommentsTabProps) {
   const [newComment, setNewComment] = useState('');
+  const [isSubmitting, setIsSubmitting] = useState(false);
 
   /**
    * Handles the submission of a new comment.
-   * Clears the input after successful submission.
+   * Clears the input only once the comment is saved, so a failed post keeps the draft
+   * (and its idempotency key) for a retry.
    */
-  const handleSubmit = () => {
-    if (!newComment.trim()) return;
-    onAddComment(newComment);
-    setNewComment('');
+  const handleSubmit = async () => {
+    if (!newComment.trim() || isSubmitting) return;
+    setIsSubmitting(true);
+    const saved = await onAddComment(newComment);
+    setIsSubmitting(false);
+    if (saved) setNewComment('');
   };
 
   return (
@@ -50,8 +54,8 @@ export function CommentsTab({ comments, currentUser, onAddComment }: CommentsTab
             rows={3}
           />
           <div className="mt-2">
-            <Button size="sm" onClick={handleSubmit} disabled={!newComment.trim()}>
-              Add Comment
+            <Button size="sm" onClick={handleSubmit} disabled={!newComment.trim() || isSubmitting}>
+              {isSubmitting ? 'Adding…' : 'Add Comment'}
             </Button>
           </div>
         </div>

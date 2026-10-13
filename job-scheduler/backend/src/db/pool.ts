@@ -5,7 +5,7 @@
  * @module db/pool
  */
 
-import { Pool, PoolConfig } from 'pg';
+import { Pool, PoolClient, PoolConfig } from 'pg';
 import { logger } from '../utils/logger';
 
 /** Pool configuration with sensible defaults for the job scheduler workload */
@@ -96,47 +96,30 @@ export async function queryOne<T>(text: string, params?: unknown[]): Promise<T |
 }
 
 /**
- * Executes a callback within a database transaction.
+ * Executes a callback within a database transaction on a dedicated client.
  *
- * @description Wraps multiple database operations in a transaction, automatically
- * handling BEGIN, COMMIT, and ROLLBACK. Ensures atomicity for multi-statement
- * operations like creating a job with its initial execution record.
+ * @description Every multi-statement state change in the scheduler goes through this:
+ * firing a due job (insert execution + advance next_run_time), recording a failure
+ * (close the attempt + insert the retry), and reaping expired leases. Row locks taken
+ * with SELECT ... FOR UPDATE [SKIP LOCKED] only mean something inside a transaction;
+ * through the pool's autocommit query() they are released as soon as the SELECT ends.
  *
  * @template T - The return type of the callback function
- * @param {(client: { query: typeof query }) => Promise<T>} callback - Function receiving
- *   a query interface to execute operations within the transaction context
- * @returns {Promise<T>} Result from the callback function
- * @throws {Error} Rolls back transaction and re-throws any errors from the callback
- *
- * @example
- * // Create job and initial execution atomically
- * const result = await transaction(async (client) => {
- *   const [job] = await client.query<Job>(
- *     'INSERT INTO jobs (name, handler) VALUES ($1, $2) RETURNING *',
- *     ['my-job', 'http.webhook']
- *   );
- *   const [execution] = await client.query<JobExecution>(
- *     'INSERT INTO job_executions (job_id, status) VALUES ($1, $2) RETURNING *',
- *     [job.id, 'PENDING']
- *   );
- *   return { job, execution };
- * });
+ * @param callback - Receives the pg client bound to the open transaction
+ * @returns Result from the callback, after COMMIT
+ * @throws Rolls back and re-throws any error from the callback
  */
-export async function transaction<T>(
-  callback: (client: { query: typeof query }) => Promise<T>
+export async function withTransaction<T>(
+  callback: (client: PoolClient) => Promise<T>
 ): Promise<T> {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const clientQuery = async <R>(text: string, params?: unknown[]): Promise<R[]> => {
-      const result = await client.query(text, params);
-      return result.rows as R[];
-    };
-    const result = await callback({ query: clientQuery });
+    const result = await callback(client);
     await client.query('COMMIT');
     return result;
   } catch (error) {
-    await client.query('ROLLBACK');
+    await client.query('ROLLBACK').catch(() => undefined);
     throw error;
   } finally {
     client.release();

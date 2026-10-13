@@ -45,6 +45,10 @@ export interface Issue {
   labels: string[];
   components: string[];
   custom_fields: Record<string, unknown>;
+  /** Bumped on every field or status change; exposed as the ETag for If-Match. */
+  version: number;
+  /** Board and backlog position within the project (see services/rank.ts). */
+  rank: string;
   created_at: Date;
   updated_at: Date;
 }

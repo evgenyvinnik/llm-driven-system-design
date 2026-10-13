@@ -71,6 +71,12 @@ export function errorHandler(
   res: Response,
   _next: NextFunction
 ): void {
+  // A malformed id in the URL reaches PostgreSQL as an invalid UUID (22P02).
+  if ((err as { code?: string }).code === '22P02') {
+    res.status(400).json({ success: false, error: 'Invalid identifier' } as ApiResponse<never>);
+    return;
+  }
+
   logger.error({ err, path: req.path, method: req.method }, 'Unhandled error');
 
   res.status(500).json({

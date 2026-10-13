@@ -36,6 +36,9 @@ export class UploadError extends Error {
 
 export const VIDEO_CONTENT_TYPE = 'video/webm';
 
+/** S3's floor for every part except the last; the configured part size is only a recommendation. */
+export const S3_MIN_PART_SIZE = 5 * 1024 * 1024;
+
 /** Object key for a video's original upload. Deterministic, so retries reuse it. */
 export function sourceObjectKey(userId: string, videoId: string): string {
   return `${userId}/${videoId}/source.webm`;
@@ -139,7 +142,7 @@ export async function listParts(videoId: string, userId: string) {
 export function findPartProblems(
   parts: { part: number; size: number }[],
   expected: number,
-  minPartSize: number = config.upload.partSizeBytes,
+  minPartSize: number = S3_MIN_PART_SIZE,
 ): { reason: string; missingParts?: number[] } | null {
   const present = new Set(parts.map((p) => p.part));
   const missingParts: number[] = [];

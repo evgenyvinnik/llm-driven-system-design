@@ -4,7 +4,8 @@ WORKDIR /app
 
 # Install dependencies
 COPY package*.json ./
-RUN npm ci
+# No lockfile is committed for this project, so `npm ci` would refuse to run.
+RUN npm install --no-audit --no-fund
 
 # Copy source
 COPY . .

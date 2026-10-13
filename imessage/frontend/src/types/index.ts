@@ -91,10 +91,15 @@ export interface Reaction {
  * Includes sender info, content, and metadata for display.
  */
 export interface Message {
-  /** Unique message identifier (UUID) */
+  /** Unique message identifier (UUID); a client ID until the server confirms */
   id: string;
   /** Parent conversation identifier */
   conversation_id: string;
+  /**
+   * Position in the conversation, assigned by the server (1, 2, 3, ...).
+   * Absent on optimistic messages that the server has not accepted yet.
+   */
+  seq?: number;
   /** User who sent this message */
   sender_id: string;
   /** Message text or content */
@@ -105,6 +110,8 @@ export interface Message {
   reply_to_id: string | null;
   /** ISO timestamp if message was edited (null if not) */
   edited_at: string | null;
+  /** ISO timestamp if the message was deleted (tombstone) */
+  deleted_at?: string | null;
   /** ISO timestamp when message was created */
   created_at: string;
   /** Sender's username (denormalized for display) */
@@ -121,11 +128,20 @@ export interface Message {
     content: string;
     sender_id: string;
   } | null;
-  /** Client-side delivery status for optimistic updates */
-  status?: 'sending' | 'sent' | 'delivered' | 'read' | 'failed';
-  /** Temporary client ID for matching optimistic updates with server responses */
+  /**
+   * Delivery state of the current user's own messages: 'sending' until the
+   * server acks, then 'sent', 'delivered' (a recipient device acknowledged
+   * it) and 'read' (a recipient's read watermark passed it).
+   */
+  status?: MessageStatus | null;
+  /** Client-generated ID, reused on every retry of this send */
   clientMessageId?: string;
+  /** Server copy of clientMessageId */
+  client_message_id?: string | null;
 }
+
+/** Delivery states in the order a message moves through them ('failed' is terminal until retried). */
+export type MessageStatus = 'sending' | 'sent' | 'delivered' | 'read' | 'failed';
 
 /**
  * Represents a read receipt showing who has read messages in a conversation.
@@ -133,8 +149,8 @@ export interface Message {
 export interface ReadReceipt {
   /** User who read the messages */
   user_id: string;
-  /** Last message ID they have read */
-  last_read_message_id: string;
+  /** Read watermark: every message at or below this seq is read */
+  last_read_seq: number;
   /** ISO timestamp when they read it */
   last_read_at: string;
   /** User's username for display */
@@ -174,6 +190,9 @@ export interface AuthState {
   /** Whether auth check is in progress */
   isLoading: boolean;
 }
+
+/** Lifecycle of the client's WebSocket connection, shown in the UI. */
+export type ConnectionStatus = 'connecting' | 'open' | 'reconnecting' | 'closed';
 
 /**
  * Generic WebSocket message structure.

@@ -7,8 +7,8 @@
 import { Router } from 'express';
 import { asyncHandler } from './types';
 import { authenticate, authorize } from '../shared/auth';
+import { idempotencyMiddleware } from '../shared/idempotency';
 import * as db from '../db/repository';
-import { queue } from '../queue/reliable-queue';
 import { ApiResponse, ExecutionStatus } from '../types/index';
 
 const router = Router();
@@ -106,9 +106,13 @@ router.get(
  *
  * @param {string} req.params.id - UUID of the execution to cancel
  *
+ * A RUNNING execution is stopped cooperatively: its worker's next lease renewal finds
+ * the row CANCELLED, aborts the handler, and any result it still produces is rejected
+ * by the fenced completion write.
+ *
  * @returns {ApiResponse<Execution>} 200 - Updated execution with cancelled status
- * @returns {ApiResponse} 400 - Execution cannot be cancelled in current state
  * @returns {ApiResponse} 404 - Execution not found
+ * @returns {ApiResponse} 409 - Execution is not PENDING or RUNNING
  *
  * @example
  * ```bash
@@ -120,32 +124,20 @@ router.post(
   authenticate,
   authorize('admin'),
   asyncHandler(async (req, res) => {
-    const execution = await db.getExecution(req.params.id);
+    // One guarded UPDATE: the state check and the write cannot be split by a worker
+    // completing the execution in between.
+    const updated = await db.cancelExecution(req.params.id);
 
-    if (!execution) {
-      res.status(404).json({
+    if (!updated) {
+      const execution = await db.getExecution(req.params.id);
+      res.status(execution ? 409 : 404).json({
         success: false,
-        error: 'Execution not found',
+        error: execution
+          ? `Execution cannot be cancelled while ${execution.status}`
+          : 'Execution not found',
       } as ApiResponse<never>);
       return;
     }
-
-    if (
-      execution.status !== ExecutionStatus.PENDING &&
-      execution.status !== ExecutionStatus.RUNNING
-    ) {
-      res.status(400).json({
-        success: false,
-        error: 'Execution cannot be cancelled in current state',
-      } as ApiResponse<never>);
-      return;
-    }
-
-    const updated = await db.updateExecution(req.params.id, {
-      status: ExecutionStatus.CANCELLED,
-      completed_at: new Date(),
-      error: 'Cancelled by user',
-    });
 
     res.json({
       success: true,
@@ -158,18 +150,19 @@ router.post(
 /**
  * POST /api/v1/executions/:id/retry - Retry a failed or cancelled execution.
  *
- * @description Creates a new execution for the same job and enqueues it for processing.
- * Only failed or cancelled executions can be retried. The original execution remains
- * unchanged in the history. Requires authentication.
+ * @description Runs the same scheduled run again as its next attempt (same job and slot,
+ * attempt + 1). Works on the latest FAILED, CANCELLED or DEAD_LETTER attempt; a
+ * dead-lettered row leaves the dead-letter state. Accepts an Idempotency-Key header, and
+ * a second request for an already-redriven run gets 409. Requires authentication.
  *
  * @route POST /api/v1/executions/:id/retry
  * @access Authenticated users
  *
  * @param {string} req.params.id - UUID of the execution to retry
  *
- * @returns {ApiResponse<Execution>} 200 - Newly created execution
- * @returns {ApiResponse} 400 - Execution is not in a retriable state
- * @returns {ApiResponse} 404 - Execution or associated job not found
+ * @returns {ApiResponse<Execution>} 200 - Newly created attempt
+ * @returns {ApiResponse} 404 - Execution not found
+ * @returns {ApiResponse} 409 - Not in a retryable state, or a newer attempt exists
  *
  * @example
  * ```bash
@@ -179,46 +172,26 @@ router.post(
 router.post(
   '/executions/:id/retry',
   authenticate,
+  idempotencyMiddleware(),
   asyncHandler(async (req, res) => {
-    const execution = await db.getExecution(req.params.id);
+    const result = await db.redriveExecution(req.params.id);
 
-    if (!execution) {
-      res.status(404).json({
-        success: false,
-        error: 'Execution not found',
-      } as ApiResponse<never>);
+    if (!result.ok) {
+      const errors = {
+        not_found: [404, 'Execution not found'],
+        not_retryable: [409, 'Only failed, cancelled or dead-lettered executions can be retried'],
+        superseded: [409, 'A newer attempt of this run already exists; retry that one instead'],
+      } as const;
+      const [status, error] = errors[result.reason];
+      res.status(status).json({ success: false, error } as ApiResponse<never>);
       return;
     }
-
-    if (
-      execution.status !== ExecutionStatus.FAILED &&
-      execution.status !== ExecutionStatus.CANCELLED
-    ) {
-      res.status(400).json({
-        success: false,
-        error: 'Only failed or cancelled executions can be retried',
-      } as ApiResponse<never>);
-      return;
-    }
-
-    const job = await db.getJob(execution.job_id);
-    if (!job) {
-      res.status(404).json({
-        success: false,
-        error: 'Job not found',
-      } as ApiResponse<never>);
-      return;
-    }
-
-    // Create a new execution
-    const newExecution = await db.createExecution(job.id, new Date());
-    await queue.enqueue(newExecution.id, job.id, job.priority);
 
     res.json({
       success: true,
-      data: newExecution,
+      data: result.execution,
       message: 'Retry scheduled successfully',
-    } as ApiResponse<typeof newExecution>);
+    } as ApiResponse<typeof result.execution>);
   })
 );
 

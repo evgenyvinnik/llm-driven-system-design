@@ -60,6 +60,7 @@ export const api = {
     password: string;
     displayName?: string;
     deviceName?: string;
+    installId?: string;
   }) => request('/auth/register', { method: 'POST', body: JSON.stringify(data) }),
 
   /**
@@ -71,6 +72,7 @@ export const api = {
     usernameOrEmail: string;
     password: string;
     deviceName?: string;
+    installId?: string;
   }) => request('/auth/login', { method: 'POST', body: JSON.stringify(data) }),
 
   /**
@@ -201,17 +203,17 @@ export const api = {
 
   // Messages
   /**
-   * Retrieves messages for a conversation with pagination support.
-   * Supports cursor-based pagination using before/after message IDs.
+   * Retrieves messages for a conversation, oldest first, with keyset
+   * pagination on the conversation sequence number.
    * @param conversationId - The UUID of the conversation
-   * @param options - Pagination options: limit (default 50), before/after message ID
+   * @param options - limit (default 50); beforeSeq for older history; afterSeq to fill a gap
    * @returns Promise with array of messages
    */
-  getMessages: (conversationId: string, options?: { limit?: number; before?: string; after?: string }) => {
+  getMessages: (conversationId: string, options?: { limit?: number; beforeSeq?: number; afterSeq?: number }) => {
     const params = new URLSearchParams();
     if (options?.limit) params.set('limit', options.limit.toString());
-    if (options?.before) params.set('before', options.before);
-    if (options?.after) params.set('after', options.after);
+    if (options?.beforeSeq !== undefined) params.set('before_seq', options.beforeSeq.toString());
+    if (options?.afterSeq !== undefined) params.set('after_seq', options.afterSeq.toString());
     const query = params.toString();
     return request<{ messages: import('@/types').Message[] }>(
       `/messages/conversation/${conversationId}${query ? `?${query}` : ''}`

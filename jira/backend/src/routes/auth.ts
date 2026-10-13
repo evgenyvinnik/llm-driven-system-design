@@ -1,4 +1,4 @@
-import { Router } from 'express';
+import { Router, Request } from 'express';
 import { verifyPassword, createUser, getUserById, updateUser, searchUsers, getAllUsers } from '../services/userService.js';
 import { requireAuth } from '../middleware/auth.js';
 
@@ -7,6 +7,20 @@ import { requireAuth } from '../middleware/auth.js';
  * Handles login/logout, registration, and user profile operations.
  */
 const router = Router();
+
+/**
+ * Issues a fresh session id on login, so a session id planted before authentication
+ * (session fixation) never becomes an authenticated session.
+ */
+function startSession(req: Request, userId: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    req.session.regenerate((err) => {
+      if (err) return reject(err);
+      req.session.userId = userId;
+      req.session.save((saveErr) => (saveErr ? reject(saveErr) : resolve()));
+    });
+  });
+}
 
 /**
  * POST /login
@@ -25,7 +39,7 @@ router.post('/login', async (req, res) => {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
 
-    req.session.userId = user.id;
+    await startSession(req, user.id);
     res.json({ user });
   } catch (error) {
     console.error('Login error:', error);
@@ -60,7 +74,7 @@ router.post('/register', async (req, res) => {
     }
 
     const user = await createUser({ email, password, name });
-    req.session.userId = user.id;
+    await startSession(req, user.id);
     res.status(201).json({ user });
   } catch (error: unknown) {
     if ((error as { code?: string }).code === '23505') {

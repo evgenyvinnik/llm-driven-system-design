@@ -45,6 +45,50 @@ async function fetchApi<T>(
   return data as ApiResponse<T>;
 }
 
+/** A rejected mutation, carrying the server's message and any field-level details. */
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly details?: string[]
+  ) {
+    super(message);
+    this.name = 'ApiError';
+  }
+}
+
+/**
+ * Sends a state-changing request and throws ApiError unless the server reports success.
+ *
+ * Reads go through fetchApi and degrade to empty results; writes must not, or a 400
+ * (invalid cron) or 409 (duplicate name) looks exactly like a successful create.
+ * Pass an idempotencyKey for POSTs that are not naturally idempotent: resending the same
+ * key after a timeout returns the original result instead of doing the work twice.
+ */
+async function mutateApi<T>(
+  url: string,
+  options: RequestInit & { idempotencyKey?: string }
+): Promise<T> {
+  const { idempotencyKey, ...init } = options;
+  const response = await fetch(`${API_BASE}${url}`, {
+    ...init,
+    headers: {
+      'Content-Type': 'application/json',
+      ...(idempotencyKey ? { 'Idempotency-Key': idempotencyKey } : {}),
+      ...init.headers,
+    },
+  });
+
+  const data = (await response.json().catch(() => ({}))) as ApiResponse<T> & { details?: string[] };
+  if (!response.ok || !data.success) {
+    const message = data.details?.length
+      ? `${data.error}: ${data.details.join('; ')}`
+      : data.error || `Request failed with status ${response.status}`;
+    throw new ApiError(message, response.status, data.details);
+  }
+  return data.data as T;
+}
+
 // === Health Check ===
 
 /**
@@ -100,84 +144,73 @@ export async function getJob(id: string): Promise<Job | null> {
 /**
  * Creates a new job.
  * @param input - Job creation parameters
- * @returns Created job or null on failure
+ * @param idempotencyKey - Same key for every submission of the same draft
+ * @returns The created job
+ * @throws ApiError with the validation details or conflict message
  */
-export async function createJob(input: CreateJobInput): Promise<Job | null> {
-  const response = await fetchApi<Job>('/jobs', {
+export async function createJob(input: CreateJobInput, idempotencyKey?: string): Promise<Job> {
+  return mutateApi<Job>('/jobs', {
     method: 'POST',
     body: JSON.stringify(input),
+    idempotencyKey,
   });
-  return response.data || null;
 }
 
 /**
  * Updates an existing job.
  * @param id - Job UUID to update
  * @param input - Fields to update
- * @returns Updated job or null if not found
+ * @returns Updated job
  */
-export async function updateJob(
-  id: string,
-  input: UpdateJobInput
-): Promise<Job | null> {
-  const response = await fetchApi<Job>(`/jobs/${id}`, {
+export async function updateJob(id: string, input: UpdateJobInput): Promise<Job> {
+  return mutateApi<Job>(`/jobs/${id}`, {
     method: 'PUT',
     body: JSON.stringify(input),
   });
-  return response.data || null;
 }
 
 /**
  * Deletes a job and all its executions.
  * @param id - Job UUID to delete
- * @returns True if deleted successfully
+ * @returns True once deleted
  */
 export async function deleteJob(id: string): Promise<boolean> {
-  const response = await fetchApi<void>(`/jobs/${id}`, {
-    method: 'DELETE',
-  });
-  return response.success;
+  await mutateApi<void>(`/jobs/${id}`, { method: 'DELETE' });
+  return true;
 }
 
 /**
  * Pauses a job, preventing future executions.
  * @param id - Job UUID to pause
- * @returns Updated job or null
+ * @returns Updated job
  */
-export async function pauseJob(id: string): Promise<Job | null> {
-  const response = await fetchApi<Job>(`/jobs/${id}/pause`, {
-    method: 'POST',
-  });
-  return response.data || null;
+export async function pauseJob(id: string): Promise<Job> {
+  return mutateApi<Job>(`/jobs/${id}/pause`, { method: 'POST' });
 }
 
 /**
  * Resumes a paused job.
  * @param id - Job UUID to resume
- * @returns Updated job or null
+ * @returns Updated job
  */
-export async function resumeJob(id: string): Promise<Job | null> {
-  const response = await fetchApi<Job>(`/jobs/${id}/resume`, {
-    method: 'POST',
-  });
-  return response.data || null;
+export async function resumeJob(id: string): Promise<Job> {
+  return mutateApi<Job>(`/jobs/${id}/resume`, { method: 'POST' });
 }
 
 /**
  * Triggers immediate execution of a job.
  * @param id - Job UUID to trigger
- * @returns Job and new execution or null
+ * @param idempotencyKey - Same key when the same click is retried
+ * @returns Job and new execution
  */
 export async function triggerJob(
-  id: string
-): Promise<{ job: Job; execution: JobExecution } | null> {
-  const response = await fetchApi<{ job: Job; execution: JobExecution }>(
-    `/jobs/${id}/trigger`,
-    {
-      method: 'POST',
-    }
-  );
-  return response.data || null;
+  id: string,
+  idempotencyKey?: string
+): Promise<{ job: Job; execution: JobExecution }> {
+  return mutateApi<{ job: Job; execution: JobExecution }>(`/jobs/${id}/trigger`, {
+    method: 'POST',
+    idempotencyKey,
+  });
 }
 
 // === Execution Operations ===
@@ -222,25 +255,23 @@ export async function getExecution(id: string): Promise<JobExecution | null> {
 /**
  * Cancels a pending or running execution.
  * @param id - Execution UUID to cancel
- * @returns Updated execution or null
+ * @returns Updated execution
  */
-export async function cancelExecution(id: string): Promise<JobExecution | null> {
-  const response = await fetchApi<JobExecution>(`/executions/${id}/cancel`, {
-    method: 'POST',
-  });
-  return response.data || null;
+export async function cancelExecution(id: string): Promise<JobExecution> {
+  return mutateApi<JobExecution>(`/executions/${id}/cancel`, { method: 'POST' });
 }
 
 /**
- * Retries a failed or cancelled execution.
+ * Retries a failed, cancelled or dead-lettered execution as its next attempt.
  * @param id - Execution UUID to retry
- * @returns New execution created for the retry
+ * @param idempotencyKey - Same key when the same click is retried
+ * @returns The new attempt
  */
-export async function retryExecution(id: string): Promise<JobExecution | null> {
-  const response = await fetchApi<JobExecution>(`/executions/${id}/retry`, {
+export async function retryExecution(id: string, idempotencyKey?: string): Promise<JobExecution> {
+  return mutateApi<JobExecution>(`/executions/${id}/retry`, {
     method: 'POST',
+    idempotencyKey,
   });
-  return response.data || null;
 }
 
 // === Metrics & Monitoring ===

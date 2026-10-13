@@ -5,45 +5,31 @@
  */
 import express, { Request, Response, NextFunction } from 'express'
 import cors from 'cors'
-import { v4 as uuid } from 'uuid'
-import { query, transaction } from '../shared/db.js'
-import { authMiddleware, optionalAuthMiddleware as _optionalAuthMiddleware } from '../shared/auth.js'
-import { cacheGet, cacheSet, cacheDel, hashIncr, redis as _redis } from '../shared/cache.js'
+import { v4 as uuid, v5 as uuidv5 } from 'uuid'
+import { query } from '../shared/db.js'
+import { authMiddleware } from '../shared/auth.js'
 import { createLogger } from '../shared/logger.js'
+import { errorHandler, HttpError } from '../shared/errors.js'
+import { createHighlight, deleteHighlight, updateHighlight } from '../shared/highlights.js'
+import { deviceIdFrom, notifyDevices } from '../shared/notify.js'
+import {
+  isUuid,
+  parseClientTimestamp,
+  parseHighlightChanges,
+  parseLimit,
+  parseNewHighlight,
+  parseNonNegative,
+} from '../shared/validation.js'
 
 const logger = createLogger('highlight-service')
+
+/** Namespace for deriving a highlight id from an Idempotency-Key header (RFC 4122 v5). */
+const IDEMPOTENCY_NAMESPACE = '6f1c5d2e-8a43-4b8e-9f0a-3c7d2b1e4a55'
 
 export const app = express()
 
 app.use(cors())
 app.use(express.json())
-
-/** Highlight data structure */
-interface Highlight {
-  id: string
-  user_id: string
-  book_id: string
-  location_start: number
-  location_end: number
-  highlighted_text: string
-  note: string | null
-  color: string
-  visibility: string
-  created_at: Date
-  updated_at: Date
-}
-
-/** Create highlight request body */
-interface CreateHighlightBody {
-  bookId: string
-  locationStart: number
-  locationEnd: number
-  text: string
-  note?: string
-  color?: string
-  visibility?: string
-  idempotencyKey?: string
-}
 
 /** Health check endpoint */
 app.get('/health', (_req: Request, res: Response) => {
@@ -53,81 +39,64 @@ app.get('/health', (_req: Request, res: Response) => {
 /**
  * Create a new highlight
  * POST /api/highlights
+ *
+ * The client should send the highlight's `id` (a UUID minted on the device): retrying with
+ * the same id returns the original highlight (200, Idempotent-Replayed: true) instead of a
+ * duplicate. Clients that can't mint ids may send an Idempotency-Key header instead; the id
+ * is then derived from (user, key), which scopes keys per user.
  */
 app.post('/api/highlights', authMiddleware, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const userId = req.userId!
-    const { bookId, locationStart, locationEnd, text, note, color = 'yellow', visibility = 'private', idempotencyKey } = req.body as CreateHighlightBody
+    const parsed = parseNewHighlight(req.body)
+    if (!parsed.ok) throw new HttpError(400, parsed.error)
 
-    // Check idempotency
-    if (idempotencyKey) {
-      const existing = await cacheGet<Highlight>(`idempotency:${idempotencyKey}`)
-      if (existing) {
-        res.json(existing)
-        return
-      }
+    const idempotencyKey = req.header('Idempotency-Key')
+    const id = parsed.value.id ?? (idempotencyKey ? uuidv5(`${userId}:${idempotencyKey}`, IDEMPOTENCY_NAMESPACE) : uuid())
+    const deviceId = deviceIdFrom(req)
+    const clientTs = parseClientTimestamp(req.body.clientUpdatedAt, Date.now())
+
+    const result = await createHighlight(userId, { ...parsed.value, id }, { deviceId, clientTs })
+
+    if (result.status === 'replayed') {
+      res.setHeader('Idempotent-Replayed', 'true')
+      res.status(200).json(result.highlight)
+      return
     }
 
-    const highlightId = uuid()
-
-    const result = await query<Highlight>(
-      `INSERT INTO highlights
-         (id, user_id, book_id, location_start, location_end, highlighted_text, note, color, visibility, idempotency_key)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-       RETURNING *`,
-      [highlightId, userId, bookId, locationStart, locationEnd, text, note || null, color, visibility, idempotencyKey || null]
-    )
-
-    const highlight = result.rows[0]
-
-    // Update aggregation counters in Redis
-    if (visibility !== 'private') {
-      const passageId = normalizePassage(locationStart, locationEnd)
-      await hashIncr(`book:${bookId}:highlights`, passageId, 1)
-    }
-
-    // Cache idempotency result
-    if (idempotencyKey) {
-      await cacheSet(`idempotency:${idempotencyKey}`, highlight, 86400)
-    }
-
-    // Invalidate user highlights cache
-    await cacheDel(`user:${userId}:highlights`)
-
-    logger.info({ event: 'highlight_created', userId, bookId, highlightId })
-
-    res.status(201).json(highlight)
+    await notifyDevices(userId, result.seq!, deviceId, logger)
+    logger.info({ event: 'highlight_created', userId, bookId: parsed.value.bookId, highlightId: id, seq: result.seq })
+    res.status(201).json(result.highlight)
   } catch (error) {
     next(error)
   }
 })
 
 /**
- * Get user's highlights
- * GET /api/highlights
+ * Get user's highlights (newest first)
+ * GET /api/highlights?bookId=&search=&limit=&offset=
+ *
+ * Not cached: it is a small, indexed, user-scoped read, and caching it would mean
+ * invalidating every variant of the key on every write.
  */
 app.get('/api/highlights', authMiddleware, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const userId = req.userId!
-    const { bookId, search, limit = '50', offset = '0' } = req.query as Record<string, string>
-
-    const cacheKey = `user:${userId}:highlights:${bookId || 'all'}:${search || ''}:${limit}:${offset}`
-    const cached = await cacheGet<Highlight[]>(cacheKey)
-    if (cached) {
-      res.json(cached)
-      return
-    }
+    const { bookId, search } = req.query as Record<string, string | undefined>
+    const limit = parseLimit(req.query.limit, 50, 200)
+    const offset = parseNonNegative(req.query.offset, 0)
 
     let sql = `
       SELECT h.*, b.title as book_title, b.author as book_author
       FROM highlights h
       JOIN books b ON b.id = h.book_id
-      WHERE h.user_id = $1 AND h.archived = false
+      WHERE h.user_id = $1 AND h.deleted_at IS NULL
     `
-    const params: any[] = [userId]
+    const params: unknown[] = [userId]
     let paramIndex = 2
 
     if (bookId) {
+      if (!isUuid(bookId)) throw new HttpError(400, 'bookId must be a UUID')
       sql += ` AND h.book_id = $${paramIndex++}`
       params.push(bookId)
     }
@@ -138,13 +107,10 @@ app.get('/api/highlights', authMiddleware, async (req: Request, res: Response, n
       paramIndex++
     }
 
-    sql += ` ORDER BY h.created_at DESC LIMIT $${paramIndex++} OFFSET $${paramIndex}`
-    params.push(parseInt(limit), parseInt(offset))
+    sql += ` ORDER BY h.created_at DESC, h.id LIMIT $${paramIndex++} OFFSET $${paramIndex}`
+    params.push(limit, offset)
 
     const result = await query(sql, params)
-
-    await cacheSet(cacheKey, result.rows, 60) // Cache for 1 minute
-
     res.json(result.rows)
   } catch (error) {
     next(error)
@@ -158,9 +124,10 @@ app.get('/api/highlights', authMiddleware, async (req: Request, res: Response, n
 app.get('/api/highlights/:id', authMiddleware, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const userId = req.userId!
-    const { id } = req.params
+    const id = String(req.params.id)
+    if (!isUuid(id)) throw new HttpError(400, 'id must be a UUID')
 
-    const result = await query<Highlight>(
+    const result = await query(
       `SELECT h.*, b.title as book_title, b.author as book_author
        FROM highlights h
        JOIN books b ON b.id = h.book_id
@@ -168,122 +135,90 @@ app.get('/api/highlights/:id', authMiddleware, async (req: Request, res: Respons
       [id, userId]
     )
 
-    if (result.rows.length === 0) {
-      res.status(404).json({ error: 'Highlight not found' })
-      return
-    }
+    const highlight = result.rows[0]
+    if (!highlight) throw new HttpError(404, 'Highlight not found')
+    if (highlight.deleted_at) throw new HttpError(410, 'Highlight was deleted')
 
-    res.json(result.rows[0])
+    res.json(highlight)
   } catch (error) {
     next(error)
   }
 })
 
 /**
- * Update a highlight
+ * Update a highlight's note, color or visibility
  * PATCH /api/highlights/:id
+ *
+ * Conflicts between devices are resolved per field by last-writer-wins on the device's
+ * `clientUpdatedAt` (defaults to now). `note: null` clears the note.
  */
 app.patch('/api/highlights/:id', authMiddleware, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const userId = req.userId!
-    const { id } = req.params
-    const { note, color, visibility } = req.body
+    const id = String(req.params.id)
+    if (!isUuid(id)) throw new HttpError(400, 'id must be a UUID')
+    const parsed = parseHighlightChanges(req.body)
+    if (!parsed.ok) throw new HttpError(400, parsed.error)
 
-    const result = await query<Highlight>(
-      `UPDATE highlights
-       SET note = COALESCE($1, note),
-           color = COALESCE($2, color),
-           visibility = COALESCE($3, visibility),
-           updated_at = NOW()
-       WHERE id = $4 AND user_id = $5
-       RETURNING *`,
-      [note, color, visibility, id, userId]
-    )
+    const deviceId = deviceIdFrom(req)
+    const clientTs = parseClientTimestamp(req.body.clientUpdatedAt, Date.now())
+    const result = await updateHighlight(userId, id.toLowerCase(), parsed.value, { deviceId, clientTs })
 
-    if (result.rows.length === 0) {
-      res.status(404).json({ error: 'Highlight not found' })
-      return
+    if (result.status === 'not_found') throw new HttpError(404, 'Highlight not found')
+    if (result.status === 'gone') throw new HttpError(410, 'Highlight was deleted')
+    if (result.status === 'applied') {
+      await notifyDevices(userId, result.seq, deviceId, logger)
+      logger.info({ event: 'highlight_updated', userId, highlightId: id, applied: result.applied, seq: result.seq })
     }
 
-    await cacheDel(`user:${userId}:highlights`)
-
-    logger.info({ event: 'highlight_updated', userId, highlightId: id })
-
-    res.json(result.rows[0])
+    // 'superseded' still answers 200 with the current state: a newer edit already won.
+    res.setHeader('X-Merge-Result', result.status)
+    res.json(result.highlight)
   } catch (error) {
     next(error)
   }
 })
 
 /**
- * Delete a highlight
+ * Delete a highlight (tombstone). Idempotent: deleting twice answers 204 both times.
  * DELETE /api/highlights/:id
  */
 app.delete('/api/highlights/:id', authMiddleware, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const userId = req.userId!
-    const { id } = req.params
+    const id = String(req.params.id)
+    if (!isUuid(id)) throw new HttpError(400, 'id must be a UUID')
 
-    await transaction(async (client) => {
-      // Get highlight before deletion for aggregation update
-      const highlight = await client.query<Highlight>(
-        'SELECT * FROM highlights WHERE id = $1 AND user_id = $2',
-        [id, userId]
-      )
-
-      if (highlight.rows.length === 0) {
-        throw new Error('Highlight not found')
-      }
-
-      const h = highlight.rows[0]
-
-      // Soft delete for sync
-      await client.query(
-        'INSERT INTO deleted_highlights (highlight_id, user_id) VALUES ($1, $2)',
-        [id, userId]
-      )
-
-      // Archive the highlight
-      await client.query(
-        'UPDATE highlights SET archived = true, updated_at = NOW() WHERE id = $1',
-        [id]
-      )
-
-      // Update aggregation counters
-      if (h.visibility !== 'private') {
-        const passageId = normalizePassage(h.location_start, h.location_end)
-        await hashIncr(`book:${h.book_id}:highlights`, passageId, -1)
-      }
-    })
-
-    await cacheDel(`user:${userId}:highlights`)
-
-    logger.info({ event: 'highlight_deleted', userId, highlightId: id })
+    const result = await deleteHighlight(userId, id.toLowerCase())
+    if (result.status === 'not_found') throw new HttpError(404, 'Highlight not found')
+    if (result.status === 'deleted') {
+      await notifyDevices(userId, result.seq!, deviceIdFrom(req), logger)
+      logger.info({ event: 'highlight_deleted', userId, highlightId: id, seq: result.seq })
+    }
 
     res.status(204).send()
-  } catch (error: any) {
-    if (error.message === 'Highlight not found') {
-      res.status(404).json({ error: 'Highlight not found' })
-      return
-    }
+  } catch (error) {
     next(error)
   }
 })
 
 /**
  * Export highlights
- * GET /api/highlights/export
+ * GET /api/export/highlights?format=markdown|csv|json
  */
 app.get('/api/export/highlights', authMiddleware, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const userId = req.userId!
     const { format = 'markdown' } = req.query as { format?: string }
+    if (!['markdown', 'csv', 'json'].includes(format)) {
+      throw new HttpError(400, 'Invalid format. Use markdown, csv, or json')
+    }
 
-    const result = await query(
+    const result = await query<ExportRow>(
       `SELECT h.*, b.title as book_title, b.author as book_author
        FROM highlights h
        JOIN books b ON b.id = h.book_id
-       WHERE h.user_id = $1 AND h.archived = false
+       WHERE h.user_id = $1 AND h.deleted_at IS NULL
        ORDER BY b.title, h.location_start`,
       [userId]
     )
@@ -291,20 +226,16 @@ app.get('/api/export/highlights', authMiddleware, async (req: Request, res: Resp
     const highlights = result.rows
 
     if (format === 'markdown') {
-      const markdown = formatAsMarkdown(highlights)
       res.setHeader('Content-Type', 'text/markdown')
       res.setHeader('Content-Disposition', 'attachment; filename=my-highlights.md')
-      res.send(markdown)
+      res.send(formatAsMarkdown(highlights))
     } else if (format === 'csv') {
-      const csv = formatAsCSV(highlights)
       res.setHeader('Content-Type', 'text/csv')
       res.setHeader('Content-Disposition', 'attachment; filename=my-highlights.csv')
-      res.send(csv)
-    } else if (format === 'json') {
+      res.send(formatAsCSV(highlights))
+    } else {
       res.setHeader('Content-Disposition', 'attachment; filename=my-highlights.json')
       res.json(highlights)
-    } else {
-      res.status(400).json({ error: 'Invalid format. Use markdown, csv, or json' })
     }
 
     logger.info({ event: 'highlights_exported', userId, format, count: highlights.length })
@@ -325,7 +256,7 @@ app.get('/api/library', authMiddleware, async (req: Request, res: Response, next
       `SELECT b.*, COUNT(h.id) as highlight_count, MAX(h.created_at) as last_highlighted
        FROM books b
        JOIN highlights h ON h.book_id = b.id
-       WHERE h.user_id = $1 AND h.archived = false
+       WHERE h.user_id = $1 AND h.deleted_at IS NULL
        GROUP BY b.id
        ORDER BY last_highlighted DESC`,
       [userId]
@@ -337,21 +268,22 @@ app.get('/api/library', authMiddleware, async (req: Request, res: Response, next
   }
 })
 
-/**
- * Normalize passage location to a fixed window for aggregation
- */
-function normalizePassage(start: number, end: number): string {
-  const windowSize = 100
-  const normalizedStart = Math.floor(start / windowSize) * windowSize
-  const normalizedEnd = Math.ceil(end / windowSize) * windowSize
-  return `${normalizedStart}-${normalizedEnd}`
+/** A highlight joined with its book, as exported. */
+interface ExportRow {
+  book_id: string
+  book_title: string
+  book_author: string
+  highlighted_text: string
+  note: string | null
+  color: string
+  created_at: Date
 }
 
 /**
  * Format highlights as Markdown
  */
-function formatAsMarkdown(highlights: any[]): string {
-  const byBook: Record<string, { title: string; author: string; highlights: any[] }> = {}
+function formatAsMarkdown(highlights: ExportRow[]): string {
+  const byBook: Record<string, { title: string; author: string; highlights: ExportRow[] }> = {}
 
   for (const h of highlights) {
     if (!byBook[h.book_id]) {
@@ -383,17 +315,23 @@ function formatAsMarkdown(highlights: any[]): string {
   return md
 }
 
+/** Quotes a CSV field when it contains a delimiter, quote or newline. */
+function csvField(value: string | null | undefined): string {
+  const text = value ?? ''
+  return /[",\n\r]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text
+}
+
 /**
  * Format highlights as CSV
  */
-function formatAsCSV(highlights: any[]): string {
+function formatAsCSV(highlights: ExportRow[]): string {
   const headers = ['Book Title', 'Author', 'Highlighted Text', 'Note', 'Color', 'Date']
   const rows = highlights.map((h) => [
-    h.book_title,
-    h.book_author,
-    `"${h.highlighted_text.replace(/"/g, '""')}"`,
-    h.note ? `"${h.note.replace(/"/g, '""')}"` : '',
-    h.color,
+    csvField(h.book_title),
+    csvField(h.book_author),
+    csvField(h.highlighted_text),
+    csvField(h.note),
+    csvField(h.color),
     new Date(h.created_at).toISOString(),
   ])
 
@@ -401,7 +339,4 @@ function formatAsCSV(highlights: any[]): string {
 }
 
 /** Error handling middleware */
-app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
-  logger.error({ error: err.message, stack: err.stack })
-  res.status(500).json({ error: 'Internal server error' })
-})
+app.use(errorHandler(logger))

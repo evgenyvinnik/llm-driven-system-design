@@ -65,7 +65,7 @@ export function DashboardPage() {
         <MetricCard
           title="Queue Depth"
           value={metrics?.queue.queued || 0}
-          subtitle={`${metrics?.queue.processing || 0} processing`}
+          subtitle={`${metrics?.queue.processing || 0} running · ${metrics?.queue.delayed || 0} waiting to retry`}
         />
         <MetricCard
           title="Active Workers"

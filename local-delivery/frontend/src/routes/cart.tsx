@@ -1,10 +1,12 @@
 import { createFileRoute, useNavigate } from '@tanstack/react-router';
-import { useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useCartStore } from '@/stores/cartStore';
 import { useLocationStore } from '@/stores/locationStore';
 import { useAuthStore } from '@/stores/authStore';
-import { api } from '@/services/api';
+import { api, ApiError } from '@/services/api';
 import { formatPrice, toNumber } from '@/utils/format';
+import { newIdempotencyKey } from '@/utils/idempotency';
+import type { OrderQuote } from '@/types';
 
 export const Route = createFileRoute('/cart')({
   component: CartPage,
@@ -28,10 +30,68 @@ function CartPage() {
   const [tip, setTip] = useState(0);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState('');
+  const [quote, setQuote] = useState<OrderQuote | null>(null);
+  const [quoteError, setQuoteError] = useState('');
 
-  const subtotal = getSubtotal();
-  const deliveryFee = 2.99;
-  const total = subtotal + deliveryFee + tip;
+  // One idempotency key per checkout attempt. A retry after a timeout or a
+  // double click reuses it, so the server returns the first order instead of
+  // creating a second one. Any change to the order starts a new attempt.
+  const attemptKey = useRef<string | null>(null);
+  useEffect(() => {
+    attemptKey.current = null;
+  }, [items, tip, deliveryAddress, deliveryInstructions, merchant?.id]);
+
+  const quoteItems = useMemo(
+    () => items.map((item) => ({ menu_item_id: item.menuItem.id, quantity: item.quantity })),
+    [items]
+  );
+
+  // The server prices the cart (delivery fee depends on distance), so the
+  // total on the button is the total that will be charged. Debounced, and a
+  // newer cart aborts the older request so a slow response cannot win.
+  useEffect(() => {
+    if (!merchant || quoteItems.length === 0 || !location) {
+      setQuote(null);
+      return;
+    }
+    const controller = new AbortController();
+    const timer = setTimeout(() => {
+      api
+        .quoteOrder(
+          {
+            merchant_id: merchant.id,
+            delivery_lat: location.lat,
+            delivery_lng: location.lng,
+            items: quoteItems,
+            tip: tip > 0 ? tip : undefined,
+          },
+          controller.signal
+        )
+        .then((result) => {
+          setQuote(result);
+          setQuoteError('');
+        })
+        .catch((err: unknown) => {
+          if ((err as Error).name === 'AbortError') return;
+          setQuote(null);
+          setQuoteError((err as Error).message || 'Could not price this order');
+        });
+    }, 250);
+    return () => {
+      clearTimeout(timer);
+      controller.abort();
+    };
+  }, [merchant, quoteItems, location, tip]);
+
+  useEffect(() => {
+    if (!location) {
+      void getCurrentLocation();
+    }
+  }, [location, getCurrentLocation]);
+
+  const subtotal = quote ? toNumber(quote.subtotal) : getSubtotal();
+  const deliveryFee = quote ? toNumber(quote.delivery_fee) : null;
+  const total = quote ? toNumber(quote.total) : null;
 
   const handleQuantityChange = (itemId: string, delta: number) => {
     const item = items.find((i) => i.menuItem.id === itemId);
@@ -58,6 +118,7 @@ function CartPage() {
 
     setIsSubmitting(true);
     setError('');
+    attemptKey.current ??= newIdempotencyKey();
 
     try {
       // Get current location or use default
@@ -80,11 +141,18 @@ function CartPage() {
         tip: tip > 0 ? tip : undefined,
       };
 
-      const order = await api.createOrder(orderData);
+      const order = await api.createOrder(orderData, attemptKey.current);
+      attemptKey.current = null;
       clearCart();
       navigate({ to: '/orders/$orderId', params: { orderId: (order as { id: string }).id } });
     } catch (err) {
-      setError((err as Error).message || 'Failed to place order');
+      if (err instanceof ApiError) {
+        // The server answered: this attempt is settled; editing the cart starts a new one.
+        setError(err.message);
+      } else {
+        // No answer (network): the order may exist. Retrying reuses the same key, so it is safe.
+        setError('Network problem: we could not confirm your order. Retry is safe and will not order twice.');
+      }
     } finally {
       setIsSubmitting(false);
     }
@@ -226,7 +294,7 @@ function CartPage() {
           </div>
           <div className="flex justify-between">
             <span className="text-gray-600">Delivery Fee</span>
-            <span>${formatPrice(deliveryFee)}</span>
+            <span>{deliveryFee === null ? 'Calculating...' : `$${formatPrice(deliveryFee)}`}</span>
           </div>
           {tip > 0 && (
             <div className="flex justify-between">
@@ -236,13 +304,20 @@ function CartPage() {
           )}
           <div className="flex justify-between text-lg font-semibold pt-2 border-t">
             <span>Total</span>
-            <span>${formatPrice(total)}</span>
+            <span>{total === null ? '...' : `$${formatPrice(total)}`}</span>
           </div>
         </div>
+        {quoteError && (
+          <p className="mt-3 text-sm text-red-600" role="alert">
+            {quoteError}
+          </p>
+        )}
       </div>
 
       {error && (
-        <div className="mb-4 p-3 bg-red-50 text-red-600 rounded-lg">{error}</div>
+        <div className="mb-4 p-3 bg-red-50 text-red-600 rounded-lg" role="alert">
+          {error}
+        </div>
       )}
 
       <button
@@ -250,7 +325,11 @@ function CartPage() {
         disabled={isSubmitting}
         className="btn-primary w-full btn-lg"
       >
-        {isSubmitting ? 'Placing Order...' : `Place Order - $${formatPrice(total)}`}
+        {isSubmitting
+          ? 'Placing Order...'
+          : total === null
+            ? 'Place Order'
+            : `Place Order - $${formatPrice(total)}`}
       </button>
     </div>
   );

@@ -63,7 +63,7 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    command: ["node", "dist/api/server.js"]
+    command: ["node", "dist/api/index.js"]
 
   # Scheduler Service (only one should be leader)
   scheduler:

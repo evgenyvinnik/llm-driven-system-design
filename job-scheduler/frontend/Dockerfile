@@ -4,7 +4,8 @@ FROM node:20-alpine as build
 WORKDIR /app
 
 COPY package*.json ./
-RUN npm ci
+# No lockfile is committed for this project, so `npm ci` would refuse to run.
+RUN npm install --no-audit --no-fund
 
 COPY . .
 RUN npm run build

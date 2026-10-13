@@ -4,8 +4,8 @@
  * @module components/CreateJobModal
  */
 
-import { useState } from 'react';
-import { CreateJobInput } from '../types';
+import { useRef, useState } from 'react';
+import { CreateJobInput, MisfirePolicy } from '../types';
 import { Button, Input, TextArea, Select, Modal } from './UI';
 
 /** Props for the CreateJobModal component */
@@ -14,8 +14,12 @@ interface CreateJobModalProps {
   isOpen: boolean;
   /** Callback to close the modal */
   onClose: () => void;
-  /** Async callback to create the job with collected input */
-  onCreate: (input: CreateJobInput) => Promise<void>;
+  /**
+   * Async callback to create the job. It receives the same idempotency key for every
+   * submission of an unchanged draft, so resubmitting after a timeout cannot create
+   * the job twice.
+   */
+  onCreate: (input: CreateJobInput, idempotencyKey: string) => Promise<void>;
 }
 
 /** Available job handlers with display labels */
@@ -40,8 +44,11 @@ export function CreateJobModal({ isOpen, onClose, onCreate }: CreateJobModalProp
   const [schedule, setSchedule] = useState('');
   const [priority, setPriority] = useState(50);
   const [maxRetries, setMaxRetries] = useState(3);
+  const [misfirePolicy, setMisfirePolicy] = useState<MisfirePolicy>('fire_once');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  /** Key for the draft last submitted; reused only while the draft is unchanged. */
+  const submission = useRef<{ draft: string; key: string } | null>(null);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -54,7 +61,7 @@ export function CreateJobModal({ isOpen, onClose, onCreate }: CreateJobModalProp
         parsedPayload = JSON.parse(payload);
       }
 
-      await onCreate({
+      const input: CreateJobInput = {
         name,
         description: description || undefined,
         handler,
@@ -62,9 +69,17 @@ export function CreateJobModal({ isOpen, onClose, onCreate }: CreateJobModalProp
         schedule: schedule || undefined,
         priority,
         max_retries: maxRetries,
-      });
+        misfire_policy: schedule ? misfirePolicy : undefined,
+      };
+      const draft = JSON.stringify(input);
+      if (submission.current?.draft !== draft) {
+        submission.current = { draft, key: crypto.randomUUID() };
+      }
+
+      await onCreate(input, submission.current.key);
 
       // Reset form
+      submission.current = null;
       setName('');
       setDescription('');
       setHandler('test.echo');
@@ -72,6 +87,7 @@ export function CreateJobModal({ isOpen, onClose, onCreate }: CreateJobModalProp
       setSchedule('');
       setPriority(50);
       setMaxRetries(3);
+      setMisfirePolicy('fire_once');
       onClose();
     } catch (err) {
       setError((err as Error).message);
@@ -84,7 +100,7 @@ export function CreateJobModal({ isOpen, onClose, onCreate }: CreateJobModalProp
     <Modal isOpen={isOpen} onClose={onClose} title="Create New Job">
       <form onSubmit={handleSubmit} className="space-y-4">
         {error && (
-          <div className="bg-red-50 text-red-600 p-3 rounded-md text-sm">
+          <div role="alert" className="bg-red-50 text-red-600 p-3 rounded-md text-sm">
             {error}
           </div>
         )}
@@ -122,11 +138,23 @@ export function CreateJobModal({ isOpen, onClose, onCreate }: CreateJobModalProp
         />
 
         <Input
-          label="Schedule (Cron Expression)"
+          label="Schedule (Cron Expression, UTC)"
           value={schedule}
           onChange={(e) => setSchedule(e.target.value)}
           placeholder="*/5 * * * * (every 5 minutes)"
         />
+
+        {schedule.trim() && (
+          <Select
+            label="If runs are missed (scheduler down longer than the grace window)"
+            value={misfirePolicy}
+            onChange={(e) => setMisfirePolicy(e.target.value as MisfirePolicy)}
+            options={[
+              { value: 'fire_once', label: 'Run once to catch up' },
+              { value: 'skip', label: 'Skip the missed runs' },
+            ]}
+          />
+        )}
 
         <div className="grid grid-cols-2 gap-4">
           <Input

@@ -63,6 +63,8 @@ export const uploadLimiter = limiter('upload', {
 export const sharePasswordLimiter = limiter('share-pw', {
   windowMs: 15 * 60 * 1000,
   limit: 10,
+  // Only wrong passwords count; a viewer who unlocks several times is not guessing.
+  skipSuccessfulRequests: true,
   keyGenerator: (req: Request) => `${req.ip}:${req.params.token}`,
   message: { error: 'Too many password attempts for this link, please try again later.' },
 });

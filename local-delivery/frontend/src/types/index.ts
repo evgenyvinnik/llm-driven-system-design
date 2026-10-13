@@ -98,6 +98,8 @@ export interface Order {
   delivered_at: string | null;
   cancelled_at: string | null;
   cancellation_reason: string | null;
+  /** Incremented on every state change; the client keeps the highest version it has seen. */
+  version: number;
 }
 
 export interface OrderItem {
@@ -170,9 +172,34 @@ export interface LocationUpdatePayload {
 }
 
 export interface StatusUpdatePayload {
+  order_id: string;
   status: OrderStatus;
+  driver_id: string | null;
+  version: number;
   timestamp: string;
 }
+
+export interface OrderSnapshotPayload {
+  order: OrderWithDetails;
+}
+
+/** Server-computed price for a cart (DECIMAL amounts as strings). */
+export interface OrderQuote {
+  subtotal: string;
+  delivery_fee: string;
+  tip: string;
+  total: string;
+  distance_km: number;
+}
+
+/** GET /driver/offers/pending */
+export interface PendingOfferResponse {
+  offer: DriverOffer & { expires_in_seconds: number };
+  order: OrderWithDetails;
+}
+
+/** WebSocket connection state shown in the UI. */
+export type ConnectionState = 'connecting' | 'open' | 'reconnecting' | 'closed';
 
 export interface NewOfferPayload {
   offer_id: string;

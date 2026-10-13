@@ -14,6 +14,9 @@
     "lint": "eslint src",
     "seed": "tsx src/seed.ts",
     "db:migrate": "tsx src/migrate.ts",
+    "search:reindex": "tsx src/reindexSearch.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "format": "prettier --write src/**/*.ts"
   },
   "dependencies": {

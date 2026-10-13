@@ -7,10 +7,12 @@ import { CommentItem } from './CommentItem';
 interface CommentSectionProps {
   videoId: string;
   playerTime: number;
+  /** Clicking a timestamp badge seeks the player there. */
+  onSeek?: (seconds: number) => void;
 }
 
 /** Displays video comments with time-anchored input, threading, and real-time player sync. */
-export function CommentSection({ videoId, playerTime }: CommentSectionProps) {
+export function CommentSection({ videoId, playerTime, onSeek }: CommentSectionProps) {
   const user = useAuthStore((s) => s.user);
   const [comments, setComments] = useState<Comment[]>([]);
   const [loading, setLoading] = useState(true);
@@ -80,6 +82,7 @@ export function CommentSection({ videoId, playerTime }: CommentSectionProps) {
                 comment={comment}
                 canDelete={user?.id === comment.userId}
                 onDelete={() => handleDelete(comment.id)}
+                onSeek={onSeek}
               />
               {replies
                 .filter((r) => r.parentId === comment.id)
@@ -89,6 +92,7 @@ export function CommentSection({ videoId, playerTime }: CommentSectionProps) {
                       comment={reply}
                       canDelete={user?.id === reply.userId}
                       onDelete={() => handleDelete(reply.id)}
+                      onSeek={onSeek}
                     />
                   </div>
                 ))}

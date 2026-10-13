@@ -1,16 +1,36 @@
 import { createFileRoute } from '@tanstack/react-router';
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { api } from '@/services/api';
 import { formatPrice, formatNumber, toNumber } from '@/utils/format';
 import { wsService } from '@/services/websocket';
 import { useAuthStore } from '@/stores/authStore';
 import { StatusBadge } from '@/components/StatusBadge';
 import { PageLoading } from '@/components/LoadingSpinner';
-import type { OrderWithDetails, LocationUpdatePayload, StatusUpdatePayload } from '@/types';
+import type { ConnectionState, OrderStatus, OrderWithDetails } from '@/types';
 
 export const Route = createFileRoute('/orders/$orderId')({
   component: OrderDetailPage,
 });
+
+const TERMINAL_STATUSES: OrderStatus[] = ['delivered', 'cancelled'];
+
+/** Human wording for screen-reader announcements of status changes. */
+const STATUS_ANNOUNCEMENTS: Partial<Record<OrderStatus, string>> = {
+  driver_assigned: 'A driver accepted your order',
+  picked_up: 'Your order was picked up',
+  in_transit: 'Your order is on the way',
+  delivered: 'Your order was delivered',
+  cancelled: 'Your order was cancelled',
+};
+
+/**
+ * Keeps whichever copy of the order is newer. Events and snapshots can arrive
+ * in any order around a reconnect; the server's version decides.
+ */
+function newerOrder(current: OrderWithDetails | null, incoming: OrderWithDetails): OrderWithDetails {
+  if (!current || (incoming.version ?? 0) >= (current.version ?? 0)) return incoming;
+  return current;
+}
 
 function OrderDetailPage() {
   const { orderId } = Route.useParams();
@@ -18,64 +38,87 @@ function OrderDetailPage() {
   const [isLoading, setIsLoading] = useState(true);
   const [driverLocation, setDriverLocation] = useState<{ lat: number; lng: number } | null>(null);
   const [eta, setEta] = useState<number | null>(null);
+  const [connection, setConnection] = useState<ConnectionState>('closed');
+  const [announcement, setAnnouncement] = useState('');
+  const [actionError, setActionError] = useState('');
   const [ratingSubmitted, setRatingSubmitted] = useState(false);
   const [driverRating, setDriverRating] = useState(5);
   const [merchantRating, setMerchantRating] = useState(5);
 
   const { token } = useAuthStore();
 
+  // Latest version shown, readable from socket callbacks without re-subscribing.
+  const versionRef = useRef(0);
   useEffect(() => {
-    loadOrder();
+    versionRef.current = order?.version ?? 0;
+  }, [order?.version]);
+
+  /** REST snapshot; applied only if it is at least as new as what is shown. */
+  const refreshOrder = useCallback(async () => {
+    try {
+      const data = (await api.getOrder(orderId)) as OrderWithDetails;
+      setOrder((prev) => newerOrder(prev, data));
+    } catch (error) {
+      console.error('Failed to load order:', error);
+    }
   }, [orderId]);
 
   useEffect(() => {
-    if (!token || !order || order.status === 'delivered' || order.status === 'cancelled') {
+    setIsLoading(true);
+    setOrder(null);
+    refreshOrder().finally(() => setIsLoading(false));
+  }, [refreshOrder]);
+
+  const isTerminal = order ? TERMINAL_STATUSES.includes(order.status) : false;
+  const hasOrder = order !== null;
+
+  // One socket per tracked order. Every (re)connect resubscribes and the server
+  // answers with a fresh snapshot, so nothing missed while offline is lost.
+  useEffect(() => {
+    if (!token || !hasOrder || isTerminal) {
       return;
     }
 
-    // Connect to WebSocket for real-time updates
     wsService.connect(token, {
-      onConnected: () => {
-        wsService.subscribeToOrder(orderId);
-      },
-      onLocationUpdate: (payload: LocationUpdatePayload) => {
+      onConnected: () => wsService.subscribeToOrder(orderId),
+      onConnectionChange: setConnection,
+      onOrderSnapshot: ({ order: snapshot }) => setOrder((prev) => newerOrder(prev, snapshot)),
+      onLocationUpdate: (payload) => {
         setDriverLocation({ lat: payload.lat, lng: payload.lng });
         setEta(payload.eta_seconds);
       },
-      onStatusUpdate: (payload: StatusUpdatePayload) => {
-        setOrder((prev) => prev ? { ...prev, status: payload.status } : null);
+      onStatusUpdate: (payload) => {
+        if (payload.order_id !== orderId || payload.version < versionRef.current) return;
+        setOrder((prev) =>
+          !prev || payload.version < (prev.version ?? 0)
+            ? prev
+            : { ...prev, status: payload.status, driver_id: payload.driver_id, version: payload.version }
+        );
+        setAnnouncement(STATUS_ANNOUNCEMENTS[payload.status] ?? `Order status: ${payload.status}`);
+        // The event says what changed; the REST snapshot fills in details
+        // (courier name, timestamps) and is version-checked too.
+        void refreshOrder();
       },
-      onError: (message) => {
-        console.error('WebSocket error:', message);
-      },
+      onError: (message) => console.error('WebSocket error:', message),
     });
 
     return () => {
       wsService.unsubscribeFromOrder();
       wsService.disconnect();
     };
-  }, [token, order?.id, order?.status]);
-
-  const loadOrder = async () => {
-    setIsLoading(true);
-    try {
-      const data = await api.getOrder(orderId);
-      setOrder(data as OrderWithDetails);
-    } catch (error) {
-      console.error('Failed to load order:', error);
-    } finally {
-      setIsLoading(false);
-    }
-  };
+  }, [token, orderId, hasOrder, isTerminal, refreshOrder]);
 
   const handleCancelOrder = async () => {
     if (!confirm('Are you sure you want to cancel this order?')) return;
 
+    setActionError('');
     try {
-      await api.cancelOrder(orderId, 'Customer cancelled');
-      loadOrder();
+      const cancelled = (await api.cancelOrder(orderId, 'Customer cancelled')) as OrderWithDetails;
+      setOrder((prev) => (prev ? newerOrder(prev, { ...prev, ...cancelled }) : prev));
     } catch (error) {
-      console.error('Failed to cancel order:', error);
+      // 409: a driver accepted a moment earlier. Show the truth, not a stale button.
+      setActionError((error as Error).message || 'Failed to cancel order');
+      void refreshOrder();
     }
   };
 
@@ -121,6 +164,24 @@ function OrderDetailPage() {
         </div>
         <StatusBadge status={order.status} />
       </div>
+
+      <p className="sr-only" aria-live="polite" role="status">
+        {announcement}
+      </p>
+
+      {!isActive || connection === 'open' || connection === 'closed' ? null : (
+        <div className="mb-4 p-3 rounded-lg bg-yellow-50 text-yellow-800 text-sm" role="status">
+          {connection === 'reconnecting'
+            ? 'Live updates paused. Reconnecting...'
+            : 'Connecting to live updates...'}
+        </div>
+      )}
+
+      {actionError && (
+        <div className="mb-4 p-3 rounded-lg bg-red-50 text-red-700 text-sm" role="alert">
+          {actionError}
+        </div>
+      )}
 
       {/* Live Tracking */}
       {isActive && order.driver && (
@@ -333,7 +394,7 @@ function getStatusSteps(order: OrderWithDetails) {
 
   const currentIndex = statusOrder.indexOf(order.status);
 
-  return steps.map((step, _index) => ({
+  return steps.map((step) => ({
     ...step,
     completed: statusOrder.indexOf(step.status) < currentIndex,
     current: step.status === order.status,

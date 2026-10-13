@@ -1,13 +1,15 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import type { IssueWithDetails, Comment, IssueHistory, Transition, User } from '../types';
 import * as api from '../services/api';
+import { ApiError, isUncertainFailure } from '../services/api';
 import { useIssueStore } from '../stores';
+import { newIdempotencyKey } from '../utils/idempotency';
 
 /**
  * State returned by the useIssueDetail hook.
  */
 interface IssueDetailState {
-  /** The current issue data */
+  /** The current issue data (including its version) */
   issue: IssueWithDetails;
   /** Comments on the issue */
   comments: Comment[];
@@ -27,54 +29,42 @@ interface IssueDetailState {
   editedSummary: string;
   /** Current edited description value */
   editedDescription: string;
+  /** Last failure or conflict explanation, shown in an alert region */
+  error: string | null;
 }
 
 /**
  * Actions returned by the useIssueDetail hook.
  */
 interface IssueDetailActions {
-  /** Starts editing the issue summary and description */
   startEditing: () => void;
-  /** Cancels editing and reverts changes */
   cancelEditing: () => void;
-  /** Sets the edited summary value */
   setEditedSummary: (value: string) => void;
-  /** Sets the edited description value */
   setEditedDescription: (value: string) => void;
-  /** Saves the edited summary and description */
   saveChanges: () => Promise<void>;
-  /** Executes a status transition */
   executeTransition: (transitionId: number) => Promise<void>;
-  /** Changes the issue assignee */
   changeAssignee: (assigneeId: string) => Promise<void>;
-  /** Changes the issue priority */
   changePriority: (priority: string) => Promise<void>;
-  /** Changes the issue story points */
   changeStoryPoints: (points: string) => Promise<void>;
-  /** Adds a new comment to the issue */
-  addComment: (body: string) => Promise<void>;
+  addComment: (body: string) => Promise<boolean>;
+  dismissError: () => void;
 }
+
+type IssueUpdate = Parameters<typeof api.updateIssue>[1];
+
+const CONFLICT_MESSAGE =
+  'Someone else changed this issue while you had it open, so your change was not saved. ' +
+  'The latest version is shown; apply your change again if it still makes sense.';
 
 /**
  * Custom hook for managing issue detail state and operations.
  *
- * Handles all data fetching, state management, and API calls for
- * the issue detail view. Centralizes logic that was previously
- * spread across the IssueDetail component.
+ * Every edit sends the version the user is looking at (If-Match). If someone else saved
+ * first, the server answers 412 with the current issue: the hook shows that version and
+ * keeps the user's unsaved text, instead of silently overwriting the other person's work.
  *
  * @param initialIssue - The initial issue data
  * @returns An object containing state and actions
- *
- * @example
- * ```tsx
- * const { state, actions } = useIssueDetail(issue);
- *
- * // Access state
- * console.log(state.comments);
- *
- * // Trigger actions
- * await actions.saveChanges();
- * ```
  */
 export function useIssueDetail(initialIssue: IssueWithDetails): {
   state: IssueDetailState;
@@ -82,173 +72,175 @@ export function useIssueDetail(initialIssue: IssueWithDetails): {
 } {
   const { updateIssueInList } = useIssueStore();
 
-  // Core state
   const [issue, setIssue] = useState(initialIssue);
   const [comments, setComments] = useState<Comment[]>([]);
   const [history, setHistory] = useState<IssueHistory[]>([]);
   const [transitions, setTransitions] = useState<Transition[]>([]);
   const [users, setUsers] = useState<User[]>([]);
 
-  // UI state
   const [isLoading, setIsLoading] = useState(true);
   const [isSaving, setIsSaving] = useState(false);
   const [isEditing, setIsEditing] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
-  // Edit state
   const [editedSummary, setEditedSummary] = useState(initialIssue.summary);
   const [editedDescription, setEditedDescription] = useState(initialIssue.description || '');
 
-  /**
-   * Loads all related data for the issue.
-   */
+  /** Idempotency key of the comment draft being submitted, reused only for its retries. */
+  const commentKey = useRef<{ body: string; key: string } | null>(null);
+
   const loadData = useCallback(async () => {
     setIsLoading(true);
     try {
-      const [commentsData, historyData, transitionsData, usersData] = await Promise.all([
+      const [fresh, commentsData, historyData, transitionsData, usersData] = await Promise.all([
+        api.getIssue(issue.id),
         api.getIssueComments(issue.id),
         api.getIssueHistory(issue.id),
         api.getIssueTransitions(issue.id),
         api.getUsers(),
       ]);
+      setIssue(fresh);
       setComments(commentsData);
       setHistory(historyData);
       setTransitions(transitionsData);
       setUsers(usersData);
-    } catch (error) {
-      console.error('Failed to load issue data:', error);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to load the issue');
     }
     setIsLoading(false);
   }, [issue.id]);
 
-  // Load data when issue ID changes
   useEffect(() => {
     loadData();
   }, [loadData]);
 
-  /**
-   * Starts editing mode.
-   */
-  const startEditing = useCallback(() => {
-    setIsEditing(true);
-  }, []);
+  /** Shows the server's copy of the issue everywhere it is displayed. */
+  const applyIssue = useCallback(
+    (next: IssueWithDetails) => {
+      setIssue(next);
+      updateIssueInList(next);
+    },
+    [updateIssueInList]
+  );
+
+  /** History and transitions depend on the issue's current state; refresh them after a change. */
+  const refreshDerived = useCallback(async () => {
+    const [historyData, transitionsData] = await Promise.all([
+      api.getIssueHistory(issue.id),
+      api.getIssueTransitions(issue.id),
+    ]);
+    setHistory(historyData);
+    setTransitions(transitionsData);
+  }, [issue.id]);
 
   /**
-   * Cancels editing and reverts to original values.
+   * Saves fields with the version the user saw. Returns true on success. On 412 it shows
+   * the current issue and returns false so the caller can keep the user's draft.
    */
+  const saveFields = useCallback(
+    async (updates: IssueUpdate): Promise<boolean> => {
+      setError(null);
+      try {
+        const updated = await api.updateIssue(issue.id, updates, issue.version);
+        applyIssue(updated);
+        refreshDerived().catch(() => {});
+        return true;
+      } catch (err) {
+        if (err instanceof ApiError && err.status === 412 && err.body.issue) {
+          applyIssue(err.body.issue as IssueWithDetails);
+          refreshDerived().catch(() => {});
+          setError(CONFLICT_MESSAGE);
+        } else {
+          setError(err instanceof Error ? err.message : 'Failed to save');
+        }
+        return false;
+      }
+    },
+    [issue.id, issue.version, applyIssue, refreshDerived]
+  );
+
+  const startEditing = useCallback(() => {
+    setEditedSummary(issue.summary);
+    setEditedDescription(issue.description || '');
+    setIsEditing(true);
+  }, [issue.summary, issue.description]);
+
   const cancelEditing = useCallback(() => {
     setIsEditing(false);
     setEditedSummary(issue.summary);
     setEditedDescription(issue.description || '');
   }, [issue.summary, issue.description]);
 
-  /**
-   * Saves the edited summary and description.
-   */
   const saveChanges = useCallback(async () => {
     setIsSaving(true);
-    try {
-      const updated = await api.updateIssue(issue.id, {
-        summary: editedSummary,
-        description: editedDescription,
-      });
-      setIssue(updated);
-      updateIssueInList(updated);
-      setIsEditing(false);
-    } catch (error) {
-      console.error('Failed to update issue:', error);
-    }
+    const saved = await saveFields({ summary: editedSummary, description: editedDescription || null });
+    // On a conflict the draft stays in the editor so nothing the user typed is lost.
+    if (saved) setIsEditing(false);
     setIsSaving(false);
-  }, [issue.id, editedSummary, editedDescription, updateIssueInList]);
+  }, [saveFields, editedSummary, editedDescription]);
 
-  /**
-   * Executes a status transition.
-   */
   const executeTransition = useCallback(
     async (transitionId: number) => {
+      setError(null);
       try {
         const updated = await api.executeTransition(issue.id, transitionId);
-        setIssue(updated);
-        updateIssueInList(updated);
-        // Reload transitions for new status
-        const newTransitions = await api.getIssueTransitions(issue.id);
-        setTransitions(newTransitions);
-      } catch (error) {
-        console.error('Failed to execute transition:', error);
+        applyIssue(updated);
+        await refreshDerived();
+      } catch (err) {
+        if (err instanceof ApiError && err.status === 409) {
+          // The issue moved under us: show where it is now and what can be done from there.
+          applyIssue(await api.getIssue(issue.id));
+          await refreshDerived();
+        }
+        setError(err instanceof Error ? err.message : 'Failed to change the status');
       }
     },
-    [issue.id, updateIssueInList]
+    [issue.id, applyIssue, refreshDerived]
   );
 
-  /**
-   * Changes the issue assignee.
-   */
   const changeAssignee = useCallback(
     async (assigneeId: string) => {
-      try {
-        const updated = await api.updateIssue(issue.id, {
-          assigneeId: assigneeId || null,
-        });
-        setIssue(updated);
-        updateIssueInList(updated);
-      } catch (error) {
-        console.error('Failed to update assignee:', error);
-      }
+      await saveFields({ assigneeId: assigneeId || null });
     },
-    [issue.id, updateIssueInList]
+    [saveFields]
   );
 
-  /**
-   * Changes the issue priority.
-   */
   const changePriority = useCallback(
     async (priority: string) => {
-      try {
-        const updated = await api.updateIssue(issue.id, { priority });
-        setIssue(updated);
-        updateIssueInList(updated);
-      } catch (error) {
-        console.error('Failed to update priority:', error);
-      }
+      await saveFields({ priority });
     },
-    [issue.id, updateIssueInList]
+    [saveFields]
   );
 
-  /**
-   * Changes the issue story points.
-   */
   const changeStoryPoints = useCallback(
     async (points: string) => {
-      try {
-        const updated = await api.updateIssue(issue.id, {
-          storyPoints: points ? parseInt(points, 10) : null,
-        });
-        setIssue(updated);
-        updateIssueInList(updated);
-      } catch (error) {
-        console.error('Failed to update story points:', error);
-      }
+      await saveFields({ storyPoints: points ? parseInt(points, 10) : null });
     },
-    [issue.id, updateIssueInList]
+    [saveFields]
   );
 
-  /**
-   * Adds a new comment to the issue.
-   */
   const addComment = useCallback(
-    async (body: string) => {
-      if (!body.trim()) return;
+    async (body: string): Promise<boolean> => {
+      if (!body.trim()) return false;
+      setError(null);
+      // Same draft as a failed attempt whose outcome is unknown: reuse its key, so a
+      // retry cannot post the comment twice.
+      if (commentKey.current?.body !== body) commentKey.current = { body, key: newIdempotencyKey() };
       try {
-        const comment = await api.addComment(issue.id, body);
-        setComments((prev) => [
-          ...prev,
-          { ...comment, author: users.find((u) => u.id === comment.author_id)! },
-        ]);
-      } catch (error) {
-        console.error('Failed to add comment:', error);
+        const comment = await api.addComment(issue.id, body, commentKey.current.key);
+        commentKey.current = null;
+        setComments((prev) => [...prev, { ...comment, author: users.find((u) => u.id === comment.author_id)! }]);
+        return true;
+      } catch (err) {
+        if (!isUncertainFailure(err)) commentKey.current = null;
+        setError(err instanceof Error ? err.message : 'Failed to add the comment');
+        return false;
       }
     },
     [issue.id, users]
   );
+
+  const dismissError = useCallback(() => setError(null), []);
 
   return {
     state: {
@@ -262,6 +254,7 @@ export function useIssueDetail(initialIssue: IssueWithDetails): {
       isEditing,
       editedSummary,
       editedDescription,
+      error,
     },
     actions: {
       startEditing,
@@ -274,6 +267,7 @@ export function useIssueDetail(initialIssue: IssueWithDetails): {
       changePriority,
       changeStoryPoints,
       addComment,
+      dismissError,
     },
   };
 }

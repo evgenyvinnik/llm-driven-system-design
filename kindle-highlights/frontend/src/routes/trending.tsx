@@ -16,26 +16,28 @@ function TrendingPage() {
   const [days, setDays] = useState(7)
 
   useEffect(() => {
-    loadTrending()
-  }, [days])
-
-  const loadTrending = async () => {
+    // Switching the period quickly must not let a slow, older response overwrite a newer one.
+    let stale = false
     setLoading(true)
-    try {
-      const data = await getTrending({ limit: 20, days })
-      setHighlights(data)
-    } catch (error) {
-      console.error('Failed to load trending:', error)
-    } finally {
-      setLoading(false)
+    getTrending({ limit: 20, days })
+      .then((data) => {
+        if (!stale) setHighlights(data)
+      })
+      .catch((error) => console.error('Failed to load trending:', error))
+      .finally(() => {
+        if (!stale) setLoading(false)
+      })
+    return () => {
+      stale = true
     }
-  }
+  }, [days])
 
   return (
     <div className="mx-auto max-w-4xl px-4 py-8">
       <div className="mb-8 flex items-center justify-between">
         <h1 className="text-3xl font-bold text-gray-900">Trending Highlights</h1>
         <select
+          aria-label="Time period"
           value={days}
           onChange={(e) => setDays(Number(e.target.value))}
           className="rounded-md border border-gray-300 px-3 py-2 focus:border-blue-500 focus:outline-none"
@@ -52,13 +54,15 @@ function TrendingPage() {
         </div>
       ) : highlights.length === 0 ? (
         <div className="rounded-lg bg-white p-8 text-center shadow-sm">
-          <p className="text-gray-500">No trending highlights found.</p>
+          <p className="text-gray-500">
+            No trending highlights yet. A passage shows up here once enough readers have highlighted it.
+          </p>
         </div>
       ) : (
         <div className="space-y-4">
           {highlights.map((highlight, index) => (
             <TrendingCard
-              key={highlight.passage_id}
+              key={`${highlight.book_id}:${highlight.passage_id}`}
               highlight={highlight}
               rank={index + 1}
             />
@@ -90,7 +94,7 @@ function TrendingCard({ highlight, rank }: TrendingCardProps) {
         <p className="text-lg text-gray-800">"{highlight.passage_text}"</p>
       </blockquote>
       <p className="mt-3 text-sm text-gray-500">
-        {highlight.highlight_count} readers highlighted this
+        {highlight.reader_count} readers highlighted this
       </p>
     </div>
   )

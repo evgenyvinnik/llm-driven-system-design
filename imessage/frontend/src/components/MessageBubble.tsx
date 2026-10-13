@@ -10,6 +10,8 @@ interface MessageBubbleProps {
   isOwn: boolean;
   /** Whether to show the sender's avatar (for grouping consecutive messages) */
   showAvatar: boolean;
+  /** Resends a failed message with its original client ID */
+  onRetry?: () => void;
 }
 
 /**
@@ -21,7 +23,7 @@ interface MessageBubbleProps {
  * @param props - Component props
  * @returns React component for a message bubble
  */
-export function MessageBubble({ message, isOwn, showAvatar }: MessageBubbleProps) {
+export function MessageBubble({ message, isOwn, showAvatar, onRetry }: MessageBubbleProps) {
   /**
    * Formats a date string to a time-only display (e.g., "2:30 PM").
    *
@@ -136,6 +138,17 @@ export function MessageBubble({ message, isOwn, showAvatar }: MessageBubbleProps
               {message.status === 'sent' && 'Sent'}
               {message.status === 'delivered' && 'Delivered'}
               {message.status === 'read' && 'Read'}
+            </span>
+          )}
+
+          {isOwn && message.status === 'failed' && (
+            <span className="text-xs text-red-500">
+              Not delivered
+              {onRetry && (
+                <button type="button" onClick={onRetry} className="ml-1 underline hover:text-red-700">
+                  Retry
+                </button>
+              )}
             </span>
           )}
         </div>

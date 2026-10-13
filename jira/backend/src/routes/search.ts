@@ -5,6 +5,7 @@ import { requireAuth } from '../middleware/auth.js';
 /**
  * Search routes for issue discovery.
  * Provides JQL search, quick search, suggestions, and filter aggregations.
+ * Every search is restricted to projects where the caller holds view_issue.
  */
 const router = Router();
 
@@ -34,15 +35,19 @@ router.get('/', requireAuth, async (req, res) => {
         sortField: sortField ? String(sortField) : undefined,
         sortOrder: sortOrder as 'asc' | 'desc' | undefined,
       },
-      req.user?.id
+      req.user!
     );
 
     res.json(result);
   } catch (error: unknown) {
-    console.error('Search error:', error);
     if ((error as Error).message?.startsWith('Invalid JQL')) {
-      return res.status(400).json({ error: (error as Error).message });
+      return res.status(400).json({ error: (error as Error).message, code: 'invalid_jql' });
     }
+    if (error instanceof searchService.SearchUnavailableError) {
+      res.setHeader('Retry-After', '30');
+      return res.status(503).json({ error: error.message, code: 'search_unavailable' });
+    }
+    console.error('Search error:', error);
     res.status(500).json({ error: 'Search failed' });
   }
 });
@@ -61,12 +66,17 @@ router.get('/quick', requireAuth, async (req, res) => {
 
     const issues = await searchService.quickSearch(
       String(q),
+      req.user!,
       projectId ? String(projectId) : undefined,
-      limit ? parseInt(String(limit), 10) : 10
+      limit ? parseInt(String(limit), 10) || 10 : 10
     );
 
     res.json({ issues });
   } catch (error) {
+    if (error instanceof searchService.SearchUnavailableError) {
+      res.setHeader('Retry-After', '30');
+      return res.status(503).json({ error: error.message, code: 'search_unavailable' });
+    }
     console.error('Quick search error:', error);
     res.status(500).json({ error: 'Search failed' });
   }
@@ -87,6 +97,7 @@ router.get('/suggestions', requireAuth, async (req, res) => {
     const suggestions = await searchService.getSearchSuggestions(
       String(field),
       String(prefix),
+      req.user!,
       projectId ? String(projectId) : undefined
     );
 
@@ -106,6 +117,7 @@ router.get('/aggregations', requireAuth, async (req, res) => {
     const { projectId } = req.query;
 
     const aggregations = await searchService.getFilterAggregations(
+      req.user!,
       projectId ? String(projectId) : undefined
     );
 

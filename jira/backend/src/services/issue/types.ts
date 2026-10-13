@@ -19,7 +19,7 @@ import { IssueType, Priority } from '../../types/index.js';
  * @property sprintId - ID of the sprint this issue is assigned to
  * @property storyPoints - Estimated story points for the issue
  * @property labels - Array of label strings
- * @property components - Array of component IDs
+ * @property components - Array of component names
  * @property customFields - Key-value pairs for custom field data
  *
  * @example
@@ -48,7 +48,7 @@ export interface CreateIssueData {
   sprintId?: number;
   storyPoints?: number;
   labels?: string[];
-  components?: number[];
+  components?: string[];
   customFields?: Record<string, unknown>;
 }
 
@@ -69,7 +69,7 @@ export interface CreateIssueData {
  * @property storyPoints - Updated story points, or null to clear
  * @property labels - Complete replacement of labels array
  * @property components - Complete replacement of components array
- * @property customFields - Merged with existing custom fields
+ * @property customFields - Shallow-merged into the existing custom fields
  *
  * @example
  * ```typescript
@@ -82,7 +82,7 @@ export interface CreateIssueData {
  */
 export interface UpdateIssueData {
   summary?: string;
-  description?: string;
+  description?: string | null;
   issueType?: IssueType;
   priority?: Priority;
   assigneeId?: string | null;
@@ -90,8 +90,20 @@ export interface UpdateIssueData {
   sprintId?: number | null;
   storyPoints?: number | null;
   labels?: string[];
-  components?: number[];
+  components?: string[];
   customFields?: Record<string, unknown>;
+}
+
+/**
+ * Thrown when a write references something that does not belong to the issue's project
+ * (a sprint, epic or parent from another project, or a user that does not exist).
+ * Routes answer it with 422 and the offending field.
+ */
+export class IssueInputError extends Error {
+  constructor(public readonly field: string, message: string) {
+    super(message);
+    this.name = 'IssueInputError';
+  }
 }
 
 /**

@@ -27,7 +27,12 @@ export enum ExecutionStatus {
   PENDING_RETRY = 'PENDING_RETRY',
   CANCELLED = 'CANCELLED',
   DEDUPLICATED = 'DEDUPLICATED',
+  /** Out of retries (or failed permanently); waiting for an operator to retry it. */
+  DEAD_LETTER = 'DEAD_LETTER',
 }
+
+/** What the scheduler does with a recurring run it finds later than its grace window. */
+export type MisfirePolicy = 'fire_once' | 'skip';
 
 /** Job definition for display and management */
 export interface Job {
@@ -44,6 +49,7 @@ export interface Job {
   max_backoff_ms: number;
   timeout_ms: number;
   status: JobStatus;
+  misfire_policy: MisfirePolicy;
   created_at: string;
   updated_at: string;
 }
@@ -71,6 +77,10 @@ export interface JobExecution {
   error: string | null;
   worker_id: string | null;
   created_at: string;
+  /** Lease deadline while RUNNING. */
+  lease_expires_at?: string | null;
+  /** Token of the lease that ran (or is running) this attempt. */
+  fencing_token?: string | null;
   logs?: ExecutionLog[];
 }
 
@@ -97,6 +107,7 @@ export interface CreateJobInput {
   initial_backoff_ms?: number;
   max_backoff_ms?: number;
   timeout_ms?: number;
+  misfire_policy?: MisfirePolicy;
 }
 
 /** Input for updating an existing job */
@@ -141,7 +152,10 @@ export interface SystemMetrics {
     failed_24h: number;
   };
   queue: {
+    /** PENDING and claimable now */
     queued: number;
+    /** PENDING but waiting for a retry backoff */
+    delayed: number;
     processing: number;
     deadLetter: number;
   };

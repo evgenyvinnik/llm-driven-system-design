@@ -9,24 +9,24 @@
 // Additionally, you should also exclude this file from your linter and/or formatter to prevent it from being checked or modified.
 
 import { Route as rootRouteImport } from './routes/__root'
-import { Route as ProjectsRouteImport } from './routes/projects'
 import { Route as IndexRouteImport } from './routes/index'
+import { Route as ProjectsRouteImport } from './routes/projects'
 import { Route as ProjectsIndexRouteImport } from './routes/projects/index'
 import { Route as ProjectsProjectKeyRouteImport } from './routes/projects/$projectKey'
 import { Route as ProjectsProjectKeyIndexRouteImport } from './routes/projects/$projectKey/index'
-import { Route as ProjectsProjectKeySettingsRouteImport } from './routes/projects/$projectKey/settings'
-import { Route as ProjectsProjectKeyIssuesRouteImport } from './routes/projects/$projectKey/issues'
-import { Route as ProjectsProjectKeyBoardRouteImport } from './routes/projects/$projectKey/board'
 import { Route as ProjectsProjectKeyBacklogRouteImport } from './routes/projects/$projectKey/backlog'
+import { Route as ProjectsProjectKeyBoardRouteImport } from './routes/projects/$projectKey/board'
+import { Route as ProjectsProjectKeyIssuesRouteImport } from './routes/projects/$projectKey/issues'
+import { Route as ProjectsProjectKeySettingsRouteImport } from './routes/projects/$projectKey/settings'
 
-const ProjectsRoute = ProjectsRouteImport.update({
-  id: '/projects',
-  path: '/projects',
-  getParentRoute: () => rootRouteImport,
-} as any)
 const IndexRoute = IndexRouteImport.update({
   id: '/',
   path: '/',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ProjectsRoute = ProjectsRouteImport.update({
+  id: '/projects',
+  path: '/projects',
   getParentRoute: () => rootRouteImport,
 } as any)
 const ProjectsIndexRoute = ProjectsIndexRouteImport.update({
@@ -44,16 +44,10 @@ const ProjectsProjectKeyIndexRoute = ProjectsProjectKeyIndexRouteImport.update({
   path: '/',
   getParentRoute: () => ProjectsProjectKeyRoute,
 } as any)
-const ProjectsProjectKeySettingsRoute =
-  ProjectsProjectKeySettingsRouteImport.update({
-    id: '/settings',
-    path: '/settings',
-    getParentRoute: () => ProjectsProjectKeyRoute,
-  } as any)
-const ProjectsProjectKeyIssuesRoute =
-  ProjectsProjectKeyIssuesRouteImport.update({
-    id: '/issues',
-    path: '/issues',
+const ProjectsProjectKeyBacklogRoute =
+  ProjectsProjectKeyBacklogRouteImport.update({
+    id: '/backlog',
+    path: '/backlog',
     getParentRoute: () => ProjectsProjectKeyRoute,
   } as any)
 const ProjectsProjectKeyBoardRoute = ProjectsProjectKeyBoardRouteImport.update({
@@ -61,10 +55,16 @@ const ProjectsProjectKeyBoardRoute = ProjectsProjectKeyBoardRouteImport.update({
   path: '/board',
   getParentRoute: () => ProjectsProjectKeyRoute,
 } as any)
-const ProjectsProjectKeyBacklogRoute =
-  ProjectsProjectKeyBacklogRouteImport.update({
-    id: '/backlog',
-    path: '/backlog',
+const ProjectsProjectKeyIssuesRoute =
+  ProjectsProjectKeyIssuesRouteImport.update({
+    id: '/issues',
+    path: '/issues',
+    getParentRoute: () => ProjectsProjectKeyRoute,
+  } as any)
+const ProjectsProjectKeySettingsRoute =
+  ProjectsProjectKeySettingsRouteImport.update({
+    id: '/settings',
+    path: '/settings',
     getParentRoute: () => ProjectsProjectKeyRoute,
   } as any)
 
@@ -141,18 +141,18 @@ export interface RootRouteChildren {
 
 declare module '@tanstack/react-router' {
   interface FileRoutesByPath {
-    '/projects': {
-      id: '/projects'
-      path: '/projects'
-      fullPath: '/projects'
-      preLoaderRoute: typeof ProjectsRouteImport
-      parentRoute: typeof rootRouteImport
-    }
     '/': {
       id: '/'
       path: '/'
       fullPath: '/'
       preLoaderRoute: typeof IndexRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/projects': {
+      id: '/projects'
+      path: '/projects'
+      fullPath: '/projects'
+      preLoaderRoute: typeof ProjectsRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/projects/': {
@@ -176,18 +176,11 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ProjectsProjectKeyIndexRouteImport
       parentRoute: typeof ProjectsProjectKeyRoute
     }
-    '/projects/$projectKey/settings': {
-      id: '/projects/$projectKey/settings'
-      path: '/settings'
-      fullPath: '/projects/$projectKey/settings'
-      preLoaderRoute: typeof ProjectsProjectKeySettingsRouteImport
-      parentRoute: typeof ProjectsProjectKeyRoute
-    }
-    '/projects/$projectKey/issues': {
-      id: '/projects/$projectKey/issues'
-      path: '/issues'
-      fullPath: '/projects/$projectKey/issues'
-      preLoaderRoute: typeof ProjectsProjectKeyIssuesRouteImport
+    '/projects/$projectKey/backlog': {
+      id: '/projects/$projectKey/backlog'
+      path: '/backlog'
+      fullPath: '/projects/$projectKey/backlog'
+      preLoaderRoute: typeof ProjectsProjectKeyBacklogRouteImport
       parentRoute: typeof ProjectsProjectKeyRoute
     }
     '/projects/$projectKey/board': {
@@ -197,11 +190,18 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ProjectsProjectKeyBoardRouteImport
       parentRoute: typeof ProjectsProjectKeyRoute
     }
-    '/projects/$projectKey/backlog': {
-      id: '/projects/$projectKey/backlog'
-      path: '/backlog'
-      fullPath: '/projects/$projectKey/backlog'
-      preLoaderRoute: typeof ProjectsProjectKeyBacklogRouteImport
+    '/projects/$projectKey/issues': {
+      id: '/projects/$projectKey/issues'
+      path: '/issues'
+      fullPath: '/projects/$projectKey/issues'
+      preLoaderRoute: typeof ProjectsProjectKeyIssuesRouteImport
+      parentRoute: typeof ProjectsProjectKeyRoute
+    }
+    '/projects/$projectKey/settings': {
+      id: '/projects/$projectKey/settings'
+      path: '/settings'
+      fullPath: '/projects/$projectKey/settings'
+      preLoaderRoute: typeof ProjectsProjectKeySettingsRouteImport
       parentRoute: typeof ProjectsProjectKeyRoute
     }
   }

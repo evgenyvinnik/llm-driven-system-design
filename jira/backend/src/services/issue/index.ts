@@ -6,9 +6,11 @@
  *
  * - **types**: TypeScript interfaces for issue data structures
  * - **queries**: Read-only operations for fetching issues and history
- * - **create**: Issue creation and search indexing
- * - **update**: Issue modification and deletion
- * - **transitions**: Workflow transition metrics
+ * - **create**: Issue creation (key allocation, initial status, rank via trigger)
+ * - **update**: Field edits with optimistic concurrency (version / If-Match) and deletion
+ * - **transitions**: Workflow transitions (rules, compare-and-swap, post-functions)
+ * - **rank**: Board and backlog ordering
+ * - **afterCommit**: Search indexing and event publishing after a change commits
  * - **comments**: Comment CRUD operations
  *
  * Import from this file to access all issue service functions in a single import.
@@ -38,11 +40,14 @@
 
 // Types
 export type { CreateIssueData, UpdateIssueData, HistoryRecord, IssueSearchDetails } from './types.js';
+export { IssueInputError } from './types.js';
 
 // Query functions
 export {
   getIssueById,
   getIssueByKey,
+  getIssueRow,
+  getIssueProjectId,
   getIssuesByProject,
   getIssuesBySprint,
   getBacklogIssues,
@@ -50,21 +55,22 @@ export {
 } from './queries.js';
 
 // Create functions
-export {
-  createIssue,
-  indexIssueForSearch,
-  invalidateProjectBoardCache,
-} from './create.js';
+export { createIssue } from './create.js';
 
 // Update functions
-export {
-  updateIssue,
-  deleteIssue,
-  invalidateIssueCache,
-} from './update.js';
+export { updateIssue, deleteIssue, diffIssue } from './update.js';
+export type { UpdateIssueResult, FieldChange } from './update.js';
 
-// Transition functions
-export { recordTransitionMetric } from './transitions.js';
+// Workflow transitions
+export { transitionIssue, recordTransitionMetric } from './transitions.js';
+export type { TransitionResult, TransitionFailureCode } from './transitions.js';
+
+// Board / backlog order
+export { rankIssue } from './rank.js';
+export type { RankResult, RankPlacement } from './rank.js';
+
+// Post-commit side effects (search index, events)
+export { indexIssueById, afterIssueCommitted } from './afterCommit.js';
 
 // Comment functions
 export {

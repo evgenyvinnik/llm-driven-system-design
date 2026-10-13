@@ -3,7 +3,9 @@ import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import { createServer } from 'http';
 import { Logger } from 'pino';
-import { setupWebSocket } from './services/websocket.js';
+import { setupWebSocket, closeAllConnections } from './services/websocket.js';
+import { pruneExpiredInbox } from './services/messages.js';
+import pool from './db.js';
 
 // Routes
 import authRoutes from './routes/auth.js';
@@ -15,7 +17,7 @@ import usersRoutes from './routes/users.js';
 import redis, { pubClient, subClient } from './redis.js';
 
 // Shared modules
-import logger, { requestLogger, createLogger, LoggedRequest } from './shared/logger.js';
+import { requestLogger, createLogger } from './shared/logger.js';
 import { metricsHandler } from './shared/metrics.js';
 import { livenessHandler, readinessHandler, healthHandler } from './shared/health.js';
 
@@ -70,7 +72,7 @@ app.use((req: Request, res: Response) => {
 });
 
 // Error handling
-app.use((err: ErrorWithStack, req: RequestWithLog, res: Response, next: NextFunction) => {
+app.use((err: ErrorWithStack, req: RequestWithLog, res: Response, _next: NextFunction) => {
   const log = req.log || appLogger;
 
   log.error({
@@ -87,27 +89,51 @@ app.use((err: ErrorWithStack, req: RequestWithLog, res: Response, next: NextFunc
   res.status(500).json({ error: 'Internal server error' });
 });
 
-// Initialize Redis connections
+// Initialize Redis connections. The clients are lazy; setupWebSocket's
+// SUBSCRIBE has usually started the subscriber already, and calling connect()
+// on a client that is connecting throws, so only connect the idle ones.
 async function initRedis(): Promise<void> {
   try {
-    await redis.connect();
-    await pubClient.connect();
-    await subClient.connect();
+    for (const client of [redis, pubClient, subClient]) {
+      if (client.status === 'wait') await client.connect();
+    }
     appLogger.info('Redis connected');
   } catch (error) {
-    appLogger.error({ error }, 'Redis connection error');
+    appLogger.error({ err: error }, 'Redis connection error');
     // Continue without Redis for development
   }
 }
 
 // Setup WebSocket
-setupWebSocket(server);
+const wss = setupWebSocket(server);
 
 const PORT = parseInt(process.env.PORT || '3000');
+
+// Undelivered inbox rows are kept for a bounded window (iMessage keeps
+// messages for offline devices about 30 days). A device that never comes back
+// must not pin storage forever. The DELETE is idempotent, so every instance
+// can run the sweep without coordination.
+const INBOX_RETENTION_DAYS = parseInt(process.env.INBOX_RETENTION_DAYS || '30');
+let inboxSweep: ReturnType<typeof setInterval> | null = null;
+
+async function sweepInbox(): Promise<void> {
+  try {
+    const removed = await pruneExpiredInbox(INBOX_RETENTION_DAYS);
+    if (removed > 0) {
+      appLogger.info({ removed, retentionDays: INBOX_RETENTION_DAYS }, 'Expired inbox rows removed');
+    }
+  } catch (error) {
+    appLogger.error({ error }, 'Inbox retention sweep failed');
+  }
+}
 
 // Start server
 async function start(): Promise<void> {
   await initRedis();
+
+  await sweepInbox();
+  inboxSweep = setInterval(sweepInbox, 60 * 60 * 1000);
+  inboxSweep.unref();
 
   server.listen(PORT, () => {
     appLogger.info({
@@ -121,30 +147,40 @@ async function start(): Promise<void> {
   });
 }
 
-// Graceful shutdown
-process.on('SIGTERM', async () => {
-  appLogger.info('SIGTERM received, shutting down gracefully');
+// Graceful shutdown: stop accepting connections, tell WebSocket clients to
+// reconnect elsewhere (close code 1001), let in-flight HTTP requests finish,
+// then close Redis and PostgreSQL.
+let shuttingDown = false;
 
-  server.close(() => {
-    appLogger.info('HTTP server closed');
+async function shutdown(signal: string): Promise<void> {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  appLogger.info({ signal }, 'Shutting down gracefully');
+
+  if (inboxSweep) clearInterval(inboxSweep);
+  closeAllConnections(wss);
+  wss.close();
+
+  await new Promise<void>((resolve) => {
+    server.close(() => resolve());
+    // Do not wait forever for keep-alive connections
+    setTimeout(resolve, 10_000).unref();
   });
+  appLogger.info('HTTP server closed');
 
   try {
-    await redis.quit();
-    await pubClient.quit();
-    await subClient.quit();
-    appLogger.info('Redis connections closed');
+    await Promise.allSettled([redis.quit(), pubClient.quit(), subClient.quit()]);
+    await pool.end();
+    appLogger.info('Redis and PostgreSQL connections closed');
   } catch (error) {
-    appLogger.error({ error }, 'Error closing Redis connections');
+    appLogger.error({ error }, 'Error closing connections');
   }
 
   process.exit(0);
-});
+}
 
-process.on('SIGINT', async () => {
-  appLogger.info('SIGINT received, shutting down');
-  process.exit(0);
-});
+process.on('SIGTERM', () => void shutdown('SIGTERM'));
+process.on('SIGINT', () => void shutdown('SIGINT'));
 
 start().catch((error) => {
   appLogger.fatal({ error }, 'Failed to start server');

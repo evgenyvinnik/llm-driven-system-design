@@ -1,192 +1,169 @@
-import type { WebSocketMessage } from '@/types';
+import type { ConnectionStatus, WebSocketMessage } from '@/types';
 
 /**
  * Callback function type for handling incoming WebSocket messages.
  * @param message - The parsed WebSocket message object
  */
 type MessageHandler = (message: WebSocketMessage) => void;
+type StatusHandler = (status: ConnectionStatus) => void;
+
+const BASE_DELAY_MS = 1000;
+const MAX_DELAY_MS = 30_000;
+
+/** Close codes after which reconnecting cannot help (bad token, revoked device). */
+const TERMINAL_CLOSE_CODES = new Set([4001, 4003]);
 
 /**
- * WebSocket service for real-time messaging functionality.
- * Handles connection management, automatic reconnection with exponential backoff,
- * message queuing for offline scenarios, and provides convenience methods for
- * common messaging operations (send message, typing indicators, read receipts, reactions).
+ * WebSocket service for real-time messaging.
  *
- * This service implements the client side of the iMessage real-time protocol,
- * enabling features like live message delivery, typing indicators, and presence.
+ * Responsibilities: one connection per tab, reconnection with capped
+ * exponential backoff plus jitter (forever - a messaging app must come back
+ * after any outage), an outbox for frames sent while disconnected, and a
+ * connection status the UI can show.
+ *
+ * Delivery guarantees do not depend on this socket staying up. The server
+ * keeps every message in this device's inbox until the device acks it, and
+ * pushes the backlog when the socket (re)connects; sends are idempotent by
+ * clientMessageId, so replaying the outbox cannot duplicate a message.
  */
 class WebSocketService {
-  /** Active WebSocket connection instance */
   private ws: WebSocket | null = null;
-  /** Set of registered message handlers for incoming messages */
+  private token: string | null = null;
   private handlers: Set<MessageHandler> = new Set();
-  /** Current number of reconnection attempts */
+  private statusHandlers: Set<StatusHandler> = new Set();
+  private status: ConnectionStatus = 'closed';
   private reconnectAttempts = 0;
-  /** Maximum allowed reconnection attempts before giving up */
-  private maxReconnectAttempts = 5;
-  /** Base delay in ms for exponential backoff reconnection */
-  private reconnectDelay = 1000;
-  /** Interval ID for keep-alive pings */
-  private pingInterval: ReturnType<typeof setInterval> | null = null;
-  /** Queue for messages sent while disconnected */
-  private messageQueue: WebSocketMessage[] = [];
-  /** Flag to prevent multiple simultaneous connection attempts */
-  private isConnecting = false;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Frames sent while disconnected, flushed in order when the socket opens */
+  private outbox: WebSocketMessage[] = [];
+  /** Set by disconnect(): an intentional close must not trigger reconnects */
+  private closedByClient = true;
 
-  /**
-   * Establishes a WebSocket connection to the server.
-   * Automatically determines ws/wss protocol based on page protocol.
-   * Processes queued messages upon successful connection.
-   *
-   * @param token - JWT authentication token for the connection
-   * @returns Promise that resolves when connection is established
-   * @throws Error if connection fails
-   */
-  connect(token: string): Promise<void> {
-    return new Promise((resolve, reject) => {
+  constructor() {
+    if (typeof window === 'undefined') return;
+    // The network came back or the tab woke up: skip the remaining backoff
+    window.addEventListener('online', () => this.reconnectNow());
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState !== 'visible') return;
       if (this.ws?.readyState === WebSocket.OPEN) {
-        resolve();
-        return;
+        // Cheap catch-up in case a push was missed while the tab was asleep
+        this.requestSync();
+      } else {
+        this.reconnectNow();
       }
-
-      if (this.isConnecting) {
-        resolve();
-        return;
-      }
-
-      this.isConnecting = true;
-
-      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const host = window.location.host;
-      const wsUrl = `${protocol}//${host}/ws?token=${token}`;
-
-      this.ws = new WebSocket(wsUrl);
-
-      this.ws.onopen = () => {
-        console.log('WebSocket connected');
-        this.isConnecting = false;
-        this.reconnectAttempts = 0;
-
-        // Send queued messages
-        while (this.messageQueue.length > 0) {
-          const message = this.messageQueue.shift();
-          if (message) {
-            this.send(message);
-          }
-        }
-
-        // Start ping interval to keep connection alive
-        this.startPing();
-
-        resolve();
-      };
-
-      this.ws.onmessage = (event) => {
-        try {
-          const message = JSON.parse(event.data) as WebSocketMessage;
-          this.handlers.forEach((handler) => handler(message));
-        } catch (error) {
-          console.error('Failed to parse WebSocket message:', error);
-        }
-      };
-
-      this.ws.onclose = () => {
-        console.log('WebSocket disconnected');
-        this.isConnecting = false;
-        this.stopPing();
-        this.attemptReconnect(token);
-      };
-
-      this.ws.onerror = (error) => {
-        console.error('WebSocket error:', error);
-        this.isConnecting = false;
-        reject(error);
-      };
     });
   }
 
   /**
-   * Starts the keep-alive ping interval to maintain the connection.
-   * The actual ping/pong is handled by the server; this keeps the JS event loop active.
-   * @private
+   * Opens the connection (idempotent while one is open or opening).
+   * @param token - Session token for the connection
    */
-  private startPing() {
-    this.pingInterval = setInterval(() => {
-      if (this.ws?.readyState === WebSocket.OPEN) {
-        // WebSocket ping is handled by the server
-      }
-    }, 25000);
-  }
-
-  /**
-   * Stops the keep-alive ping interval.
-   * Called when disconnecting or before reconnection attempts.
-   * @private
-   */
-  private stopPing() {
-    if (this.pingInterval) {
-      clearInterval(this.pingInterval);
-      this.pingInterval = null;
-    }
-  }
-
-  /**
-   * Attempts to reconnect to the WebSocket server using exponential backoff.
-   * Gives up after maxReconnectAttempts to prevent infinite loops.
-   *
-   * @param token - JWT token for reauthentication
-   * @private
-   */
-  private attemptReconnect(token: string) {
-    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-      console.error('Max reconnection attempts reached');
+  connect(token: string): void {
+    this.token = token;
+    this.closedByClient = false;
+    if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
       return;
     }
+    this.open();
+  }
 
+  private open(): void {
+    if (!this.token) return;
+
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const ws = new WebSocket(`${protocol}//${window.location.host}/ws?token=${encodeURIComponent(this.token)}`);
+    this.ws = ws;
+    this.setStatus(this.reconnectAttempts > 0 ? 'reconnecting' : 'connecting');
+
+    ws.onopen = () => {
+      this.reconnectAttempts = 0;
+      this.setStatus('open');
+      // The server processes frames in arrival order, after authentication
+      for (const frame of this.outbox.splice(0)) {
+        ws.send(JSON.stringify(frame));
+      }
+    };
+
+    ws.onmessage = (event) => {
+      try {
+        const message = JSON.parse(event.data) as WebSocketMessage;
+        this.handlers.forEach((handler) => handler(message));
+      } catch (error) {
+        console.error('Failed to parse WebSocket message:', error);
+      }
+    };
+
+    ws.onclose = (event) => {
+      if (this.ws !== ws) return; // superseded by a newer socket
+      this.ws = null;
+      if (this.closedByClient || TERMINAL_CLOSE_CODES.has(event.code)) {
+        this.setStatus('closed');
+        return;
+      }
+      this.scheduleReconnect();
+    };
+
+    ws.onerror = () => {
+      // onclose always follows and owns reconnection
+    };
+  }
+
+  private scheduleReconnect(): void {
+    if (this.reconnectTimer || this.closedByClient) return;
     this.reconnectAttempts++;
-    const delay = this.reconnectDelay * Math.pow(2, this.reconnectAttempts - 1);
-
-    console.log(`Attempting to reconnect in ${delay}ms (attempt ${this.reconnectAttempts})`);
-
-    setTimeout(() => {
-      this.connect(token).catch(console.error);
+    const ceiling = Math.min(MAX_DELAY_MS, BASE_DELAY_MS * 2 ** (this.reconnectAttempts - 1));
+    // Jitter spreads out thousands of clients reconnecting after a server restart
+    const delay = Math.round(ceiling / 2 + Math.random() * (ceiling / 2));
+    this.setStatus('reconnecting');
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      this.open();
     }, delay);
   }
 
-  /**
-   * Closes the WebSocket connection and cleans up all resources.
-   * Clears handlers, message queue, and ping interval.
-   */
-  disconnect() {
-    this.stopPing();
-    if (this.ws) {
-      this.ws.close();
-      this.ws = null;
+  private reconnectNow(): void {
+    if (this.closedByClient || !this.token || this.ws) return;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
     }
-    this.handlers.clear();
-    this.messageQueue = [];
+    this.open();
   }
 
   /**
-   * Sends a message through the WebSocket connection.
-   * If not connected, queues the message for later delivery.
-   *
-   * @param message - The WebSocket message object to send
+   * Closes the connection on logout. Subscribers stay registered: they belong
+   * to long-lived components, and clearing them here used to leave a
+   * re-logged-in tab without any real-time updates.
    */
-  send(message: WebSocketMessage) {
+  disconnect(): void {
+    this.closedByClient = true;
+    this.token = null;
+    this.outbox = [];
+    this.reconnectAttempts = 0;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    const ws = this.ws;
+    this.ws = null;
+    ws?.close(1000, 'Logged out');
+    this.setStatus('closed');
+  }
+
+  /**
+   * Sends a frame, or queues it until the socket opens. Typing indicators are
+   * dropped instead of queued - they are worthless once stale.
+   */
+  send(message: WebSocketMessage): void {
     if (this.ws?.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(message));
-    } else {
-      // Queue message for later
-      this.messageQueue.push(message);
+    } else if (message.type !== 'typing') {
+      this.outbox.push(message);
     }
   }
 
   /**
    * Registers a handler function for incoming WebSocket messages.
-   * Multiple handlers can be registered and will all receive messages.
-   *
-   * @param handler - Callback function to handle incoming messages
    * @returns Unsubscribe function to remove the handler
    */
   subscribe(handler: MessageHandler): () => void {
@@ -196,19 +173,34 @@ class WebSocketService {
     };
   }
 
+  /** Registers a listener for connection status changes. */
+  subscribeStatus(handler: StatusHandler): () => void {
+    this.statusHandlers.add(handler);
+    return () => {
+      this.statusHandlers.delete(handler);
+    };
+  }
+
+  getStatus(): ConnectionStatus {
+    return this.status;
+  }
+
+  private setStatus(status: ConnectionStatus): void {
+    if (status === this.status) return;
+    this.status = status;
+    this.statusHandlers.forEach((handler) => handler(status));
+  }
+
   // Convenience methods
+
   /**
-   * Sends a chat message to a conversation.
-   * Generates a client-side ID for optimistic updates and deduplication.
-   *
-   * @param conversationId - Target conversation UUID
-   * @param content - Message text content
-   * @param options - Optional contentType, replyToId for replies, and clientMessageId
+   * Sends a chat message. The clientMessageId is generated once per message
+   * and reused for every retry, which is what makes retries safe.
    */
   sendMessage(
     conversationId: string,
     content: string,
-    options?: { contentType?: string; replyToId?: string; clientMessageId?: string }
+    options: { clientMessageId: string; contentType?: string; replyToId?: string }
   ) {
     this.send({
       type: 'send_message',
@@ -218,13 +210,7 @@ class WebSocketService {
     });
   }
 
-  /**
-   * Sends a typing indicator to a conversation.
-   * Other participants will see that this user is typing.
-   *
-   * @param conversationId - Target conversation UUID
-   * @param isTyping - True when user starts typing, false when they stop
-   */
+  /** Sends a typing indicator to a conversation. */
   sendTyping(conversationId: string, isTyping: boolean) {
     this.send({
       type: 'typing',
@@ -233,13 +219,7 @@ class WebSocketService {
     });
   }
 
-  /**
-   * Sends a read receipt for a message.
-   * Updates the read status visible to other participants.
-   *
-   * @param conversationId - Target conversation UUID
-   * @param messageId - UUID of the last read message
-   */
+  /** Advances this device's read watermark to the given message. */
   sendRead(conversationId: string, messageId: string) {
     this.send({
       type: 'read',
@@ -248,13 +228,7 @@ class WebSocketService {
     });
   }
 
-  /**
-   * Sends a reaction (emoji) to a message.
-   *
-   * @param messageId - UUID of the message to react to
-   * @param reaction - The emoji reaction string
-   * @param remove - If true, removes the reaction instead of adding it
-   */
+  /** Sends a reaction (emoji) to a message, or removes it. */
   sendReaction(messageId: string, reaction: string, remove = false) {
     this.send({
       type: 'reaction',
@@ -264,11 +238,18 @@ class WebSocketService {
     });
   }
 
-  /**
-   * Checks if the WebSocket connection is currently open.
-   *
-   * @returns True if connected and ready to send/receive messages
-   */
+  /** Acknowledges received messages so the server can drop them from this device's inbox. */
+  sendAck(messageIds: string[]) {
+    if (messageIds.length === 0) return;
+    this.send({ type: 'ack', messageIds });
+  }
+
+  /** Asks the server for the next batch of this device's undelivered messages. */
+  requestSync() {
+    this.send({ type: 'sync' });
+  }
+
+  /** True if connected and ready to send/receive messages */
   isConnected(): boolean {
     return this.ws?.readyState === WebSocket.OPEN;
   }

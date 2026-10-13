@@ -131,14 +131,53 @@ export async function destroySession(sessionId: string): Promise<void> {
   logger.info({ sessionId }, 'Session destroyed');
 }
 
+/** Length of the derived scrypt key, in bytes. */
+const SCRYPT_KEY_LENGTH = 64;
+
+/** Async scrypt, so hashing (~50 ms by design) never blocks the event loop. */
+function scrypt(password: string, salt: Buffer, keyLength: number): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    crypto.scrypt(password, salt, keyLength, (error, key) => (error ? reject(error) : resolve(key)));
+  });
+}
+
 /**
- * Simple password hashing (for demo purposes).
- * In production, use bcrypt or argon2.
- * @param password - Plain text password
- * @returns Hashed password
+ * Hashes a password with scrypt and a random 16-byte salt.
+ *
+ * scrypt is deliberately slow and memory-hard, and the per-user salt means equal
+ * passwords produce different hashes, so a leaked user store can't be reversed with a
+ * lookup table. (Users were previously stored with an unsalted SHA-256 hex digest.)
+ * @returns `scrypt$<salt base64>$<key base64>`
  */
-function hashPassword(password: string): string {
-  return crypto.createHash('sha256').update(password).digest('hex');
+export async function hashPassword(password: string): Promise<string> {
+  const salt = crypto.randomBytes(16);
+  const key = await scrypt(password, salt, SCRYPT_KEY_LENGTH);
+  return `scrypt$${salt.toString('base64')}$${key.toString('base64')}`;
+}
+
+/**
+ * Checks a password against a stored hash in constant time. Accepts the legacy
+ * unsalted SHA-256 format so existing users can still log in (and get upgraded).
+ */
+export async function verifyPassword(password: string, stored: string): Promise<boolean> {
+  if (stored.startsWith('scrypt$')) {
+    const [, saltB64, keyB64] = stored.split('$');
+    const expected = Buffer.from(keyB64 ?? '', 'base64');
+    if (!saltB64 || expected.length === 0) {
+      return false;
+    }
+    const actual = await scrypt(password, Buffer.from(saltB64, 'base64'), expected.length);
+    return crypto.timingSafeEqual(actual, expected);
+  }
+
+  const legacy = Buffer.from(crypto.createHash('sha256').update(password).digest('hex'));
+  const storedBytes = Buffer.from(stored);
+  return storedBytes.length === legacy.length && crypto.timingSafeEqual(storedBytes, legacy);
+}
+
+/** True when a stored hash predates scrypt and should be replaced on next login. */
+function isLegacyHash(stored: string): boolean {
+  return !stored.startsWith('scrypt$');
 }
 
 /**
@@ -157,7 +196,7 @@ export async function createUser(
   const user: User = {
     id,
     username,
-    passwordHash: hashPassword(password),
+    passwordHash: await hashPassword(password),
     role,
     createdAt: Date.now(),
   };
@@ -186,7 +225,14 @@ export async function validateCredentials(
 
   try {
     const user: User = JSON.parse(data);
-    if (user.passwordHash === hashPassword(password)) {
+    if (await verifyPassword(password, user.passwordHash)) {
+      if (isLegacyHash(user.passwordHash)) {
+        // Transparent upgrade: re-hash with scrypt now that we know the password.
+        await redis.set(
+          `${USER_PREFIX}${username}`,
+          JSON.stringify({ ...user, passwordHash: await hashPassword(password) })
+        );
+      }
       const { passwordHash: _, ...userWithoutPassword } = user;
       return userWithoutPassword;
     }

@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import type { Video } from '../types';
 import { videosApi, uploadApi } from '../services/api';
+import { ChunkedUploader, type UploadSnapshot } from '../services/chunkedUploader';
 
 interface VideoState {
   videos: Video[];
@@ -8,32 +9,46 @@ interface VideoState {
   total: number;
   page: number;
   loading: boolean;
-  uploading: boolean;
-  uploadProgress: number;
-  recording: boolean;
   recordedBlob: Blob | null;
+  /** Progress of the upload that runs while recording; null when no recording is in flight. */
+  recordingUpload: UploadSnapshot | null;
   error: string | null;
   fetchVideos: (params?: { page?: number; search?: string; folderId?: string }) => Promise<void>;
   fetchVideo: (id: string) => Promise<void>;
-  createAndUpload: (title: string, blob: Blob, durationSeconds: number, description?: string) => Promise<Video>;
   deleteVideo: (id: string) => Promise<void>;
   updateVideo: (id: string, data: { title?: string; description?: string }) => Promise<void>;
-  setRecording: (recording: boolean) => void;
   setRecordedBlob: (blob: Blob | null) => void;
   clearError: () => void;
+  /** Recording started: create the video and open its multipart upload in the background. */
+  beginRecordingUpload: () => void;
+  /** A MediaRecorder chunk arrived. */
+  pushRecordingChunk: (chunk: Blob) => void;
+  /** Recording stopped: send the tail and complete the upload. */
+  finishRecordingUpload: (durationSeconds: number) => void;
+  retryRecordingUpload: () => void;
+  /** Applies the title the user typed once the upload is complete. */
+  saveRecording: (title: string, description?: string) => Promise<Video>;
+  discardRecording: () => Promise<void>;
 }
 
-/** Video library state with upload progress tracking, recording state, and CRUD operations. */
+// The uploader holds the recorded chunks and in-flight requests; it lives outside React
+// state and only its snapshot goes into the store.
+let uploader: ChunkedUploader | null = null;
+let completion: Promise<Video> | null = null;
+
+function defaultTitle(): string {
+  return `Recording ${new Date().toLocaleString()}`;
+}
+
+/** Video library state, plus the streaming upload of the recording in progress. */
 export const useVideoStore = create<VideoState>((set, get) => ({
   videos: [],
   currentVideo: null,
   total: 0,
   page: 1,
   loading: false,
-  uploading: false,
-  uploadProgress: 0,
-  recording: false,
   recordedBlob: null,
+  recordingUpload: null,
   error: null,
 
   fetchVideos: async (params) => {
@@ -48,63 +63,13 @@ export const useVideoStore = create<VideoState>((set, get) => ({
   },
 
   fetchVideo: async (id) => {
-    set({ loading: true, error: null });
+    set({ loading: true, error: null, currentVideo: null });
     try {
       const { video } = await videosApi.get(id);
       set({ currentVideo: video, loading: false });
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Failed to load video';
       set({ error: message, loading: false });
-    }
-  },
-
-  createAndUpload: async (title, blob, durationSeconds, description) => {
-    set({ uploading: true, uploadProgress: 0, error: null });
-    try {
-      // 1. Create video metadata
-      const { video } = await videosApi.create(title, description);
-      set({ uploadProgress: 10 });
-
-      // 2. Get presigned upload URL
-      const { uploadUrl } = await uploadApi.getPresignedUrl(video.id, 'video');
-      set({ uploadProgress: 20 });
-
-      // 3. Upload blob to MinIO via presigned URL
-      const xhr = new XMLHttpRequest();
-      await new Promise<void>((resolve, reject) => {
-        xhr.upload.addEventListener('progress', (e) => {
-          if (e.lengthComputable) {
-            const progress = 20 + (e.loaded / e.total) * 60;
-            set({ uploadProgress: Math.round(progress) });
-          }
-        });
-        xhr.addEventListener('load', () => {
-          if (xhr.status >= 200 && xhr.status < 300) {
-            resolve();
-          } else {
-            reject(new Error(`Upload failed with status ${xhr.status}`));
-          }
-        });
-        xhr.addEventListener('error', () => reject(new Error('Upload failed')));
-        xhr.open('PUT', uploadUrl);
-        xhr.setRequestHeader('Content-Type', 'video/webm');
-        xhr.send(blob);
-      });
-      set({ uploadProgress: 85 });
-
-      // 4. Mark video as complete
-      const { video: completedVideo } = await uploadApi.complete(video.id, durationSeconds);
-      set({ uploadProgress: 100, uploading: false });
-
-      // Add to list
-      const currentVideos = get().videos;
-      set({ videos: [completedVideo, ...currentVideos] });
-
-      return completedVideo;
-    } catch (err) {
-      const message = err instanceof Error ? err.message : 'Upload failed';
-      set({ error: message, uploading: false, uploadProgress: 0 });
-      throw err;
     }
   },
 
@@ -131,7 +96,68 @@ export const useVideoStore = create<VideoState>((set, get) => ({
     }
   },
 
-  setRecording: (recording) => set({ recording }),
   setRecordedBlob: (blob) => set({ recordedBlob: blob }),
   clearError: () => set({ error: null }),
+
+  beginRecordingUpload: () => {
+    // The id is generated here, so retrying a create whose response was lost
+    // returns the same video instead of making a second one.
+    const videoId = crypto.randomUUID();
+    const title = defaultTitle();
+    uploader = new ChunkedUploader({
+      start: async () => {
+        await videosApi.create(title, undefined, videoId);
+        const { partSize } = await uploadApi.startMultipart(videoId);
+        return { videoId, partSize };
+      },
+      partUrl: async (id, partNumber) => (await uploadApi.partUrl(id, partNumber)).url,
+      putPart: uploadApi.putPart,
+      complete: async (id, partCount, durationSeconds) =>
+        (await uploadApi.complete(id, partCount, durationSeconds)).video,
+    });
+    completion = null;
+    uploader.subscribe((snapshot) => set({ recordingUpload: snapshot }));
+    uploader.begin();
+    set({ error: null });
+  },
+
+  pushRecordingChunk: (chunk) => {
+    uploader?.push(chunk);
+  },
+
+  finishRecordingUpload: (durationSeconds) => {
+    if (!uploader) return;
+    completion = uploader.finish(durationSeconds);
+    // Failures surface through the snapshot's 'error' phase; keep the promise handled.
+    completion.catch(() => undefined);
+  },
+
+  retryRecordingUpload: () => {
+    const resumed = uploader?.retry();
+    if (resumed) {
+      completion = resumed;
+      completion.catch(() => undefined);
+    }
+  },
+
+  saveRecording: async (title, description) => {
+    if (!completion) throw new Error('No recording to save');
+    const uploaded = await completion;
+    const { video } = await videosApi.update(uploaded.id, { title, description });
+    uploader = null;
+    completion = null;
+    set({ videos: [video, ...get().videos.filter((v) => v.id !== video.id)], recordingUpload: null });
+    return video;
+  },
+
+  discardRecording: async () => {
+    const active = uploader;
+    uploader = null;
+    completion = null;
+    set({ recordingUpload: null, recordedBlob: null });
+    if (!active) return;
+    const videoId = await active.abort();
+    // Deleting the video also aborts its multipart upload on the server.
+    if (videoId) await videosApi.delete(videoId).catch(() => undefined);
+  },
 }));

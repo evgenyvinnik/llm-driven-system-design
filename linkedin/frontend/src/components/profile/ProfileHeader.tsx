@@ -1,12 +1,15 @@
 /**
  * Profile header component displaying user banner, avatar, name, and connection actions.
  * This component shows the top section of a user's profile including their photo,
- * name, headline, location, and connection status/actions.
+ * name, headline, location, degree badge, "how you're connected" path and the
+ * connection action that matches the server-reported relationship.
  *
  * @module components/profile/ProfileHeader
  */
-import { MapPin, Pencil, UserPlus, UserMinus } from 'lucide-react';
-import type { User } from '../../types';
+import { MapPin, Pencil } from 'lucide-react';
+import type { Relationship, User } from '../../types';
+import { ConnectionActions } from './ConnectionActions';
+import { ConnectionPath } from './ConnectionPath';
 
 /**
  * Props for the ProfileHeader component.
@@ -16,17 +19,22 @@ interface ProfileHeaderProps {
   profile: User;
   /** Whether this is the current user's own profile */
   isOwnProfile: boolean;
-  /** Connection degree (1, 2, 3, or null/undefined for no connection, -1 for pending) */
-  connectionDegree: number | null;
-  /** List of mutual connections with the profile user */
-  mutualConnections: User[];
+  /** Relationship with the viewer (null while loading or on your own profile) */
+  relationship: Relationship | null;
+  /** True while a connection mutation is in flight */
+  actionPending: boolean;
+  /** Last connection action error, announced to screen readers */
+  actionError: string | null;
   /** Callback to open the edit profile modal */
   onEditProfile: () => void;
-  /** Callback to send a connection request */
   onConnect: () => void;
-  /** Callback to remove an existing connection */
+  onWithdraw: () => void;
+  onAccept: () => void;
+  onIgnore: () => void;
   onRemoveConnection: () => void;
 }
+
+const DEGREE_LABELS: Record<number, string> = { 1: '1st', 2: '2nd', 3: '3rd' };
 
 /**
  * Displays the header section of a user's profile page.
@@ -38,28 +46,17 @@ interface ProfileHeaderProps {
 export function ProfileHeader({
   profile,
   isOwnProfile,
-  connectionDegree,
-  mutualConnections,
+  relationship,
+  actionPending,
+  actionError,
   onEditProfile,
   onConnect,
+  onWithdraw,
+  onAccept,
+  onIgnore,
   onRemoveConnection,
 }: ProfileHeaderProps) {
-  /**
-   * Formats the connection degree as a human-readable ordinal string.
-   *
-   * @param degree - The connection degree (1, 2, or 3)
-   * @returns Formatted degree string (e.g., "1st", "2nd", "3rd")
-   */
-  const formatConnectionDegree = (degree: number): string => {
-    switch (degree) {
-      case 1:
-        return '1st';
-      case 2:
-        return '2nd';
-      default:
-        return '3rd';
-    }
-  };
+  const degree = relationship?.degree;
 
   return (
     <div className="card overflow-hidden">
@@ -81,7 +78,6 @@ export function ProfileHeader({
             )}
           </div>
 
-          {/* Action buttons based on profile ownership and connection status */}
           {isOwnProfile ? (
             <button
               onClick={onEditProfile}
@@ -91,29 +87,15 @@ export function ProfileHeader({
               Edit profile
             </button>
           ) : (
-            <div className="flex gap-2">
-              {connectionDegree === 1 ? (
-                <button
-                  onClick={onRemoveConnection}
-                  className="btn-secondary flex items-center gap-2"
-                >
-                  <UserMinus className="w-4 h-4" />
-                  Connected
-                </button>
-              ) : connectionDegree === -1 ? (
-                <button disabled className="btn-secondary opacity-50">
-                  Pending
-                </button>
-              ) : (
-                <button
-                  onClick={onConnect}
-                  className="btn-primary flex items-center gap-2"
-                >
-                  <UserPlus className="w-4 h-4" />
-                  Connect
-                </button>
-              )}
-            </div>
+            <ConnectionActions
+              relationship={relationship}
+              busy={actionPending}
+              onConnect={onConnect}
+              onWithdraw={onWithdraw}
+              onAccept={onAccept}
+              onIgnore={onIgnore}
+              onRemove={onRemoveConnection}
+            />
           )}
         </div>
 
@@ -141,20 +123,18 @@ export function ProfileHeader({
               </span>
             )}
 
-            {connectionDegree && connectionDegree > 0 && (
+            {degree && degree > 0 && (
               <span className="bg-gray-100 px-2 py-0.5 rounded text-xs">
-                {formatConnectionDegree(connectionDegree)}
+                {DEGREE_LABELS[degree]}
               </span>
             )}
           </div>
 
-          {/* Mutual connections info (only shown for other users' profiles) */}
-          {!isOwnProfile && mutualConnections.length > 0 && (
-            <div className="mt-2 text-sm text-gray-600">
-              {mutualConnections.length} mutual connection
-              {mutualConnections.length > 1 ? 's' : ''}
-            </div>
-          )}
+          {!isOwnProfile && <ConnectionPath relationship={relationship} />}
+
+          <p role="status" aria-live="polite" className="mt-2 text-sm text-red-600 min-h-[1.25rem]">
+            {actionError ?? ''}
+          </p>
         </div>
       </div>
     </div>

@@ -1,11 +1,31 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
+import type { UploadSnapshot } from '../services/chunkedUploader';
 
 interface RecordingInterfaceProps {
+  /** Called once capture has started, before the first chunk. */
+  onRecordingStart?: () => void;
+  /** Every MediaRecorder chunk, as it is produced, so it can be uploaded right away. */
+  onChunk?: (chunk: Blob) => void;
   onRecordingComplete: (blob: Blob, duration: number) => void;
+  /** Live upload progress to show while recording. */
+  uploadStatus?: UploadSnapshot | null;
+}
+
+/** WebM variants in order of preference; the server stores WebM, so nothing else is offered. */
+const MIME_CANDIDATES = ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm'];
+
+function pickMimeType(): string | null {
+  if (typeof MediaRecorder === 'undefined') return null;
+  return MIME_CANDIDATES.find((type) => MediaRecorder.isTypeSupported(type)) ?? null;
 }
 
 /** Browser-based recording interface with screen/camera selection, pause/resume, and MediaRecorder capture. */
-export function RecordingInterface({ onRecordingComplete }: RecordingInterfaceProps) {
+export function RecordingInterface({
+  onRecordingStart,
+  onChunk,
+  onRecordingComplete,
+  uploadStatus,
+}: RecordingInterfaceProps) {
   const [isRecording, setIsRecording] = useState(false);
   const [isPaused, setIsPaused] = useState(false);
   const [recordingTime, setRecordingTime] = useState(0);
@@ -43,6 +63,11 @@ export function RecordingInterface({ onRecordingComplete }: RecordingInterfacePr
   const startRecording = useCallback(async () => {
     setError(null);
     chunksRef.current = [];
+    const mimeType = pickMimeType();
+    if (!mimeType) {
+      setError('This browser cannot record WebM video. Try Chrome, Edge or Firefox.');
+      return;
+    }
 
     try {
       let stream: MediaStream;
@@ -74,13 +99,14 @@ export function RecordingInterface({ onRecordingComplete }: RecordingInterfacePr
 
       setPreviewStream(stream);
 
-      const mediaRecorder = new MediaRecorder(stream, {
-        mimeType: 'video/webm;codecs=vp9,opus',
-      });
+      const mediaRecorder = new MediaRecorder(stream, { mimeType });
 
+      // Each one-second chunk is kept for the local preview and handed to the uploader
+      // immediately, so most of the recording is in storage before Stop is pressed.
       mediaRecorder.ondataavailable = (e) => {
         if (e.data.size > 0) {
           chunksRef.current.push(e.data);
+          onChunk?.(e.data);
         }
       };
 
@@ -103,6 +129,7 @@ export function RecordingInterface({ onRecordingComplete }: RecordingInterfacePr
       });
 
       mediaRecorderRef.current = mediaRecorder;
+      onRecordingStart?.();
       mediaRecorder.start(1000); // Collect data every second
       startTimeRef.current = Date.now();
       setIsRecording(true);
@@ -115,7 +142,7 @@ export function RecordingInterface({ onRecordingComplete }: RecordingInterfacePr
       const message = err instanceof Error ? err.message : 'Failed to start recording';
       setError(message);
     }
-  }, [recordingMode, onRecordingComplete]);
+  }, [recordingMode, onRecordingComplete, onRecordingStart, onChunk]);
 
   const stopRecording = useCallback(() => {
     if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
@@ -223,6 +250,18 @@ export function RecordingInterface({ onRecordingComplete }: RecordingInterfacePr
             {isPaused && <span className="text-loom-warning text-xs">PAUSED</span>}
           </div>
         )}
+
+        {/* Upload progress while recording: shows that bytes leave as they are recorded */}
+        {isRecording && uploadStatus && (
+          <div
+            className="absolute top-4 right-4 bg-black/60 px-3 py-1.5 rounded-full text-white text-xs"
+            aria-live="polite"
+          >
+            {uploadStatus.phase === 'error'
+              ? 'Upload paused - will retry'
+              : `Uploaded ${formatMegabytes(uploadStatus.uploadedBytes)} of ${formatMegabytes(uploadStatus.recordedBytes)}`}
+          </div>
+        )}
       </div>
 
       {/* Controls */}
@@ -254,6 +293,10 @@ export function RecordingInterface({ onRecordingComplete }: RecordingInterfacePr
       </div>
     </div>
   );
+}
+
+function formatMegabytes(bytes: number): string {
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 function formatTime(totalSeconds: number): string {

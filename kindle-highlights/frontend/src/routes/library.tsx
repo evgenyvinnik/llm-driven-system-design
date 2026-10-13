@@ -3,7 +3,7 @@
  * @module routes/library
  */
 import { createFileRoute, Link, useNavigate } from '@tanstack/react-router'
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { getLibrary, getHighlights, type Book, type Highlight } from '@/api/client'
 import { useStore } from '@/stores/useStore'
 
@@ -14,8 +14,31 @@ export const Route = createFileRoute('/library')({
 function LibraryPage() {
   const navigate = useNavigate()
   const { isAuthenticated, library, setLibrary, highlights, setHighlights, searchQuery, setSearchQuery } = useStore()
+  const remoteSeq = useStore((state) => state.remoteSeq)
   const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
   const [view, setView] = useState<'books' | 'highlights'>('books')
+
+  /** Loads books and highlights independently, so one failing request doesn't empty the page. */
+  const loadData = useCallback(
+    async (silent = false) => {
+      if (!silent) setLoading(true)
+      const query = useStore.getState().searchQuery
+      const [libraryData, highlightsData] = await Promise.allSettled([
+        getLibrary(),
+        getHighlights({ search: query || undefined }),
+      ])
+      if (libraryData.status === 'fulfilled') setLibrary(libraryData.value)
+      if (highlightsData.status === 'fulfilled') setHighlights(highlightsData.value)
+      setError(
+        libraryData.status === 'rejected' || highlightsData.status === 'rejected'
+          ? 'Some of your library could not be loaded. Try again in a moment.'
+          : ''
+      )
+      setLoading(false)
+    },
+    [setLibrary, setHighlights]
+  )
 
   useEffect(() => {
     if (!isAuthenticated) {
@@ -24,23 +47,13 @@ function LibraryPage() {
     }
 
     loadData()
-  }, [isAuthenticated])
+  }, [isAuthenticated, navigate, loadData])
 
-  const loadData = async () => {
-    setLoading(true)
-    try {
-      const [libraryData, highlightsData] = await Promise.all([
-        getLibrary(),
-        getHighlights({ search: searchQuery || undefined }),
-      ])
-      setLibrary(libraryData)
-      setHighlights(highlightsData)
-    } catch (error) {
-      console.error('Failed to load library:', error)
-    } finally {
-      setLoading(false)
-    }
-  }
+  // Another device changed a highlight: refresh in the background.
+  const firstRemoteSeq = useRef(remoteSeq)
+  useEffect(() => {
+    if (remoteSeq !== firstRemoteSeq.current) loadData(true)
+  }, [remoteSeq, loadData])
 
   const handleSearch = (e: React.FormEvent) => {
     e.preventDefault()
@@ -83,9 +96,16 @@ function LibraryPage() {
         </div>
       </div>
 
-      <form onSubmit={handleSearch} className="mb-6">
+      {error && (
+        <p role="alert" className="mb-4 rounded-md bg-red-50 p-3 text-sm text-red-700">
+          {error}
+        </p>
+      )}
+
+      <form onSubmit={handleSearch} className="mb-6" role="search">
         <div className="flex gap-2">
           <input
+            aria-label="Search your highlights"
             type="text"
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}

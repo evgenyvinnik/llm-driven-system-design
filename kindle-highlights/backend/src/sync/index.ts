@@ -3,23 +3,33 @@
  * @module sync/index
  */
 import http from 'http'
-import { app, createSyncServer } from './app.js'
+import { app, createSyncServer, startFanout, stopFanout } from './app.js'
 import { initRedis } from '../shared/cache.js'
 import { createLogger } from '../shared/logger.js'
+import { closeServer, onShutdown } from '../shared/lifecycle.js'
 
 const logger = createLogger('sync-service')
 const PORT = process.env.SYNC_PORT || 3002
 
 async function start(): Promise<void> {
   await initRedis()
+  await startFanout()
 
   const server = http.createServer(app)
-  const _wss = createSyncServer(server)
+  const wss = createSyncServer(server)
 
   server.listen(PORT, () => {
     logger.info({ event: 'server_started', port: PORT })
     console.log(`Sync service running on port ${PORT}`)
-    console.log(`WebSocket available at ws://localhost:${PORT}/sync`)
+    console.log(`WebSocket available at ws://localhost:${PORT}/api/sync/ws`)
+  })
+
+  onShutdown(logger, async () => {
+    // 1001 "going away": clients reconnect (to another instance) and resume from their cursor
+    for (const ws of wss.clients) ws.close(1001, 'Server shutting down')
+    wss.close()
+    await closeServer(server)
+    await stopFanout()
   })
 }
 

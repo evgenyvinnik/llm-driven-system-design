@@ -3,6 +3,7 @@ import { persist } from 'zustand/middleware';
 import type { User } from '@/types';
 import { api } from '@/services/api';
 import { wsService } from '@/services/websocket';
+import { getInstallId } from '@/lib/ids';
 
 /**
  * Authentication state interface.
@@ -56,7 +57,7 @@ interface AuthState {
  */
 export const useAuthStore = create<AuthState>()(
   persist(
-    (set, _get) => ({
+    (set) => ({
       user: null,
       deviceId: null,
       token: null,
@@ -68,6 +69,7 @@ export const useAuthStore = create<AuthState>()(
           usernameOrEmail,
           password,
           deviceName: navigator.userAgent.slice(0, 50),
+          installId: getInstallId(),
         }) as { user: User; device: { id: string }; token: string };
 
         localStorage.setItem('token', response.token);
@@ -80,8 +82,8 @@ export const useAuthStore = create<AuthState>()(
           isLoading: false,
         });
 
-        // Connect WebSocket
-        await wsService.connect(response.token);
+        // Connect WebSocket; the server pushes this device's undelivered messages on connect
+        wsService.connect(response.token);
       },
 
       register: async (username: string, email: string, password: string, displayName?: string) => {
@@ -91,6 +93,7 @@ export const useAuthStore = create<AuthState>()(
           password,
           displayName,
           deviceName: navigator.userAgent.slice(0, 50),
+          installId: getInstallId(),
         }) as { user: User; device: { id: string }; token: string };
 
         localStorage.setItem('token', response.token);
@@ -103,8 +106,8 @@ export const useAuthStore = create<AuthState>()(
           isLoading: false,
         });
 
-        // Connect WebSocket
-        await wsService.connect(response.token);
+        // Connect WebSocket; the server pushes this device's undelivered messages on connect
+        wsService.connect(response.token);
       },
 
       logout: async () => {
@@ -146,7 +149,7 @@ export const useAuthStore = create<AuthState>()(
           });
 
           // Connect WebSocket
-          await wsService.connect(token);
+          wsService.connect(token);
         } catch (error) {
           console.error('Auth check failed:', error);
           localStorage.removeItem('token');

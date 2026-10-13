@@ -1,5 +1,5 @@
 -- Seed data for job_scheduler database
--- Usage: PGPASSWORD=password psql -h localhost -U scheduler -d job_scheduler -f backend/db-seed/seed.sql
+-- Usage: PGPASSWORD=scheduler psql -h localhost -U scheduler -d job_scheduler -f backend/db-seed/seed.sql
 
 BEGIN;
 
@@ -237,7 +237,7 @@ VALUES (
   '0 */2 * * *',
   NULL,
   40,
-  5,
+  4,
   10000,
   600000,
   300000,
@@ -309,7 +309,8 @@ VALUES
    NULL, '{"users_migrated": 154832, "errors": 0, "skipped": 23, "duration_seconds": 2805}', NULL, 'worker-1', NOW() - INTERVAL '10 days')
 ON CONFLICT DO NOTHING;
 
--- Executions for legacy-sync-connector (job 10) — all failed, escalating errors
+-- Executions for legacy-sync-connector (job 10) — every attempt failed; max_retries = 4
+-- allows 5 attempts, so the 5th is dead-lettered and shows up in the dead-letter view
 INSERT INTO job_executions (id, job_id, status, attempt, scheduled_at, started_at, completed_at, next_retry_at, result, error, worker_id, created_at)
 VALUES
   ('c0000000-0000-0000-0000-000000000014', 'b0000000-0000-0000-0000-000000000010', 'FAILED', 1,
@@ -324,7 +325,7 @@ VALUES
   ('c0000000-0000-0000-0000-000000000017', 'b0000000-0000-0000-0000-000000000010', 'FAILED', 4,
    NOW() - INTERVAL '2 days 4 hours', NOW() - INTERVAL '2 days 2 hours 19 minutes', NOW() - INTERVAL '2 days 2 hours 14 minutes',
    NOW() - INTERVAL '2 days 2 hours 14 minutes', NULL, 'SOAP fault: SSL certificate expired for erp.internal.example.com', 'worker-3', NOW() - INTERVAL '2 days 2 hours 19 minutes'),
-  ('c0000000-0000-0000-0000-000000000018', 'b0000000-0000-0000-0000-000000000010', 'FAILED', 5,
+  ('c0000000-0000-0000-0000-000000000018', 'b0000000-0000-0000-0000-000000000010', 'DEAD_LETTER', 5,
    NOW() - INTERVAL '2 days 4 hours', NOW() - INTERVAL '2 days 19 minutes', NOW() - INTERVAL '2 days 14 minutes',
    NULL, NULL, 'Max retries exceeded. Last error: SOAP fault: SSL certificate expired for erp.internal.example.com', 'worker-3', NOW() - INTERVAL '2 days 19 minutes')
 ON CONFLICT DO NOTHING;
@@ -337,12 +338,14 @@ VALUES
    NULL, '{"emails_sent": 1847, "bounced": 12, "template": "daily_digest"}', NULL, 'worker-2', NOW() - INTERVAL '2 hours')
 ON CONFLICT DO NOTHING;
 
--- A currently running execution for thumbnail-generator (job 9)
-INSERT INTO job_executions (id, job_id, status, attempt, scheduled_at, started_at, completed_at, next_retry_at, result, error, worker_id, created_at)
+-- A currently running execution for thumbnail-generator (job 9). Its lease runs for
+-- 10 more minutes; no live worker renews it, so the scheduler's reaper then treats it
+-- like a crashed worker's attempt and schedules attempt 2.
+INSERT INTO job_executions (id, job_id, status, attempt, scheduled_at, started_at, completed_at, next_retry_at, result, error, worker_id, created_at, lease_expires_at)
 VALUES
   ('c0000000-0000-0000-0000-000000000020', 'b0000000-0000-0000-0000-000000000009', 'RUNNING', 1,
    NOW() - INTERVAL '2 minutes', NOW() - INTERVAL '1 minute 50 seconds', NULL,
-   NULL, NULL, NULL, 'worker-1', NOW() - INTERVAL '2 minutes')
+   NULL, NULL, NULL, 'worker-1', NOW() - INTERVAL '2 minutes', NOW() + INTERVAL '10 minutes')
 ON CONFLICT DO NOTHING;
 
 -- ============================================================

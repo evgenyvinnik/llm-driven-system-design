@@ -5,6 +5,7 @@ import { useAuthStore } from '../stores/authStore';
 import type { Post, Comment } from '../types';
 import { Avatar } from '../components/Avatar';
 import { formatTimeAgo, formatNumber } from '../utils/format';
+import { useOptimisticToggle } from '../hooks/useOptimisticToggle';
 
 export const Route = createFileRoute('/post/$postId')({
   component: PostPage,
@@ -17,9 +18,6 @@ function PostPage() {
   const [comments, setComments] = useState<Comment[]>([]);
   const [loading, setLoading] = useState(true);
   const [currentMediaIndex, setCurrentMediaIndex] = useState(0);
-  const [isLiked, setIsLiked] = useState(false);
-  const [isSaved, setIsSaved] = useState(false);
-  const [likeCount, setLikeCount] = useState(0);
   const [commentText, setCommentText] = useState('');
   const [submittingComment, setSubmittingComment] = useState(false);
 
@@ -33,9 +31,6 @@ function PostPage() {
       setLoading(true);
       const response = await postsApi.get(postId);
       setPost(response.post);
-      setIsLiked(response.post.isLiked || false);
-      setIsSaved(response.post.isSaved || false);
-      setLikeCount(response.post.likeCount);
     } catch (error) {
       console.error('Error loading post:', error);
     } finally {
@@ -49,38 +44,6 @@ function PostPage() {
       setComments(response.comments);
     } catch (error) {
       console.error('Error loading comments:', error);
-    }
-  };
-
-  const handleLike = async () => {
-    if (!isAuthenticated) return;
-    try {
-      if (isLiked) {
-        await postsApi.unlike(postId);
-        setIsLiked(false);
-        setLikeCount((prev) => prev - 1);
-      } else {
-        await postsApi.like(postId);
-        setIsLiked(true);
-        setLikeCount((prev) => prev + 1);
-      }
-    } catch (error) {
-      console.error('Like error:', error);
-    }
-  };
-
-  const handleSave = async () => {
-    if (!isAuthenticated) return;
-    try {
-      if (isSaved) {
-        await postsApi.unsave(postId);
-        setIsSaved(false);
-      } else {
-        await postsApi.save(postId);
-        setIsSaved(true);
-      }
-    } catch (error) {
-      console.error('Save error:', error);
     }
   };
 
@@ -262,57 +225,7 @@ function PostPage() {
           </div>
 
           {/* Actions */}
-          <div className="p-4 border-t border-border-gray">
-            <div className="flex items-center justify-between mb-2">
-              <div className="flex items-center gap-4">
-                <button onClick={handleLike}>
-                  <svg
-                    className={`w-6 h-6 ${isLiked ? 'text-like-red fill-current' : ''}`}
-                    fill={isLiked ? 'currentColor' : 'none'}
-                    stroke="currentColor"
-                    viewBox="0 0 24 24"
-                  >
-                    <path
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      strokeWidth={2}
-                      d="M4.318 6.318a4.5 4.5 0 000 6.364L12 20.364l7.682-7.682a4.5 4.5 0 00-6.364-6.364L12 7.636l-1.318-1.318a4.5 4.5 0 00-6.364 0z"
-                    />
-                  </svg>
-                </button>
-                <button>
-                  <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      strokeWidth={2}
-                      d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"
-                    />
-                  </svg>
-                </button>
-              </div>
-              <button onClick={handleSave}>
-                <svg
-                  className={`w-6 h-6 ${isSaved ? 'fill-current' : ''}`}
-                  fill={isSaved ? 'currentColor' : 'none'}
-                  stroke="currentColor"
-                  viewBox="0 0 24 24"
-                >
-                  <path
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    strokeWidth={2}
-                    d="M5 5a2 2 0 012-2h10a2 2 0 012 2v16l-7-3.5L5 21V5z"
-                  />
-                </svg>
-              </button>
-            </div>
-
-            <p className="font-semibold text-sm mb-1">
-              {formatNumber(likeCount)} {likeCount === 1 ? 'like' : 'likes'}
-            </p>
-            <p className="text-xs text-text-secondary uppercase">{formatTimeAgo(post.createdAt)}</p>
-          </div>
+          <PostDetailActions key={post.id} post={post} />
 
           {/* Comment input */}
           {isAuthenticated && (
@@ -335,6 +248,84 @@ function PostPage() {
           )}
         </div>
       </div>
+    </div>
+  );
+}
+
+/** Like/save bar for the detail page; optimistic with rollback (see useOptimisticToggle). */
+function PostDetailActions({ post }: { post: Post }) {
+  const { isAuthenticated } = useAuthStore();
+  const like = useOptimisticToggle({
+    initialActive: post.isLiked || false,
+    initialCount: post.likeCount,
+    activate: () => postsApi.like(post.id),
+    deactivate: () => postsApi.unlike(post.id),
+  });
+  const save = useOptimisticToggle({
+    initialActive: post.isSaved || false,
+    activate: () => postsApi.save(post.id),
+    deactivate: () => postsApi.unsave(post.id),
+  });
+
+  return (
+    <div className="p-4 border-t border-border-gray">
+      {post.status === 'processing' && (
+        <p className="text-xs text-text-secondary mb-2" role="status">
+          Your photos are still processing. They will appear here in a few seconds.
+        </p>
+      )}
+      <div className="flex items-center justify-between mb-2">
+        <div className="flex items-center gap-4">
+          <button
+            type="button"
+            onClick={() => isAuthenticated && void like.toggle()}
+            aria-label={like.active ? 'Unlike' : 'Like'}
+            aria-pressed={like.active}
+          >
+            <svg
+              className={`w-6 h-6 ${like.active ? 'text-like-red fill-current' : ''}`}
+              fill={like.active ? 'currentColor' : 'none'}
+              stroke="currentColor"
+              viewBox="0 0 24 24"
+            >
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                strokeWidth={2}
+                d="M4.318 6.318a4.5 4.5 0 000 6.364L12 20.364l7.682-7.682a4.5 4.5 0 00-6.364-6.364L12 7.636l-1.318-1.318a4.5 4.5 0 00-6.364 0z"
+              />
+            </svg>
+          </button>
+        </div>
+        <button
+          type="button"
+          onClick={() => isAuthenticated && void save.toggle()}
+          aria-label={save.active ? 'Remove from saved' : 'Save'}
+          aria-pressed={save.active}
+        >
+          <svg
+            className={`w-6 h-6 ${save.active ? 'fill-current' : ''}`}
+            fill={save.active ? 'currentColor' : 'none'}
+            stroke="currentColor"
+            viewBox="0 0 24 24"
+          >
+            <path
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              strokeWidth={2}
+              d="M5 5a2 2 0 012-2h10a2 2 0 012 2v16l-7-3.5L5 21V5z"
+            />
+          </svg>
+        </button>
+      </div>
+
+      <p className="font-semibold text-sm mb-1">
+        {formatNumber(like.count)} {like.count === 1 ? 'like' : 'likes'}
+      </p>
+      <p className="text-xs text-text-secondary uppercase">{formatTimeAgo(post.createdAt)}</p>
+      <p role="status" aria-live="polite" className="text-xs text-like-red mt-1">
+        {like.error || save.error}
+      </p>
     </div>
   );
 }

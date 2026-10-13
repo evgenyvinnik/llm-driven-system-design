@@ -23,7 +23,32 @@ interface AuthenticatedRequest extends Request {
 }
 
 /**
- * Rate limiter using Redis sliding window algorithm
+ * Sliding-window log in one atomic step. The previous version counted with
+ * ZCARD and added with a separate ZADD, so concurrent requests could all see
+ * "59 of 60" and all be admitted. Running trim, count and add inside one Lua
+ * script makes the check-and-record indivisible on the Redis server.
+ *
+ * KEYS[1] = window key; ARGV = now (ms), window (ms), limit, unique member.
+ * Returns {allowed (1|0), count after this request, oldest score in window}.
+ */
+const SLIDING_WINDOW_LUA = `
+local key = KEYS[1]
+local now = tonumber(ARGV[1])
+local window = tonumber(ARGV[2])
+local limit = tonumber(ARGV[3])
+redis.call('ZREMRANGEBYSCORE', key, 0, now - window)
+local count = redis.call('ZCARD', key)
+if count >= limit then
+  local oldest = redis.call('ZRANGE', key, 0, 0, 'WITHSCORES')
+  return {0, count, tonumber(oldest[2]) or now}
+end
+redis.call('ZADD', key, now, ARGV[4])
+redis.call('PEXPIRE', key, window)
+return {1, count + 1, now}
+`;
+
+/**
+ * Rate limiter using a Redis sliding window, shared by every server instance
  */
 export class RateLimiter {
   private redis: RedisClient;
@@ -35,62 +60,34 @@ export class RateLimiter {
   }
 
   /**
-   * Check if a request is allowed under the rate limit
+   * Check if a request is allowed under the rate limit, and record it if so
    */
   async checkLimit(key: string, limit: number, windowSeconds: number): Promise<RateLimitResult> {
     const fullKey = `${this.keyPrefix}${key}`;
     const now = Date.now();
-    const windowStart = now - (windowSeconds * 1000);
+    const windowMs = windowSeconds * 1000;
 
     try {
-      // Use a transaction for atomic operations
-      const pipeline = this.redis.pipeline();
+      const [allowed, count, oldest] = (await this.redis.eval(
+        SLIDING_WINDOW_LUA,
+        1,
+        fullKey,
+        now,
+        windowMs,
+        limit,
+        `${now}:${Math.random().toString(36).slice(2)}`
+      )) as [number, number, number];
 
-      // Remove old entries outside the window
-      pipeline.zremrangebyscore(fullKey, 0, windowStart);
-
-      // Count current entries in the window
-      pipeline.zcard(fullKey);
-
-      // Execute the pipeline
-      const results = await pipeline.exec();
-
-      // Get the current count after removing old entries
-      const currentCount = results?.[1]?.[1] as number ?? 0;
-
-      if (currentCount >= limit) {
-        // Get the oldest entry to calculate retry-after
-        const oldestEntry = await this.redis.zrange(fullKey, 0, 0, 'WITHSCORES');
-        const oldestTimestamp = oldestEntry.length >= 2 ? parseInt(oldestEntry[1]) : now;
-        const retryAfter = Math.ceil((oldestTimestamp + (windowSeconds * 1000) - now) / 1000);
-
-        logger.debug({
-          key,
-          currentCount,
-          limit,
-          retryAfter,
-        }, 'Rate limit exceeded');
-
-        return {
-          allowed: false,
-          remaining: 0,
-          retryAfter: Math.max(1, retryAfter),
-        };
+      if (allowed !== 1) {
+        const retryAfter = Math.max(1, Math.ceil((oldest + windowMs - now) / 1000));
+        logger.debug({ key, count, limit, retryAfter }, 'Rate limit exceeded');
+        return { allowed: false, remaining: 0, retryAfter };
       }
 
-      // Add the current request
-      await this.redis.zadd(fullKey, now, `${now}:${Math.random()}`);
-
-      // Set expiry on the key
-      await this.redis.expire(fullKey, windowSeconds);
-
-      return {
-        allowed: true,
-        remaining: limit - currentCount - 1,
-      };
+      return { allowed: true, remaining: Math.max(0, limit - count) };
     } catch (error) {
       logger.error({ error, key }, 'Rate limit check failed');
-      // Fail open - allow the request if Redis is down
+      // Fail open - delivering messages matters more than enforcing limits
       return { allowed: true, remaining: limit };
     }
   }
@@ -105,19 +102,18 @@ export class RateLimiter {
       const key = keyGenerator(req);
       const result = await this.checkLimit(key, limit, windowSeconds);
 
-      // Set rate limit headers
-      res.setHeader('X-RateLimit-Limit', limit);
-      res.setHeader('X-RateLimit-Remaining', result.remaining);
-      res.setHeader('X-RateLimit-Window', windowSeconds);
+      // IETF RateLimit header fields (draft-ietf-httpapi-ratelimit-headers)
+      res.setHeader('RateLimit-Limit', limit);
+      res.setHeader('RateLimit-Remaining', result.remaining);
+      res.setHeader('RateLimit-Reset', result.allowed ? windowSeconds : result.retryAfter!);
 
       if (!result.allowed) {
         res.setHeader('Retry-After', result.retryAfter!);
-        res.setHeader('X-RateLimit-Reset', Date.now() + (result.retryAfter! * 1000));
 
-        // Record metric
+        // Record metric (per endpoint only; the user goes to the log)
         const authReq = req as AuthenticatedRequest;
         const userId = authReq.user?.id || 'anonymous';
-        rateLimitExceeded.inc({ endpoint, user_id: userId });
+        rateLimitExceeded.inc({ endpoint });
 
         logger.warn({
           userId,
@@ -143,10 +139,13 @@ export class RateLimiter {
 const rateLimiter = new RateLimiter(redis);
 
 // Pre-configured rate limiters for common use cases
+/** Message sends per user, shared by the REST route and the WebSocket path. */
+export const MESSAGE_RATE_LIMIT = { limit: 60, windowSeconds: 60 } as const;
+export const messageRateKey = (userId: string): string => `messages:${userId}`;
+
 export const messageRateLimiter = rateLimiter.middleware({
-  limit: 60,
-  windowSeconds: 60,
-  keyGenerator: (req) => `messages:${(req as AuthenticatedRequest).user!.id}`,
+  ...MESSAGE_RATE_LIMIT,
+  keyGenerator: (req) => messageRateKey((req as AuthenticatedRequest).user!.id),
   endpoint: 'messages',
 });
 

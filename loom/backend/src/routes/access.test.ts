@@ -37,7 +37,7 @@ const videoRow = {
 };
 
 function shareRow(token: string) {
-  if (token === 'locked-token') {
+  if (token === 'locked-token' || token === 'guess-token') {
     return { id: SHARE, video_id: VIDEO, password_hash: HASH, expires_at: null, allow_download: false };
   }
   if (token === 'expired-token') {
@@ -156,12 +156,16 @@ describe('password-protected shares', () => {
     expect((await request(app).get('/api/share/no-such-token')).status).toBe(404);
   });
 
-  it('rate-limits password guessing per link', async () => {
-    let last = 0;
+  it('rate-limits failed password guesses per link', async () => {
+    const statuses: number[] = [];
     for (let i = 0; i < 11; i++) {
-      last = (await request(app).post('/api/share/locked-token/unlock').set('X-Test', String(i)).send({ password: `guess-${i}` })).status;
+      const res = await request(app).post('/api/share/guess-token/unlock').send({ password: `guess-${i}` });
+      statuses.push(res.status);
     }
-    expect(last).toBe(429);
+    expect(statuses.slice(0, 10).every((status) => status === 401)).toBe(true);
+    expect(statuses[10]).toBe(429);
+    // The limit is per link: the same client can still open a different one.
+    expect((await request(app).post('/api/share/locked-token/unlock').send({ password: 'password123' })).status).toBe(200);
   });
 });
 

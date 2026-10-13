@@ -7,6 +7,7 @@ import { CommentSection } from '../components/CommentSection';
 import { AnalyticsPanel } from '../components/AnalyticsPanel';
 import { ShareModal } from '../components/ShareModal';
 import { uploadApi } from '../services/api';
+import { useViewTracker } from '../hooks/useViewTracker';
 
 function VideoPage() {
   const { videoId } = Route.useParams();
@@ -19,13 +20,18 @@ function VideoPage() {
   const [showShareModal, setShowShareModal] = useState(false);
   const [activeTab, setActiveTab] = useState<'comments' | 'analytics'>('comments');
   const [playerTime, setPlayerTime] = useState(0);
+  const [seekRequest, setSeekRequest] = useState<{ time: number; nonce: number } | null>(null);
+  // Only share viewers count as audience; the owner's own plays are not views.
+  const tracker = useViewTracker(currentVideo?.id ?? null, currentVideo?.access === 'viewer');
 
   useEffect(() => {
     fetchVideo(videoId);
   }, [videoId, fetchVideo]);
 
   useEffect(() => {
-    if (currentVideo?.status === 'ready') {
+    setDownloadUrl(null);
+    // 'processing' videos are already playable from the original upload.
+    if (currentVideo?.status === 'ready' || currentVideo?.status === 'processing') {
       uploadApi.getDownloadUrl(currentVideo.id).then(({ downloadUrl: url }) => {
         setDownloadUrl(url);
       }).catch(() => {
@@ -50,7 +56,11 @@ function VideoPage() {
     );
   }
 
-  const isOwner = user?.id === currentVideo.userId;
+  const isOwner = currentVideo.access ? currentVideo.access === 'owner' : user?.id === currentVideo.userId;
+  const handleTimeUpdate = (time: number, duration: number) => {
+    setPlayerTime(time);
+    tracker.onTimeUpdate(time, duration);
+  };
 
   return (
     <div className="max-w-6xl mx-auto px-6 py-8">
@@ -61,7 +71,10 @@ function VideoPage() {
             videoUrl={downloadUrl}
             posterUrl={currentVideo.thumbnailUrl}
             status={currentVideo.status}
-            onTimeUpdate={setPlayerTime}
+            onTimeUpdate={handleTimeUpdate}
+            onPlay={tracker.onPlay}
+            onEnded={tracker.onEnded}
+            seekRequest={seekRequest}
           />
 
           <div className="mt-4">
@@ -125,7 +138,11 @@ function VideoPage() {
 
             <div className="p-4">
               {activeTab === 'comments' ? (
-                <CommentSection videoId={videoId} playerTime={playerTime} />
+                <CommentSection
+                  videoId={videoId}
+                  playerTime={playerTime}
+                  onSeek={(time) => setSeekRequest({ time, nonce: Date.now() })}
+                />
               ) : (
                 <AnalyticsPanel videoId={videoId} />
               )}

@@ -16,21 +16,23 @@ function ExportPage() {
   const { isAuthenticated } = useStore()
   const [loading, setLoading] = useState(false)
   const [preview, setPreview] = useState<string | null>(null)
+  const [error, setError] = useState('')
   const [format, setFormat] = useState<'markdown' | 'csv' | 'json'>('markdown')
 
   useEffect(() => {
     if (!isAuthenticated) {
       navigate({ to: '/login' })
     }
-  }, [isAuthenticated])
+  }, [isAuthenticated, navigate])
 
   const handlePreview = async () => {
     setLoading(true)
+    setError('')
     try {
       const data = await exportHighlights(format)
       setPreview(data)
-    } catch (error) {
-      console.error('Failed to export:', error)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Export failed')
     } finally {
       setLoading(false)
     }
@@ -38,6 +40,7 @@ function ExportPage() {
 
   const handleDownload = async () => {
     setLoading(true)
+    setError('')
     try {
       const data = await exportHighlights(format)
       const blob = new Blob([data], { type: getContentType(format) })
@@ -49,8 +52,8 @@ function ExportPage() {
       a.click()
       document.body.removeChild(a)
       URL.revokeObjectURL(url)
-    } catch (error) {
-      console.error('Failed to download:', error)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Download failed')
     } finally {
       setLoading(false)
     }
@@ -119,6 +122,12 @@ function ExportPage() {
           </button>
         </div>
       </div>
+
+      {error && (
+        <p role="alert" className="mt-4 rounded-md bg-red-50 p-3 text-sm text-red-700">
+          {error}
+        </p>
+      )}
 
       {preview && (
         <div className="mt-6 rounded-lg bg-white p-6 shadow-sm">

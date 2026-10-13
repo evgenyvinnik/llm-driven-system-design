@@ -31,6 +31,8 @@ function DriverDashboard() {
     isLoading,
     isTogglingStatus,
     isOnline,
+    notice,
+    dismissNotice,
     handleGoOnline,
     handleGoOffline,
     handleAcceptOffer,
@@ -61,6 +63,15 @@ function DriverDashboard() {
           onAccept={handleAcceptOffer}
           onDecline={handleRejectOffer}
         />
+      )}
+
+      {notice && (
+        <div className="mb-4 p-3 rounded-lg bg-yellow-50 text-yellow-800 flex justify-between items-start" role="status">
+          <span>{notice}</span>
+          <button onClick={dismissNotice} className="text-sm underline ml-4" aria-label="Dismiss message">
+            Dismiss
+          </button>
+        </div>
       )}
 
       {/* Driver Status Header */}

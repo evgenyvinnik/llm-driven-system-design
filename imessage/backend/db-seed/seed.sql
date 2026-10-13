@@ -174,98 +174,98 @@ ON CONFLICT DO NOTHING;
 -- =============================================================================
 
 -- Conversation 1: Alice <-> Bob (direct messages)
-INSERT INTO messages (id, conversation_id, sender_id, content, content_type, created_at)
+INSERT INTO messages (id, conversation_id, sender_id, seq, content, content_type, created_at)
 VALUES
   ('60000000-0000-0000-0000-000000000001',
-   'c0000000-0000-0000-0000-000000000001', 'a0000000-0000-0000-0000-000000000001',
+   'c0000000-0000-0000-0000-000000000001', 'a0000000-0000-0000-0000-000000000001', 1,
    'Hey Bob! How are you?', 'text', NOW() - INTERVAL '2 hours'),
 
   ('60000000-0000-0000-0000-000000000002',
-   'c0000000-0000-0000-0000-000000000001', 'a0000000-0000-0000-0000-000000000002',
+   'c0000000-0000-0000-0000-000000000001', 'a0000000-0000-0000-0000-000000000002', 2,
    'Hi Alice! I''m doing great, thanks for asking. What''s up?', 'text', NOW() - INTERVAL '1 hour 55 minutes'),
 
   ('60000000-0000-0000-0000-000000000003',
-   'c0000000-0000-0000-0000-000000000001', 'a0000000-0000-0000-0000-000000000001',
+   'c0000000-0000-0000-0000-000000000001', 'a0000000-0000-0000-0000-000000000001', 3,
    'Just wanted to check if you''re free this weekend for the hiking trip.', 'text', NOW() - INTERVAL '1 hour 50 minutes'),
 
   ('60000000-0000-0000-0000-000000000004',
-   'c0000000-0000-0000-0000-000000000001', 'a0000000-0000-0000-0000-000000000002',
+   'c0000000-0000-0000-0000-000000000001', 'a0000000-0000-0000-0000-000000000002', 4,
    'Absolutely! I''ve been looking forward to it. What time should we meet?', 'text', NOW() - INTERVAL '1 hour 45 minutes'),
 
   ('60000000-0000-0000-0000-000000000005',
-   'c0000000-0000-0000-0000-000000000001', 'a0000000-0000-0000-0000-000000000001',
+   'c0000000-0000-0000-0000-000000000001', 'a0000000-0000-0000-0000-000000000001', 5,
    'Let''s do 8 AM at the trailhead. I''ll send the coordinates later.', 'text', NOW() - INTERVAL '1 hour 40 minutes')
 ON CONFLICT DO NOTHING;
 
 -- Conversation 2: Alice <-> Charlie (direct messages)
-INSERT INTO messages (id, conversation_id, sender_id, content, content_type, created_at)
+INSERT INTO messages (id, conversation_id, sender_id, seq, content, content_type, created_at)
 VALUES
   ('60000000-0000-0000-0000-000000000006',
-   'c0000000-0000-0000-0000-000000000002', 'a0000000-0000-0000-0000-000000000003',
+   'c0000000-0000-0000-0000-000000000002', 'a0000000-0000-0000-0000-000000000003', 1,
    'Alice, did you see the new design mockups?', 'text', NOW() - INTERVAL '3 hours'),
 
   ('60000000-0000-0000-0000-000000000007',
-   'c0000000-0000-0000-0000-000000000002', 'a0000000-0000-0000-0000-000000000001',
+   'c0000000-0000-0000-0000-000000000002', 'a0000000-0000-0000-0000-000000000001', 2,
    'Yes! They look amazing. I especially love the new color scheme.', 'text', NOW() - INTERVAL '2 hours 50 minutes'),
 
   ('60000000-0000-0000-0000-000000000008',
-   'c0000000-0000-0000-0000-000000000002', 'a0000000-0000-0000-0000-000000000003',
+   'c0000000-0000-0000-0000-000000000002', 'a0000000-0000-0000-0000-000000000003', 3,
    'Great, I''ll finalize them and share with the team tomorrow.', 'text', NOW() - INTERVAL '2 hours 45 minutes')
 ON CONFLICT DO NOTHING;
 
 -- Conversation 3: Weekend Plans group
-INSERT INTO messages (id, conversation_id, sender_id, content, content_type, created_at)
+INSERT INTO messages (id, conversation_id, sender_id, seq, content, content_type, created_at)
 VALUES
   ('60000000-0000-0000-0000-000000000009',
-   'c0000000-0000-0000-0000-000000000003', 'a0000000-0000-0000-0000-000000000001',
+   'c0000000-0000-0000-0000-000000000003', 'a0000000-0000-0000-0000-000000000001', 1,
    'Hey everyone! Planning a weekend hike. Who''s in?', 'text', NOW() - INTERVAL '5 hours'),
 
   ('60000000-0000-0000-0000-000000000010',
-   'c0000000-0000-0000-0000-000000000003', 'a0000000-0000-0000-0000-000000000002',
+   'c0000000-0000-0000-0000-000000000003', 'a0000000-0000-0000-0000-000000000002', 2,
    'Count me in! Where are we going?', 'text', NOW() - INTERVAL '4 hours 50 minutes'),
 
   ('60000000-0000-0000-0000-000000000011',
-   'c0000000-0000-0000-0000-000000000003', 'a0000000-0000-0000-0000-000000000003',
+   'c0000000-0000-0000-0000-000000000003', 'a0000000-0000-0000-0000-000000000003', 3,
    'I''m interested! Let me check my schedule.', 'text', NOW() - INTERVAL '4 hours 30 minutes'),
 
   ('60000000-0000-0000-0000-000000000012',
-   'c0000000-0000-0000-0000-000000000003', 'a0000000-0000-0000-0000-000000000001',
+   'c0000000-0000-0000-0000-000000000003', 'a0000000-0000-0000-0000-000000000001', 4,
    'Thinking about Eagle Peak trail. It''s about 8 miles round trip.', 'text', NOW() - INTERVAL '4 hours'),
 
   ('60000000-0000-0000-0000-000000000013',
-   'c0000000-0000-0000-0000-000000000003', 'a0000000-0000-0000-0000-000000000002',
+   'c0000000-0000-0000-0000-000000000003', 'a0000000-0000-0000-0000-000000000002', 5,
    'Perfect difficulty level. What should we bring?', 'text', NOW() - INTERVAL '3 hours 45 minutes'),
 
   ('60000000-0000-0000-0000-000000000014',
-   'c0000000-0000-0000-0000-000000000003', 'a0000000-0000-0000-0000-000000000003',
+   'c0000000-0000-0000-0000-000000000003', 'a0000000-0000-0000-0000-000000000003', 6,
    'I confirmed, I''m free Saturday! I''ll bring snacks and water.', 'text', NOW() - INTERVAL '3 hours 30 minutes'),
 
   ('60000000-0000-0000-0000-000000000015',
-   'c0000000-0000-0000-0000-000000000003', 'a0000000-0000-0000-0000-000000000001',
+   'c0000000-0000-0000-0000-000000000003', 'a0000000-0000-0000-0000-000000000001', 7,
    'Awesome! Bring sunscreen and comfortable shoes. Meet at 8 AM.', 'text', NOW() - INTERVAL '3 hours')
 ON CONFLICT DO NOTHING;
 
 -- Conversation 4: Project Alpha group
-INSERT INTO messages (id, conversation_id, sender_id, content, content_type, created_at)
+INSERT INTO messages (id, conversation_id, sender_id, seq, content, content_type, created_at)
 VALUES
   ('60000000-0000-0000-0000-000000000016',
-   'c0000000-0000-0000-0000-000000000004', 'a0000000-0000-0000-0000-000000000002',
+   'c0000000-0000-0000-0000-000000000004', 'a0000000-0000-0000-0000-000000000002', 1,
    'Charlie, we need to finalize the API spec by Friday.', 'text', NOW() - INTERVAL '6 hours'),
 
   ('60000000-0000-0000-0000-000000000017',
-   'c0000000-0000-0000-0000-000000000004', 'a0000000-0000-0000-0000-000000000003',
+   'c0000000-0000-0000-0000-000000000004', 'a0000000-0000-0000-0000-000000000003', 2,
    'Got it. I''ll have a draft ready by Wednesday for review.', 'text', NOW() - INTERVAL '5 hours 45 minutes'),
 
   ('60000000-0000-0000-0000-000000000018',
-   'c0000000-0000-0000-0000-000000000004', 'a0000000-0000-0000-0000-000000000002',
+   'c0000000-0000-0000-0000-000000000004', 'a0000000-0000-0000-0000-000000000002', 3,
    'Sounds good. Let''s sync up Thursday to go over any changes.', 'text', NOW() - INTERVAL '5 hours 30 minutes')
 ON CONFLICT DO NOTHING;
 
 -- A reply message (thread support)
-INSERT INTO messages (id, conversation_id, sender_id, content, content_type, reply_to_id, created_at)
+INSERT INTO messages (id, conversation_id, sender_id, seq, content, content_type, reply_to_id, created_at)
 VALUES
   ('60000000-0000-0000-0000-000000000019',
-   'c0000000-0000-0000-0000-000000000001', 'a0000000-0000-0000-0000-000000000002',
+   'c0000000-0000-0000-0000-000000000001', 'a0000000-0000-0000-0000-000000000002', 6,
    'Sounds perfect! I''ll set my alarm.', 'text',
    '60000000-0000-0000-0000-000000000005', NOW() - INTERVAL '1 hour 30 minutes')
 ON CONFLICT DO NOTHING;
@@ -306,35 +306,35 @@ ON CONFLICT DO NOTHING;
 -- =============================================================================
 
 -- Alice's iPhone has read all messages in conversation with Bob
-INSERT INTO read_receipts (user_id, device_id, conversation_id, last_read_message_id, last_read_at)
+INSERT INTO read_receipts (user_id, device_id, conversation_id, last_read_message_id, last_read_seq, last_read_at)
 VALUES
   ('a0000000-0000-0000-0000-000000000001', 'd0000000-0000-0000-0000-000000000001',
-   'c0000000-0000-0000-0000-000000000001', '60000000-0000-0000-0000-000000000019',
+   'c0000000-0000-0000-0000-000000000001', '60000000-0000-0000-0000-000000000019', 6,
    NOW() - INTERVAL '1 hour 25 minutes'),
 
   -- Alice's MacBook has read up to message 4 in the Bob conversation
   ('a0000000-0000-0000-0000-000000000001', 'd0000000-0000-0000-0000-000000000002',
-   'c0000000-0000-0000-0000-000000000001', '60000000-0000-0000-0000-000000000004',
+   'c0000000-0000-0000-0000-000000000001', '60000000-0000-0000-0000-000000000004', 4,
    NOW() - INTERVAL '1 hour 44 minutes'),
 
   -- Bob's iPhone has read all messages in conversation with Alice
   ('a0000000-0000-0000-0000-000000000002', 'd0000000-0000-0000-0000-000000000003',
-   'c0000000-0000-0000-0000-000000000001', '60000000-0000-0000-0000-000000000019',
+   'c0000000-0000-0000-0000-000000000001', '60000000-0000-0000-0000-000000000019', 6,
    NOW() - INTERVAL '1 hour 29 minutes'),
 
   -- Alice has read all messages in the Charlie DM
   ('a0000000-0000-0000-0000-000000000001', 'd0000000-0000-0000-0000-000000000001',
-   'c0000000-0000-0000-0000-000000000002', '60000000-0000-0000-0000-000000000008',
+   'c0000000-0000-0000-0000-000000000002', '60000000-0000-0000-0000-000000000008', 3,
    NOW() - INTERVAL '2 hours 40 minutes'),
 
   -- Alice has read all group messages in Weekend Plans
   ('a0000000-0000-0000-0000-000000000001', 'd0000000-0000-0000-0000-000000000001',
-   'c0000000-0000-0000-0000-000000000003', '60000000-0000-0000-0000-000000000015',
+   'c0000000-0000-0000-0000-000000000003', '60000000-0000-0000-0000-000000000015', 7,
    NOW() - INTERVAL '2 hours 55 minutes'),
 
   -- Bob has read all group messages in Weekend Plans
   ('a0000000-0000-0000-0000-000000000002', 'd0000000-0000-0000-0000-000000000003',
-   'c0000000-0000-0000-0000-000000000003', '60000000-0000-0000-0000-000000000015',
+   'c0000000-0000-0000-0000-000000000003', '60000000-0000-0000-0000-000000000015', 7,
    NOW() - INTERVAL '2 hours 58 minutes')
 ON CONFLICT DO NOTHING;
 
@@ -365,36 +365,26 @@ VALUES
 ON CONFLICT DO NOTHING;
 
 -- =============================================================================
--- SYNC CURSORS (device sync progress)
+-- DEVICE INBOX (undelivered messages per device)
 -- =============================================================================
 
-INSERT INTO sync_cursors (device_id, conversation_id, last_synced_message_id, last_synced_at)
+-- Alice's MacBook has been offline since before Bob's reply in conversation 1,
+-- so that message is still waiting in its inbox. The seeded phone/tablet
+-- devices never connect locally; rows like this one stay until the device
+-- acknowledges them or the retention sweep removes them.
+INSERT INTO device_inbox (device_id, message_id, conversation_id, seq, enqueued_at)
 VALUES
-  -- Alice's iPhone is fully synced on all conversations
-  ('d0000000-0000-0000-0000-000000000001', 'c0000000-0000-0000-0000-000000000001',
-   '60000000-0000-0000-0000-000000000019', NOW() - INTERVAL '1 hour'),
-  ('d0000000-0000-0000-0000-000000000001', 'c0000000-0000-0000-0000-000000000002',
-   '60000000-0000-0000-0000-000000000008', NOW() - INTERVAL '2 hours'),
-  ('d0000000-0000-0000-0000-000000000001', 'c0000000-0000-0000-0000-000000000003',
-   '60000000-0000-0000-0000-000000000015', NOW() - INTERVAL '2 hours 50 minutes'),
-
-  -- Alice's MacBook is behind on conversation 1 (hasn't synced reply)
-  ('d0000000-0000-0000-0000-000000000002', 'c0000000-0000-0000-0000-000000000001',
-   '60000000-0000-0000-0000-000000000004', NOW() - INTERVAL '1 hour 45 minutes'),
-
-  -- Bob's iPhone is fully synced
-  ('d0000000-0000-0000-0000-000000000003', 'c0000000-0000-0000-0000-000000000001',
-   '60000000-0000-0000-0000-000000000019', NOW() - INTERVAL '1 hour'),
-  ('d0000000-0000-0000-0000-000000000003', 'c0000000-0000-0000-0000-000000000003',
-   '60000000-0000-0000-0000-000000000015', NOW() - INTERVAL '2 hours 50 minutes'),
-  ('d0000000-0000-0000-0000-000000000003', 'c0000000-0000-0000-0000-000000000004',
-   '60000000-0000-0000-0000-000000000018', NOW() - INTERVAL '5 hours'),
-
-  -- Charlie's iPhone
-  ('d0000000-0000-0000-0000-000000000005', 'c0000000-0000-0000-0000-000000000002',
-   '60000000-0000-0000-0000-000000000008', NOW() - INTERVAL '2 hours 40 minutes'),
-  ('d0000000-0000-0000-0000-000000000005', 'c0000000-0000-0000-0000-000000000003',
-   '60000000-0000-0000-0000-000000000015', NOW() - INTERVAL '2 hours 55 minutes'),
-  ('d0000000-0000-0000-0000-000000000005', 'c0000000-0000-0000-0000-000000000004',
-   '60000000-0000-0000-0000-000000000018', NOW() - INTERVAL '5 hours 25 minutes')
+  ('d0000000-0000-0000-0000-000000000002', '60000000-0000-0000-0000-000000000019',
+   'c0000000-0000-0000-0000-000000000001', 6, NOW() - INTERVAL '1 hour 30 minutes')
 ON CONFLICT DO NOTHING;
+
+-- =============================================================================
+-- SEQUENCER STATE
+-- =============================================================================
+
+-- Point each conversation's sequencer at its highest seeded seq, so the next
+-- message sent in it gets the next number. Safe to re-run.
+UPDATE conversations c
+SET last_seq = s.max_seq
+FROM (SELECT conversation_id, MAX(seq) AS max_seq FROM messages GROUP BY conversation_id) s
+WHERE s.conversation_id = c.id AND c.last_seq < s.max_seq;

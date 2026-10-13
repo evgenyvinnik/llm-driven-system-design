@@ -8,8 +8,32 @@ const BASE_URL = '/api'
 /**
  * Get stored session ID from localStorage
  */
-function getSessionId(): string | null {
+export function getSessionId(): string | null {
   return localStorage.getItem('sessionId')
+}
+
+/**
+ * This browser's device id. The server stamps edits with it (last-writer-wins tie-breaks)
+ * and uses it to skip poking the device that made a change.
+ */
+export function getDeviceId(): string {
+  let id = localStorage.getItem('deviceId')
+  if (!id) {
+    id = `web-${crypto.randomUUID()}`
+    localStorage.setItem('deviceId', id)
+  }
+  return id
+}
+
+/** An HTTP error from the API, with its status so callers can tell 4xx from network failures. */
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    public readonly status: number
+  ) {
+    super(message)
+    this.name = 'ApiError'
+  }
 }
 
 /**
@@ -22,6 +46,7 @@ async function request<T>(
   const sessionId = getSessionId()
   const headers: HeadersInit = {
     'Content-Type': 'application/json',
+    'X-Device-Id': getDeviceId(),
     ...options.headers,
   }
 
@@ -36,7 +61,7 @@ async function request<T>(
 
   if (!response.ok) {
     const error = await response.json().catch(() => ({ error: 'Request failed' }))
-    throw new Error(error.error || 'Request failed')
+    throw new ApiError(error.error || 'Request failed', response.status)
   }
 
   if (response.status === 204) {
@@ -91,8 +116,15 @@ export async function getMe(): Promise<User> {
   return request<User>('/auth/me')
 }
 
-export function logout(): void {
-  localStorage.removeItem('sessionId')
+/** Revokes the session on the server (best effort), then forgets it locally. */
+export async function logout(): Promise<void> {
+  try {
+    if (getSessionId()) await request<void>('/auth/logout', { method: 'POST' })
+  } catch {
+    // An expired or already-revoked session is fine; the local token goes either way.
+  } finally {
+    localStorage.removeItem('sessionId')
+  }
 }
 
 // ==================== Highlights ====================
@@ -109,11 +141,17 @@ export interface Highlight {
   visibility: string
   created_at: string
   updated_at: string
+  /** Position of this highlight's latest change in the owner's change feed. */
+  sync_seq?: number
+  /** Set when the highlight was deleted (a tombstone). */
+  deleted_at?: string | null
   book_title?: string
   book_author?: string
 }
 
 export interface CreateHighlightParams {
+  /** Minted on the device; retrying with the same id can never create a duplicate. */
+  id?: string
   bookId: string
   locationStart: number
   locationEnd: number
@@ -126,7 +164,7 @@ export interface CreateHighlightParams {
 export async function createHighlight(params: CreateHighlightParams): Promise<Highlight> {
   return request<Highlight>('/highlights', {
     method: 'POST',
-    body: JSON.stringify(params),
+    body: JSON.stringify({ id: crypto.randomUUID(), clientUpdatedAt: Date.now(), ...params }),
   })
 }
 
@@ -148,11 +186,11 @@ export async function getHighlights(params?: {
 
 export async function updateHighlight(
   id: string,
-  updates: { note?: string; color?: string; visibility?: string }
+  updates: { note?: string | null; color?: string; visibility?: string }
 ): Promise<Highlight> {
   return request<Highlight>(`/highlights/${id}`, {
     method: 'PATCH',
-    body: JSON.stringify(updates),
+    body: JSON.stringify({ ...updates, clientUpdatedAt: Date.now() }),
   })
 }
 
@@ -166,6 +204,11 @@ export async function exportHighlights(format: 'markdown' | 'csv' | 'json'): Pro
       Authorization: `Bearer ${getSessionId()}`,
     },
   })
+  if (!response.ok) {
+    // Without this check an error body would be offered to the user as their export file
+    const error = await response.json().catch(() => ({ error: 'Export failed' }))
+    throw new ApiError(error.error || 'Export failed', response.status)
+  }
   return response.text()
 }
 
@@ -191,9 +234,12 @@ export async function getLibrary(): Promise<Book[]> {
 export interface PopularHighlight {
   passage_id: string
   passage_text: string
-  highlight_count: number
+  /** Distinct readers; passages below the privacy threshold are never returned. */
+  reader_count: number
   location_start: number
   location_end: number
+  last_contribution_at?: string | null
+  book_id?: string
   book_title?: string
   book_author?: string
 }
@@ -276,4 +322,36 @@ export async function shareHighlight(
     method: 'POST',
     body: JSON.stringify({ platform }),
   })
+}
+
+// ==================== Sync ====================
+
+/** One entry of this device's outbox (see sync/outbox.ts). */
+export type SyncOp =
+  | { opId: string; kind: 'update'; id: string; changes: { note?: string | null; color?: string; visibility?: string }; clientUpdatedAt: number }
+  | { opId: string; kind: 'delete'; id: string; clientUpdatedAt: number }
+
+/** The server's verdict on one pushed operation. Every status is final for that operation. */
+export interface SyncOpResult {
+  opId: string | null
+  id?: string
+  status: 'created' | 'replayed' | 'applied' | 'superseded' | 'unchanged' | 'deleted' | 'gone' | 'not_found' | 'rejected'
+  highlight?: Highlight
+  error?: string
+}
+
+/** Applies a batch of offline operations, in order. Safe to retry with the same batch. */
+export async function pushOps(ops: SyncOp[]): Promise<{ results: SyncOpResult[] }> {
+  return request<{ results: SyncOpResult[] }>('/sync/push', {
+    method: 'POST',
+    body: JSON.stringify({ ops }),
+  })
+}
+
+/** The caller's changes after `since` (a cursor from a previous call), oldest first. */
+export async function getChanges(
+  since: number,
+  limit = 200
+): Promise<{ changes: Highlight[]; cursor: number; hasMore: boolean; resync: boolean }> {
+  return request(`/sync/changes?since=${since}&limit=${limit}`)
 }

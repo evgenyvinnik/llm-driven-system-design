@@ -15,6 +15,8 @@ interface Problem {
   examples: string;
   constraints: string;
   difficulty: string;
+  /** 'unordered' when the statement allows the answer in any order */
+  checker?: 'exact' | 'unordered';
   starter_code_python: string;
   starter_code_javascript: string;
   starter_code_cpp: string;
@@ -35,6 +37,7 @@ const problems: Problem[] = [
 You may assume that each input would have exactly one solution, and you may not use the same element twice.
 
 You can return the answer in any order.`,
+    checker: 'unordered',
     examples: `**Example 1:**
 \`\`\`
 Input: nums = [2,7,11,15], target = 9
@@ -2805,8 +2808,8 @@ async function seed(): Promise<void> {
       const problemId = uuidv4();
 
       await pool.query(`
-        INSERT INTO problems (id, title, slug, description, examples, constraints, difficulty, starter_code_python, starter_code_javascript, starter_code_cpp, starter_code_java, solution_python, solution_javascript, solution_cpp, solution_java)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+        INSERT INTO problems (id, title, slug, description, examples, constraints, difficulty, starter_code_python, starter_code_javascript, starter_code_cpp, starter_code_java, solution_python, solution_javascript, solution_cpp, solution_java, checker)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
         ON CONFLICT (slug) DO UPDATE SET
           title = EXCLUDED.title,
           description = EXCLUDED.description,
@@ -2821,6 +2824,7 @@ async function seed(): Promise<void> {
           solution_javascript = EXCLUDED.solution_javascript,
           solution_cpp = EXCLUDED.solution_cpp,
           solution_java = EXCLUDED.solution_java,
+          checker = EXCLUDED.checker,
           updated_at = NOW()
         RETURNING id
       `, [
@@ -2838,7 +2842,8 @@ async function seed(): Promise<void> {
         problem.solution_python,
         problem.solution_javascript,
         problem.solution_cpp,
-        problem.solution_java
+        problem.solution_java,
+        problem.checker ?? 'exact'
       ]);
 
       // Get the actual problem ID (in case of update)

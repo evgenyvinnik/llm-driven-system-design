@@ -103,6 +103,7 @@ export async function addComment(
  * is enforced at the database level - only the original author can update
  * their comment. The comment's updated_at timestamp is automatically set.
  *
+ * @param issueId - Issue the comment must belong to (from the URL)
  * @param commentId - Numeric ID of the comment to update
  * @param body - New text content for the comment
  * @param userId - UUID of the user attempting the update (must match original author)
@@ -110,7 +111,7 @@ export async function addComment(
  *
  * @example
  * ```typescript
- * const updated = await updateComment(456, 'Fixed typo in my previous comment', 'user-uuid');
+ * const updated = await updateComment(123, 456, 'Fixed typo in my previous comment', 'user-uuid');
  * if (updated) {
  *   console.log('Comment updated successfully');
  * } else {
@@ -119,15 +120,16 @@ export async function addComment(
  * ```
  */
 export async function updateComment(
+  issueId: number,
   commentId: number,
   body: string,
   userId: string
 ): Promise<Comment | null> {
   const { rows } = await query<Comment>(
     `UPDATE comments SET body = $1, updated_at = NOW()
-     WHERE id = $2 AND author_id = $3
+     WHERE id = $2 AND author_id = $3 AND issue_id = $4
      RETURNING *`,
-    [body, commentId, userId]
+    [body, commentId, userId, issueId]
   );
 
   return rows[0] || null;
@@ -140,13 +142,14 @@ export async function updateComment(
  * is enforced at the database level - only the original author can delete
  * their comment. The delete operation is atomic and cannot be undone.
  *
+ * @param issueId - Issue the comment must belong to (from the URL)
  * @param commentId - Numeric ID of the comment to delete
  * @param userId - UUID of the user attempting deletion (must match original author)
  * @returns Promise resolving to true if deleted, false if not found or unauthorized
  *
  * @example
  * ```typescript
- * const deleted = await deleteComment(456, 'user-uuid');
+ * const deleted = await deleteComment(123, 456, 'user-uuid');
  * if (deleted) {
  *   console.log('Comment deleted successfully');
  * } else {
@@ -154,10 +157,10 @@ export async function updateComment(
  * }
  * ```
  */
-export async function deleteComment(commentId: number, userId: string): Promise<boolean> {
+export async function deleteComment(issueId: number, commentId: number, userId: string): Promise<boolean> {
   const { rowCount } = await query(
-    'DELETE FROM comments WHERE id = $1 AND author_id = $2',
-    [commentId, userId]
+    'DELETE FROM comments WHERE id = $1 AND author_id = $2 AND issue_id = $3',
+    [commentId, userId, issueId]
   );
 
   return (rowCount ?? 0) > 0;

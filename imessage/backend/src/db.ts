@@ -1,5 +1,10 @@
 import pg, { Pool, PoolClient, QueryResult, QueryResultRow } from 'pg';
 
+// BIGINT columns (messages.seq, conversations.last_seq) arrive as strings by
+// default to avoid precision loss. Sequence numbers stay far below 2^53, so
+// parse them as numbers once here instead of at every call site.
+pg.types.setTypeParser(pg.types.builtins.INT8, (value: string) => parseInt(value, 10));
+
 const pool: Pool = new pg.Pool({
   connectionString: process.env.DATABASE_URL || 'postgresql://imessage:imessage_secret@localhost:5432/imessage',
   max: 20,

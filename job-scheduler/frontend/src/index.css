@@ -49,3 +49,7 @@ body {
 .status-deduplicated {
   @apply bg-indigo-100 text-indigo-800;
 }
+
+.status-dead_letter {
+  @apply bg-red-200 text-red-900;
+}

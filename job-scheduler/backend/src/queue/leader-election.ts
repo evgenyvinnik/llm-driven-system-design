@@ -1,253 +1,172 @@
 /**
- * Leader election and distributed locking using Redis.
- * Ensures only one scheduler instance processes due jobs at a time,
- * preventing duplicate scheduling in a distributed deployment.
+ * Leader election for the scheduler tick, implemented as a lease in Redis.
+ *
+ * Only the leader fires due jobs and reaps expired execution leases. The lease is an
+ * efficiency mechanism, not the correctness guarantee: firing is an idempotent
+ * PostgreSQL transaction (see fireDueJobs), so two schedulers that briefly both believe
+ * they lead cannot double-fire a slot. What the lease buys is that followers stay idle
+ * instead of contending for the same rows every second.
  * @module queue/leader-election
  */
 
+import { performance } from 'perf_hooks';
 import { redis } from './redis';
 import { logger } from '../utils/logger';
 
+/** Extends the lease only if this instance still holds it (atomic compare-and-pexpire). */
+const RENEW_SCRIPT = `
+  if redis.call("get", KEYS[1]) == ARGV[1] then
+    return redis.call("pexpire", KEYS[1], ARGV[2])
+  else
+    return 0
+  end
+`;
+
+/** Deletes the lease only if this instance still holds it (atomic compare-and-delete). */
+const RELEASE_SCRIPT = `
+  if redis.call("get", KEYS[1]) == ARGV[1] then
+    return redis.call("del", KEYS[1])
+  else
+    return 0
+  end
+`;
+
+/** Optional knobs, mainly for tests. */
+export interface LeaderElectionOptions {
+  /** Monotonic clock in milliseconds (defaults to performance.now). */
+  now?: () => number;
+  /** Subtracted from the TTL when computing the local deadline. */
+  safetyMarginMs?: number;
+}
+
 /**
- * Leader election manager for single-active-scheduler pattern.
- * Uses Redis SET NX EX for distributed lock acquisition with heartbeat
- * to maintain leadership and automatic failover if the leader crashes.
+ * Single-leader lease with heartbeat renewal and local self-fencing.
+ *
+ * The local deadline is the important part. A leader whose process stalls (GC pause,
+ * blocked event loop, network partition from Redis) can't know that its key expired
+ * and another instance took over. So it keeps its own deadline, measured from when
+ * the last successful SET/renew was *sent* (an underestimate of when Redis applied
+ * it), and stops acting as leader the moment that deadline passes, renewed or not.
  */
 export class LeaderElection {
-  private instanceId: string;
-  private lockKey: string;
-  private lockTTL: number;
-  private isLeader: boolean = false;
-  private heartbeatInterval: NodeJS.Timeout | null = null;
+  private leader = false;
+  /** Local monotonic time after which this instance must not act as leader. */
+  private validUntil = 0;
+  private renewTimer: NodeJS.Timeout | null = null;
+  private readonly now: () => number;
+  private readonly safetyMarginMs: number;
 
   /**
-   * Creates a new LeaderElection instance.
-   * @param instanceId - Unique identifier for this instance
-   * @param lockKey - Redis key for the leader lock
-   * @param lockTTL - Lock time-to-live in seconds (default: 30)
+   * @param instanceId - unique id of this scheduler process (the lock value)
+   * @param lockKey - Redis key holding the lease
+   * @param ttlMs - lease length; renewed every ttlMs / 3 while leading
    */
   constructor(
-    instanceId: string,
-    lockKey: string = 'job_scheduler:leader',
-    lockTTL: number = 30
+    private readonly instanceId: string,
+    private readonly lockKey: string,
+    private readonly ttlMs: number,
+    options: LeaderElectionOptions = {}
   ) {
-    this.instanceId = instanceId;
-    this.lockKey = lockKey;
-    this.lockTTL = lockTTL;
+    this.now = options.now ?? (() => performance.now());
+    this.safetyMarginMs = options.safetyMarginMs ?? Math.min(2000, Math.floor(ttlMs / 10));
   }
 
-  /**
-   * Try to become the leader
-   */
-  async tryBecomeLeader(): Promise<boolean> {
-    try {
-      const result = await redis.set(
-        this.lockKey,
-        this.instanceId,
-        'EX',
-        this.lockTTL,
-        'NX'
+  /** True only while the lease is held and its local deadline has not passed. */
+  isLeader(): boolean {
+    if (this.leader && this.now() >= this.validUntil) {
+      logger.warn(
+        { instanceId: this.instanceId },
+        'Leader lease deadline passed without a successful renewal; stepping down'
       );
-
-      this.isLeader = result === 'OK';
-
-      if (this.isLeader) {
-        logger.info(`Instance ${this.instanceId} became leader`);
-        this.startHeartbeat();
-      }
-
-      return this.isLeader;
-    } catch (error) {
-      logger.error('Error trying to become leader', error);
-      this.isLeader = false;
-      return false;
+      this.stepDown();
     }
+    return this.leader;
   }
 
-  /**
-   * Extend leadership lock
-   */
-  async maintainLeadership(): Promise<boolean> {
-    if (!this.isLeader) {
-      return false;
-    }
-
-    try {
-      // Check if we still own the lock
-      const currentHolder = await redis.get(this.lockKey);
-
-      if (currentHolder !== this.instanceId) {
-        logger.warn(`Lost leadership: lock held by ${currentHolder}`);
-        this.isLeader = false;
-        this.stopHeartbeat();
-        return false;
-      }
-
-      // Extend the lock
-      await redis.expire(this.lockKey, this.lockTTL);
+  /** Tries to take the lease (SET NX PX). Returns true if this instance now leads. */
+  async tryAcquire(): Promise<boolean> {
+    if (this.isLeader()) {
       return true;
+    }
+
+    const sentAt = this.now();
+    try {
+      const result = await redis.set(this.lockKey, this.instanceId, 'PX', this.ttlMs, 'NX');
+      if (result === 'OK') {
+        this.becomeLeader(sentAt);
+        logger.info({ instanceId: this.instanceId }, 'Acquired scheduler leadership');
+        return true;
+      }
+      return false;
     } catch (error) {
-      logger.error('Error maintaining leadership', error);
-      this.isLeader = false;
-      this.stopHeartbeat();
+      logger.error({ err: error, instanceId: this.instanceId }, 'Error trying to acquire leadership');
       return false;
     }
   }
 
   /**
-   * Voluntarily release leadership
+   * Extends the lease if this instance still holds it. Steps down immediately when the
+   * key is gone or owned by someone else. On a Redis error it keeps leading only until
+   * the local deadline, because the lease may still be valid.
    */
-  async releaseLeadership(): Promise<void> {
-    if (!this.isLeader) {
+  async renew(): Promise<boolean> {
+    if (!this.leader) {
+      return false;
+    }
+
+    const sentAt = this.now();
+    try {
+      const result = await redis.eval(RENEW_SCRIPT, 1, this.lockKey, this.instanceId, this.ttlMs);
+      if (result === 1) {
+        this.validUntil = sentAt + this.ttlMs - this.safetyMarginMs;
+        return true;
+      }
+      logger.warn({ instanceId: this.instanceId }, 'Lost leadership: lease is gone or held by another instance');
+      this.stepDown();
+      return false;
+    } catch (error) {
+      logger.error({ err: error, instanceId: this.instanceId }, 'Error renewing leadership');
+      return this.isLeader();
+    }
+  }
+
+  /** Gives up the lease (compare-and-delete), e.g. on graceful shutdown. */
+  async release(): Promise<void> {
+    const wasLeader = this.leader;
+    this.stepDown();
+    if (!wasLeader) {
       return;
     }
 
     try {
-      // Only delete if we own the lock (using Lua script for atomicity)
-      const script = `
-        if redis.call("get", KEYS[1]) == ARGV[1] then
-          return redis.call("del", KEYS[1])
-        else
-          return 0
-        end
-      `;
-
-      await redis.eval(script, 1, this.lockKey, this.instanceId);
-      logger.info(`Instance ${this.instanceId} released leadership`);
+      await redis.eval(RELEASE_SCRIPT, 1, this.lockKey, this.instanceId);
+      logger.info({ instanceId: this.instanceId }, 'Released scheduler leadership');
     } catch (error) {
-      logger.error('Error releasing leadership', error);
-    } finally {
-      this.isLeader = false;
-      this.stopHeartbeat();
+      logger.error({ err: error, instanceId: this.instanceId }, 'Error releasing leadership');
     }
   }
 
-  /**
-   * Check if this instance is the leader
-   */
-  getIsLeader(): boolean {
-    return this.isLeader;
-  }
-
-  /**
-   * Get the current leader instance ID
-   */
+  /** Returns the instance id currently holding the lease, if any. */
   async getCurrentLeader(): Promise<string | null> {
     return redis.get(this.lockKey);
   }
 
-  /**
-   * Start the heartbeat to maintain leadership
-   */
-  private startHeartbeat(): void {
-    if (this.heartbeatInterval) {
-      return;
+  private becomeLeader(sentAt: number): void {
+    this.leader = true;
+    this.validUntil = sentAt + this.ttlMs - this.safetyMarginMs;
+    if (!this.renewTimer) {
+      this.renewTimer = setInterval(() => {
+        void this.renew();
+      }, Math.floor(this.ttlMs / 3));
     }
-
-    // Heartbeat at 1/3 of the TTL
-    const heartbeatMs = (this.lockTTL * 1000) / 3;
-    this.heartbeatInterval = setInterval(async () => {
-      const maintained = await this.maintainLeadership();
-      if (!maintained) {
-        logger.warn('Failed to maintain leadership in heartbeat');
-      }
-    }, heartbeatMs);
-
-    logger.debug(`Started leadership heartbeat every ${heartbeatMs}ms`);
   }
 
-  /**
-   * Stop the heartbeat
-   */
-  private stopHeartbeat(): void {
-    if (this.heartbeatInterval) {
-      clearInterval(this.heartbeatInterval);
-      this.heartbeatInterval = null;
-      logger.debug('Stopped leadership heartbeat');
+  private stepDown(): void {
+    this.leader = false;
+    this.validUntil = 0;
+    if (this.renewTimer) {
+      clearInterval(this.renewTimer);
+      this.renewTimer = null;
     }
   }
 }
-
-/**
- * Distributed lock for job execution deduplication.
- * Prevents the same job from running concurrently on multiple workers.
- * Uses Redis SET NX EX with Lua scripts for atomic operations.
- */
-export class DistributedLock {
-  /** Lock time-to-live in seconds */
-  private lockTTL: number;
-
-  /**
-   * Creates a new DistributedLock instance.
-   * @param lockTTL - Lock time-to-live in seconds (default: 1 hour)
-   */
-  constructor(lockTTL: number = 3600) {
-    this.lockTTL = lockTTL;
-  }
-
-  /**
-   * Try to acquire a lock
-   */
-  async acquire(key: string, value: string): Promise<boolean> {
-    const lockKey = `job_scheduler:lock:${key}`;
-    const result = await redis.set(lockKey, value, 'EX', this.lockTTL, 'NX');
-    return result === 'OK';
-  }
-
-  /**
-   * Check if a lock is held
-   */
-  async isLocked(key: string): Promise<boolean> {
-    const lockKey = `job_scheduler:lock:${key}`;
-    const exists = await redis.exists(lockKey);
-    return exists === 1;
-  }
-
-  /**
-   * Get the current lock holder
-   */
-  async getHolder(key: string): Promise<string | null> {
-    const lockKey = `job_scheduler:lock:${key}`;
-    return redis.get(lockKey);
-  }
-
-  /**
-   * Release a lock (only if we hold it)
-   */
-  async release(key: string, value: string): Promise<boolean> {
-    const lockKey = `job_scheduler:lock:${key}`;
-    const script = `
-      if redis.call("get", KEYS[1]) == ARGV[1] then
-        return redis.call("del", KEYS[1])
-      else
-        return 0
-      end
-    `;
-
-    const result = await redis.eval(script, 1, lockKey, value);
-    return result === 1;
-  }
-
-  /**
-   * Extend a lock's TTL (only if we hold it)
-   */
-  async extend(key: string, value: string, ttl?: number): Promise<boolean> {
-    const lockKey = `job_scheduler:lock:${key}`;
-    const script = `
-      if redis.call("get", KEYS[1]) == ARGV[1] then
-        return redis.call("expire", KEYS[1], ARGV[2])
-      else
-        return 0
-      end
-    `;
-
-    const result = await redis.eval(script, 1, lockKey, value, ttl || this.lockTTL);
-    return result === 1;
-  }
-}
-
-/**
- * Default distributed lock instance for job execution deduplication.
- * Shared across all worker instances.
- */
-export const distributedLock = new DistributedLock();

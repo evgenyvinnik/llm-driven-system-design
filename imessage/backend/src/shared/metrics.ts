@@ -30,6 +30,14 @@ export const messageDeliveryStatus: Counter<'status'> = new Counter({
   registers: [register],
 });
 
+// Device inbox metrics: enqueued - acked - expired is the undelivered backlog
+export const inboxRows: Counter<'event'> = new Counter({
+  name: 'imessage_inbox_rows_total',
+  help: 'Device inbox rows by lifecycle event',
+  labelNames: ['event'], // 'enqueued', 'acked', 'expired'
+  registers: [register],
+});
+
 // Sync metrics
 export const syncLatency: Histogram<'conversation_type'> = new Histogram({
   name: 'imessage_sync_latency_seconds',
@@ -75,11 +83,11 @@ export const cacheMisses: Counter<'cache_type'> = new Counter({
   registers: [register],
 });
 
-// Rate limiting metrics
-export const rateLimitExceeded: Counter<'endpoint' | 'user_id'> = new Counter({
+// Rate limiting metrics (no per-user label: user IDs would make the series count unbounded)
+export const rateLimitExceeded: Counter<'endpoint'> = new Counter({
   name: 'imessage_rate_limit_exceeded_total',
   help: 'Number of rate limit exceeded events',
-  labelNames: ['endpoint', 'user_id'],
+  labelNames: ['endpoint'],
   registers: [register],
 });
 

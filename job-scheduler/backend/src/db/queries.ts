@@ -109,7 +109,7 @@ export async function getSystemMetrics(): Promise<SystemMetrics> {
       (SELECT COUNT(*) FROM job_executions WHERE status = 'PENDING') as queued_executions,
       (SELECT COUNT(*) FROM job_executions WHERE status = 'RUNNING') as running_executions,
       (SELECT COUNT(*) FROM job_executions WHERE status = 'COMPLETED' AND completed_at > NOW() - INTERVAL '24 hours') as completed_24h,
-      (SELECT COUNT(*) FROM job_executions WHERE status = 'FAILED' AND completed_at > NOW() - INTERVAL '24 hours') as failed_24h
+      (SELECT COUNT(*) FROM job_executions WHERE status IN ('FAILED', 'DEAD_LETTER') AND completed_at > NOW() - INTERVAL '24 hours') as failed_24h
   `);
 
   if (!result) {
@@ -160,12 +160,12 @@ export async function getExecutionStats(hours: number = 24): Promise<HourlyStats
     `SELECT
       date_trunc('hour', completed_at) as hour,
       COUNT(*) FILTER (WHERE status = 'COMPLETED') as completed,
-      COUNT(*) FILTER (WHERE status = 'FAILED') as failed,
+      COUNT(*) FILTER (WHERE status IN ('FAILED', 'DEAD_LETTER')) as failed,
       AVG(EXTRACT(EPOCH FROM (completed_at - started_at)) * 1000) FILTER (WHERE completed_at IS NOT NULL AND started_at IS NOT NULL) as avg_duration_ms
     FROM job_executions
-    WHERE completed_at > NOW() - INTERVAL '${hours} hours'
+    WHERE completed_at > NOW() - ($1::int * INTERVAL '1 hour')
     GROUP BY date_trunc('hour', completed_at)
     ORDER BY hour ASC`,
-    []
+    [hours]
   );
 }

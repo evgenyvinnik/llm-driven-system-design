@@ -22,8 +22,8 @@ interface IssueDetailTabsProps {
   history: IssueHistory[];
   /** The current user for showing the avatar in the comment form */
   currentUser?: User;
-  /** Callback when a new comment is added */
-  onAddComment: (body: string) => void;
+  /** Callback when a new comment is added; resolves to true once it is saved */
+  onAddComment: (body: string) => Promise<boolean>;
 }
 
 /**

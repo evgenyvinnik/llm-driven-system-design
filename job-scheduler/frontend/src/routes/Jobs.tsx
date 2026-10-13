@@ -6,7 +6,7 @@
 
 import { useEffect, useState } from 'react';
 import { useJobsStore } from '../stores';
-import { Button, Spinner, Pagination } from '../components/UI';
+import { Button, Spinner, Pagination, ErrorBanner } from '../components/UI';
 import { JobTable } from '../components/JobCard';
 import { CreateJobModal } from '../components/CreateJobModal';
 
@@ -18,6 +18,7 @@ export function JobsPage() {
   const {
     jobs,
     loading,
+    error,
     page,
     totalPages,
     fetchJobs,
@@ -26,6 +27,7 @@ export function JobsPage() {
     resumeJob,
     triggerJob,
     deleteJob,
+    clearError,
   } = useJobsStore();
 
   const [showCreateModal, setShowCreateModal] = useState(false);
@@ -38,8 +40,9 @@ export function JobsPage() {
     fetchJobs(newPage);
   };
 
-  const handleCreate = async (input: Parameters<typeof createJob>[0]) => {
-    await createJob(input);
+  // Errors propagate to the modal, which shows them next to the form.
+  const handleCreate = async (input: Parameters<typeof createJob>[0], idempotencyKey: string) => {
+    await createJob(input, idempotencyKey);
   };
 
   const handleDelete = async (id: string) => {
@@ -56,6 +59,8 @@ export function JobsPage() {
           Create Job
         </Button>
       </div>
+
+      <ErrorBanner message={error} onDismiss={clearError} />
 
       {loading && jobs.length === 0 ? (
         <div className="flex justify-center items-center h-64">

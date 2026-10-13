@@ -102,6 +102,52 @@ export const feedCacheMisses: Counter<string> = new client.Counter({
   registers: [register],
 });
 
+export const feedFanoutTotal: Counter<string> = new client.Counter({
+  name: 'instagram_feed_fanout_total',
+  help: 'Published posts by fan-out mode (push = written to follower timelines, pull = merged at read time)',
+  labelNames: ['mode'] as const,
+  registers: [register],
+});
+
+export const feedFanoutTimelineWrites: Counter<string> = new client.Counter({
+  name: 'instagram_feed_fanout_timeline_writes_total',
+  help: 'Timeline sorted-set writes performed by fan-out (cached timelines only)',
+  registers: [register],
+});
+
+// Media pipeline metrics (transactional outbox -> RabbitMQ -> image worker)
+export const outboxPendingEvents: Gauge<string> = new client.Gauge({
+  name: 'instagram_outbox_pending_events',
+  help: 'Outbox events not yet published to RabbitMQ',
+  registers: [register],
+});
+
+export const outboxPublishedTotal: Counter<string> = new client.Counter({
+  name: 'instagram_outbox_published_total',
+  help: 'Outbox events published with a broker confirm',
+  registers: [register],
+});
+
+export const outboxPublishFailures: Counter<string> = new client.Counter({
+  name: 'instagram_outbox_publish_failures_total',
+  help: 'Outbox publish attempts that failed and were rescheduled',
+  registers: [register],
+});
+
+export const imageJobOutcomes: Counter<string> = new client.Counter({
+  name: 'instagram_image_job_outcomes_total',
+  help: 'Image job deliveries by outcome',
+  labelNames: ['outcome'] as const, // published, duplicate, post_missing, retried, dead_lettered
+  registers: [register],
+});
+
+export const idempotentReplays: Counter<string> = new client.Counter({
+  name: 'instagram_idempotent_replays_total',
+  help: 'Requests answered from a stored idempotency key instead of re-executing',
+  labelNames: ['result'] as const, // replayed, mismatch
+  registers: [register],
+});
+
 // Image processing metrics
 export const imageProcessingDuration: Histogram<string> = new client.Histogram({
   name: 'instagram_image_processing_seconds',

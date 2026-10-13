@@ -3,33 +3,69 @@
  * @module routes/books.$bookId
  */
 import { createFileRoute, useNavigate } from '@tanstack/react-router'
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   getHighlights,
   getPopularHighlights,
   getFriendsHighlights,
-  deleteHighlight,
-  updateHighlight,
   type Highlight,
   type PopularHighlight,
+  type SyncOpResult,
 } from '@/api/client'
 import { useStore } from '@/stores/useStore'
+import { enqueueDelete, enqueueUpdate, flushOutbox, withPending } from '@/sync/outbox'
 
 export const Route = createFileRoute('/books/$bookId')({
   component: BookDetailPage,
 })
 
+type Tab = 'mine' | 'popular' | 'friends'
+
+/** One line for the status region after the outbox was pushed. */
+function describeFlush(results: SyncOpResult[]): string {
+  if (results.some((r) => r.status === 'superseded')) return 'A newer edit from another device was kept.'
+  if (results.some((r) => r.status === 'gone')) return 'That highlight was deleted on another device.'
+  if (results.some((r) => r.status === 'rejected')) return 'A change was rejected and discarded.'
+  return 'Saved.'
+}
+
 function BookDetailPage() {
   const { bookId } = Route.useParams()
   const navigate = useNavigate()
   const { isAuthenticated, removeHighlight } = useStore()
+  const remoteSeq = useStore((state) => state.remoteSeq)
+  const pendingOps = useStore((state) => state.pendingOps)
   const [highlights, setHighlights] = useState<Highlight[]>([])
   const [popularHighlights, setPopularHighlights] = useState<PopularHighlight[]>([])
   const [friendsHighlights, setFriendsHighlights] = useState<Highlight[]>([])
+  const [errors, setErrors] = useState<Partial<Record<Tab, string>>>({})
   const [loading, setLoading] = useState(true)
-  const [activeTab, setActiveTab] = useState<'mine' | 'popular' | 'friends'>('mine')
+  const [activeTab, setActiveTab] = useState<Tab>('mine')
   const [editingId, setEditingId] = useState<string | null>(null)
   const [editNote, setEditNote] = useState('')
+  const [status, setStatus] = useState('')
+
+  /** Loads the three panels independently: one failing service doesn't blank the page. */
+  const loadData = useCallback(
+    async (silent = false) => {
+      if (!silent) setLoading(true)
+      const [mine, popular, friends] = await Promise.allSettled([
+        getHighlights({ bookId }),
+        getPopularHighlights(bookId),
+        getFriendsHighlights(bookId),
+      ])
+      const failed: Partial<Record<Tab, string>> = {}
+      if (mine.status === 'fulfilled') setHighlights(mine.value)
+      else failed.mine = 'Your highlights could not be loaded.'
+      if (popular.status === 'fulfilled') setPopularHighlights(popular.value)
+      else failed.popular = 'Popular highlights are unavailable right now.'
+      if (friends.status === 'fulfilled') setFriendsHighlights(friends.value)
+      else failed.friends = "Friends' highlights are unavailable right now."
+      setErrors(failed)
+      setLoading(false)
+    },
+    [bookId]
+  )
 
   useEffect(() => {
     if (!isAuthenticated) {
@@ -37,48 +73,40 @@ function BookDetailPage() {
       return
     }
     loadData()
-  }, [isAuthenticated, bookId])
+  }, [isAuthenticated, bookId, navigate, loadData])
 
-  const loadData = async () => {
-    setLoading(true)
+  // Another device wrote: refresh in the background (the socket only says "something changed").
+  const firstRemoteSeq = useRef(remoteSeq)
+  useEffect(() => {
+    if (remoteSeq !== firstRemoteSeq.current) loadData(true)
+  }, [remoteSeq, loadData])
+
+  /** Pushes the outbox and reconciles with what the server decided. */
+  const sync = async () => {
     try {
-      const [myHighlights, popular, friends] = await Promise.all([
-        getHighlights({ bookId }),
-        getPopularHighlights(bookId),
-        getFriendsHighlights(bookId),
-      ])
-      setHighlights(myHighlights)
-      setPopularHighlights(popular)
-      setFriendsHighlights(friends)
-    } catch (error) {
-      console.error('Failed to load book data:', error)
-    } finally {
-      setLoading(false)
+      const results = await flushOutbox()
+      setStatus(describeFlush(results))
+      await loadData(true)
+    } catch {
+      setStatus("Saved on this device. It will sync when you're back online.")
     }
   }
 
-  const handleDelete = async (id: string) => {
+  const handleDelete = (id: string) => {
     if (!confirm('Delete this highlight?')) return
-    try {
-      await deleteHighlight(id)
-      setHighlights((prev) => prev.filter((h) => h.id !== id))
-      removeHighlight(id)
-    } catch (error) {
-      console.error('Failed to delete highlight:', error)
-    }
+    enqueueDelete(id)
+    setHighlights((prev) => prev.filter((h) => h.id !== id))
+    removeHighlight(id)
+    void sync()
   }
 
-  const handleUpdateNote = async (id: string) => {
-    try {
-      await updateHighlight(id, { note: editNote })
-      setHighlights((prev) =>
-        prev.map((h) => (h.id === id ? { ...h, note: editNote } : h))
-      )
-      setEditingId(null)
-      setEditNote('')
-    } catch (error) {
-      console.error('Failed to update highlight:', error)
-    }
+  const handleUpdateNote = (id: string) => {
+    const note = editNote.trim() === '' ? null : editNote
+    enqueueUpdate(id, { note })
+    setHighlights((prev) => prev.map((h) => (h.id === id ? { ...h, note } : h)))
+    setEditingId(null)
+    setEditNote('')
+    void sync()
   }
 
   if (loading) {
@@ -89,8 +117,10 @@ function BookDetailPage() {
     )
   }
 
-  const bookTitle = highlights[0]?.book_title || 'Book'
-  const bookAuthor = highlights[0]?.book_author || ''
+  // Queued edits stay visible even if a refetch lands before they reach the server.
+  const myHighlights = pendingOps > 0 ? withPending(highlights) : highlights
+  const bookTitle = myHighlights[0]?.book_title || 'Book'
+  const bookAuthor = myHighlights[0]?.book_author || ''
 
   return (
     <div className="mx-auto max-w-4xl px-4 py-8">
@@ -99,15 +129,21 @@ function BookDetailPage() {
         {bookAuthor && <p className="text-lg text-gray-500">by {bookAuthor}</p>}
       </div>
 
-      <div className="mb-6 flex gap-2">
+      <p role="status" aria-live="polite" className="mb-4 min-h-5 text-sm text-gray-600">
+        {status}
+      </p>
+
+      <div role="tablist" aria-label="Highlights" className="mb-6 flex gap-2">
         <TabButton
+          id="mine"
           active={activeTab === 'mine'}
           onClick={() => setActiveTab('mine')}
-          count={highlights.length}
+          count={myHighlights.length}
         >
           My Highlights
         </TabButton>
         <TabButton
+          id="popular"
           active={activeTab === 'popular'}
           onClick={() => setActiveTab('popular')}
           count={popularHighlights.length}
@@ -115,6 +151,7 @@ function BookDetailPage() {
           Popular
         </TabButton>
         <TabButton
+          id="friends"
           active={activeTab === 'friends'}
           onClick={() => setActiveTab('friends')}
           count={friendsHighlights.length}
@@ -124,11 +161,13 @@ function BookDetailPage() {
       </div>
 
       {activeTab === 'mine' && (
-        <div className="space-y-4">
-          {highlights.length === 0 ? (
+        <div role="tabpanel" id="panel-mine" aria-labelledby="tab-mine" className="space-y-4">
+          {errors.mine ? (
+            <EmptyState message={errors.mine} />
+          ) : myHighlights.length === 0 ? (
             <EmptyState message="No highlights yet. Start highlighting!" />
           ) : (
-            highlights.map((h) => (
+            myHighlights.map((h) => (
               <MyHighlightCard
                 key={h.id}
                 highlight={h}
@@ -149,9 +188,11 @@ function BookDetailPage() {
       )}
 
       {activeTab === 'popular' && (
-        <div className="space-y-4">
-          {popularHighlights.length === 0 ? (
-            <EmptyState message="No popular highlights for this book yet." />
+        <div role="tabpanel" id="panel-popular" aria-labelledby="tab-popular" className="space-y-4">
+          {errors.popular ? (
+            <EmptyState message={errors.popular} />
+          ) : popularHighlights.length === 0 ? (
+            <EmptyState message="No popular highlights yet. A passage appears once enough readers have highlighted it." />
           ) : (
             popularHighlights.map((h) => (
               <PopularHighlightCard key={h.passage_id} highlight={h} />
@@ -161,8 +202,10 @@ function BookDetailPage() {
       )}
 
       {activeTab === 'friends' && (
-        <div className="space-y-4">
-          {friendsHighlights.length === 0 ? (
+        <div role="tabpanel" id="panel-friends" aria-labelledby="tab-friends" className="space-y-4">
+          {errors.friends ? (
+            <EmptyState message={errors.friends} />
+          ) : friendsHighlights.length === 0 ? (
             <EmptyState message="No highlights from friends for this book." />
           ) : (
             friendsHighlights.map((h) => (
@@ -176,15 +219,20 @@ function BookDetailPage() {
 }
 
 interface TabButtonProps {
+  id: Tab
   active: boolean
   onClick: () => void
   count: number
   children: React.ReactNode
 }
 
-function TabButton({ active, onClick, count, children }: TabButtonProps) {
+function TabButton({ id, active, onClick, count, children }: TabButtonProps) {
   return (
     <button
+      id={`tab-${id}`}
+      role="tab"
+      aria-selected={active}
+      aria-controls={`panel-${id}`}
       onClick={onClick}
       className={`rounded-md px-4 py-2 ${
         active ? 'bg-blue-600 text-white' : 'bg-gray-100 text-gray-700'
@@ -235,6 +283,7 @@ function MyHighlightCard({
       {isEditing ? (
         <div className="mt-4">
           <textarea
+            aria-label="Note"
             value={editNote}
             onChange={(e) => onNoteChange(e.target.value)}
             placeholder="Add a note..."
@@ -299,7 +348,7 @@ function PopularHighlightCard({ highlight }: PopularHighlightCardProps) {
         <p className="text-gray-800">"{highlight.passage_text}"</p>
       </blockquote>
       <p className="mt-3 text-sm text-gray-500">
-        {highlight.highlight_count} readers highlighted this passage
+        {highlight.reader_count} readers highlighted this passage
       </p>
     </div>
   )

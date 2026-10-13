@@ -1,7 +1,9 @@
 import { Router, Request, Response, RequestHandler } from 'express';
 import { query } from '../services/db.js';
-import { requireAuth, optionalAuth as _optionalAuth, AuthenticatedRequest } from '../middleware/auth.js';
+import { requireAuth, optionalAuth, AuthenticatedRequest } from '../middleware/auth.js';
 import { commentRateLimiter } from '../services/rateLimiter.js';
+import { invalidatePostCache } from '../services/redis.js';
+import { findVisiblePost, isUuid } from '../services/visibility.js';
 import logger from '../services/logger.js';
 
 const router = Router();
@@ -23,12 +25,22 @@ interface PostOwnerRow {
   user_id: string;
 }
 
-// Get comments for a post
-router.get('/posts/:postId/comments', async (req: Request, res: Response): Promise<void> => {
+const viewerOf = (req: Request): { userId?: string; role?: string } => {
+  const session = (req as AuthenticatedRequest).session;
+  return { userId: session?.userId, role: session?.role };
+};
+
+// Get comments for a post (same visibility as the post itself)
+router.get('/posts/:postId/comments', optionalAuth as RequestHandler, async (req: Request, res: Response): Promise<void> => {
   try {
-    const { postId } = req.params;
+    const postId = req.params.postId as string;
     const { cursor, limit = '20' } = req.query as { cursor?: string; limit?: string };
-    const limitNum = parseInt(limit, 10);
+    const limitNum = Math.min(Math.max(parseInt(limit, 10) || 20, 1), 100);
+
+    if (!(await findVisiblePost(postId, viewerOf(req)))) {
+      res.status(404).json({ error: 'Post not found' });
+      return;
+    }
 
     let queryText = `
       SELECT c.*, u.username, u.display_name, u.profile_picture_url
@@ -95,15 +107,18 @@ router.post(
         return;
       }
 
-      // Verify post exists
-      const postCheck = await query<{ id: string }>('SELECT id FROM posts WHERE id = $1', [postId]);
-      if (postCheck.rows.length === 0) {
+      // The commenter must be able to see the post (private accounts, unpublished posts)
+      if (!(await findVisiblePost(postId as string, viewerOf(req)))) {
         res.status(404).json({ error: 'Post not found' });
         return;
       }
 
       // If replying, verify parent comment exists
       if (parentCommentId) {
+        if (!isUuid(parentCommentId)) {
+          res.status(404).json({ error: 'Parent comment not found' });
+          return;
+        }
         const parentCheck = await query<{ id: string }>('SELECT id FROM comments WHERE id = $1 AND post_id = $2', [
           parentCommentId,
           postId,
@@ -129,6 +144,9 @@ router.post(
         [userId]
       );
       const user = userResult.rows[0];
+
+      // comment_count changed (trigger); drop the cached post detail
+      await invalidatePostCache(postId as string);
 
       logger.info(
         {
@@ -177,10 +195,11 @@ router.delete('/comments/:commentId', requireAuth as RequestHandler, async (req:
     const userId = authReq.session.userId!;
 
     // Check ownership
-    const commentCheck = await query<{ user_id: string; post_id: string }>(
-      'SELECT user_id, post_id FROM comments WHERE id = $1',
-      [commentId]
-    );
+    const commentCheck = isUuid(commentId)
+      ? await query<{ user_id: string; post_id: string }>('SELECT user_id, post_id FROM comments WHERE id = $1', [
+          commentId,
+        ])
+      : { rows: [] as { user_id: string; post_id: string }[] };
     if (commentCheck.rows.length === 0) {
       res.status(404).json({ error: 'Comment not found' });
       return;
@@ -200,6 +219,7 @@ router.delete('/comments/:commentId', requireAuth as RequestHandler, async (req:
     }
 
     await query('DELETE FROM comments WHERE id = $1', [commentId]);
+    await invalidatePostCache(comment.post_id);
 
     logger.info(
       {
@@ -233,16 +253,20 @@ router.post('/comments/:commentId/like', requireAuth as RequestHandler, async (r
     const authReq = req as AuthenticatedRequest;
     const userId = authReq.session.userId!;
 
-    // Insert like - idempotent with ON CONFLICT
+    const comment = isUuid(commentId)
+      ? await query<{ post_id: string }>('SELECT post_id FROM comments WHERE id = $1', [commentId])
+      : { rows: [] as { post_id: string }[] };
+    if (comment.rows.length === 0 || !(await findVisiblePost(comment.rows[0].post_id, viewerOf(req)))) {
+      res.status(404).json({ error: 'Comment not found' });
+      return;
+    }
+
+    // Insert like - idempotent with ON CONFLICT; like_count is maintained by a trigger in the
+    // same statement, so the row and the counter can't drift apart.
     const result = await query<{ id: string }>(
       'INSERT INTO comment_likes (user_id, comment_id) VALUES ($1, $2) ON CONFLICT DO NOTHING RETURNING id',
       [userId, commentId]
     );
-
-    if (result.rows.length > 0) {
-      // New like - update count
-      await query('UPDATE comments SET like_count = like_count + 1 WHERE id = $1', [commentId]);
-    }
 
     res.json({ message: 'Comment liked', idempotent: result.rows.length === 0 });
   } catch (error) {
@@ -266,14 +290,12 @@ router.delete('/comments/:commentId/like', requireAuth as RequestHandler, async 
     const authReq = req as AuthenticatedRequest;
     const userId = authReq.session.userId!;
 
-    const result = await query<{ id: string }>(
-      'DELETE FROM comment_likes WHERE user_id = $1 AND comment_id = $2 RETURNING id',
-      [userId, commentId]
-    );
-
-    if (result.rows.length > 0) {
-      await query('UPDATE comments SET like_count = like_count - 1 WHERE id = $1', [commentId]);
-    }
+    const result = isUuid(commentId)
+      ? await query<{ id: string }>('DELETE FROM comment_likes WHERE user_id = $1 AND comment_id = $2 RETURNING id', [
+          userId,
+          commentId,
+        ])
+      : { rows: [] as { id: string }[] };
 
     res.json({ message: 'Comment unliked', idempotent: result.rows.length === 0 });
   } catch (error) {
@@ -291,11 +313,19 @@ router.delete('/comments/:commentId/like', requireAuth as RequestHandler, async 
 });
 
 // Get replies to a comment
-router.get('/comments/:commentId/replies', async (req: Request, res: Response): Promise<void> => {
+router.get('/comments/:commentId/replies', optionalAuth as RequestHandler, async (req: Request, res: Response): Promise<void> => {
   try {
-    const { commentId } = req.params;
+    const commentId = req.params.commentId as string;
     const { cursor, limit = '10' } = req.query as { cursor?: string; limit?: string };
-    const limitNum = parseInt(limit, 10);
+    const limitNum = Math.min(Math.max(parseInt(limit, 10) || 10, 1), 100);
+
+    const parent = isUuid(commentId)
+      ? await query<{ post_id: string }>('SELECT post_id FROM comments WHERE id = $1', [commentId])
+      : { rows: [] as { post_id: string }[] };
+    if (parent.rows.length === 0 || !(await findVisiblePost(parent.rows[0].post_id, viewerOf(req)))) {
+      res.status(404).json({ error: 'Comment not found' });
+      return;
+    }
 
     let queryText = `
       SELECT c.*, u.username, u.display_name, u.profile_picture_url

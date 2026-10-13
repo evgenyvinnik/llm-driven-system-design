@@ -4,8 +4,10 @@ import { authenticateRequest, AuthenticatedRequest } from '../middleware/auth.js
 import { loginRateLimiter } from '../shared/rate-limiter.js';
 import { createLogger, LoggedRequest } from '../shared/logger.js';
 import { authAttempts } from '../shared/metrics.js';
+import { publishControl } from '../services/realtime.js';
 
 const router = Router();
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const logger = createLogger('auth-routes');
 
 interface DbError extends Error {
@@ -15,14 +17,14 @@ interface DbError extends Error {
 router.post('/register', async (req: Request, res: Response): Promise<void> => {
   const _loggedReq = req as LoggedRequest;
   try {
-    const { username, email, password, displayName, deviceName, deviceType } = req.body;
+    const { username, email, password, displayName, deviceName, deviceType, installId } = req.body;
 
     if (!username || !email || !password) {
       res.status(400).json({ error: 'Username, email, and password are required' });
       return;
     }
 
-    const result = await register(username, email, password, displayName, deviceName, deviceType);
+    const result = await register(username, email, password, displayName, deviceName, deviceType, installId);
 
     logger.info({ userId: result.user.id, username }, 'User registered');
     authAttempts.inc({ result: 'success' });
@@ -43,14 +45,14 @@ router.post('/register', async (req: Request, res: Response): Promise<void> => {
 router.post('/login', loginRateLimiter, async (req: Request, res: Response): Promise<void> => {
   const _loggedReq = req as LoggedRequest;
   try {
-    const { usernameOrEmail, password, deviceName, deviceType } = req.body;
+    const { usernameOrEmail, password, deviceName, deviceType, installId } = req.body;
 
     if (!usernameOrEmail || !password) {
       res.status(400).json({ error: 'Username/email and password are required' });
       return;
     }
 
-    const result = await login(usernameOrEmail, password, deviceName, deviceType);
+    const result = await login(usernameOrEmail, password, deviceName, deviceType, installId);
 
     logger.info({ userId: result.user.id }, 'User logged in');
     authAttempts.inc({ result: 'success' });
@@ -105,7 +107,15 @@ router.get('/devices', authenticateRequest as any, async (req: Request, res: Res
 router.delete('/devices/:deviceId', authenticateRequest as any, async (req: Request, res: Response): Promise<void> => {
   const authReq = req as AuthenticatedRequest;
   try {
-    await deactivateDevice(authReq.user.id, req.params.deviceId);
+    const revoked = UUID_PATTERN.test(req.params.deviceId)
+      && await deactivateDevice(authReq.user.id, req.params.deviceId);
+    if (!revoked) {
+      res.status(404).json({ error: 'Device not found' });
+      return;
+    }
+
+    // Close the revoked device's open sockets on whichever instance holds them
+    await publishControl({ type: 'device_revoked', userId: authReq.user.id, deviceId: req.params.deviceId });
 
     logger.info({ userId: authReq.user.id, deviceId: req.params.deviceId }, 'Device deactivated');
 

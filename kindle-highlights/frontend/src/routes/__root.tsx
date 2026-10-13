@@ -4,6 +4,9 @@
  */
 import { createRootRoute, Outlet, Link } from '@tanstack/react-router'
 import { useStore } from '@/stores/useStore'
+import { logout as revokeSession } from '@/api/client'
+import { clearOutbox } from '@/sync/outbox'
+import { useSyncChannel } from '@/sync/useSyncChannel'
 
 /**
  * Root route component that provides the main layout
@@ -14,6 +17,13 @@ export const Route = createRootRoute({
 
 function RootLayout() {
   const { isAuthenticated, user, logout } = useStore()
+  useSyncChannel()
+
+  const handleLogout = () => {
+    clearOutbox()
+    void revokeSession()
+    logout()
+  }
 
   return (
     <div className="min-h-screen bg-kindle-cream">
@@ -48,11 +58,12 @@ function RootLayout() {
                   Export
                 </Link>
                 <div className="flex items-center gap-3">
+                  <SyncStatus />
                   <span className="text-sm text-gray-600">
                     Hello, {user?.username}
                   </span>
                   <button
-                    onClick={logout}
+                    onClick={handleLogout}
                     className="rounded-md bg-gray-100 px-3 py-1.5 text-sm text-gray-700 hover:bg-gray-200"
                   >
                     Logout
@@ -87,5 +98,30 @@ function RootLayout() {
         <p>Kindle Highlights - A social reading platform</p>
       </footer>
     </div>
+  )
+}
+
+/** Connection and outbox state, announced politely to screen readers when it changes. */
+function SyncStatus() {
+  const syncStatus = useStore((state) => state.syncStatus)
+  const pendingOps = useStore((state) => state.pendingOps)
+
+  const label =
+    syncStatus === 'live'
+      ? pendingOps > 0
+        ? `Syncing ${pendingOps} change${pendingOps === 1 ? '' : 's'}`
+        : 'Synced'
+      : syncStatus === 'connecting'
+        ? 'Connecting'
+        : pendingOps > 0
+          ? `Offline: ${pendingOps} change${pendingOps === 1 ? '' : 's'} waiting`
+          : 'Offline'
+  const dot = syncStatus === 'live' ? 'bg-green-500' : syncStatus === 'connecting' ? 'bg-yellow-400' : 'bg-gray-400'
+
+  return (
+    <span role="status" aria-live="polite" className="flex items-center gap-1.5 text-xs text-gray-500">
+      <span aria-hidden="true" className={`h-2 w-2 rounded-full ${dot}`} />
+      {label}
+    </span>
   )
 }

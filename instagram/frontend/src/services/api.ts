@@ -1,5 +1,21 @@
 const API_BASE = '/api/v1';
 
+/** Error carrying the HTTP status, so callers can tell 404 from 429 from a network failure. */
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    public readonly status: number
+  ) {
+    super(message);
+    this.name = 'ApiError';
+  }
+}
+
+async function toApiError(response: Response): Promise<ApiError> {
+  const body = await response.json().catch(() => ({ error: 'Request failed' }));
+  return new ApiError(body.error || 'Request failed', response.status);
+}
+
 async function request<T>(
   endpoint: string,
   options: RequestInit = {}
@@ -14,8 +30,7 @@ async function request<T>(
   });
 
   if (!response.ok) {
-    const error = await response.json().catch(() => ({ error: 'Request failed' }));
-    throw new Error(error.error || 'Request failed');
+    throw await toApiError(response);
   }
 
   return response.json();
@@ -24,21 +39,31 @@ async function request<T>(
 async function requestFormData<T>(
   endpoint: string,
   formData: FormData,
-  method = 'POST'
+  method = 'POST',
+  headers: Record<string, string> = {}
 ): Promise<T> {
   const response = await fetch(`${API_BASE}${endpoint}`, {
     method,
     body: formData,
+    headers,
     credentials: 'include',
   });
 
   if (!response.ok) {
-    const error = await response.json().catch(() => ({ error: 'Request failed' }));
-    throw new Error(error.error || 'Request failed');
+    throw await toApiError(response);
   }
 
   return response.json();
 }
+
+/** Result of an idempotent toggle: `idempotent: true` means the server state already matched. */
+export interface ToggleResult {
+  message: string;
+  idempotent?: boolean;
+}
+
+const withCursor = (path: string, cursor?: string) =>
+  cursor ? `${path}${path.includes('?') ? '&' : '?'}cursor=${encodeURIComponent(cursor)}` : path;
 
 // Auth
 /** API client for authentication: register, login, logout, and session check. */
@@ -57,8 +82,14 @@ export const authApi = {
 // Posts
 /** API client for post CRUD, likes, and post retrieval. */
 export const postsApi = {
-  create: (formData: FormData) =>
-    requestFormData<{ post: import('../types').Post }>('/posts', formData),
+  /**
+   * The Idempotency-Key identifies one draft: retries of the same draft reuse it, so a timed-out
+   * upload that actually succeeded is answered with the original post instead of a duplicate.
+   */
+  create: (formData: FormData, idempotencyKey: string) =>
+    requestFormData<{ post: import('../types').Post; message?: string }>('/posts', formData, 'POST', {
+      'Idempotency-Key': idempotencyKey,
+    }),
 
   get: (postId: string) =>
     request<{ post: import('../types').Post }>(`/posts/${postId}`),
@@ -67,20 +98,20 @@ export const postsApi = {
     request(`/posts/${postId}`, { method: 'DELETE' }),
 
   like: (postId: string) =>
-    request(`/posts/${postId}/like`, { method: 'POST' }),
+    request<ToggleResult>(`/posts/${postId}/like`, { method: 'POST' }),
 
   unlike: (postId: string) =>
-    request(`/posts/${postId}/like`, { method: 'DELETE' }),
+    request<ToggleResult>(`/posts/${postId}/like`, { method: 'DELETE' }),
 
   save: (postId: string) =>
-    request(`/posts/${postId}/save`, { method: 'POST' }),
+    request<ToggleResult>(`/posts/${postId}/save`, { method: 'POST' }),
 
   unsave: (postId: string) =>
-    request(`/posts/${postId}/save`, { method: 'DELETE' }),
+    request<ToggleResult>(`/posts/${postId}/save`, { method: 'DELETE' }),
 
   getLikes: (postId: string, cursor?: string) =>
     request<{ likes: import('../types').User[]; nextCursor: string | null }>(
-      `/posts/${postId}/likes${cursor ? `?cursor=${cursor}` : ''}`
+      withCursor(`/posts/${postId}/likes`, cursor)
     ),
 };
 
@@ -89,7 +120,7 @@ export const postsApi = {
 export const commentsApi = {
   getComments: (postId: string, cursor?: string) =>
     request<{ comments: import('../types').Comment[]; nextCursor: string | null }>(
-      `/posts/${postId}/comments${cursor ? `?cursor=${cursor}` : ''}`
+      withCursor(`/posts/${postId}/comments`, cursor)
     ),
 
   addComment: (postId: string, content: string, parentCommentId?: string) =>
@@ -119,12 +150,12 @@ export const usersApi = {
 
   getPosts: (username: string, cursor?: string) =>
     request<{ posts: import('../types').PostThumbnail[]; nextCursor: string | null }>(
-      `/users/${username}/posts${cursor ? `?cursor=${cursor}` : ''}`
+      withCursor(`/users/${username}/posts`, cursor)
     ),
 
   getSavedPosts: (cursor?: string) =>
     request<{ posts: import('../types').PostThumbnail[]; nextCursor: string | null }>(
-      `/users/me/saved${cursor ? `?cursor=${cursor}` : ''}`
+      withCursor('/users/me/saved', cursor)
     ),
 
   follow: (userId: string) =>
@@ -135,12 +166,12 @@ export const usersApi = {
 
   getFollowers: (username: string, cursor?: string) =>
     request<{ followers: import('../types').User[]; nextCursor: string | null }>(
-      `/users/${username}/followers${cursor ? `?cursor=${cursor}` : ''}`
+      withCursor(`/users/${username}/followers`, cursor)
     ),
 
   getFollowing: (username: string, cursor?: string) =>
     request<{ following: import('../types').User[]; nextCursor: string | null }>(
-      `/users/${username}/following${cursor ? `?cursor=${cursor}` : ''}`
+      withCursor(`/users/${username}/following`, cursor)
     ),
 
   search: (query: string) =>
@@ -148,16 +179,20 @@ export const usersApi = {
 };
 
 // Feed
-/** API client for personalized feed retrieval with pagination. */
+/**
+ * API client for personalized feed retrieval with pagination. Cursors are opaque strings from
+ * the server (`<created_ms>_<post id>` for the home feed); the client only passes them back.
+ * `degraded` is set when the server served an empty page because a dependency is struggling.
+ */
 export const feedApi = {
   getFeed: (cursor?: string) =>
-    request<{ posts: import('../types').Post[]; nextCursor: string | null }>(
-      `/feed${cursor ? `?cursor=${cursor}` : ''}`
+    request<{ posts: import('../types').Post[]; nextCursor: string | null; degraded?: boolean }>(
+      withCursor('/feed', cursor)
     ),
 
   getExplore: (cursor?: string) =>
     request<{ posts: import('../types').PostThumbnail[]; nextCursor: string | null }>(
-      `/feed/explore${cursor ? `?cursor=${cursor}` : ''}`
+      withCursor('/feed/explore', cursor)
     ),
 };
 
@@ -184,7 +219,7 @@ export const storiesApi = {
 
   getViewers: (storyId: string, cursor?: string) =>
     request<{ viewers: import('../types').User[]; nextCursor: string | null }>(
-      `/stories/${storyId}/viewers${cursor ? `?cursor=${cursor}` : ''}`
+      withCursor(`/stories/${storyId}/viewers`, cursor)
     ),
 
   delete: (storyId: string) =>

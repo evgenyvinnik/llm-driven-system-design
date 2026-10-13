@@ -33,12 +33,37 @@ let connection: any = null;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 let channel: any = null;
 let isConnecting = false;
-let connectionRetries = 0;
-const MAX_RETRIES = 5;
+let shuttingDown = false;
+let reconnectAttempt = 0;
+let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+
+/** Reconnect delay: 5 s doubling to a 60 s ceiling, retried for as long as the process runs. */
+const RECONNECT_BASE_MS = 5000;
+const RECONNECT_MAX_MS = 60000;
+
+/**
+ * Consumers registered with consumeQueue. A channel dies with its connection, and the
+ * consumers on it die too, so every (re)connect starts them again on the new channel.
+ * Without this, a worker would keep running after a broker restart without consuming.
+ */
+const consumers = new Map<string, { handler: MessageHandler; maxRetries: number }>();
+
+function scheduleReconnect(): void {
+  if (shuttingDown || reconnectTimer) return;
+  const delay = Math.min(RECONNECT_BASE_MS * 2 ** reconnectAttempt, RECONNECT_MAX_MS);
+  reconnectAttempt++;
+  logger.info({ delay_ms: delay, attempt: reconnectAttempt }, 'Scheduling RabbitMQ reconnect');
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    initializeMessageQueue().catch((err) => logger.warn({ err }, 'RabbitMQ reconnect failed'));
+  }, delay);
+}
 
 /**
  * Initializes connection to RabbitMQ.
- * Sets up exchanges and queues with appropriate durability and dead-letter configuration.
+ * Sets up exchanges and queues with appropriate durability and dead-letter configuration,
+ * then (re)starts every registered consumer. On failure it schedules a reconnect and
+ * returns null; callers never block on the broker.
  *
  * @returns Promise resolving to the channel, or null if connection fails
  */
@@ -48,21 +73,22 @@ export async function initializeMessageQueue(): Promise<any | null> {
   if (isConnecting) return null;
 
   isConnecting = true;
+  shuttingDown = false;
 
   try {
     const url = config.rabbitmq?.url || 'amqp://jira:jira_dev@localhost:5672';
     connection = await amqplib.connect(url);
-    channel = await connection.createChannel();
+    const ch = await connection.createChannel();
 
     // Set prefetch for backpressure control
-    await channel.prefetch(10);
+    await ch.prefetch(10);
 
     // Create exchanges
-    await channel.assertExchange(EXCHANGES.ISSUE_EVENTS, 'fanout', { durable: true });
+    await ch.assertExchange(EXCHANGES.ISSUE_EVENTS, 'fanout', { durable: true });
 
     // Create queues with dead-letter configuration
     for (const queueName of Object.values(QUEUES)) {
-      await channel.assertQueue(queueName, {
+      await ch.assertQueue(queueName, {
         durable: true,
         arguments: {
           'x-dead-letter-exchange': '',
@@ -71,44 +97,40 @@ export async function initializeMessageQueue(): Promise<any | null> {
       });
 
       // Create dead-letter queue
-      await channel.assertQueue(`${queueName}.dlq`, { durable: true });
+      await ch.assertQueue(`${queueName}.dlq`, { durable: true });
     }
 
     // Bind issue events queue to fanout exchange
-    await channel.bindQueue(QUEUES.ISSUE_EVENTS, EXCHANGES.ISSUE_EVENTS, '');
-    await channel.bindQueue(QUEUES.SEARCH_INDEX, EXCHANGES.ISSUE_EVENTS, '');
-    await channel.bindQueue(QUEUES.NOTIFICATIONS, EXCHANGES.ISSUE_EVENTS, '');
-    await channel.bindQueue(QUEUES.WEBHOOKS, EXCHANGES.ISSUE_EVENTS, '');
+    await ch.bindQueue(QUEUES.ISSUE_EVENTS, EXCHANGES.ISSUE_EVENTS, '');
+    await ch.bindQueue(QUEUES.SEARCH_INDEX, EXCHANGES.ISSUE_EVENTS, '');
+    await ch.bindQueue(QUEUES.NOTIFICATIONS, EXCHANGES.ISSUE_EVENTS, '');
+    await ch.bindQueue(QUEUES.WEBHOOKS, EXCHANGES.ISSUE_EVENTS, '');
 
     connection.on('error', (err: Error) => {
       logger.error({ err }, 'RabbitMQ connection error');
     });
 
     connection.on('close', () => {
-      logger.warn('RabbitMQ connection closed, attempting reconnect...');
+      logger.warn('RabbitMQ connection closed');
       channel = null;
       connection = null;
-      if (connectionRetries < MAX_RETRIES) {
-        connectionRetries++;
-        setTimeout(() => initializeMessageQueue(), 5000);
-      }
+      scheduleReconnect();
     });
 
-    logger.info('Connected to RabbitMQ');
-    connectionRetries = 0;
+    channel = ch;
+    reconnectAttempt = 0;
     isConnecting = false;
+    logger.info('Connected to RabbitMQ');
+
+    for (const [queueName, consumer] of consumers) {
+      await startConsumer(ch, queueName, consumer.handler, consumer.maxRetries);
+    }
     return channel;
   } catch (error) {
-    logger.error({ err: error }, 'Failed to connect to RabbitMQ');
+    logger.warn({ err: error }, 'Failed to connect to RabbitMQ');
     isConnecting = false;
-
-    if (connectionRetries < MAX_RETRIES) {
-      connectionRetries++;
-      logger.info({ retries: connectionRetries }, 'Retrying RabbitMQ connection...');
-      await new Promise((resolve) => setTimeout(resolve, 5000));
-      return initializeMessageQueue();
-    }
-
+    channel = null;
+    scheduleReconnect();
     return null;
   }
 }
@@ -219,7 +241,10 @@ export async function publishToQueue(
 export type MessageHandler = (message: Record<string, unknown>, msg: any) => Promise<void>;
 
 /**
- * Starts consuming messages from a queue.
+ * Starts consuming messages from a queue, now and after every reconnect.
+ * Failed messages are re-published with an x-retry-count header after an exponential
+ * delay; after maxRetries they are rejected without requeue, which dead-letters them to
+ * <queue>.dlq instead of redelivering a poison message forever.
  *
  * @param queueName - Queue to consume from
  * @param handler - Handler function for processing messages
@@ -230,14 +255,23 @@ export async function consumeQueue(
   handler: MessageHandler,
   options: { maxRetries?: number } = {}
 ): Promise<void> {
+  const maxRetries = options.maxRetries ?? 3;
+  consumers.set(queueName, { handler, maxRetries });
+
   if (!channel) {
-    logger.warn({ queue: queueName }, 'RabbitMQ channel not available, cannot start consumer');
+    logger.warn({ queue: queueName }, 'RabbitMQ not connected yet; consumer starts when it connects');
     return;
   }
+  await startConsumer(channel, queueName, handler, maxRetries);
+}
 
-  const maxRetries = options.maxRetries ?? 3;
-  const ch = channel; // Capture for closure
-
+async function startConsumer(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  ch: any,
+  queueName: string,
+  handler: MessageHandler,
+  maxRetries: number
+): Promise<void> {
   await ch.consume(
     queueName,
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -285,6 +319,11 @@ export async function consumeQueue(
  * Closes the RabbitMQ connection gracefully.
  */
 export async function closeMessageQueue(): Promise<void> {
+  shuttingDown = true;
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
   if (channel) {
     await channel.close();
     channel = null;

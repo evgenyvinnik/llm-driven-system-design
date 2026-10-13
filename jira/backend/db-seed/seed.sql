@@ -278,6 +278,8 @@ JOIN statuses st ON st.name = i.status_name AND st.workflow_id = p.workflow_id
 JOIN users rep ON rep.email = i.reporter_email
 LEFT JOIN users asgn ON asgn.email = i.assignee_email
 LEFT JOIN sprints sp ON sp.name = i.sprint_name AND sp.project_id = p.id
+-- Rows are inserted in key order, so the rank trigger gives the board that order.
+ORDER BY i.key
 ON CONFLICT (key) DO NOTHING;
 
 -- ============================================================
@@ -319,6 +321,8 @@ JOIN statuses st ON st.name = i.status_name AND st.workflow_id = p.workflow_id
 JOIN users rep ON rep.email = i.reporter_email
 LEFT JOIN users asgn ON asgn.email = i.assignee_email
 LEFT JOIN sprints sp ON sp.name = i.sprint_name AND sp.project_id = p.id
+-- Rows are inserted in key order, so the rank trigger gives the board that order.
+ORDER BY i.key
 ON CONFLICT (key) DO NOTHING;
 
 -- ============================================================

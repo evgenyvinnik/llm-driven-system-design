@@ -1,11 +1,18 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import { useNavigate } from '@tanstack/react-router';
-import { api } from '@/services/api';
+import { api, ApiError } from '@/services/api';
 import { wsService } from '@/services/websocket';
 import { useAuthStore } from '@/stores/authStore';
 import { useLocationStore } from '@/stores/locationStore';
-import type { Driver, DriverStats, OrderWithDetails, NewOfferPayload, DriverOffer } from '@/types';
+import type { Driver, DriverStats, OrderWithDetails, NewOfferPayload, DriverOffer, Location } from '@/types';
 import type { PendingOffer } from '@/components/driver/DeliveryOfferModal';
+
+/**
+ * The server treats a courier as reachable only if they pinged in the last
+ * 30 s. Browsers fire watchPosition only on movement, so a parked courier
+ * re-sends the last position on this interval.
+ */
+const HEARTBEAT_INTERVAL_MS = 10_000;
 
 /**
  * Return type for the useDriverDashboard hook.
@@ -23,6 +30,10 @@ interface UseDriverDashboardReturn {
   isTogglingStatus: boolean;
   /** Whether the driver is currently online (available or busy) */
   isOnline: boolean;
+  /** Last outcome worth telling the driver about (e.g. an offer that was taken) */
+  notice: string | null;
+  /** Clears the notice */
+  dismissNotice: () => void;
   /** Handler to go online and start accepting orders */
   handleGoOnline: () => Promise<void>;
   /** Handler to go offline and stop accepting orders */
@@ -40,31 +51,24 @@ interface UseDriverDashboardReturn {
 }
 
 /**
+ * Sends a location ping over the socket when it is open, otherwise over HTTP.
+ * Never both: each ping is one write and one location event for trackers.
+ */
+async function sendLocation(location: Location): Promise<void> {
+  if (!wsService.updateLocation(location.lat, location.lng)) {
+    await api.updateLocation(location.lat, location.lng);
+  }
+}
+
+/**
  * Custom hook that encapsulates all state management and business logic
  * for the driver dashboard. Handles:
  * - Loading and refreshing driver profile and orders
- * - WebSocket connection for real-time delivery offers
- * - Online/offline status toggling with location tracking
+ * - WebSocket connection for real-time delivery offers, with the pending
+ *   offer re-fetched on every (re)connect so a missed push is recovered
+ * - Online/offline status toggling with location tracking and a heartbeat
  * - Offer acceptance/rejection with countdown timer
  * - Order status transitions (picked up, in transit, delivered)
- *
- * @example
- * ```tsx
- * function DriverDashboard() {
- *   const {
- *     driver,
- *     orders,
- *     pendingOffer,
- *     isLoading,
- *     handleGoOnline,
- *     handleAcceptOffer,
- *     // ... other values
- *   } = useDriverDashboard();
- *
- *   if (isLoading) return <Loading />;
- *   // ... render dashboard
- * }
- * ```
  */
 export function useDriverDashboard(): UseDriverDashboardReturn {
   const [driver, setDriver] = useState<(Driver & DriverStats) | null>(null);
@@ -72,10 +76,17 @@ export function useDriverDashboard(): UseDriverDashboardReturn {
   const [pendingOffer, setPendingOffer] = useState<PendingOffer | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [isTogglingStatus, setIsTogglingStatus] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
 
   const { user, token } = useAuthStore();
   const { location, getCurrentLocation, watchLocation, stopWatching } = useLocationStore();
   const navigate = useNavigate();
+
+  // Latest known position, readable by the heartbeat without re-creating it.
+  const lastLocation = useRef<Location | null>(location);
+  useEffect(() => {
+    lastLocation.current = location;
+  }, [location]);
 
   /**
    * Loads the driver profile and active orders from the API.
@@ -96,6 +107,25 @@ export function useDriverDashboard(): UseDriverDashboardReturn {
     }
   }, []);
 
+  /**
+   * Fetches the offer the server says is pending (if any), so an offer pushed
+   * while the socket was down still shows up, with the server's countdown.
+   */
+  const recoverPendingOffer = useCallback(async () => {
+    try {
+      const pending = await api.getPendingOffer();
+      if (pending) {
+        setPendingOffer({
+          offer: pending.offer,
+          order: pending.order,
+          expiresIn: pending.offer.expires_in_seconds,
+        });
+      }
+    } catch (error) {
+      console.error('Failed to fetch pending offer:', error);
+    }
+  }, []);
+
   // Redirect non-driver users and load initial data
   useEffect(() => {
     if (!user || user.role !== 'driver') {
@@ -106,15 +136,18 @@ export function useDriverDashboard(): UseDriverDashboardReturn {
     loadDriverData();
   }, [user, navigate, loadDriverData]);
 
-  // Connect to WebSocket for real-time offers when online
+  const isOnline = driver !== null && driver.status !== 'offline';
+
+  // Connect to WebSocket for real-time offers while online
   useEffect(() => {
-    if (!token || !driver || driver.status === 'offline') {
+    if (!token || !isOnline) {
       return;
     }
 
     wsService.connect(token, {
       onConnected: () => {
         wsService.subscribeToDriverOffers();
+        void recoverPendingOffer();
       },
       onNewOffer: (payload: NewOfferPayload) => {
         setPendingOffer({
@@ -131,11 +164,42 @@ export function useDriverDashboard(): UseDriverDashboardReturn {
     return () => {
       wsService.disconnect();
     };
-  }, [token, driver?.status]);
+  }, [token, isOnline, recoverPendingOffer]);
+
+  // While online: follow the device position and send a heartbeat ping, so the
+  // courier stays "fresh" in the geo index even when parked. This also resumes
+  // tracking after a reload for a courier who was already online.
+  useEffect(() => {
+    if (!isOnline) {
+      return;
+    }
+
+    watchLocation((newLoc) => {
+      sendLocation(newLoc).catch((error) => console.error('Location update failed:', error));
+    });
+    if (!lastLocation.current) {
+      // No fix yet (e.g. reload while online): use the browser's position or the demo default.
+      void getCurrentLocation().then((loc) => {
+        lastLocation.current = loc;
+        return sendLocation(loc);
+      });
+    }
+    const heartbeat = setInterval(() => {
+      if (lastLocation.current) {
+        sendLocation(lastLocation.current).catch((error) => console.error('Heartbeat failed:', error));
+      }
+    }, HEARTBEAT_INTERVAL_MS);
+
+    return () => {
+      clearInterval(heartbeat);
+      stopWatching();
+    };
+  }, [isOnline, watchLocation, stopWatching, getCurrentLocation]);
 
   // Countdown timer for pending offer expiration
+  const offerId = pendingOffer?.offer.id;
   useEffect(() => {
-    if (!pendingOffer) return;
+    if (!offerId) return;
 
     const timer = setInterval(() => {
       setPendingOffer((prev) => {
@@ -148,11 +212,11 @@ export function useDriverDashboard(): UseDriverDashboardReturn {
     }, 1000);
 
     return () => clearInterval(timer);
-  }, [pendingOffer?.offer.id]);
+  }, [offerId]);
 
   /**
-   * Transitions the driver to online status and starts location tracking.
-   * Gets the current location if not available and begins watching for updates.
+   * Transitions the driver to online status. Location watching and the
+   * heartbeat start from the effect above once the status flips.
    */
   const handleGoOnline = useCallback(async () => {
     setIsTogglingStatus(true);
@@ -161,47 +225,43 @@ export function useDriverDashboard(): UseDriverDashboardReturn {
       if (!loc) {
         loc = await getCurrentLocation();
       }
+      lastLocation.current = loc;
 
       await api.goOnline(loc.lat, loc.lng);
-
-      // Start watching location and sending updates
-      watchLocation(async (newLoc) => {
-        await api.updateLocation(newLoc.lat, newLoc.lng);
-        wsService.updateLocation(newLoc.lat, newLoc.lng);
-      });
-
-      setDriver((prev) => prev ? { ...prev, status: 'available' } : null);
+      setDriver((prev) => (prev ? { ...prev, status: 'available' } : null));
     } catch (error) {
       console.error('Failed to go online:', error);
     } finally {
       setIsTogglingStatus(false);
     }
-  }, [location, getCurrentLocation, watchLocation]);
+  }, [location, getCurrentLocation]);
 
   /**
-   * Transitions the driver to offline status and stops location tracking.
-   * Prevents going offline if there are active orders.
+   * Transitions the driver to offline status. The server refuses (409) while
+   * a delivery is active, so the client check is only a fast path.
    */
   const handleGoOffline = useCallback(async () => {
     if (orders.length > 0) {
-      alert('Complete your active deliveries before going offline');
+      setNotice('Complete your active deliveries before going offline');
       return;
     }
 
     setIsTogglingStatus(true);
     try {
       await api.goOffline();
-      stopWatching();
-      setDriver((prev) => prev ? { ...prev, status: 'offline' } : null);
+      setPendingOffer(null);
+      setDriver((prev) => (prev ? { ...prev, status: 'offline' } : null));
     } catch (error) {
-      console.error('Failed to go offline:', error);
+      setNotice((error as Error).message || 'Failed to go offline');
     } finally {
       setIsTogglingStatus(false);
     }
-  }, [orders.length, stopWatching]);
+  }, [orders.length]);
 
   /**
-   * Accepts the current pending delivery offer and adds the order to active orders.
+   * Accepts the current pending delivery offer. A 409 means someone or
+   * something got there first (offer expired, order cancelled): say so and
+   * close the offer instead of failing silently.
    */
   const handleAcceptOffer = useCallback(async () => {
     if (!pendingOffer) return;
@@ -209,8 +269,14 @@ export function useDriverDashboard(): UseDriverDashboardReturn {
     try {
       const order = await api.acceptOffer(pendingOffer.offer.id);
       setOrders((prev) => [...prev, order as OrderWithDetails]);
+      setDriver((prev) => (prev ? { ...prev, status: 'busy' } : null));
       setPendingOffer(null);
     } catch (error) {
+      if (error instanceof ApiError && error.status === 409) {
+        setNotice(error.message);
+        setPendingOffer(null);
+        return;
+      }
       console.error('Failed to accept offer:', error);
     }
   }, [pendingOffer]);
@@ -223,9 +289,10 @@ export function useDriverDashboard(): UseDriverDashboardReturn {
 
     try {
       await api.rejectOffer(pendingOffer.offer.id);
-      setPendingOffer(null);
     } catch (error) {
       console.error('Failed to reject offer:', error);
+    } finally {
+      setPendingOffer(null);
     }
   }, [pendingOffer]);
 
@@ -237,7 +304,7 @@ export function useDriverDashboard(): UseDriverDashboardReturn {
       await api.markPickedUp(orderId);
       loadDriverData();
     } catch (error) {
-      console.error('Failed to mark picked up:', error);
+      setNotice((error as Error).message || 'Failed to mark picked up');
     }
   }, [loadDriverData]);
 
@@ -249,7 +316,7 @@ export function useDriverDashboard(): UseDriverDashboardReturn {
       await api.markInTransit(orderId);
       loadDriverData();
     } catch (error) {
-      console.error('Failed to mark in transit:', error);
+      setNotice((error as Error).message || 'Failed to mark in transit');
     }
   }, [loadDriverData]);
 
@@ -261,11 +328,11 @@ export function useDriverDashboard(): UseDriverDashboardReturn {
       await api.markDelivered(orderId);
       loadDriverData();
     } catch (error) {
-      console.error('Failed to mark delivered:', error);
+      setNotice((error as Error).message || 'Failed to mark delivered');
     }
   }, [loadDriverData]);
 
-  const isOnline = driver?.status !== 'offline';
+  const dismissNotice = useCallback(() => setNotice(null), []);
 
   return {
     driver,
@@ -274,6 +341,8 @@ export function useDriverDashboard(): UseDriverDashboardReturn {
     isLoading,
     isTogglingStatus,
     isOnline,
+    notice,
+    dismissNotice,
     handleGoOnline,
     handleGoOffline,
     handleAcceptOffer,

@@ -4,10 +4,12 @@
  */
 import express, { Request, Response, NextFunction } from 'express'
 import cors from 'cors'
-import crypto from 'crypto'
-import { query } from '../shared/db.js'
-import { authMiddleware, createSession } from '../shared/auth.js'
+import { query, transaction } from '../shared/db.js'
+import { authMiddleware, createSession, destroySession } from '../shared/auth.js'
 import { createLogger } from '../shared/logger.js'
+import { errorHandler, HttpError } from '../shared/errors.js'
+import { hashPassword, verifyPassword } from '../shared/password.js'
+import { isUuid, parseLimit, parseNonNegative, VISIBILITIES, type Visibility } from '../shared/validation.js'
 
 const logger = createLogger('social-service')
 
@@ -35,33 +37,33 @@ app.post('/api/auth/register', async (req: Request, res: Response, next: NextFun
       res.status(400).json({ error: 'Email, username, and password are required' })
       return
     }
+    if (typeof password !== 'string' || password.length < 8) {
+      res.status(400).json({ error: 'Password must be at least 8 characters' })
+      return
+    }
 
-    const passwordHash = crypto.createHash('sha256').update(password).digest('hex')
+    const passwordHash = await hashPassword(password)
 
-    const result = await query<{ id: string }>(
-      `INSERT INTO users (email, username, password_hash)
-       VALUES ($1, $2, $3)
-       RETURNING id`,
-      [email, username, passwordHash]
-    )
-
-    const userId = result.rows[0].id
-
-    // Create default privacy settings
-    await query(
-      `INSERT INTO user_privacy_settings (user_id)
-       VALUES ($1)`,
-      [userId]
-    )
+    // The account and its default privacy settings are created together or not at all.
+    const userId = await transaction(async (client) => {
+      const result = await client.query<{ id: string }>(
+        `INSERT INTO users (email, username, password_hash)
+         VALUES ($1, $2, $3)
+         RETURNING id`,
+        [email, username, passwordHash]
+      )
+      await client.query('INSERT INTO user_privacy_settings (user_id) VALUES ($1)', [result.rows[0].id])
+      return result.rows[0].id
+    })
 
     const sessionId = await createSession(userId)
 
     logger.info({ event: 'user_registered', userId, username })
 
     res.status(201).json({ userId, sessionId })
-  } catch (error: any) {
-    if (error.code === '23505') {
-      res.status(409).json({ error: 'Email or username already exists' })
+  } catch (error) {
+    if ((error as { code?: string }).code === '23505') {
+      res.status(409).json({ error: 'Email already registered' })
       return
     }
     next(error)
@@ -81,20 +83,24 @@ app.post('/api/auth/login', async (req: Request, res: Response, next: NextFuncti
       return
     }
 
-    const passwordHash = crypto.createHash('sha256').update(password).digest('hex')
-
-    const result = await query<{ id: string; username: string }>(
-      `SELECT id, username FROM users
-       WHERE email = $1 AND password_hash = $2`,
-      [email, passwordHash]
+    const result = await query<{ id: string; username: string; password_hash: string }>(
+      'SELECT id, username, password_hash FROM users WHERE email = $1',
+      [email]
     )
 
-    if (result.rows.length === 0) {
+    const user = result.rows[0]
+    const verdict = user ? await verifyPassword(String(password), user.password_hash) : { ok: false, needsRehash: false }
+    if (!user || !verdict.ok) {
       res.status(401).json({ error: 'Invalid email or password' })
       return
     }
 
-    const user = result.rows[0]
+    // Accounts from before the scrypt switch: replace the unsalted digest now that we have the password.
+    if (verdict.needsRehash) {
+      await query('UPDATE users SET password_hash = $2, updated_at = NOW() WHERE id = $1', [user.id, await hashPassword(String(password))])
+      logger.info({ event: 'password_hash_upgraded', userId: user.id })
+    }
+
     const sessionId = await createSession(user.id)
 
     logger.info({ event: 'user_logged_in', userId: user.id })
@@ -130,6 +136,20 @@ app.get('/api/auth/me', authMiddleware, async (req: Request, res: Response, next
   }
 })
 
+/**
+ * Logout: revoke the session server-side (deleting the token client-side alone leaves it valid)
+ * POST /api/auth/logout
+ */
+app.post('/api/auth/logout', authMiddleware, async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    await destroySession(req.sessionId!)
+    logger.info({ event: 'user_logged_out', userId: req.userId })
+    res.status(204).send()
+  } catch (error) {
+    next(error)
+  }
+})
+
 // ==================== Following ====================
 
 /**
@@ -139,7 +159,8 @@ app.get('/api/auth/me', authMiddleware, async (req: Request, res: Response, next
 app.post('/api/users/:userId/follow', authMiddleware, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const followerId = req.userId!
-    const followeeId = req.params.userId
+    const followeeId = String(req.params.userId)
+    if (!isUuid(followeeId)) throw new HttpError(400, 'userId must be a UUID')
 
     if (followerId === followeeId) {
       res.status(400).json({ error: 'Cannot follow yourself' })
@@ -179,7 +200,8 @@ app.post('/api/users/:userId/follow', authMiddleware, async (req: Request, res: 
 app.delete('/api/users/:userId/follow', authMiddleware, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const followerId = req.userId!
-    const followeeId = req.params.userId
+    const followeeId = String(req.params.userId)
+    if (!isUuid(followeeId)) throw new HttpError(400, 'userId must be a UUID')
 
     await query(
       `DELETE FROM follows WHERE follower_id = $1 AND followee_id = $2`,
@@ -245,12 +267,18 @@ app.get('/api/followers', authMiddleware, async (req: Request, res: Response, ne
 /**
  * Get highlights from people I follow for a specific book
  * GET /api/books/:bookId/friends-highlights
+ *
+ * Each highlight's own visibility decides: 'public' highlights of people I follow are shown,
+ * 'friends' highlights only when the follow is mutual (they follow me back), 'private' never.
+ * Following is one-sided and needs no approval, so treating every follower as a friend would
+ * let anyone unlock 'friends' highlights by clicking Follow.
  */
 app.get('/api/books/:bookId/friends-highlights', authMiddleware, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const userId = req.userId!
-    const { bookId } = req.params
-    const { limit = '50' } = req.query as Record<string, string>
+    const bookId = String(req.params.bookId)
+    if (!isUuid(bookId)) throw new HttpError(400, 'bookId must be a UUID')
+    const limit = parseLimit(req.query.limit, 50, 200)
 
     const result = await query(
       `SELECT
@@ -260,20 +288,24 @@ app.get('/api/books/:bookId/friends-highlights', authMiddleware, async (req: Req
          h.location_start,
          h.location_end,
          h.color,
+         h.visibility,
          h.created_at,
          u.username,
          u.avatar_url
        FROM highlights h
-       JOIN follows f ON f.followee_id = h.user_id
+       JOIN follows f ON f.followee_id = h.user_id AND f.follower_id = $1
        JOIN users u ON u.id = h.user_id
-       JOIN user_privacy_settings ups ON ups.user_id = h.user_id
-       WHERE f.follower_id = $1
-         AND h.book_id = $2
-         AND h.archived = false
-         AND (ups.highlight_visibility = 'public' OR ups.highlight_visibility = 'friends')
+       WHERE h.book_id = $2
+         AND h.deleted_at IS NULL
+         AND (
+           h.visibility = 'public'
+           OR (h.visibility = 'friends' AND EXISTS (
+                 SELECT 1 FROM follows back
+                 WHERE back.follower_id = h.user_id AND back.followee_id = $1))
+         )
        ORDER BY h.created_at DESC
        LIMIT $3`,
-      [userId, bookId, parseInt(limit)]
+      [userId, bookId, limit]
     )
 
     res.json(result.rows)
@@ -291,10 +323,11 @@ app.get('/api/books/:bookId/friends-highlights', authMiddleware, async (req: Req
 app.post('/api/highlights/:highlightId/share', authMiddleware, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const userId = req.userId!
-    const { highlightId } = req.params
+    const highlightId = String(req.params.highlightId)
     const { platform } = req.body
+    if (!isUuid(highlightId)) throw new HttpError(400, 'highlightId must be a UUID')
 
-    if (!platform) {
+    if (typeof platform !== 'string' || platform === '' || platform.length > 30) {
       res.status(400).json({ error: 'Platform is required' })
       return
     }
@@ -303,7 +336,7 @@ app.post('/api/highlights/:highlightId/share', authMiddleware, async (req: Reque
       `SELECT h.*, b.title as book_title, b.author as book_author
        FROM highlights h
        JOIN books b ON b.id = h.book_id
-       WHERE h.id = $1 AND h.user_id = $2`,
+       WHERE h.id = $1 AND h.user_id = $2 AND h.deleted_at IS NULL`,
       [highlightId, userId]
     )
 
@@ -316,9 +349,9 @@ app.post('/api/highlights/:highlightId/share', authMiddleware, async (req: Reque
 
     // Log share event
     await query(
-      `INSERT INTO highlight_shares (highlight_id, platform)
-       VALUES ($1, $2)`,
-      [highlightId, platform]
+      `INSERT INTO highlight_shares (highlight_id, user_id, platform)
+       VALUES ($1, $2, $3)`,
+      [highlightId, userId, platform]
     )
 
     // Generate share content
@@ -372,19 +405,47 @@ app.get('/api/settings/privacy', authMiddleware, async (req: Request, res: Respo
 app.patch('/api/settings/privacy', authMiddleware, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const userId = req.userId!
-    const { highlightVisibility, allowFollowers, includeInAggregation } = req.body
+    const { highlightVisibility, allowFollowers, includeInAggregation } = req.body ?? {}
 
-    await query(
-      `INSERT INTO user_privacy_settings (user_id, highlight_visibility, allow_followers, include_in_aggregation)
-       VALUES ($1, $2, $3, $4)
-       ON CONFLICT (user_id) DO UPDATE SET
-         highlight_visibility = COALESCE($2, user_privacy_settings.highlight_visibility),
-         allow_followers = COALESCE($3, user_privacy_settings.allow_followers),
-         include_in_aggregation = COALESCE($4, user_privacy_settings.include_in_aggregation)`,
-      [userId, highlightVisibility, allowFollowers, includeInAggregation]
-    )
+    if (highlightVisibility !== undefined && !VISIBILITIES.includes(highlightVisibility as Visibility)) {
+      throw new HttpError(400, `highlightVisibility must be one of ${VISIBILITIES.join(', ')}`)
+    }
+    for (const [name, value] of Object.entries({ allowFollowers, includeInAggregation })) {
+      if (value !== undefined && typeof value !== 'boolean') throw new HttpError(400, `${name} must be a boolean`)
+    }
 
-    logger.info({ event: 'privacy_settings_updated', userId })
+    const consentChanged = await transaction(async (client) => {
+      const before = await client.query<{ include_in_aggregation: boolean }>(
+        'SELECT include_in_aggregation FROM user_privacy_settings WHERE user_id = $1 FOR UPDATE',
+        [userId]
+      )
+      const after = await client.query<{ include_in_aggregation: boolean }>(
+        `INSERT INTO user_privacy_settings (user_id, highlight_visibility, allow_followers, include_in_aggregation)
+         VALUES ($1, COALESCE($2, 'private'), COALESCE($3, true), COALESCE($4, true))
+         ON CONFLICT (user_id) DO UPDATE SET
+           highlight_visibility = COALESCE($2, user_privacy_settings.highlight_visibility),
+           allow_followers = COALESCE($3, user_privacy_settings.allow_followers),
+           include_in_aggregation = COALESCE($4, user_privacy_settings.include_in_aggregation),
+           updated_at = NOW()
+         RETURNING include_in_aggregation`,
+        [userId, highlightVisibility ?? null, allowFollowers ?? null, includeInAggregation ?? null]
+      )
+      const wasIncluded = before.rows[0]?.include_in_aggregation ?? true
+      const changed = wasIncluded !== after.rows[0].include_in_aggregation
+      if (changed) {
+        // Opting out (or back in) moves this reader's public highlights out of (or into) every
+        // book's counts; the worker recounts those books after this commit.
+        await client.query(
+          `INSERT INTO aggregation_outbox (book_id, reason)
+           SELECT DISTINCT book_id, 'consent' FROM highlights
+           WHERE user_id = $1 AND visibility = 'public' AND deleted_at IS NULL`,
+          [userId]
+        )
+      }
+      return changed
+    })
+
+    logger.info({ event: 'privacy_settings_updated', userId, consentChanged })
 
     res.json({ success: true })
   } catch (error) {
@@ -400,13 +461,15 @@ app.patch('/api/settings/privacy', authMiddleware, async (req: Request, res: Res
  */
 app.get('/api/users/:userId', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { userId } = req.params
+    const userId = String(req.params.userId)
+    if (!isUuid(userId)) throw new HttpError(400, 'userId must be a UUID')
 
     const result = await query(
       `SELECT u.id, u.username, u.avatar_url, u.bio, u.created_at,
               (SELECT COUNT(*) FROM follows WHERE followee_id = u.id) as followers_count,
               (SELECT COUNT(*) FROM follows WHERE follower_id = u.id) as following_count,
-              (SELECT COUNT(*) FROM highlights WHERE user_id = u.id AND visibility = 'public') as public_highlights_count
+              (SELECT COUNT(*) FROM highlights
+               WHERE user_id = u.id AND visibility = 'public' AND deleted_at IS NULL) as public_highlights_count
        FROM users u
        WHERE u.id = $1`,
       [userId]
@@ -429,17 +492,21 @@ app.get('/api/users/:userId', async (req: Request, res: Response, next: NextFunc
  */
 app.get('/api/users/:userId/highlights', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { userId } = req.params
-    const { limit = '50', offset = '0' } = req.query as Record<string, string>
+    const userId = String(req.params.userId)
+    if (!isUuid(userId)) throw new HttpError(400, 'userId must be a UUID')
+    const limit = parseLimit(req.query.limit, 50, 200)
+    const offset = parseNonNegative(req.query.offset, 0)
 
+    // Explicit columns: sync metadata (sequence numbers, per-device edit stamps) stays private.
     const result = await query(
-      `SELECT h.*, b.title as book_title, b.author as book_author
+      `SELECT h.id, h.book_id, h.location_start, h.location_end, h.highlighted_text, h.note, h.color,
+              h.created_at, b.title as book_title, b.author as book_author
        FROM highlights h
        JOIN books b ON b.id = h.book_id
-       WHERE h.user_id = $1 AND h.visibility = 'public' AND h.archived = false
+       WHERE h.user_id = $1 AND h.visibility = 'public' AND h.deleted_at IS NULL
        ORDER BY h.created_at DESC
        LIMIT $2 OFFSET $3`,
-      [userId, parseInt(limit), parseInt(offset)]
+      [userId, limit, offset]
     )
 
     res.json(result.rows)
@@ -449,7 +516,4 @@ app.get('/api/users/:userId/highlights', async (req: Request, res: Response, nex
 })
 
 /** Error handling middleware */
-app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
-  logger.error({ error: err.message, stack: err.stack })
-  res.status(500).json({ error: 'Internal server error' })
-})
+app.use(errorHandler(logger))

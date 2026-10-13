@@ -1,5 +1,5 @@
 import { createFileRoute } from '@tanstack/react-router';
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { useProjectStore, useIssueStore, useUIStore } from '../../../stores';
 import { KanbanBoard } from '../../../components/Board';
 import { IssueDetail } from '../../../components/IssueDetail';
@@ -20,15 +20,19 @@ function BoardPage() {
 
   const activeSprint = sprints.find((s) => s.status === 'active');
 
-  useEffect(() => {
-    if (currentProject) {
-      if (selectedSprint === 'all') {
-        fetchProjectIssues(currentProject.id);
-      } else if (selectedSprint && selectedSprint !== 'all') {
-        fetchSprintIssues(parseInt(selectedSprint, 10));
-      }
+  /** Loads the issues for the selected sprint (or the whole project). */
+  const loadIssues = useCallback(() => {
+    if (!currentProject) return;
+    if (selectedSprint === 'all') {
+      fetchProjectIssues(currentProject.id);
+    } else if (selectedSprint) {
+      fetchSprintIssues(parseInt(selectedSprint, 10));
     }
   }, [currentProject, selectedSprint, fetchProjectIssues, fetchSprintIssues]);
+
+  useEffect(() => {
+    loadIssues();
+  }, [loadIssues]);
 
   // Auto-select active sprint if available
   useEffect(() => {
@@ -79,6 +83,7 @@ function BoardPage() {
         workflow={workflow}
         onIssueClick={setSelectedIssue}
         isLoading={isLoading}
+        onConflict={loadIssues}
       />
 
       {selectedIssue && (

@@ -128,7 +128,6 @@ app.use('/api/folders', folderRoutes);
 
 // Errors that reach here (a failed rate-limit store, a broken session store) answer in
 // JSON like every route does, instead of Express's default HTML page.
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
 app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
   logger.error({ err }, 'Unhandled request error');
   if (res.headersSent) return;

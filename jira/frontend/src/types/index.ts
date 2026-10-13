@@ -43,8 +43,12 @@ export interface Issue {
   sprint_id?: number;
   story_points?: number;
   labels: string[];
-  components: number[];
+  components: string[];
   custom_fields: Record<string, unknown>;
+  /** Bumped on every field or status change; sent back as If-Match when editing. */
+  version: number;
+  /** Position in the project's board and backlog order (compare as plain strings). */
+  rank: string;
   created_at: string;
   updated_at: string;
 }
