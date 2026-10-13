@@ -1,576 +1,304 @@
-# LinkedIn - System Design Answer (Full-Stack Focus)
+# 💼 LinkedIn (Professional Network) — System Design Answer (Full-Stack Focus)
 
-*45-minute system design interview format - Full-Stack Engineer Position*
+*45-minute full-stack interview. This is a proposed production design; what this repository actually runs is described in [architecture.md → Implementation Notes](./architecture.md#implementation-notes).*
 
-## Problem Statement
+> "As a full-stack engineer I want to follow one relationship through the whole system — a click on Connect, the invitation, the accept, and the profile header that finally says '1st' — and get the contracts between the layers right. Two of them carry most of the weight: invitation writes that report what actually happened, so the client can retry and render the truth, and a relationship read that separates 'how far apart are we' from 'what can I do', so every button and badge stays honest even while caches and indexes lag."
 
-Design LinkedIn, a professional social network where users build career profiles, connect with colleagues, and discover job opportunities. The full-stack challenge involves building an integrated system where the frontend efficiently consumes graph-based APIs for connection recommendations (PYMK), job matching, and algorithmic feed ranking.
+| Phase | Time | What I want the interviewer to leave with |
+|-------|------|--------------------------------------------|
+| Requirements & scale | 5 min | Scope, and targets on both sides of the wire |
+| End-to-end architecture | 8 min | One diagram from the browser to the index workers, plus the core flows |
+| Data model & API contract | 7 min | Server tables, client cache keys, and the fields both sides rely on |
+| Deep dive 1: connecting two people | 8 min | Optimistic UI on top of an idempotent, race-free write |
+| Deep dive 2: "how you're connected" | 7 min | The relationship contract and its caching on both sides |
+| Deep dive 3: search that degrades | 6 min | Outbox-fed index, fallback, and an honest UI |
+| Failures, scale, wrap-up | 4 min | What each failure looks like to a member |
 
-## Requirements Clarification
+---
 
-### Functional Requirements
-- **Profiles**: Rich professional profiles with experience, education, skills
-- **Connections**: Send/accept requests, view network by degree
-- **PYMK**: "People You May Know" recommendations
-- **Feed**: Posts from connections with ranking
-- **Jobs**: Job listings with candidate matching
-- **Search**: Global search across people, companies, jobs
+## 🎯 Requirements & Scale (5 min)
 
-### Non-Functional Requirements
-- **Latency**: < 200ms for feed, < 500ms for PYMK
-- **Scale**: 900M users, 100B+ connections
-- **Consistency**: Strong for connections, eventual for feed
-- **Availability**: 99.9% uptime
+**Functional.** Members send, accept, decline and withdraw invitations and remove connections. Every profile shows the degree (1st, 2nd, 3rd), the mutual count and a "how you're connected" path, with the right action button. My Network lists invitations, connections and People You May Know with reasons. The feed shows ranked posts from connections. People and job search with filters. Out of scope: messaging, recruiter tools, ads.
 
-### Full-Stack Concerns
-- Efficient API design for graph data
-- Optimistic updates for social actions
-- Real-time feedback for connection requests
-- Shared type definitions between frontend and backend
+| Side | Requirement | Target |
+|------|-------------|--------|
+| Backend | Degree and path computation | p99 < 50 ms; it runs in every profile view |
+| Backend | Invite / accept | p99 < 300 ms; both members see the new state within 1 s |
+| Backend | Search freshness | A profile edit is searchable within 30 s |
+| Frontend | Feed load | LCP < 2.5 s cold, < 1 s repeat; 60 fps scrolling |
+| Frontend | Social actions | INP < 200 ms; Connect and Like respond on the click |
+| Both | Correctness | A connection is never one-sided; retries and double clicks never duplicate an invitation |
+| Both | Convergence | A change made on one device shows on the others within ~2 s |
 
-## High-Level Architecture
+**Scale.** 900M members, 100M daily; ~50B connections (100B adjacency entries, ~5 TB of RAM with replicas); ~1B profile views a day (12K/s, 35K/s peak), each needing a degree; 1.5B feed loads a day; ~20M invitations a day. A member with 500 connections has about 250,000 second-degree members.
 
-```
-┌───────────────────────────────────────────────────────────────────────────┐
-│                         Frontend (React)                                   │
-│  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐                      │
-│  │ Profile │  │  Feed   │  │ Network │  │  Jobs   │                      │
-│  └────┬────┘  └────┬────┘  └────┬────┘  └────┬────┘                      │
-│       │            │            │            │                            │
-│       └────────────┼────────────┼────────────┘                            │
-│                    │                                                       │
-│               ┌────┴────┐                                                  │
-│               │   API   │                                                  │
-│               │ Service │                                                  │
-│               └────┬────┘                                                  │
-└────────────────────┼───────────────────────────────────────────────────────┘
-                     │ HTTP/REST
-                     ▼
-┌───────────────────────────────────────────────────────────────────────────┐
-│                         API Gateway                                        │
-└────────────────────┬───────────────────────────────────────────────────────┘
-                     │
-      ┌──────────────┼──────────────┬──────────────┐
-      ▼              ▼              ▼              ▼
-┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐
-│ Profile  │  │  Graph   │  │   Feed   │  │   Jobs   │
-│ Service  │  │ Service  │  │ Service  │  │ Service  │
-└────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘
-     │             │             │             │
-     └─────────────┼─────────────┼─────────────┘
-                   ▼
-┌───────────────────────────────────────────────────────────────────────────┐
-│  PostgreSQL        │  Valkey/Redis       │  Elasticsearch                 │
-│  (Profiles, Jobs)  │  (Connections,      │  (Search, Indexing)            │
-│                    │   PYMK Cache)       │                                │
-└───────────────────────────────────────────────────────────────────────────┘
-```
+"The last number decides the design on both sides. The server must never enumerate a second-degree network while a member waits, and the client must never guess relationship state, because it can't see the other side of the graph."
 
-## Deep Dives
+---
 
-### 1. API Design for Graph Operations
-
-**RESTful Endpoints:**
+## 🏗️ End-to-End Architecture (8 min)
 
 ```
-┌───────────────────────────────────────────────────────────────────────────┐
-│                         Connection APIs                                    │
-├───────────────────────────────────────────────────────────────────────────┤
-│  GET    /api/v1/connections              ──▶ Get user's connections       │
-│  GET    /api/v1/connections/:userId/degree ──▶ Get connection degree      │
-│  GET    /api/v1/connections/:userId/mutual ──▶ Get mutual connections     │
-│  POST   /api/v1/connections/request      ──▶ Send connection request      │
-│  PUT    /api/v1/connections/request/:id/accept ──▶ Accept request         │
-│  DELETE /api/v1/connections/:userId      ──▶ Remove connection            │
-├───────────────────────────────────────────────────────────────────────────┤
-│                         PYMK APIs                                          │
-├───────────────────────────────────────────────────────────────────────────┤
-│  GET    /api/v1/pymk                     ──▶ Get recommendations          │
-│  GET    /api/v1/pymk/:userId/score       ──▶ Get PYMK score for user      │
-├───────────────────────────────────────────────────────────────────────────┤
-│                         Feed APIs                                          │
-├───────────────────────────────────────────────────────────────────────────┤
-│  GET    /api/v1/feed                     ──▶ Get ranked feed              │
-│  POST   /api/v1/posts                    ──▶ Create post                  │
-│  POST   /api/v1/posts/:id/like           ──▶ Like post                    │
-│  POST   /api/v1/posts/:id/comments       ──▶ Add comment                  │
-├───────────────────────────────────────────────────────────────────────────┤
-│                         Jobs APIs                                          │
-├───────────────────────────────────────────────────────────────────────────┤
-│  GET    /api/v1/jobs                     ──▶ List jobs                    │
-│  GET    /api/v1/jobs/recommended         ──▶ Get matched jobs             │
-│  POST   /api/v1/jobs/:id/apply           ──▶ Apply to job                 │
-│  GET    /api/v1/jobs/:id/match-score     ──▶ Get match score              │
-└───────────────────────────────────────────────────────────────────────────┘
+  ┌──────────────────────────────────────────────────────────────────────────────────────────────┐
+  │ Browser SPA · query cache keyed by member · optimistic Connect · SSE invalidation            │
+  └─────────┬───────────────────────────────────┬─────────────────────────────┬──────────────────┘
+            │ (1) POST /invitations/{id}/accept │ (2) GET /feed?cursor        │ (3) GET /search?q
+            │                                   │                             │
+            ▼                                   ▼                             ▼
+  ┌──────────────────────────────────────────────────────────────────────────────────────────────┐
+  │ API gateway · TLS · session lookup in Redis · per-member rate limits · routing               │
+  └─────────┬───────────────────────────────────┬─────────────────────────────┬──────────────────┘
+            ▼                                   ▼                             ▼
+  ┌──────────────────────┐            ┌──────────────────────┐        ┌──────────────────────────┐
+  │ Graph Service        │ connections│ Feed Service         │        │ Profile & Search API     │
+  │ invitations, degree, │◀───────────┤ pull recent posts    │        │ profiles · jobs ·        │
+  │ mutuals, PYMK        │            │ from connections,    │        │ applications ·           │
+  │ adjacency in RAM     │            │ rank, cursor pages   │        │ people and job search    │
+  └───▲─────────────┬────┘            └───────────┬──────────┘        └───┬───────────────┬──────┘
+      │             │                             │                       │               │
+      │             │                             │ recent post ids       │ search query  │
+      │             │ tx: invitation, edge,       │ per author            │               │
+      │             │ counters, outbox row        │                       │               │
+      │             │                             ▼                       │               ▼
+      │ edge        │                   ┌────────────────────────┐        │     ┌────────────────┐
+      │ events      │                   │ Redis                  │        │     │ Elasticsearch  │
+      │             │                   │ sessions · recent post │        │     │ people · jobs  │
+      │             │                   │ ids · PYMK lists       │        │     └─────────▲──────┘
+      │             │                   └────────────────────────┘        │ profiles, jobs│
+      │             ▼                                                     ▼               │
+      │   ┌───────────────────────────────────────────────────────────────────┐           │ index
+      │   │ PostgreSQL · sharded by member id                                 │           │ docs
+      │   │ profiles, invitations, edges, posts, jobs, outbox                 │           │
+      │   └─────────────────────────────┬─────────────────────────────────────┘           │
+      │                                 │ outbox relay                                    │
+      │                                 ▼                                                 │
+      │                     ┌───────────────────────────┐ profile, job events    ┌────────┴──────┐
+      └─────────────────────┤ Kafka · change events     ├───────────────────────▶│ Index workers │
+                            └───────────────────────────┘                        └───────────────┘
 ```
 
-**Response Shaping for Frontend:**
+1. **Accept (1).** The SPA sends the accept; the Graph Service locks the pair's row, flips it to connected and writes an outbox row in one transaction, and returns the new status. The relay publishes `pair.connected`, which updates in-memory adjacency and reaches other tabs and devices as a server-sent event.
+2. **Feed (2).** The Feed Service gets my connections from the Graph Service, reads each author's recent post ids from Redis, ranks, and returns a page plus a cursor that the SPA's infinite query passes back.
+3. **Search (3).** The Profile & Search API queries Elasticsearch; profile and job edits reach it through the outbox and index workers. If the cluster is down the API answers from PostgreSQL full-text and says so.
+
+| Layer | Choice | Why |
+|-------|--------|-----|
+| Browser | React SPA; TanStack Query for server state; URL for filters; one SSE stream per browser | The relationship is server-owned; the cache handles dedupe, retries and invalidation |
+| Public pages | Server-rendered profiles and job posts | Crawlers and anonymous first paint |
+| Graph Service | Invitations, degree, mutuals, PYMK serving; adjacency in RAM | Tightest latency budget; every service calls it |
+| Feed Service | Fan-out on read, ranked session snapshots | 58 posts/s don't justify 2.5B timeline writes a day |
+| PostgreSQL | Source of truth, sharded by member | One pair row per two members; transactions where correctness lives |
+| Kafka + workers | Outbox events to adjacency, index and other tabs | Derived data converges without dual writes |
+
+### Flow: Connect, across the wire
 
 ```
-┌───────────────────────────────────────────────────────────────────────────┐
-│              ConnectionDegreeResponse Structure                            │
-├───────────────────────────────────────────────────────────────────────────┤
-│  {                                                                         │
-│    userId: number,                                                         │
-│    degree: 1 | 2 | 3 | null,                                               │
-│    mutualConnections?: {                                                   │
-│      count: number,                                                        │
-│      sample: User[]   ──▶ First 3 for UI display                          │
-│    },                                                                      │
-│    path?: User[]      ──▶ Connection path for 2nd/3rd degree              │
-│  }                                                                         │
-└───────────────────────────────────────────────────────────────────────────┘
-
-┌───────────────────────────────────────────────────────────────────────────┐
-│              Connection Degree Handler Flow                                │
-├───────────────────────────────────────────────────────────────────────────┤
-│  1. Check 1st degree (direct connection)                                   │
-│     └── If connected ──▶ return { degree: 1 }                              │
-│                                                                            │
-│  2. Check 2nd degree (get mutuals)                                         │
-│     └── If mutuals exist ──▶ return { degree: 2, mutualConnections }       │
-│                                                                            │
-│  3. Check 3rd degree (find path with max depth 3)                          │
-│     └── If path found ──▶ return { degree: 3, path }                       │
-│                                                                            │
-│  4. No connection found ──▶ return { degree: null }                        │
-└───────────────────────────────────────────────────────────────────────────┘
+ Browser                       Graph API                      PostgreSQL    Redis
+    │                              │                               │          │
+    │ 1 cache: status = pending_sent                               │          │
+    │ 2 POST /invitations {to: B}  │                               │          │
+    │─────────────────────────────▶│                               │          │
+    │                              │ 3 lock pair, reverse invite?  │          │
+    │                              │──────────────────────────────▶│          │
+    │                              │ 4 sent | pending | connected  │          │
+    │                              │◀──────────────────────────────│          │
+    │                              │ 5 bump graph versions                    │
+    │                              │─────────────────────────────────────────▶│
+    │ 6 {outcome, status}          │                               │          │
+    │◀─────────────────────────────│                               │          │
+    │ 7 server status wins; refetch                                │          │
+    │                              │                               │          │
 ```
 
-### 2. Shared Type Definitions
+"Step 1 and step 7 are the two halves of the client's contract: show the expected state immediately, then replace it with whatever the server says. Steps 3–4 are the server's half: under the pair lock it finds out whether the other person already invited me — then it connects us instead of creating a second invitation — and it reports one of three outcomes. Step 5 bumps both members' graph versions so the next relationship read can't come from a stale cache."
+
+### Flow: opening a profile
 
 ```
-┌───────────────────────────────────────────────────────────────────────────┐
-│                    Shared Types (Frontend + Backend)                       │
-├───────────────────────────────────────────────────────────────────────────┤
-│  User                                                                      │
-│  ├── id, email, firstName, lastName                                        │
-│  ├── headline?, summary?, location?, industry?                             │
-│  ├── profileImageUrl?, bannerImageUrl?                                     │
-│  ├── connectionCount                                                       │
-│  ├── role: 'user' | 'recruiter' | 'admin'                                  │
-│  └── createdAt                                                             │
-├───────────────────────────────────────────────────────────────────────────┤
-│  Experience                                                                │
-│  ├── id, userId, companyId?, companyName                                   │
-│  ├── title, location?, startDate, endDate?                                 │
-│  ├── description?, isCurrent                                               │
-├───────────────────────────────────────────────────────────────────────────┤
-│  Skill                                                                     │
-│  ├── id, name, endorsementCount?                                           │
-├───────────────────────────────────────────────────────────────────────────┤
-│  Post                                                                      │
-│  ├── id, userId, author: User, content, imageUrl?                          │
-│  ├── likeCount, commentCount, shareCount, createdAt                        │
-├───────────────────────────────────────────────────────────────────────────┤
-│  Job                                                                       │
-│  ├── id, companyId, company: Company, title, description                   │
-│  ├── location?, isRemote, employmentType, experienceLevel                  │
-│  ├── yearsRequired?, salaryMin?, salaryMax?                                │
-│  ├── requiredSkills: Skill[], status, createdAt                            │
-├───────────────────────────────────────────────────────────────────────────┤
-│  PYMKCandidate                                                             │
-│  ├── user: User, score, mutualCount                                        │
-│  ├── sharedCompanies: string[]                                             │
-│  ├── sharedSchools: string[]                                               │
-│  └── sharedSkills: string[]                                                │
-└───────────────────────────────────────────────────────────────────────────┘
+ Browser                            Profile API    Graph Service                              Redis
+    │                                    │               │                                      │
+    │ 1 GET /profiles/B (public fields)  │               │                                      │
+    │───────────────────────────────────▶│               │                                      │
+    │ 2 GET /members/B/relationship                      │                                      │
+    │───────────────────────────────────────────────────▶│                                      │
+    │                                    │               │ 3 lists of A and B (versioned keys)  │
+    │                                    │               │─────────────────────────────────────▶│
+    │                                    │               │ 4 F(A), F(B) (miss: load, cache)     │
+    │                                    │               │◀─────────────────────────────────────│
+    │                                    │               │ 5 intersect, else bridge probe       │
+    │ 6 {degree: 3, status, path: A, x, y, B}            │                                      │
+    │◀───────────────────────────────────────────────────│                                      │
+    │ 7 header renders; button from status               │                                      │
+    │                                    │               │                                      │
 ```
 
-### 3. Connection Request Flow (Full-Stack)
+"The profile and the relationship are separate requests on purpose. The profile is public data that can be cached and server-rendered; the relationship is personal, cheap to compute, and may be slow or missing without breaking the page. The header renders the profile at once and the action area fills in when step 6 arrives."
 
-**Backend Handler:**
-
-```
-┌───────────────────────────────────────────────────────────────────────────┐
-│              POST /api/v1/connections/request                              │
-├───────────────────────────────────────────────────────────────────────────┤
-│  INPUT: { targetUserId, message? }                                         │
-├───────────────────────────────────────────────────────────────────────────┤
-│  VALIDATIONS                                                               │
-│  ├── Check not already connected ──▶ 400 "Already connected"              │
-│  └── Check no pending request ──▶ 400 "Request already pending"           │
-├───────────────────────────────────────────────────────────────────────────┤
-│  ACTIONS                                                                   │
-│  1. INSERT INTO connection_requests                                        │
-│     (from_user_id, to_user_id, message, status='pending')                  │
-│                                                                            │
-│  2. Queue notification via RabbitMQ                                        │
-│     { type: 'connection_request', userId: targetUserId, ... }              │
-│                                                                            │
-│  3. Audit log: 'connection.request.sent'                                   │
-├───────────────────────────────────────────────────────────────────────────┤
-│  RESPONSE: 201 with created request                                        │
-└───────────────────────────────────────────────────────────────────────────┘
-```
-
-**Frontend Component:**
+### Flow: searching while the search cluster is down
 
 ```
-┌───────────────────────────────────────────────────────────────────────────┐
-│                      ConnectButton Component                               │
-├───────────────────────────────────────────────────────────────────────────┤
-│  STATE: connectionStatus: 'none' | 'pending' | 'connected' | 'loading'    │
-├───────────────────────────────────────────────────────────────────────────┤
-│  ON MOUNT (useEffect)                                                      │
-│  ├── Get connection degree                                                 │
-│  │   └── degree === 1 ──▶ setConnectionStatus('connected')                 │
-│  └── Check pending request                                                 │
-│      └── pending exists ──▶ setConnectionStatus('pending')                 │
-├───────────────────────────────────────────────────────────────────────────┤
-│  RENDER                                                                    │
-│                                                                            │
-│  connectionStatus === 'connected':                                         │
-│  ├── [Check icon] "Connected" (gray text)                                  │
-│                                                                            │
-│  connectionStatus === 'pending':                                           │
-│  ├── [Clock icon] "Pending" (gray text)                                    │
-│                                                                            │
-│  connectionStatus === 'none' or 'loading':                                 │
-│  └── [Connect] button (blue, LinkedIn style)                               │
-│      └── onClick ──▶ optimistic 'loading' ──▶ API call                     │
-│          ├── Success: setConnectionStatus('pending')                       │
-│          └── Failure: setConnectionStatus('none')                          │
-└───────────────────────────────────────────────────────────────────────────┘
+ Browser              Search API               Elasticsearch   PostgreSQL              Indexer
+    │                      │                         │              │                     │
+    │ 1 GET /search?q=dev  │                         │              │                     │
+    │─────────────────────▶│                         │              │                     │
+    │                      │ 2 query, boost network  │              │                     │
+    │                      │────────────────────────▶│              │                     │
+    │                      │ 3 timeout -> breaker    │              │                     │
+    │                      │◀────────────────────────│              │                     │
+    │                      │ 4 full-text fallback                   │                     │
+    │                      │───────────────────────────────────────▶│                     │
+    │ 5 {users, source}    │                         │              │                     │
+    │◀─────────────────────│                         │              │                     │
+    ····································· meanwhile ·······································
+    │                      │                         │              │ 6 claim dirty rows  │
+    │                      │                         │              │◀────────────────────│
+    │                      │                         │ 7 rebuild doc, backoff             │
+    │                      │                         │◀───────────────────────────────────│
+    │                      │                         │              │                     │
 ```
 
-### 4. PYMK Integration
+"The breaker in step 3 means only the first request in a 30-second window pays the timeout; the rest go straight to PostgreSQL. The `source` field in step 5 is how the backend's degradation becomes visible in the UI. Meanwhile the indexer keeps retrying with backoff, so nothing written during the outage is lost."
 
-**Backend - PYMK Scoring:**
+---
 
-```
-┌───────────────────────────────────────────────────────────────────────────┐
-│                   GET /api/v1/pymk Handler                                 │
-├───────────────────────────────────────────────────────────────────────────┤
-│  1. Try cache first                                                        │
-│     └── valkey.get(`pymk:${userId}`) ──▶ if hit, return top N              │
-│                                                                            │
-│  2. Cache miss: compute PYMK                                               │
-│     ├── Get 2nd-degree connections                                         │
-│     ├── For each candidate: computePYMKScore()                             │
-│     ├── Sort by score descending                                           │
-│     └── Take top 100                                                       │
-│                                                                            │
-│  3. Cache for 1 hour                                                       │
-│     └── valkey.setex(`pymk:${userId}`, 3600, JSON.stringify(candidates))   │
-│                                                                            │
-│  4. Return top N (from query.limit, default 20)                            │
-└───────────────────────────────────────────────────────────────────────────┘
+## 💾 Data Model & API Contract (7 min)
 
-┌───────────────────────────────────────────────────────────────────────────┐
-│                   computePYMKScore Algorithm                               │
-├───────────────────────────────────────────────────────────────────────────┤
-│  Parallel fetch:                                                           │
-│  ├── getMutualConnections(userId, candidateId)                             │
-│  ├── getSharedCompanies(userId, candidateId)                               │
-│  ├── getSharedSchools(userId, candidateId)                                 │
-│  └── getSharedSkills(userId, candidateId)                                  │
-├───────────────────────────────────────────────────────────────────────────┤
-│  SCORING WEIGHTS                                                           │
-│  ├── Mutual connections: 10 points each                                    │
-│  ├── Same current company: 8 points                                        │
-│  ├── Same past company: 5 points                                           │
-│  ├── Same school: 5 points each                                            │
-│  └── Shared skills: 2 points each                                          │
-├───────────────────────────────────────────────────────────────────────────┤
-│  RETURN                                                                    │
-│  {                                                                         │
-│    total: sum of all weighted scores,                                      │
-│    mutualCount, sharedCompanies[], sharedSchools[], sharedSkills[]        │
-│  }                                                                         │
-└───────────────────────────────────────────────────────────────────────────┘
-```
+### Server side
 
-**Frontend - PYMK Display:**
+| Store | Table / key | Key columns | Notes |
+|-------|-------------|-------------|-------|
+| PostgreSQL | `member_pairs` | `(low_id, high_id)`, `state`, `requested_by`, `version` | Source of truth for invitations and connections; one row per two members |
+| PostgreSQL | `adjacency` | `(member_id, other_id)`, `connected_at` | Derived from pair events, two rows per connection |
+| PostgreSQL | `members`, `posts`, `jobs` | Member id, `(author_id, id)`, job id | Email is a private column, never in public projections |
+| PostgreSQL | `outbox` | `id`, `topic`, `key`, `payload` | Same transaction as the change |
+| Redis | `graph:ver:{member}`, `rel:…:{vA}:{vB}` | Version counters, cached relationships | Versioned keys instead of deletes |
+| Redis | `pymk:{member}`, `posts:recent:{author}` | Precomputed lists | Filtered or merged at read time |
+| Elasticsearch | `people`, `jobs` | Rebuilt documents | Derived from rows by workers |
+
+### Client side
+
+| Cache key | Holds | Invalidated by |
+|-----------|-------|----------------|
+| `['relationship', memberId]` | `degree`, `status`, `requestId`, `mutualCount`, `path` | Any connection mutation on that member; `pair.*` events |
+| `['invitations']` | Received invitations | Accept, decline, `invitation.received` events |
+| `['pymk']` | Suggestions with reasons | Connect from a card; `pair.connected` |
+| `['feed']` | Pages with `nextCursor` | Time (2 min) and the "New posts" pill |
+| `['search', q, filters]` | Hits and `source` | Time (1 min) |
+
+### The contract
 
 ```
-┌───────────────────────────────────────────────────────────────────────────┐
-│                       PYMKSection Component                                │
-├───────────────────────────────────────────────────────────────────────────┤
-│  STATE                                                                     │
-│  ├── candidates: PYMKCandidate[]                                           │
-│  └── loading: boolean                                                      │
-├───────────────────────────────────────────────────────────────────────────┤
-│  ON MOUNT                                                                  │
-│  └── pymkApi.getRecommendations(20) ──▶ setCandidates                      │
-├───────────────────────────────────────────────────────────────────────────┤
-│  handleConnect(candidateId)                                                │
-│  ├── connectionsApi.sendRequest(candidateId)                               │
-│  └── Remove candidate from list (optimistic removal)                       │
-├───────────────────────────────────────────────────────────────────────────┤
-│  RENDER                                                                    │
-│  ┌─────────────────────────────────────────────────────────────────────┐  │
-│  │  "People you may know"                                               │  │
-│  │  ┌────────────────┐ ┌────────────────┐ ┌────────────────┐           │  │
-│  │  │  ┌──────────┐  │ │  ┌──────────┐  │ │  ┌──────────┐  │           │  │
-│  │  │  │  Avatar  │  │ │  │  Avatar  │  │ │  │  Avatar  │  │           │  │
-│  │  │  └──────────┘  │ │  └──────────┘  │ │  └──────────┘  │           │  │
-│  │  │  Name          │ │  Name          │ │  Name          │           │  │
-│  │  │  Headline      │ │  Headline      │ │  Headline      │           │  │
-│  │  │  "X mutual"    │ │  "Worked at X" │ │  "Attended X"  │           │  │
-│  │  │  [Connect]     │ │  [Connect]     │ │  [Connect]     │           │  │
-│  │  └────────────────┘ └────────────────┘ └────────────────┘           │  │
-│  └─────────────────────────────────────────────────────────────────────┘  │
-└───────────────────────────────────────────────────────────────────────────┘
-
-┌───────────────────────────────────────────────────────────────────────────┐
-│                       PYMKCard "Reason" Logic                              │
-├───────────────────────────────────────────────────────────────────────────┤
-│  Priority order for display reason:                                        │
-│  1. mutualCount > 0 ──▶ "X mutual connections"                             │
-│  2. sharedCompanies.length > 0 ──▶ "Worked at [first company]"             │
-│  3. sharedSchools.length > 0 ──▶ "Attended [first school]"                 │
-│  4. None of above ──▶ no reason displayed                                  │
-└───────────────────────────────────────────────────────────────────────────┘
+POST   /api/v1/invitations                {to, message?} → {outcome, status, invitation}
+POST   /api/v1/invitations/{id}/accept    → {status, changed}   (/decline, /withdraw)
+DELETE /api/v1/connections/{memberId}     → {removed}
+GET    /api/v1/members/{id}/relationship  → {degree, status, request_id, mutual_count, path}
+GET    /api/v1/pymk?limit=20              → {candidates[{member, reasons}]}
+GET    /api/v1/feed?cursor=               → {posts, next_cursor}
+GET    /api/v1/search/people?q=           → {hits, source}
+GET    /api/v1/events                     text/event-stream with Last-Event-ID
 ```
 
-### 5. Feed Ranking Integration
+| Contract element | The server guarantees | The client relies on it to |
+|------------------|----------------------|----------------------------|
+| `outcome` (`sent`, `already_pending`, `connected`) | Says what the write did; repeating it is safe | Retry blindly and show the right state after a crossing invitation |
+| `status` | Invitation state between the two members | Pick the button: Connect, Pending, Accept/Ignore, Connected |
+| `degree` + `path` | Distance and one shortest chain, computed after the last committed change | Render the badge and the "how you're connected" line |
+| `changed` | Whether the transition happened now or earlier | Skip the success toast on a duplicate accept |
+| Public projections | No email or contact details outside your own profile | Render any member card without leaking data |
+| `next_cursor` | Names a ranked snapshot and a position | Infinite scroll without repeats or gaps |
+| `source` | Which engine answered the search | Say "results may be incomplete" when degraded |
+| Event ids | Monotonic per member; replay after `Last-Event-ID` | Catch up after sleep or a network change |
 
-**Backend - Feed Generation:**
+---
 
-```
-┌───────────────────────────────────────────────────────────────────────────┐
-│                   GET /api/v1/feed Handler                                 │
-├───────────────────────────────────────────────────────────────────────────┤
-│  QUERY PARAMS: offset (default 0), limit (default 20)                      │
-├───────────────────────────────────────────────────────────────────────────┤
-│  SQL QUERY (with CTE for connections)                                      │
-│                                                                            │
-│  WITH user_connections AS (                                                │
-│    SELECT connected_to AS conn_id FROM connections WHERE user_id = $1      │
-│    UNION                                                                   │
-│    SELECT user_id AS conn_id FROM connections WHERE connected_to = $1      │
-│  )                                                                         │
-│  SELECT p.*, u.first_name, u.last_name, ...                                │
-│                                                                            │
-│  RANKING FORMULA:                                                          │
-│  ┌─────────────────────────────────────────────────────────────────────┐  │
-│  │  rank_score =                                                        │  │
-│  │    like_count * 0.3                    (engagement)                  │  │
-│  │  + comment_count * 0.5                 (engagement)                  │  │
-│  │  + (is_connection ? 15 : 0)            (relationship boost)          │  │
-│  │  + (1 / (1 + hours_since_post)) * 10   (recency decay)               │  │
-│  └─────────────────────────────────────────────────────────────────────┘  │
-│                                                                            │
-│  WHERE: posts from connections OR own posts                                │
-│  ORDER BY: rank_score DESC                                                 │
-│  LIMIT: $limit OFFSET: $offset                                             │
-├───────────────────────────────────────────────────────────────────────────┤
-│  RESPONSE: { posts: Post[], hasMore: boolean }                             │
-└───────────────────────────────────────────────────────────────────────────┘
-```
+## 🔧 Deep Dive 1: Connecting Two People (8 min)
 
-**Frontend - Infinite Scroll Feed:**
+"The scenario: Alice clicks Connect on Ethan's profile on a flaky train connection, the request times out, she clicks again — and Ethan, at the same moment, clicks Connect on Alice's profile. Without care we create two crossing invitations, inflate counters, or show Alice an error for something that worked."
 
-```
-┌───────────────────────────────────────────────────────────────────────────┐
-│                       FeedPage Component                                   │
-├───────────────────────────────────────────────────────────────────────────┤
-│  STATE                                                                     │
-│  ├── posts: Post[]                                                         │
-│  ├── loading: boolean (initial load)                                       │
-│  ├── loadingMore: boolean (infinite scroll)                                │
-│  └── hasMore: boolean                                                      │
-├───────────────────────────────────────────────────────────────────────────┤
-│  INFINITE SCROLL (IntersectionObserver)                                    │
-│  ├── observerRef watches loadMoreRef element                               │
-│  ├── When visible & hasMore & !loadingMore ──▶ loadPosts(posts.length)    │
-│  └── Cleanup: observerRef.disconnect()                                     │
-├───────────────────────────────────────────────────────────────────────────┤
-│  handleLike (optimistic update)                                            │
-│  1. Immediate UI: increment likeCount                                      │
-│  2. API call: feedApi.likePost(postId)                                     │
-│  3. On error: decrement likeCount (rollback)                               │
-├───────────────────────────────────────────────────────────────────────────┤
-│  RENDER                                                                    │
-│  ┌─────────────────────────────────────────────────────────────────────┐  │
-│  │  <CreatePostCard onPostCreated={(post) => prepend to posts} />       │  │
-│  │                                                                       │  │
-│  │  posts.map((post) => <PostCard post={post} onLike={handleLike} />)   │  │
-│  │                                                                       │  │
-│  │  <div ref={loadMoreRef}>                                              │  │
-│  │    {loadingMore && <Spinner />}                                       │  │
-│  │  </div>                                                               │  │
-│  └─────────────────────────────────────────────────────────────────────┘  │
-└───────────────────────────────────────────────────────────────────────────┘
-```
+**Browser.** The mutation snapshots `['relationship', ethan]`, writes `pending_sent`, and sends. On success it writes the server's `status` (which may be `connected`), invalidates `['pymk']`, and refetches the relationship to pick up the new path. On error it restores the snapshot and announces the message (`429` shows the retry time). A retry after a timeout is safe because the server's answer to a duplicate is `already_pending`, not an error.
 
-### 6. Job Matching Integration
+**Server.** One transaction: lock the pair `(low, high)`; if they're already connected answer `409 already_connected`; if Ethan has a pending invitation to Alice, accept it — counters move once, the outbox row is written — and answer `outcome: connected`; otherwise insert or re-open Alice's invitation, or report `already_pending`. Accepts use a compare-and-set on `state = 'pending'`, so twenty concurrent accepts produce one change and nineteen `changed: false` responses.
 
-**Backend - Job Match Score:**
+**After commit.** Both members' graph versions are bumped before the response goes out, so Alice's next relationship read can't come from a cache filled a moment before. The outbox event updates adjacency and reaches Ethan's open tabs, which invalidate their `['relationship', alice]`.
 
-```
-┌───────────────────────────────────────────────────────────────────────────┐
-│              GET /api/v1/jobs/:id/match-score Handler                      │
-├───────────────────────────────────────────────────────────────────────────┤
-│  Parallel fetch: [job with skills, user with details]                      │
-├───────────────────────────────────────────────────────────────────────────┤
-│  SCORING BREAKDOWN                                                         │
-│                                                                            │
-│  ┌────────────────────────────────────────────────────────────────────┐   │
-│  │ SKILL SCORE (max 40 points)                                         │   │
-│  │ (matchedSkills.length / requiredSkills.length) * 40                 │   │
-│  │                                                                      │   │
-│  │ EXPERIENCE SCORE (max 25 points)                                    │   │
-│  │ 25 - (abs(job.yearsRequired - user.yearsExperience) * 5)            │   │
-│  │                                                                      │   │
-│  │ LOCATION SCORE (15 points)                                          │   │
-│  │ job.isRemote || user.location === job.location ? 15 : 0             │   │
-│  │                                                                      │   │
-│  │ NETWORK SCORE (10 points)                                           │   │
-│  │ hasConnectionAtCompany(userId, job.companyId) ? 10 : 0              │   │
-│  └────────────────────────────────────────────────────────────────────┘   │
-│                                                                            │
-│  total = skillScore + expScore + locationScore + networkScore             │
-├───────────────────────────────────────────────────────────────────────────┤
-│  RESPONSE                                                                  │
-│  {                                                                         │
-│    jobId,                                                                  │
-│    matchScore: Math.round(total),                                          │
-│    breakdown: {                                                            │
-│      skills: { score, matched[], missing[] },                              │
-│      experience: { score },                                                │
-│      location: { score },                                                  │
-│      network: { score }                                                    │
-│    }                                                                       │
-│  }                                                                         │
-└───────────────────────────────────────────────────────────────────────────┘
-```
+| Approach | Verdict |
+|----------|---------|
+| ✅ Optimistic client + idempotent outcomes + pair lock | Instant, correct under retries, double clicks and crossing invitations |
+| ❌ Client-side dedupe (disable the button) | Prevents double clicks, not timeouts, refreshes, other tabs or the other person |
+| ❌ Idempotency-Key header per click | Dedupes Alice's retries but not Ethan's crossing invitation; the pair row already is the natural key |
+| ❌ Unique constraint and surface the error | Turns a retry into a red error banner for an action that succeeded |
 
-**Frontend - Job Card with Match Score:**
+"What I give up: a lock per pair, which serializes only operations between the same two people — fine — and a slightly richer response shape that both sides must keep in sync. I'd generate the client types from the API schema so `outcome` and `status` can't drift."
 
-```
-┌───────────────────────────────────────────────────────────────────────────┐
-│                       JobCard Component                                    │
-├───────────────────────────────────────────────────────────────────────────┤
-│  STATE: matchScore: JobMatchScore | null                                   │
-│  ON MOUNT: jobsApi.getMatchScore(job.id) ──▶ setMatchScore                │
-├───────────────────────────────────────────────────────────────────────────┤
-│  RENDER                                                                    │
-│  ┌─────────────────────────────────────────────────────────────────────┐  │
-│  │  ┌───────┐  Job Title (LinkedIn blue, link)     ┌────────────────┐  │  │
-│  │  │ Logo  │  Company Name                        │  75%           │  │  │
-│  │  │       │  Location (Remote)                   │  match         │  │  │
-│  │  └───────┘                                      │  (color coded) │  │  │
-│  │                                                  └────────────────┘  │  │
-│  │  Skills: [React] [TypeScript] [Node.js] [GraphQL]                   │  │
-│  │          ^^^^^^^^ green ^^^^^^^^         ^^^ gray ^^^                │  │
-│  │          (matched)                       (missing)                   │  │
-│  │                                                                       │  │
-│  │  Posted 3 days ago                              [Apply]              │  │
-│  └─────────────────────────────────────────────────────────────────────┘  │
-│                                                                            │
-│  Match score colors:                                                       │
-│  ├── >= 70: text-green-600                                                 │
-│  ├── >= 40: text-yellow-600                                                │
-│  └── < 40:  text-gray-400                                                  │
-└───────────────────────────────────────────────────────────────────────────┘
-```
+---
 
-### 7. Session Management
+## 🔧 Deep Dive 2: "How You're Connected" (7 min)
 
-**Backend Middleware:**
+"The decision: one relationship endpoint that returns distance and invitation state separately, computed by a bidirectional search, cached with versions on the server and invalidated by events on the client."
 
-```
-┌───────────────────────────────────────────────────────────────────────────┐
-│                    Session Configuration                                   │
-├───────────────────────────────────────────────────────────────────────────┤
-│  express-session with connect-pg-simple                                    │
-│                                                                            │
-│  Cookie settings:                                                          │
-│  ├── secure: true (production)                                             │
-│  ├── httpOnly: true                                                        │
-│  ├── sameSite: 'strict'                                                    │
-│  └── maxAge: 7 days                                                        │
-└───────────────────────────────────────────────────────────────────────────┘
+**Why two fields.** Degree is graph distance; status is the invitation state between the two members. They're independent: a 3rd-degree stranger can have invited me (`pending_received`, Accept and Ignore buttons), and someone 2nd degree can be someone I already invited (`pending_sent`, a Pending button with Withdraw). Early versions of this kind of UI derive the button from the degree and end up offering Connect to someone who invited you, which fails with a confusing error.
 
-┌───────────────────────────────────────────────────────────────────────────┐
-│                    requireAuth Middleware                                  │
-├───────────────────────────────────────────────────────────────────────────┤
-│  if (!req.session.userId) ──▶ 401 Unauthorized                             │
-│  else ──▶ next()                                                           │
-└───────────────────────────────────────────────────────────────────────────┘
+**Server.** Read both first-degree sets (about 500 ids each, from in-memory adjacency or a versioned cache). If they intersect, the answer is 2nd degree, and the intersection gives the mutual count and the middle of the path. If not, expand the smaller side one hop (~500 lookups, batched) and look for a hit — that's the 3rd-degree path A → x → y → B. Hub members are capped by a budget. Path members are returned as public summaries (name, headline, avatar), never with contact details.
 
-┌───────────────────────────────────────────────────────────────────────────┐
-│                    POST /api/v1/auth/login                                 │
-├───────────────────────────────────────────────────────────────────────────┤
-│  1. Get user by email                                                      │
-│  2. Verify password with bcrypt.compare                                    │
-│  3. Failed ──▶ auditLog + 401 Invalid credentials                          │
-│  4. Success:                                                               │
-│     ├── Set session: userId, email, role                                   │
-│     ├── auditLog('auth.login.success')                                     │
-│     └── Return user object (no password hash)                              │
-└───────────────────────────────────────────────────────────────────────────┘
+**Client.** `['relationship', id]` never goes stale on a timer; it's invalidated by mutations and by `pair.*` events. The `ConnectionPath` component renders "You → Bob → Ethan" with links and nothing for 1st degree; out of network shows "Outside your network" instead of a badge.
 
-┌───────────────────────────────────────────────────────────────────────────┐
-│                    GET /api/v1/auth/me                                     │
-├───────────────────────────────────────────────────────────────────────────┤
-│  1. requireAuth middleware                                                 │
-│  2. Get user by session.userId                                             │
-│  3. If user not found ──▶ destroy session, 401                             │
-│  4. Return user object                                                     │
-└───────────────────────────────────────────────────────────────────────────┘
-```
+| Approach | Verdict |
+|----------|---------|
+| ✅ Separate `degree` and `status`, bidirectional search | Right button in every case; two lookups for most views |
+| ❌ Button derived from degree | Offers Connect to people who already invited you |
+| ❌ Precomputed second-degree sets | ~30 trillion stored ids, stale after every new edge in the neighborhood |
+| ❌ Client computes degree from connection lists | Needs other members' connection lists — a privacy leak and megabytes per view |
 
-**Frontend Auth Store:**
+"What I give up: a second request per profile view and real graph work on the server. It's cheap in the common case, and isolating it means a slow graph partition costs a badge, not the page."
 
-```
-┌───────────────────────────────────────────────────────────────────────────┐
-│                    useAuthStore (Zustand)                                  │
-├───────────────────────────────────────────────────────────────────────────┤
-│  STATE                                                                     │
-│  ├── user: User | null                                                     │
-│  ├── isAuthenticated: boolean                                              │
-│  └── isLoading: boolean (default: true)                                    │
-├───────────────────────────────────────────────────────────────────────────┤
-│  ACTIONS                                                                   │
-│                                                                            │
-│  checkSession:                                                             │
-│  ├── api.get('/auth/me')                                                   │
-│  ├── Success ──▶ set user, isAuthenticated=true, isLoading=false           │
-│  └── Error ──▶ set user=null, isAuthenticated=false, isLoading=false       │
-│                                                                            │
-│  login(email, password):                                                   │
-│  ├── api.post('/auth/login', { email, password })                          │
-│  └── set user, isAuthenticated=true                                        │
-│                                                                            │
-│  logout:                                                                   │
-│  ├── api.post('/auth/logout')                                              │
-│  └── set user=null, isAuthenticated=false                                  │
-└───────────────────────────────────────────────────────────────────────────┘
+---
 
-┌───────────────────────────────────────────────────────────────────────────┐
-│                    RootLayout Component                                    │
-├───────────────────────────────────────────────────────────────────────────┤
-│  ON MOUNT                                                                  │
-│  └── checkSession()                                                        │
-│                                                                            │
-│  RENDER                                                                    │
-│  ├── isLoading ──▶ <FullPageSpinner />                                     │
-│  └── else ──▶ <Outlet />                                                   │
-└───────────────────────────────────────────────────────────────────────────┘
-```
+## 🔧 Deep Dive 3: Search That Degrades Instead of Failing (6 min)
 
-## Trade-offs Summary
+"The decision: profile and job edits reach Elasticsearch through a transactional outbox; when the cluster is unavailable, search answers from PostgreSQL full-text and the response says so."
 
-| Decision | Chosen | Alternative | Rationale |
-|----------|--------|-------------|-----------|
-| API style | REST | GraphQL | Simpler for defined queries, GraphQL adds complexity |
-| Session storage | PostgreSQL | Redis/Valkey | One less service, sufficient for scale |
-| State management | Zustand | Redux | Simpler API, less boilerplate |
-| Type sharing | Shared types file | Code generation | Manual is sufficient for project size |
-| Feed loading | Infinite scroll | Pagination | Better UX for social content |
-| Match scoring | Real-time compute | Precomputed | Scores update as user adds skills |
-| PYMK caching | 1-hour TTL | Real-time | Balance freshness vs. performance |
+**Write side.** Saving a profile commits the row and an outbox entry together, then returns — the request never waits on Elasticsearch. Workers claim entries (`FOR UPDATE SKIP LOCKED`, so several can run), rebuild the document from the current rows — profile, skills, companies — index it, and delete the entry only if nobody re-dirtied it meanwhile. Failures back off from seconds to minutes. Because each document is rebuilt from the source of truth, retries and out-of-order processing still converge.
 
-## Future Enhancements
+**Read side.** A breaker stops calling Elasticsearch for 30 s after a connection failure or timeout. During that window the API queries generated full-text columns in PostgreSQL with GIN indexes — exact and prefix matches on names and headlines, no typo tolerance — and returns `source: postgres`.
 
-1. **WebSocket for real-time**: Live notifications for connection requests and post engagement
-2. **GraphQL API**: Consider for complex nested queries (profile + connections + posts)
-3. **Optimistic UI everywhere**: Immediate feedback for all social actions
-4. **Service worker**: Offline profile viewing and post drafts
-5. **Type generation**: Auto-generate frontend types from OpenAPI spec
-6. **A/B testing framework**: Tune PYMK weights and feed ranking
-7. **Analytics pipeline**: Track feature engagement for optimization
-8. **Rate limiting feedback**: Show users when they're approaching limits
+**Client.** Typeahead debounces 200 ms, aborts the previous request with an `AbortController`, caches by normalized query and keeps the query in the URL. When `source` is `postgres`, it shows "Results may be incomplete" under the box.
+
+| Approach | Verdict |
+|----------|---------|
+| ✅ Outbox + rebuild from rows + fallback with `source` | Edits never fail on search; index converges; search degrades visibly |
+| ❌ Dual write in the request | An Elasticsearch timeout fails a profile edit that already committed; the retry then hits "email already exists" on sign-up |
+| ❌ Async message published after commit | A crash between commit and publish loses the update silently |
+| ❌ Return 503 when the cluster is down | Search is how people find each other; partial results beat none |
+
+"What I give up: up to 30 seconds of index lag in normal operation, a worker fleet to watch, and a fallback that is noticeably worse — which is exactly why the UI tells the member."
+
+---
+
+## 📈 Failures & Scale (3 min)
+
+| Failure | What the member sees | Mitigation |
+|---------|----------------------|------------|
+| Graph partition down | Profiles without the badge or path; actions still work | Replicas; the relationship query has its own timeout |
+| Kafka or edge consumer lag | Other tabs update late; third parties see old adjacency | Outbox drains on recovery; the accepting member already has the new status |
+| SSE stream lost | Changes from other devices appear on navigation | Reconnect with `Last-Event-ID`; fall back to polling the badge every 60 s |
+| Elasticsearch down | "Results may be incomplete" | Breaker + PostgreSQL full-text; outbox retries |
+| Invitation rate limit | "Try again in 3 minutes" on Connect | `429` + `Retry-After`; per-member token bucket |
+| Shard primary down | Connect and post fail with a retry message; reading works | Replica promotion; reads from replicas and caches |
+
+**What breaks first as we grow:** hub members in degree checks (expand the smaller side, cap the budget), feed candidate gathering (batched multi-gets, capped lists), the PYMK batch window (partition by member, nearline recompute), and, on the client, memory on marathon feed sessions (keep ~20 pages of data, drop older pages but keep their cursors).
+
+---
+
+## ⚖️ Trade-offs & Wrap-up (2 min)
+
+| Decision | ✅ Chosen | ❌ Alternative | Why |
+|----------|-----------|----------------|-----|
+| Invitation writes | Idempotent outcomes under a pair lock | Client dedupe or idempotency keys | Covers retries, other tabs and the other person |
+| Connect UI | Optimistic, server status wins | Spinner, or boolean optimism | Instant and correct after crossing invitations |
+| Relationship API | `degree` and `status` separately | Button derived from degree | Right action for every invitation state |
+| Degree | Bidirectional search, versioned caches | Precomputed second-degree sets | Exact, fresh, two lookups in the common case |
+| Search sync | Outbox, rebuild from rows | Dual write | Edits never fail on the index |
+| Search outage | PostgreSQL fallback + `source` | Error page | Degraded and honest beats broken |
+| Live updates | SSE events invalidate cache keys | Polling | Convergence in seconds at one connection per browser |
+
+"With more time: privacy controls that hide connection lists from degree paths, invitation abuse controls ('I don't know this person' lowering a sender's limit), and schema-generated client types so the contract above is checked at build time."

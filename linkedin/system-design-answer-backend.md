@@ -1,351 +1,339 @@
-# LinkedIn - System Design Answer (Backend Focus)
+# 💼 LinkedIn (Professional Network) — System Design Answer (Backend Focus)
 
-*45-minute system design interview format - Backend Engineer Position*
+*45-minute backend interview. This is a proposed production design; what this repository actually runs is described in [architecture.md → Implementation Notes](./architecture.md#implementation-notes).*
 
-## 📋 Problem Statement
+> "Profiles, posts and job listings are ordinary CRUD. What makes LinkedIn hard is the connection graph: about 50 billion mutual-consent edges, a 'how are you connected?' question inside every profile view, and PYMK and the feed both walking that graph. So I'll spend most of the time on two things — storing the graph so a connection can never be one-sided, and reading it so we never enumerate someone's 250,000-person second-degree network while a user waits."
 
-Design the backend for LinkedIn: professional profiles, a mutual-consent connection graph, a ranked feed, People You May Know, and job matching. The defining characteristic of this system is that its hardest queries are **graph queries** — "who are my 2nd-degree connections," "how many mutual connections do we share," "who should I connect with next" — executed against a graph of 900M nodes and 100B edges, at interactive latency, on infrastructure that is mostly a relational database plus caches.
+| Phase | Time | What I want the interviewer to leave with |
+|-------|------|--------------------------------------------|
+| Requirements & scale | 5 min | Scope, targets, and the numbers that shape the graph |
+| High-level architecture | 10 min | One overview, then accept, degree and PYMK flows |
+| Data model & API | 7 min | Pair rows, derived adjacency, idempotent invitation API |
+| Deep dive 1: storing the graph | 8 min | Pair row as truth, directed adjacency as an index |
+| Deep dive 2: degree of separation | 7 min | Bidirectional search instead of precomputing |
+| Deep dive 3: feed fan-out | 5 min | Pull beats push at LinkedIn's read/write ratio |
+| Scale, failures, wrap-up | 3 min | What breaks first; the trade-offs I made |
 
-I want to spend the interview on the three problems that dominate the design: connection-degree computation, PYMK, and feed ranking — because each one forces a different answer to the same underlying question: *compute at write time, compute at read time, or precompute in batch?*
+---
 
-Clarifying questions I'd ask before committing to an architecture: Is a connection request a one-sided follow or mutual-consent (mutual — this shapes the whole graph as undirected)? Does the feed need to reflect a brand-new post within seconds, or is "within a minute or two" acceptable (the latter — this is what licenses aggressive caching)? Is PYMK a core growth lever worth dedicated infrastructure, or a nice-to-have (core — LinkedIn's growth is famously network-effect-driven, so PYMK quality is a business metric, not a cosmetic feature)?
+## 🎯 Requirements & Scale (5 min)
 
-## 🎯 Requirements Clarification
+"Let me pin down scope, because 'LinkedIn' covers a dozen products."
 
-### Functional Requirements
+### Functional requirements
 
-- **Profiles**: professional history — experience, education, normalized skills with endorsements
-- **Connections**: request → accept/decline lifecycle; mutual consent; view 1st/2nd/3rd degree
-- **Feed**: posts from connections, ranked by relevance and engagement, with likes and comments
-- **PYMK**: multi-signal recommendations drawn from the 2nd-degree network
-- **Jobs**: listings, applications, candidate-job match scoring
-- **Search**: people and jobs with fuzzy matching and relevance ranking
+1. **Connections**: send, accept, decline and withdraw invitations; remove a connection; list my connections.
+2. **Degree and path**: every profile shows 1st, 2nd or 3rd degree, the number of mutual connections, and one "how you're connected" chain.
+3. **People You May Know**: ranked suggestions with reasons ("12 mutual connections", "Both worked at DataFlow").
+4. **Feed**: ranked posts from my connections, with likes and comments.
+5. **Profiles, search and jobs**: profile CRUD, people and job search, job applications.
 
-### Non-Functional Requirements
+Out of scope: messaging, company page administration, ads and the recruiter product.
 
-- **Latency**: feed < 200ms p99; PYMK < 500ms p99
-- **Availability**: 99.9% — a professional network tolerates brief degradation better than data loss
-- **Consistency**: strong for connection state (an accepted connection must be immediately symmetric); eventual for feed, PYMK, and search
-- **Abuse resistance**: connection-request spam is an existential product threat; rate limiting is a feature, not plumbing
+### Non-functional requirements
 
-These three requirements sit in tension: strong consistency for connections means the accept path cannot be casually async, low PYMK latency means the recommendation engine cannot be naively real-time, and 99.9% availability means every one of these subsystems needs an explicit degraded mode rather than an implicit crash. The rest of this answer is largely about resolving that tension per subsystem.
+| Requirement | Target | Why |
+|-------------|--------|-----|
+| Degree computation | p99 < 50 ms | It runs inside every profile view |
+| Feed first page | p99 < 250 ms | The landing page |
+| Invite / accept | p99 < 300 ms; both members see it within 1 s | A connection must never look one-sided |
+| PYMK serving | p99 < 100 ms; new connections reflected in minutes | Growth feature; staleness is visible when it suggests existing connections |
+| Search freshness | Profile edits searchable within 30 s | People edit, then search themselves |
+| Availability | 99.95% reads, 99.9% writes | Reads can degrade; writes can retry |
 
-### Scale Estimates
+### Capacity estimate
 
-| Quantity | Estimate | Implication |
+| Quantity | Estimate | Consequence |
 |----------|----------|-------------|
-| Users | 900M total, 100M DAU | Graph has ~900M nodes |
-| Connections | 100B edges, ~500 avg/active user | ~200 GB as adjacency lists — fits in memory across a modest cluster |
-| Feed reads | 1.5B/day → ~17,400 QPS | The dominant read path; must be cache-friendly |
-| PYMK views | 200M/day → ~2,300 QPS | Expensive to compute → must be precomputed or cached |
-| New posts | 5M/day → ~58/sec | Write volume is trivial; read amplification is the problem |
-| Search | 50M/day → ~580 QPS | Dedicated search infrastructure, not the OLTP database |
+| Members | 900M, 100M daily active | Shard everything by member id |
+| Edges | ~50B pairs = 100B adjacency entries | ~800 GB of ids, ~5 TB of RAM with overhead and 3 replicas |
+| Average connections | ~500 for active members | Second-degree network ≈ 250K before overlap |
+| Profile views | ~1B/day → 12K/s, ~35K/s peak | Degree must be two lookups in the common case |
+| Feed loads | 1.5B/day → 17K/s, ~50K/s peak | ~500 authors per load → 8.5M list reads/s |
+| Posts | 5M/day → 58/s | Push would be 2.5B timeline writes a day |
+| Invitations | ~20M/day → 230/s; accepts ~115/s | Writes are tiny; correctness is the problem |
 
-The asymmetry to notice: post *writes* are 58/sec while feed *reads* are 17,400/sec — a 300:1 read amplification. That ratio drives the feed architecture decision later.
+"Two numbers drive the design. The graph is 100 billion adjacency entries — too big for one machine, small enough for RAM across forty. And a second-degree network is about 250,000 people, which tells me any algorithm that enumerates it per request is dead on arrival."
 
-A second asymmetry worth flagging up front: PYMK computation is roughly two orders of magnitude more expensive per request than a feed read (graph expansion versus an indexed query), yet its QPS is nearly an order of magnitude lower. Those two facts together are what make PYMK a batch problem and feed a cache problem, rather than both landing on the same solution.
+---
 
-## 🏗️ High-Level Architecture
+## 🏗️ High-Level Architecture (10 min)
 
-```
-┌───────────────────────────────────────────────────────────────────┐
-│                      Clients (web / mobile)                       │
-└───────────────────────────────┬───────────────────────────────────┘
-                                │
-                     ┌──────────▼──────────┐
-                     │  API Gateway / LB   │
-                     │  auth · rate limits │
-                     └──────────┬──────────┘
-        ┌───────────────┬───────┴───────┬────────────────┐
-        │               │               │                │
-┌───────▼──────┐ ┌──────▼───────┐ ┌─────▼────────┐ ┌─────▼───────┐
-│   Profile    │ │  Connection  │ │    Feed      │ │    Job      │
-│   Service    │ │  Service     │ │   Service    │ │   Service   │
-│ CRUD, skills │ │ requests,    │ │ posts, rank, │ │ listings,   │
-│ experience   │ │ degrees, PYMK│ │ likes, cmts  │ │ match, apply│
-└───────┬──────┘ └──────┬───────┘ └─────┬────────┘ └─────┬───────┘
-        │               │               │                │
-        └───────┬───────┴───────┬───────┴───────┬────────┘
-                │               │               │
-     ┌──────────▼───┐  ┌────────▼───────┐  ┌────▼─────────────┐
-     │  PostgreSQL  │  │  Valkey/Redis  │  │  Elasticsearch   │
-     │ users, graph,│  │ sessions, conn │  │ people + job     │
-     │ posts, jobs  │  │ cache, PYMK,   │  │ indices          │
-     │              │  │ feed, limits   │  │                  │
-     └──────────────┘  └────────────────┘  └──────────────────┘
-                │
-     ┌──────────▼──────────┐        ┌──────────────────────┐
-     │ Message queue       │───────▶│ Workers: PYMK batch, │
-     │ (RabbitMQ → Kafka   │        │ search indexing,     │
-     │  at scale)          │        │ notifications        │
-     └─────────────────────┘        └──────────────────────┘
-```
-
-At full production scale, the connection store graduates from PostgreSQL to a dedicated in-memory graph service (LinkedIn built LIquid for exactly this), and the queue graduates to Kafka for event streaming. The service decomposition stays the same; the storage under the Connection Service is the piece that gets replaced — which is why it sits behind its own service boundary from day one.
-
-## 💾 Data Model
-
-Described as prose tables — the shapes matter more than DDL.
-
-| Table | Key columns | Notable design points |
-|-------|-------------|----------------------|
-| users | id, email (unique), name, headline, location, industry, connection_count, role | connection_count is denormalized — it renders on every profile, card, and PYMK suggestion; counting rows in a 100B-edge table per view is a non-starter |
-| connections | (user_id, connected_to) composite PK, connected_at | Canonical ordering: smaller ID always first, enforced by a check constraint — each edge stored exactly once |
-| connection_requests | from_user, to_user, message, status; unique per pair | Status machine: pending → accepted / declined / withdrawn |
-| skills + user_skills | skill catalog; junction with endorsement_count | Normalized so "JavaScript" and "JS" cannot fragment PYMK and job matching |
-| experiences / education | user_id FK, company_id FK, dates, is_current | company_id links the employment graph that PYMK and job matching traverse |
-| posts | id, user_id, content, like_count, comment_count, created_at | Counts denormalized; indexed (user_id, created_at desc) for feed pulls |
-| post_likes | (user_id, post_id) composite PK | PK makes likes naturally idempotent; count derived from rows, not incremented |
-| jobs + job_skills | company_id, title, level, years_required; skills flagged required/optional | Required-vs-optional flag feeds the match score |
-| job_applications | (job_id, user_id) unique, match_score 0–100 | Score stored at apply time for recruiter-side sorting |
-
-**The canonical-edge decision deserves a beat.** Storing each connection once as (smaller_id, larger_id) instead of two directed rows halves the table — at 100B edges that is 100B rows saved — and eliminates a whole failure class: with paired rows, every accept must write both directions atomically, and a partial failure leaves the graph asymmetric ("I see you as a connection; you don't see me"), which users experience as data corruption. The price is that every lookup queries both columns ("where user_id = me or connected_to = me"), needing an index on each. That is a trivial planner cost against a structural consistency guarantee.
-
-## 🔌 API Design
+"I'll draw the whole system, then walk the three journeys that carry the design: accepting an invitation, loading the feed, and searching."
 
 ```
-POST   /api/connections/request        → Send invitation (idempotent per pair)
-POST   /api/connections/:id/accept     → Accept; creates canonical edge
-DELETE /api/connections/:id            → Remove connection
-GET    /api/connections                → 1st-degree list
-GET    /api/connections/degree/:userId → 1st / 2nd / 3rd / none
-GET    /api/connections/mutual/:userId → Mutual connections
-GET    /api/connections/pymk           → Ranked PYMK suggestions
-
-GET    /api/feed?cursor=               → Ranked feed page
-POST   /api/feed/posts                 → Create post
-POST   /api/feed/posts/:id/like        → Like (idempotent)
-POST   /api/feed/posts/:id/comments    → Comment
-
-GET    /api/jobs?filters…              → Search/filter listings
-POST   /api/jobs/:id/apply             → Apply; computes match_score
-GET    /api/jobs/:id/applicants        → Recruiter view, sorted by score
-
-GET    /api/users/search?q=            → People search (Elasticsearch)
-GET    /api/jobs/search?q=             → Job search (Elasticsearch)
+  ┌──────────────────────────────────────────────────────────────────────────────────────────────┐
+  │ Web and mobile clients (members, recruiters)                                                 │
+  └─────────┬───────────────────────────────────┬─────────────────────────────┬──────────────────┘
+            │ (1) POST /invitations/{id}/accept │ (2) GET /feed?cursor        │ (3) GET /search?q
+            │                                   │                             │
+            ▼                                   ▼                             ▼
+  ┌──────────────────────────────────────────────────────────────────────────────────────────────┐
+  │ API gateway · TLS · session lookup in Redis · per-member rate limits · routing               │
+  └─────────┬───────────────────────────────────┬─────────────────────────────┬──────────────────┘
+            ▼                                   ▼                             ▼
+  ┌──────────────────────┐            ┌──────────────────────┐        ┌──────────────────────────┐
+  │ Graph Service        │ connections│ Feed Service         │        │ Profile & Search API     │
+  │ invitations, degree, │◀───────────┤ pull recent posts    │        │ profiles · jobs ·        │
+  │ mutuals, PYMK        │            │ from connections,    │        │ applications ·           │
+  │ adjacency in RAM     │            │ rank, cursor pages   │        │ people and job search    │
+  └───▲─────────────┬────┘            └───────────┬──────────┘        └───┬───────────────┬──────┘
+      │             │                             │                       │               │
+      │             │                             │ recent post ids       │ search query  │
+      │             │ tx: invitation, edge,       │ per author            │               │
+      │             │ counters, outbox row        │                       │               │
+      │             │                             ▼                       │               ▼
+      │ edge        │                   ┌────────────────────────┐        │     ┌────────────────┐
+      │ events      │                   │ Redis                  │        │     │ Elasticsearch  │
+      │             │                   │ sessions · recent post │        │     │ people · jobs  │
+      │             │                   │ ids · PYMK lists       │        │     └─────────▲──────┘
+      │             │                   └────────────────────────┘        │ profiles, jobs│
+      │             ▼                                                     ▼               │
+      │   ┌───────────────────────────────────────────────────────────────────┐           │ index
+      │   │ PostgreSQL · sharded by member id                                 │           │ docs
+      │   │ profiles, invitations, edges, posts, jobs, outbox                 │           │
+      │   └─────────────────────────────┬─────────────────────────────────────┘           │
+      │                                 │ outbox relay                                    │
+      │                                 ▼                                                 │
+      │                     ┌───────────────────────────┐ profile, job events    ┌────────┴──────┐
+      └─────────────────────┤ Kafka · change events     ├───────────────────────▶│ Index workers │
+                            └───────────────────────────┘                        └───────────────┘
 ```
 
-Every write endpoint above is either naturally idempotent (composite-PK inserts, unique constraints) or carries a client-supplied idempotency key the server dedupes on — a design choice that pays off directly in the frontend's ability to retry aggressively without a negotiation protocol.
+1. **Accept (1).** The Graph Service locks the pair's row in PostgreSQL, flips it to connected and writes an outbox row in one transaction, then answers. The outbox relay publishes `pair.connected`; the Graph Service applies it to both members' in-memory adjacency lists.
+2. **Feed (2).** The Feed Service gets my connections from the Graph Service, multi-gets each author's recent post ids from Redis, ranks, and returns a page with a cursor.
+3. **Search (3).** The Profile & Search API queries Elasticsearch with a boost for my network. Profile and job changes reach the index through the same outbox, rebuilt by index workers.
 
-## 🧩 Service Boundaries: Why Split Now, Even at Modest Scale
+| Component | Responsibility | Scales with | Notes |
+|-----------|----------------|-------------|-------|
+| API gateway | TLS, sessions, rate limits, routing | Requests | Sessions in Redis, so API instances are stateless |
+| Graph Service | Invitations, degree, mutuals, PYMK serving | Graph RAM, profile views | ~40 partitions by member id, 3 replicas |
+| Feed Service | Candidate gathering, ranking, cursors | Feed loads | Stateless |
+| Profile & Search API | Profiles, jobs, search queries | Edits, searches | Stateless |
+| PostgreSQL | Source of truth | Members | Sharded by member id; pairs on the lower id's shard |
+| Redis | Sessions, recent post ids, PYMK lists, versioned caches | Hot keys | Cache loss costs latency, not correctness |
+| Kafka + index workers | Change events, search documents | Write rate | Replayable; documents rebuilt from rows |
+| Elasticsearch | People and job indices | Queries | Derived; rebuildable |
 
-Four services — Profile, Connection, Feed, Job — sharing PostgreSQL, Valkey, and Elasticsearch. This is more decomposition than raw request volume strictly demands today, and I want to justify it rather than assume it.
+"Why is the graph its own service? Three reasons: its storage is unusual — a partitioned in-memory graph — its latency budget is the tightest in the system, and every other service calls it. With an API in front, I can start on PostgreSQL alone and move to an in-memory graph without touching callers."
 
-The boundary that matters is Connection Service, and it exists for a reason unrelated to load: **it is the piece of the system whose storage will not survive to production scale unchanged.** Profile and Job are comfortable in PostgreSQL indefinitely — their access patterns are point lookups and small filtered scans. Connections is the one workload that graduates to a specialized graph store at the 100B-edge tier. Drawing the service boundary there now means that migration is an internal storage swap behind a stable API, not a rewrite of every caller that touches connection data.
-
-Feed gets its own service because its read path (17K QPS) and write path (58/sec) have wildly different scaling needs — the read side wants aggressive caching and eventually read replicas; the write side barely needs anything. Coupling it to Profile's CRUD-shaped scaling would mean over-provisioning one to serve the other.
-
-> "I would resist the temptation to draw more boundaries than this. A Skills microservice or an Endorsements microservice would each be defensible in isolation, but they share the users table's write path and don't have distinct scaling profiles from Profile. Splitting them buys a network hop and a deployment unit for no scaling benefit — service boundaries should track where the scaling story diverges, not where the schema happens to have a separate table."
-
-**Inter-service communication** stays REST/JSON over the internal network rather than gRPC at this scale — the four services are called from a shared API gateway, request volumes per hop are modest, and REST's debuggability (curl a service directly, read the payload) outweighs gRPC's serialization efficiency until the East-West traffic between services itself becomes a bottleneck, which is a Feed-Service-calls-Connection-Service-per-request problem this design avoids by having Feed read connection sets from the shared Valkey cache directly rather than round-tripping through Connection Service on every feed request.
-
-## 🔧 Deep Dive 1: Connection Degrees — the Write/Read/Batch Triangle
-
-The query "what degree is user B to user A" runs on every profile view — roughly a billion times a day. Three strategies exist, and the numbers eliminate two of them:
-
-| Approach | Read cost | Storage | Freshness |
-|----------|-----------|---------|-----------|
-| ❌ Real-time traversal | O(connections²) per view | none extra | perfect |
-| ❌ Full precomputation | O(1) | ~45 trillion entries | nightly-stale |
-| ✅ Hybrid: cached 1st-degree sets, intersect on demand | O(connections) | moderate | ~1 hour |
-
-**Why real-time traversal fails.** A median user has ~500 connections, each with ~500 of their own. Answering "is B in A's 2nd degree" by expansion touches 250,000 candidate edges; 3rd degree multiplies to 125M. At a billion profile views daily, that is quintillions of edge touches — no database survives it as a per-request query.
-
-**Why full precomputation fails.** Storing every user's 2nd-degree list costs users × average-2nd-degree-size ≈ 900M × 50K = 45 trillion entries. Even at a few bytes each, that is hundreds of terabytes of hot storage holding material where the median entry is *never read* — most users' 2nd-degree lists are consulted for a handful of specific profiles, never enumerated.
-
-**The hybrid.** Cache each user's 1st-degree connection *set* in Valkey (a ~500-member integer set is a few KB; one-hour TTL, invalidated on connection mutations). Then:
-
-1. **Degree(A, B) = 1st?** — one set-membership check on A's cached set
-2. **Degree = 2nd?** — intersect A's set with B's set: any common member means a shared neighbor, hence 2nd degree. Set intersection on two ~500-member sets is microseconds in memory
-3. **Degree = 3rd?** — check whether any of B's connections is 2nd-degree to A; bounded, and cacheable per (A, B) pair with a short TTL
-4. **Mutual connections list** — the same intersection, materialized; cached separately since it is displayed, not just tested
-
-> "The insight that makes the hybrid work is that degree queries are *pairwise*, not *enumerative*. Nobody asks for their full 2nd-degree list on a profile view — they ask about one specific person. Pairwise degree is two cached-set operations. The only consumer that genuinely enumerates the 2nd-degree network is PYMK, and PYMK runs in batch where a 250K-candidate expansion is perfectly acceptable — so I route the expensive shape of the query to the offline path and keep the online path to set intersections."
-
-What we give up: up to an hour of staleness in cached sets (masked by explicit invalidation on the mutating user's own actions, so users always see their own changes) and a Valkey working set of tens of GB for hot users' sets — memory happily spent to keep p99 profile views under 50ms.
-
-At the 100B-edge extreme, even this outgrows PostgreSQL, which is when a partitioned in-memory adjacency service (the LIquid approach) replaces the storage layer behind the same Connection Service API — the service boundary is the migration seam.
-
-## 🔧 Deep Dive 2: PYMK — Batch Precompute Over a Multi-Signal Score
-
-PYMK generates candidates from the 2nd-degree network (already-connected users are excluded by construction) and scores them:
-
-| Signal | Weight | Why this weight |
-|--------|--------|----------------|
-| Mutual connections | 10 per mutual | Strongest predictor — LinkedIn's published research attributes >60% of successful connection predictions to mutuals alone |
-| Same current company | 8 | Colleagues connect; strong but binary |
-| Same past company | 5 | Alumni effect, decays with time |
-| Same school | 5 | Educational ties |
-| Shared skills | 2 each | Professional affinity; weak individually, additive |
-| Same location | 2 | Proximity prior |
-
-**Why explicit graph signals and not collaborative filtering?** PYMK predicts *real-world relationships*, not content taste. Latent-factor models excel when preferences are hidden and must be inferred; here the predictive signals are directly observable — a shared employer is not a latent factor, it is a database row. A CF model would spend its capacity rediscovering "mutual connections matter," with worse explainability: "12 mutual connections, both at Acme" is a UI string that measurably drives accept rates; an embedding similarity is not.
-
-**Batch-first execution.** The candidate expansion is the expensive part — the same 250K-row fan-out that Deep Dive 1 banished from the read path:
-
-1. Nightly (or triggered by connection-event bursts through the queue), a worker expands the user's 2nd-degree candidates, scores the top slice (candidate cap ~100 keeps the scoring bounded), and writes the ranked list to Valkey with a 24-hour TTL
-2. The online endpoint is a cache read — that is how 2,300 QPS meets the 500ms budget with room to spare
-3. Connection events (request accepted, connection removed) enqueue a recompute for both endpoints of the edge, so active networkers see fresh suggestions faster than the nightly cycle
-
-**Why not real-time scoring?** The inputs change slowly — people change jobs yearly, not hourly — so recomputing on every view buys freshness nobody perceives, at roughly 100× the compute. The worst staleness failure is showing someone you connected with an hour ago; that is fixed by post-filtering the cached list against the live 1st-degree set at serve time. That one serve-time filter buys most of the freshness benefit of real-time computation at none of its cost.
-
-What we give up: cold-start users with no connections have an empty 2nd-degree network, so the fallback ladder is company → school → industry cohorts — measurably weaker suggestions, but for a bounded population, briefly.
-
-## 🔧 Deep Dive 3: Feed — Pull Beats Push at LinkedIn's Read/Write Ratio
-
-**Ranking.** A multi-factor score, computable in the database:
-
-- rank = engagement × 0.3 + recency × 0.5 + relationship boost
-- engagement = likes + 2 × comments — a comment is a stronger intent signal than a like; discussion is what a professional network optimizes for
-- recency = linear decay over ~4 days — professional content (job changes, announcements) is time-relevant, and *linear* decay keeps a high-engagement post alive for days, where exponential decay would bury it in hours
-
-**Delivery: pull, not fanout-on-write.** The scale numbers make this call:
-
-- **✅ Pull**: at read time, fetch the viewer's cached connection ID set (~500), query those authors' recent posts, rank, return. With the (user_id, created_at) index this is one indexed query over a bounded author set — tens of milliseconds — and 58 posts/sec of write volume touches one row per post.
-- **❌ Fanout-on-write**: each post is copied to every connection's materialized timeline. Average case: 5M posts × 500 connections = 2.5B timeline writes/day — a 43,000× write amplification over pull's 58 rows/sec. Worst case: an influencer with millions of followers turns one post into millions of writes, and a burst of influencer posts creates queue backlogs where some followers see the post minutes after others — the *inconsistency* is worse than uniform pull latency.
-
-**Why LinkedIn's usage pattern favors pull specifically.** Fanout's payoff is amortizing one write across many cheap reads — it wins when feeds are checked constantly (dozens of sessions a day, Twitter-style). LinkedIn users check 2–3 times daily; each user's materialized timeline would be read only a couple of times between rebuilds. Paying 2.5B daily writes to accelerate reads that a 50ms indexed query already serves under budget is negative-return engineering.
-
-**Caching and invalidation.** Ranked first pages cache in Valkey for minutes. On post creation, the author's first ~50 connections' feed caches are explicitly deleted — closest connections see the post immediately; everyone else within the TTL window. The 50-cap prevents a popular author's post from triggering a mass-invalidation stampede, which would be fanout-on-write sneaking back in through the cache layer.
-
-**The hybrid future**: if session frequency ever grows toward consumer-social patterns, move to fanout for users with <1,000 connections (bounded, cheap) and pull for high-degree hubs — the standard hybrid — behind the same feed API.
-
-## 🔎 Job Discovery vs. Job Matching
-
-Two distinct problems get conflated if I'm not careful: *discovery* (does this job match the searcher's query) and *matching* (does this candidate fit this specific job). They run on different infrastructure for a reason.
-
-Discovery runs on Elasticsearch: title boosted 3×, skills 2×, plus facets (location, remote, level). Fuzzy matching matters more here than for job matching itself — real names and titles have variant spellings ("Sr." vs "Senior"), which PostgreSQL full-text handles poorly and which is a core reason Elasticsearch is in the stack at all.
-
-Matching (covered in the next deep dive) is a scoring function computed once, at apply time, and stored — it answers a narrower question for a narrower audience (this specific candidate, this specific job) and would be wasted work if computed for every job a search returns, since only a fraction of impressions become applications.
-
-## 🔔 Notification Delivery and Audit Trail
-
-Two supporting systems that touch every other service:
-
-**Notifications** are produced, not queried — connection accepted, invitation received, comment/like on my content all enqueue an event at the point of mutation (inside the same transaction where practical, so a notification is never lost to a crash between "connection created" and "notify"). A dedicated delivery path fans these out over server-sent events to connected clients and falls back to a poll-friendly unread-count endpoint for clients that are not actively connected. The backend's job here is narrow: guarantee the event is durable once the mutation commits, and let delivery be best-effort — a missed real-time push is recovered the next time the client asks for its unread count, which is why the count itself, not the stream, is the source of truth.
-
-**Audit logging** records security-relevant events — login attempts, profile changes, connection events, admin actions — as an append-only table indexed by actor, target, and event type. This is not user-facing; it exists for abuse investigation and compliance. It is written asynchronously off the request path (a logging failure must never block a login), and its retention and query patterns (by actor over a date range, by target entity) are different enough from the OLTP tables that at real scale it would move to its own store — a wide-column or log-oriented system suits an append-heavy, range-scanned-by-time workload better than PostgreSQL's general-purpose indexing.
-
-Both systems share a property worth naming: they are write-heavy, read-rarely paths that must never add latency to the request that triggers them. That is precisely the shape async processing exists for, and it's why neither one appears as a synchronous step in any of the three deep dives above — they hang off the side, fire-and-durable, never fire-and-block.
-
-## 🔁 Consistency and Idempotency
-
-- **Connection state is strongly consistent**: accept runs in one transaction — insert canonical edge, update both connection_counts, close the request. The unique pair constraint on requests plus insert-if-absent on the edge makes double-accepts harmless.
-- **Likes are structurally idempotent**: composite PK on (user_id, post_id); the denormalized like_count is recomputed from rows rather than incremented, so retries cannot over-count.
-- **Queue messages carry idempotency keys**: consumers check a processed-keys set in Valkey (24h TTL) before acting; failed messages reject to a dead-letter queue rather than requeueing, so a poison message cannot loop forever.
-- **Search is eventually consistent by design**: profile updates enqueue an index job; a few seconds between "saved" and "searchable" is invisible in this product.
-
-## 📬 Async Processing
-
-Five queues carry work off the request path, each with its own dead-letter queue so a poison message degrades one feature instead of jamming the pipeline:
+### Flow 1: accepting an invitation
 
 ```
-┌────────────┐     ┌──────────────────────────────────────────┐
-│ API Server │────▶│                 RabbitMQ                  │
-└────────────┘     │  pymk.compute · feed.fanout(future) ·     │
-                    │  notifications · search.index ·           │
-                    │  profile.update                            │
-                    └───────────────────┬────────────────────────┘
-                    ┌────────────────────┼────────────────────┐
-                    ▼                    ▼                    ▼
-             ┌────────────┐      ┌────────────┐      ┌────────────┐
-             │ PYMK worker│      │Index worker│      │Notif worker│
-             └────────────┘      └────────────┘      └────────────┘
+Member app                      Graph Service                PostgreSQL                   Kafka
+     │                                │                           │                         │
+     │ 1 POST /invitations/42/accept  │                           │                         │
+     │───────────────────────────────▶│                           │                         │
+     │                                │ 2 lock pair row           │                         │
+     │                                │──────────────────────────▶│                         │
+     │                                │ 3 set connected + outbox  │                         │
+     │                                │──────────────────────────▶│                         │
+     │                                │ 4 COMMIT (or 0 rows)      │                         │
+     │                                │◀──────────────────────────│                         │
+     │ 5 200 {status: connected}      │                           │                         │
+     │◀───────────────────────────────│                           │                         │
+     ······························· outbox relay, under 1 s ································
+     │                                │                           │ 6 pair.connected {A,B}  │
+     │                                │                           │────────────────────────▶│
+     │                                │ 7 add edge to both lists                            │
+     │                                │◀────────────────────────────────────────────────────│
+     │                                │                           │                         │
 ```
 
-RabbitMQ over Kafka at this stage because the workload is job-shaped, not stream-shaped: each message is processed once by one worker and discarded, there is no need for multiple independent consumer groups replaying the same log, and RabbitMQ's per-queue DLQ and prefetch-based backpressure map directly onto "retry this specific PYMK job" without building that semantics on top of a log abstraction. The trade I accept is Kafka's superior replay and multi-consumer fan-out — irrelevant today, valuable if search indexing and analytics both need to consume the same profile-update stream independently, which is the trigger for migrating.
+"Step 2 is the important one. Both directions of an invitation between A and B live in one row keyed by (low id, high id), so the questions 'is there an invitation the other way?' and 'are they already connected?' are answered under one lock on one shard. Step 3 is a compare-and-set: it only applies while the state is pending, so a double click or a client retry finds 'connected', changes nothing, and returns 200 with `changed: false`. The counters and the event happen exactly once. Steps 6–7 are asynchronous: adjacency is an index built from the event, so a third person might see the old state for under a second, but A and B never disagree, because the pair row answers for them."
 
-## 🛡️ Security, Rate Limiting, Failure Handling
+### Flow 2: viewing a profile — degree and path
 
-Rate limits are Valkey token buckets, made atomic with server-side scripting (a get-then-set pair would race at exactly the moment it matters — the last token), applied per category:
+```
+Viewer app                         Router          Shard of A   Shard of B   Shards of F(B)
+     │                                │                 │            │              │
+     │ 1 GET /members/B/relationship  │                 │            │              │
+     │───────────────────────────────▶│                 │            │              │
+     │                                │ 2 adjacency(A)  │            │              │
+     │                                │────────────────▶│            │              │
+     │                                │ 3 adjacency(B)               │              │
+     │                                │─────────────────────────────▶│              │
+     │                                │ 4 intersect? -> 2nd degree   │              │
+     │                                │ 5 adjacency(each id in F(B))                │
+     │                                │────────────────────────────────────────────▶│
+     │                                │ 6 ~170K ids                                 │
+     │                                │◀────────────────────────────────────────────│
+     │                                │ 7 hit in F(A)? -> 3rd + path │              │
+     │ 8 {degree, status, path}       │                 │            │              │
+     │◀───────────────────────────────│                 │            │              │
+     │                                │                 │            │              │
+```
 
-| Category | Limit | Reason |
-|----------|-------|--------|
-| Login/register | 10/min | Credential stuffing |
-| Reads | 100/min | Scraping — profile data is the product's crown jewels |
-| Writes | 30/min | Post spam |
-| Connection requests | 20/min | Mass-connect spam is the product's oldest abuse vector |
-| Search | 20/min | Each query costs an Elasticsearch round trip |
+"This is the hot read, about 35,000 times a second at peak. Two adjacency reads answer 1st and 2nd degree; only when the sets don't meet do I expand one side by one hop and look for a hit. I'll come back to why this beats precomputing in deep dive 2."
 
-A single rate-limit check, walked through, shows why the Lua-scripted atomicity matters: (1) construct the key from category and user ID, (2) atomically increment the counter and read the new value in one script execution, (3) if this is the first increment, set a 60-second expiry in the same script, (4) if the returned value exceeds the category's limit, reject with 429 and rate-limit headers telling the client when to retry. Splitting steps 2–3 into separate Redis commands opens a race: two concurrent requests can both read "0 remaining" and both pass, because neither has committed its increment before the other reads. At 30 writes/min per user this race is rare but not theoretical — connection-request spam is exactly the adversarial, high-concurrency case designed to find it.
+### Flow 3: People You May Know
 
-Failure posture, one line each:
+```
+Member app                   Graph Service          Redis                       PYMK jobs
+     │                             │                  │                             │
+     │                             │                 1 nightly: friends of friends  │
+     │                             │                  │      2 score, keep top 100  │
+     │                             │                  │ 3 SET pymk:{id}, TTL 24 h   │
+     │                             │                  │◀────────────────────────────│
+     ··························· member opens My Network ····························
+     │ 4 GET /pymk?limit=20        │                  │                             │
+     │────────────────────────────▶│                  │                             │
+     │                             │ 5 GET pymk:{id}  │                             │
+     │                             │─────────────────▶│                             │
+     │                             │ 6 drop new connections, invites                │
+     │ 7 20 suggestions + reasons  │                  │                             │
+     │◀────────────────────────────│                  │                             │
+     ·························· nearline: A and B connect ···························
+     │                             │                  │ 8 recompute pymk:A, pymk:B  │
+     │                             │                  │◀────────────────────────────│
+     │                             │                  │                             │
+```
 
-- **Rate limiter fails open** — a Valkey outage briefly weakens abuse protection rather than blocking all traffic; fail-closed turns a cache blip into a full outage
-- **PYMK degrades to empty** — a recommendation is an enhancement; erroring the network page over it inverts the feature's value
-- **Queue down ≠ API down** — the API keeps serving reads and synchronous writes; async features (indexing, notifications, PYMK refresh) pause and drain on recovery
-- **Sessions live in Redis**, keeping API nodes stateless — any node serves any request; node loss is invisible
+"The expensive part — a friends-of-friends join with mutual counts — runs offline. Serving is a key-value read plus a filter against live state, so a list computed last night never suggests someone I connected with this morning. A `pair.connected` event triggers a nearline recompute for the two members, which keeps active networkers' suggestions fresh."
 
-Observability: latency histograms on feed generation and PYMK computation (the two SLO-bearing paths), queue-depth gauges (the early warning that async processing is falling behind), cache hit-ratio counters (the feed SLO silently depends on >80% connection-set hit rate), and trace IDs propagated through every request and queue message so a slow feed call can be attributed to its specific downstream.
+| Option | Verdict |
+|--------|---------|
+| ✅ Nightly batch + nearline recompute + serve-time filter | ~100× cheaper than scoring per view; freshness comes from the filter |
+| ❌ Score on every request | A 250K-member walk per page view, to gain freshness nobody notices — jobs and schools change monthly |
+| ❌ Collaborative filtering first | Spends model capacity rediscovering "mutual connections matter" and can't explain itself on the card |
 
-**Authorization** is role-based rather than per-resource: users carry one of `user`, `recruiter`, `admin`. This is a deliberate simplification — with 900M users, per-user permission rows are infeasible to store or reason about, and the actual authorization surface is small (own-data CRUD, recruiter access to applicant pools for their own job postings, admin access to audit logs). A row-level policy ("can recruiter R see applicant A's data") reduces to "is R the poster of the job A applied to," which is a join, not a permissions table. RBAC covers the coarse cases; ownership checks cover the fine ones — that combination avoids building a general-purpose permission system for a product that does not need one yet.
+"I start with explicit weights — 10 per mutual connection, 8 for the same current company, 5 for a shared past company or school, 2 per shared skill capped at five — because the reasons on the card come from the same features. Once there's acceptance data, a learned ranker replaces the weights without changing the pipeline."
 
-### SLIs and SLOs
+---
 
-| SLI | Target | Consequence of miss |
-|-----|--------|---------------------|
-| Feed API latency (p99) | < 200ms | Feed cache hit ratio investigated first — this is almost always a cache problem, not a query problem |
-| PYMK API latency (p99) | < 500ms | Indicates cache miss storm; check whether batch job completed |
-| Connection accept → visible everywhere | < 1s | Strong-consistency requirement; any miss here is a correctness bug, paged immediately |
-| API availability | 99.9% | ~43 minutes/month budget; rate-limiter fail-open and PYMK graceful degradation exist specifically to protect this |
-| Cache hit ratio (connection sets) | > 80% | Below this, degree queries start hitting PostgreSQL directly and feed latency SLO is at risk |
+## 💾 Data Model (4 min)
 
-## 🧮 Job Matching, in More Depth
+"PostgreSQL holds the truth, sharded by member id. Everything graph-shaped that is read in bulk is derived from it."
 
-Candidate-job scoring runs at apply time and is stored, not recomputed on every view — recruiters sort applicant lists by score constantly, and the inputs (candidate profile snapshot, job requirements) are stable once the application exists.
+| Store | Table / key | Key columns | Notes |
+|-------|-------------|-------------|-------|
+| PostgreSQL | `member_pairs` | `(low_id, high_id)` PK, `state` (pending, connected, declined, withdrawn, removed), `requested_by`, `message`, `version` | The source of truth for "connected?"; lives on the lower id's shard |
+| PostgreSQL | `adjacency` | `(member_id, other_id)` PK, `connected_at` | Derived, two rows per connection, each on its owner's shard |
+| PostgreSQL | `invitations_inbox` | `(recipient_id, created_at, sender_id)` | Derived, so "my invitations" is one shard |
+| PostgreSQL | `members` | `id`, `email` (private), `headline`, `location`, `connection_count`, `graph_version` | Counters maintained by the edge consumer |
+| PostgreSQL | `posts` | `(author_id, id)` PK with time-ordered ids | An author's recent posts are one range scan |
+| PostgreSQL | `outbox` | `id`, `topic`, `key`, `payload`, `published_at` | Same transaction as the change |
+| Redis | `posts:recent:{author}` | Last ~100 post ids | Capped list; one append per post |
+| Redis | `pymk:{member}` | Top 100 ids + reason codes | 24 h TTL |
+| Redis | `rel:{viewer}:{target}:{vA}:{vB}` | Cached relationship | Keyed by both members' graph versions |
+| Elasticsearch | `people`, `jobs` | Name, headline, skills, companies, location | Rebuilt from rows by index workers |
 
-Five weighted factors sum to a 0–100 score:
+"The graph version deserves a sentence. Every committed change to a member's connections bumps their version, and every graph cache key includes it. That is how I invalidate without the classic race where a reader that loaded the old list a millisecond before the change writes it back after the delete."
 
-1. **Required-skill overlap (~40%)** — intersection of required job skills and candidate skills, normalized by total required. This is the dominant weight because skill-job fit is the strongest observed predictor of application success and, unlike the softer signals below, it is unambiguous to compute once skills are normalized.
-2. **Experience-level gap (~25%)** — full credit if years meet the requirement, tapering as the gap widens
-3. **Location compatibility (~15%)** — full credit for remote roles or same-location candidates
-4. **Education match (~10%)** — credit if the candidate meets the stated minimum
-5. **Referral signal (~10%)** — credit if the candidate has a 1st-degree connection at the hiring company
+---
 
-That last factor is the one worth explaining: it is binary, not scaled, because the underlying reality is binary — either a referral path exists or it does not. A referral path materially changes response likelihood on this platform specifically, which is why it earns a fixed weight rather than being folded into a continuous score.
+## 🔌 API Design (3 min)
 
-Job discovery itself runs on Elasticsearch, not this scoring function — search ranks *relevance to a query*, matching scores rank *fit to a specific job*, and conflating the two would mean re-deriving match scores at search time for every job in the result set, which is wasted work when only a fraction of search results become applications.
+```
+POST   /api/v1/invitations                  {to, message?} → 201 sent | 200 already_pending | 200 connected
+POST   /api/v1/invitations/{id}/accept      → 200 {status, changed}  (/decline, /withdraw likewise)
+DELETE /api/v1/connections/{memberId}       → 200 {removed}
+GET    /api/v1/members/{id}/relationship    → {degree, status, request_id, mutual_count, path}
+GET    /api/v1/connections?cursor=          → my connections, most recent first
+GET    /api/v1/pymk?limit=20                → suggestions with reasons
+GET    /api/v1/feed?cursor=                 → ranked page + next_cursor
+POST   /api/v1/posts                        Idempotency-Key → 201
+GET    /api/v1/search/people?q=&cursor=     → hits + source
+```
 
-## ⚖️ Trade-offs Summary
+- **Every graph write says what happened.** `sent`, `already_pending` or `connected` (a crossing invitation), plus the resulting status. Clients can retry blindly; nothing needs an idempotency key because the pair row already is one.
+- **`status` is separate from `degree`.** The button depends on invitations (`pending_sent`, `pending_received`), the badge on distance. A 3rd-degree member can have invited you.
+- **Cursors name a ranked snapshot**, so feed pages don't repeat or skip when scores move.
+- **Errors** are `application/problem+json` with stable codes (`already_connected`, `request_not_pending`); invitation sends are rate-limited per member and return `429` with `Retry-After`.
 
-| Decision | Chosen | Alternative | Rationale |
-|----------|--------|-------------|-----------|
-| Edge storage | ✅ Canonical single row | ❌ Two directed rows | Half of 100B rows; asymmetry structurally impossible |
-| Degree queries | ✅ Cached sets + intersection | ❌ Live traversal / full precompute | Pairwise queries need set ops, not expansion |
-| PYMK execution | ✅ Batch + 24h cache + serve-time filter | ❌ Real-time scoring | Inputs change slowly; 100× compute for invisible freshness |
-| PYMK model | ✅ Explicit graph signals | ❌ Collaborative filtering | Observable signals dominate; explainable "why" strings |
-| Feed delivery | ✅ Pull + cache | ❌ Fanout-on-write | 300:1 read/write ratio; 2.5B daily writes avoided |
-| Feed decay | ✅ Linear over ~4 days | ❌ Exponential | Professional content has multi-day relevance |
-| Comment weight | ✅ 2× likes | ❌ Equal weight | Discussion is the engagement a professional network wants |
-| Search | ✅ Elasticsearch | ❌ Postgres full-text | Fuzzy names, field boosting, facets |
-| Skills | ✅ Normalized catalog | ❌ Free-text array | Matching breaks on "JS" vs "JavaScript" |
-| Match scores | ✅ Computed at apply, stored | ❌ Recomputed per view | Snapshot-stable inputs; recruiters sort constantly |
-| Queue | ✅ RabbitMQ → Kafka later | ❌ Kafka day one | Job semantics + DLQs now; streaming when volume demands |
-| Auth | ✅ Sessions in Redis | ❌ JWT | Instant revocation matters on an account-takeover target |
+---
 
-## 📈 Scalability — What Breaks First
+## 🔧 Deep Dive 1: Storing the Graph (8 min)
 
-1. **The connections table breaks first.** At 100B edges, even indexed pair lookups strain a single PostgreSQL instance's buffer pool. Path: read replicas → shard by smaller user ID (co-locating each edge with at least one endpoint) → dedicated in-memory graph service behind the existing Connection Service API. The API boundary means callers never notice the migration.
-2. **Feed query fan-in** second: pulling posts for 500 authors across shards becomes scatter-gather. Path: co-shard posts with their authors, add read replicas dedicated to the feed path, and only then consider hybrid fanout.
-3. **PYMK batch window** third: nightly recompute for 100M active users must partition across workers by user-ID range; the queue-triggered incremental path already carries urgency, so the nightly batch can tolerate hours.
-4. **Elasticsearch indexing lag** under profile-update storms: dedicated indexing consumers with backpressure; split people and job indices so one cannot starve the other.
-5. **Valkey memory** for hot users' connection sets: LRU eviction is acceptable precisely because every cached set is rebuildable from PostgreSQL — cache loss is a latency event, never a correctness event.
+"The decision: the source of truth is one row per *pair* of members, and the per-member adjacency that everything reads is an index derived from its change events."
 
-### Sharding Strategy, When It's Needed
+**Why it works.** Connections are mutual and the two members must never disagree. With one row per pair there is nothing to disagree about: the row is either connected or not. It also gives me a natural lock for the invitation state machine — none, pending (with a direction), connected, declined, withdrawn, removed. The crossing-invitation case, where A and B invite each other within the same second, becomes trivial: the second sender finds a pending invitation from the other side under the lock and accepts it instead of creating a second invitation. Counters move in the same transaction as the state change, only when it actually changed.
 
-Each table shards on the key that keeps its dominant query pattern local to one shard:
+**Why the alternatives fail.**
 
-- **Users/profiles**: hash on user_id — profile reads are always single-user, so any hash works and load spreads evenly
-- **Connections**: co-located with the *smaller* user_id in the canonical pair — since every edge already has a deterministic smaller endpoint, this piggybacks on a decision already made for storage, and a user's full connection list is always a single-shard scatter-free query in the common direction
-- **Posts**: shard by author's user_id — feed pulls query a bounded set of authors, so a query fans out to at most a few dozen shards for a 500-connection user rather than every shard
-- **Jobs**: shard by company_id — a company's listings and applicant pools are always accessed together
+| Approach | Where it breaks |
+|----------|-----------------|
+| ✅ Pair row + derived directed adjacency | — (costs a sub-second index lag) |
+| ❌ Two directed rows written together | Once sharded by member, A→B and B→A live on different shards; atomicity needs two-phase commit, and without it a crash leaves a one-sided connection |
+| ❌ One canonical row, read directly | Symmetric, but "all of X's connections" is a scatter across shards for the half of edges where X is the larger id |
+| ❌ Graph database as the source of truth | Fast traversals, but weak at the transactional invitation state machine, and a second source of truth for profiles |
 
-The common thread: shard keys are chosen so that the *dominant* read (not every read) stays single-shard or low-fanout. Cross-shard queries (search, admin analytics) are explicitly routed to Elasticsearch or a separate analytical store rather than optimized for in the OLTP shard layout.
+"The canonical row is what I'd ship on a single PostgreSQL — and it's exactly what the local implementation does. It breaks only when I shard, and the fix is not to abandon it but to stop reading it in bulk: adjacency becomes a projection."
 
-## 🚀 Closing
+**The derived index.** An edge consumer applies `pair.connected` and `pair.removed` events to the two directed rows and to the Graph Service's in-memory lists. The writes are upserts keyed by (member, other), so a replayed event is a no-op, and the event carries the pair version, so an old event arriving late can't undo a newer one. A nightly job compares pair rows with adjacency and repairs any drift; the alert threshold for mismatches is zero.
 
-The backbone of this design is routing each graph workload to the tier that matches its access shape: pairwise degree checks to cached set intersections (online, microseconds), candidate enumeration to batch workers (offline, minutes), and feed assembly to indexed pulls over a bounded author set (online, tens of milliseconds). The relational core stays simple and consistent — canonical edges, transactional connection state, idempotent engagement — while everything expensive is either cached with an honest staleness budget or pushed off the request path entirely.
+**What I give up.** For under a second after a change, a third person can see old adjacency — B's feed might not yet include A's posts. The two members themselves never see an inconsistent state, because "are we connected?" and the profile button read the pair row (or the cache versions it bumped), and the accept response carries the new status. I'm trading global freshness for no distributed transactions, and for this product that's the right trade.
 
-If I had another 45 minutes, the next layer I'd design is the write path for connection_count and other denormalized counters under concurrent updates — right now they update inside the same transaction as the mutation, which is correct but means a burst of simultaneous accepts on a popular user's profile briefly serializes on that row. A future iteration would move high-contention counters to an eventually-consistent increment stream, the same pattern already used for post like_count, trading a few seconds of counter staleness for removing a lock contention point entirely.
+---
 
-Future work beyond that: hybrid feed fanout if session frequency rises, ML-learned ranking weights replacing the hand-tuned formula once engagement data accumulates, and the graph-service migration the Connection Service boundary was designed to absorb.
+## 🔧 Deep Dive 2: Degree of Separation (7 min)
+
+"The decision: compute degree per request with a bidirectional search over in-memory adjacency, and never store second-degree sets."
+
+**Why it works.** A profile view asks a pairwise question: how far is this one person from me? Two adjacency reads — mine and theirs, about 500 ids each — answer 1st degree (they're in my list) and 2nd degree (our lists intersect; the intersection is the mutual-connection list). For 3rd degree I expand one side by one hop: fetch the adjacency of each of their ~500 connections, batched per partition, and probe each id against my set. That's about 500 lookups and 250K hash probes — single-digit milliseconds in RAM — and the first hit gives the path, A → x → y → B.
+
+**Why the alternatives fail.**
+
+| Approach | Cost per query | Where it breaks |
+|----------|----------------|-----------------|
+| ✅ Bidirectional search | 2 lookups (1st/2nd), ~500 (3rd) | Hub members; capped below |
+| ❌ BFS from the viewer | 250K at depth 2, 125M at depth 3 | Far over budget at 35K views/s |
+| ❌ Precomputed second-degree sets | 1 lookup | ~100K ids × 300M active members ≈ 30 trillion entries, mostly never read, invalidated by every new edge in the neighborhood |
+| ❌ SQL self-joins on the edge table | Joins across shards | Works on one node; at 100B rows it's a scatter-gather on every view |
+
+**Hubs.** A member with 30,000 connections turns the one-hop expansion into 30,000 lookups. The router always expands the smaller side and gives up after a budget of about 50K ids, answering "3rd+" without a path. Hubs are rare and their profiles are viewed by strangers who mostly are 3rd degree anyway.
+
+**Caching.** The answer is cached for ten minutes under both members' graph versions. If either member connects or disconnects with anyone, their version bumps and the cache entry is simply never read again.
+
+**What I give up.** Every profile view does real graph work instead of a precomputed lookup, and I need the adjacency in RAM — about 5 TB across ~40 servers. That's the price of exact answers that change the instant a connection is accepted, and the memory is shared with the feed and PYMK serving.
+
+---
+
+## 🔧 Deep Dive 3: Feed Fan-out (5 min)
+
+"The decision: fan-out on read. A post costs one write; a feed load gathers candidates from the authors I'm connected to."
+
+**Why it works.** Each post appends its id to the author's capped list in Redis. A feed load fetches my connections from the Graph Service, multi-gets ~500 recent-post lists (batched by Redis shard), merges the newest few hundred candidates, ranks them — engagement, recency, how often I interact with the author — and stores the ranked ids as a short-lived session snapshot. The cursor names that snapshot and a position in it, so scrolling never repeats or skips posts even though scores keep moving.
+
+**Why fan-out on write fails here.**
+
+| Approach | Writes | Where it breaks |
+|----------|--------|-----------------|
+| ✅ Fan-out on read | 58 posts/s → 58 appends/s | 8.5M list reads/s, but cheap, cached and parallel |
+| ❌ Fan-out on write | 5M posts × 500 = 2.5B timeline writes/day | An influencer post becomes millions of writes; followers see it minutes apart |
+| ❌ Hybrid push/pull | Push for small authors | Worth it when members open the feed dozens of times a day; LinkedIn members open it two or three times, so most precomputed timelines are rewritten before they're read |
+
+**What I give up.** Read work on every load and a ranking step on the request path. I keep it within budget by capping candidates, caching the snapshot for the session, and computing author-affinity features offline. If session frequency rose toward consumer-social levels, I'd revisit the hybrid.
+
+---
+
+## 📈 Scale, Failures & Observability (2 min)
+
+**What breaks first, in order:** hub members in degree queries (cap and expand the smaller side), feed candidate gathering (batch by shard, cap lists at ~100 ids), the PYMK batch window as the graph grows (partition the join by member; lean on nearline recompute), and adjacency RAM (add partitions; rebuild from snapshots plus the Kafka log, never from live traffic).
+
+| Failure | What members see | Mitigation |
+|---------|------------------|------------|
+| Graph partition down | Some profiles lack the degree badge | Replicas; the badge has its own timeout and is optional |
+| Kafka down | New connections reach feeds late | Outbox rows accumulate and drain; writes still succeed |
+| Edge consumer lag | Third parties see old adjacency | Pair row answers for the two members; alert at 5 s |
+| Redis down | Slower pages | Caches fall back to the database; graph cache reads fail open |
+| Elasticsearch down | Search without typo tolerance | Breaker opens; PostgreSQL full-text fallback; outbox retries |
+| Shard primary down | Writes for that shard fail with `503` | Replica promotion; reads from replicas |
+
+**What I'd watch:** degree p99 by outcome and the cap-hit rate; invitation outcomes (a jump in `accepted_reverse` is fine, a jump in `request_not_pending` is a client retry storm); adjacency lag and reconciliation mismatches; PYMK serve-time filter drop rate (high means stale lists); search outbox age against the 30-second freshness target.
+
+---
+
+## ⚖️ Trade-offs & Wrap-up (1 min)
+
+| Decision | ✅ Chosen | ❌ Alternative | Why |
+|----------|-----------|----------------|-----|
+| Relationship truth | Pair row, derived adjacency | Two directed rows written together | Symmetry can't break; no 2PC |
+| Degree | Bidirectional search in RAM | Precomputed second-degree sets | Two lookups instead of 30T stored ids |
+| Cache freshness | Versioned keys | Delete on write | No stale refill after a change |
+| PYMK | Batch + nearline + serve-time filter | Score per request | 100× cheaper, fresh where it matters |
+| Feed | Fan-out on read + ranked snapshots | Fan-out on write | 2.5B daily writes avoided; stable cursors |
+| Search sync | Outbox, rebuild from rows | Dual write | Edits never fail on search |
+| Invitation retries | Idempotent outcomes | Client idempotency keys | The pair row is already the key |
+
+"With more time, I'd design the abuse side of invitations — weekly caps, 'I don't know this person' feedback lowering a sender's limits — and the privacy layer: degree and paths must respect members who hide their connections."

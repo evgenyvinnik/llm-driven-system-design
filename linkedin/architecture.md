@@ -1,806 +1,492 @@
-# Design LinkedIn - Architecture
+# LinkedIn (Professional Network) — Architecture
 
 ## System Overview
 
-LinkedIn is a professional social network where users build career profiles, connect with colleagues, and discover job opportunities. Core challenges involve graph traversal for connection degrees, multi-factor recommendation algorithms (PYMK, job matching), and feed ranking with professional context.
+A professional network where members keep a career profile, connect with people they know, read a feed of their connections' posts, get "People You May Know" (PYMK) suggestions, and search for people and jobs. Posts and profiles are ordinary CRUD. What makes LinkedIn a design problem is the **connection graph**: every profile view asks "how am I connected to this person?" (1st, 2nd or 3rd degree, and through whom), PYMK is a ranked walk over friends-of-friends, the feed is assembled from each member's connections, and people search ranks by network distance. The graph has roughly 50 billion edges, and two members must never disagree about whether they are connected.
 
-**Learning Goals:**
-- Design efficient social graph storage and traversal
-- Build recommendation engines (PYMK, job matching)
-- Implement feed ranking with multiple signals
-- Handle company-employee relationships
+This document describes the production-scale design first. [Implementation Notes](#implementation-notes) maps it to what this repository runs: Express + PostgreSQL + Valkey, with Elasticsearch and RabbitMQ optional, and a React frontend.
 
----
+**Learning goals**
+
+- Storing an undirected, mutual-consent graph: one pair row as the source of truth versus two directed rows.
+- Degree of separation with a bidirectional (meet-in-the-middle) search instead of enumerating second-degree networks.
+- PYMK as candidate generation plus explainable scoring, computed offline and filtered at serve time.
+- Feed fan-out on read versus fan-out on write, decided by the read/write ratio.
+- Keeping a search index in step with the database through a transactional outbox, and degrading when it is down.
 
 ## Requirements
 
-### Functional Requirements
+### Functional requirements
 
-1. **Profiles**: Professional history (experience, education, skills)
-2. **Connections**: Request, accept, view 1st/2nd/3rd degree network
-3. **Feed**: Posts from connections, ranked by relevance and engagement
-4. **Jobs**: Post listings, apply, match candidates to jobs
-5. **Search**: Find people, companies, jobs with relevance ranking
-6. **Recommendations**: People You May Know (PYMK) with multi-signal scoring
+1. **Profiles**: experience, education and skills; skills can be endorsed by 1st-degree connections.
+2. **Connections**: send, accept, decline and withdraw invitations; remove a connection; list connections.
+3. **Degree and path**: every profile shows 1st/2nd/3rd degree, the mutual-connection count and one "how you're connected" chain.
+4. **PYMK**: ranked suggestions with human-readable reasons ("12 mutual connections", "Both worked at DataFlow").
+5. **Feed**: posts from connections, ranked; likes and comments.
+6. **Search and jobs**: people and job search with filters; job applications with a match score.
 
-### Non-Functional Requirements
+Out of scope: messaging/InMail, company pages administration, ads, learning, and the recruiter product.
 
-- **Latency**: < 200ms for feed, < 500ms for PYMK computation
-- **Scale**: 900M users, 100B connections
-- **Availability**: 99.9% uptime
-- **Consistency**: Eventual for feed and PYMK, strong for connection state
+### Non-functional requirements
 
----
+| Requirement | Target |
+|-------------|--------|
+| Profile view, including degree badge | p99 < 200 ms server time; degree computation p99 < 50 ms |
+| Feed first page | p99 < 250 ms |
+| Invite / accept | p99 < 300 ms; both members see the new state within 1 s |
+| PYMK serving | p99 < 100 ms; new connections reflected within 5 minutes, full refresh daily |
+| Search | typeahead p99 < 100 ms; a profile edit is searchable within 30 s |
+| Availability | 99.95% for reads (profile, feed, search), 99.9% for writes |
+| Correctness | A connection is never one-sided; connection counts match the edges they count |
 
 ## Capacity Estimation
 
-### Production Scale
-
-- **Users**: 900M total, 300M MAU, 100M DAU
-- **Connections**: 100B total, 500 average connections per active user
-- **Posts**: 5M new posts/day (~58/sec)
-- **Feed reads**: 100M DAU * 15 feed views/day = 1.5B feed requests/day (~17,400 QPS)
-- **PYMK requests**: 100M DAU * 2 views/day = 200M/day (~2,300 QPS)
-- **Job postings**: 20M active listings, 1M new/day
-- **Search queries**: 50M/day (~580 QPS)
-- **Connection graph**: 900M nodes, 100B edges, ~200 GB in adjacency list format
+| Quantity | Estimate | Design consequence |
+|----------|----------|--------------------|
+| Members | 900M total, 300M monthly, 100M daily active | Every per-member structure is sharded by member id |
+| Connections | ~50B pairs, 100B adjacency entries; active members average ~500 | The graph does not fit one machine, but it fits in RAM across a cluster |
+| Adjacency in RAM | 100B × 8 B ≈ 800 GB of ids, ~1.6 TB with overhead, ×3 replicas ≈ 5 TB | ~40 servers with 128 GB each, partitioned by member id |
+| Second-degree network | 500 × 500 ≈ 250K members (100K+ after overlap) per member | Never enumerate it on a request path |
+| Profile views | ~1B/day → ~12K/s average, ~35K/s peak | Degree must be two adjacency lookups in the common case |
+| Feed loads | 1.5B/day → ~17K/s average, ~50K/s peak | Cache-first, each load gathers recent posts from ~500 authors |
+| New posts | 5M/day → ~58/s | Fan-out on write would be 5M × 500 = 2.5B timeline writes a day |
+| Invitations | ~20M/day → ~230/s; accepts ~115/s | Graph writes are tiny; correctness, not throughput, is the problem |
+| PYMK lists | 300M members × top 100 × ~16 B ≈ 480 GB | Precomputed nightly into a key-value store |
+| Search | 50M queries/day (~580/s), typeahead ~10× that in requests | Dedicated search cluster, not the OLTP database |
 
 ### Local Development Scale
 
-- 2-5 concurrent users, ~50 connections, ~20 posts
-- Single PostgreSQL instance, single Valkey instance
-- Single Elasticsearch instance, single RabbitMQ instance
-- All services run as a single Express process
-
----
+Ten seeded members, twelve connections, seven jobs and seven posts. One Express process (optionally three on ports 3001–3003 sharing sessions through Valkey), one PostgreSQL, one Valkey. Elasticsearch and RabbitMQ are optional: search falls back to PostgreSQL full-text and queue publishing is best-effort. Setup and ports are in the [README](./README.md).
 
 ## High-Level Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                              Clients                                     │
-│                    (Web / Mobile / LinkedIn Apps)                         │
-└──────────────────────────────┬──────────────────────────────────────────┘
-                               │
-                     ┌─────────▼─────────┐
-                     │   API Gateway /   │
-                     │   Load Balancer   │
-                     └─────────┬─────────┘
-                               │
-       ┌──────────────────┬────┼────┬──────────────────┐
-       │                  │         │                   │
-┌──────▼──────┐  ┌────────▼───┐ ┌───▼──────────┐ ┌─────▼───────┐
-│  Profile    │  │ Connection │ │ Feed         │ │ Job         │
-│  Service    │  │ Service    │ │ Service      │ │ Service     │
-│             │  │            │ │              │ │             │
-│ - CRUD      │  │ - Requests │ │ - Ranking    │ │ - Listings  │
-│ - Skills    │  │ - PYMK     │ │ - Posts      │ │ - Matching  │
-│ - Experience│  │ - Degrees  │ │ - Comments   │ │ - Apply     │
-└──────┬──────┘  └─────┬──────┘ └──────┬───────┘ └──────┬──────┘
-       │               │               │                │
-       └───────┬───────┴───────┬───────┴────────┬───────┘
-               │               │                │
-┌──────────────▼──┐  ┌────────▼────────┐  ┌────▼──────────────┐
-│   PostgreSQL    │  │  Valkey/Redis   │  │  Elasticsearch    │
-│  (Users, Conns, │  │  (Sessions,     │  │  (Users, Jobs     │
-│   Posts, Jobs)  │  │   PYMK cache,   │  │   full-text       │
-│                 │  │   Feed cache,   │  │   search)         │
-│                 │  │   Rate limits)  │  │                   │
-└─────────────────┘  └────────────────┘  └───────────────────┘
-               │
-     ┌─────────▼─────────┐
-     │    RabbitMQ        │
-     │  (Feed fanout,     │
-     │   Notifications,   │
-     │   PYMK compute,    │
-     │   Search index)    │
-     └────────────────────┘
+  ┌──────────────────────────────────────────────────────────────────────────────────────────────┐
+  │ Web and mobile clients (members, recruiters)                                                 │
+  └─────────┬───────────────────────────────────┬─────────────────────────────┬──────────────────┘
+            │ (1) POST /invitations/{id}/accept │ (2) GET /feed?cursor        │ (3) GET /search?q
+            │                                   │                             │
+            ▼                                   ▼                             ▼
+  ┌──────────────────────────────────────────────────────────────────────────────────────────────┐
+  │ API gateway · TLS · session lookup in Redis · per-member rate limits · routing               │
+  └─────────┬───────────────────────────────────┬─────────────────────────────┬──────────────────┘
+            ▼                                   ▼                             ▼
+  ┌──────────────────────┐            ┌──────────────────────┐        ┌──────────────────────────┐
+  │ Graph Service        │ connections│ Feed Service         │        │ Profile & Search API     │
+  │ invitations, degree, │◀───────────┤ pull recent posts    │        │ profiles · jobs ·        │
+  │ mutuals, PYMK        │            │ from connections,    │        │ applications ·           │
+  │ adjacency in RAM     │            │ rank, cursor pages   │        │ people and job search    │
+  └───▲─────────────┬────┘            └───────────┬──────────┘        └───┬───────────────┬──────┘
+      │             │                             │                       │               │
+      │             │                             │ recent post ids       │ search query  │
+      │             │ tx: invitation, edge,       │ per author            │               │
+      │             │ counters, outbox row        │                       │               │
+      │             │                             ▼                       │               ▼
+      │ edge        │                   ┌────────────────────────┐        │     ┌────────────────┐
+      │ events      │                   │ Redis                  │        │     │ Elasticsearch  │
+      │             │                   │ sessions · recent post │        │     │ people · jobs  │
+      │             │                   │ ids · PYMK lists       │        │     └─────────▲──────┘
+      │             │                   └────────────────────────┘        │ profiles, jobs│
+      │             ▼                                                     ▼               │
+      │   ┌───────────────────────────────────────────────────────────────────┐           │ index
+      │   │ PostgreSQL · sharded by member id                                 │           │ docs
+      │   │ profiles, invitations, edges, posts, jobs, outbox                 │           │
+      │   └─────────────────────────────┬─────────────────────────────────────┘           │
+      │                                 │ outbox relay                                    │
+      │                                 ▼                                                 │
+      │                     ┌───────────────────────────┐ profile, job events    ┌────────┴──────┐
+      └─────────────────────┤ Kafka · change events     ├───────────────────────▶│ Index workers │
+                            └───────────────────────────┘                        └───────────────┘
 ```
 
-At production scale, the architecture would add:
-- **Graph database** (e.g., LinkedIn's in-house LIquid) for connection traversal at billions of edges
-- **Kafka** for event streaming between services
-- **Dedicated PYMK service** with precomputed recommendations
-- **CDN** for profile images and static assets
-- **ML pipeline** for feed ranking, job matching, and recommendation quality
+1. **Accept an invitation (1).** The Graph Service locks the pair's row in PostgreSQL, flips it from pending to connected and writes an outbox row in the same transaction, then answers. The outbox relay publishes `pair.connected` to Kafka; the Graph Service applies it to both members' in-memory adjacency lists, and a consumer writes the two directed adjacency rows.
+2. **Load the feed (2).** The Feed Service asks the Graph Service for the member's connections, reads the recent post ids each of those authors has in Redis, ranks the candidates and returns a page with a cursor. Nothing was written per follower when those posts were created.
+3. **Search (3).** The Profile & Search API queries Elasticsearch, boosting people in the searcher's network. Profile and job changes reach Elasticsearch through the same outbox and Kafka path, rebuilt by index workers from the database rows.
 
----
+| Component | Responsibility | Scales with | Notes |
+|-----------|----------------|-------------|-------|
+| API gateway | TLS, session lookup, rate limits, routing | Requests | Sessions live in Redis so any instance serves any member |
+| Graph Service | Invitations, connections, degree and path, mutuals, PYMK serving | Graph size (RAM) and profile views | Adjacency lists partitioned by member id, rebuilt from the edge log |
+| Feed Service | Candidate gathering, ranking, cursor pages | Feed loads | Stateless; reads activity lists and asks the Graph Service for connections |
+| Profile & Search API | Profiles, jobs, applications, search queries | Profile edits and searches | Stateless |
+| PostgreSQL | Source of truth: profiles, pair rows, adjacency rows, posts, jobs, outbox | Members | Sharded by member id (pairs by the lower id) with replicas |
+| Redis | Sessions, recent post ids per author, PYMK lists, versioned caches | Hot keys | Losing it is a latency event, not a correctness event |
+| Kafka | Change events from the outbox | Write rate | Partitioned by member id; replayable for rebuilds |
+| Index workers | Rebuild search documents from PostgreSQL rows | Change rate | Idempotent; a document is always rebuilt from current state |
+| Elasticsearch | People and job indices | Documents and queries | Derived; can be rebuilt from PostgreSQL |
 
-## Core Components
+The Graph Service is separate from profiles and the feed because it is the one workload whose storage is unusual (a partitioned in-memory graph), whose latency budget is tight (it runs inside every profile view), and which other services call. Putting it behind its own API means the storage can change — PostgreSQL alone for a small network, an in-memory graph at LinkedIn scale — without touching callers.
 
-### 1. Connection Degree Calculation
+## Core Components / Request Flows
 
-**Challenge**: With 900M users and 100B connections, finding 2nd-degree connections (friends-of-friends) is a graph traversal problem that can explode in complexity.
-
-**Approaches**:
-
-| Approach | Latency | Storage | Freshness |
-|----------|---------|---------|-----------|
-| Real-time graph traversal | O(connections^2) | None extra | Real-time |
-| Precomputed 2nd-degree cache | O(1) lookup | Massive (per-user lists) | Stale (nightly refresh) |
-| Hybrid: cached 1st-degree, compute 2nd on demand | O(connections) | Moderate | 1-hour cache |
-
-**Chosen: Hybrid approach**. First-degree connections are cached in Valkey for 1 hour. Second-degree connections are computed on demand by intersecting first-degree lists. This works because the median LinkedIn user has ~500 connections, making the intersection manageable (~250K comparisons worst case).
-
-**Why real-time traversal fails at scale**: A user with 500 connections, each with 500 connections, produces 250,000 candidate 2nd-degree connections. Adding 3rd-degree multiplies again to 125M candidates. Without caching, every profile view triggers this computation.
-
-**Why full precomputation fails**: Storing every user's 2nd-degree list requires O(users * avg_2nd_degree) storage. With 900M users averaging 50K 2nd-degree connections, that is 45 trillion entries. Even with compact encoding, this exceeds practical storage limits.
-
-### 2. PYMK Algorithm (People You May Know)
-
-Multi-signal scoring combines graph proximity with professional similarity:
-
-| Signal | Weight | Rationale |
-|--------|--------|-----------|
-| Mutual connections | 10 points each | Strongest predictor of real-world relationship |
-| Same current company | 8 points | Colleagues often connect |
-| Same past company | 5 points | Alumni networks |
-| Same school | 5 points | Educational ties |
-| Shared skills | 2 points each | Professional affinity |
-| Same location | 2 points | Geographic proximity |
-
-The algorithm operates on 2nd-degree connections only (already connected users are excluded). Results are cached for 24 hours because the inputs (connections, experience, skills) change infrequently.
-
-**Why not collaborative filtering?** PYMK is not a content recommendation problem. It predicts real-world relationships, where explicit graph signals (mutual friends, shared employer) outperform latent factor models. LinkedIn's published research confirms that mutual connections alone account for >60% of successful connection predictions.
-
-### 3. Feed Ranking
-
-The feed uses a multi-factor scoring formula computed in SQL:
+### Accepting an invitation
 
 ```
-rank_score = (engagement_score * 0.3) + (recency_score * 0.5) + (relationship_boost)
-
-engagement_score = like_count + (comment_count * 2)
-recency_score = max(0, 100 - hours_since_posted)
-relationship_boost = 20 if author is the viewing user, else 0
+Member app                      Graph Service                PostgreSQL                   Kafka
+     │                                │                           │                         │
+     │ 1 POST /invitations/42/accept  │                           │                         │
+     │───────────────────────────────▶│                           │                         │
+     │                                │ 2 lock pair row           │                         │
+     │                                │──────────────────────────▶│                         │
+     │                                │ 3 set connected + outbox  │                         │
+     │                                │──────────────────────────▶│                         │
+     │                                │ 4 COMMIT (or 0 rows)      │                         │
+     │                                │◀──────────────────────────│                         │
+     │ 5 200 {status: connected}      │                           │                         │
+     │◀───────────────────────────────│                           │                         │
+     ······························· outbox relay, under 1 s ································
+     │                                │                           │ 6 pair.connected {A,B}  │
+     │                                │                           │────────────────────────▶│
+     │                                │ 7 add edge to both lists                            │
+     │                                │◀────────────────────────────────────────────────────│
+     │                                │                           │                         │
 ```
 
-**Why comments are weighted 2x likes**: A comment represents higher engagement intent than a like. Professional content that generates discussion (comments) is more valuable to the network than content that receives passive approval (likes).
+- **The pair row is the lock and the truth.** Both directions of an invitation for members A and B live in one row keyed by `(low_id, high_id)` on one shard, so "is there an invitation the other way?" and "are they already connected?" are answered under the same row lock. A crossing invitation (B invites A while A's invitation to B is pending) becomes an accept instead of a second invitation.
+- **The state change is a compare-and-set.** The update applies only while the state is `pending`; a double click or a retried request finds `connected` and returns `200` with `changed: false`, so the counters and the event are produced exactly once.
+- **Adjacency is derived.** Kafka consumers apply `pair.connected` to both members' in-memory lists and upsert the two directed adjacency rows (`A→B` on A's shard, `B→A` on B's), keyed so a replayed event is a no-op. Members can be on different shards; nothing needs a distributed transaction.
+- Locally there is one PostgreSQL: the transaction takes an advisory lock on `(low, high)`, claims the request with a conditional `UPDATE`, inserts the single canonical edge row and moves both counters only if that insert happened (see [Implementation Notes](#implementation-notes)).
 
-**Why recency dominates at 50%**: LinkedIn is a professional network where timely information matters. A job announcement from yesterday is more relevant than a thought leadership post from last week, even if the old post has more engagement. The linear decay (not exponential) ensures that high-engagement posts remain visible for ~4 days before falling off.
+### Viewing a profile: degree and "how you're connected"
 
-**Feed cache invalidation**: When a user creates a post, the feed caches for their first 50 connections are explicitly deleted. This ensures direct connections see new content immediately. Beyond 50 connections, the TTL-based cache (not yet implemented) handles eventual consistency.
+```
+Viewer app                         Router          Shard of A   Shard of B   Shards of F(B)
+     │                                │                 │            │              │
+     │ 1 GET /members/B/relationship  │                 │            │              │
+     │───────────────────────────────▶│                 │            │              │
+     │                                │ 2 adjacency(A)  │            │              │
+     │                                │────────────────▶│            │              │
+     │                                │ 3 adjacency(B)               │              │
+     │                                │─────────────────────────────▶│              │
+     │                                │ 4 intersect? -> 2nd degree   │              │
+     │                                │ 5 adjacency(each id in F(B))                │
+     │                                │────────────────────────────────────────────▶│
+     │                                │ 6 ~170K ids                                 │
+     │                                │◀────────────────────────────────────────────│
+     │                                │ 7 hit in F(A)? -> 3rd + path │              │
+     │ 8 {degree, status, path}       │                 │            │              │
+     │◀───────────────────────────────│                 │            │              │
+     │                                │                 │            │              │
+```
 
-### 4. Job-Candidate Matching
+- **Bidirectional search.** Steps 2–3 fetch both first-degree sets (~500 ids each). If they intersect, the target is 2nd degree and every member of the intersection is a mutual connection. Otherwise step 5 expands *one* side by one hop — the target's side, or whichever is smaller — and checks the result against the viewer's set. That is about 500 adjacency lookups, batched per partition, instead of the 250K lookups a viewer-side expansion to depth 2 would need, or the 125M of a naive depth-3 walk.
+- **Hubs are capped.** Members with tens of thousands of connections make step 5 expensive; the router always expands the smaller set and gives up after a budget (say 50K ids), answering "3rd+" without a path.
+- **Caching.** The answer for (viewer, target) is cached for ten minutes under both members' graph versions; any connection change bumps the version, so a stale "2nd" can't outlive the change that made it "1st".
 
-Job matching scores candidates against job requirements across multiple dimensions:
+### PYMK: precompute, then filter at serve time
 
-| Dimension | Score Calculation |
-|-----------|-------------------|
-| Skills match | (matched_required / total_required * 60) + (matched_optional * 5) |
-| Experience level | 20 points if experience years >= required years |
-| Location | 15 points if job location matches candidate location |
-| Remote preference | 10 points if job is remote and candidate is remote-friendly |
+```
+Member app                   Graph Service          Redis                       PYMK jobs
+     │                             │                  │                             │
+     │                             │                 1 nightly: friends of friends  │
+     │                             │                  │      2 score, keep top 100  │
+     │                             │                  │ 3 SET pymk:{id}, TTL 24 h   │
+     │                             │                  │◀────────────────────────────│
+     ··························· member opens My Network ····························
+     │ 4 GET /pymk?limit=20        │                  │                             │
+     │────────────────────────────▶│                  │                             │
+     │                             │ 5 GET pymk:{id}  │                             │
+     │                             │─────────────────▶│                             │
+     │                             │ 6 drop new connections, invites                │
+     │ 7 20 suggestions + reasons  │                  │                             │
+     │◀────────────────────────────│                  │                             │
+     ·························· nearline: A and B connect ···························
+     │                             │                  │ 8 recompute pymk:A, pymk:B  │
+     │                             │                  │◀────────────────────────────│
+     │                             │                  │                             │
+```
 
-The matching score (0-100) is stored on the `job_applications` table as `match_score` for sorting and filtering.
-
----
+- **Candidate generation** (step 1) is a friends-of-friends join over the adjacency table with mutual counts, kept to the top few hundred by mutual count per member. Members with thin networks also get colleagues and classmates (same company or school), the cold-start path.
+- **Scoring** (step 2) starts with explicit, explainable weights — 10 per mutual connection, 8 for the same current company, 5 for a shared past company or school, 2 per shared skill (capped at five), 2 for the same location — and is replaced by a learned ranker once acceptance data exists. The reasons shown on the card come from the same features.
+- **Serve-time filter** (step 6) drops anyone who became a connection, has a pending invitation either way, or was dismissed since the list was computed, so a day-old list never suggests someone you just connected with.
+- **Nearline refresh** (step 8): a `pair.connected` event recomputes the two members' lists within minutes, so a burst of new connections changes suggestions the same day.
 
 ## Database Schema
 
-### Complete Table Definitions
+### Production schema
 
-#### 1. companies
+PostgreSQL, sharded by member id. Pair rows live on the shard of the lower id so both directions share one row.
 
-| Column | Type | Constraints | Description |
-|--------|------|-------------|-------------|
-| id | SERIAL | PRIMARY KEY | Company identifier |
-| name | VARCHAR(255) | NOT NULL | Company name |
-| slug | VARCHAR(255) | UNIQUE, NOT NULL | URL-friendly identifier |
-| description | TEXT | | Company description |
-| industry | VARCHAR(100) | | Industry sector |
-| size | VARCHAR(50) | | Employee count range |
-| location | VARCHAR(100) | | Headquarters location |
-| website | VARCHAR(255) | | Company website URL |
-| logo_url | VARCHAR(500) | | Company logo URL |
-| created_at | TIMESTAMP | DEFAULT NOW() | Creation timestamp |
+```sql
+-- Relationship state between two members: the source of truth for "connected?"
+CREATE TABLE member_pairs (
+  low_id       BIGINT NOT NULL,
+  high_id      BIGINT NOT NULL,
+  state        TEXT   NOT NULL CHECK (state IN ('pending', 'connected', 'declined', 'withdrawn', 'removed')),
+  requested_by BIGINT,                      -- who sent the current invitation
+  message      VARCHAR(300),
+  version      BIGINT NOT NULL DEFAULT 1,   -- compare-and-set and cache versions
+  updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (low_id, high_id),
+  CHECK (low_id < high_id)
+);
 
-#### 2. users
+-- Derived: one row per direction, on the owner's shard; written by the edge consumer
+CREATE TABLE adjacency (
+  member_id    BIGINT NOT NULL,
+  other_id     BIGINT NOT NULL,
+  connected_at TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (member_id, other_id)
+);
 
-| Column | Type | Constraints | Description |
-|--------|------|-------------|-------------|
-| id | SERIAL | PRIMARY KEY | User identifier |
-| email | VARCHAR(255) | UNIQUE, NOT NULL | Login email |
-| password_hash | VARCHAR(255) | NOT NULL | bcrypt hashed password |
-| first_name | VARCHAR(100) | NOT NULL | First name |
-| last_name | VARCHAR(100) | NOT NULL | Last name |
-| headline | VARCHAR(200) | | Professional tagline |
-| summary | TEXT | | About section |
-| location | VARCHAR(100) | | Current location |
-| industry | VARCHAR(100) | | Primary industry |
-| profile_image_url | VARCHAR(500) | | Profile photo |
-| banner_image_url | VARCHAR(500) | | Profile banner |
-| connection_count | INTEGER | DEFAULT 0 | Denormalized 1st-degree count |
-| role | VARCHAR(20) | DEFAULT 'user' | user, recruiter, admin |
-| created_at | TIMESTAMP | DEFAULT NOW() | Account creation |
+-- Derived inbox so "invitations I received" is a single-shard read
+CREATE TABLE invitations_inbox (
+  recipient_id BIGINT NOT NULL,
+  sender_id    BIGINT NOT NULL,
+  created_at   TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (recipient_id, created_at, sender_id)
+);
 
-**Design rationale**: `connection_count` is denormalized because it appears on every profile view, connection card, and PYMK suggestion. Computing it from the connections table on every render would be expensive at scale.
+CREATE TABLE members (
+  id                BIGINT PRIMARY KEY,
+  email             TEXT NOT NULL UNIQUE,      -- never returned on public views
+  first_name        TEXT NOT NULL,
+  last_name         TEXT NOT NULL,
+  headline          VARCHAR(220),
+  location          TEXT,
+  connection_count  INTEGER NOT NULL DEFAULT 0, -- maintained by the edge consumer
+  graph_version     BIGINT NOT NULL DEFAULT 0
+);
 
-#### 3. skills (normalized)
+CREATE TABLE posts (
+  author_id   BIGINT NOT NULL,
+  id          BIGINT NOT NULL,               -- time-ordered id (Snowflake-style)
+  body        TEXT NOT NULL,
+  like_count  INTEGER NOT NULL DEFAULT 0,
+  created_at  TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (author_id, id)                -- an author's posts are one range scan
+);
 
-**skills** table:
+CREATE TABLE outbox (
+  id           BIGSERIAL PRIMARY KEY,
+  topic        TEXT NOT NULL,                -- pair.connected, member.updated, job.updated
+  key          BIGINT NOT NULL,              -- Kafka partition key (member id)
+  payload      JSONB NOT NULL,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  published_at TIMESTAMPTZ
+);
+CREATE INDEX outbox_unpublished ON outbox (id) WHERE published_at IS NULL;
+```
 
-| Column | Type | Constraints | Description |
-|--------|------|-------------|-------------|
-| id | SERIAL | PRIMARY KEY | Skill identifier |
-| name | VARCHAR(100) | UNIQUE, NOT NULL | Skill name (e.g., "Python") |
+Redis keys: `sess:{id}` (sessions), `posts:recent:{authorId}` (the last ~100 post ids, capped list), `pymk:{memberId}` (top 100 with reason codes, 24 h TTL), `rel:{viewer}:{target}:{vA}:{vB}` (relationship cache keyed by both graph versions), `rl:{category}:{memberId}` (token buckets).
 
-**user_skills** junction table:
+### Local schema
 
-| Column | Type | Constraints | Description |
-|--------|------|-------------|-------------|
-| user_id | INTEGER | FK -> users ON DELETE CASCADE | User |
-| skill_id | INTEGER | FK -> skills ON DELETE CASCADE | Skill |
-| endorsement_count | INTEGER | DEFAULT 0 | Endorsement count |
-| | | PRIMARY KEY (user_id, skill_id) | |
+The local schema is [`backend/src/db/init.sql`](./backend/src/db/init.sql); it is loaded by `npm run db:migrate` or on a fresh Docker volume, and is safe to run twice. It maps to the production design like this:
 
-**Design rationale**: Normalized skills (separate table with IDs) enable consistent PYMK matching. Without normalization, "JavaScript" vs "Javascript" vs "JS" would be treated as different skills.
+| Production | Local | Difference |
+|------------|-------|------------|
+| `member_pairs` (state machine) | `connections` (one canonical row per connected pair) + `connection_requests` (one row per direction) | Two tables instead of one pair row; the pair is serialized with an advisory lock instead of a row lock |
+| `adjacency` (two directed rows) | — | One canonical row; "all connections of X" reads the primary key and `idx_connections_connected_to` |
+| `posts`, `members` | `posts`, `users`, `experiences`, `education`, `skills`, `user_skills`, `skill_endorsements` | Same shape, single node |
+| Elasticsearch documents fed by the outbox | `search_index_queue` + generated `search_document` columns with GIN indexes | The queue is a per-entity outbox; full-text columns serve the fallback |
+| PYMK store | Valkey `pymk:{id}` | Computed on a cache miss instead of nightly |
 
-#### 4. experiences
+The edge table and the search outbox, verbatim from `init.sql`:
 
-| Column | Type | Constraints | Description |
-|--------|------|-------------|-------------|
-| id | SERIAL | PRIMARY KEY | Experience identifier |
-| user_id | INTEGER | FK -> users ON DELETE CASCADE | User |
-| company_id | INTEGER | FK -> companies ON DELETE SET NULL | Company reference |
-| company_name | VARCHAR(255) | NOT NULL | Denormalized for display |
-| title | VARCHAR(200) | NOT NULL | Job title |
-| location | VARCHAR(100) | | Work location |
-| start_date | DATE | NOT NULL | Start date |
-| end_date | DATE | | End date (NULL = current) |
-| description | TEXT | | Role description |
-| is_current | BOOLEAN | DEFAULT FALSE | Current position flag |
+```sql
+CREATE TABLE IF NOT EXISTS connections (
+  user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  connected_to INTEGER REFERENCES users(id) ON DELETE CASCADE,
+  connected_at TIMESTAMP DEFAULT NOW(),
+  PRIMARY KEY (user_id, connected_to),
+  CONSTRAINT connection_order CHECK (user_id < connected_to)
+);
+```
 
-#### 5. education
-
-| Column | Type | Constraints | Description |
-|--------|------|-------------|-------------|
-| id | SERIAL | PRIMARY KEY | Education identifier |
-| user_id | INTEGER | FK -> users ON DELETE CASCADE | User |
-| school_name | VARCHAR(255) | NOT NULL | Institution name |
-| degree | VARCHAR(100) | | Degree type |
-| field_of_study | VARCHAR(100) | | Major/field |
-| start_year | INTEGER | | Start year |
-| end_year | INTEGER | | End year |
-| description | TEXT | | Additional details |
-
-#### 6. connections (Social Graph)
-
-| Column | Type | Constraints | Description |
-|--------|------|-------------|-------------|
-| user_id | INTEGER | FK -> users ON DELETE CASCADE | Smaller user ID |
-| connected_to | INTEGER | FK -> users ON DELETE CASCADE | Larger user ID |
-| connected_at | TIMESTAMP | DEFAULT NOW() | Connection established |
-| | | PRIMARY KEY (user_id, connected_to) | |
-| | | CHECK (user_id < connected_to) | Canonical ordering |
-
-**Design rationale**: Storing connections with `user_id < connected_to` halves storage and eliminates duplicate records. A connection between users 5 and 12 is always stored as `(5, 12)`, never `(12, 5)`. Queries use `WHERE user_id = ? OR connected_to = ?` to find all connections for either user.
-
-#### 7. connection_requests
-
-| Column | Type | Constraints | Description |
-|--------|------|-------------|-------------|
-| id | SERIAL | PRIMARY KEY | Request identifier |
-| from_user_id | INTEGER | FK -> users ON DELETE CASCADE | Sender |
-| to_user_id | INTEGER | FK -> users ON DELETE CASCADE | Recipient |
-| message | TEXT | | Personalized invitation |
-| status | VARCHAR(20) | DEFAULT 'pending' | pending, accepted, declined, withdrawn |
-| created_at | TIMESTAMP | DEFAULT NOW() | Request sent time |
-| | | UNIQUE(from_user_id, to_user_id) | One request per pair |
-
-#### 8. posts
-
-| Column | Type | Constraints | Description |
-|--------|------|-------------|-------------|
-| id | SERIAL | PRIMARY KEY | Post identifier |
-| user_id | INTEGER | FK -> users ON DELETE CASCADE | Author |
-| content | TEXT | NOT NULL | Post text |
-| image_url | VARCHAR(500) | | Attached image |
-| like_count | INTEGER | DEFAULT 0 | Denormalized like count |
-| comment_count | INTEGER | DEFAULT 0 | Denormalized comment count |
-| share_count | INTEGER | DEFAULT 0 | Denormalized share count |
-| created_at | TIMESTAMP | DEFAULT NOW() | Post creation time |
-
-**Indexes**: `(user_id)`, `(created_at DESC)`.
-
-#### 9. post_likes / post_comments
-
-**post_likes**: `PRIMARY KEY (user_id, post_id)` prevents duplicate likes.
-
-**post_comments**: Standard comment table with `post_id` FK and `user_id` FK. Flat structure (no threading) since LinkedIn comments are rarely deeply nested.
-
-#### 10. jobs
-
-| Column | Type | Constraints | Description |
-|--------|------|-------------|-------------|
-| id | SERIAL | PRIMARY KEY | Job identifier |
-| company_id | INTEGER | FK -> companies ON DELETE CASCADE | Hiring company |
-| posted_by_user_id | INTEGER | FK -> users ON DELETE SET NULL | Recruiter who posted |
-| title | VARCHAR(200) | NOT NULL | Job title |
-| description | TEXT | NOT NULL | Full description |
-| location | VARCHAR(100) | | Job location |
-| is_remote | BOOLEAN | DEFAULT FALSE | Remote work flag |
-| employment_type | VARCHAR(50) | | full-time, part-time, contract, internship |
-| experience_level | VARCHAR(50) | | entry, associate, mid-senior, director, executive |
-| years_required | INTEGER | | Minimum years of experience |
-| salary_min | INTEGER | | Salary range minimum |
-| salary_max | INTEGER | | Salary range maximum |
-| status | VARCHAR(20) | DEFAULT 'active' | active, closed, filled, draft |
-
-**job_skills**: Many-to-many junction with `is_required` flag (required vs nice-to-have).
-
-**job_applications**: `UNIQUE(job_id, user_id)` prevents duplicate applications. Includes `match_score` (0-100) for candidate ranking.
-
-#### 11. audit_logs
-
-| Column | Type | Constraints | Description |
-|--------|------|-------------|-------------|
-| id | SERIAL | PRIMARY KEY | Log identifier |
-| event_type | VARCHAR(100) | NOT NULL | Event category |
-| actor_id | INTEGER | FK -> users ON DELETE SET NULL | Acting user |
-| actor_ip | INET | | Client IP |
-| target_type | VARCHAR(50) | | Entity type |
-| target_id | INTEGER | | Entity ID |
-| action | VARCHAR(50) | NOT NULL | Action description |
-| details | JSONB | DEFAULT '{}' | Event-specific data |
-| created_at | TIMESTAMP | DEFAULT NOW() | Event time |
-
-**Indexes**: `(actor_id, created_at)`, `(target_type, target_id, created_at)`, `(event_type, created_at)`, `(created_at)`, partial index for admin actions.
-
----
+```sql
+CREATE TABLE IF NOT EXISTS search_index_queue (
+  entity_type VARCHAR(10) NOT NULL,     -- 'user' | 'job'
+  entity_id INTEGER NOT NULL,
+  version BIGINT NOT NULL DEFAULT 1,    -- bumped by every re-enqueue
+  enqueued_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  attempts INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  last_error TEXT,
+  PRIMARY KEY (entity_type, entity_id)
+);
+```
 
 ## API Design
 
+### Production API
+
 ```
-# Authentication
-POST   /api/auth/register           - Create account
-POST   /api/auth/login              - Login
-POST   /api/auth/logout             - Logout
-GET    /api/auth/me                 - Get current user
-
-# Users / Profiles
-GET    /api/users/:id               - Get full profile
-PUT    /api/users/:id               - Update profile
-GET    /api/users/:id/experience    - Get work history
-POST   /api/users/:id/experience    - Add experience
-GET    /api/users/:id/education     - Get education
-POST   /api/users/:id/education     - Add education
-GET    /api/users/:id/skills        - Get skills with endorsements
-POST   /api/users/:id/skills        - Add skill
-POST   /api/users/:id/skills/:skillId/endorse - Endorse a skill
-GET    /api/users/search?q=         - Search users (Elasticsearch)
-
-# Connections
-POST   /api/connections/request     - Send connection request
-POST   /api/connections/:id/accept  - Accept request
-POST   /api/connections/:id/reject  - Reject request
-DELETE /api/connections/:id         - Remove connection
-GET    /api/connections             - List connections
-GET    /api/connections/pending     - Pending requests
-GET    /api/connections/mutual/:userId - Mutual connections
-GET    /api/connections/degree/:userId - Connection degree (1st/2nd/3rd)
-GET    /api/connections/pymk        - People You May Know
-
-# Feed
-GET    /api/feed                    - Personalized feed
-POST   /api/feed/posts              - Create post
-POST   /api/feed/posts/:id/like     - Like post
-DELETE /api/feed/posts/:id/like     - Unlike post
-POST   /api/feed/posts/:id/comments - Add comment
-GET    /api/feed/posts/:id/comments - Get comments
-
-# Jobs
-GET    /api/jobs                    - List jobs with filters
-GET    /api/jobs/:id                - Get job details
-POST   /api/jobs                    - Create job posting
-POST   /api/jobs/:id/apply          - Apply to job
-GET    /api/jobs/:id/applicants     - Get applicants with match scores
-GET    /api/jobs/search?q=          - Search jobs (Elasticsearch)
+POST   /api/v1/invitations                     {to, message?} → 201 sent | 200 already_pending | 200 connected
+POST   /api/v1/invitations/{id}/accept         → 200 {status, changed}   (also /decline, /withdraw)
+DELETE /api/v1/connections/{memberId}          → 200 {removed}
+GET    /api/v1/connections?cursor=             → my connections, most recent first
+GET    /api/v1/members/{id}/relationship       → {degree, status, request_id, mutual_count, path}
+GET    /api/v1/pymk?limit=20                   → suggestions with reasons
+GET    /api/v1/feed?cursor=                    → ranked page + next_cursor
+POST   /api/v1/posts                           Idempotency-Key → 201
+GET    /api/v1/search/people?q=&cursor=        → hits + source
+GET    /api/v1/jobs?q=&location=&remote=       → hits + source
+POST   /api/v1/jobs/{id}/applications          Idempotency-Key → 201 | 409 closed
 ```
 
----
+- **Invitation writes are idempotent by construction.** The response says what happened (`sent`, `already_pending`, `connected`) and the resulting status, so a client can retry blindly and render the server's answer.
+- **`status` drives the UI.** `connected`, `pending_sent`, `pending_received` or `none` decides the profile button; `degree` and `path` decide the badge and the "how you're connected" line. Clients never infer one from the other.
+- **Cursors, not offsets.** The feed cursor names a ranked snapshot and a position in it, so pages don't repeat or skip when scores change between requests.
+- **Errors** are `application/problem+json` with stable codes (`already_connected`, `request_not_pending`, `user_not_found`); rate limits come back as `429` with `Retry-After`.
+
+### Local routes
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| POST | `/api/auth/register`, `/login`, `/logout`; GET `/api/auth/me` | Session auth (cookie, sessions in Valkey) |
+| GET, PATCH | `/api/users/:id`, `/api/users/me` | Profile (email only on your own); allowlisted edits |
+| GET | `/api/users?q=` | People search: `{users, source}` |
+| POST | `/api/connections/request` | Invite: `201 sent`, `200 already_pending` or `200 accepted_reverse` |
+| POST | `/api/connections/requests/:id/accept`, `/reject`, `/withdraw` | Idempotent transitions with `changed` |
+| DELETE | `/api/connections/:userId` | Remove: `{removed}` |
+| GET | `/api/connections/degree/:userId` | Relationship: degree, status, request id, mutual count, path |
+| GET | `/api/connections`, `/requests`, `/mutual/:userId`, `/second-degree`, `/pymk` | Lists and suggestions |
+| GET, POST | `/api/feed`, `/api/feed/:id/like`, `/api/feed/:id/comments` | Feed (offset pages), likes, comments |
+| GET, POST | `/api/jobs`, `/api/jobs/:id`, `/api/jobs/:id/apply`, `/api/jobs/companies` | Jobs, applications, companies |
+| GET | `/health`, `/health/live`, `/health/ready`, `/metrics` | Operations |
 
 ## Key Design Decisions
 
-### 1. Canonical Connection Storage (user_id < connected_to)
+### 1. A pair row is the source of truth; directed adjacency is derived
 
-**Chosen**: Store each connection once with smaller ID first, constrained by `CHECK (user_id < connected_to)`.
+The alternatives fail in specific ways. **Two directed rows written together** (A→B and B→A) are natural once you shard by member, but the two rows land on different shards, so writing both atomically needs a distributed transaction; without one, a crash between the writes leaves a one-sided connection that one member sees and the other doesn't. **One canonical row** keyed by `(low, high)` makes symmetry impossible to break, but "all of X's connections" becomes a scatter across shards for the half of the edges where X is the larger id. The design keeps both: the pair row decides (one shard, one lock, a state machine for invitations), and the directed rows and in-memory lists are an index built from its change events, idempotent and replayable. What it costs is a window of under a second in which a third party can read the old adjacency, and a reconciliation job that compares pairs with adjacency nightly.
 
-**Why this works**: A connection between users 5 and 12 is always row `(5, 12)`. To check if two users are connected, the application normalizes the pair before querying. This halves the storage (one row per connection, not two) and eliminates the ambiguity of "which direction was it stored."
+### 2. Degree by bidirectional search, not precomputed second-degree sets
 
-**What breaks with bidirectional storage**: Storing both `(5, 12)` and `(12, 5)` doubles the connections table. At 100B connections, that is 200B rows. Worse, every connection mutation requires two writes and consistency between them. If one write succeeds and the other fails, the graph becomes asymmetric.
+Precomputing every member's second-degree set means storing ~100K+ ids for 300M active members — tens of trillions of entries, mostly never read, and invalidated by every new connection anywhere in the neighborhood. A per-request BFS from the viewer touches 250K members at depth 2. Profile views are pairwise questions ("A and B"), so the search meets in the middle: two adjacency reads answer 1st and 2nd degree, and one bounded one-sided expansion answers 3rd. The cost is a hard tail for hub members, handled by expanding the smaller side and capping the budget.
 
-**What we give up**: Queries are slightly more complex. Instead of `WHERE user_id = ?`, we need `WHERE user_id = ? OR connected_to = ?`. But this is a negligible query planning cost compared to the storage and consistency benefits.
+### 3. PYMK precomputed offline, filtered online
 
-### 2. Pull Model for Feed (Not Fanout-on-Write)
+Scoring at request time means a friends-of-friends join on every page view: ~100× the cost of reading a list, to gain freshness nobody notices because jobs and schools change on a scale of months. The batch job owns the expensive join; the serving path owns freshness through the filter and nearline recomputation. Explicit features come first because they explain themselves on the card and are easy to debug; a learned model can replace the weights without changing the pipeline.
 
-**Chosen**: Feed is computed on demand by querying posts from the user's connections.
+### 4. Feed: fan-out on read from per-author activity lists
 
-**Why pull model works for LinkedIn**: The median LinkedIn user has ~500 connections and checks their feed 2-3 times/day. Pull model computes the feed at read time: fetch connections from cache, query posts from those users, rank them. At 500 connections, this is a single `WHERE user_id = ANY(array_of_500_ids) ORDER BY rank_score DESC LIMIT 20` query, which PostgreSQL handles in <50ms with proper indexes.
+Fan-out on write would turn 5M posts a day into 2.5B timeline writes for an average 500-connection author, and an influencer's post into millions of writes and a queue backlog. LinkedIn members open the feed a few times a day, so materialized timelines would be rewritten far more often than read. Pull instead: each post appends its id to the author's capped list in Redis (one write), and a feed load multi-gets ~500 such lists (batched by shard), merges the newest candidates, ranks them, and stores the ranked ids as a short-lived session snapshot that cursors page through. The cost is read work — about 8.5M list reads a second at average load — which is cheap, cacheable and parallel.
 
-**What breaks with fanout-on-write**: When a user creates a post, fanout-on-write copies it to every follower's feed timeline. A LinkedIn influencer with 10M followers would require 10M write operations per post. With 5M posts/day and an average of 500 connections, fanout generates 2.5B write operations/day just for feed maintenance. This is operationally expensive and introduces write amplification.
+### 5. Search fed through an outbox, with a degraded mode
 
-**What we give up**: Feed latency is higher than pre-materialized feeds. A pull model requires a database query per feed request, while fanout serves from a pre-built list. For LinkedIn's usage pattern (professional network, not real-time messaging), sub-200ms query latency is sufficient.
-
-### 3. Elasticsearch for User and Job Search
-
-**Chosen**: Elasticsearch with fuzzy matching and field boosting for user and job discovery.
-
-**Why Elasticsearch over PostgreSQL full-text**: LinkedIn search requires fuzzy matching (finding "Jhon" when searching "John"), multi-field search with different weights (name boosted 2x, skills boosted 2x for jobs), and faceted filtering (by location, remote, experience level). PostgreSQL `tsvector` supports full-text search but lacks native fuzzy matching and sophisticated relevance tuning.
-
-**What we give up**: An additional infrastructure dependency. Elasticsearch requires index synchronization, which introduces eventual consistency between the database and search results. A newly registered user may not appear in search for a few seconds.
-
----
+Writing to PostgreSQL and then calling Elasticsearch in the request is a dual write: when Elasticsearch is slow the profile edit fails after it was committed, and when the second call is lost the index is silently stale. The outbox row commits with the change; workers rebuild the document from current state, so retries and reordering converge. When the cluster is down, search answers from PostgreSQL full-text (exact and prefix matches, no typo tolerance) instead of failing.
 
 ## Consistency and Idempotency
 
-### Connection Request Idempotency
+| Operation | Guarantee | Mechanism |
+|-----------|-----------|-----------|
+| Send invitation | At most one pending invitation per pair; crossing invitations connect | Pair row lock (local: advisory lock on `(low, high)`); upsert that re-opens declined or withdrawn invitations |
+| Accept / decline / withdraw | Each transition happens once; retries return `changed: false` | Compare-and-set on `state = 'pending'` (local: conditional `UPDATE … RETURNING`) |
+| Connection counters | Match the edges | Incremented only when the edge insert actually happened, in the same transaction |
+| Adjacency mirrors | Symmetric within ~1 s | Idempotent upserts keyed by `(member_id, other_id)`; nightly reconciliation |
+| Graph caches | Never older than the last committed change | Version per member bumped after commit; cache keys include the version |
+| PYMK | Never suggests a current connection or pending invitee | Serve-time filter against live state |
+| Search index | Converges to the database | Outbox row per change; documents rebuilt from current rows; delete only the claimed version |
+| Likes, endorsements | Idempotent per member | Primary keys `(user_id, post_id)` and `(endorser_id, user_id, skill_id)` |
+| Post creation, job application | One effect per click | `Idempotency-Key` with a stored response (production); applications are unique per `(job, member)` |
 
-Connection requests check for existing connections and pending requests before creating. The `UNIQUE(from_user_id, to_user_id)` constraint prevents database-level duplicates. Accepting a connection uses `INSERT ... ON CONFLICT DO NOTHING` when creating the connection row.
-
-### Like Idempotency
-
-`INSERT INTO post_likes (user_id, post_id) VALUES ($1, $2) ON CONFLICT DO NOTHING` makes likes naturally idempotent. The `like_count` is updated by counting actual rows rather than incrementing, preventing over-counting from duplicate requests:
-```sql
-UPDATE posts SET like_count = (SELECT COUNT(*) FROM post_likes WHERE post_id = $1) WHERE id = $1
-```
-
-### Message Idempotency (RabbitMQ)
-
-Every queue message carries an `idempotencyKey` (UUID). Before processing, the consumer checks Redis for `processed:{key}`. If found, the message is acknowledged without re-processing. After successful processing, the key is stored in Redis with a 24-hour TTL. Failed messages are rejected to a dead letter queue (not requeued) to prevent infinite retry loops.
-
-### Feed Cache Invalidation
-
-When a user creates a post, feed caches for their first 50 connections are explicitly deleted (`cacheDel('feed:${connId}')`). This ensures high-value connections see fresh content immediately. The 50-connection limit prevents cache stampedes when popular users post.
-
----
+A member always reads their own write: the accept response carries the new status, and the cache versions are bumped before the response returns.
 
 ## Security / Auth
 
-- **Session-based auth** with express-session (in-memory store in development, Redis in production)
-- **bcryptjs** password hashing
-- **Rate limiting** via Redis token bucket algorithm (`src/utils/rateLimiter.ts`):
-  - Public endpoints (login/register): 10 requests/minute
-  - Read operations: 100 requests/minute
-  - Write operations: 30 requests/minute
-  - Connection requests: 20 requests/minute (anti-spam)
-  - Search: 20 requests/minute
-- **Trace ID propagation**: `X-Trace-Id` header on every request/response for distributed tracing
-- **CORS**: Restricted to frontend origin
-- **Cookie security**: HttpOnly, SameSite=strict, secure in production
-
----
+- **Sessions** in Redis behind an `HttpOnly`, `SameSite=Strict` cookie, `Secure` in production. Revocation is a key delete; any API instance can serve any member.
+- **Authorization**: roles (`user`, `recruiter`, `admin`) for coarse permissions, ownership checks for everything a member edits. Profile updates accept an allowlist of fields; role, email and counters are never writable through the profile API.
+- **Privacy**: email and contact details never appear on public profiles, search hits, cards or paths. Search results respect profile visibility settings at query time.
+- **Abuse**: invitations are rate-limited per member (token bucket in Redis: 20/min burst 10, plus a weekly cap) because mass-inviting is the platform's oldest spam vector; "I don't know this person" responses lower the sender's limits. Reads are limited per member to slow scraping.
+- **Input**: parameterized SQL everywhere, column lists built only from allowlists, ids validated before they reach a query, invitation notes capped at 300 characters.
 
 ## Observability
 
-### Prometheus Metrics
-
-| Metric | Type | Purpose |
-|--------|------|---------|
-| `http_requests_total` | Counter | Request count by method/path/status |
-| `http_request_duration_seconds` | Histogram | API latency by method/path |
-| `connections_created_total` | Counter | New connections rate |
-| `connections_removed_total` | Counter | Connection removal rate |
-| `connection_requests_total` | Counter | Connection request rate |
-| `posts_created_total` | Counter | Post creation rate |
-| `post_likes_total` | Counter | Like rate |
-| `post_comments_total` | Counter | Comment rate |
-| `profile_views_total` | Counter | Profile view rate |
-| `search_queries_total` | Counter | Search query rate by type |
-| `pymk_computation_duration_seconds` | Histogram | PYMK algorithm performance |
-| `feed_generation_duration_seconds` | Histogram | Feed query time |
-| `queue_depth` | Gauge | RabbitMQ queue depth by queue |
-| `queue_processing_duration_seconds` | Histogram | Message processing time |
-| `db_query_duration_seconds` | Histogram | Database query time by type |
-| `cache_hits_total` / `cache_misses_total` | Counter | Cache effectiveness |
-| `rate_limit_hits_total` | Counter | Rate limit violations by category |
-| `login_attempts_total` | Counter | Login attempts (success/failure) |
-| `active_sessions` | Gauge | Current active sessions |
-
-### Health Checks
-
-- `GET /health` - Detailed status with PostgreSQL, Valkey, and RabbitMQ checks with latency
-- `GET /health/live` - Liveness probe
-- `GET /health/ready` - Readiness probe (database + Redis)
-- `GET /metrics` - Prometheus scrape endpoint
-
-### Structured Logging
-
-Pino logger with JSON output. Trace IDs (`X-Trace-Id`) propagated through request lifecycle. Request duration, user ID, and status code logged for every request.
-
----
+- **Graph**: degree latency by outcome (1st/2nd/3rd/none), expansion size, cap hits; invitation outcomes (`sent`, `already_pending`, `accepted_reverse`); adjacency mirror lag and reconciliation mismatches (should be zero).
+- **Caches**: hit ratio per cache (`connections`, `pymk`), version bumps per second.
+- **PYMK**: batch duration and coverage, nearline lag, serve-time filter drop rate (a high rate means the lists are stale).
+- **Feed**: candidate count per load, ranking time, p99 by shard.
+- **Search**: fallback rate, outbox backlog and oldest age (alert above 30 s — that's the freshness SLO), indexing failures.
+- Structured logs with a trace id per request, propagated into events; RED metrics per route; liveness separate from readiness, with readiness failing during shutdown so the load balancer drains an instance first.
 
 ## Failure Handling
 
-- **RabbitMQ unavailability**: Server starts even if RabbitMQ is unavailable (logged as warning). Async features (notifications, search indexing) are disabled but core API remains functional
-- **Dead letter queues**: Every RabbitMQ queue has a DLQ. Failed messages are rejected without requeue (`nack(msg, false, false)`) and routed to the DLQ for manual inspection
-- **Rate limiter fail-open**: If Redis is down, rate limiting allows all requests rather than blocking. This trades abuse protection for availability
-- **PYMK degradation**: If PYMK computation fails (e.g., database timeout), return empty recommendations rather than error. The cache ensures most requests are served from pre-computed results
-- **Graceful shutdown**: SIGTERM/SIGINT handlers close RabbitMQ channel/connection, drain database pool, disconnect Redis
-
----
+| Failure | What members see | Mitigation |
+|---------|------------------|------------|
+| Graph partition down | Degree badge and path missing on some profiles; the profile still loads | Replicas per partition; the badge is an enhancement with its own timeout |
+| Kafka down | New connections reach adjacency and the feed late; writes still succeed | Outbox rows accumulate and drain on recovery |
+| Edge consumer lag | A third party briefly sees the old adjacency | The pair row answers "connected?" for the two members; lag alert at 5 s |
+| Redis down | Slower pages; sign-in required again if sessions are lost | Caches fall back to the database; sessions replicated; graph cache reads fail open |
+| Elasticsearch down | Search still works without typo tolerance | Breaker opens for 30 s and answers from PostgreSQL full-text; the outbox retries with backoff |
+| PostgreSQL shard primary down | Writes for that shard return `503` | Replica promotion; reads from replicas and caches |
+| PYMK batch fails | Yesterday's suggestions, still filtered | Lists have a TTL longer than the batch period |
 
 ## Scalability Considerations
 
-### Horizontal Scaling Path
-
-1. **API servers**: Stateless (sessions in Redis), scale behind load balancer. Multiple instances on ports 3001-3003 supported
-2. **Connection graph**: At 100B connections, PostgreSQL struggles. Production LinkedIn uses an in-house graph store. For medium scale, connection queries can use read replicas and aggressive caching
-3. **PYMK computation**: Move to dedicated workers consuming from RabbitMQ. Batch-compute recommendations nightly for all users, store in Redis. On-demand computation for recently changed networks
-4. **Feed generation**: Introduce hybrid push/pull: fanout for users with <1000 connections, pull for power users. Pre-materialize feeds in Redis sorted sets
-5. **Search**: Elasticsearch cluster with sharding by index type (users, jobs). Dedicated indexing pipeline consuming from RabbitMQ
-6. **Database**: Vertical scaling then read replicas for read-heavy queries (profiles, feeds). Shard users table by user_id hash for horizontal scaling
-
-### Sharding Strategy (Future)
-
-- **Users/profiles**: Shard by user_id hash
-- **Connections**: Shard by smaller user_id (connections are co-located with at least one user)
-- **Posts**: Shard by user_id (author's posts co-located)
-- **Jobs**: Shard by company_id (company's jobs co-located)
-
----
+1. **Hub members break first.** A member with 30K connections makes every 3rd-degree check that touches them expensive; expand the smaller side, cap the budget, and cache answers.
+2. **Feed candidate gathering** is ~500 list reads per load; batch by Redis shard, keep the lists capped at ~100 ids, and cache ranked snapshots for the session.
+3. **The PYMK batch window** grows with the graph; partition the friends-of-friends join by member id and rely on nearline recomputation for members whose networks changed.
+4. **Adjacency RAM** grows with edges; add partitions and rebalance from the Kafka log plus snapshots, never from live traffic.
+5. **Search indexing bursts** (bulk imports) go through the same outbox; workers scale horizontally because claiming uses `FOR UPDATE SKIP LOCKED`.
 
 ## Trade-offs Summary
 
 | Decision | Chosen | Alternative | Rationale |
 |----------|--------|-------------|-----------|
-| Connection storage | Canonical (id < id) | Bidirectional rows | Half storage, no inconsistency risk |
-| Feed strategy | Pull + cache | Push (fanout-on-write) | Simpler, sufficient for professional network usage pattern |
-| Search | Elasticsearch | PostgreSQL full-text | Fuzzy matching, field boosting, faceted filters |
-| Graph traversal | SQL + cache | Graph database (Neo4j) | Simpler operations, sufficient for 2-degree queries |
-| Session storage | In-memory / Redis | JWT | Immediate revocation, simpler state management |
-| PYMK caching | 24-hour Redis cache | Real-time computation | Inputs change slowly, computation is expensive |
-| Message queue | RabbitMQ | Kafka | Simpler for job-based processing, sufficient throughput |
-| Rate limiting | Redis token bucket | In-memory | Distributed rate limiting across API instances |
-
----
+| Relationship truth | Pair row + derived directed adjacency | Two directed rows written together | No cross-shard transaction; symmetry can't break |
+| Degree queries | Bidirectional search on in-RAM adjacency | Precomputed second-degree sets | Pairwise questions need two lookups, not trillions of stored ids |
+| Graph cache freshness | Versioned keys bumped after commit | Delete on write | A racing refill can't resurrect stale data |
+| PYMK | Nightly batch + nearline + serve-time filter | Score on every request | 100× cheaper; freshness comes from the filter |
+| PYMK model | Explicit weights with reasons | Learned ranker from day one | Explainable cards; swap the model later |
+| Feed delivery | Fan-out on read, ranked session snapshot | Fan-out on write | 2.5B writes a day avoided; stable cursors |
+| Search sync | Transactional outbox + rebuild from rows | Dual write in the request | Edits never fail on search; index converges |
+| Search outage | PostgreSQL full-text fallback | Return an error | Degraded results beat no results |
+| Sessions | Redis | JWT | Instant revocation; stateless API instances |
+| Invitation retries | Idempotent outcomes in the response | Client-side dedupe | Retries and double clicks are safe by construction |
 
 ## Implementation Notes
 
-### Local Architecture
+### What runs locally
 
-```
-┌───────────────────┐     ┌───────────────────────────┐
-│   React Frontend  │────▶│   Express API Server      │
-│   localhost:5173   │     │   localhost:3000           │
-└───────────────────┘     │                           │
-                          │  Routes:                  │
-                          │  /api/auth/*              │
-                          │  /api/users/*             │
-                          │  /api/connections/*       │
-                          │  /api/feed/*              │
-                          │  /api/jobs/*              │
-                          │                           │
-                          │  /health, /metrics        │
-                          └──┬────┬────┬────┬─────────┘
-                             │    │    │    │
-              ┌──────────────▼┐ ┌─▼────▼──┐ │
-              │ PostgreSQL    │ │ Valkey   │ │
-              │ :5432         │ │ :6379    │ │
-              │ linkedin/     │ │ sessions │ │
-              │ linkedin_pwd  │ │ PYMK     │ │
-              └───────────────┘ │ feed     │ │
-                                │ rate lim │ │
-                                └──────────┘ │
-                    ┌────────────────────────▼┐
-                    │     Elasticsearch       │
-                    │     :9200               │
-                    │     users, jobs indices  │
-                    └─────────────────────────┘
-                    ┌─────────────────────────┐
-                    │     RabbitMQ            │
-                    │     :5672 (AMQP)        │
-                    │     :15672 (Mgmt UI)    │
-                    │     feed.fanout         │
-                    │     notifications       │
-                    │     pymk.compute        │
-                    │     search.index        │
-                    │     profile.update      │
-                    └─────────────────────────┘
+[`backend/src/index.ts`](./backend/src/index.ts) starts one Express process serving auth, users, connections, feed and jobs under `/api`. Sessions are stored in Valkey through `connect-redis`, so `dev:server1..3` share logins. On startup the process creates the Elasticsearch indices when it can reach the cluster (queueing a full reindex for a new index), connects to RabbitMQ if available, and starts the search outbox relay. SIGTERM stops accepting connections, fails readiness, lets in-flight requests finish, then closes RabbitMQ, the pool and Valkey (forced exit after 10 s). The frontend is React 19 + TanStack Router + Zustand + Tailwind; it keeps server data in component state.
+
+### Production patterns actually implemented
+
+**Invitation lifecycle in one transaction** — [`connectionService.ts`](./backend/src/services/connectionService.ts). Every lifecycle operation takes `pg_advisory_xact_lock(low, high)` for the pair, which is what turns crossing invitations into an accept. Accepting is a claim:
+
+```sql
+UPDATE connection_requests SET status = 'accepted', updated_at = NOW()
+WHERE id = $1 AND to_user_id = $2 AND status = 'pending'
+RETURNING *
 ```
 
-### Production-Grade Patterns Implemented
+The canonical edge is inserted with `ON CONFLICT DO NOTHING`, and both `connection_count`s move only if that insert created a row. A repeated accept returns `changed: false`; declined or withdrawn requests return `409 request_not_pending`. Sending again while pending returns `200 already_pending`; a declined or withdrawn invitation is re-opened by an upsert. Errors are `ApiError`s with stable codes ([`errors.ts`](./backend/src/utils/errors.ts)), so database messages never reach clients.
 
-1. **Prometheus metrics** (`src/utils/metrics.ts`): 20+ custom metrics covering HTTP requests, business events (connections, posts, likes), PYMK computation time, feed generation time, queue depth, cache hits/misses, rate limit violations, and login attempts. Default Node.js metrics (CPU, memory, event loop) included.
+**Versioned graph cache** — [`graphCache.ts`](./backend/src/utils/graphCache.ts). First-degree lists are cached under `connections:{id}:v{version}`; every graph write bumps `graph:ver:{id}` after commit, so a reader that loaded the old list just before the change writes it under a version nobody reads. Redis errors fall back to PostgreSQL.
 
-2. **Structured logging** (`src/utils/logger.ts`): Pino with JSON output. Trace ID propagation via `X-Trace-Id` header for request correlation across services.
+**Degree and path** — [`connectionPath.ts`](./backend/src/services/connectionPath.ts) implements the bidirectional search against the two cached lists; the 3rd-degree meeting point is one indexed probe for an edge between the two sets. `GET /api/connections/degree/:userId` returns degree, status (`connected`, `pending_sent`, `pending_received`, `none`), request id, mutual count and the path as public summaries.
 
-3. **Rate limiting** (`src/utils/rateLimiter.ts`): Redis-backed token bucket algorithm with Lua scripting for atomic operations. Six categories with different limits (public, read, write, connection requests, search, admin). Rate limit headers (`X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`) on responses. Fail-open design if Redis is unavailable.
+**PYMK** — [`pymkService.ts`](./backend/src/services/pymkService.ts) generates second-degree candidates in one SQL statement ordered by mutual count (capped at 100, excluding connections and pending invitations), adds colleagues and classmates when fewer than ten exist, loads features for all candidates in four batched queries, scores them with [`pymkScoring.ts`](./backend/src/services/pymkScoring.ts), caches the top 50 for 24 hours, and filters the cached list against live connections and invitations on every read.
 
-4. **RabbitMQ message infrastructure** (`src/utils/rabbitmq.ts`): Five queues with dead letter configuration (feed fanout, notifications, PYMK compute, search index, profile update). Three exchange types (direct, fanout, topic). Message idempotency via Redis-tracked processing keys. Prefetch limit of 10 for backpressure.
+**Search outbox and fallback** — [`searchIndexer.ts`](./backend/src/services/searchIndexer.ts) and [`searchService.ts`](./backend/src/services/searchService.ts). Profile, experience, skill and job writes upsert a `search_index_queue` row in the same transaction. A relay (every 2 s, in each API process) claims due rows with `FOR UPDATE SKIP LOCKED` and a 30 s lease, rebuilds documents from PostgreSQL, indexes them and deletes the row only if its `version` is unchanged; failures back off from 2 s to 5 minutes. [`elasticsearch.ts`](./backend/src/utils/elasticsearch.ts) uses a 3 s timeout and pauses calls for 30 s after a connection failure; people and job search then answer from generated `search_document` columns with GIN indexes and report `source: "postgres"`. `npm run search:reindex` queues everything.
 
-5. **Elasticsearch integration** (`src/utils/elasticsearch.ts`): Automatic index creation at startup with optimized mappings. User search with name boosting (2x) and fuzzy matching. Job search with title boosting (3x), skill boosting (2x), and faceted filters.
+**Safer profile writes** — [`userService.ts`](./backend/src/services/userService.ts) builds `UPDATE` statements only from allowlisted columns (body keys used to become column names, which allowed role escalation and SQL injection), returns public projections without email, and records endorsements in `skill_endorsements` so each connection endorses a skill once.
 
-6. **PYMK algorithm** (`src/services/connectionService.ts`): Multi-factor scoring (mutual connections, same company, same school, shared skills, same location). Results cached in Valkey for 24 hours. Candidate limit of 100 for performance.
+**Operational patterns**: Prometheus metrics in [`metrics.ts`](./backend/src/utils/metrics.ts) (HTTP RED metrics, invitation and connection counters, PYMK duration by network size, cache hits and misses per cache, `search_index_backlog`, `search_fallbacks_total`, queue depth); Pino logs with a trace id ([`logger.ts`](./backend/src/utils/logger.ts)); a Lua token-bucket rate limiter in Valkey per category with `X-RateLimit-*` headers that fails open ([`rateLimiter.ts`](./backend/src/utils/rateLimiter.ts)); audit rows for logins, profile edits and connection events ([`audit.ts`](./backend/src/utils/audit.ts)); `/health` (PostgreSQL and Valkey required; Elasticsearch and RabbitMQ reported), `/health/live`, `/health/ready`.
 
-7. **Feed ranking** (`src/services/feedService.ts`): SQL-based multi-factor ranking combining engagement (30%), recency (50%), and relationship boost. Cache invalidation on post creation for first 50 connections.
+**Tests**: 26 vitest tests with mocked shared modules cover the path search, PYMK scoring and ranking, the cache-version race, the outbox relay (success, backoff, deleted rows, breaker), the search fallback and the accept/send state machine (`npm test` in `backend/`).
 
-8. **Health checks** (`src/index.ts`): Detailed health endpoint checking PostgreSQL, Valkey, and RabbitMQ. Separate liveness and readiness probes. Graceful shutdown with resource cleanup.
+**Frontend**: the profile header renders from the relationship endpoint — Connect, Pending (withdraw), Accept/Ignore or Connected (remove after confirmation) — applies the expected status optimistically, rolls back with an announced error, and shows the "how you're connected" path ([`ProfileHeader.tsx`](./frontend/src/components/profile/ProfileHeader.tsx), [`ConnectionActions.tsx`](./frontend/src/components/profile/ConnectionActions.tsx)). PYMK cards show the server's reasons and their Connect buttons send invitations; the search page aborts superseded requests.
 
-9. **Audit logging** (database-backed): Security event tracking for login attempts, profile changes, connection events, and administrative actions.
+### Simplified or substituted
 
-### What Was Simplified
+| Production | Local |
+|------------|-------|
+| Pair row + derived directed adjacency, sharded | Canonical `connections` row + `connection_requests`, one PostgreSQL |
+| In-memory partitioned graph | Cached first-degree lists in Valkey + SQL bridge probe |
+| Nightly PYMK batch + nearline jobs | Computed on a cache miss, 24 h TTL; only the two members' lists are dropped on a change |
+| Kafka + index workers | `search_index_queue` + relay inside the API process |
+| Fan-out on read from Redis activity lists, ranked snapshots | One SQL query ranks posts from self and connections (`0.3 × engagement + 0.5 × recency + own-post boost`) with `OFFSET` pages |
+| Notifications over SSE | Events published to RabbitMQ only |
 
-| Production Design | Local Implementation |
-|-------------------|---------------------|
-| Graph database for connections | PostgreSQL with SQL joins and caching |
-| Kafka event streaming | RabbitMQ with direct queue publishing |
-| Distributed session store (Redis) | In-memory express-session store |
-| ML-based feed ranking | SQL formula with fixed weights |
-| Precomputed PYMK (nightly batch) | On-demand computation with 24-hour cache |
-| CDN for profile images | Direct URL references |
-| OAuth/SSO/2FA | Session-based auth with bcrypt |
-| Separate microservices | Single Express process with route modules |
+### Omitted or still limited
 
-### What Was Omitted
-
-- CDN and multi-region deployment
-- Kubernetes orchestration
-- Database sharding and read replicas
-- ML pipeline for feed ranking and job matching
-- Real-time notifications (WebSocket/SSE)
-- Email notification system
-- Profile image upload and processing
-- Company pages with admin management
-- Messaging/InMail system
-- Content moderation and spam detection
-- A/B testing framework
-- Skills assessment and certification
-
----
-
-## Frontend Architecture
-
-### Component Hierarchy
-
-```
-__root (RootComponent)
-├── Navbar                          # Top navigation with search, nav links, profile
-├── Outlet (route-specific content)
-│   ├── / (HomePage)                # 3-column layout: profile card | feed | PYMK
-│   │   ├── Profile Card (sidebar)  # Mini profile with avatar, headline, connections link
-│   │   ├── Post Composer           # Inline post creation with action buttons
-│   │   ├── PostCard[]              # Feed posts with like/comment/share actions
-│   │   │   └── Comments section    # Expandable, lazy-loaded on demand
-│   │   └── PYMK sidebar           # People You May Know suggestions
-│   ├── /network                    # Connection management with 3 tabs
-│   │   ├── Connections tab         # Grid of ConnectionCard components
-│   │   ├── Requests tab            # Pending requests with accept/reject
-│   │   └── PYMK tab               # Grid of ConnectionCard with match reasons
-│   ├── /profile/$userId            # Full professional profile
-│   │   ├── ProfileHeader           # Banner, avatar, name, connection actions
-│   │   ├── EditProfileModal        # Modal form for editing profile fields
-│   │   ├── ProfileAbout            # Summary/about section
-│   │   ├── ExperienceSection       # Work history with company info
-│   │   ├── EducationSection        # Education history
-│   │   ├── SkillsSection           # Skills with endorsement counts
-│   │   └── ActivitySection         # Recent posts
-│   ├── /jobs                       # 2-column: sidebar nav | job listings
-│   │   ├── Search form + filters   # Keyword, location, remote, type, level
-│   │   ├── JobCard[]               # Job listings with match scores
-│   │   └── Recommended tab         # Jobs matched to user profile
-│   ├── /jobs/$jobId                # Job detail page
-│   ├── /search                     # User search results
-│   ├── /login                      # Login form
-│   └── /register                   # Registration form
-```
-
-### Zustand Stores
-
-**`useAuthStore`** (`stores/authStore.ts`): Manages authentication state with the `persist` middleware. Stores `user` (the full `User` object) and `isAuthenticated` (boolean) in localStorage under the key `linkedin-auth`. Provides `login`, `register`, `logout`, `checkAuth`, and `updateUser` actions. The `checkAuth` action is called from the root route's `useEffect` on every app mount, validating the session cookie against `/api/auth/me`. If validation fails (expired session, server restart), the store clears both `user` and `isAuthenticated`, redirecting to login.
-
-The `updateUser` action is notable: it allows the profile edit flow to update the cached auth user without re-fetching from the server, keeping the navbar display name and headline in sync immediately after a profile edit.
-
-The project does not use separate stores for feed, connections, or jobs. All data is fetched and managed as local component state within each route. This keeps the architecture simple but means navigating away from a page discards all fetched data.
-
-### Routing
-
-TanStack Router with file-based routing. The root layout renders `Navbar` globally and uses `Outlet` for route-specific content. Authentication guards are implemented imperatively: each protected route checks `isAuthenticated` in its `useEffect` and redirects to `/login` via `useNavigate` if not authenticated.
-
-| File | URL Pattern | Purpose |
-|------|-------------|---------|
-| `routes/index.tsx` | `/` | Home feed with post composer + PYMK sidebar |
-| `routes/network.tsx` | `/network` | Connection management (connections, requests, PYMK) |
-| `routes/profile.$userId.tsx` | `/profile/:userId` | Full professional profile |
-| `routes/jobs.tsx` | `/jobs` | Job search and recommendations |
-| `routes/jobs.$jobId.tsx` | `/jobs/:jobId` | Job detail and application |
-| `routes/search.tsx` | `/search` | User search |
-| `routes/login.tsx` / `routes/register.tsx` | `/login`, `/register` | Authentication |
-
-### Data Fetching
-
-The API client (`services/api.ts`) is organized into domain-specific namespaces: `authApi`, `usersApi`, `connectionsApi`, `feedApi`, and `jobsApi`. Each namespace groups related endpoints with typed request/response signatures. All requests use `credentials: 'include'` for cookie-based session forwarding.
-
-Routes use `Promise.all` for parallel data loading. The home page loads feed posts and PYMK suggestions simultaneously. The network page loads connections, pending requests, and PYMK in a single parallel batch. The profile page loads profile data and user posts in parallel, then conditionally loads connection degree and mutual connections for non-own profiles.
-
-The jobs page loads all jobs and recommended jobs in parallel on mount, then uses a dedicated search handler for filtering. Search triggers a fresh API call with query parameters (keyword, location, remote flag, employment type, experience level) rather than client-side filtering.
-
-### Optimistic Updates
-
-The LinkedIn frontend uses a mixed approach to UI updates:
-
-**Immediate local state updates**: When accepting a connection request, the handler calls `connectionsApi.acceptRequest`, then immediately moves the user from `pendingRequests` to `connections` in local state. The UI updates before the API call completes. If the API call fails, the error is logged but the UI is not rolled back, which is acceptable for a learning project.
-
-**Post-creation insert**: After creating a post via `feedApi.createPost`, the returned post object is prepended to the local `posts` array with the current user as the author: `setPosts([{ ...post, author: user! }, ...posts])`. This ensures the new post appears at the top of the feed immediately.
-
-**Endorsement increment**: When endorsing a skill, the handler calls the API and then locally increments the `endorsement_count` for that skill in the skills array via `setSkills(skills.map(...))`. This avoids re-fetching the entire skills list.
-
-### Key UI Patterns
-
-**Tabbed interfaces**: Both the network page and jobs page use tab-based navigation implemented with local state (`activeTab`). Tabs switch between different data views (connections/requests/PYMK, search/recommended) without changing the URL. All tab data is loaded in parallel on mount, so switching tabs is instant.
-
-**Lazy-loaded comments**: The `PostCard` component does not load comments until the user clicks "Comment" or the comment count. This prevents unnecessary API calls for posts the user scrolls past. Once loaded, comments are cached in local component state.
-
-**Connection degree display**: The profile page displays connection degree (1st, 2nd, 3rd) and mutual connections for non-own profiles. This data is fetched in a second parallel batch after profile data loads, since it requires a separate graph query.
-
-**Modal-based editing**: Profile editing uses a modal (`EditProfileModal`) that pre-fills form fields from the current profile. On save, the updated user is set in both the local profile state and the global auth store (via `updateUser`), keeping the navbar in sync.
-
----
-
-## Deep Pattern Explanations
-
-### Rate Limiting
-
-Rate limiting restricts how many requests a client can make within a time window. Without it, a single user (or bot) can overwhelm the server by sending thousands of requests per second, degrading performance for everyone. Rate limiting protects both against malicious abuse (credential stuffing, scraping) and accidental abuse (buggy client code in an infinite retry loop).
-
-The implementation (`src/utils/rateLimiter.ts`) uses a Redis-backed token bucket algorithm. Each user starts with a "bucket" of tokens (e.g., 100 tokens for read operations). Every request consumes one token. Tokens refill at a steady rate (100 per minute). When the bucket is empty, subsequent requests receive a `429 Too Many Requests` response with `X-RateLimit-Remaining: 0` and `X-RateLimit-Reset: <unix-timestamp>` headers telling the client when to retry.
-
-The system uses different rate limits for different endpoint categories because different operations have different costs and abuse risks:
-
-| Category | Limit | Rationale |
-|----------|-------|-----------|
-| Public (login/register) | 10/min | Prevents credential stuffing attacks |
-| Read (GET) | 100/min | Generous for normal browsing, blocks scraping |
-| Write (POST/PUT) | 30/min | Prevents spam posting |
-| Connection requests | 20/min | Prevents mass-connect spam |
-| Search | 20/min | Search is expensive (Elasticsearch query per request) |
-
-The token bucket is implemented as a Lua script executed atomically in Redis. Lua scripting is necessary because the "check remaining tokens and decrement" operation must be atomic. If implemented as separate Redis GET and SET commands, a race condition between two concurrent requests could allow both to pass when only one token remains.
-
-**Fail-open design**: If Redis is down, the rate limiter allows all requests instead of blocking them. This trades abuse protection for availability. The rationale: a Redis outage is temporary, and blocking all users during that window causes more harm than temporarily allowing unlimited requests.
-
-### Structured Logging
-
-Structured logging means emitting log messages as machine-parseable JSON objects rather than free-form text strings. Instead of `"2024-01-15 10:30:00 INFO User 42 sent connection request to user 87"`, a structured log produces `{"level":"info","msg":"connection.request.sent","fromUserId":42,"toUserId":87,"traceId":"abc-123","timestamp":"2024-01-15T10:30:00Z"}`.
-
-The implementation uses Pino (`src/utils/logger.ts`), which outputs JSON by default. Every request receives a unique trace ID via the `X-Trace-Id` header, which propagates through the entire request lifecycle. This means every log line emitted during a request carries the same trace ID, making it possible to reconstruct the full request flow across all middleware, route handlers, and service functions.
-
-**Why JSON over text**: Log aggregation systems (Elasticsearch, Datadog, Grafana Loki) can index JSON fields for fast querying. A query like `traceId="abc-123" AND level="error"` returns all errors from a specific request in milliseconds. With text logs, this requires regex parsing, which is slower by orders of magnitude and brittle when log formats change.
-
-### Prometheus Metrics
-
-Prometheus is a time-series database that scrapes numerical measurements from your application at regular intervals (typically every 15 seconds). The application exposes a `/metrics` endpoint that returns metrics in Prometheus text format. Prometheus stores these measurements with timestamps, enabling queries like "what was the p95 latency over the last hour" or "how many requests returned 500 errors in the last 5 minutes."
-
-The four metric types are:
-- **Counter**: Monotonically increasing value (e.g., `connections_created_total`). You calculate rates using PromQL: `rate(connections_created_total[5m])` gives connections per second.
-- **Histogram**: Distribution of values in configurable buckets (e.g., `http_request_duration_seconds`). Enables percentile calculations: `histogram_quantile(0.95, ...)` gives the p95 latency.
-- **Gauge**: Value that can increase or decrease (e.g., `queue_depth`, `active_sessions`). Represents current state.
-- **Summary**: Client-side percentile calculation (less common than histograms).
-
-The implementation (`src/utils/metrics.ts`) defines 20+ custom metrics covering HTTP traffic, business events (connections, posts, likes), algorithm performance (PYMK computation time, feed generation time), infrastructure health (queue depth, cache hits/misses), and security events (rate limit violations, login attempts). Default Node.js metrics (CPU, memory, event loop lag, GC duration) are included automatically via `collectDefaultMetrics()`.
-
-### Health Checks
-
-Health checks are HTTP endpoints that report whether the application can serve requests. They exist for two audiences: orchestration systems (Kubernetes) and operations teams.
-
-- **`GET /health`**: Returns detailed status of every dependency (PostgreSQL, Valkey, RabbitMQ) with individual latency measurements. An operations engineer uses this to diagnose which component is degraded.
-- **`GET /health/live`**: Returns 200 if the process is alive. Kubernetes uses this to detect hung processes. This must never check external dependencies, because a database outage should not cause the orchestrator to restart all API instances simultaneously (cascading failure).
-- **`GET /health/ready`**: Returns 200 if the application can serve traffic. Checks that the database connection pool is active and Redis is reachable. Kubernetes uses this to decide whether to route traffic to this instance. A newly started instance that has not yet established database connections will fail readiness, so the load balancer skips it until it is ready.
-
-### RBAC (Role-Based Access Control)
-
-RBAC is an authorization model where permissions are assigned to roles, and roles are assigned to users. Instead of checking "does user 42 have permission to delete this post," the system checks "does user 42 have the admin role, and does the admin role include the delete-any-post permission."
-
-In the LinkedIn implementation, users have a `role` column with values `user`, `recruiter`, or `admin`. The auth middleware extracts the user's role from the session. Route-level authorization checks whether the role has sufficient privileges for the requested operation. For example, only users with the `admin` role can view all users' audit logs, while any authenticated user can view their own connections.
-
-**Why roles instead of per-user permissions**: With 900M users, storing individual permissions per user is infeasible. Roles group permissions into a small set (3 roles), and assigning a role to a user is a single column update. Adding a new permission (e.g., "can pin posts") means updating the role definition in code, not modifying millions of user records.
-
-### Redis Cache-Aside
-
-Cache-aside (also called "lazy loading") is a caching pattern where the application checks the cache before querying the database. If the cache has the data (cache hit), return it immediately. If not (cache miss), query the database, store the result in the cache with a TTL, and return it.
-
-The implementation uses this pattern for PYMK results and feed data. When a user requests their PYMK suggestions, the service first checks Valkey for `pymk:{userId}`. If found, the cached result is returned in <1ms. If not, the PYMK algorithm runs (50-200ms), the result is stored in Valkey with a 24-hour TTL, and subsequent requests hit the cache.
-
-**Why not write-through?** Write-through updates the cache on every database write. For PYMK, the inputs (connections, experience, skills) change infrequently but the computation is expensive. Write-through would recompute PYMK every time a user updates their profile, wasting computation. Cache-aside with a long TTL (24 hours) amortizes the computation cost.
-
-**Cache invalidation**: The hardest problem in computer science. Feed caches are explicitly deleted when a user creates a post (`cacheDel('feed:${connId}')` for the first 50 connections). This ensures high-priority connections see fresh content immediately, while others see it within the TTL window.
+- **RabbitMQ has no consumers.** `notifications`, `pymk.compute` and `feed.fanout` receive events (without publisher confirms) that nothing processes; they are dropped when the broker is down.
+- **Feed pagination** uses `OFFSET` with a score that depends on `NOW()`, so pages can shift between requests; there is no feed cache or activity list.
+- **Hub members**: the bridge probe has no budget, and PYMK lists of members two hops away are not invalidated when an edge forms (the 24 h TTL bounds it).
+- **Search fallback** has no typo tolerance and doesn't match skills or companies; only Elasticsearch does.
+- **Frontend** has no shared server-state cache, virtualization, infinite scroll or live updates; the feed loads its first page only.
+- **Two seeders**: `db-seed/seed.sql` (ten members, used by the screenshot harness) and `npm run seed` (a different eight-member dataset).
+- Elasticsearch and RabbitMQ paths were not exercised in the last review (neither was available); everything else was run against PostgreSQL 16 and Valkey/Redis 7.

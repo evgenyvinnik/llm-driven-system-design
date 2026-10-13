@@ -83,14 +83,19 @@ npm install
 # Apply the schema (idempotent; also auto-applied via docker-entrypoint-initdb.d on a fresh volume)
 npm run db:migrate
 
-# Seed the database with test data
+# Seed the database with test data (or load db-seed/seed.sql with psql, see Demo Accounts)
 npm run seed
 
 # Start the development server
 npm run dev
+
+# Run the unit tests (offline, no services needed)
+npm test
 ```
 
 The backend will be available at http://localhost:3001
+
+Elasticsearch and RabbitMQ are optional at runtime: without Elasticsearch, people and job search answer from PostgreSQL full-text (responses carry `"source": "postgres"`) and profile/job changes wait in the `search_index_queue` outbox until the cluster is back; without RabbitMQ, event publishing is skipped. `npm run search:reindex` queues every member and job for reindexing (for example after recreating the Elasticsearch volume).
 
 ### 3. Setup Frontend
 
@@ -109,6 +114,8 @@ The frontend will be available at http://localhost:5173
 ## Demo Accounts
 
 All demo accounts use the password: `password123`
+
+`backend/db-seed/seed.sql` (used by the screenshot harness: `PGPASSWORD=linkedin_password psql -h localhost -U linkedin -d linkedin -v ON_ERROR_STOP=1 -f backend/db-seed/seed.sql`) creates alice, bob, charlie, diana, admin, ethan, fiona, george, hannah and ivan `@example.com`, arranged so that for Alice, Ethan/Fiona/Ivan are 2nd degree, George is 3rd degree and Hannah (who has invited her) is outside her network. `npm run seed` creates the different dataset below.
 
 | Email | Role | Description |
 |-------|------|-------------|
@@ -141,11 +148,12 @@ All demo accounts use the password: `password123`
 ### Connections
 - `GET /api/connections` - Get my connections
 - `GET /api/connections/requests` - Get pending requests
-- `POST /api/connections/request` - Send connection request
-- `POST /api/connections/requests/:id/accept` - Accept request
+- `POST /api/connections/request` - Send connection request (`201 sent`, `200 already_pending`, or `200 accepted_reverse` when they had already invited you)
+- `POST /api/connections/requests/:id/accept` - Accept request (idempotent: repeats return `changed: false`)
 - `POST /api/connections/requests/:id/reject` - Reject request
+- `POST /api/connections/requests/:id/withdraw` - Withdraw an invitation you sent
 - `DELETE /api/connections/:userId` - Remove connection
-- `GET /api/connections/degree/:userId` - Get connection degree
+- `GET /api/connections/degree/:userId` - Relationship: degree, status, pending request id, mutual count, "how you're connected" path
 - `GET /api/connections/mutual/:userId` - Get mutual connections
 - `GET /api/connections/second-degree` - Get 2nd degree connections
 - `GET /api/connections/pymk` - Get People You May Know recommendations
@@ -202,12 +210,16 @@ DB_NAME=linkedin
 DB_USER=linkedin
 DB_PASSWORD=linkedin_password
 
-# Redis
+# Redis (sessions, graph and PYMK caches, rate limits)
 REDIS_HOST=localhost
 REDIS_PORT=6379
 
-# Elasticsearch
+# Elasticsearch (optional; search falls back to PostgreSQL full-text)
 ELASTICSEARCH_URL=http://localhost:9200
+ELASTICSEARCH_TIMEOUT_MS=3000
+
+# RabbitMQ (optional)
+RABBITMQ_URL=amqp://linkedin:linkedin123@localhost:5672
 
 # Session
 SESSION_SECRET=your-secret-key
@@ -218,14 +230,14 @@ FRONTEND_URL=http://localhost:5173
 
 ## Key Technical Challenges
 
-1. **Connection Degrees**: Efficiently computing 2nd and 3rd degree connections using recursive CTEs
+1. **Connection Degrees**: Computing 1st–3rd degree and the connection path with a bidirectional search over cached first-degree lists
 2. **People You May Know**: Multi-factor scoring based on mutual connections, shared companies, schools, skills, and location
 3. **Feed Ranking**: Balancing recency, relevance (connection degree), and engagement signals
 4. **Job Matching**: Multi-factor scoring based on skill match, experience level, location, and company connections
 
 ## Development Insights
 
-See [claude.md](./claude.md) for development insights and design decisions.
+See [CLAUDE.md](./CLAUDE.md) for development insights and iteration history.
 
 ## References & Inspiration
 
