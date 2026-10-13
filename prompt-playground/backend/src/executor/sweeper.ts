@@ -55,11 +55,14 @@ export async function sweepOnce(): Promise<void> {
       RETURNING id, model`,
   )
   for (const row of expired.rows) {
-    const output = await streamedOutput(row.id).catch(() => '')
+    // Close the log first, then read it: once `end` is appended no executor can add
+    // output, so the stored partial output is exactly what viewers were shown.
+    const seenBefore = await streamedOutput(row.id).catch(() => '')
+    await publishEnd(row.id, row.model, 'EXECUTOR_LOST', 'The executor running this stopped responding', seenBefore !== '')
+    const output = await streamedOutput(row.id).catch(() => seenBefore)
     if (output) {
       await pool.query('UPDATE runs SET output = $2, output_truncated = true WHERE id = $1', [row.id, output])
     }
-    await publishEnd(row.id, row.model, 'EXECUTOR_LOST', 'The executor running this stopped responding', output !== '')
     log.warn({ runId: row.id }, 'failed run with expired lease')
   }
 

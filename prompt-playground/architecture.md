@@ -139,7 +139,7 @@ This answers the interview follow-ups directly:
 
 - *A prompt is edited while its previous version is running. Which text belongs to the result?* The run's snapshot, fixed at creation.
 - *Can I run an unsaved draft?* Yes. The draft's text becomes (or reuses) a snapshot with no version. If the same text is saved later, the new version points at the same snapshot, and the run list shows "Draft · now v4". That label is computed at read time, so no run row is ever updated.
-- *Two people save at once.* Versions are append-only, so nothing can be overwritten. The save carries `baseVersion` (the head the editor started from). If the head moved, the API returns `409 HEAD_MOVED` with the newer version, and the user chooses to load it or keep their edits on top. Re-saving identical text is a no-op.
+- *Two people save at once.* Versions are append-only, so nothing can be overwritten. The save carries `baseVersion` (the head the editor started from). If the head moved, the API returns `409 HEAD_MOVED` with the newer version, and the user chooses to load it or keep their edits on top. Saving text that is already the head is a no-op (`200`) even with a stale `baseVersion`, so a save retried after a lost response returns the version the first attempt created.
 
 ### 2. Run lifecycle
 
@@ -166,7 +166,7 @@ This answers the interview follow-ups directly:
 **Failed run: the executor dies partway through:**
 
 1. The lease expires 15 s after the last heartbeat.
-2. Every executor runs a sweeper every 10 s. One of them wins the conditional update `running → failed (EXECUTOR_LOST)`, rebuilds the partial output from the event log, stores it, and appends the `end` event.
+2. Every executor runs a sweeper every 10 s. One of them wins the conditional update `running → failed (EXECUTOR_LOST)`, appends the `end` event (closing the log), then rebuilds the partial output from the log and stores it. Closing before reading makes the stored output exactly what viewers saw.
 3. If the "dead" executor was only stalled (GC pause, network partition) and wakes up, it is fenced out three ways: its heartbeat matches zero rows and aborts the generation, its finalize matches zero rows, and its late delta appends are refused because the event log is closed.
 4. The browser shows the partial output with "EXECUTOR_LOST". The run is **not** retried automatically. The user has already seen part of an answer, a retry would bill the tokens again, and with temperature > 0 it would produce a different answer. Running again is one click and creates a new run.
 
@@ -511,7 +511,7 @@ HTTP/1.1 409 Conflict
 | Execute | At most one owner at a time | Conditional claim `queued → running`, lease, `attempt` fencing token |
 | Final outcome | Exactly one recorded ending | `UPDATE … WHERE attempt = $a AND status = 'running'`; event log closed by the first `end` |
 | Output delivery to a browser | No gaps, no duplicates | Stream entry IDs + `Last-Event-ID` |
-| Save a version | No lost saves | Append-only versions, `FOR UPDATE` on the prompt row, `baseVersion` check |
+| Save a version | No lost saves; retries are idempotent | Append-only versions, `FOR UPDATE` on the prompt row, `baseVersion` check; text equal to the head is a no-op |
 | Edit a preset | No silent overwrite | `revision` compare-and-set via `If-Match` |
 | Rename a prompt | Last write wins | Accepted: titles are labels and a lost rename is cheap to redo |
 
@@ -569,10 +569,10 @@ Queue time and TTFT are separate on purpose: "runs feel slow" has opposite fixes
 ## Scalability Considerations
 
 - **API and stream service**: stateless and horizontally scalable. Sessions, limits and run logs are in Valkey, so any instance serves any user and any run. In production the SSE endpoint moves to its own fleet so 2,000+ idle-but-open connections do not consume REST capacity.
-- **What breaks first**: SSE read fan-out. The local build opens one Valkey connection per open stream because `XREAD BLOCK` holds its connection. At thousands of streams per instance, that becomes a connection-count problem before it is a CPU problem. The fix is a multiplexed reader per instance: one blocking `XREAD` over all followed run keys, dispatching entries to local subscribers.
+- **What breaks first**: SSE read fan-out. The local build opens one Valkey connection per open stream because `XREAD BLOCK` holds its connection. At thousands of streams per instance, that becomes a connection-count problem before it is a CPU problem. The fix is a multiplexed reader per instance: one blocking `XREAD` over all followed run keys, dispatching entries to local subscribers. On a Valkey cluster, one `XREAD` can only span keys in the same hash slot, so the reader runs one blocking read per shard (or run keys get bucketed hash tags).
 - **Valkey**: run keys are hash-tagged by run ID (`run:{id}:…`), so the event logs shard across a cluster with no hot key. The run queue is a single stream; at ≈120 runs/s that is far from a limit, and it can be split by workspace hash if it ever is.
 - **Executors**: scale with concurrent generations, not request rate. Each is I/O-bound on the model stream; at 50-100 runs per process, 1,200 concurrent runs need about 15-25 processes.
-- **PostgreSQL**: ≈720 writes/s at peak is one primary's work. History reads go to replicas. `runs` is the only large table: partition it by month on `created_at`, and move outputs older than the retention window to object storage.
+- **PostgreSQL**: ≈720 writes/s at peak is one primary's work. History reads go to replicas. `runs` is the only large table: partition it by month on `created_at`, and move outputs older than the retention window to object storage. Partitioning has one catch: a unique constraint on a partitioned table must include the partition key, so `UNIQUE (created_by, idempotency_key)` moves to a small unpartitioned idempotency table that maps the key to the run ID.
 - **The real ceiling is model capacity**: once the model provider is the bottleneck, the work is admission control. Keep queue depth bounded, share capacity fairly across workspaces, and prefer `429` with `Retry-After` over a queue that grows without limit.
 
 ## Trade-offs Summary

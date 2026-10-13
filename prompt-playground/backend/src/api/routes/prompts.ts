@@ -193,6 +193,19 @@ promptsRouter.post(
       )
       const prompt = locked.rows[0]
       if (!prompt) throw new HttpError(404, 'NOT_FOUND', 'Prompt not found')
+      const snapshot = await upsertSnapshot(client, promptId, body.system, body.template, user.id)
+      if (prompt.head_version > 0) {
+        const head = await client.query<{ snapshot_id: string }>(
+          'SELECT snapshot_id FROM prompt_versions WHERE prompt_id = $1 AND version = $2',
+          [promptId, prompt.head_version],
+        )
+        // Saving the text that is already the head is a no-op, even with a stale
+        // baseVersion. That makes a retried save idempotent: if the first attempt
+        // committed but its response was lost, the retry returns that version.
+        if (head.rows[0]?.snapshot_id === snapshot.id) {
+          return { created: false, version: await loadVersion(client, promptId, prompt.head_version) }
+        }
+      }
       if (prompt.head_version !== body.baseVersion) {
         const head = await loadVersion(client, promptId, prompt.head_version)
         throw new HttpError(
@@ -201,16 +214,6 @@ promptsRouter.post(
           `${head?.createdBy.displayName ?? 'Someone'} saved version ${prompt.head_version} after you started editing`,
           { head },
         )
-      }
-      const snapshot = await upsertSnapshot(client, promptId, body.system, body.template, user.id)
-      if (prompt.head_version > 0) {
-        const head = await client.query<{ snapshot_id: string }>(
-          'SELECT snapshot_id FROM prompt_versions WHERE prompt_id = $1 AND version = $2',
-          [promptId, prompt.head_version],
-        )
-        if (head.rows[0]?.snapshot_id === snapshot.id) {
-          return { created: false, version: await loadVersion(client, promptId, prompt.head_version) }
-        }
       }
       const next = prompt.head_version + 1
       await client.query(

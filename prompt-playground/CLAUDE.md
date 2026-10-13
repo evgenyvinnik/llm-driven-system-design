@@ -47,6 +47,7 @@ Bugs found by testing against the running stack, in the order they were found:
 5. **Removed members could still list prompts.** Routes that act on the session's workspace trusted the workspace ID cached in the session. Fix: `requireWorkspaceMember` re-checks membership per request (`403 NOT_A_MEMBER`). Routes addressed by resource ID already joined `workspace_members`.
 6. **Smoke tests never logged in.** The repo's generator waited with `waitForURL(/(?!.*login).*/)`, which is unanchored and matches `/login` itself, so each test navigated away and aborted the sign-in request. Fixed in `scripts/generate-smoke-tests.mjs` for `/login`-style login pages (configs with a login form at `/` keep the old line). Other projects' committed smoke tests pick this up when they are regenerated.
 7. **Comparison columns could swap.** Seeded comparison runs had identical `created_at`, so A/B order depended on row order. Seeds now differ by a millisecond, and both the API and the UI tie-break on ID.
+8. **A retried version save looked like a conflict.** If a save committed but its response was lost, the retry (same `baseVersion`) got `409 HEAD_MOVED` naming the user's own save. Found while writing the full-stack interview answer, which asked "what happens when a client retries after losing the response?" for every write. Fix: the server checks whether the submitted text is already the head *before* checking `baseVersion`, and answers `200 created: false` with that version.
 
 ## Verification Environment Notes
 
