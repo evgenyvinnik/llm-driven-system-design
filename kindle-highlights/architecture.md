@@ -1,866 +1,501 @@
-# Design Kindle Community Highlights - Architecture
+# Kindle Community Highlights — Architecture
 
 ## System Overview
 
-A social reading platform enabling users to highlight passages in books, sync highlights across devices in real time, and discover popular community highlights. The system handles offline-first clients, privacy-preserving aggregation, and social features (follow, share, export).
+Readers highlight passages on a Kindle, a phone or the web. Each highlight must reach every other device the reader owns, including a Kindle that sat in a drawer for a month. Separately, the platform publishes "1,247 readers highlighted this passage" to everyone reading the same book. Underneath it is a CRUD app, but two problems make it a real design exercise:
 
-**Learning Goals:**
-- Build real-time sync across devices via WebSocket push
-- Design aggregation at scale (billions of highlights)
-- Implement privacy-preserving community features
-- Handle offline-first architecture with conflict resolution
+1. **Offline-first sync across devices.** Edits happen without a network, on several devices, in any order. The system has to accept retried uploads without duplicates, merge concurrent edits predictably, and propagate deletes to devices that were offline when they happened. A device's cursor must never skip a change.
+2. **A public statistic built from private acts.** Counting readers per passage across millions of readers must not put a contended write on every save. The published number must also never identify anyone: a passage highlighted by one reader of a small book is, in effect, that reader's name.
+
+This document describes the production design first. [Implementation Notes](#implementation-notes) maps it onto the local Express + PostgreSQL + Valkey + React build.
+
+**Learning goals**
+
+- A gap-free change feed with a per-user sequence number, so devices sync from a cursor instead of a queue or a timestamp.
+- Idempotent uploads with client-generated ids, and field-level last-writer-wins for concurrent edits.
+- Tombstones, tombstone retention, and the "your cursor is too old, resync" path.
+- Transactional outbox → stream aggregation of *distinct readers*, instead of incrementing a counter row on every save.
+- Privacy engineering on an aggregate: consent at write time, a k-anonymity threshold on a passage's *presence*, and enforcement at both publish and serve time.
 
 ## Requirements
 
-### Functional Requirements
+### Functional requirements
 
-1. **Highlight**: Create, edit, delete highlights with color and notes
-2. **Sync**: Real-time sync across all user devices within 2 seconds
-3. **Discover**: View popular highlights in any book, ranked by highlight count
-4. **Social**: Follow readers, view friends' highlights, share to external platforms
-5. **Export**: Export personal highlights in Markdown, CSV, and JSON formats
-6. **Privacy**: Per-highlight visibility (private, friends, public) and per-user privacy settings
+1. **Highlight**: create a highlight on a text range, with a color and an optional note; edit the note, color or visibility; delete it.
+2. **Sync**: every change reaches all of the reader's devices, in under 2 seconds when they are online and on reconnect when they are not.
+3. **Popular highlights**: per book, the passages most readers highlighted, with the reader count. Also a cross-book "trending" list.
+4. **Social**: follow readers and see their highlights in a book. Each highlight's visibility is `private`, `friends` (people you follow who follow you back) or `public`.
+5. **Privacy controls**: a default visibility for new highlights and an opt-out from community counts.
+6. **Library and export**: per-book lists, keyword search, and export to Markdown, CSV and JSON.
 
-### Non-Functional Requirements
+Out of scope: the reading engine itself, shared annotations (book clubs), recommendations, purchases.
 
-- **Sync Latency**: < 2 seconds cross-device (p95)
-- **Scale**: 10M users, 1B highlights stored
-- **Read Throughput**: 100K highlight views/second for popular books
-- **Write Throughput**: 10K highlights created/second globally
-- **Privacy**: Community highlights are anonymized; aggregation respects opt-in settings
-- **Availability**: 99.9% uptime for read operations, 99.5% for writes
+### Non-functional requirements
+
+| Requirement | Target | Why |
+|-------------|--------|-----|
+| Cross-device sync | p95 < 2 s for connected devices | Highlight on the Kindle, pick up the phone, it's there |
+| Write acknowledgement | Instant on the device; server ack p99 < 200 ms | Highlighting is a reading gesture; it can't wait on the network |
+| Offline window | Incremental catch-up after up to 90 days offline; full resync after that | A Kindle can stay off for a month |
+| Durability | An acknowledged highlight is never lost; an unsynced one survives on the device | A lost highlight is a lost thought |
+| Popular freshness | Within 5 minutes | Nobody can tell 1,247 from 1,251; this slack pays for the read path |
+| Privacy | No passage shown with fewer than k = 10 distinct readers; opt-out effective within minutes | In a small readership a count of 1 identifies a person |
+| Availability | 99.9% for reads; writes queue on the device when the service is down | Reading never depends on the server |
 
 ## Capacity Estimation
 
-### Production Scale
+| Quantity | Estimate | Consequence |
+|----------|----------|-------------|
+| Readers | 50M monthly, 10M daily, ~2.5 devices each | ~25M devices hold a sync cursor |
+| Highlight writes | 10M × 3 per day ≈ 30M/day ≈ 350/s average, ~3,500/s peak | Modest overall; sharded PostgreSQL handles it |
+| Hot book | A launch or viral passage: ~1,000 highlights/s on one book | Any per-book counter row would serialize; aggregation must absorb skew |
+| Stored highlights | ~10B × ~300 B ≈ 3 TB of rows, ~6 TB with indexes | Shard by `user_id`: every raw-highlight query is user-scoped |
+| Connected devices | ~2.5M sockets at the evening peak (10% of devices) | ~50 sync gateways at 50K sockets each |
+| Feed pulls | ~25M devices × 6 wakes a day ≈ 150M/day ≈ 1,700/s | Pulls must be one indexed range scan; a gateway restart sends 50K pulls at once |
+| Popular reads | One request per book open: 10M × 4 ≈ 40M/day, ~5,000/s peak | 80% hit the top 1% of titles, so a CDN absorbs most of it |
+| Aggregation input | ~25% of writes are public and consenting ≈ 90/s average, ~1,000/s peak | Small stream, but skewed onto one partition during a launch |
+| Published aggregate | 5M books × ~10 passages ≈ 50M rows ≈ 10 GB | Fits on one replicated database next to the CDN |
 
-| Metric | Value | Calculation |
-|--------|-------|-------------|
-| Users | 10M registered, 1M DAU | -- |
-| Highlights | 1B total, 5M created/day | ~100 per active user per day |
-| Books | 5M in catalog | -- |
-| Popular highlights | 50M aggregated passages | Top 10 per popular book |
-| WebSocket connections | 2M concurrent | 2 devices per active user |
-| Sync events/sec | 60 RPS peak | 5M highlights/day / 86,400s |
-| Popular highlights reads | 100K RPS | Hot path, heavily cached |
-| Storage (highlights) | ~500 GB | 1B rows x ~500 bytes avg |
-| Storage (popular) | ~5 GB | 50M rows x ~100 bytes |
+The read/write asymmetry is the main fact here. Highlights are written once and read back mostly by their owner, but the published aggregate is read by every reader of the book. That is why the aggregate is computed out of band and served as a precomputed, cacheable document.
 
 ### Local Development Scale
 
-| Metric | Value |
-|--------|-------|
-| Users | 10 seeded accounts |
-| Highlights | ~500 seeded |
-| WebSocket connections | 1-5 |
-| Sync events/sec | < 1 |
-| PostgreSQL storage | < 50 MB |
-| Redis memory | < 10 MB |
+Four Express services, one aggregation worker, PostgreSQL and Valkey, sized for a laptop: 12 seeded readers, 3 books, 34 highlights, a handful of sockets. The seed is built so the privacy threshold is visible: three passages clear the local threshold of 5 readers and two stay hidden. Ports and setup are in the [README](./README.md).
 
 ## High-Level Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                           Client Devices                               │
-│            Kindle  │  iOS App  │  Android App  │  Web Reader           │
-│                                                                        │
-│  ┌───────────────┐  ┌───────────────┐  ┌───────────────┐              │
-│  │  Local DB     │  │  Sync Engine  │  │  UI Layer     │              │
-│  │  (SQLite)     │  │  (WebSocket)  │  │               │              │
-│  └───────────────┘  └───────────────┘  └───────────────┘              │
-└───────────────────────────────┬─────────────────────────────────────────┘
-                                │ HTTPS + WSS
-                                ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         API Gateway / CDN                              │
-│           TLS termination, rate limiting, geographic routing           │
-└───────────────────────────────┬─────────────────────────────────────────┘
-                                │
-            ┌───────────────────┼───────────────────┐
-            ▼                   ▼                   ▼
-┌──────────────────┐ ┌──────────────────┐ ┌──────────────────┐
-│ Highlight Service│ │   Sync Service   │ │  Social Service  │
-│                  │ │                  │ │                  │
-│ CRUD operations  │ │ WebSocket server │ │ Auth, follow,    │
-│ Search, export   │ │ Device registry  │ │ share, privacy   │
-│ Idempotency      │ │ Offline queue    │ │                  │
-│                  │ │ Conflict resolve │ │                  │
-└────────┬─────────┘ └────────┬─────────┘ └────────┬─────────┘
-         │                    │                     │
-         └────────┬───────────┴──────────┬──────────┘
-                  │                      │
-         ┌────────┴────────┐    ┌────────┴────────┐
-         ▼                 ▼    ▼                  ▼
-┌──────────────────┐ ┌──────────────────┐ ┌──────────────────┐
-│   PostgreSQL     │ │   Redis/Valkey   │ │ Aggregation      │
-│                  │ │                  │ │ Worker            │
-│ users            │ │ Sessions         │ │                  │
-│ books            │ │ Sync queues      │ │ Redis counters   │
-│ highlights       │ │ Popular cache    │ │ → PostgreSQL     │
-│ follows          │ │ Aggregation      │ │   batch sync     │
-│ popular_*        │ │ counters         │ │                  │
-│ privacy          │ │                  │ │                  │
-└──────────────────┘ └──────────────────┘ └──────────────────┘
+  ┌──────────────────────────────────────────────────────────────────────────────────────┐
+  │ Reading apps · Kindle, phone, web · local store, outbox, feed cursor per device      │
+  └─────┬─────────────────────┬────────────────────────────▲───────────────────┬─────────┘
+        │ (1) POST /sync/push │ (2) GET /sync/changes      │ WSS "changed N"   │ (3) GET popular
+        ▼                     ▼                            │                   ▼
+  ┌───────────────────────────────────────────┐            │         ┌─────────────────────┐
+  │ API gateway · TLS · sessions · rate limit │            │         │ CDN · 60 s per book │
+  └─────────────────────┬─────────────────────┘            │         └──────────┬──────────┘
+                        ▼                                  │                    ▼ miss
+  ┌───────────────────────────────────────────┐  ┌─────────┴────────┐  ┌─────────────────────┐
+  │ Highlight API · stateless                 │  │ Sync gateway     │  │ Popular API         │
+  │ push · pull · CRUD · library · export     │  │ WebSockets only  │  │ readers ≥ k only    │
+  └─────┬────────────────────────┬────────────┘  └─────────▲────────┘  └──────────┬──────────┘
+        │ one tx: row + seq      │ PUBLISH user:{id}       │ message              │ SELECT
+        │ + outbox row           ▼                         │                      ▼
+  ┌─────┴────────────────────┐ ┌───────────────────────────┴──┐        ┌─────────────────────┐
+  │ PostgreSQL · by user_id  │ │ Redis · pub/sub              │        │ Popular DB          │
+  │ highlights, seqs, outbox │ └──────────────────────────────┘        │ passages ≥ k        │
+  └─────┬────────────────────┘                                         └──────────▲──────────┘
+        │ outbox relay       ┌────────────────────────┐   ┌───────────────────┐   │ upsert
+        └───────────────────▶│ Kafka · highlight      │──▶│ Aggregator        │───┘
+                             │ changes, key = book    │   │ distinct readers  │
+                             └────────────────────────┘   └───────────────────┘
 ```
 
-## Core Components
+1. **Write (1).** A device pushes its outbox (queued creates, edits and deletes) to the Highlight API. Each operation runs in one transaction: lock the reader's sequence row, write the highlight, stamp it with the next sequence number, and insert an outbox row if a public count can change. After the commit, the API publishes "user U's feed is at seq N" to Redis. The Sync gateway that holds U's other devices relays it as a `changed` poke.
+2. **Catch-up (2).** A poked or reconnecting device asks for `changes since <cursor>`. That is one indexed range scan on the reader's shard. It returns the latest state of every changed highlight, tombstones included, plus the new cursor.
+3. **Popular (3).** A relay ships outbox rows to Kafka, keyed by book. Aggregator workers keep the set of distinct readers per passage and publish passages with at least k readers to the Popular DB. A device opening a book fetches its passages through the CDN; the Popular API filters by k again.
 
-### Highlight Service
+| Component | Responsibility | Scales with | Notes |
+|-----------|----------------|-------------|-------|
+| API gateway | TLS, session check, routing, per-user rate limits | Requests | Routes `/sync/ws` upgrades to the Sync gateways |
+| Highlight API | Push, pull, single-item CRUD, library, search, export jobs | Writes and pulls | Stateless; every write goes through one shared write path |
+| Sync gateway | Holds device WebSockets; pokes devices when their feed advances | Connected devices | Connection-only: no business logic, so a crash costs reconnects, not data |
+| Redis pub/sub | One channel per user; gateways subscribe for the users they hold | Connected users | A lost message only delays a device until its next pull |
+| PostgreSQL (sharded by `user_id`) | Highlights, per-user sequence rows, outbox, follows, privacy settings | Readers | Source of truth for everything a reader owns |
+| Kafka `highlight-changes` | Durable, replayable change stream keyed by book | Public changes | Per-book order; new consumers (search indexer) read the same stream |
+| Aggregator | Distinct readers per passage, threshold, publish | Books with activity | Stateful (RocksDB-backed state), partitioned by book |
+| Popular DB + Popular API + CDN | Serve published passages and trending | Book opens | 10 GB, replicated; the API enforces k again; CDN caches 60 s |
 
-Handles CRUD operations on highlights with keyword search and export.
+The Social Service (auth, follows, privacy settings, friends' highlights) sits beside the Highlight API and is left out of the diagram. It reads the same shards.
 
-**Create highlight flow**:
-1. Validate input (book exists, location range valid, color in palette)
-2. Check idempotency key in Redis (prevent duplicate creates from retries)
-3. Insert into `highlights` table within a transaction
-4. Update `user_books` reading progress
-5. If visibility is `public` and user has opted into aggregation, increment Redis counter for the passage
-6. Store idempotency result in Redis (24-hour TTL)
-7. Push sync event to all user's other connected devices via Sync Service
+## Core Components / Request Flows
 
-**Search**: locally, a case-insensitive substring match (`ILIKE`) on the `highlighted_text` and `note` fields, always scoped to the requesting user's own highlights. At production scale this moves to an Elasticsearch cluster — `ILIKE` is scan-heavy and index-unfriendly, so it would overload PostgreSQL as highlight volume grows.
+### Writing a highlight and telling the reader's other devices
 
-**Export**: Generate Markdown, CSV, or JSON from a user's highlights, filtered by book, date range, or tag.
+```
+Kindle             Highlight API                   PostgreSQL    Redis    Sync gateway        Phone
+   │                     │                              │          │            │               │
+   │ 1 POST /sync/push   │                              │          │            │               │
+   │────────────────────▶│                              │          │            │               │
+   │                     │ 2 lock feed row of U         │          │            │               │
+   │                     │─────────────────────────────▶│          │            │               │
+   │                     │ 3 insert h1, merge h2        │          │            │               │
+   │                     │─────────────────────────────▶│          │            │               │
+   │                     │ 4 seq 42-43, outbox, commit  │          │            │               │
+   │                     │─────────────────────────────▶│          │            │               │
+   │ 5 created, applied  │                              │          │            │               │
+   │◀────────────────────│                              │          │            │               │
+   │                     │ 6 PUBLISH user:U 43                     │            │               │
+   │                     │────────────────────────────────────────▶│            │               │
+   │                     │                              │          │ 7 message  │               │
+   │                     │                              │          │───────────▶│               │
+   │                     │                              │          │            │ 8 changed 43  │
+   │                     │                              │          │            │──────────────▶│
+   │                     │ 9 GET changes?since=41                                               │
+   │                     │◀─────────────────────────────────────────────────────────────────────│
+   │                     │ 10 h1, h2, cursor 43                                                 │
+   │                     │─────────────────────────────────────────────────────────────────────▶│
+   │                     │                              │          │            │               │
+```
 
-### Sync Service
+- **Idempotency.** Highlight ids are UUIDs minted on the device when the reader highlights, so the id *is* the idempotency key. A retried push hits the primary key (`ON CONFLICT (id) DO NOTHING`) and gets the stored row back as `replayed`. Reusing an id for different text is `422`; an id owned by another reader is `409`. Neither leaks the stored row.
+- **Sequence numbers.** Step 2 locks the reader's `user_sync_state` row, and steps 3–4 take `last_seq + 1` under that lock. The lock is held until commit, so sequence numbers are handed out in commit order. A device that has seen 43 can never later miss a change that commits as 42. A timestamp cursor or a global sequence would give no such guarantee, because a transaction that started earlier can commit later. The cost is that one reader's writes are serialized, which is harmless at a few writes per minute per reader.
+- **Edits** carry the device's clock time per field and merge by field-level last-writer-wins ([Key Design Decisions](#2-field-level-last-writer-wins-with-clamped-device-clocks)). A replay of the same edit is a no-op, so pushing a batch twice consumes no sequence numbers.
+- **Fan-out.** Steps 6–8 happen after the commit and are best effort. The Kindle that made the change is not poked, and a poke lost anywhere costs latency, never data.
 
-Maintains WebSocket connections for real-time cross-device synchronization.
+### Catching up after weeks offline
 
-**Sync protocol**:
-1. Device connects via WebSocket, authenticates with session token
-2. Server registers device in connection map (in-memory) and Redis (for cross-server awareness)
-3. On highlight create/edit/delete, server pushes sync event to all user's connected devices
-4. If a device is offline, event is queued in Redis with 30-day TTL
-5. On reconnect, device sends `lastSyncTimestamp` and receives all queued events
+```
+Kindle                            Highlight API                                PostgreSQL
+   │                                    │                                           │
+   ··················· back online after three weeks in a drawer ····················
+   │ 1 POST /sync/push (14 queued ops)  │                                           │
+   │───────────────────────────────────▶│                                           │
+   │ 2 one result per op                │                                           │
+   │◀───────────────────────────────────│                                           │
+   │ 3 GET /sync/changes?since=40       │                                           │
+   │───────────────────────────────────▶│                                           │
+   │                                    │ 4 one snapshot: last_seq, purged_through  │
+   │                                    │──────────────────────────────────────────▶│
+   │                                    │ 5 rows WHERE seq > 40 LIMIT 200           │
+   │                                    │──────────────────────────────────────────▶│
+   │ 6 200 rows, cursor 251, hasMore    │                                           │
+   │◀───────────────────────────────────│                                           │
+   │ 7 apply rows and tombstones, save 251                                          │
+   │ 8 GET /sync/changes?since=251      │                                           │
+   │───────────────────────────────────▶│                                           │
+   │ 9 17 rows, cursor 268, done        │                                           │
+   │◀───────────────────────────────────│                                           │
+   │                                    │                                           │
+```
 
-**Conflict resolution**: Last-write-wins using `updated_at` timestamps. If two devices edit the same highlight offline, the edit with the later timestamp wins. This is acceptable because highlight edits are rare and conflicts are rarer.
+- The device pushes before it pulls, so its own offline edits are merged first and come back in the pull with their final state.
+- The feed returns **state, not operations**: each row holds only its latest change. A highlight edited 30 times while the Kindle was away arrives once.
+- The cursor and the rows are read in one `REPEATABLE READ` snapshot. A cursor of `last_seq` therefore never runs ahead of the rows the device actually received.
+- **Tombstones and resync.** Deletes leave a tombstone row (content wiped, `deleted_at` set) that flows through the feed like any change. Tombstones are reaped after 90 days, and the reaper records `purged_through_seq`. A device whose cursor is below that mark could miss a delete and resurrect the highlight, so it gets `resync: true`, discards its local copies and pulls from zero. A cursor ahead of `last_seq` (a restored database) is treated the same way.
 
-**Why not CRDTs**: CRDTs (Conflict-free Replicated Data Types) provide mathematically guaranteed convergence without coordination. For highlights, the data model is simple (text + color + note), edits are infrequent, and users rarely edit the same highlight from two devices simultaneously. Last-write-wins with timestamp comparison handles the vanishingly rare conflict case with far less implementation complexity. CRDTs would be appropriate for a collaborative text editor where concurrent character-level edits are common.
+### Counting readers and serving popular passages
 
-### Aggregation Service
+```
+ Highlight API            PostgreSQL                Kafka            Aggregator           Popular DB
+       │                       │                      │                   │                    │
+       │ 1 row + outbox, 1 tx  │                      │                   │                    │
+       │──────────────────────▶│                      │                   │                    │
+       │                       │ 2 relay, key = book  │                   │                    │
+       │                       │─────────────────────▶│                   │                    │
+       │                       │                      │ 3 poll batch      │                    │
+       │                       │                      │◀──────────────────│                    │
+       │                       │        4 add/remove reader in set(B, P)  │                    │
+       │                     5 every 60 s: keep passages with k+ readers  │                    │
+       │                       │                      │                   │ 6 upsert passages  │
+       │                       │                      │                   │───────────────────▶│
+       │                       │                      │ 7 commit offsets  │                    │
+       │                       │                      │◀──────────────────│                    │
+       │                       │                      │                   │                    │
+```
 
-Computes and serves popular highlights per book.
+1. The outbox row is written in the same transaction as the highlight change and carries the highlight's current contribution: `(book, reader, highlight, sync_seq, counted range or NULL)`. NULL means "not counted", which covers private, friends-only, deleted, or a reader who opted out. The writer decides eligibility, so the aggregator never reads privacy settings.
+2. Kafka partitions by book: all events of a book reach one aggregator, in order.
+3. The aggregator keeps, per (book, reader), which passages that reader's highlights cover. Each passage has a set of reader ids. Because events are **state-based and carry `sync_seq`**, a replayed or reordered event is ignored when its sequence is not newer, so at-least-once delivery yields exact counts. A reader with two highlights on one passage is still one reader.
+4. Every 60 seconds the aggregator republishes the books that changed, writing only passages with at least k = 10 readers. Sub-threshold counts never leave the aggregator's state.
+5. Offsets are committed after the upsert. A crash replays events, which step 3 makes harmless.
 
-**Two-phase counting**:
-1. **Real-time phase**: When a public highlight is created, `HINCRBY` increments a Redis hash counter for the book's passage (`book:{bookId}:highlights` → `{passageId}: count`)
-2. **Batch phase**: Background worker runs every 5 minutes, syncing Redis counters to the `popular_highlights` PostgreSQL table with passage text samples
+**Reading** is one request per book open: `GET /books/{id}/popular` through the CDN (60 s TTL) to the Popular API, which re-checks the threshold and reads the Popular DB through an in-process cache. A bestseller's passages are one cache entry on every API instance, not one Redis key everyone hammers. **Trending** ranks passages by readers gained in the last 1, 7 or 30 days, from per-hour reader buckets the aggregator keeps alongside the sets. **Nightly**, a batch job recomputes every book from the source of truth and compares: drift above zero is an alert, because it means events were lost.
 
-**Passage normalization**: Highlights on similar passages are grouped using 100-character normalized windows. This balances precision (grouping "similar enough" selections) against over-aggregation (merging clearly distinct passages).
+### Friends' highlights
 
-**Why Redis counters + batch sync (not real-time SQL)**:
-- At 10K highlights/second, running `UPDATE popular_highlights SET count = count + 1` on every create would generate 10K PostgreSQL writes/second on the same hot rows, causing lock contention and WAL amplification
-- Redis `HINCRBY` handles 100K+ increments/second without breaking a sweat
-- The 5-minute batch sync means popular highlight counts are eventually consistent (5 minutes stale at worst), which is perfectly acceptable for a "X people highlighted this" feature
-
-**What we give up**: Real-time accuracy. A highlight created at t=0 may not appear in the "popular" count until t=5min. For a reading platform where users spend 30+ minutes per session, this delay is imperceptible.
-
-### Social Service
-
-Handles authentication, follows, sharing, and privacy settings.
-
-**Follow model**: Directed graph (`follows` table). Following enables viewing a user's `friends`-visibility highlights for shared books.
-
-**Privacy enforcement**: Three visibility levels per highlight:
-- `private`: Only the owner sees it
-- `friends`: Owner + followers see it
-- `public`: Everyone sees it; included in aggregation if user has opted in
-
-Privacy settings are enforced at query time: the Social Service joins `highlights` with `follows` and `user_privacy_settings` to filter results.
-
-**Sharing**: Generate formatted text ("highlighted text" -- Author, Book Title) with a shareable link. Log share events for analytics.
+"What did people I follow highlight in this book" is computed at read time. The query takes my followees (a few hundred), groups them by shard and asks each shard for `book_id = B AND deleted_at IS NULL`. A highlight is returned if it is `public`, or `friends` and the owner follows me back. Follows are sharded by follower, so the "do they follow me back" check sits on the owner's shard next to their highlights. It is not precomputed: one row of a "visible to user X" view serves exactly one reader, and every follow, unfollow or visibility change would invalidate slices of it. A stale privacy filter is a leak, not a lag.
 
 ## Database Schema
 
+### Production schema
+
+Every table a reader owns is sharded by `user_id`, so all of a reader's writes, their sequence row and their outbox rows commit on one shard in one transaction.
+
 ```sql
--- Users
-CREATE TABLE users (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  email VARCHAR(255) UNIQUE NOT NULL,
-  username VARCHAR(100) NOT NULL,
-  password_hash VARCHAR(255) NOT NULL,
-  avatar_url VARCHAR(500),
-  bio TEXT,
-  created_at TIMESTAMP DEFAULT NOW(),
-  updated_at TIMESTAMP DEFAULT NOW()
+-- One row per reader: the change-feed counter. Every write of this reader locks it.
+CREATE TABLE user_sync_state (
+  user_id            UUID PRIMARY KEY,
+  last_seq           BIGINT NOT NULL DEFAULT 0,
+  purged_through_seq BIGINT NOT NULL DEFAULT 0      -- tombstones at or below were reaped
 );
 
-CREATE INDEX idx_users_email ON users(email);
-
--- Books catalog
-CREATE TABLE books (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  title VARCHAR(500) NOT NULL,
-  author VARCHAR(200),
-  isbn VARCHAR(20),
-  publisher VARCHAR(200),
-  description TEXT,
-  cover_url VARCHAR(500),
-  total_locations INTEGER,
-  created_at TIMESTAMP DEFAULT NOW()
-);
-
-CREATE INDEX idx_books_isbn ON books(isbn);
-CREATE INDEX idx_books_title ON books(title);
-
--- User-book associations (reading progress)
-CREATE TABLE user_books (
-  user_id UUID REFERENCES users(id) ON DELETE CASCADE,
-  book_id UUID REFERENCES books(id) ON DELETE CASCADE,
-  progress_location INTEGER DEFAULT 0,
-  last_read_at TIMESTAMP DEFAULT NOW(),
-  added_at TIMESTAMP DEFAULT NOW(),
-  PRIMARY KEY (user_id, book_id)
-);
-
-CREATE INDEX idx_user_books_user ON user_books(user_id);
-CREATE INDEX idx_user_books_book ON user_books(book_id);
-
--- User highlights with sync support
 CREATE TABLE highlights (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  book_id UUID NOT NULL REFERENCES books(id) ON DELETE CASCADE,
-  location_start INTEGER NOT NULL,
-  location_end INTEGER NOT NULL,
-  highlighted_text TEXT NOT NULL,
-  note TEXT,
-  color VARCHAR(20) DEFAULT 'yellow',
-  visibility VARCHAR(20) DEFAULT 'private',
-  archived BOOLEAN DEFAULT false,
-  created_at TIMESTAMP DEFAULT NOW(),
-  updated_at TIMESTAMP DEFAULT NOW(),
-  synced_at TIMESTAMP DEFAULT NOW()
+  user_id          UUID        NOT NULL,             -- shard key
+  id               UUID        NOT NULL,             -- minted on the device: the idempotency key
+  book_id          UUID        NOT NULL,
+  location_start   INTEGER     NOT NULL,
+  location_end     INTEGER     NOT NULL CHECK (location_end >= location_start),
+  highlighted_text TEXT        NOT NULL,             -- wiped on delete
+  note             TEXT,
+  color            TEXT        NOT NULL DEFAULT 'yellow',
+  visibility       TEXT        NOT NULL DEFAULT 'private'
+                   CHECK (visibility IN ('private', 'friends', 'public')),
+  sync_seq         BIGINT      NOT NULL,             -- latest change's position in the feed
+  field_clock      JSONB       NOT NULL,             -- {field: {ts, device}} for last-writer-wins
+  deleted_at       TIMESTAMPTZ,                      -- tombstone
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (user_id, id)
+);
+CREATE INDEX highlights_feed    ON highlights (user_id, sync_seq);                 -- pull
+CREATE INDEX highlights_by_book ON highlights (user_id, book_id, location_start);  -- book view, friends
+
+-- Transactional outbox, relayed to Kafka (key = book_id) and deleted after the relay.
+CREATE TABLE outbox (
+  id            BIGSERIAL   PRIMARY KEY,
+  user_id       UUID        NOT NULL,
+  highlight_id  UUID        NOT NULL,
+  book_id       UUID        NOT NULL,
+  sync_seq      BIGINT      NOT NULL,                -- lets the aggregator drop stale events
+  counted_range INT4RANGE,                           -- NULL = not counted
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE INDEX idx_highlights_user ON highlights(user_id, created_at DESC);
-CREATE INDEX idx_highlights_book ON highlights(book_id);
-CREATE INDEX idx_highlights_location ON highlights(book_id, location_start, location_end);
-CREATE INDEX idx_highlights_visibility ON highlights(visibility) WHERE archived = false;
-
--- Soft deletes for cross-device sync
-CREATE TABLE deleted_highlights (
-  highlight_id UUID PRIMARY KEY,
-  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  deleted_at TIMESTAMP DEFAULT NOW()
-);
-
-CREATE INDEX idx_deleted_highlights_user ON deleted_highlights(user_id);
-
--- Aggregated popular highlights
-CREATE TABLE popular_highlights (
-  book_id UUID REFERENCES books(id) ON DELETE CASCADE,
-  passage_id VARCHAR(50),
-  passage_text TEXT,
-  highlight_count INTEGER DEFAULT 0,
-  location_start INTEGER,
-  location_end INTEGER,
-  updated_at TIMESTAMP DEFAULT NOW(),
-  PRIMARY KEY (book_id, passage_id)
-);
-
-CREATE INDEX idx_popular_count ON popular_highlights(book_id, highlight_count DESC);
-
--- Social follows (directed graph)
-CREATE TABLE follows (
-  follower_id UUID REFERENCES users(id) ON DELETE CASCADE,
-  followee_id UUID REFERENCES users(id) ON DELETE CASCADE,
-  created_at TIMESTAMP DEFAULT NOW(),
+CREATE TABLE follows (                               -- sharded by follower_id
+  follower_id UUID NOT NULL,
+  followee_id UUID NOT NULL,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY (follower_id, followee_id)
 );
 
-CREATE INDEX idx_follows_followee ON follows(followee_id);
-CREATE INDEX idx_follows_follower ON follows(follower_id);
-
--- Per-user privacy settings
-CREATE TABLE user_privacy_settings (
-  user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-  highlight_visibility VARCHAR(20) DEFAULT 'private',
-  allow_followers BOOLEAN DEFAULT true,
-  include_in_aggregation BOOLEAN DEFAULT true,
-  updated_at TIMESTAMP DEFAULT NOW()
+CREATE TABLE privacy_settings (
+  user_id                UUID    PRIMARY KEY,
+  default_visibility     TEXT    NOT NULL DEFAULT 'private',
+  include_in_aggregation BOOLEAN NOT NULL DEFAULT true,
+  allow_followers        BOOLEAN NOT NULL DEFAULT true
 );
+```
 
--- Sessions
-CREATE TABLE sessions (
-  id VARCHAR(100) PRIMARY KEY,
-  user_id UUID REFERENCES users(id) ON DELETE CASCADE,
-  expires_at TIMESTAMP NOT NULL,
-  created_at TIMESTAMP DEFAULT NOW()
+The published aggregate lives in its own small, replicated database. The threshold is part of the schema, so even a buggy writer cannot publish a small count:
+
+```sql
+CREATE TABLE popular_passages (
+  book_id        UUID        NOT NULL,
+  passage_id     INTEGER     NOT NULL,               -- first sentence index of the passage
+  passage_text   TEXT        NOT NULL,
+  reader_count   INTEGER     NOT NULL CHECK (reader_count >= 10),
+  location_start INTEGER     NOT NULL,
+  location_end   INTEGER     NOT NULL,
+  last_reader_at TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (book_id, passage_id)
 );
-
-CREATE INDEX idx_sessions_user ON sessions(user_id);
-CREATE INDEX idx_sessions_expires ON sessions(expires_at);
+CREATE INDEX popular_by_book ON popular_passages (book_id, reader_count DESC);
 ```
 
-### Redis Data Structures
+### Local schema
 
-```
-# Session tokens
-session:{sessionId} = { userId, email, expiresAt }
-TTL: 24 hours
+The local schema is [`backend/src/db/init.sql`](./backend/src/db/init.sql), applied by `npm run db:migrate`. It is re-runnable, and its upgrade blocks migrate databases created by older versions of the file.
 
-# Sync offline queue (per user per device)
-sync:queue:{userId}:{deviceId} = [event1, event2, ...]
-TTL: 30 days
-
-# Aggregation counters (per book)
-book:{bookId}:highlights = { passageId1: count, passageId2: count, ... }
-No TTL (persistent, synced to PostgreSQL by worker)
-
-# Popular highlights cache
-popular:{bookId} = [{ passageText, count, locationStart, locationEnd }, ...]
-TTL: 5 minutes
-
-# Idempotency keys
-idempotency:{key} = { result }
-TTL: 24 hours
-```
+| Production | Local | Difference |
+|------------|-------|------------|
+| `highlights`, PK `(user_id, id)` | `highlights`, PK `id`, same sync columns | One unsharded database; `id` is globally unique |
+| `user_sync_state` | Same | — |
+| `outbox` relayed to Kafka | `aggregation_outbox (book_id, reason)` | Marks a book "needs a recount"; the worker recomputes the whole book |
+| Aggregator state (reader sets) | None | Recomputed from `highlights` per recount |
+| `popular_passages` (sentences, `CHECK >= 10`) | `popular_highlights` (100-location windows, `reader_count`, `last_contribution_at`) | Same database; threshold enforced by the worker and the API, default 5 |
+| `follows`, `privacy_settings` | `follows`, `user_privacy_settings` | Same meaning |
+| — | `highlight_shares`, `books`, `user_books`, `users`, `sessions` | `sessions` is unused (sessions live in Redis) |
 
 ## API Design
 
-### Highlight Service (port 3001)
+### Production API
 
 ```
-POST   /api/highlights                → Create highlight
-GET    /api/highlights                → List user's highlights (with filters)
-GET    /api/highlights/:id            → Get single highlight
-PUT    /api/highlights/:id            → Update highlight
-DELETE /api/highlights/:id            → Delete highlight (soft delete)
-GET    /api/highlights/search?q=      → Full-text search
-GET    /api/highlights/export         → Export in Markdown/CSV/JSON
+POST   /api/v1/sync/push                    {ops[]} + X-Device-Id → one result per op
+GET    /api/v1/sync/changes?since&limit     → {changes, cursor, hasMore, resync}
+WSS    /api/v1/sync/ws                      hello {token, deviceId} → welcome {latestSeq}, changed {seq}
+POST   /api/v1/highlights                   client id (or Idempotency-Key) → 201 | 200 replay | 409 | 422
+PATCH  /api/v1/highlights/{id}              note | color | visibility, clientUpdatedAt → 200 | 410 gone
+DELETE /api/v1/highlights/{id}              → 204, also when already deleted | 404
+GET    /api/v1/highlights?bookId&q&cursor   my highlights, keyset-paginated
+GET    /api/v1/books/{id}/popular?limit     passages with ≥ k readers, CDN-cacheable
+GET    /api/v1/trending?days=1|7|30         passages that gained readers in the window
+GET    /api/v1/books/{id}/friends-highlights  public + mutual-friend highlights of people I follow
+PATCH  /api/v1/settings/privacy             default visibility, include_in_aggregation
+POST   /api/v1/exports                      202 + job id; the file arrives as a link
 ```
 
-### Sync Service (port 3002)
+- **Push results are final per operation**: `created`, `replayed`, `applied`, `superseded` (a newer edit won), `unchanged` (a replay), `deleted`, `gone` (already a tombstone), `not_found`, `rejected` (invalid). One invalid operation never blocks the batch, and the device drops it instead of retrying forever.
+- **`minCount` can only raise the threshold.** The server takes `max(k, minCount)`.
+- **The token travels in the WebSocket's first message**, not the URL, so it never lands in proxy logs.
 
-```
-WebSocket /ws/sync                    → Real-time sync connection
-GET    /api/sync/status               → Sync status for current user
-POST   /api/sync/pull                 → Pull missed events since timestamp
-```
+### Local routes
 
-### Aggregation Service (port 3003)
+| Service (port) | Routes |
+|----------------|--------|
+| Highlight (3000) | `POST/GET /api/highlights`, `GET/PATCH/DELETE /api/highlights/:id`, `GET /api/library`, `GET /api/export/highlights?format=` |
+| Social (3001) | `/api/auth/register`, `/login`, `/logout`, `/me`; `POST/DELETE /api/users/:id/follow`; `GET /api/following`, `/api/followers`; `GET /api/books/:id/friends-highlights`; `POST /api/highlights/:id/share`; `GET/PATCH /api/settings/privacy`; `GET /api/users/:id`, `/api/users/:id/highlights` |
+| Sync (3002) | `GET /api/sync/changes`, `POST /api/sync/push`, WebSocket `/api/sync/ws` |
+| Aggregation (3003) | `GET /api/books/:id/popular`, `/heatmap`, `/count`; `GET /api/trending`; `GET /health` (outbox lag, worker heartbeat) |
 
-```
-GET    /api/popular/:bookId           → Popular highlights for a book
-GET    /api/trending                  → Trending highlights across all books
-```
-
-### Social Service (port 3004)
-
-```
-POST   /api/auth/register             → Create account
-POST   /api/auth/login                → Login
-POST   /api/auth/logout               → Logout
-GET    /api/auth/me                   → Current user
-
-POST   /api/social/follow/:userId     → Follow a user
-DELETE /api/social/follow/:userId     → Unfollow a user
-GET    /api/social/followers          → My followers
-GET    /api/social/following          → People I follow
-GET    /api/social/friends-highlights/:bookId → Friends' highlights for a book
-
-POST   /api/social/share/:highlightId → Share highlight to external platform
-PUT    /api/privacy/settings          → Update privacy settings
-GET    /api/privacy/settings          → Get privacy settings
-```
+The Vite dev server proxies each path to its owning service ([`frontend/vite.config.ts`](./frontend/vite.config.ts)).
 
 ## Key Design Decisions
 
-### Sync Protocol: WebSocket Push with Offline Queue
+### 1. A per-user sequence number as the sync cursor
 
-**Chosen**: Persistent WebSocket connections for connected devices. Redis-backed queue for offline devices.
+Each device stores one number: the highest `sync_seq` it has applied. The alternatives each break in a specific way. **Timestamps** (`updated_at > lastSync`) skip late commits: a transaction stamped 10:00:00.100 that commits after one stamped 10:00:00.200 is invisible to a device that already advanced past .200, and device and server clocks disagree. **Per-device queues** in Redis are a second copy of the truth that must be written for every offline device, expire, and can be lost on failover; they were also dead weight here because the feed already holds the same changes. **A global sequence** has the same late-commit gap as timestamps. Taking `last_seq + 1` under the reader's row lock costs one row lock per write, and readers write a few times a minute, so the contention is nil. It makes the feed gap-free by construction. The cost is a hot row per *reader*, never per book, which is why it fits this workload and would not fit a shared document.
 
-**Why WebSocket over polling**: The sync requirement is < 2 seconds cross-device. HTTP polling at 2-second intervals means average 1-second latency plus the overhead of 30 requests/minute per device for a mostly-idle connection. WebSocket pushes the event immediately when it happens, achieving sub-second sync with zero wasted requests.
+### 2. Field-level last-writer-wins with clamped device clocks
 
-**Why not Server-Sent Events (SSE)**: SSE is unidirectional (server → client). The sync protocol needs bidirectional communication -- the client needs to send sync acknowledgments, request missed events, and report connection state. WebSocket supports both directions natively.
+A highlight has exactly one owner, so the only conflict is the same reader editing it on two devices before they sync. Each mutable field (`note`, `color`, `visibility`) stores the stamp of the edit that set it, `{ts, device}`. An incoming edit wins a field only if its stamp is newer, and ties go to the higher device id, so every replica picks the same winner. Edits to different fields both survive. A device whose clock reads next year would win every conflict forever, so the server clamps device time to `now + 5 minutes`. **Deletes win**: a tombstoned highlight accepts no edits, so a note typed offline cannot resurrect a highlight deleted on another device.
 
-**Offline queue design**: When a device disconnects, sync events are appended to a Redis list keyed by `sync:queue:{userId}:{deviceId}` with 30-day TTL. On reconnect, the device sends its `lastSyncTimestamp`, and the server replays all queued events newer than that timestamp. This ensures devices that have been offline for weeks (e.g., a Kindle left in a drawer) still receive all updates.
+**Rejected**: *CRDTs or OT* solve concurrent multi-writer editing, a problem single-owner data doesn't have, at the price of merge metadata on 10B rows and identical merge code on every client including e-ink firmware. *`If-Match`/`412` optimistic concurrency* works for online clients but not offline ones: a Kindle replaying a week of edits can't stop and ask the reader to resolve each `412`. **What we give up**: a concurrent edit to the same field is silently lost to the newer one. For a highlight note that's survivable, and the device can show "a newer edit from another device was kept". If the product added shared annotations, this decision would flip.
 
-**What we give up**: WebSocket connections are stateful and harder to load-balance than stateless HTTP. Adding a new server requires sticky sessions or a Redis-backed connection registry. Connection drops require client-side reconnection logic with exponential backoff.
+### 3. Outbox → stream aggregation of distinct readers, not a counter per save
 
-### Aggregation: Redis Counters with Batch Sync to PostgreSQL
+Incrementing `popular.count = count + 1` on each save fails twice. First, the count is the indexed column the top-N query sorts by, so every increment is a non-HOT update: a new tuple version, an index entry, and vacuum debt, concentrated on a few rows per hot book. Second, the average rate hides the skew: a launch puts ~1,000 writes/s on one book's handful of rows, and they serialize on row locks exactly when the feature is most visible. Recomputing on read (`GROUP BY` over a book's highlights per request) is worse, since one bestseller would scan millions of rows per book open. The outbox makes the change event part of the write transaction, so it can't be lost between commit and publish. Kafka partitioned by book gives each book one ordered consumer. State-based events keyed by highlight make replays harmless and the count exact, and they count *readers*, not highlights. **What we give up**: popular counts lag by up to a minute or two, and the aggregator holds state (~10 GB of reader sets) that must be checkpointed and rebuilt by the nightly job.
 
-**Chosen**: Real-time increments in Redis hashes, batch sync to PostgreSQL every 5 minutes.
+### 4. Privacy is enforced where data enters and where it leaves
 
-**Why not real-time SQL aggregation**: At scale, 10K highlights/second touching the same `popular_highlights` rows creates severe lock contention. PostgreSQL's MVCC handles concurrent reads well, but concurrent increments on the same row serialize on the row lock. Redis hash increments are single-threaded and lock-free, handling 100K+ operations/second.
+- **Consent at write time.** Only `public` highlights of readers who haven't opted out produce a counted contribution. An opted-out reader's highlights never enter the stream, so no later bug can leak them. Opting out emits "not counted" events for all of the reader's public highlights, which the next aggregation removes.
+- **The threshold applies to presence, not just the number.** Showing a passage with its count hidden still says "somebody here highlighted this", and in a 40-reader book that is the leak. Below k the passage does not exist in any public response. The price: small books never get community highlights. That's the feature working, not a bug.
+- **Twice.** The aggregator only publishes passages with at least k readers (and the Popular DB's `CHECK` rejects smaller counts); the API filters again, and `minCount` can only raise k.
+- **Aggregates are never attributed.** The pipeline stores passage → readers, but publishes only counts. Friends' highlights, the attributed surface, is a separate query with its own rule: `friends` means a mutual follow, because following is one-sided and needs no approval.
+- **No differential privacy.** Counts are displayed exactly and prominently, and noise hurts most in the low-count tail, which is exactly where the threshold already gives a hard guarantee. Sub-threshold state is still sensitive: no debug endpoint dumps a book's raw passage sets.
 
-**Why not pre-compute on read**: Computing `SELECT book_id, passage_id, COUNT(*) FROM highlights GROUP BY ...` on every popular-highlights API call would scan millions of rows. With 100K reads/second on popular books, this would collapse the database. Pre-computing and caching is the only viable approach.
+### 5. Passages anchored to sentences
 
-**What we give up**: Popular highlight counts are eventually consistent (up to 5 minutes stale). A newly created highlight will not appear in the "popular" list immediately. For a reading platform, this latency is invisible -- users spend minutes to hours reading before checking popular highlights.
-
-### Privacy: Per-Highlight Visibility with Query-Time Enforcement
-
-**Chosen**: Each highlight has a `visibility` field (private/friends/public). Privacy is enforced by JOINing with the `follows` table and `user_privacy_settings` at query time.
-
-**Why query-time enforcement (not materialized views)**: Materialized views for "highlights visible to user X" would require refreshing whenever a follow relationship changes, a privacy setting changes, or a highlight's visibility changes. The combinatorial explosion (10M users x their visible highlights) makes pre-computation infeasible.
-
-**Why per-highlight visibility (not per-user only)**: Users want fine-grained control. A reader might share a profound quote publicly while keeping personal annotations private. Per-user defaults (in `user_privacy_settings`) set the default for new highlights, but per-highlight overrides enable this flexibility.
-
-**What we give up**: Query complexity. Every highlights query must JOIN with follows and privacy settings, adding latency. Mitigation: index on `(visibility) WHERE archived = false` and Redis caching for frequently-accessed data (popular highlights, friends' highlights).
-
-### Conflict Resolution: Last-Write-Wins with Timestamps
-
-**Chosen**: When two devices edit the same highlight offline, the edit with the later `updated_at` timestamp wins.
-
-**Why not operational transform (OT)**: OT is designed for real-time collaborative editing where multiple users modify the same document simultaneously. Highlights are owned by a single user who occasionally edits from different devices. The probability of concurrent edits on the same highlight is extremely low (editing the note on your phone while simultaneously editing it on your Kindle). When it does happen, keeping the most recent edit is intuitive behavior.
-
-**Why not CRDTs**: CRDTs guarantee convergence without coordination but require every field to be modeled as a CRDT type (e.g., LWW-Register, G-Counter). For a highlight (text, color, note), this adds implementation complexity with no practical benefit given the low conflict probability.
-
-**What we give up**: In the rare case of concurrent offline edits, one edit is silently lost. The user sees the "newer" version on sync. For highlight notes, this is acceptable -- the user can re-edit.
+Two readers never select the same characters. Exact `(start, end)` grouping splits one famous sentence into thousands of passages with a count of 1 each. Fixed location windows are cheap but systematically undercount sentences that straddle a window boundary. Retuning the window size only moves which sentences lose. We own the book text, so production anchors highlights to sentences: a highlight counts toward each sentence it covers at least half of, and adjacent sentences with similar reader sets are displayed as one passage. The aggregator loads each book's sentence offsets, a few KB per book. Locally there is no book text, so the worker uses 100-location windows and the seed shows the fragmentation (`"Victory Mansions"` lands in `200-300` while a longer selection ending at the same words lands in `100-300`).
 
 ## Consistency and Idempotency
 
-### Idempotency Keys
+| Operation | Guarantee | Mechanism |
+|-----------|-----------|-----------|
+| Create | At most one highlight per client id, even under concurrent retries | Client-generated id + `ON CONFLICT (id) DO NOTHING`; replay returns the stored row; `422` on reused id with different text |
+| Edit | Deterministic convergence across devices | Field-level stamps, clamped clocks, device-id tie-break; replays are `unchanged` |
+| Delete | Reaches every device; never resurrected | Tombstone row in the feed; edits to tombstones answer `gone`; replayed creates return the tombstone |
+| Feed | Gap-free, per reader, in commit order | `last_seq + 1` under the reader's row lock; cursor and rows from one snapshot |
+| Old cursor | No silent missed deletes | `purged_through_seq`; below it → `resync: true` |
+| Popular count | Exactly the distinct consenting readers, eventually | Outbox in the write transaction; state-based events with `sync_seq`; offsets committed after publish; nightly recompute |
+| Cache | At most one TTL stale | Popular entries are invalidated after each republish; CDN 60 s; a racing refill can cache an old list for one TTL, which the freshness target allows |
 
-All write operations accept a client-generated idempotency key (via header or request body):
+## Security / Auth
 
-1. Before processing, check Redis for `idempotency:{key}`
-2. If found, return the cached result (preventing duplicate creates)
-3. If not found, process the operation
-4. Store the result in Redis with 24-hour TTL
-5. Also store an `idempotency_key` column in PostgreSQL for database-level deduplication within a transaction
-
-This handles network retries, client-side double-taps, and load balancer request duplication.
-
-### Soft Deletes for Sync
-
-Highlights are not physically deleted. Instead, a record is inserted into `deleted_highlights` with the highlight's UUID. This allows the sync protocol to propagate deletions to offline devices -- without the tombstone, a reconnecting device would not know to delete the highlight locally.
-
-Tombstones are retained for 90 days (longer than the 30-day offline queue TTL), ensuring any device that reconnects within 30 days receives the deletion event.
-
-## Security
-
-### Authentication
-
-Session-based authentication with tokens stored in Redis (24-hour TTL). Passwords hashed with bcrypt. Sessions are revocable server-side by deleting the Redis key.
-
-### Authorization
-
-| Resource | Owner | Followers | Public |
-|----------|-------|-----------|--------|
-| Private highlights | Read/Write | -- | -- |
-| Friends highlights | Read/Write | Read | -- |
-| Public highlights | Read/Write | Read | Read |
-| Privacy settings | Read/Write | -- | -- |
-| Follow relationship | Create/Delete | -- | -- |
-
-### Rate Limiting
-
-| Endpoint | Limit | Window |
-|----------|-------|--------|
-| Highlight create | 100 per minute | Per user |
-| Auth attempts | 5 per minute | Per IP |
-| Export | 10 per hour | Per user |
-| Search | 30 per minute | Per user |
-| API requests | 1000 per minute | Per user |
+- **Authentication**: sessions in Redis behind an `HttpOnly`, `Secure`, `SameSite=Lax` cookie for the web app and a bearer token for devices; revocable instantly. Passwords hashed with a salted, memory-hard KDF (scrypt or Argon2id).
+- **Authorization**: every highlight query is scoped by `user_id` from the session, never from the request. Ids from clients only ever select within the caller's rows, and a foreign id answers `409` without revealing the row.
+- **Visibility**: one query helper implements private / friends (mutual follow) / public for every read of someone else's highlights. Public profile endpoints return explicit columns, so sync metadata such as device ids in `field_clock` is never exposed.
+- **Rate limits** (Redis token buckets): highlight writes 100/min per reader (a human can't highlight faster), auth 5/min per IP, follows 60/hour, exports 10/hour. The write limit is also the first defense against inflating a passage's count.
+- **Abuse**: counts come only from accounts with plausible reading progress in the book, and velocity anomalies on one passage are reviewed before they publish.
 
 ## Observability
 
-### Metrics
-
-**Highlight operations**:
-- `highlight_operation_duration_seconds{operation,status}` -- Histogram [0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5]
-- `highlights_created_total{book_id}` -- Counter per book
-
-**Sync**:
-- `websocket_active_connections` -- Gauge
-- `sync_queue_depth{user_id}` -- Gauge (pending events per user)
-- `sync_latency_seconds` -- Histogram (time from create to WebSocket delivery)
-
-**Aggregation**:
-- `aggregation_job_duration_seconds` -- Histogram
-- `cache_hits_total` / `cache_misses_total` -- Popular highlights cache effectiveness
-
-**SLIs**:
-
-| SLI | Target | Measurement |
-|-----|--------|-------------|
-| Highlight creation latency | p99 < 200ms | `highlight_operation_duration_seconds{operation="create"}` |
-| Cross-device sync latency | p95 < 2s | Time from create to WebSocket delivery |
-| Popular highlights cache hit rate | > 90% | `cache_hits / (cache_hits + cache_misses)` |
-| API availability | 99.5% | Successful responses / total requests |
-
-### Structured Logging (Pino)
-
-JSON-formatted logs with service-scoped child loggers.
-
-**Log levels**:
-- `error`: Failed operations, database errors, unhandled exceptions
-- `warn`: Retry attempts, degraded performance, approaching limits
-- `info`: Successful operations, sync events, aggregation jobs
-- `debug`: Request/response details, cache operations (dev only)
-
-**Key events logged**:
-- `highlight_created` -- userId, bookId, highlightId, location, durationMs
-- `sync_pushed` -- userId, deviceCount, queuedCount
-- `aggregation_completed` -- booksProcessed, durationMs
-- `privacy_changed` -- userId, oldSettings, newSettings
-
-### Alert Thresholds
-
-| Alert | Condition | Action |
-|-------|-----------|--------|
-| High API latency | p99 > 500ms for 5 min | Check database queries, Redis connection |
-| Sync queue backlog | Queue depth > 100 per user | Investigate WebSocket disconnections |
-| Cache miss spike | Hit rate < 70% for 10 min | Check Redis memory, TTL configuration |
-| Error rate increase | > 5% errors for 5 min | Check logs for root cause |
-| WebSocket disconnections | > 10 disconnects/min | Check network, server memory |
+- **Sync**: create-to-poke latency (the 2 s SLO), pull latency and page size, resync rate (should be near zero), pushed-op status mix (a rising `rejected` share means a client bug), socket count and reconnect rate per gateway.
+- **Aggregation**: outbox relay lag and Kafka consumer lag (= popular-count staleness), events skipped as stale, publish cycle time against its 60 s budget, nightly recompute drift (must be zero), passages suppressed by the threshold.
+- **Liveness vs progress**: a worker can be alive and idle. The aggregator writes a heartbeat after every cycle, and readiness fails if it is older than three cycles or the outbox's oldest row is older than five minutes.
+- **Tracing**: one id per pushed operation follows it from the device through the write, the outbox, Kafka and the poke, so "my highlight didn't reach my phone" is answerable.
 
 ## Failure Handling
 
-### Retry Strategy with Idempotency
-
-All write operations use exponential backoff with jitter:
-- Max retries: 3
-- Base delay: 100ms, max delay: 5s, multiplier: 2x
-- Retryable errors: ECONNRESET, ETIMEDOUT, ECONNREFUSED, 503, 429
-- Idempotency keys ensure retries are safe (no duplicate side effects)
-
-### Circuit Breaker Pattern
-
-Downstream services (PostgreSQL, Redis, Elasticsearch at scale) are protected by circuit breakers:
-
-| Service | Timeout | Error Threshold | Reset Timeout |
-|---------|---------|-----------------|---------------|
-| PostgreSQL | 3s | 50% over 5 requests | 30s |
-| Redis | 1s | 60% over 5 requests | 10s |
-| Elasticsearch (future) | 3s | 50% over 5 requests | 30s |
-
-**Fallback behaviors**:
-- Redis read fails → return null (cache miss, fall through to PostgreSQL)
-- Redis write fails → queue write in PostgreSQL fallback table
-- PostgreSQL read fails → return cached data if available, error otherwise
-- Elasticsearch fails → fall back to PostgreSQL ILIKE search (slower but functional)
-
-### Graceful Degradation
-
-| Failure | Degraded Behavior |
-|---------|-------------------|
-| Sync service down | Highlights still created in DB; sync queued, delivered on recovery |
-| Aggregation worker down | Popular counts stale until worker recovers |
-| Redis down | Sessions fall back to PostgreSQL; popular highlights served from DB |
-| Search fails | Disable search feature, show browse-only UI |
+| Failure | Effect | Mitigation |
+|---------|--------|------------|
+| Device offline | Writes queue locally | Outbox + idempotent push on reconnect; nothing depends on the server to keep reading |
+| Response lost after commit | Device retries | Client id makes the retry a replay |
+| Sync gateway crash | 50K sockets drop | Clients reconnect with exponential backoff and jitter, then pull from their cursor; pulls are cheap range scans |
+| Redis pub/sub down | No pokes | Devices still pull on reconnect, app foreground and periodically (every 5 min) |
+| Shard primary down | Writes for its readers fail | Devices keep queueing; replica promotion; reads of other shards unaffected |
+| Kafka or aggregator down | Popular counts freeze | Outbox rows accumulate in PostgreSQL, so nothing is lost; serving continues from the Popular DB |
+| Poison operation in a push | One op can never succeed | Rejected individually with a reason; the device drops it; the rest of the batch applies |
+| Hot book | One partition and one cache key run hot | One consumer handles ~1,000 events/s; reads are served by the CDN and in-process caches |
 
 ## Scalability Considerations
 
-### Horizontal Scaling Path
-
-1. **< 10K users**: Single instance of each service, single PostgreSQL, single Redis
-2. **10K-100K users**: Multiple service instances behind LB, PostgreSQL read replicas, Redis Sentinel
-3. **100K-1M users**: Elasticsearch for search, Kafka for event streaming, database sharding by user_id
-4. **1M-10M users**: CDN for book metadata, geographic distribution, dedicated aggregation pipeline
-
-### Bottleneck Analysis
-
-| Component | Bottleneck | Threshold | Solution |
-|-----------|------------|-----------|----------|
-| PostgreSQL writes | Highlights table | ~10K inserts/sec | Shard by user_id, batch inserts |
-| PostgreSQL reads | Popular highlights queries | ~5K queries/sec | Redis cache with 5-min TTL |
-| Redis memory | Aggregation counters + sync queues | ~500 MB for 1M users | Redis Cluster, eviction policy |
-| WebSocket connections | Per-server connection limit | ~10K per server | Add servers, sticky LB |
-| Sync fanout | Multi-device broadcast | ~5 devices per user | Connection registry in Redis |
-
-### Storage Tiering (production)
-
-| Data Age | Storage Tier | Access Pattern |
-|----------|--------------|----------------|
-| 0-30 days | PostgreSQL (SSD) | Full indexing, fast queries |
-| 30-365 days | PostgreSQL (HDD) | Partial indexing, slower queries |
-| > 1 year | Object storage (S3) | Archive, no indexing, retrieve on demand |
+1. **Raw highlights shard by `user_id`.** Every raw-highlight query is user-scoped: my library, my book, my search, my feed. The one cross-user query, counting readers per passage, is precomputed by the aggregator, and that is what makes `user_id` a viable shard key.
+2. **Sync gateways scale with sockets** (~50K each). A reader's devices may land on different gateways; per-user Redis channels route pokes, and each gateway subscribes only for the users it holds. Plan for the reconnect storm, not the steady state.
+3. **The aggregator scales by Kafka partitions.** A single hot book stays on one partition. Its state is small (one book's reader sets), so one consumer is enough, and the 60 s publish cycle batches its writes.
+4. **Popular reads** are a cacheable document per book: CDN, then an in-process cache on each Popular API instance, then a 10 GB replicated database.
+5. **Search** moves to OpenSearch indexes per user cohort, fed from the same Kafka stream, and stays user-scoped.
+6. **Storage tiering**, never deletion: old highlights are rarely read but never garbage. Only tombstones expire.
 
 ## Trade-offs Summary
 
 | Decision | Chosen | Alternative | Rationale |
 |----------|--------|-------------|-----------|
-| Sync protocol | WebSocket push | HTTP polling | Sub-2s sync; polling wastes bandwidth on idle connections |
-| Aggregation | Redis counters + batch sync | Real-time SQL | 100x write throughput; 5-min staleness acceptable |
-| Passage grouping | 100-char normalized windows | Exact matching | Practical grouping of "similar enough" selections |
-| Conflict resolution | Last-write-wins (timestamps) | CRDTs | Simple, sufficient for low-conflict highlights |
-| Privacy enforcement | Query-time JOINs | Materialized views | Avoids combinatorial explosion of pre-computation |
-| Soft deletes | Tombstone table | Physical delete | Enables sync propagation to offline devices |
-| Session storage | Redis tokens | JWT | Immediate revocation, server-controlled expiry |
-| Search (production) | Elasticsearch | PostgreSQL LIKE | 10x faster for large datasets; PG fallback available |
-
-## Frontend Architecture
-
-### Component Hierarchy
-
-```
-App (TanStack Router)
-├── __root.tsx (RootLayout)
-│   ├── Header: nav links (Library, Trending, Export), user greeting, logout
-│   ├── <Outlet /> ──▶ routes
-│   └── Footer
-│
-├── / (LandingPage)
-│   └── Welcome content with login/register CTAs
-│
-├── /login (LoginPage)
-│   └── Email + password form
-│
-├── /register (RegisterPage)
-│   └── Email + username + password form
-│
-├── /library (LibraryPage)
-│   ├── View toggle: Books | All Highlights
-│   ├── Search bar (full-text search)
-│   ├── BooksView
-│   │   └── Book cards (grid layout: title, author, highlight count, last read)
-│   └── HighlightsView
-│       └── HighlightCard (blockquote with color styling + note)
-│
-├── /books/$bookId (BookDetailPage)
-│   ├── Book title + author header
-│   ├── Tab bar: My Highlights | Popular | Friends
-│   ├── MyHighlightCard (with inline note editing, delete)
-│   ├── PopularHighlightCard (passage text + reader count)
-│   └── FriendHighlightCard (avatar + username + passage)
-│
-├── /trending (TrendingPage)
-│   └── Trending highlights across all books
-│
-└── /export (ExportPage)
-    └── Format selector (Markdown/CSV/JSON) + export button
-```
-
-### Zustand Store
-
-A single Zustand store (`useStore`) with `persist` middleware manages all global state:
-
-**Auth state**: `user` (User object or null), `isAuthenticated` (derived boolean). The `persist` middleware stores only `user` and `isAuthenticated` in `localStorage` under the key `kindle-highlights-storage`, so the user stays logged in across page reloads. The `logout` action clears the localStorage `sessionId`, resets user state, and empties cached data arrays.
-
-**Highlights state**: `highlights` array with `setHighlights`, `addHighlight`, `removeHighlight`, and `updateHighlightInStore` mutators. Highlights are loaded from the API on page navigation and cached in the store for immediate rendering.
-
-**Library state**: `library` (array of Book objects with highlight counts) with `setLibrary`. Loaded alongside highlights on the library page.
-
-**UI state**: `selectedBookId` (currently viewed book) and `searchQuery` (search input value). These are persisted across navigation so the search bar retains its value when switching between views.
-
-### Routing
-
-TanStack Router with file-based routing provides six routes:
-- `/` -- Landing page (unauthenticated welcome)
-- `/login` -- Login form, stores session ID in `localStorage` on success
-- `/register` -- Registration form
-- `/library` -- User's books and highlights (requires auth)
-- `/books/$bookId` -- Book detail with tabbed highlight views (requires auth)
-- `/trending` -- Trending highlights across the platform (requires auth)
-- `/export` -- Export highlights in multiple formats (requires auth)
-
-The root layout provides navigation links that change based on `isAuthenticated` -- unauthenticated users see Login/Sign Up, authenticated users see Library/Trending/Export.
-
-### Data Fetching
-
-All API calls go through `api/client.ts`, a typed API client module. Authentication uses Bearer tokens -- the session ID is stored in `localStorage` and attached as an `Authorization: Bearer {sessionId}` header on every request. The Vite dev server proxies `/api` requests to the four backend services.
-
-**Library page loading**: On mount, the library page calls `getLibrary()` and `getHighlights()` in parallel via `Promise.all`. Both results are stored in the Zustand store. Subsequent visits to the library page re-fetch to ensure freshness.
-
-**Book detail page loading**: Uses `Promise.all` to fetch three data sets simultaneously: the user's highlights for this book (`getHighlights({bookId})`), popular highlights (`getPopularHighlights(bookId)`), and friends' highlights (`getFriendsHighlights(bookId)`). Each is stored in local component state (not the global store) because these are page-specific and do not need to persist across navigation.
-
-**Search**: The library page search form updates `searchQuery` in the store and triggers a re-fetch of highlights with the search parameter. The backend performs full-text search via PostgreSQL.
-
-### Key UI Patterns
-
-**Color-coded highlights**: Each highlight has a `color` field (yellow, green, blue, pink). The frontend maps these to CSS classes like `highlight-yellow` that apply background colors to blockquote elements. This creates the familiar Kindle highlighting experience where different colors serve different purposes (important passages, questions, favorites).
-
-**Three-tab book detail view**: The `BookDetailPage` uses a tab bar to switch between "My Highlights," "Popular," and "Friends" views. Each tab has a count badge showing how many highlights exist. The tabs load all data upfront (via the parallel `Promise.all` fetch) rather than lazy-loading per tab, since highlight lists are small enough that the bandwidth cost is negligible.
-
-**Inline note editing**: `MyHighlightCard` supports inline editing of the note field. Clicking "Edit" toggles the card into edit mode, showing a textarea pre-filled with the existing note. "Save" calls `updateHighlight` and updates local state. "Cancel" reverts to view mode. This avoids opening a separate modal for a simple text edit.
-
-**Popular highlights with social proof**: `PopularHighlightCard` displays the passage text in a yellow-tinted blockquote with a footer showing "N readers highlighted this passage." This count comes from the aggregation service's batch-synced Redis counters.
-
-**Friend highlight attribution**: `FriendHighlightCard` shows the friend's avatar (first letter of username in a circle) and username above the highlighted passage. This creates a social reading experience where you can see what your friends found interesting in the same book.
-
-**Multi-format export**: The export page lets users choose between Markdown, CSV, and JSON formats. The API returns the formatted text directly (not JSON-wrapped), and the frontend displays or downloads it.
-
-## Production-Grade Pattern Deep Dives
-
-This section explains each production-grade pattern referenced in the architecture, written for readers encountering these concepts for the first time.
-
-### Redis Cache-Aside
-
-Cache-aside (also called "lazy loading") is a caching strategy where the application checks the cache before querying the database. If the data is in the cache (a "hit"), it is returned immediately without touching the database. If not (a "miss"), the application queries the database, stores the result in the cache with a TTL (time-to-live), and returns it.
-
-**How it works step by step**: (1) A request arrives for popular highlights of a book. (2) Check Redis: `GET popular:{bookId}`. (3) If found, deserialize and return -- this takes ~0.2ms versus ~5ms for a database query. (4) If not found, query PostgreSQL's `popular_highlights` table. (5) Store the result in Redis: `SET popular:{bookId} value EX 300` (5-minute TTL). (6) Return the result.
-
-**Cache invalidation**: For popular highlights, the cache naturally expires every 5 minutes, which aligns with the aggregation worker's batch sync interval. For user-specific data, cache keys are deleted on write operations (create, update, delete highlight).
-
-**How it works in this project**: Popular highlights for each book are cached in Redis with a 5-minute TTL. The aggregation service updates these counts every 5 minutes, so the cache TTL matches the data freshness interval. See `src/shared/cache.ts`.
-
-**Why it matters for reading platforms**: The architecture targets 100K reads/second for popular highlights of bestselling books. A Harry Potter title might have millions of readers checking "what others highlighted." Without caching, each request would run a `SELECT ... ORDER BY highlight_count DESC LIMIT 10` query against PostgreSQL, which at 100K QPS would overwhelm the database. Redis serves these cached results with sub-millisecond latency.
-
-### Idempotency
-
-Idempotency means that performing the same operation multiple times produces the same result as performing it once. For API design, this means a duplicate request (caused by network retries, client-side double-taps, or load balancer request duplication) does not create duplicate data.
-
-**How idempotency keys work**: The client generates a unique key (typically a UUID) for each highlight creation and sends it as a header. The server checks Redis for this key before processing: (1) If found, return the cached result from the first execution. (2) If not found, create the highlight, store the result in Redis with a 24-hour TTL, and return it.
-
-**Two-layer deduplication in this project**: First, Redis is checked for the idempotency key (fast path). Second, the `idempotency_key` column in the PostgreSQL `highlights` table provides database-level deduplication within a transaction. This double-check handles the case where Redis is unavailable -- the database constraint still prevents duplicates.
-
-**Why this matters for highlight sync**: Consider a user highlighting a passage on their Kindle. The device sends a create request, but the cellular connection drops before the response arrives. The device queues the request for retry. When connectivity returns, it retries. Without idempotency, the user now has two identical highlights in their library. With idempotency keys, the retry hits the cached result and returns the already-created highlight.
-
-### Circuit Breaker
-
-A circuit breaker is a stability pattern that prevents an application from repeatedly calling a failing downstream service. It works like an electrical circuit breaker: when failures exceed a threshold, the "circuit opens" and subsequent calls fail immediately without attempting the request. After a cooldown period, the circuit allows one test request through ("half-open"). If it succeeds, the circuit closes and normal operation resumes.
-
-**The three states**:
-1. **Closed** (normal): Requests flow through normally. Failures are counted. If failures exceed the threshold (e.g., 50% of the last 5 requests fail), the circuit opens.
-2. **Open** (failing): All requests are immediately routed to a fallback function without attempting the downstream call. This prevents a failing service from dragging down the caller with timeout delays.
-3. **Half-open** (testing): After the reset timeout (e.g., 30 seconds), one request is allowed through to test whether the downstream service has recovered. If it succeeds, the circuit closes. If it fails, the circuit reopens.
-
-**Fallback behaviors in this project**: Redis read failures fall back to returning null (cache miss, continue to PostgreSQL). Redis write failures fall back to queuing the write in a PostgreSQL fallback table. PostgreSQL read failures return cached data if available, or an error. Elasticsearch failures (at production scale) fall back to PostgreSQL `ILIKE` search.
-
-**Why this matters for a reading platform**: The highlight service depends on both PostgreSQL and Redis. If Redis goes down, every highlight creation would wait for the Redis timeout (e.g., 1-3 seconds) before falling through to the database path. With 10K highlights/second at scale, that is 10K-30K seconds of accumulated waiting per second -- the server would quickly exhaust its connection pool and crash. A circuit breaker detects the failure after a few requests and starts skipping Redis entirely, keeping highlight creation fast.
-
-### Structured Logging
-
-Structured logging means emitting log entries as machine-readable JSON objects instead of free-form text strings. Instead of `"User alice created highlight in The Great Gatsby"`, the entry is `{"level":"info","service":"highlight","userId":"abc-123","bookId":"def-456","highlightId":"ghi-789","action":"highlight_created","durationMs":12}`.
-
-**Why JSON instead of text**: In production with multiple service instances generating thousands of log lines per second, searching free-form text is impractical. JSON logs can be indexed by any field in a log aggregation system. Finding "all highlight creations that took longer than 500ms" becomes a filter query instead of a regex search through millions of lines.
-
-**How Pino works in this project**: Pino outputs JSON in production mode and pretty-prints in development mode. Each service creates a child logger with the service name as context (`createLogger('highlight')`, `createLogger('sync')`). This means every log line from the highlight service automatically includes `"service":"highlight"`, making it trivial to filter logs by service. See `src/shared/logger.ts`.
-
-**Key events logged**: `highlight_created` (userId, bookId, highlightId, location, durationMs), `sync_pushed` (userId, deviceCount, queuedCount), `aggregation_completed` (booksProcessed, durationMs), `privacy_changed` (userId, oldSettings, newSettings). Each event includes enough context to reconstruct what happened without needing to correlate with other log lines.
-
-**Why it matters for sync debugging**: When a user reports "my highlight didn't sync to my other device," you need to trace the event through four microservices (highlight creation -> sync push -> device queue -> WebSocket delivery). With structured logs and a shared userId, you can filter to that user's events across all services and see exactly where the sync chain broke.
-
-### Prometheus Metrics
-
-Prometheus is a monitoring system that collects numerical measurements (metrics) from applications at regular intervals. Applications expose metrics at a `/metrics` HTTP endpoint. A Prometheus server scrapes this endpoint every 15-30 seconds and stores the time-series data for querying, dashboards, and alerting.
-
-**Three metric types that matter**:
-- **Counter**: A number that only goes up. Example: `highlights_created_total{book_id}`. The *rate* of change tells you how many highlights are being created per second.
-- **Gauge**: A number that goes up and down. Example: `websocket_active_connections`. Shows how many devices are currently connected for sync.
-- **Histogram**: Tracks the distribution of values across configurable buckets. Example: `highlight_operation_duration_seconds` with buckets at 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5 seconds. Lets you compute percentiles -- "p99 highlight creation latency is 180ms."
-
-**SLIs defined in this project**: Highlight creation latency (target: p99 < 200ms), cross-device sync latency (target: p95 < 2s), popular highlights cache hit rate (target: > 90%), API availability (target: 99.5% successful responses). Each SLI maps to a specific Prometheus metric.
-
-**Why it matters for a sync platform**: The architecture promises < 2 second cross-device sync. Without metrics measuring the time from highlight creation to WebSocket delivery, you cannot verify this promise. A histogram on sync latency gives you exact p95 values. If p95 drifts above 2 seconds, an alert fires before users notice degradation.
-
-### Rate Limiting
-
-Rate limiting restricts how many requests a client can make within a time window. Without it, a single misbehaving client can overwhelm the server.
-
-**How it works**: The server tracks request counts per client (identified by user ID or IP address). Each incoming request checks the counter. If exceeded, the server returns HTTP 429 (Too Many Requests). If not, the request proceeds and the counter increments. Counters are typically stored in Redis for cross-server sharing.
-
-**Rate limits defined in this project**:
-- Highlight creation: 100/minute per user (prevents automated bulk creation)
-- Auth attempts: 5/minute per IP (prevents brute-force password guessing)
-- Export: 10/hour per user (exports are expensive database queries)
-- Search: 30/minute per user (search queries are CPU-intensive)
-- Global API: 1000/minute per user (general abuse protection)
-
-**Why different limits for different endpoints**: Not all operations cost the same. Creating a highlight involves a database write, cache update, Redis counter increment, and sync event broadcast -- it is 10x more expensive than reading a highlight. Export requires scanning and formatting potentially thousands of highlights. Rate limits should reflect the actual cost of each operation.
-
-### Health Checks
-
-A health check is an HTTP endpoint that reports whether the service is alive and capable of handling requests. Load balancers and container orchestrators poll this endpoint to decide where to route traffic.
-
-**How it works in this project**: Each of the four microservices exposes a health endpoint. A basic check just returns HTTP 200 to prove the process is running. A more thorough check tests downstream dependencies -- can this service reach PostgreSQL? Is Redis responding? If either is down, the service reports unhealthy, and the load balancer stops sending it traffic.
-
-**Why health checks matter for microservices**: With four separate services (highlight, sync, aggregation, social), a failure in one should not cascade to the others. If the aggregation worker's PostgreSQL connection dies, the health check fails, and the orchestrator restarts just that service without affecting highlight creation or sync.
-
-### RBAC (Role-Based Access Control)
-
-RBAC is a method of restricting system access based on roles assigned to users rather than per-user permission lists. You define roles (e.g., "owner", "friend", "public") with associated permissions and assign users to roles for each resource.
-
-**How it applies to this project**: The privacy system functions as a simplified RBAC model. Each highlight has a `visibility` field that acts as a role assignment:
-- `private`: Only the owner can see it (owner role)
-- `friends`: Owner and users in the `follows` table can see it (friend role)
-- `public`: Everyone can see it, and it is included in aggregation counts (public role)
-
-The `user_privacy_settings` table sets default visibility for new highlights, which users can override per-highlight. Query-time enforcement JOINs the highlights table with the follows table and privacy settings to filter results based on the requesting user's relationship to the highlight owner.
-
-**Why per-highlight rather than per-user visibility**: Users want fine-grained control. A reader might share a profound quote publicly while keeping personal annotations private within the same book. Per-user settings establish the default; per-highlight overrides enable this flexibility without requiring a complex RBAC middleware.
+| Sync cursor | Per-user sequence under a row lock | Timestamps, per-device queues | Gap-free in commit order; one source of truth |
+| Feed content | Latest state per changed highlight | Operation log | A device offline for a month receives each highlight once |
+| Upload idempotency | Client-generated highlight id | Server ids + dedupe by body | Retries replay; a reader may highlight the same words twice |
+| Conflicts | Field-level LWW, clamped clocks, delete wins | CRDT/OT, `If-Match` + `412` | Single-owner data; offline devices can't resolve 412s |
+| Deletes | Tombstones, 90-day retention, resync below | Hard delete | Prevents resurrection by long-offline devices |
+| Live updates | WebSocket poke, then HTTP pull | Push payloads, polling | A lost poke costs latency only; polling 25M devices to say "nothing new" |
+| Counting | Outbox → Kafka → distinct-reader sets | Counter per save, recompute on read | No hot rows or index churn; exact under replay |
+| Passage grouping | Sentence-anchored | Exact ranges, fixed windows | We own the text; windows undercount boundary sentences |
+| Privacy | Consent at write; k on presence; publish + serve | Read-time filter, hide only the number | Opted-out data never enters; presence is the disclosure |
+| Friends' highlights | Read-time query, mutual follow | Materialized per-viewer view | One row would serve one reader; stale privacy is a leak |
+| Shard key | `user_id` | `book_id` | All raw reads are user-scoped; cross-user counts are precomputed |
 
 ## Implementation Notes
 
-This section maps the production architecture to the actual local implementation, documenting production-grade patterns used, simplifications, and omissions.
+### What runs locally
 
-### Local Setup
+| Process | Port | Code |
+|---------|------|------|
+| Highlight service | 3000 | [`backend/src/highlight/app.ts`](./backend/src/highlight/app.ts) |
+| Social service | 3001 (the `PORT` the screenshot harness waits on) | [`backend/src/social/app.ts`](./backend/src/social/app.ts) |
+| Sync service: pull, push, WebSocket | 3002 | [`backend/src/sync/app.ts`](./backend/src/sync/app.ts) |
+| Aggregation API | 3003 | [`backend/src/aggregation/app.ts`](./backend/src/aggregation/app.ts) |
+| Aggregation worker | — | [`backend/src/aggregation/worker.ts`](./backend/src/aggregation/worker.ts) |
+| PostgreSQL 16, Valkey 7 | 5432, 6379 | [`docker-compose.yml`](./docker-compose.yml) |
+| React SPA (Vite proxy routes each path to its service) | 5173 | [`frontend/`](./frontend/) |
 
-```
-┌────────────────────────────────────────────────────────────────────┐
-│                   React Frontend (:5173)                          │
-│   TanStack Router, Zustand state, Tailwind CSS                   │
-│   Library, Book detail, Trending, Export views                   │
-│   Vite proxy → backend services                                  │
-└──────────────────┬───────────────────┬─────────────────────────────┘
-                   │ HTTP              │ WS
-    ┌──────────────┴──────┐    ┌───────┴──────────┐
-    ▼                     ▼    ▼                  ▼
-┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐
-│Highlight │  │  Social  │  │   Sync   │  │ Aggreg.  │
-│ Service  │  │ Service  │  │ Service  │  │ Service  │
-│ (:3001)  │  │ (:3004)  │  │ (:3002)  │  │ (:3003)  │
-│          │  │          │  │          │  │          │
-│ CRUD,    │  │ Auth,    │  │ WebSocket│  │ Popular  │
-│ search,  │  │ follow,  │  │ push,    │  │ highlights│
-│ export   │  │ share,   │  │ offline  │  │ API      │
-│          │  │ privacy  │  │ queue    │  │          │
-└────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘
-     └──────┬──────┴──────┬──────┴──────┬───────┘
-            ▼             ▼             ▼
-     ┌────────────┐  ┌──────────┐  ┌──────────┐
-     │ PostgreSQL │  │  Valkey  │  │ Aggreg.  │
-     │  (:5432)   │  │ (:6379)  │  │ Worker   │
-     │            │  │          │  │ (bg job) │
-     │ highlights │  │ sessions │  │          │
-     │ books      │  │ sync     │  │ Redis →  │
-     │ users      │  │ queues   │  │ Postgres │
-     │ follows    │  │ popular  │  │ batch    │
-     │ popular_*  │  │ cache    │  │ sync     │
-     │ privacy    │  │ counters │  │          │
-     └────────────┘  └──────────┘  └──────────┘
-```
+### Production patterns implemented
 
-All services started concurrently via `npm run dev` (uses `concurrently` to run all `dev:*` scripts).
+- **One write path with a gap-free feed** ([`shared/highlights.ts`](./backend/src/shared/highlights.ts)). REST writes and offline pushes both go through `createHighlight`, `updateHighlight` and `deleteHighlight`. Each locks the reader's `user_sync_state` row first and stamps the row with the next sequence number in the same transaction:
 
-### Production-Grade Patterns Implemented
+  ```ts
+  await client.query('INSERT INTO user_sync_state (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING', [userId])
+  const result = await client.query<{ last_seq: number }>(
+    'SELECT last_seq FROM user_sync_state WHERE user_id = $1 FOR UPDATE',
+    [userId]
+  )
+  ```
 
-**Microservice decomposition** (`backend/src/{highlight,sync,aggregation,social}/`): Four separate Express services, each with its own port and responsibility. Services share database and cache connections via shared modules but run as independent processes.
+  Creates use the client's id with `ON CONFLICT (id) DO NOTHING`; a replay consumes no sequence number and enqueues no recount. `changesSince` reads the cursor and the rows in one `REPEATABLE READ READ ONLY` transaction and answers `resync` below `purged_through_seq`.
+- **Field-level last-writer-wins** ([`shared/lww.ts`](./backend/src/shared/lww.ts)): per-field `{ts, device}` stamps, device clocks clamped to server time + 5 minutes, device-id tie-break, replays reported as `unchanged`, deletes final.
+- **Batched push with per-operation results** ([`sync/app.ts`](./backend/src/sync/app.ts)): up to 100 operations, one transaction each; invalid operations and `409`/`422` outcomes are `rejected` individually; one Redis publish per batch.
+- **WebSocket pokes across processes**: first-message authentication (`hello` within 5 s, else close `4001`), per-user Redis `SUBSCRIBE` on the first socket of a reader and `UNSUBSCRIBE` on the last, the origin device skipped, ping every 30 s with dead sockets terminated ([`shared/notify.ts`](./backend/src/shared/notify.ts)).
+- **Transactional outbox + recount worker** ([`aggregation/worker.ts`](./backend/src/aggregation/worker.ts)). Any change that can move a public count inserts an `aggregation_outbox` row in its transaction. The worker drains one book per transaction:
 
-**WebSocket sync with offline queue** (`backend/src/sync/app.ts`): Persistent WebSocket connections with device registration. Push sync events to all connected devices. Redis-backed offline queue with 30-day TTL for disconnected devices. Last-write-wins conflict resolution using timestamps.
+  ```
+  Worker                                    PostgreSQL    Redis
+     │                                           │          │
+     │ 1 oldest outbox row, SKIP LOCKED: book B  │          │
+     │──────────────────────────────────────────▶│          │
+     │ 2 advisory lock on B                      │          │
+     │──────────────────────────────────────────▶│          │
+     │ 3 DELETE B's outbox rows                  │          │
+     │──────────────────────────────────────────▶│          │
+     │ 4 public, consenting highlights of B      │          │
+     │──────────────────────────────────────────▶│          │
+     │ 5 count distinct readers per passage      │          │
+     │ 6 replace rows with k+ readers; COMMIT    │          │
+     │──────────────────────────────────────────▶│          │
+     │ 7 DEL popular:B, heatmap:B                           │
+     │─────────────────────────────────────────────────────▶│
+     │                                           │          │
+  ```
 
-**Background aggregation worker** (`backend/src/aggregation/worker.ts`): Separate background process that periodically syncs Redis counters to PostgreSQL `popular_highlights` table. Decoupled from the API servers so aggregation work does not impact user-facing latency.
+  The claim uses `FOR UPDATE SKIP LOCKED` so several workers share the outbox. The per-book advisory lock stops an older snapshot from overwriting a newer one. Deleting the outbox rows *before* reading highlights guarantees that every consumed row's change is visible to the read. [`shared/passage.ts`](./backend/src/shared/passage.ts) counts distinct readers and drops sub-threshold passages before anything is written. Every 6 hours the worker requeues all books (reconcile), and every hour it reaps tombstones older than 90 days.
+- **Privacy threshold everywhere** ([`shared/privacy.ts`](./backend/src/shared/privacy.ts)): `POPULAR_MIN_READERS` (default 5, never below 2) applies to popular, trending, heatmap and count; `minCount` only raises it. Friends' highlights check each highlight's own visibility and a mutual follow. Consent changes enqueue a recount of the reader's books in the same transaction.
+- **Operational basics**: salted scrypt password hashes with transparent upgrade of legacy SHA-256 hashes on login ([`shared/password.ts`](./backend/src/shared/password.ts)); server-side logout; boundary validation returning 4xx instead of 500 ([`shared/validation.ts`](./backend/src/shared/validation.ts), [`shared/errors.ts`](./backend/src/shared/errors.ts)); graceful shutdown that stops accepting, drains and closes pools ([`shared/lifecycle.ts`](./backend/src/shared/lifecycle.ts)); `GET /health` on the aggregation API reports outbox backlog and the worker's heartbeat age; cache-aside with TTL jitter for popular, trending and heatmap.
+- **Web client as a device**: [`frontend/src/sync/outbox.ts`](./frontend/src/sync/outbox.ts) queues note edits and deletes in `localStorage`, shows them immediately and pushes them single-flight on the next flush. [`frontend/src/sync/useSyncChannel.ts`](./frontend/src/sync/useSyncChannel.ts) keeps one socket with exponential backoff and jitter, flushes the outbox on every `welcome` and `online` event, and pages refetch in the background when another device writes.
+- **Tests**: `npm test` runs 46 vitest tests (merge rules, passage aggregation, validation, password hashing, and endpoint tests with mocked shared modules for the threshold, push batches and idempotent create).
 
-**Privacy-preserving queries** (`backend/src/social/app.ts`): Friends' highlights queries JOIN with `follows` and `user_privacy_settings` tables to enforce per-highlight and per-user visibility rules at query time.
+### Simplified or substituted
 
-**Structured logging (Pino)** (`backend/src/shared/logger.ts`): JSON-formatted output in production, pretty-print in development. Service-scoped child loggers via `createLogger(serviceName)`.
+- One unsharded PostgreSQL; the outbox marks books dirty and the worker **recomputes the whole book** from `highlights`. That is exact and idempotent, but its cost grows with a book's public highlights. Production replaces it with Kafka and incremental reader sets and keeps the recompute as the nightly check.
+- 100-location windows instead of sentence anchoring (no book text is stored).
+- The sync service serves pull and push next to its sockets; production keeps gateways connection-only.
+- The web client refetches the visible lists after a poke instead of applying the feed to an IndexedDB store. It has no create-highlight UI, so highlights come from the seed or the API, and its outbox is cleared on logout.
+- Trending ranks published passages that gained a reader in the window by total readers, rather than by readers gained.
+- The Vite dev proxy plays the API gateway. Sessions live only in Redis, and the web app keeps the bearer token in `localStorage` rather than an `HttpOnly` cookie.
 
-**Session-based auth** (`backend/src/shared/auth.ts`): Session tokens stored in Redis with 24-hour TTL. Middleware validates session on every request.
+### Omitted
 
-**Database migrations** (`backend/src/db/migrate.ts`, `backend/src/db/init.sql`): Full SQL schema with indexes, constraints, and foreign keys. Migration runner executes `init.sql` against PostgreSQL.
+Kafka, the CDN, sharding, OpenSearch (search is `ILIKE` with `OFFSET` paging), rate limiting, Prometheus metrics, circuit breakers, async export jobs, multi-region deployment, and counter-fraud detection.
 
-**Seed data** (`backend/src/db/seed.ts`): Demo data with users, books, highlights, follows, and privacy settings for local development and screenshot automation.
+### Known limitations
 
-**Redis caching** (`backend/src/shared/cache.ts`): Popular highlights cached in Redis with 5-minute TTL. Cache-aside pattern -- check Redis first, fall through to PostgreSQL on miss.
-
-**Multi-format export** (`backend/src/highlight/app.ts`): Export highlights as Markdown, CSV, or JSON with book/date filtering.
-
-### Simplifications
-
-| Production Design | Local Simplification |
-|-------------------|---------------------|
-| API Gateway with rate limiting | Direct service access via Vite proxy |
-| Elasticsearch for full-text search | PostgreSQL ILIKE queries |
-| Redis Sentinel/Cluster for HA | Single Valkey instance |
-| PostgreSQL read replicas | Single PostgreSQL instance |
-| Kafka for event streaming | Direct WebSocket push + Redis queues |
-| CDN for book covers and static assets | Vite dev server |
-| OAuth / JWT for mobile clients | Simple session tokens |
-| Storage tiering (SSD → HDD → S3) | All data in single PostgreSQL |
-| Database sharding by user_id | Single database, no sharding |
-| Horizontal scaling of services | Single instance per service |
-
-### What Was Omitted
-
-- **Elasticsearch**: Full-text search uses PostgreSQL; Elasticsearch would be needed at scale
-- **Kafka**: Event streaming for cross-service communication; replaced by direct Redis pub/sub and WebSocket
-- **CDN**: No content delivery network for static assets or book metadata
-- **Multi-region**: No geographic distribution or cross-region replication
-- **Kubernetes**: No container orchestration or auto-scaling
-- **Circuit breakers**: Not implemented in this project (documented in architecture for production)
-- **Prometheus metrics (prom-client)**: Not instrumented; Pino logging provides observability
-- **Client-side SQLite**: No offline-first local database on the client; the web frontend fetches from the API
-- **Storage tiering**: No archival of old highlights to cold storage
-- **Audit logging**: No separate audit table for security-relevant events
+- Device clocks are clamped but not hybrid logical clocks, so a slow clock loses same-field conflicts it should win.
+- The schema upgrade that numbers pre-existing rows into the feed must run with the services stopped.
+- Popular-list cache invalidation can race a concurrent refill and serve the previous list for one TTL (5 minutes).
+- Login does not equalize timing for unknown emails, and there is no lockout.

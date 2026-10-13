@@ -56,11 +56,14 @@ npm run db:seed  # Optional: adds demo data
 npm run dev
 ```
 
-This starts four services:
-- **Highlight Service**: Port 3001 - CRUD operations for highlights
-- **Sync Service**: Port 3002 - WebSocket real-time sync
-- **Aggregation Service**: Port 3003 - Popular highlights API
-- **Social Service**: Port 3004 - Auth, following, sharing
+This starts four services and the aggregation worker:
+- **Highlight Service**: Port 3000 - CRUD, library, search, export
+- **Social Service**: Port 3001 - Auth, following, sharing, privacy settings
+- **Sync Service**: Port 3002 - change feed, offline push, WebSocket pokes
+- **Aggregation Service**: Port 3003 - Popular, trending, heatmap (privacy-thresholded)
+- **Aggregation worker** - drains the outbox and republishes popular passages
+
+`npm run db:seed` is re-runnable. Popular passages appear after the worker's first cycle (a few seconds).
 
 ### 3. Frontend Setup
 
@@ -78,85 +81,79 @@ See [architecture.md](./architecture.md) for detailed system design documentatio
 
 ### Services Overview
 
+The Vite dev server routes each `/api/*` path to the service that owns it (see `frontend/vite.config.ts`).
+
 ```
-┌────────────────────────────────────────────────────────────────┐
-│                      Frontend (React SPA)                       │
-│                     http://localhost:5173                        │
-└────────────────────────────────────────────────────────────────┘
-                              │
-         ┌────────────────────┼────────────────────┐
-         ▼                    ▼                    ▼
-┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐
-│ Highlight       │  │ Sync Service    │  │ Aggregation     │
-│ Service :3001   │  │ :3002           │  │ Service :3003   │
-│                 │  │                 │  │                 │
-│ • CRUD          │  │ • WebSocket     │  │ • Popular       │
-│ • Search        │  │ • Real-time     │  │   highlights    │
-│ • Export        │  │ • Offline queue │  │ • Trending      │
-└─────────────────┘  └─────────────────┘  └─────────────────┘
-         │                    │                    │
-         └────────────────────┼────────────────────┘
-                              ▼
-         ┌────────────────────┴────────────────────┐
-         ▼                                         ▼
-┌─────────────────────┐              ┌─────────────────────┐
-│    PostgreSQL       │              │       Redis         │
-│    :5432            │              │       :6379         │
-│                     │              │                     │
-│ • Users             │              │ • Sessions          │
-│ • Highlights        │              │ • Aggregation       │
-│ • Books             │              │   counters          │
-│ • Popular           │              │ • Sync queues       │
-│   highlights        │              │ • Cache             │
-└─────────────────────┘              └─────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│ React SPA · http://localhost:5173 · Vite proxy routes /api/*         │
+└───────┬─────────────────┬─────────────────┬─────────────────┬────────┘
+        ▼                 ▼                 ▼                 ▼
+┌───────────────┐ ┌───────────────┐ ┌───────────────┐ ┌───────────────┐
+│ Highlight     │ │ Social        │ │ Sync          │ │ Aggregation   │
+│ :3000 · CRUD  │ │ :3001 · auth, │ │ :3002 · pull, │ │ :3003 ·       │
+│ search export │ │ follows       │ │ push, WS      │ │ popular       │
+└───────┬───────┘ └───────┬───────┘ └───────┬───────┘ └───────┬───────┘
+        ▼                 ▼                 ▼                 ▼
+┌──────────────────────────────────────┐ ┌─────────────────────────────┐
+│ PostgreSQL :5432 · highlights, feed  │ │ Valkey :6379 · sessions,    │
+│ sequence, outbox, popular_highlights │ │ pub/sub pokes, read cache   │
+└──────────────────▲───────────────────┘ └─────────────────────────────┘
+                   │ recount books from aggregation_outbox
+          ┌────────┴────────────────┐
+          │ Aggregation worker      │
+          └─────────────────────────┘
 ```
 
 ## API Endpoints
 
-### Highlight Service (Port 3001)
+### Highlight Service (Port 3000)
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | GET | /health | Health check |
-| POST | /api/highlights | Create highlight |
-| GET | /api/highlights | List user highlights |
-| GET | /api/highlights/:id | Get highlight |
-| PATCH | /api/highlights/:id | Update highlight |
-| DELETE | /api/highlights/:id | Delete highlight |
-| GET | /api/export/highlights | Export highlights |
-| GET | /api/library | Get user's books with counts |
+| POST | /api/highlights | Create; send a client-generated `id` (or `Idempotency-Key`); a retry answers 200 `Idempotent-Replayed` |
+| GET | /api/highlights | List my highlights (`bookId`, `search`, `limit`, `offset`) |
+| GET | /api/highlights/:id | Get highlight (410 if deleted) |
+| PATCH | /api/highlights/:id | Update note/color/visibility; per-field last-writer-wins on `clientUpdatedAt` |
+| DELETE | /api/highlights/:id | Delete (tombstone, idempotent) |
+| GET | /api/export/highlights | Export (`format` = markdown, csv or json) |
+| GET | /api/library | My books with highlight counts |
 
 ### Sync Service (Port 3002)
 
-| Endpoint | Type | Description |
-|----------|------|-------------|
-| /sync | WebSocket | Real-time sync connection |
-| /health | GET | Health check with connection count |
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | /api/sync/changes | Changes after a cursor: `{changes, cursor, hasMore, resync}` |
+| POST | /api/sync/push | Apply a device's offline ops (`create`/`update`/`delete`), one result per op |
+| WS | /api/sync/ws | First message `{type:"hello", token, deviceId}`; receives `{type:"changed", seq}` |
+| GET | /health | Connection count and fan-out status |
 
 ### Aggregation Service (Port 3003)
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| GET | /health | Health check |
-| GET | /api/books/:bookId/popular | Popular highlights for book |
-| GET | /api/trending | Trending highlights |
-| GET | /api/books/:bookId/heatmap | Highlight density map |
+| GET | /health | Outbox backlog and worker heartbeat age |
+| GET | /api/books/:bookId/popular | Popular passages (only with at least `POPULAR_MIN_READERS` readers) |
+| GET | /api/trending | Published passages with a recent reader (`days`, `limit`) |
+| GET | /api/books/:bookId/heatmap | Reader counts of published passages |
+| GET | /api/books/:bookId/count | Readers for a location range (`null` below the threshold) |
 
-### Social Service (Port 3004)
+### Social Service (Port 3001)
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | POST | /api/auth/register | Register user |
 | POST | /api/auth/login | Login |
+| POST | /api/auth/logout | Revoke the session |
 | GET | /api/auth/me | Current user |
 | POST | /api/users/:userId/follow | Follow user |
 | DELETE | /api/users/:userId/follow | Unfollow user |
 | GET | /api/following | Users I follow |
 | GET | /api/followers | My followers |
-| GET | /api/books/:bookId/friends-highlights | Friends' highlights |
+| GET | /api/books/:bookId/friends-highlights | Public highlights of people I follow, plus friends-only ones if the follow is mutual |
 | POST | /api/highlights/:id/share | Share highlight |
 | GET | /api/settings/privacy | Privacy settings |
-| PATCH | /api/settings/privacy | Update privacy |
+| PATCH | /api/settings/privacy | Update privacy (opting out triggers a recount) |
 
 ## Demo Credentials
 
@@ -167,6 +164,7 @@ After running `npm run db:seed`:
 | alice@example.com | password123 |
 | bob@example.com | password123 |
 | charlie@example.com | password123 |
+| reader01@example.com … reader09@example.com | password123 |
 
 ## Key Features
 
@@ -194,9 +192,9 @@ After running `npm run db:seed`:
 - Privacy controls
 
 ### 5. Real-time Sync
-- WebSocket-based sync
-- Offline queue for disconnected devices
-- Cross-device synchronization
+- Per-user change feed: devices pull `changes since <cursor>`; gap-free sequence numbers
+- Offline outbox pushed in batches; every operation is idempotent
+- WebSocket pokes ("your feed moved") across service instances via Redis pub/sub
 
 ## Development
 
@@ -204,11 +202,12 @@ After running `npm run db:seed`:
 
 ```bash
 # Run specific service
-npm run dev:highlight    # Port 3001
+npm run dev:highlight    # Port 3000
+npm run dev:social       # Port 3001
 npm run dev:sync         # Port 3002
 npm run dev:aggregation  # Port 3003
-npm run dev:social       # Port 3004
 npm run dev:worker       # Aggregation background job
+npm test                 # vitest unit and endpoint tests (no database needed)
 ```
 
 ### Environment Variables
@@ -217,10 +216,21 @@ npm run dev:worker       # Aggregation background job
 # Backend
 DATABASE_URL=postgresql://postgres:postgres@localhost:5432/highlights
 REDIS_URL=redis://localhost:6379
-HIGHLIGHT_PORT=3001
+HIGHLIGHT_PORT=3000
+SOCIAL_PORT=3001
 SYNC_PORT=3002
 AGGREGATION_PORT=3003
-SOCIAL_PORT=3004
+POPULAR_MIN_READERS=5          # privacy threshold (never below 2)
+AGGREGATION_INTERVAL=10000     # worker cycle, ms
+RECONCILE_INTERVAL=21600000    # requeue every book, ms
+TOMBSTONE_RETENTION_DAYS=90    # older cursors must resync
+SYNC_HEARTBEAT_MS=30000        # WebSocket ping interval
+
+# Frontend dev proxy targets (optional)
+HIGHLIGHT_URL=http://localhost:3000
+SOCIAL_URL=http://localhost:3001
+SYNC_URL=http://localhost:3002
+AGGREGATION_URL=http://localhost:3003
 ```
 
 ## Key Technical Challenges
