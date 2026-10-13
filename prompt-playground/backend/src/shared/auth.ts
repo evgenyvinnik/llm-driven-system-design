@@ -97,5 +97,23 @@ export async function assertWorkspaceMember(userId: string, workspaceId: string)
     'SELECT 1 FROM workspace_members WHERE workspace_id = $1 AND user_id = $2',
     [workspaceId, userId],
   )
-  if (!rowCount) throw new HttpError(404, 'NOT_FOUND', 'Not found')
+  if (!rowCount) throw new HttpError(403, 'NOT_A_MEMBER', 'You are no longer a member of this workspace')
+}
+
+/**
+ * For routes that act on the session's workspace (listing prompts, presets):
+ * the session only remembers which workspace was chosen, so membership is
+ * re-checked here rather than trusted from the session.
+ */
+export async function requireWorkspaceMember(req: Request, _res: Response, next: NextFunction): Promise<void> {
+  if (!req.user) {
+    next(new HttpError(401, 'UNAUTHENTICATED', 'Sign in to continue'))
+    return
+  }
+  try {
+    await assertWorkspaceMember(req.user.id, req.user.workspaceId)
+    next()
+  } catch (err) {
+    next(err)
+  }
 }

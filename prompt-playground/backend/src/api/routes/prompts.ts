@@ -1,6 +1,6 @@
 import { Router } from 'express'
 import { z } from 'zod'
-import { requireAuth } from '../../shared/auth.js'
+import { requireAuth, requireWorkspaceMember } from '../../shared/auth.js'
 import { pool, withTransaction } from '../../shared/db.js'
 import { asyncHandler, HttpError } from '../../shared/errors.js'
 import { uuidParam } from '../../shared/ids.js'
@@ -8,7 +8,7 @@ import { loadPromptForUser, loadVersion, upsertSnapshot, type PromptRow } from '
 import { RUN_SELECT, serializeRun, type RunRow } from '../services/runs.js'
 
 export const promptsRouter = Router()
-promptsRouter.use(requireAuth)
+promptsRouter.use(requireAuth, asyncHandler(requireWorkspaceMember))
 
 const createSchema = z
   .object({

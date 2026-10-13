@@ -149,6 +149,7 @@ Each folder contains an independent implementation of a system design problem.
 |---------|-------------|--------|
 | [Scale AI](./scale-ai/) | Data labeling with crowdsourced drawing collection | ✅ Implemented |
 | [Health Data Pipeline](./health-data-pipeline/) | Multi-device health data aggregation | ✅ Implemented |
+| [Prompt Playground](./prompt-playground/) | Versioned prompts, streamed runs, side-by-side comparisons, and share links over a model API | ✅ Implemented |
 
 ### Infrastructure & System Components
 
@@ -186,7 +187,6 @@ The next round, focused on AI products and developer platforms. See [ROADMAP.md]
 
 | Project | Description | Status |
 |---------|-------------|--------|
-| [Prompt Playground](./ROADMAP.md#1-prompt-playground) | Edit, version, run, and share prompts against a model API | 📋 Planned |
 | [ChatGPT](./ROADMAP.md#2-chatgpt) | Streaming assistant with branching history, cancellation, and multi-device sync | 📋 Planned |
 | [Settings Service](./ROADMAP.md#3-settings-service) | Backend for an existing preferences UI: precise APIs, concurrency, and org policies | 📋 Planned |
 | [LLM Chat Analytics](./ROADMAP.md#4-llm-chat-analytics) | Near-real-time usage, latency, and token dashboards with late-data handling | 📋 Planned |

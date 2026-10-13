@@ -6,7 +6,7 @@
 import { randomBytes } from 'node:crypto'
 import { Router } from 'express'
 import { z } from 'zod'
-import { requireAuth } from '../../shared/auth.js'
+import { requireAuth, requireWorkspaceMember } from '../../shared/auth.js'
 import { pool, withTransaction } from '../../shared/db.js'
 import { asyncHandler, HttpError } from '../../shared/errors.js'
 import { uuidParam } from '../../shared/ids.js'
@@ -18,8 +18,8 @@ import { loadRunForUser, runUsage, type RunRow } from '../services/runs.js'
 export const sharesRouter = Router()
 
 const createSchema = z.discriminatedUnion('kind', [
-  z.object({ kind: z.literal('version'), version: z.number().int().positive() }),
-  z.object({ kind: z.literal('run'), runId: z.string().uuid() }),
+  z.object({ kind: z.literal('version'), version: z.number().int().positive() }).strict(),
+  z.object({ kind: z.literal('run'), runId: z.string().uuid() }).strict(),
 ])
 
 const TOKEN = /^[A-Za-z0-9_-]{16,64}$/
@@ -153,6 +153,7 @@ sharesRouter.get(
 sharesRouter.post(
   '/shared/:token/fork',
   requireAuth,
+  asyncHandler(requireWorkspaceMember),
   asyncHandler(async (req, res) => {
     const s = await loadShared(req.params.token)
     const user = req.user!

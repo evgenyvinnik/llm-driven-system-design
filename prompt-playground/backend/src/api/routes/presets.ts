@@ -7,14 +7,14 @@
 import type { Request } from 'express'
 import { Router } from 'express'
 import { z } from 'zod'
-import { requireAuth } from '../../shared/auth.js'
+import { requireAuth, requireWorkspaceMember } from '../../shared/auth.js'
 import { modelConfigSchema } from '../../shared/catalog.js'
 import { pool } from '../../shared/db.js'
 import { asyncHandler, HttpError } from '../../shared/errors.js'
 import { uuidParam } from '../../shared/ids.js'
 
 export const presetsRouter = Router()
-presetsRouter.use(requireAuth)
+presetsRouter.use(requireAuth, asyncHandler(requireWorkspaceMember))
 
 const createSchema = z.object({ name: z.string().trim().min(1).max(80), config: modelConfigSchema }).strict()
 const updateSchema = z

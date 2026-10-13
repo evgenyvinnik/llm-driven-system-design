@@ -109,12 +109,19 @@ describe('API', () => {
   })
 
   it('requires If-Match to edit a preset', async () => {
+    query.mockResolvedValueOnce({ rowCount: 1, rows: [{}] }) // workspace membership
     const res = await request(app)
       .patch('/api/v1/presets/9dce4c5f-3b10-4ffd-a37f-77a20de2471b')
       .set('Cookie', cookie)
       .send({ name: 'x' })
       .expect(428)
     expect(res.body.error.code).toBe('PRECONDITION_REQUIRED')
+  })
+
+  it('re-checks workspace membership instead of trusting the session', async () => {
+    query.mockResolvedValueOnce({ rowCount: 0, rows: [] })
+    const res = await request(app).get('/api/v1/prompts').set('Cookie', cookie).expect(403)
+    expect(res.body.error.code).toBe('NOT_A_MEMBER')
   })
 
   it('serves share links without a session and rejects malformed tokens', async () => {

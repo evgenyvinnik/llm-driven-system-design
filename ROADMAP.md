@@ -33,7 +33,7 @@ Sources surveyed: Glassdoor, Aced (formerly Exponent) and Hello Interview.
 
 | # | Project | Folder | Tier | Signal | Builds on |
 |---|---------|--------|------|--------|-----------|
-| 1 | [Prompt Playground](#1-prompt-playground) | `prompt-playground/` | 1 | OpenAI (candidate report); OpenAI, Anthropic (community) | mcplator |
+| 1 | [Prompt Playground](#1-prompt-playground) ✅ Built | [`prompt-playground/`](./prompt-playground/) | 1 | OpenAI (candidate report); OpenAI, Anthropic (community) | mcplator |
 | 2 | [ChatGPT](#2-chatgpt) | `chatgpt/` | 1 | OpenAI (community) | imessage, mcplator |
 | 3 | [Settings Service](#3-settings-service) | `settings-service/` | 1 | OpenAI (candidate report) | — |
 | 4 | [LLM Chat Analytics](#4-llm-chat-analytics) | `llm-chat-analytics/` | 1 | Anthropic (community) | ad-click-aggregator, dashboarding |
@@ -96,6 +96,8 @@ Each answer should also walk through **one successful and one failed execution t
 ### 1. Prompt Playground
 
 **Folder:** `prompt-playground/` · **Signal:** OpenAI (candidate report, Full Stack Engineer on the Applied team); OpenAI and Anthropic (community attribution)
+
+**Status:** ✅ Built. See [prompt-playground/](./prompt-playground/) and its [architecture.md](./prompt-playground/architecture.md). The entry below is kept as the original brief.
 
 **Problem.** Developers edit prompts, choose a model and its parameters, run requests, inspect results, and save or share experiments. Assume the model-serving API already exists. The design is the product built around it.
 
@@ -514,4 +516,4 @@ Each answer should also walk through **one successful and one failed execution t
 2. Write `architecture.md` first. Expand the entry above into the production design, then add the local Implementation Notes. Make sure it answers the [Design Review Checklist](#design-review-checklist).
 3. Implement the backend and frontend, add `scripts/screenshot-configs/<project>.json`, and generate smoke tests.
 4. Write the three `system-design-answer-*.md` files (no code, 350–550 lines each), making sure they cover the follow-up questions listed above.
-5. Move the project's row in [README.md](./README.md) from **Planned Projects** into its category table with `✅ Implemented`, and remove its entry from this roadmap.
+5. Move the project's row in [README.md](./README.md) from **Planned Projects** into its category table with `✅ Implemented`, and mark its entry here as built (keep the entry, so numbering and links stay stable).
