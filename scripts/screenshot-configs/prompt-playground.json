@@ -1,0 +1,46 @@
+{
+  "name": "prompt-playground",
+  "frontendPort": 5173,
+  "backendRequired": true,
+  "dbName": "prompt_playground",
+  "dbUser": "playground",
+  "auth": {
+    "enabled": true,
+    "loginUrl": "/login",
+    "credentials": { "username": "alice", "password": "password123" },
+    "usernameSelector": "input[name='username']",
+    "passwordSelector": "input[name='password']",
+    "submitSelector": "button[type='submit']",
+    "successIndicator": "main"
+  },
+  "screens": [
+    { "name": "01-login", "path": "/login", "waitFor": "form", "skipAuth": true, "delay": 500 },
+    { "name": "02-prompts", "path": "/", "waitFor": "table", "delay": 800 },
+    {
+      "name": "03-playground-comparison",
+      "path": "/",
+      "waitFor": "table",
+      "steps": [
+        { "click": "a:has-text('Support ticket triage')", "delay": 1200 },
+        { "click": "li button:has-text(' vs ')", "delay": 1500 }
+      ]
+    },
+    {
+      "name": "04-run-streaming",
+      "path": "/",
+      "waitFor": "table",
+      "steps": [
+        { "click": "a:has-text('Release notes writer')", "delay": 1200 },
+        { "fill": "#var-audience", "value": "developers using the public API" },
+        { "fill": "#var-version", "value": "2.15.0" },
+        { "fill": "#var-changes", "value": "- Add streaming to the export endpoint\n- Fix timezone handling in usage reports\n- Remove the deprecated v1 auth header" },
+        { "click": "button:has-text('Compare with another config')", "delay": 400 },
+        { "click": "aside button.btn-primary", "delay": 1400 }
+      ]
+    },
+    { "name": "05-presets", "path": "/presets", "waitFor": "h1", "delay": 800 },
+    { "name": "06-admin", "path": "/admin", "waitFor": "text=Runs per hour", "delay": 1500, "fullPage": true },
+    { "name": "07-shared-run", "path": "/s/demo-support-triage-share", "waitFor": "text=Copy to my workspace", "delay": 800, "fullPage": true }
+  ],
+  "viewport": { "width": 1440, "height": 900 }
+}

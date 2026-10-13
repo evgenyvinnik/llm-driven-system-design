@@ -128,8 +128,18 @@ function generateSmokeTests(config) {
     lines.push(`  await page.locator("${usernameSelector}").first().fill('${usernameValue}');`);
     lines.push(`  await page.locator("${passwordSelector}").first().fill('${creds.password || 'password123'}');`);
     lines.push(`  await page.locator("${submitSelector}").first().click();`);
-    lines.push(`  // Wait for navigation after login`);
-    lines.push(`  await page.waitForURL(/(?!.*login).*/);`);
+    // The old /(?!.*login).*/ pattern is unanchored, so it matches /login itself and
+    // resolves immediately; tests then navigated away and aborted the sign-in request.
+    // Wait for the app to actually leave the login path instead. A login form served
+    // at "/" can't be detected from the URL, so those keep the previous behavior.
+    const loginPath = (config.auth.loginUrl || '/login').split(/[?#]/)[0];
+    if (loginPath !== '/') {
+      lines.push(`  // Wait until the app leaves the login page, i.e. the sign-in request completed`);
+      lines.push(`  await page.waitForURL((url) => url.pathname !== '${loginPath}', { timeout: 15000 });`);
+    } else {
+      lines.push(`  // Wait for navigation after login`);
+      lines.push(`  await page.waitForURL(/(?!.*login).*/);`);
+    }
     lines.push(`}`);
     lines.push('');
   }
