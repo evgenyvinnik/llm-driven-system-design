@@ -1,491 +1,312 @@
-# Job Scheduler - System Design Answer (Frontend Focus)
+# ⏰ Distributed Job Scheduler — System Design Answer (Frontend Focus)
 
-*45-minute system design interview format - Frontend Engineer Position*
+*45-minute frontend interview, structured with the [RADIO framework](https://www.greatfrontend.com/front-end-system-design-playbook/framework): Requirements → Architecture → Data model → Interface → Optimizations. This is a proposed production design; what this repository actually runs is described in [architecture.md → Implementation Notes](./architecture.md#implementation-notes).*
 
-## 📋 Opening Statement
+> "A scheduler's UI is an operations console for things that happen somewhere else: on a schedule, on a worker, minutes after anyone clicked anything. So the frontend has two jobs. It must show the truth about state that changes without the user (a run going from running to failed to retrying), including how fresh that truth is. And it must make the dangerous buttons safe under stress: 'Trigger now', 'Cancel' and 'Retry all' get pressed during incidents, on bad networks, by tired people."
 
-"Today I'll design the frontend for a distributed job scheduler dashboard, focusing on the UI components and user experience for managing jobs, monitoring executions, and viewing worker status. The key challenges are displaying real-time execution updates, building intuitive job configuration forms, and creating effective monitoring visualizations with appropriate loading and error states."
-
----
-
-## 🎯 Step 1: Requirements Clarification (3-5 minutes)
-
-### Functional Requirements
-
-1. **Job Management Dashboard** - List, create, edit, delete jobs
-2. **Execution Monitoring** - Real-time status updates, execution history
-3. **Worker Status** - Active workers, health metrics
-4. **Dead Letter Queue** - Failed jobs inspection and retry
-5. **Metrics Dashboard** - System health visualization
-
-### UI/UX Requirements
-
-- **Responsiveness**: Desktop-first but mobile-friendly
-- **Real-time Updates**: WebSocket for live execution status
-- **Accessibility**: WCAG 2.1 AA compliance
-- **Performance**: Handle thousands of jobs with virtualization
-
-### Frontend Deep Dive Areas
-
-- Job list with filtering, sorting, and bulk actions
-- Job configuration form with cron expression builder
-- Execution timeline with status indicators
-- Worker health monitoring cards
+| Phase | Time | What I want the interviewer to leave with |
+|-------|------|--------------------------------------------|
+| R — Requirements | 5 min | Who uses it, for what, and the targets |
+| A — Architecture | 8 min | Component tree, who owns which state, the data layer |
+| D — Data model | 5 min | Jobs, runs, attempts, and how updates are ordered |
+| I — Interface | 5 min | The API as the client sees it; component contracts |
+| O — Optimizations & deep dives | 20 min | Live status, schedule editing, safe actions, big lists |
+| Loading, error & empty states | 2 min | What the UI does when things go wrong |
+| Wrap-up | 2 min | Trade-offs and next steps |
 
 ---
 
-## 🏗️ Step 2: Component Architecture
+## 🎯 R — Requirements (5 min)
 
-### Application Structure
+"I'll confirm who uses this first. It's an internal console used by engineers and on-call operators, mostly on desktop, sometimes from a phone during an incident."
 
-```
-┌───────────────────────────────────────────────────────────────────────────────┐
-│                          🎨 React Application                                  │
-├───────────────────────────────────────────────────────────────────────────────┤
-│                                                                               │
-│  ┌─────────────────────────────────────────────────────────────────────────┐  │
-│  │                              Routes                                      │  │
-│  │  ┌─────────┐  ┌─────────────┐  ┌───────────────┐  ┌───────────────┐     │  │
-│  │  │  index  │  │ jobs/index  │  │ jobs/$jobId   │  │  executions   │     │  │
-│  │  │ (home)  │  │  (list)     │  │  (detail)     │  │   (list)      │     │  │
-│  │  └─────────┘  └─────────────┘  └───────────────┘  └───────────────┘     │  │
-│  │  ┌─────────────┐  ┌─────────────┐                                        │  │
-│  │  │   workers   │  │ dead-letter │                                        │  │
-│  │  │  (status)   │  │   (queue)   │                                        │  │
-│  │  └─────────────┘  └─────────────┘                                        │  │
-│  └─────────────────────────────────────────────────────────────────────────┘  │
-│                                                                               │
-│  ┌─────────────────────────────────────────────────────────────────────────┐  │
-│  │                           Components                                     │  │
-│  │  ┌───────────────────────────┐  ┌───────────────────────────┐           │  │
-│  │  │         jobs/             │  │       executions/         │           │  │
-│  │  │  ├─ JobList.tsx           │  │  ├─ ExecutionTimeline.tsx │           │  │
-│  │  │  ├─ JobCard.tsx           │  │  ├─ ExecutionCard.tsx     │           │  │
-│  │  │  ├─ JobForm.tsx           │  │  └─ ExecutionLogs.tsx     │           │  │
-│  │  │  └─ CronBuilder.tsx       │  │                           │           │  │
-│  │  └───────────────────────────┘  └───────────────────────────┘           │  │
-│  │  ┌───────────────────────────┐  ┌───────────────────────────┐           │  │
-│  │  │        workers/           │  │          ui/              │           │  │
-│  │  │  ├─ WorkerGrid.tsx        │  │  ├─ StatusBadge.tsx       │           │  │
-│  │  │  └─ WorkerCard.tsx        │  │  ├─ PriorityIndicator.tsx │           │  │
-│  │  │                           │  │  └─ TimeAgo.tsx           │           │  │
-│  │  └───────────────────────────┘  └───────────────────────────┘           │  │
-│  └─────────────────────────────────────────────────────────────────────────┘  │
-│                                                                               │
-│  ┌─────────────────────────────────────────────────────────────────────────┐  │
-│  │                             Stores (Zustand)                             │  │
-│  │  ┌─────────────┐   ┌─────────────────┐   ┌─────────────────┐            │  │
-│  │  │  jobStore   │   │ executionStore  │   │  workerStore    │            │  │
-│  │  └─────────────┘   └─────────────────┘   └─────────────────┘            │  │
-│  └─────────────────────────────────────────────────────────────────────────┘  │
-│                                                                               │
-└───────────────────────────────────────────────────────────────────────────────┘
-```
+### Functional requirements
+
+1. **Jobs list**: search and filter by status, handler and team; sort by next run; teams have up to ~10,000 jobs.
+2. **Job detail**: definition, the next five runs, attempt history grouped by run, and logs for each attempt.
+3. **Create and edit**: handler, payload, priority, retry policy, timeout, and a schedule (cron with a builder, one-time, or on demand), with a preview of upcoming runs and the job's time zone.
+4. **Operate**: pause/resume, trigger now, cancel a running attempt, retry a failed one.
+5. **Dead-letter triage**: see runs that exhausted their retries, filter by error, redrive one or many.
+6. **Fleet health**: workers, queue depth, oldest waiting run.
+
+Out of scope: a workflow (DAG) editor and a native mobile app.
+
+### Non-functional requirements
+
+| Requirement | Target | Why |
+|-------------|--------|-----|
+| LCP | < 2.0 s on a laptop over office Wi-Fi; < 3 s on 4G | Opened from alert links during incidents |
+| INP | < 200 ms, including typing in search over 10K jobs | The list is the main working surface |
+| Status freshness | Run status on screen < 2 s after the worker records it | "Is it running yet?" is the most common question |
+| JavaScript | < 200 KB gzipped initial; log viewer, cron builder and charts lazy-loaded | Most visits are list → detail |
+| Accessibility | WCAG 2.2 AA; status never conveyed by color alone; status changes announced | Status badges are the whole product |
+| Resilience | Keep working when the live stream drops; never show a stale state as current | Incidents are when networks are worst |
 
 ---
 
-## 🔍 Step 3: Job List Component
+## 🏗️ A — Architecture (8 min)
 
-### JobList with Filtering and Actions
-
-"I'm choosing @tanstack/react-virtual for list virtualization because at thousands of jobs, rendering all DOM nodes would cause performance issues. The virtualizer only renders visible items plus a small overscan buffer."
-
-**Key Features:**
-- Virtualized list for performance with thousands of jobs
-- Multi-select checkbox for bulk operations (pause, resume, trigger)
-- Filters: status (multi-select), priority (range), handler (dropdown), search text
-- Sort options: name, nextRun, priority with asc/desc toggle
-- Loading skeleton and error state with retry button
-- Empty state with CTA to create first job
+"This is an authenticated console with no SEO needs, so I'd build a client-rendered SPA with route-level code splitting. Server rendering would speed up first paint for pages nobody crawls, at the price of a rendering tier. I keep the SPA's cold start in check with a small shell and hashed, immutable assets."
 
 ```
-┌───────────────────────────────────────────────────────────────────────────────┐
-│                            JobList Component                                   │
-├───────────────────────────────────────────────────────────────────────────────┤
-│  ┌─────────────────────────────────────────────────────────────────────────┐  │
-│  │                          Filter Bar                                      │  │
-│  │  ┌────────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌────────────┐   │  │
-│  │  │🔍 Search   │ │ Status ▼ │ │ Priority │ │ Handler ▼│ │ Sort By ▼  │   │  │
-│  │  └────────────┘ └──────────┘ └──────────┘ └──────────┘ └────────────┘   │  │
-│  └─────────────────────────────────────────────────────────────────────────┘  │
-│                                                                               │
-│  ┌─────────────────────────────────────────────────────────────────────────┐  │
-│  │  Bulk Actions (when selected > 0)                                        │  │
-│  │  "3 jobs selected" [Pause Selected] [Trigger Selected] [Clear]           │  │
-│  └─────────────────────────────────────────────────────────────────────────┘  │
-│                                                                               │
-│  ┌─────────────────────────────────────────────────────────────────────────┐  │
-│  │                    Virtualized Job List                                  │  │
-│  │  ┌─────────────────────────────────────────────────────────────────┐    │  │
-│  │  │ ☐ [50] daily-report-generator      [SCHEDULED] → Next: 2h       │    │  │
-│  │  │       Generates daily analytics reports        ⋮ menu           │    │  │
-│  │  ├─────────────────────────────────────────────────────────────────┤    │  │
-│  │  │ ☑ [80] payment-processor           [RUNNING]   → Started: 5m    │    │  │
-│  │  │       Process pending payments                 ⋮ menu           │    │  │
-│  │  ├─────────────────────────────────────────────────────────────────┤    │  │
-│  │  │ ☐ [25] cleanup-temp-files          [PAUSED]    → Paused         │    │  │
-│  │  │       Remove files older than 7 days           ⋮ menu           │    │  │
-│  │  └─────────────────────────────────────────────────────────────────┘    │  │
-│  └─────────────────────────────────────────────────────────────────────────┘  │
-└───────────────────────────────────────────────────────────────────────────────┘
+ ┌────────────────────────────────────────────────────────────────────────────────────────┐
+ │ App shell · TanStack Router · auth guard · Zustand: session, UI prefs                  │
+ │ URL state: /jobs?status&q&cursor · /jobs/$jobId?tab · /dead-letter                     │
+ └─────────┬──────────────────────┬──────────────────────┬──────────────────────┬─────────┘
+           │                      │                      │                      │
+           ▼                      ▼                      ▼                      ▼
+ ┌───────────────────┐  ┌───────────────────┐  ┌───────────────────┐  ┌───────────────────┐
+ │ /jobs             │  │ /jobs/$jobId      │  │ /dead-letter      │  │ /workers          │
+ │ JobTable          │  │ RunsList          │  │ DLQTable          │  │ WorkerGrid        │
+ │ JobForm           │  │ LogViewer         │  │ BulkRedrive       │  │ lease health      │
+ └─────────┬─────────┘  └─────────┬─────────┘  └─────────┬─────────┘  └─────────┬─────────┘
+           │ (1) create           │ (2) live runs        │ (3) redrive          │ poll 10 s
+           ▼                      ▼                      ▼                      ▼
+ ┌────────────────────────────────────────────────────────────────────────────────────────┐
+ │ TanStack Query cache: ['jobs', filters] · ['job', id] · ['runs', jobId] · ['dlq']      │
+ └──────────────────┬─────────────────────────────────────────────────────────────────────┘
+                    │ queries, mutations                          ▲ patch by seq
+                    ▼                                             │
+ ┌────────────────────────────────────────┐      ┌────────────────────────────────────────┐
+ │ API client · fetch + AbortSignal       │      │ EventSource · /jobs/{id}/events        │
+ │ Idempotency-Key · problem+json         │      │ Last-Event-ID resume · backoff         │
+ └──────────────────┬─────────────────────┘      └────────────────┬───────────────────────┘
+                    │ HTTPS · session cookie                      │ GET (SSE stream)
+                    ▼                                             ▼
+ ┌────────────────────────────────────────────────────────────────────────────────────────┐
+ │ Job API · /api/v1/jobs · /executions · /dead-letter · /workers · /events               │
+ └────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### JobCard Component
+1. **Create (1).** `JobForm` validates locally, freezes the draft with an idempotency key, and runs a mutation. On success the new job is written into the cached list and the router opens its page.
+2. **Watch a run (2).** The job page reads `['job', id]` and `['runs', jobId]` from the query cache and opens an `EventSource` for that job. Each event patches one execution in the cache, so the page re-renders without refetching.
+3. **Triage (3).** The dead-letter page lists parked runs; "Redrive selected" sends one retry per run, each with its own idempotency key, and reports per-item results.
 
-**Layout:**
-- Selection checkbox (left)
-- Priority indicator circle with number (0-100 scale)
-- Job info: linked name, status badge, description (truncated), metadata row
-- Actions dropdown: Trigger Now, Pause/Resume, View Details, Edit
+The workers page polls every 10 s instead of streaming: worker heartbeats change constantly and nobody needs them to the second.
 
-**Metadata row icons:**
-- Code icon + handler name
-- Clock icon + formatted cron expression
-- Calendar icon + "Next: TimeAgo"
+### Who owns which state
+
+| State | Owner | Why there |
+|-------|-------|-----------|
+| Server data: jobs, runs, attempts, dead letters, workers | TanStack Query | Caching, request dedupe, retries, cancellation and invalidation without hand-written loading flags |
+| Live changes to runs | `EventSource`, written into the query cache | One source of truth for rendering; the stream is just another writer |
+| Filters, sort, cursor, selected tab | URL search params | Shareable from an incident channel; back button works |
+| Session, role, display time zone preference | Zustand | Needed everywhere, tiny, not server data |
+| Form drafts, dialogs, row selection | Component state (drafts mirrored to `sessionStorage`) | Local; a draft survives a refresh |
+
+"The rule: server data never lives in a client store. If I copy runs into Zustand I own their staleness, deduplication and invalidation by hand, and that is exactly where dashboards start showing yesterday's truth."
+
+### Key interaction: creating a job
+
+```
+Operator                       JobForm                     Query cache                    Job API
+    │                             │                             │                            │
+    │ 1 Save                      │                             │                            │
+    │────────────────────────────▶│                             │                            │
+    │                             │ 2 check cron; preview next runs                          │
+    │                             │ 3 mutate(draft, K)          │                            │
+    │                             │────────────────────────────▶│                            │
+    │                             │                             │ 4 POST /jobs (key K)       │
+    │                             │                             │───────────────────────────▶│
+    │                             │                             │ 5 201 Job, or 400 details  │
+    │                             │                             │◀───────────────────────────│
+    │                             │ 6 success, or field errors  │                            │
+    │                             │◀────────────────────────────│                            │
+    │ 7 open job, or show errors  │                             │                            │
+    │◀────────────────────────────│                             │                            │
+    │                             │                             │                            │
+```
+
+"Creation is pessimistic: the server assigns the id and computes the first run time, so there's nothing honest to show early. The form keeps one idempotency key per draft. Resubmitting the unchanged draft after a timeout reuses it and gets the original job back; editing any field starts a new key, because it's a different request."
+
+### Key interaction: watching a run live
+
+```
+ JobDetail           EventSource                       Query cache    Job API
+     │                    │                                 │            │
+     │ 1 subscribe job 7  │                                 │            │
+     │───────────────────▶│                                 │            │
+     │                    │ 2 GET /jobs/7/events, Last-Event-ID 1041     │
+     │                    │─────────────────────────────────────────────▶│
+     │                    │ 3 replay 1042-1045, then stream live         │
+     │                    │◀─────────────────────────────────────────────│
+     │                    │ 4 patch execution E (seq 1045)  │            │
+     │                    │────────────────────────────────▶│            │
+     │             5 drop events older than the cached seq  │            │
+     │ 6 re-render: RUNNING to COMPLETED                    │            │
+     │◀─────────────────────────────────────────────────────│            │
+     ················ network drops; browser reconnects ··················
+     │                    │ 7 GET /jobs/7/events, Last-Event-ID 1045     │
+     │                    │─────────────────────────────────────────────▶│
+     │                    │                                 │            │
+```
+
+"Events carry a sequence number. The cache keeps the highest sequence it has applied per execution and drops anything older, so an event that arrives late can never move a run from COMPLETED back to RUNNING. When the browser reconnects it sends `Last-Event-ID` and the server replays what was missed."
+
+### Key interaction: cancelling a run
+
+```
+Operator            ExecutionRow                          Query cache                      Job API
+    │                     │                                    │                              │
+    │ 1 Cancel (confirm)  │                                    │                              │
+    │────────────────────▶│                                    │                              │
+    │                     │ 2 cancel(E)                        │                              │
+    │                     │───────────────────────────────────▶│                              │
+    │                     │                                    │ 3 POST /executions/E/cancel  │
+    │                     │                                    │─────────────────────────────▶│
+    │                     │                                    │ 4 200 CANCELLED, or 409      │
+    │                     │                                    │◀─────────────────────────────│
+    │                     │ 5 CANCELLED; worker stops in 10 s  │                              │
+    │                     │◀───────────────────────────────────│                              │
+    ······························· on 409 (it finished first) ································
+    │                     │ 6 refetch; show the real state     │                              │
+    │                     │◀───────────────────────────────────│                              │
+    │                     │                                    │                              │
+```
+
+"Cancel is a request, not a fact on the worker. The server marks the attempt CANCELLED immediately, but the worker only notices at its next lease renewal, within about 10 s, and stops the handler. So the row says 'Cancelled — stopping worker' until the stream confirms the worker let go. If the run finished first, the server answers `409` and I show what actually happened instead of a red error."
 
 ---
 
-## ⚙️ Step 4: Job Configuration Form
+## 💾 D — Data Model (5 min)
 
-### JobForm with Cron Builder
+| Entity | Shape | Cache key | Freshness |
+|--------|-------|-----------|-----------|
+| `Job` | `id`, `name`, `handler`, `schedule`, `timezone`, `nextRunTime`, `misfirePolicy`, `priority`, `retryPolicy`, `status`, `version` | `['job', id]`, and inside list pages | `staleTime` 30 s; invalidated by mutations |
+| `JobsPage` | `items: Job[]`, `nextCursor` | `['jobs', {status, q, sort}]` (infinite) | Refetch on focus |
+| `Run` | `jobId`, `slot`, `attempts: Attempt[]` | derived in a selector from attempts | — |
+| `Attempt` | `id`, `attempt`, `status`, `workerId`, `startedAt`, `completedAt`, `error`, `nextRetryAt`, `leaseExpiresAt`, `seq` | `['runs', jobId]`, `['attempt', id]` | Patched by the event stream |
+| `DeadLetterItem` | attempt fields + `jobName`, `handler` | `['dlq', filters]` | Refetch after each redrive batch |
+| `Worker` | `id`, `status`, `activeJobs`, `lastHeartbeat` | `['workers']` | Poll 10 s while visible |
+| `JobDraft` | form values + `idempotencyKey` | `sessionStorage['job-draft']` | Cleared on success |
 
-"I'm choosing react-hook-form with Zod resolver because it provides type-safe validation and integrates well with our TypeScript codebase. The schema validates JSON payload, cron expressions, and enforces limits."
+Three modeling decisions:
 
-**Form Sections:**
-
-1. **Basic Information**
-   - Job Name (required, max 255 chars)
-   - Description (optional textarea)
-   - Handler (dropdown of registered handlers)
-   - Payload (JSON textarea with validation)
-
-2. **Scheduling**
-   - Radio: "Run once" | "Recurring (cron)" | "Delayed"
-   - Conditional fields based on selection
-   - CronBuilder for recurring (see below)
-   - datetime-local picker for run-once
-   - Number input (seconds) for delayed
-
-3. **Advanced Options**
-   - Priority slider (0-100) with Low/High labels
-   - Max Retries number input (0-10)
-   - Timeout input (seconds, 1-3600)
-
-4. **Form Actions**
-   - Cancel button (outline)
-   - Submit button with loading state
-
-### CronBuilder Component
-
-```
-┌───────────────────────────────────────────────────────────────────────────────┐
-│                            Cron Builder                                        │
-├───────────────────────────────────────────────────────────────────────────────┤
-│  ┌───────────┐ ┌───────────┐                                                  │
-│  │  Simple   │ │ Advanced  │  ← Mode toggle                                   │
-│  └───────────┘ └───────────┘                                                  │
-│                                                                               │
-│  SIMPLE MODE:                                                                 │
-│  ┌─────────────────────────────────────────────────────────────────────────┐  │
-│  │  Frequency: [Every minute ▼] [Every hour ▼] [Every day ▼] ...          │  │
-│  │                                                                         │  │
-│  │  When: [Minute: :00 ▼] [Hour: 09:00 ▼] [Day of Week: Mon ▼]            │  │
-│  │        (fields shown based on frequency)                                │  │
-│  └─────────────────────────────────────────────────────────────────────────┘  │
-│                                                                               │
-│  ADVANCED MODE:                                                               │
-│  ┌─────────────────────────────────────────────────────────────────────────┐  │
-│  │  Cron Expression: [ 0 9 * * 1                                  ]        │  │
-│  │  Format: minute hour day-of-month month day-of-week                     │  │
-│  └─────────────────────────────────────────────────────────────────────────┘  │
-│                                                                               │
-│  ┌─────────────────────────────────────────────────────────────────────────┐  │
-│  │  Preview (using cronstrue):                                              │  │
-│  │  "At 09:00 AM, only on Monday"                                          │  │
-│  │                                                                          │  │
-│  │  Next runs:                                                              │  │
-│  │  • Monday, Jan 27, 2025 at 9:00 AM                                       │  │
-│  │  • Monday, Feb 3, 2025 at 9:00 AM                                        │  │
-│  │  • Monday, Feb 10, 2025 at 9:00 AM                                       │  │
-│  └─────────────────────────────────────────────────────────────────────────┘  │
-└───────────────────────────────────────────────────────────────────────────────┘
-```
+- **Attempts are rows; runs are a view.** The server stores one row per attempt; the UI groups them by `(jobId, slot)` into a run, so "Run at 09:00 — attempt 3 of 4, retrying at 09:01:12" is one line with the history folded under it.
+- **The client never invents server states.** `CANCELLED` and `DEAD_LETTER` come from the server. "Stopping worker…" and "Retrying in 12 s" are derived display flags computed from server fields (`status`, `nextRetryAt`), never stored.
+- **Every update is ordered.** `seq` is a per-execution version from the server. List refetches and stream events can race; the higher `seq` wins.
 
 ---
 
-## 📊 Step 5: Execution Timeline
+## 🔌 I — Interface (5 min)
 
-### ExecutionTimeline Component
-
-"I'm choosing a vertical timeline layout with a connecting line because it clearly shows execution order and progress. WebSocket subscription ensures real-time updates without polling."
-
-**Features:**
-- Vertical timeline with connecting line (absolute positioned)
-- Initial fetch with limit parameter
-- WebSocket subscription for real-time updates
-- Auto-prepend new executions, update in-place for status changes
-- Loading skeleton for initial fetch
-- Empty state when no executions
-
-### ExecutionCard Component
+### The API as the client sees it
 
 ```
-┌───────────────────────────────────────────────────────────────────────────────┐
-│                          Execution Timeline                                    │
-├───────────────────────────────────────────────────────────────────────────────┤
-│                                                                               │
-│  │                                                                            │
-│  ●──┬──────────────────────────────────────────────────────────────────────┐  │
-│  │  │ [RUNNING] Attempt 1                                   [Show logs ▼]  │  │
-│  │  │ Scheduled 2m ago • Started 1m ago                                    │  │
-│  │  │ Duration: 1:23 (running)                                             │  │
-│  │  │ Worker: worker-abc-123                                               │  │
-│  │  └──────────────────────────────────────────────────────────────────────┘  │
-│  │                                                                            │
-│  ●──┬──────────────────────────────────────────────────────────────────────┐  │
-│  │  │ [COMPLETED] Attempt 1                                 [Show logs ▼]  │  │
-│  │  │ Scheduled 1h ago • Started 1h ago                                    │  │
-│  │  │ Duration: 45s                                                        │  │
-│  │  │ ┌────────────────────────────────────────────────────┐               │  │
-│  │  │ │ Result: {"processed": 150, "skipped": 3}           │ (green bg)   │  │
-│  │  │ └────────────────────────────────────────────────────┘               │  │
-│  │  └──────────────────────────────────────────────────────────────────────┘  │
-│  │                                                                            │
-│  ●──┬──────────────────────────────────────────────────────────────────────┐  │
-│     │ [FAILED] Attempt 3                                    [Show logs ▼]  │  │
-│     │ Scheduled 2h ago • Started 2h ago                                    │  │
-│     │ Duration: 12s                                                        │  │
-│     │ ┌────────────────────────────────────────────────────┐               │  │
-│     │ │ Error: Connection timeout to database              │ (red bg)     │  │
-│     │ └────────────────────────────────────────────────────┘               │  │
-│     └──────────────────────────────────────────────────────────────────────┘  │
-│                                                                               │
-└───────────────────────────────────────────────────────────────────────────────┘
+GET   /api/v1/jobs?status&q&sort&cursor&limit   → {items, next_cursor}
+POST  /api/v1/jobs                    + Idempotency-Key → 201 Job | 400 {details} | 409 name taken
+PATCH /api/v1/jobs/{id}               + If-Match: version → 200 | 412 changed elsewhere
+POST  /api/v1/jobs/{id}/trigger       + Idempotency-Key → 202 {execution} | 409 paused
+POST  /api/v1/jobs/{id}/pause|resume  → 200 Job | 409
+GET   /api/v1/jobs/{id}/executions    ?cursor → attempts, newest first
+GET   /api/v1/jobs/{id}/events        SSE; id = seq; Last-Event-ID resumes
+POST  /api/v1/executions/{id}/cancel  → 200 | 409 already finished
+POST  /api/v1/executions/{id}/retry   + Idempotency-Key → 200 next attempt | 409 superseded
+GET   /api/v1/schedules/preview       ?cron&timezone&count → next run times, or 400 reason
+GET   /api/v1/dead-letter             ?error&handler&cursor → items
 ```
 
-**Timeline dot colors:**
-- PENDING: gray-400
-- RUNNING: blue-500 animate-pulse
-- COMPLETED: green-500
-- FAILED: red-500
-- PENDING_RETRY: yellow-500
-- CANCELLED: gray-500
-- DEDUPLICATED: purple-500
+- **Errors are `application/problem+json`** with field details; the API client maps `details` onto form fields and everything else onto a toast.
+- **The schedule preview is a server endpoint**, so the client never runs its own cron library that disagrees with the scheduler's about edge cases.
+
+### Component contracts
+
+| Component / hook | Contract |
+|------------------|----------|
+| `<JobTable query onSelect>` | Virtualized rows, keyboard navigation, row actions in a menu |
+| `<JobForm job? onSaved>` | Owns the draft lifecycle: validate → preview → freeze key → submit → map server errors |
+| `<RunsList jobId>` | Groups attempts into runs; subscribes to the event stream while mounted |
+| `<CronField value timezone onChange>` | Builder plus raw text; shows the server's preview and errors |
+| `useJobEvents(jobId)` | Opens and resumes the stream; patches the cache; falls back to polling |
+| `useTrigger()`, `useCancel()`, `useRedrive()` | Wrap mutations, idempotency keys and cache updates so components never touch query keys |
 
 ---
 
-## 🖥️ Step 6: Worker Status Dashboard
+## 🔧 O — Optimizations & Deep Dives (20 min)
 
-### WorkerGrid Component
+### Deep dive 1: live run status that never lies (7 min)
 
-"I'm choosing a card grid layout with automatic refresh every 5 seconds because worker status changes frequently and users need current information. WebSocket handles real-time join/leave events."
+"An operator triggers a backfill and watches it. I need the status on screen within two seconds of the worker recording it, without hammering the API from a hundred open tabs."
 
-```
-┌───────────────────────────────────────────────────────────────────────────────┐
-│                          Worker Dashboard                                      │
-├───────────────────────────────────────────────────────────────────────────────┤
-│                                                                               │
-│  ┌─────────────────────────────────────────────────────────────────────────┐  │
-│  │                         Summary Metrics                                  │  │
-│  │  ┌───────────────┐ ┌───────────────┐ ┌───────────────┐ ┌───────────────┐│  │
-│  │  │ 🖥️ Active     │ │ ⚙️ Processing │ │ 📊 Capacity   │ │ 📈 Utilization││  │
-│  │  │   3 / 4       │ │    7 / 12     │ │     12        │ │    58%        ││  │
-│  │  └───────────────┘ └───────────────┘ └───────────────┘ └───────────────┘│  │
-│  └─────────────────────────────────────────────────────────────────────────┘  │
-│                                                                               │
-│  ┌─────────────────────────────────────────────────────────────────────────┐  │
-│  │                          Worker Cards Grid                               │  │
-│  │                                                                          │  │
-│  │  ┌─────────────────────┐  ┌─────────────────────┐  ┌─────────────────┐  │  │
-│  │  │ 🟢 worker-abc-123   │  │ 🟢 worker-def-456   │  │ 🔴 worker-ghi   │  │  │
-│  │  │              Healthy│  │              Healthy│  │          Unhealthy│ │  │
-│  │  │                     │  │                     │  │                   │  │  │
-│  │  │ Active Jobs 3/4     │  │ Active Jobs 2/4     │  │ Active Jobs 0/4   │  │  │
-│  │  │ ████████████░░░ 75% │  │ ██████████░░░░ 50%  │  │ ░░░░░░░░░░░░ 0%   │  │  │
-│  │  │                     │  │                     │  │                   │  │  │
-│  │  │ Started: 2d ago     │  │ Started: 5h ago     │  │ Started: 1h ago   │  │  │
-│  │  │ Heartbeat: 5s ago   │  │ Heartbeat: 3s ago   │  │ Heartbeat: 45s ago│  │  │
-│  │  └─────────────────────┘  └─────────────────────┘  └─────────────────┘  │  │
-│  │                                                                          │  │
-│  └─────────────────────────────────────────────────────────────────────────┘  │
-└───────────────────────────────────────────────────────────────────────────────┘
-```
+**The choice: Server-Sent Events, per job, with resumable ids.** The browser opens `EventSource('/api/v1/jobs/{id}/events')`. Each event is one execution change, `{id: seq, data: {executionId, status, attempt, seq, …}}`. SSE is plain HTTP: it goes through proxies and the load balancer, reconnects by itself, and sends `Last-Event-ID` on reconnect so the server replays what the client missed.
 
-**Worker health determination:**
-- Healthy: status === 'active' AND lastHeartbeat < 30 seconds ago
-- Progress bar colors: green (<50%), yellow (50-80%), red (>80%)
+**Applying events.** The hook writes each event into the query cache with `setQueryData`, but only when its `seq` is higher than the cached one. A list refetch that started before an event and finished after it would otherwise overwrite COMPLETED with RUNNING. Bursts are batched: events are buffered and applied once per animation frame, so a backfill emitting 200 changes a second causes at most 60 renders.
 
----
+**Freshness is visible.** A small "Live" indicator shows the stream state. If the stream has been down for more than 10 s, it turns into "Updates paused — retrying", the hook falls back to polling every 5 s, and timestamps say "as of 14:05:12". A stale status shown as current is worse than no status.
 
-## 🗄️ Step 7: State Management
+**Accessibility.** The run the user is looking at gets an `aria-live="polite"` region announcing "Attempt 2 failed, retrying in 30 seconds". Background changes in the list are not announced, or a screen reader would never stop talking.
 
-### Job Store with Zustand
+| Approach | Verdict |
+|----------|---------|
+| ✅ SSE per job + seq ordering + polling fallback | Sub-second updates, resumable, works through standard HTTP infrastructure |
+| ❌ Polling every 2 s | 100 tabs × 0.5 req/s per page; still up to 2 s late; wasteful when nothing changes |
+| ❌ WebSocket | Bidirectional channel we don't need; we'd rebuild reconnection and resume that SSE has |
 
-"I'm choosing Zustand with immer middleware because it provides simple, boilerplate-free state management with immutable updates. Optimistic updates improve perceived performance."
+"What I give up: a long-lived connection per open job page, and a server that keeps a short event history for replay. When a tab is hidden I close the stream and refetch on focus, which keeps the connection count proportional to people actually looking."
 
-```
-┌───────────────────────────────────────────────────────────────────────────────┐
-│                            Zustand Job Store                                   │
-├───────────────────────────────────────────────────────────────────────────────┤
-│                                                                               │
-│  State                                                                        │
-│  ┌─────────────────────────────────────────────────────────────────────────┐  │
-│  │  jobs: Job[]          - Array of job objects                            │  │
-│  │  loading: boolean     - Fetch in progress                               │  │
-│  │  error: string | null - Last error message                              │  │
-│  └─────────────────────────────────────────────────────────────────────────┘  │
-│                                                                               │
-│  Actions                                                                      │
-│  ┌─────────────────────────────────────────────────────────────────────────┐  │
-│  │  fetchJobs()    - GET /api/v1/jobs → set jobs array                     │  │
-│  │  createJob()    - POST → unshift new job to array                       │  │
-│  │  updateJob()    - PUT → update job in array                             │  │
-│  │  deleteJob()    - DELETE → filter out job                               │  │
-│  │  pauseJob()     - POST /pause → optimistic status update                │  │
-│  │  resumeJob()    - POST /resume → optimistic status update               │  │
-│  │  triggerJob()   - POST /trigger → execution via WebSocket               │  │
-│  └─────────────────────────────────────────────────────────────────────────┘  │
-│                                                                               │
-│  Optimistic Update Pattern:                                                   │
-│  ┌─────────────────────────────────────────────────────────────────────────┐  │
-│  │  1. Update state immediately (set job.status = 'PAUSED')                │  │
-│  │  2. Call API endpoint                                                   │  │
-│  │  3. On error: refetch all jobs to rollback                              │  │
-│  └─────────────────────────────────────────────────────────────────────────┘  │
-│                                                                               │
-└───────────────────────────────────────────────────────────────────────────────┘
-```
+### Deep dive 2: editing schedules without surprises (6 min)
+
+"Cron is where scheduler UIs cause incidents: `0 9 * * 1` in UTC is 05:00 in New York in summer, and `30 2 * * *` doesn't exist on the spring-forward day."
+
+1. **Builder and raw text, kept in sync.** Common cases (every N minutes, daily at a time, weekdays) use pickers; anything else uses the raw expression. Both edit the same string.
+2. **The server previews, the client displays.** After a 300 ms pause in typing, the field calls `/schedules/preview` (aborting the previous call with an `AbortController`) and shows the next five runs in the job's time zone **and** in the viewer's, e.g. "Mon 09:00 Europe/Berlin (08:00 your time)". Invalid expressions show the server's reason inline.
+3. **The time zone is part of the job.** The form defaults to the creator's zone but stores it explicitly. DST behavior is spelled out under the preview when the next five runs cross a transition.
+4. **Missed runs are a visible choice.** A radio group explains the misfire policy in plain words: "If the scheduler is down when this should run: run once when it recovers / skip it."
+5. **Server validation is authoritative.** Client checks are for speed; the server's `400 details` are mapped onto the matching fields, so a rule that exists only on the server still lands next to the right input.
+
+| Approach | Verdict |
+|----------|---------|
+| ✅ Server-computed preview in two time zones | One cron implementation; users see the instants that will actually fire |
+| ❌ Client-side cron library for previews | Two implementations disagree on edge cases like DST and day-of-week/day-of-month rules |
+| ❌ Raw cron string only | Experts are fine; everyone else ships `* 9 * * *` (every minute of the 9 o'clock hour) |
+
+### Deep dive 3: operator actions that are safe to repeat (5 min)
+
+"Every action button is pressed twice eventually. The question is what the second press does."
+
+- **Trigger now** is pessimistic. The button disables while the request is in flight, and the request carries an idempotency key generated per click and reused if the network fails and the client retries automatically. The server answers the retry with the original execution.
+- **Pause** is optimistic: one field, it almost always succeeds, and rollback is trivial. I snapshot the cached job, flip the badge, and restore the snapshot with a toast on error. A `409` means the job changed state under me, so I refetch and explain.
+- **Cancel** is shown as a request until confirmed (see the interaction above).
+- **Retry and bulk redrive.** "Redrive 240 selected" sends retries with a concurrency limit of 5, each with its own key, then shows "236 redriven, 4 already retried elsewhere" from the per-item `409 superseded` answers. Refreshing mid-batch is safe: the keys and the selection are in `sessionStorage`, and finished items replay their stored responses.
+- **Destructive actions** (delete job, cancel) use a confirmation dialog with focus trapped inside and returned to the trigger button when it closes.
+
+| Approach | Verdict |
+|----------|---------|
+| ✅ Idempotency keys + pessimistic trigger + optimistic pause | Double clicks and retries can't duplicate runs; cheap actions feel instant |
+| ❌ Disable the button and hope | Prevents double clicks, not a retry after a timeout or a refresh |
+| ❌ Optimistic trigger | There's no execution id to show until the server creates one |
+
+### Deep dive 4: big lists (2 min)
+
+The jobs table uses keyset pagination from the server (`next_cursor`), server-side search debounced by 250 ms with the previous results kept on screen while the next page loads, and `@tanstack/react-virtual` with fixed 48 px rows, so the DOM holds ~30 rows whether a team has 50 jobs or 10,000. Virtualized rows get `aria-rowcount` and `aria-rowindex`, and arrow-key navigation scrolls the focused row into view. The log viewer is virtualized too and tails new lines only while the user is scrolled to the bottom.
 
 ---
 
-## 🎨 Step 8: UI Components
+## 🧯 Loading, Error and Empty States (2 min)
 
-### StatusBadge Component
-
-**Status configurations:**
-| Status | Background | Text | Label |
-|--------|------------|------|-------|
-| SCHEDULED | blue-100 | blue-800 | Scheduled |
-| QUEUED | purple-100 | purple-800 | Queued |
-| PENDING | gray-100 | gray-800 | Pending |
-| RUNNING | yellow-100 | yellow-800 | Running + pulse dot |
-| COMPLETED | green-100 | green-800 | Completed |
-| FAILED | red-100 | red-800 | Failed |
-| PAUSED | gray-100 | gray-600 | Paused |
-| PENDING_RETRY | orange-100 | orange-800 | Retry Pending |
-| CANCELLED | gray-100 | gray-600 | Cancelled |
-| DEDUPLICATED | purple-100 | purple-800 | Deduplicated |
-
-### PriorityIndicator Component
-
-**Priority levels:**
-| Priority | Level | Color | Label |
-|----------|-------|-------|-------|
-| >= 80 | critical | red | Critical |
-| >= 60 | high | orange | High |
-| >= 40 | normal | blue | Normal |
-| < 40 | low | gray | Low |
-
-### TimeAgo Component
-
-**Features:**
-- Live updates every 1 second (configurable)
-- Handles future dates ("in 2h") and past dates ("2h ago")
-- Full date shown on hover (title attribute)
-- Uses semantic `<time>` element with datetime attribute
+| Situation | What the user sees | How |
+|-----------|--------------------|-----|
+| First load of the jobs list | Skeleton rows at the real row height | Pending state of the first page only |
+| Live stream disconnected | "Updates paused — retrying" with a timestamp; data stays visible | Stream state from `useJobEvents`; polling fallback |
+| Session expired during an action | Login dialog over the page; the draft or selection survives | Drafts and keys in `sessionStorage`; resubmit with the same key |
+| `409` on cancel or retry | "This run already finished" or "A newer attempt exists" with the current state | Refetch the attempt and show it |
+| `400` on save | Errors next to each field | `problem+json` details mapped to fields |
+| `429` | "Too many requests — try again in 20 s" on the button | Read `Retry-After`; count down |
+| No jobs yet | Empty state with "Create your first job" focused | The empty state is the onboarding |
+| Dead-letter queue empty | "Nothing needs attention" | An empty table looks like a failed load |
 
 ---
 
-## 🔌 Step 9: WebSocket Integration
+## ⚖️ Wrap-up (2 min)
 
-### useWebSocket Hook
+| Decision | ✅ Chosen | ❌ Alternative | Why |
+|----------|-----------|----------------|-----|
+| Rendering | SPA with route splitting | SSR | Authenticated console, no SEO |
+| Server state | TanStack Query, stream writes into it | Zustand copies of server data | One cache, no hand-written invalidation |
+| Live status | SSE + seq ordering + polling fallback | Polling or WebSocket | Fresh, resumable, cheap |
+| Schedule preview | Server endpoint, two time zones | Client cron library | One implementation of cron |
+| Trigger / retry | Pessimistic + idempotency key | Optimistic, or a disabled button | No duplicate runs from retries |
+| Pause | Optimistic + rollback | Wait for the server | One field, nearly always succeeds |
+| Big lists | Keyset pages + virtualization | Load all, filter client-side | 10K rows would wreck INP |
 
-"I'm choosing a custom WebSocket hook over Socket.io because we only need simple pub/sub and want minimal bundle size. Auto-reconnect with exponential backoff handles network issues gracefully."
-
-```
-┌───────────────────────────────────────────────────────────────────────────────┐
-│                          WebSocket Hook Flow                                   │
-├───────────────────────────────────────────────────────────────────────────────┤
-│                                                                               │
-│  Component                    Hook                         Server             │
-│     │                          │                              │               │
-│     │  useWebSocket({          │                              │               │
-│     │    channel,              │                              │               │
-│     │    onMessage             │                              │               │
-│     │  })                      │                              │               │
-│     │─────────────────────────►│                              │               │
-│     │                          │  connect()                   │               │
-│     │                          │─────────────────────────────►│               │
-│     │                          │                              │               │
-│     │                          │  onopen → subscribe(channel) │               │
-│     │                          │─────────────────────────────►│               │
-│     │                          │                              │               │
-│     │                          │◄─────────────────────────────│               │
-│     │  onMessage(data)         │  message { channel, data }   │               │
-│     │◄─────────────────────────│                              │               │
-│     │                          │                              │               │
-│     │                          │◄─────────────────────────────│               │
-│     │                          │  onclose                     │               │
-│     │                          │                              │               │
-│     │                          │  setTimeout(3s) → reconnect  │               │
-│     │                          │─────────────────────────────►│               │
-│     │                          │                              │               │
-└───────────────────────────────────────────────────────────────────────────────┘
-```
-
-**Hook interface:**
-- Input: channel name, onMessage callback, optional onConnect/onDisconnect
-- Output: send function for bidirectional communication
-- Auto-reconnect after 3 seconds on close
-- Cleanup on unmount
-
----
-
-## ⚖️ Trade-offs and Alternatives
-
-### State Management
-
-| Option | Pros | Cons | Decision |
-|--------|------|------|----------|
-| ✅ Zustand | Minimal boilerplate, good DX | Less ecosystem | **Chosen** |
-| ❌ Redux Toolkit | Large ecosystem, DevTools | More boilerplate | Good for larger teams |
-| ❌ React Query | Excellent for server state | Overkill for UI state | Use alongside Zustand |
-
-### Real-time Updates
-
-| Option | Pros | Cons | Decision |
-|--------|------|------|----------|
-| ✅ WebSocket | Low latency, bidirectional | Connection management | **Chosen** |
-| ❌ SSE | Simple, auto-reconnect | Server-to-client only | Good for read-only |
-| ❌ Polling | Simple to implement | Wasteful, laggy | Fallback only |
-
-### Virtualization
-
-| Option | Pros | Cons | Decision |
-|--------|------|------|----------|
-| ✅ @tanstack/react-virtual | Lightweight, flexible | Manual layout | **Chosen** |
-| ❌ react-window | Popular, battle-tested | Fixed height items | Good alternative |
-| ❌ No virtualization | Simplest | Poor performance at scale | Never for lists > 100 |
-
-### Form Handling
-
-| Option | Pros | Cons | Decision |
-|--------|------|------|----------|
-| ✅ react-hook-form + Zod | Type-safe, performant | Learning curve | **Chosen** |
-| ❌ Formik + Yup | Popular, mature | Re-render issues | Good alternative |
-| ❌ Controlled inputs | Simple | Verbose, slow | Never for complex forms |
-
----
-
-## 🚀 Closing Summary
-
-"I've designed a job scheduler frontend dashboard with:
-
-1. **Job list** with filtering, sorting, bulk actions, and virtualization for performance
-2. **Job configuration form** with intuitive cron expression builder and preview
-3. **Execution timeline** with real-time status updates via WebSocket
-4. **Worker monitoring dashboard** with health indicators and utilization metrics
-5. **Reusable UI components** for status badges, priority indicators, and time displays
-6. **Zustand state management** with optimistic updates for responsive UX
-
-The key insight is balancing real-time updates with usability - WebSocket connections provide immediate feedback while the form validation and cron builder make job configuration intuitive. The virtualized list ensures smooth performance even with thousands of jobs."
+"With more time I'd add a calendar heat map of upcoming runs (to spot the midnight pile-up before it happens), saved filters per team, and keyboard shortcuts for on-call triage."

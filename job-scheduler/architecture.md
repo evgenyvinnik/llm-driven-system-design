@@ -1,702 +1,520 @@
-# Job Scheduler - Architecture Design
+# Job Scheduler — Architecture
 
 ## System Overview
 
-A distributed task scheduling system that provides reliable job execution with cron-like scheduling, priority queues, and at-least-once execution guarantees. The system separates concerns into three independently-scalable services: an API server for job management, a leader-elected scheduler for due-job detection, and a pool of stateless workers for execution. This project explores distributed coordination, leader election, visibility timeouts, and failure recovery in a job processing pipeline.
+A distributed job scheduler runs code on behalf of other teams: "call this webhook every five minutes", "run the nightly export at 02:00", "run this cleanup once, now". People define **jobs** (a handler, a payload, and either a cron schedule or a single run time); the scheduler turns each due **slot** into an **execution** and a fleet of workers runs it, retrying failures and parking the hopeless ones for a human.
+
+Two things make it a real design problem rather than a `setInterval`:
+
+1. **Each run should happen once, even though every component crashes, stalls and gets partitioned.** Exactly-once is impossible when a worker can die after the webhook succeeded but before it recorded that, so the honest target is *at-least-once with duplicates made harmless*: a run is never lost, it is never executed by two workers at the same time, and a worker that lost its claim can never overwrite the outcome. The mechanisms are a transactional claim (`FOR UPDATE SKIP LOCKED`), leases that expire, and fencing tokens.
+2. **Time.** Cron slots must fire on time, exactly once each, even across a scheduler failover; runs missed during an outage need an explicit policy instead of an accident; and real cron schedules cluster on round times, so midnight UTC produces a spike hundreds of times the average.
+
+This document describes the production-scale design first. [Implementation Notes](#implementation-notes) then describes what the local Express + PostgreSQL + Redis + React implementation actually runs.
+
+**Learning goals**
+
+- Using a PostgreSQL table as a work queue: `FOR UPDATE SKIP LOCKED`, priorities, delayed retries.
+- Leases with heartbeats and expiry, and fencing tokens that stop a stale worker from writing.
+- Leader election as an optimization, with correctness coming from an idempotent firing transaction.
+- Cron arithmetic, misfire policies and the grace window; retries with jittered backoff and dead-lettering.
+- Idempotency keys on non-idempotent API calls.
 
 ## Requirements
 
-### Functional Requirements
+### Functional requirements
 
-- **Job Submission**: Create jobs with execution parameters, handler type, payload, and scheduling configuration
-- **Scheduling**: One-time, recurring (cron expressions), and delayed execution
-- **Priority Queues**: High-priority jobs execute before low-priority ones via Redis sorted sets
-- **Retry Logic**: Automatic retries with exponential backoff and configurable max retries
-- **Job Management**: Pause, resume, cancel, and trigger immediate execution
-- **Monitoring**: Job status, execution history, worker status, queue depth, and dead letter queue inspection
+1. **Define jobs**: handler name, JSON payload, priority (0–100), retry policy (`max_retries`, backoff bounds), timeout, and either a cron schedule (recurring), a run time (one-time), or neither (on demand).
+2. **Fire on schedule**: every cron slot produces exactly one execution; one-time jobs fire once.
+3. **Run executions** on a horizontally scaled worker fleet, highest priority first.
+4. **Retry** failed attempts with exponential backoff; after the last attempt, **dead-letter** the run so an operator can fix the cause and redrive it.
+5. **Operate**: pause/resume jobs, trigger now, cancel a running execution, retry a failed one, see attempt history, logs, worker health and queue depth.
 
-### Non-Functional Requirements
+Out of scope: workflow DAGs (job B after job A), arbitrary user code upload (handlers are deployed with the workers), and per-tenant billing.
 
-- **Reliability**: At-least-once execution guarantee for every scheduled job
-- **Scalability**: Horizontal worker scaling based on queue depth; 10,000+ executions per day
-- **Latency**: Job pickup within 1 second of scheduled time
-- **Availability**: Leader election ensures scheduler survives instance failures
-- **Consistency**: Distributed locks prevent duplicate execution of the same job instance
-- **Observability**: Full Prometheus metrics for scheduling lag, execution duration, error rates, and queue depth
+### Non-functional requirements
 
-### Out of Scope
-
-- Complex workflow orchestration (DAG-based job dependencies)
-- Multi-tenant isolation with per-tenant queues
-- Container-based execution environments (Docker, Lambda)
-- Sub-second scheduling precision
+| Requirement | Target |
+|-------------|--------|
+| Firing accuracy | Execution claimable within 1 s of its slot; p99 start delay < 5 s outside spikes |
+| Spike drain | The midnight UTC spike (~400K runs) fully started within 2 minutes, in priority order |
+| Delivery | At-least-once: an accepted run is never lost; never executed by two workers concurrently |
+| Crash recovery | Work held by a dead worker restarts within lease length + reaper interval (~35 s) |
+| Scheduler failover | Firing resumes within one lease TTL (15–30 s) after a leader dies |
+| API availability | 99.95% for job management; p99 < 200 ms for trigger/cancel |
+| Durability | Executions kept 30 days hot, 1 year archived; accepted jobs survive a node loss |
 
 ## Capacity Estimation
 
-### Production Scale
+| Quantity | Estimate | Design consequence |
+|----------|----------|--------------------|
+| Job definitions | ~1M recurring + on-demand jobs | The due-job scan must be an index range scan, never a table scan |
+| Executions | ~30M/day → ~350/s average | One PostgreSQL primary could absorb the average, but not the spikes below |
+| Midnight UTC spike | ~400K slots due at 00:00:00 (hourly: ~150K at :00) | Fire ahead of time (look-ahead); shard the tables; scale workers on queue depth |
+| Writes per execution | insert + claim + complete (+ a renewal every 10 s while running) | ~1.4K row writes/s average, ~25K/s while the midnight spike drains |
+| Concurrent runs | 350/s × 5 s average run (Little's law) ≈ 1,750 | 2K slots steady state, autoscaled to ~20K for spikes (~1,000 pods × 20 slots) |
+| Execution history | ~1 KB/row → 30 GB/day; logs ~2 KB/run → 60 GB/day | Partition by day; ~1.3 TB hot (30 days of runs, 7 of logs); older partitions to S3 as Parquet |
+| Redis | Leader leases, sessions, idempotency records (24 h) | A few GB; losing it costs logins and replays, never runs |
 
-| Metric | Value |
-|--------|-------|
-| Concurrent active jobs | 10,000-100,000 |
-| Worker instances | 10-50 |
-| Executions per day | 1,000,000+ |
-| Queue throughput | 1,000 jobs/second peak |
-| Job definition size | ~2 KB (metadata + payload) |
-| Execution record size | ~1 KB |
-
-### Storage Estimates
-
-| Data | Volume | Retention |
-|------|--------|-----------|
-| Job definitions | ~200 MB (100K jobs) | Indefinite |
-| Active executions (30 days) | ~30 GB | 30 days |
-| Execution logs (7 days) | ~3.5 GB | 7 days |
-| Archived executions | ~360 GB/year (Parquet) | 1 year |
-| Redis queue state | ~100 MB | Ephemeral (TTL) |
+The spike row drives the design. If 400K slots were inserted at 00:00:00, one primary would need ~80K inserts/s for five seconds. Firing 60 seconds ahead with `run_at` set to the slot spreads those inserts over the preceding minute (~6.7K/s), and hash-sharding jobs and executions by job id across 16 shards brings that to ~420 inserts/s per shard. Workers still all become eligible at 00:00:00, so the start-time target for spikes is "drained in two minutes in priority order", not "everything starts in one second".
 
 ### Local Development Scale
 
-| Metric | Value |
-|--------|-------|
-| Concurrent jobs | 100-1,000 |
-| Worker instances | 1-3 |
-| Executions per day | 10,000+ |
+One API process, one scheduler (a second can be started to watch failover), three workers with five slots each, one PostgreSQL and one Redis. Tens of jobs, a few executions per second. Ports and commands are in the [README](./README.md).
 
 ## High-Level Architecture
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                     Clients / Dashboard                   │
-└───────────────────────────┬─────────────────────────────┘
-                            │
-                   ┌────────▼────────┐
-                   │   L7 Load       │
-                   │   Balancer      │
-                   └────────┬────────┘
-                            │
-            ┌───────────────┼───────────────┐
-            │               │               │
-   ┌────────▼────────┐ ┌───▼───────┐ ┌─────▼───────┐
-   │   API Server 1  │ │ API Srv 2 │ │  API Srv N  │
-   │   (Express)     │ │           │ │             │
-   └────────┬────────┘ └─────┬─────┘ └──────┬──────┘
-            │                │               │
-            └────────────────┼───────────────┘
-                             │
-         ┌───────────────────┼───────────────────┐
-         │                   │                   │
-┌────────▼────────┐ ┌───────▼───────┐ ┌─────────▼────────┐
-│   PostgreSQL    │ │  Redis Cluster│ │   Scheduler      │
-│                 │ │               │ │  (Leader-Elected) │
-│ - Job defs      │ │ - Priority    │ │                   │
-│ - Executions    │ │   queue       │ │ - Scans due jobs  │
-│ - Logs          │ │ - Leader lock │ │ - Enqueues work   │
-│ - Users         │ │ - Job locks   │ │ - Recovers stalls │
-└─────────────────┘ │ - Worker      │ │ - Schedules       │
-                    │   registry    │ │   retries         │
-                    └───────┬───────┘ └─────────┬────────┘
-                            │                   │
-                            └─────────┬─────────┘
-                                      │
-   ┌──────────────────────────────────┼───────────────────────────────┐
-   │                           Worker Pool                             │
-   │                                                                   │
-   │  ┌──────────┐  ┌──────────┐  ┌──────────┐         ┌──────────┐  │
-   │  │ Worker 1 │  │ Worker 2 │  │ Worker 3 │  · · ·  │ Worker N │  │
-   │  │ (5 slots)│  │ (5 slots)│  │ (5 slots)│         │ (5 slots)│  │
-   │  └──────────┘  └──────────┘  └──────────┘         └──────────┘  │
-   └──────────────────────────────────────────────────────────────────┘
+  ┌──────────────────────────────────┐                ┌──────────────────────────────────┐
+  │ Operator dashboard · React SPA   │                │ Service clients · REST + API key │
+  └─────────┬────────────────────────┘                └───────────────┬──────────────────┘
+            │ (1) POST /api/v1/jobs/{id}/trigger                      │ POST /api/v1/jobs
+            │                                                         │
+            ▼                                                         ▼
+  ┌──────────────────────────────────────────────────────────────────────────────────────┐
+  │ Load balancer · TLS · session or API-key auth · rate limits                          │
+  └─────────┬────────────────────────────────────────────────────────────────────────────┘
+            │
+            ▼
+  ┌──────────────────────────────────────────┐                ┌──────────────────────────┐
+  │ Job API · stateless                      ├───────────────▶│ Redis                    │
+  │ CRUD · trigger · cancel · retry · SSE    │ keys, sessions │ idempotency keys         │
+  └─────────┬────────────────────────────────┘                │ sessions                 │
+            │ INSERT job / execution                          │ leader leases            │
+            │                                                 │ worker heartbeats        │
+            ▼                                                 └──────────────────────────┘
+  ┌──────────────────────────────────────────┐                             ▲ leader lease
+  │ PostgreSQL · hash-sharded by job id      │                ┌────────────┴─────────────┐
+  │ jobs · job_executions (= the queue)      │◀───────────────┤ Scheduler                │
+  │ execution_logs                           │ (2) fire slots │ one leader per shard     │
+  └──────────────────────────────────────────┘                └──────────────────────────┘
+            ▲
+            │ (3) claim · renew lease · complete (fenced)
+            │
+  ┌──────────────────────────────────────────┐                ┌──────────────────────────┐
+  │ Worker fleet                             ├───────────────▶│ Job targets              │
+  │ SKIP LOCKED claims · leases · fencing    │ run handler    │ webhooks · internal APIs │
+  └──────────────────────────────────────────┘                └──────────────────────────┘
 ```
 
-## Core Components
+1. **Define and trigger (1).** The dashboard or a service calls the Job API through the load balancer. Creating a job inserts a row into `jobs`; "trigger now" inserts a PENDING row into `job_executions`. That row *is* the queue entry, so there is no second system to keep in sync. Non-idempotent POSTs carry an `Idempotency-Key`, recorded in Redis.
+2. **Fire (2).** For each shard, one scheduler holds a lease in Redis. Every second it locks the due jobs, inserts one execution per due slot and moves each job's `next_run_time` forward, all in one transaction, so a slot cannot be fired twice or skipped.
+3. **Execute (3).** Workers claim PENDING executions with `FOR UPDATE SKIP LOCKED`, receive a lease and a fencing token, run the handler against the job's target, renew the lease while it runs, and record the outcome with a write that only succeeds if their token still owns the execution. Failures schedule the next attempt or dead-letter the run.
 
-### 1. API Server
+| Component | Responsibility | Scales with | Notes |
+|-----------|----------------|-------------|-------|
+| Load balancer | TLS, routing, session/API-key auth, rate limits | Requests | Stateless |
+| Job API | Job CRUD, trigger, cancel, retry, status stream (SSE) | Operators and client services | Stateless; never talks to workers directly |
+| Scheduler | Fires due slots; reaps expired leases | Due slots per second | One leader per shard, standbys waiting on the lease |
+| Worker fleet | Claims, runs and records executions | Concurrent runs | Stateless; autoscaled on ready-queue depth |
+| PostgreSQL | Jobs, executions (the queue), logs | Rows and writes | 16 hash shards by job id; executions partitioned by day |
+| Redis | Leader leases, sessions, idempotency records, worker heartbeats | Small, hot keys | Loss costs logins and replays, never runs |
+| Job targets | Webhooks and internal services the handlers call | — | Receive an idempotency key and fencing token |
+| S3 (not drawn) | Archived execution partitions (Parquet) | History | Nightly; queried with Athena/Trino when needed |
 
-Stateless Express service handling job CRUD operations, execution management, and monitoring endpoints. Validates job definitions, serves the frontend dashboard, and exposes Prometheus metrics.
+Why not put the queue in Redis or Kafka and keep PostgreSQL for history? Because then every execution is a **dual write**: the row and the queue entry are written separately, and a crash between the two either loses a run (row exists, nothing will ever run it) or duplicates one. [Key Design Decision 1](#1-the-execution-table-is-the-queue) covers the alternatives.
 
-### 2. Scheduler Service (Leader-Elected)
+## Core Components / Request Flows
 
-Only one scheduler instance is active at any time, ensured by Redis-based leader election. The scheduler runs a continuous loop:
-
-1. **Acquire or renew leader lock** (`SET NX EX` with 30-second TTL, heartbeat every 10 seconds)
-2. **Scan for due jobs**: Query PostgreSQL for jobs where `next_run_time <= NOW()` and `status = 'SCHEDULED'`
-3. **Enqueue to priority queue**: Insert into Redis sorted set with inverted priority as score
-4. **Recover stalled executions**: Check processing set for entries past visibility timeout
-5. **Schedule retries**: Find failed executions eligible for retry, calculate next attempt with exponential backoff
-6. **Compute next run time**: For recurring jobs, parse cron expression and update `next_run_time`
-
-**Why leader election over distributed scheduling:** Multiple schedulers scanning the same jobs table would create duplicate enqueue operations. The leader lock eliminates this with minimal coordination overhead. Standby schedulers continuously attempt to acquire the lock, providing automatic failover within 30 seconds (lock TTL).
-
-### 3. Priority Queue (Redis)
+### Firing a due slot
 
 ```
-Queue:        job_scheduler:queue      → Sorted Set (score = -priority, member = job_data_json)
-Processing:   job_scheduler:processing → Sorted Set (score = timeout_timestamp, member = execution_id:worker_id)
-Dead Letter:  job_scheduler:dead_letter → List (failed execution data)
-Leader Lock:  job_scheduler:scheduler:leader → String (instance_id, TTL 30s)
-Job Lock:     job_scheduler:lock:{job_id} → String (execution_id, TTL = job timeout)
-Workers:      job_scheduler:workers → Hash (worker_id → { status, active_jobs, last_heartbeat })
+ Scheduler                                           Redis   PostgreSQL
+     │                                                 │          │
+     │ 1 renew leader lease (Lua compare-and-pexpire)  │          │
+     │────────────────────────────────────────────────▶│          │
+     │ 2 1 = still the leader                          │          │
+     │◀────────────────────────────────────────────────│          │
+     │ 3 BEGIN; SELECT due jobs FOR UPDATE SKIP LOCKED            │
+     │───────────────────────────────────────────────────────────▶│
+     │ 4 job 7 due 09:00; NOW() = 09:00:01                        │
+     │◀───────────────────────────────────────────────────────────│
+     │ 5 on time: fire 09:00, next run 09:05           │          │
+     │ 6 INSERT (7, 09:00, attempt 1) ON CONFLICT DO NOTHING      │
+     │───────────────────────────────────────────────────────────▶│
+     │ 7 UPDATE next_run_time = 09:05; COMMIT                     │
+     │───────────────────────────────────────────────────────────▶│
+     │                                                 │          │
 ```
 
-**Why Redis sorted sets for priority:** ZPOPMIN atomically removes and returns the lowest-score element, which maps to the highest priority job (using inverted scores). This is O(log N) insertion and O(1) pop -- compared to a PostgreSQL priority queue which requires SELECT...FOR UPDATE SKIP LOCKED, adding locking overhead and contention at high throughput.
+- The scheduler measures lateness with the database clock (`NOW()` from the same statement that selected the job), so app-server clock skew cannot make a slot look early or late.
+- Within the grace window (60 s) the next run is computed **from the slot**, not from now: a tick that is 3 s late still fires 09:05 next, and if several slots are already due (a short outage) the following ticks catch up one slot at a time.
+- Later than the grace window, the whole gap is one **misfire**: `fire_once` runs the oldest missed slot once, `skip` runs nothing, and either way `next_run_time` jumps to the first slot after now. A job is never left with a due time in the past.
+- `ON CONFLICT DO NOTHING` on `(job_id, scheduled_at, attempt)` makes a repeated slot a no-op, and the job row lock means a second scheduler that believes it leads (a split brain) skips the job instead of firing it again.
+- At production scale the select is `next_run_time <= NOW() + 60 s` and the insert sets `run_at = slot`: executions are created ahead of time but cannot be claimed early.
 
-### 4. Worker Pool
+### Claiming and running an execution
 
-Stateless executors that pull work from the Redis queue. Each worker:
+```
+Worker                                         PostgreSQL   Webhook target
+   │                                                │              │
+   │ 1 claim PENDING rows (FOR UPDATE SKIP LOCKED)  │              │
+   │───────────────────────────────────────────────▶│              │
+   │ 2 execution E, fencing token 42, lease 30 s    │              │
+   │◀───────────────────────────────────────────────│              │
+   │ 3 POST; Idempotency-Key job:slot; X-Fencing-Token 42          │
+   │──────────────────────────────────────────────────────────────▶│
+   │ 4 every 10 s: renew lease WHERE token = 42     │              │
+   │───────────────────────────────────────────────▶│              │
+   │ 5 1 row: lease extended                        │              │
+   │◀───────────────────────────────────────────────│              │
+   │ 6 200 OK                                                      │
+   │◀──────────────────────────────────────────────────────────────│
+   │ 7 SET COMPLETED WHERE id = E AND token = 42    │              │
+   │───────────────────────────────────────────────▶│              │
+   │ 8 1 row: outcome recorded                      │              │
+   │◀───────────────────────────────────────────────│              │
+   │                                                │              │
+```
 
-1. Calls `ZPOPMIN` to atomically claim the highest-priority job
-2. Acquires a distributed lock for the job (`SET NX EX` with job timeout)
-3. Moves the execution to the processing sorted set with a visibility timeout
-4. Executes the registered handler function
-5. On success: removes from processing set, updates execution status in PostgreSQL
-6. On failure: increments attempt counter, schedules retry with exponential backoff, or moves to dead letter queue after max retries
+- The claim is one statement: a CTE selects runnable rows (`status = 'PENDING' AND run_at <= NOW()`, highest priority first) with `FOR UPDATE SKIP LOCKED`, and the outer `UPDATE` marks them RUNNING with `lease_expires_at = NOW() + 30 s` and `fencing_token = nextval(...)`. Concurrent workers skip each other's locked rows instead of waiting or double-claiming.
+- The worker renews all of its leases in one statement every 10 s. A renewal that matches zero rows means the execution was cancelled or reclaimed, and the handler's `AbortSignal` fires.
+- The worker also keeps a local deadline (last confirmed renewal + lease − 2 s). If renewals fail (database unreachable, process stalled), it stops the handler before the lease can lapse rather than run alongside a replacement.
+- The handler forwards `Idempotency-Key: {job_id}:{slot}` (stable across retries of the same run) and `X-Fencing-Token`, so a target can de-duplicate side effects and reject writes from an older attempt.
 
-**Concurrency:** Each worker processes up to `MAX_CONCURRENT_JOBS` (default 5) simultaneously using async handlers. Workers register heartbeats in Redis every 10 seconds to enable stale worker detection.
+### Recovering from a crashed or stalled worker
 
-### 5. Handler System
+```
+Worker A                           PostgreSQL                                   Reaper   Worker B
+    │                                   │                                          │         │
+    │ 1 claim E (token 42, lease 30 s)  │                                          │         │
+    │──────────────────────────────────▶│                                          │         │
+    │ 2 stalls (GC pause, partition)    │                                          │         │
+    ······························ 30 s pass without a renewal ·······························
+    │                                   │ 3 lock expired leases (SKIP LOCKED)      │         │
+    │                                   │◀─────────────────────────────────────────│         │
+    │                                   │ 4 E: FAILED; attempt 2 at now + backoff  │         │
+    │                                   │◀─────────────────────────────────────────│         │
+    │                                   │ 5 claim attempt 2 (token 43)                       │
+    │                                   │◀───────────────────────────────────────────────────│
+    │ 6 SET COMPLETED WHERE token = 42  │                                          │         │
+    │──────────────────────────────────▶│                                          │         │
+    │ 7 0 rows: lease lost; discard it  │                                          │         │
+    │◀──────────────────────────────────│                                          │         │
+    │                                   │ 8 SET COMPLETED WHERE token = 43                   │
+    │                                   │◀───────────────────────────────────────────────────│
+    │                                   │                                          │         │
+```
 
-Plugin-based architecture where job types map to handler functions registered at startup.
+- The reaper is the leader's second loop (every 5 s). It locks expired RUNNING rows with `SKIP LOCKED` and applies the same failure transition a worker would: the attempt becomes FAILED and attempt 2 is inserted with `run_at = now + backoff`, or the run is dead-lettered if no attempts remain.
+- A lapsed lease counts as a failed attempt. That is what stops a poison job that crashes its worker every time from cycling forever.
+- Worker A's late write carries token 42, but the row is no longer RUNNING under 42, so it matches nothing. A stale worker can neither complete, fail, renew nor release an execution it no longer owns.
 
-**Built-in handlers:**
-- `http.request`: Make HTTP requests (webhooks, API calls)
-- `shell.command`: Execute shell commands (disabled in production)
-- `log.message`: Log a message (testing/debugging)
-- `system.maintenance`: Data cleanup and archival tasks
+### Triggering a run from the API
 
-**Why static registration over dynamic loading:** Handler functions run with full process privileges. Dynamic loading would require sandboxing and security auditing of uploaded code. Static registration is simpler and auditable.
+```
+ Dashboard                             Job API                             Redis   PostgreSQL
+     │                                    │                                  │          │
+     │ 1 POST trigger, Idempotency-Key K  │                                  │          │
+     │───────────────────────────────────▶│                                  │          │
+     │                                    │ 2 SET idem:K in-flight NX EX 60  │          │
+     │                                    │─────────────────────────────────▶│          │
+     │                                    │ 3 OK (first time)                │          │
+     │                                    │◀─────────────────────────────────│          │
+     │                                    │ 4 INSERT execution (PENDING)                │
+     │                                    │────────────────────────────────────────────▶│
+     │                                    │ 5 store 202 + body for 24 h      │          │
+     │                                    │─────────────────────────────────▶│          │
+     │ 6 202 {execution}                  │                                  │          │
+     │◀───────────────────────────────────│                                  │          │
+     ······················ response lost; client retries with K ························
+     │ 7 POST trigger, Idempotency-Key K  │                                  │          │
+     │───────────────────────────────────▶│                                  │          │
+     │                                    │ 8 NX fails; GET stored response  │          │
+     │                                    │─────────────────────────────────▶│          │
+     │ 9 same 202 (Idempotent-Replayed)   │                                  │          │
+     │◀───────────────────────────────────│                                  │          │
+     │                                    │                                  │          │
+```
+
+- The key is claimed with `SET NX`, so two concurrent duplicates cannot both run; the stored response is replayed for 24 h. The same key with a different body is a `422`; a duplicate that arrives while the first is in flight gets `409` with `Retry-After: 1`.
+- 5xx responses are not stored, so a client can retry a genuinely failed request. If Redis is unreachable the API answers `503` rather than silently dropping the guarantee.
+- Each manual run gets its own slot (`scheduled_at = now`), so it can never collide with, or suppress, a scheduled firing.
 
 ## Database Schema
 
-Defined in `backend/src/db/migrate.ts`.
+### Production schema
 
 ```sql
--- Users table for RBAC authentication
-CREATE TABLE users (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    username VARCHAR(255) UNIQUE NOT NULL,
-    password_hash VARCHAR(255) NOT NULL,
-    role VARCHAR(50) DEFAULT 'user',
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
-
--- Job definitions and scheduling configuration
 CREATE TABLE jobs (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    name VARCHAR(255) UNIQUE NOT NULL,
-    description TEXT,
-    handler VARCHAR(255) NOT NULL,
-    payload JSONB DEFAULT '{}',
-    schedule VARCHAR(100),             -- Cron expression (NULL for one-time)
-    next_run_time TIMESTAMP WITH TIME ZONE,
-    priority INTEGER DEFAULT 50,       -- 1 (lowest) to 100 (highest)
-    max_retries INTEGER DEFAULT 3,
-    initial_backoff_ms INTEGER DEFAULT 1000,
-    max_backoff_ms INTEGER DEFAULT 3600000,
-    timeout_ms INTEGER DEFAULT 300000, -- 5 minutes
-    status VARCHAR(50) DEFAULT 'SCHEDULED',
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+  id                 UUID PRIMARY KEY,
+  shard              SMALLINT NOT NULL,              -- hash(id) % 16, routes every query
+  name               TEXT NOT NULL UNIQUE,
+  handler            TEXT NOT NULL,                  -- must exist in the worker registry
+  payload            JSONB NOT NULL DEFAULT '{}',
+  schedule           TEXT,                           -- cron; NULL for one-time / on-demand
+  timezone           TEXT NOT NULL DEFAULT 'UTC',    -- IANA zone the cron is evaluated in
+  next_run_time      TIMESTAMPTZ,                    -- the next slot; NULL once a one-time job fired
+  misfire_policy     TEXT NOT NULL DEFAULT 'fire_once' CHECK (misfire_policy IN ('fire_once', 'skip')),
+  priority           SMALLINT NOT NULL DEFAULT 50 CHECK (priority BETWEEN 0 AND 100),
+  max_retries        SMALLINT NOT NULL DEFAULT 3,
+  initial_backoff_ms INTEGER NOT NULL DEFAULT 1000,
+  max_backoff_ms     INTEGER NOT NULL DEFAULT 3600000,
+  timeout_ms         INTEGER NOT NULL DEFAULT 300000,
+  status             TEXT NOT NULL DEFAULT 'SCHEDULED',  -- SCHEDULED, PAUSED, QUEUED, RUNNING, ...
+  updated_at         TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+CREATE INDEX jobs_due ON jobs (next_run_time) WHERE status = 'SCHEDULED';
 
--- Execution attempts with full lifecycle tracking
+CREATE SEQUENCE execution_fencing_seq;
+
+-- One row per attempt. Partitioned by the slot's day: old history is detached, not deleted,
+-- and the firing guard below includes the partition key, so it holds across partitions.
 CREATE TABLE job_executions (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    job_id UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
-    status VARCHAR(50) DEFAULT 'PENDING',
-    attempt INTEGER DEFAULT 1,
-    scheduled_at TIMESTAMP WITH TIME ZONE NOT NULL,
-    started_at TIMESTAMP WITH TIME ZONE,
-    completed_at TIMESTAMP WITH TIME ZONE,
-    next_retry_at TIMESTAMP WITH TIME ZONE,
-    result JSONB,
-    error TEXT,
-    worker_id VARCHAR(255),
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
+  id               UUID NOT NULL,
+  job_id           UUID NOT NULL,
+  scheduled_at     TIMESTAMPTZ NOT NULL,             -- the slot: identity of the logical run
+  attempt          SMALLINT NOT NULL,
+  status           TEXT NOT NULL,     -- PENDING, RUNNING, COMPLETED, FAILED, DEAD_LETTER, CANCELLED
+  priority         SMALLINT NOT NULL,                -- copied from the job for the claim index
+  run_at           TIMESTAMPTZ NOT NULL,             -- earliest claim time (slot, or now + backoff)
+  worker_id        TEXT,
+  lease_expires_at TIMESTAMPTZ,
+  fencing_token    BIGINT,
+  next_retry_at    TIMESTAMPTZ,
+  started_at       TIMESTAMPTZ,
+  completed_at     TIMESTAMPTZ,
+  result           JSONB,
+  error            TEXT,
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (id, scheduled_at),
+  UNIQUE (job_id, scheduled_at, attempt)             -- the firing guard
+) PARTITION BY RANGE (scheduled_at);
 
--- Structured execution logs from handler output
-CREATE TABLE execution_logs (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    execution_id UUID NOT NULL REFERENCES job_executions(id) ON DELETE CASCADE,
-    level VARCHAR(20) NOT NULL,
-    message TEXT NOT NULL,
-    metadata JSONB,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
+CREATE INDEX executions_claimable ON job_executions (priority DESC, run_at) WHERE status = 'PENDING';
+CREATE INDEX executions_leases    ON job_executions (lease_expires_at) WHERE status = 'RUNNING';
+CREATE INDEX executions_by_job    ON job_executions (job_id, scheduled_at DESC);
 ```
 
-### Index Strategy
+Why partition by `scheduled_at` rather than `created_at`: PostgreSQL only enforces a unique constraint on a partitioned table if it includes the partition key. Partitioned by `created_at`, the firing guard would have to include `created_at` and could never conflict. A slot and all its retries share `scheduled_at`, so they live in one partition. The cost is that a lookup by execution id alone probes each daily partition's primary-key index (about 30 of them), which is acceptable for an operator screen. `execution_logs` (execution id, level, message, metadata) is partitioned by day as well and kept for 7 days.
 
-| Index | Purpose |
-|-------|---------|
-| `jobs(status)` | Filter by job state (SCHEDULED, PAUSED, etc.) |
-| `jobs(next_run_time)` | Scheduler scans for due jobs |
-| `jobs(priority DESC)` | Priority ordering for dashboard |
-| `jobs(name) UNIQUE` | Idempotent job creation |
-| `job_executions(job_id)` | Execution history per job |
-| `job_executions(status)` | Filter pending/running/failed |
-| `job_executions(scheduled_at)` | Time-range queries |
-| `job_executions(next_retry_at)` | Retry scheduling |
-| `job_executions(created_at DESC)` | Recent executions first |
-| `execution_logs(execution_id)` | Logs per execution |
-| `update_updated_at_column()` trigger | Auto-update timestamps |
+Redis keys: `scheduler:leader:{shard}` (lease), `session:{id}`, `idem:{user}:{method}:{path}:{key}` (in-flight marker or stored response), `workers` (heartbeat registry).
+
+### Local schema
+
+The local schema is the `SCHEMA_SQL` string in [`backend/src/db/migrate.ts`](./backend/src/db/migrate.ts), applied idempotently by every process at startup under a PostgreSQL advisory lock (and by `npm run db:migrate`). It maps to the production design like this:
+
+| Production | Local | Difference |
+|------------|-------|------------|
+| `jobs` with `shard`, `timezone` | `jobs` | No sharding; cron is always evaluated in UTC; `misfire_policy` added with a CHECK constraint |
+| Partitioned `job_executions` | Plain `job_executions` | Same queue columns (`priority`, `run_at`, `lease_expires_at`, `fencing_token`); unique index `(job_id, scheduled_at, attempt)` over the whole table; cleanup deletes rows instead of detaching partitions |
+| `execution_fencing_seq` | Same | — |
+| Partial indexes | `idx_executions_claimable`, `idx_executions_lease`, `idx_jobs_due` | Same shape |
+| Users in an identity provider | `users` table (seeded, unused) and users in Redis | Auth reads Redis; see Security |
 
 ## API Design
 
-### Job Management
+### Production API
 
 ```
-POST   /api/v1/jobs                    → Create job
-GET    /api/v1/jobs                    → List jobs (paginated, filterable)
-GET    /api/v1/jobs/{id}               → Get job details
-PUT    /api/v1/jobs/{id}               → Update job
-DELETE /api/v1/jobs/{id}               → Delete job
-POST   /api/v1/jobs/{id}/pause         → Pause job (stop scheduling)
-POST   /api/v1/jobs/{id}/resume        → Resume paused job
-POST   /api/v1/jobs/{id}/trigger       → Trigger immediate execution
+POST   /api/v1/jobs                         create; Idempotency-Key → 201 | 400 details | 409 name taken
+GET    /api/v1/jobs?status&q&cursor&limit   list, keyset pagination on (created_at, id)
+GET    /api/v1/jobs/{id}                    definition + next_run_time
+PATCH  /api/v1/jobs/{id}                    edit; If-Match: version → 200 | 412
+POST   /api/v1/jobs/{id}/pause | /resume    → 200 | 409 wrong state
+POST   /api/v1/jobs/{id}/trigger            Idempotency-Key → 202 {execution} | 409 paused
+GET    /api/v1/jobs/{id}/executions         attempt history, newest first (cursor)
+GET    /api/v1/jobs/{id}/events             SSE stream of execution changes; Last-Event-ID resume
+GET    /api/v1/executions/{id}              attempt + logs
+POST   /api/v1/executions/{id}/cancel       → 200 | 409 already finished
+POST   /api/v1/executions/{id}/retry        Idempotency-Key → 200 next attempt | 409 superseded
+GET    /api/v1/dead-letter?cursor           runs waiting for an operator
 ```
 
-### Execution Management
+Errors use `application/problem+json`; rate limits are reported with `RateLimit` headers. Every POST that creates work accepts an `Idempotency-Key`.
 
-```
-GET    /api/v1/jobs/{id}/executions    → List job executions
-GET    /api/v1/executions/{id}         → Get execution details + logs
-POST   /api/v1/executions/{id}/cancel  → Cancel running execution
-POST   /api/v1/executions/{id}/retry   → Retry failed execution
-```
+### Local routes
 
-### Monitoring
-
-```
-GET    /api/v1/health                  → Health check (PG, Redis)
-GET    /api/v1/metrics                 → System metrics (JSON)
-GET    /metrics                        → Prometheus metrics
-GET    /api/v1/workers                 → List workers with status
-GET    /api/v1/dead-letter             → Dead letter queue contents
-```
+| Method | Path | Purpose |
+|--------|------|---------|
+| POST | `/api/auth/login`, `/api/auth/logout`; GET `/api/auth/me` | Session cookie auth |
+| POST / GET | `/api/v1/jobs` | Create (admin, validated, `Idempotency-Key`); list with `page`/`limit`, `withStats` |
+| GET / PUT / DELETE | `/api/v1/jobs/:id` | Read; update (admin, validated); delete (admin) |
+| POST | `/api/v1/jobs/:id/pause`, `/resume`, `/trigger` | Lifecycle; trigger accepts `Idempotency-Key`, `409` when paused |
+| GET | `/api/v1/jobs/:id/executions` | Attempt history (`page`, `limit`, `status`) |
+| GET | `/api/v1/executions/:id` | Attempt with logs |
+| POST | `/api/v1/executions/:id/cancel`, `/retry` | Guarded cancel (`409`); redrive as next attempt (`Idempotency-Key`) |
+| GET | `/api/v1/metrics/system`, `/metrics/executions`, `/workers`, `/dead-letter` | Dashboard data |
+| GET | `/api/v1/health`, `/health/ready`, `/health/live`, `/metrics` | Operations |
+| POST / GET | `/api/v1/admin/users`, `/admin/cleanup`, `/admin/storage`, `/admin/circuit-breakers/reset` | Admin |
 
 ## Key Design Decisions
 
-### 1. At-Least-Once via Visibility Timeout
+### 1. The execution table is the queue
 
-The core challenge of distributed job processing is ensuring every job runs at least once without requiring distributed transactions. We use a visibility timeout pattern inspired by AWS SQS:
+Every scheduler needs two things: durable history ("what ran, when, with what result") and a work queue ("what should run next"). Keeping them in two systems is the classic dual write. With PostgreSQL rows plus a Redis sorted set, firing writes the row and then `ZADD`s; a crash in between leaves a PENDING row nothing will ever run, and the opposite order leaves a queue entry whose row may not exist yet. Recovery then needs a reconciliation scanner, which is a second scheduler in disguise.
 
-1. Worker pops a job from the queue and moves it to the "processing" sorted set with a timeout score
-2. The job becomes invisible to other workers for the duration of the timeout
-3. If the worker completes the job, it removes the entry from the processing set
-4. If the worker crashes or times out, the scheduler recovers the job by scanning the processing set for entries past their timeout
+Making the row the queue entry removes the problem. Firing, claiming, retrying and dead-lettering are single-database transactions; delayed retries are a `run_at` column; priority is an `ORDER BY` served by a partial index; and the history is the queue itself. `FOR UPDATE SKIP LOCKED` (PostgreSQL 9.5+) is what makes this practical: concurrent claimers skip rows another transaction has locked instead of blocking on them.
 
-**The trade-off is possible duplicate execution.** If a job takes longer than its timeout, the scheduler re-enqueues it while the original worker is still processing. This is why "at-least-once" (not "exactly-once"): handlers must be idempotent or tolerate duplicate runs. For most job types (sending emails, processing files, making API calls), idempotency keys or deduplication at the destination handle this correctly.
+| Option | Why / why not |
+|--------|---------------|
+| ✅ PostgreSQL rows + `SKIP LOCKED` | One source of truth; transactional firing and outcomes; delays and priorities for free. Thousands of claims/s per primary, more with shards |
+| ❌ Redis sorted set | ~100K ops/s, but a dual write with the database, and durability depends on AOF fsync settings |
+| ❌ Kafka | No per-message ack or visibility timeout (a slow job blocks its partition), no priorities, no native delays |
+| ⚠️ SQS / RabbitMQ | Visibility timeouts built in, but still a dual write (needs an outbox); SQS has no priorities and caps delays at 15 minutes |
 
-**Why not distributed transactions?** Two-phase commit across Redis (queue) and PostgreSQL (state) would guarantee exactly-once but adds 10-100x latency per job, requires a transaction coordinator, and fails if either system is temporarily unavailable. The visibility timeout is simpler, faster, and tolerates partial failures.
+The cost is write load on PostgreSQL: three to four row updates per execution and an index on hot, frequently updated rows (autovacuum must keep up). Beyond ~10K executions/s per shard I would keep PostgreSQL as the ledger and move dispatch to a broker fed by a transactional outbox.
 
-### 2. Redis Leader Election over Distributed Scheduling
+### 2. Leases and fencing tokens, not locks
 
-**Chosen: Single leader with Redis `SET NX EX`.**
+A worker that claims an execution gets a **lease**: ownership until `lease_expires_at`, extended by heartbeats. A lock without expiry would hang the run forever when its holder dies; a lease turns a dead worker into a delay of at most lease + reaper interval.
 
-With N schedulers independently scanning the jobs table, each would find the same due jobs and enqueue them N times. Deduplication at the queue level is complex because the scheduler must atomically check "is this job already enqueued?" and "enqueue if not" -- a read-then-write race condition.
+Expiry creates the opposite problem. A worker that is alive but stalled (a long GC pause, a partition from the database) does not know its lease lapsed. When it wakes up, another worker may be running the same run. The **fencing token** fixes the bookkeeping: every claim takes the next value of a global sequence, and every later write is `WHERE fencing_token = $mine AND status = 'RUNNING'`. The stale worker's writes match zero rows. The token is also passed to the job's target so it can reject older writers, and the worker stops itself at its local lease deadline so it rarely gets that far.
 
-The leader election pattern avoids this entirely: exactly one scheduler runs at any time. Standby instances continuously attempt to acquire the lock, providing automatic failover within the lock TTL (30 seconds). The leader sends heartbeats every 10 seconds to renew the lock, so failover only occurs after a genuine failure.
+The lease length is a trade-off. A 5 s lease recovers fast but expires under ordinary pauses and network blips, producing duplicate runs; a 5 min lease is safe from pauses but holds a crashed worker's job for 5 minutes. 30 s with 10 s heartbeats tolerates two missed renewals and recovers a crash in ~35 s.
 
-**The trade-off is a scheduling gap during failover.** When the leader dies, jobs due within the next 30 seconds may be delayed until the new leader acquires the lock. For most job scheduling use cases (cron-like tasks with minute-level precision), this delay is acceptable. Sub-second scheduling would require a different coordination approach (e.g., distributed consensus via Raft).
+### 3. The leader is an optimization; the firing transaction is the guarantee
 
-### 3. Redis Sorted Set over PostgreSQL for Queue
+Leader election (a Redis key set with `NX PX`, renewed with a Lua compare-and-pexpire every TTL/3) keeps one scheduler per shard doing the work. But a lease-based leader can be wrong: a paused leader can keep acting after its lease expired and someone else took over. So correctness does not depend on it. Due jobs are locked with `FOR UPDATE SKIP LOCKED` inside the firing transaction, `next_run_time` moves forward in the same commit, and the execution insert is guarded by the unique `(job_id, scheduled_at, attempt)`. Two concurrent leaders split the due jobs between them or find nothing due; neither can fire a slot twice. The leader also self-fences on a local deadline, the same way workers do.
 
-**Chosen: Redis sorted set with inverted priority scores.**
+Without a leader every scheduler instance would poll every shard every second and contend for the same rows: correct, but wasteful, and slot order within a shard would be lost.
 
-PostgreSQL can serve as a job queue using `SELECT ... FOR UPDATE SKIP LOCKED`, but this approach has contention issues at high throughput. With 50 workers all issuing `SELECT FOR UPDATE` simultaneously, PostgreSQL must lock and skip rows, creating lock contention and increased latency as queue depth grows.
+### 4. Misfires need a policy and a grace window
 
-Redis sorted sets offer O(log N) insertion and O(1) atomic pop via ZPOPMIN with no locking overhead. The trade-off is durability: Redis queue state lives in memory and can be lost on crash. We mitigate this by treating PostgreSQL as the source of truth -- the scheduler can always reconstruct the queue from the jobs table by scanning for due jobs.
+A slot that is late by less than the **grace window** (60 s, longer than the worst failover) is on time: fire it, then advance from the slot itself so a slightly late tick never skips the next slot. A slot that is later than that means the system was down. Replaying every missed slot of an every-minute job after a two-hour outage would enqueue 120 identical runs at once, which is rarely what anyone wants, so the gap collapses into one decision per job: `fire_once` (run the oldest missed slot once, the default) or `skip`. Either way `next_run_time` moves to the first future slot. One-time jobs always fire, however late.
+
+### 5. One row per attempt
+
+A retry inserts a new row (same job and slot, `attempt + 1`, `run_at = now + backoff`) instead of updating a counter. The attempt history is then exact: each row records which worker ran it, how long it took, and how it failed. The slot identifies the logical run, which is what the downstream idempotency key is built from. The cost is more rows, which daily partitions make cheap to drop.
+
+### 6. Retries: jittered backoff, a bounded budget, a dead-letter state
+
+Attempt *n* waits a random time between half and all of `min(max_backoff, initial_backoff · 2^(n−1))`. The exponent backs off from a struggling dependency; the jitter stops a thousand jobs that failed together (same outage) from retrying in one synchronized wave. `max_retries` counts retries after the first attempt. Errors a retry cannot fix (unknown handler, invalid payload, an HTTP 4xx other than 408/429) dead-letter immediately. A dead-lettered run waits in the `DEAD_LETTER` state until an operator redrives it as its next attempt.
 
 ## Consistency and Idempotency
 
-### Job Creation Idempotency
+| Operation | Guarantee | Mechanism |
+|-----------|-----------|-----------|
+| Firing a slot | At most one execution per (job, slot) | Job row lock + `next_run_time` advanced in the same transaction + unique `(job_id, scheduled_at, attempt)` |
+| Claiming | One owner per execution at a time | `FOR UPDATE SKIP LOCKED`; lease + fencing token |
+| Recording an outcome | Only the current owner's write lands | `WHERE fencing_token = $t AND status = 'RUNNING'` on complete, fail, renew and release |
+| Worker crash | Run restarts within lease + reaper interval | Reaper treats a lapsed lease as a failed attempt |
+| Side effects | Duplicates are detectable downstream | `Idempotency-Key: {job}:{slot}` and `X-Fencing-Token` sent to targets |
+| Create / trigger / retry | One effect per client intent | `Idempotency-Key` header, `SET NX` claim, stored response, `422` on body mismatch |
+| Redrive | One new attempt per dead-lettered run | Only the latest attempt can be redriven, under a row lock |
+| Pause | Survives an in-flight run finishing | Status writes from workers are compare-and-set and never overwrite `PAUSED` |
 
-Two-layer protection against duplicate job creation:
+What is **not** guaranteed: exactly-once side effects. A worker can complete a webhook call and die before recording it; the retry calls the webhook again. That is why targets get a stable idempotency key.
 
-1. **Idempotency-Key header**: Redis-cached responses for duplicate HTTP requests (24-hour TTL). If a client retries a failed request, the same response is returned without creating a second job.
-2. **Job name uniqueness**: `UNIQUE(name)` constraint in PostgreSQL. Even without an idempotency key, attempting to create a job with the same name returns a 409 Conflict.
+## Security / Auth
 
-### Execution Idempotency
-
-Redis `SET NX EX` for execution-level locks keyed by `{job_id}:{scheduled_at}`. This prevents the scenario where the scheduler re-enqueues a job that a slow worker is still processing.
-
-## Authentication and Authorization
-
-### Session-Based Authentication
-
-Session IDs stored in Redis with 24-hour TTL and sliding expiration. Cookies use `HttpOnly` and `SameSite=Strict` flags.
-
-### Role-Based Access Control
-
-| Operation | User Role | Admin Role |
-|-----------|-----------|------------|
-| View own jobs | Yes | Yes (all jobs) |
-| Trigger own jobs | Yes | Yes (all jobs) |
-| Create jobs | No | Yes |
-| Update/Delete jobs | No | Yes |
-| Pause/Resume jobs | No | Yes |
-| View system metrics | Limited | Full |
-| Manage workers/DLQ | No | Yes |
-
-### Rate Limiting
-
-| Endpoint Category | Limit | Window |
-|-------------------|-------|--------|
-| Authentication | 5 requests | 1 minute |
-| Job creation | 10 requests | 1 minute |
-| Job trigger | 30 requests | 1 minute |
-| Read operations | 100 requests | 1 minute |
-
-## Security
-
-- **Input validation**: All API endpoints validate request bodies
-- **No secrets in payloads**: Job payloads should reference environment variables, not contain secrets
-- **Shell handler disabled in production**: The `shell.command` handler is restricted to development environments
-- **Password hashing**: bcrypt for user password storage
-- **Rate limiting**: Redis-backed rate limiting on authentication and job creation endpoints
+- **Authentication**: session cookie (`HttpOnly`, `Secure`, `SameSite=Strict`) backed by Redis for people; API keys for services at the load balancer.
+- **Authorization**: roles (`admin` manages jobs; `user` views and triggers) plus ownership per team in production, so one team cannot trigger or read another team's jobs.
+- **Handlers are code, not input**: handlers ship with the worker image and are referenced by name; the API rejects unknown names. A shell handler exists only in development builds.
+- **Secrets**: payloads reference secrets by name (resolved by the worker from a secret store), so they never sit in `jobs.payload` or execution logs.
+- **Outbound calls**: webhook targets are validated against an allow-list (no internal metadata endpoints), and responses stored in `result` are truncated.
+- **Rate limits**: per user and per API key on creates and triggers, enforced in Redis so they hold across API instances.
 
 ## Observability
 
-### Prometheus Metrics
+- **Firing**: lag between slot and firing (p50/p99), misfires by policy, duplicate-slot inserts (should be zero; non-zero means two leaders), leader changes.
+- **Queue**: ready depth, delayed depth (backoff), oldest ready age, running count, expired-but-unreaped leases.
+- **Execution**: start delay (claim − run_at), duration by handler, outcome by handler, retries, dead letters.
+- **Leases**: reaped leases by outcome, fenced writes rejected (non-zero means workers stall longer than the lease), renewal latency.
+- **Alerts**: oldest ready execution > 60 s; dead-letter rate above baseline; fenced rejections > 0 for 10 minutes; no leader for a shard > 2 × TTL; worker count 0 while the queue is non-empty.
 
-| Metric | Type | Purpose |
-|--------|------|---------|
-| `job_scheduler_jobs_scheduled_total` | Counter | Jobs enqueued by handler/priority |
-| `job_scheduler_jobs_executed_total` | Counter | Executions started by handler/worker |
-| `job_scheduler_jobs_completed_total` | Counter | Successful completions |
-| `job_scheduler_jobs_failed_total` | Counter | Failures by handler, with retry label |
-| `job_scheduler_job_execution_duration_seconds` | Histogram | Execution time by handler/status |
-| `job_scheduler_dead_letter_total` | Counter | Jobs moved to dead letter queue |
-| `job_scheduler_queue_depth` | Gauge | Current pending jobs |
-| `job_scheduler_processing_count` | Gauge | Currently in-flight jobs |
-| `job_scheduler_dead_letter_queue_size` | Gauge | Failed jobs awaiting investigation |
-| `job_scheduler_active_workers` | Gauge | Registered worker count |
-| `job_scheduler_worker_active_jobs` | Gauge | Per-worker job count |
-| `job_scheduler_scheduler_is_leader` | Gauge | Leader election status |
-| `job_scheduler_stalled_jobs_recovered_total` | Counter | Stalled job recoveries |
-| `job_scheduler_circuit_breaker_state` | Gauge | Per-handler circuit state |
-| `job_scheduler_circuit_breaker_trips_total` | Counter | Circuit breaker trips |
-| `job_scheduler_http_request_duration_seconds` | Histogram | API latency |
-| `job_scheduler_http_requests_total` | Counter | API request count |
-
-### Alerting Rules
-
-| Alert | Condition | Severity |
-|-------|-----------|----------|
-| QueueBacklog | queue_depth > 1000 for 5 min | Warning |
-| HighErrorRate | failed / completed > 10% for 5 min | Critical |
-| SchedulerLag | No jobs picked up for 60 seconds | Critical |
-| NoActiveWorkers | active_workers = 0 when queue > 0 | Critical |
-| HighDLQSize | dead_letter_queue_size > 100 | Warning |
+Structured logs carry `jobId`, `executionId`, `attempt`, `workerId` and `fencingToken`, so one run can be traced across the scheduler, the worker and the target.
 
 ## Failure Handling
 
-### Circuit Breaker for Job Handlers
-
-Each handler type gets its own circuit breaker (Opossum) to isolate failures. If a handler's error rate exceeds 50% over 5 requests, the circuit opens and new jobs of that type are requeued for later rather than counted as failures. This prevents a single failing external service from consuming all worker capacity.
-
-| Configuration | Value |
-|---------------|-------|
-| Timeout | 60 seconds |
-| Error threshold | 50% failure rate |
-| Reset timeout | 30 seconds |
-| Volume threshold | 5 requests minimum |
-
-### Failure Recovery Procedures
-
-| Scenario | Behavior | Recovery |
-|----------|----------|----------|
-| Worker crashes mid-job | Visibility timeout expires; scheduler re-enqueues | Automatic (within timeout period) |
-| Scheduler crashes | Standby acquires leader lock within 30s | Automatic (30s max gap) |
-| Redis crashes | Queue state lost; API returns errors | Scheduler reconstructs queue from PostgreSQL jobs table |
-| PostgreSQL crashes | No new jobs can be created; executions can't be recorded | Workers continue processing queued jobs; state updates buffered |
-| Network partition (Redis-PG) | Split-brain risk for queue vs state | Leader lock prevents duplicate scheduling; idempotency prevents duplicate execution |
-
-### Retry Strategy
-
-Exponential backoff with configurable parameters:
-
-```
-delay = min(initial_backoff_ms * 2^attempt, max_backoff_ms)
-```
-
-| Attempt | Delay (default config) |
-|---------|----------------------|
-| 1st retry | 2 seconds |
-| 2nd retry | 4 seconds |
-| 3rd retry (max) | 8 seconds |
-| After max retries | Move to dead letter queue |
-
-## Caching Strategy
-
-### Cache-Aside Pattern
-
-The system uses cache-aside for job metadata reads from the dashboard:
-
-| Cache Key Pattern | TTL | Rationale |
-|-------------------|-----|-----------|
-| `job:{id}` | 5 minutes | Job metadata changes infrequently |
-| `jobs:list:{page}:{filters}` | 30 seconds | List views need fresher data |
-| `job:{id}:executions` | 10 seconds | Execution history updates frequently |
-| `workers:status` | 5 seconds | Worker heartbeats are real-time |
-| `metrics:summary` | 15 seconds | Dashboard metrics aggregate |
-| `handlers:list` | 1 hour | Handler registry rarely changes |
-
-**Invalidation:** Event-driven invalidation on job create/update/delete and execution state changes. Uses Redis SCAN (not KEYS) for pattern-based invalidation.
+| Failure | Effect | Mitigation |
+|---------|--------|------------|
+| Worker crashes mid-run | Run paused for up to ~35 s | Reaper reclaims the lapsed lease; next attempt on another worker |
+| Worker stalls past its lease | Two workers may run the same slot | Fencing token rejects the stale outcome; worker self-fences; target dedupes by idempotency key |
+| Scheduler leader dies | Firing pauses for up to one TTL | Standby takes the lease; slots inside the grace window fire on time-ish, older ones follow the misfire policy |
+| Two leaders (split brain) | Both tick | Firing transaction is idempotent; duplicate-slot metric alerts |
+| PostgreSQL shard down | That shard's jobs neither fire nor run | Failover to a synchronous replica; other shards unaffected |
+| Redis down | No logins, idempotency `503`, no leader changes | Running leader keeps firing until its local deadline; runs themselves are unaffected |
+| Target dependency down | Jobs for it fail repeatedly | Per-target circuit breaker holds executions back (no attempt consumed); backoff; dead letter after the budget |
+| Poison job crashes workers | Each attempt kills a worker | Lapsed lease counts as an attempt; dead-lettered after `max_retries` |
+| Deploy restarts workers | Running work interrupted | SIGTERM: stop claiming, drain for a grace period, hand back the rest without consuming an attempt |
 
 ## Scalability Considerations
 
-### Horizontal Scaling
-
-| Component | Strategy | Limit |
-|-----------|----------|-------|
-| API Servers | Stateless, add behind load balancer | Network/CPU |
-| Scheduler | Single leader (cannot scale out) | PostgreSQL scan speed |
-| Workers | Scale based on queue depth | Redis pop throughput |
-
-### What Breaks First
-
-At 10K jobs/second enqueue rate, the scheduler's PostgreSQL scan becomes the bottleneck (full table scan with `next_run_time <= NOW()`). Mitigation: partition the jobs table by status, index on `(status, next_run_time)`, or switch to an event-driven approach where job creation directly enqueues to Redis.
-
-At 50+ workers, Redis ZPOPMIN contention may cause latency spikes. Mitigation: shard the queue by priority level or handler type across multiple sorted sets.
-
-### Database Scaling
-
-- **Read replicas**: Offload execution history queries to replicas
-- **Partitioning**: Partition `job_executions` by month for efficient archival
-- **Archival**: Move completed executions older than 30 days to cold storage (Parquet on S3/MinIO)
-
-## Data Lifecycle
-
-| Category | Hot (PostgreSQL) | Cold (S3/MinIO) | Delete |
-|----------|-----------------|-----------------|--------|
-| Job definitions | Indefinite | N/A | Manual |
-| Active executions | 30 days | 1 year (Parquet) | After 1 year |
-| Execution logs | 7 days | N/A | After 7 days |
-| Dead letter queue | 30 days (Redis) | N/A | After 30 days |
-| Prometheus metrics | 15 days | N/A | After 15 days |
+1. **Spikes come from the calendar.** Fire 60 s ahead with `run_at = slot`; autoscale workers on ready-queue depth and on the known schedule (the next minute's due count is a query away); let jobs that don't care about the exact second opt into start jitter.
+2. **Shard by job id.** 16 logical shards on 4 PostgreSQL clusters to start. Each shard has its own scheduler lease; workers claim from shards round-robin, weighted by queue depth.
+3. **Keep the hot set small.** Claims touch only PENDING and RUNNING rows through partial indexes; completed rows age into daily partitions that are detached and archived, so the claim index stays small however much history accumulates.
+4. **Batch.** Claims take several rows per statement; lease renewals are one statement per worker; inserts during firing are batched per shard.
+5. **Fairness.** Strict priority can starve low-priority work under sustained overload. If that shows up, add aging (effective priority grows with wait time) or weighted per-priority queues.
+6. **Beyond ~10K executions/s per shard**, keep PostgreSQL as the ledger and dispatch through a broker fed by an outbox.
 
 ## Trade-offs Summary
 
 | Decision | Chosen | Alternative | Rationale |
 |----------|--------|-------------|-----------|
-| Queue backend | Redis sorted set | PostgreSQL SKIP LOCKED | O(1) pop, no lock contention, 10x throughput |
-| Coordination | Leader election (SET NX EX) | Distributed scheduling | Simple, no duplicate enqueue, 30s failover acceptable |
-| Execution guarantee | At-least-once (visibility timeout) | Exactly-once (distributed transactions) | Simpler, faster; handlers must be idempotent |
-| Job state | PostgreSQL | Redis only | ACID for job definitions; survives Redis restart |
-| Handler architecture | Static registration | Dynamic loading | Simpler, auditable, no sandboxing needed |
-| Session auth | Redis sessions + cookies | JWT | Immediate revocation, simpler |
-| State management | Zustand | Redux | Less boilerplate, sufficient for dashboard |
-| Routing | TanStack Router | React Router | Type-safe routing |
-
-## Frontend Architecture
-
-### Component Hierarchy
-
-```
-Layout (sidebar navigation + main content)
-├── Dashboard (/)
-│   ├── MetricCard (x8: total jobs, active jobs, queue depth, active workers,
-│   │                    completed 24h, failed 24h, running now, dead letter queue)
-│   └── JobTable (recent 5 jobs with pause/resume/trigger/delete actions)
-├── Jobs (/jobs)
-│   ├── Create Job button → CreateJobModal
-│   ├── JobTable (full paginated list with actions)
-│   └── Pagination (page navigation)
-├── JobDetail (/jobs/$jobId)
-│   ├── Job metadata (name, handler, schedule, priority, status)
-│   ├── ExecutionList (paginated execution history for this job)
-│   └── Action buttons (pause/resume/trigger/delete)
-├── ExecutionDetail (/executions/$executionId)
-│   ├── Execution metadata (status, attempt, worker, timing)
-│   ├── Result/error display
-│   └── Execution logs (structured log entries from handler)
-└── Workers (/workers)
-    ├── MetricCard (x4: active workers, total workers, total completed, total failed)
-    └── Worker table (ID, status badge, active jobs, completed, failed, last heartbeat)
-```
-
-### Routing
-
-TanStack Router with programmatic route definitions in `frontend/src/router.tsx`. The root route wraps all pages in a `Layout` component that provides a sidebar navigation with links. Five routes are registered:
-
-| Route | Component | Purpose |
-|-------|-----------|---------|
-| `/` | DashboardPage | System overview with metrics and recent jobs |
-| `/jobs` | JobsPage | Job CRUD with pagination and create modal |
-| `/jobs/$jobId` | JobDetailPage | Single job detail with execution history |
-| `/executions/$executionId` | ExecutionDetailPage | Single execution with structured logs |
-| `/workers` | WorkersPage | Worker fleet monitoring |
-
-The router uses dynamic route segments (`$jobId`, `$executionId`) for detail views, enabling type-safe parameter extraction via TanStack Router's hooks.
-
-### Zustand Stores
-
-Unlike the other projects that use a single store, this project splits state across three independent Zustand stores in `frontend/src/stores/index.ts`:
-
-**`useJobsStore`** -- Job list and CRUD operations:
-
-| State | Actions |
-|-------|---------|
-| `jobs`, `selectedJob`, `page`, `totalPages` | `fetchJobs(page)`, `fetchJob(id)`, `createJob(input)`, `updateJob(id, input)` |
-| `loading`, `error` | `deleteJob(id)`, `pauseJob(id)`, `resumeJob(id)`, `triggerJob(id)` |
-
-After every mutation (create, update, delete, pause, resume, trigger), the store automatically re-fetches the current page to reflect changes.
-
-**`useMetricsStore`** -- Dashboard metrics and worker status:
-
-| State | Actions |
-|-------|---------|
-| `metrics` (SystemMetrics) | `fetchMetrics()` |
-| `workers` (Worker[]) | `fetchWorkers()` |
-
-The Dashboard component polls both `fetchMetrics()` and `fetchWorkers()` every 5 seconds.
-
-**`useExecutionsStore`** -- Execution history and detail:
-
-| State | Actions |
-|-------|---------|
-| `executions`, `selectedExecution`, `page`, `totalPages` | `fetchExecutions(jobId?, page)`, `fetchExecution(id)` |
-| `loading`, `error` | `cancelExecution(id)`, `retryExecution(id)` |
-
-This three-store approach avoids unnecessary re-renders: updating a job does not trigger re-renders in components that only subscribe to metrics, and vice versa.
-
-### Data Fetching
-
-API functions are exported individually from `frontend/src/services/api.ts`. A generic `fetchApi<T>()` wrapper wraps all calls, handling JSON parsing and returning typed `ApiResponse<T>` objects. The API client covers job CRUD (create, read, update, delete, pause, resume, trigger), execution management (list, detail, cancel, retry), monitoring (system metrics, execution stats, workers, dead letter queue), and health checks.
-
-### Key UI Patterns
-
-- **Job lifecycle actions**: The JobTable component provides inline action buttons for each job -- Pause, Resume, Trigger, Delete -- with confirmation dialogs for destructive operations. Actions immediately re-fetch the job list to reflect state changes
-- **Create job modal**: A modal overlay (`CreateJobModal`) for job creation with form fields for name, handler selection, cron expression, payload (JSON textarea), priority slider, and retry configuration
-- **Worker heartbeat monitoring**: The Workers page calculates worker liveness by comparing `last_heartbeat` against a 60-second threshold. Workers with stale heartbeats are marked "offline" regardless of their reported status, providing accurate fleet visibility
-- **Status badges**: Color-coded badges throughout the application: job status (SCHEDULED=blue, PAUSED=yellow, COMPLETED=green, FAILED=red), worker status (idle=green, busy=yellow, offline=gray), and execution status
-- **Pagination**: The Pagination component in UI.tsx provides page navigation for jobs and executions, with the current page tracked in the Zustand store
-- **Metric trends**: MetricCard components accept an optional `trend` prop ("up", "down", "neutral") to visually indicate whether a metric is improving or degrading
-- **Auto-refresh**: The Dashboard and Workers pages poll the backend every 5 seconds using `setInterval` with cleanup in the `useEffect` return function
-
-## Deep Pattern Explanations
-
-This section explains the production-grade patterns used in this project for readers unfamiliar with them.
-
-### RBAC (Role-Based Access Control)
-
-RBAC is a method of restricting system access based on roles assigned to users, rather than managing permissions for each user individually. Instead of maintaining a list like "Alice can create jobs, Bob can view jobs, Carol can trigger jobs," you define roles: "admins can create/update/delete/trigger jobs, users can view and trigger their own jobs." When Alice is promoted, you change her role from "user" to "admin" -- her permissions update automatically.
-
-In this project, two roles exist: user (view own jobs, trigger own jobs, view limited metrics) and admin (full access to all jobs, workers, dead letter queue, and system metrics). The middleware extracts the user's role from their Redis-stored session, compares it against a permission matrix defined per endpoint, and returns 403 Forbidden if the role lacks the required permission. Session auth (rather than JWT) was chosen because sessions can be immediately revoked by deleting the Redis key -- with JWT, a revoked user could continue accessing the system until the token expires.
-
-### Redis Cache-Aside
-
-Cache-aside (lazy loading) is a caching pattern where the application checks the cache first and only queries the database on a cache miss. The key principle is that the application code manages both the cache and the database -- unlike "write-through" caching where the cache layer handles both reads and writes transparently.
-
-In this project, job metadata is cached using cache-aside with multiple TTLs based on data volatility: `job:{id}` has a 5-minute TTL (job definitions change infrequently), `jobs:list:{page}:{filters}` has a 30-second TTL (list views need fresher data), and `workers:status` has a 5-second TTL (worker heartbeats are real-time). Cache invalidation is event-driven: when a job is created, updated, or deleted, the relevant cache keys are invalidated using Redis SCAN (not KEYS, which blocks the Redis server). The tradeoff is that briefly stale data may be served between a write and the next cache miss, which is acceptable for a dashboard but would not be for the scheduler's due-job scan (which always reads from PostgreSQL).
-
-### Circuit Breaker
-
-A circuit breaker detects repeated failures to a downstream service and stops calling it, preventing wasted resources and cascading failures. Named after the electrical device that trips to prevent a short circuit from causing a fire, the software circuit breaker has three states: Closed (normal -- requests pass through, failures are counted), Open (threshold exceeded -- requests immediately fail with a fallback, the downstream service gets breathing room to recover), and Half-Open (after a cooldown, a few test requests are sent to check recovery).
-
-In this project, each job handler type gets its own circuit breaker using the Opossum library. This per-handler isolation is important: if the HTTP webhook handler fails because the target server is down, it should not prevent the log handler or shell command handler from executing. The circuit opens when the error rate exceeds 50% over 5 requests, and tests recovery after 30 seconds. When a handler's circuit is open, new jobs of that type are requeued for later processing rather than counted as failures -- this prevents burning through retry attempts while the downstream service is known to be unavailable. Prometheus metrics track each circuit's state transitions (`job_scheduler_circuit_breaker_state`, `job_scheduler_circuit_breaker_trips_total`).
-
-### Structured Logging
-
-Structured logging emits log entries as machine-parseable JSON objects rather than free-form text strings. A traditional log message like `"[2024-01-15 10:30:00] ERROR: Job report-gen failed on worker w-2 after 3 attempts: connection timeout"` is readable by humans but difficult to search programmatically. A structured entry like `{"level":"error","jobId":"report-gen","workerId":"w-2","attempt":3,"error":"connection timeout","event":"job_failed"}` enables precise queries: "show all failed jobs on worker w-2 in the last hour" without regex pattern matching.
-
-This project uses Pino with contextual fields. Worker processes create child loggers with `workerId` baked in, so every log entry from that worker automatically includes its identifier. Similarly, when processing a job, the handler creates a child logger with `jobId` and `executionId`. In development, `pino-pretty` converts JSON to colored indented output for readability.
-
-### Prometheus Metrics
-
-Prometheus is a monitoring system that collects time-series data by scraping HTTP endpoints at regular intervals. The application exposes metrics at `GET /metrics` in a specific text format. Prometheus stores this data and enables queries, dashboards (via Grafana), and alerts.
-
-This project exposes 17+ metrics covering every stage of the job lifecycle: scheduling (`job_scheduler_jobs_scheduled_total`), execution (`job_scheduler_jobs_executed_total`, `job_scheduler_job_execution_duration_seconds`), failures (`job_scheduler_jobs_failed_total`, `job_scheduler_dead_letter_total`), infrastructure (`job_scheduler_queue_depth`, `job_scheduler_active_workers`, `job_scheduler_scheduler_is_leader`), and per-handler circuit breaker state. The alerting rules section defines five alert conditions with thresholds -- for example, `QueueBacklog` fires if queue depth exceeds 1000 for 5 minutes, indicating workers cannot keep up with the scheduling rate.
-
-### Rate Limiting
-
-Rate limiting restricts how many requests a client can make within a time window to prevent abuse and protect server resources. In a job scheduler, rate limiting prevents two failure modes: (1) a buggy client creating thousands of jobs in a tight loop, and (2) an attacker using the scheduler to amplify DDoS attacks via HTTP webhook jobs.
-
-This project implements tiered rate limiting with Redis-backed counters: authentication endpoints allow 5 requests per minute (brute-force protection), job creation allows 10 per minute (prevents flooding), job triggering allows 30 per minute (more lenient for operations), and read operations allow 100 per minute. The rate limiting middleware runs before the route handler, checking a Redis counter keyed by user ID (or IP for unauthenticated requests) and returning HTTP 429 with a `Retry-After` header when the limit is exceeded.
-
-### Idempotency
-
-Idempotency ensures that performing the same operation multiple times has the same effect as performing it once. In a job scheduler, this prevents duplicate job creation from client retries and duplicate job execution from scheduler recovery.
-
-Two levels of idempotency are implemented: (1) **Job creation**: An `Idempotency-Key` HTTP header is cached in Redis with a 24-hour TTL. If a client retries a `POST /api/v1/jobs` request with the same key, the cached response is returned without creating a duplicate job. Additionally, the `UNIQUE(name)` constraint on the jobs table prevents duplicate names at the database level. (2) **Execution-level dedup**: Redis `SET NX EX` on `{job_id}:{scheduled_at}` prevents the same job instance from being executed twice. This matters when the scheduler re-enqueues a job that timed out while a slow worker is still processing it -- the second worker's lock attempt fails, so it skips the job instead of double-executing it.
-
-### Health Checks
-
-Health checks are HTTP endpoints that report service status to infrastructure components. Load balancers use them to stop routing traffic to sick instances. Container orchestrators use them to restart crashed containers. Monitoring dashboards use them for at-a-glance system status.
-
-This project exposes `GET /api/v1/health` which checks PostgreSQL connectivity (runs `SELECT 1`) and Redis connectivity (runs `PING`). The response includes the status of each dependency, enabling operators to quickly identify which component is failing. The health check is intentionally lightweight -- complex queries or heavy computations in a health check can cause false negatives under load (the service is healthy but the health check itself times out because the system is busy).
+| Work queue | PostgreSQL rows + `SKIP LOCKED` | Redis sorted set, Kafka | No dual write; transactional retries and delays |
+| Ownership | Lease + heartbeat + fencing token | Lock without expiry | Dead workers time out; stale workers can't write |
+| Delivery | At-least-once + downstream idempotency key | Exactly-once via 2PC | 2PC can't include an arbitrary webhook |
+| Scheduler | Leader per shard, idempotent firing | Every instance scans | Less contention; correctness never rests on the lock |
+| Missed runs | Grace window + `fire_once`/`skip` | Replay every slot | Avoids bursts after outages |
+| Attempt history | One row per attempt | Counter on one row | Exact failure history; slot = idempotency identity |
+| Retries | Jittered exponential backoff, then dead letter | Fixed delay, retry forever | No synchronized retry waves; poison jobs stop |
+| Spikes | Fire 60 s ahead, shard, autoscale | Bigger primary | The midnight spike is ~1,000× average |
 
 ## Implementation Notes
 
-This section maps the production architecture to what actually runs locally with Docker + Node.js + React.
+This section describes the code as it runs after the 2026-10 repair pass; [CLAUDE.md](./CLAUDE.md) records the iteration history.
 
-### Local Architecture
+### What runs
 
+Four Node.js (Express, TypeScript/CommonJS) entry points share one codebase: the API ([`backend/src/api/index.ts`](./backend/src/api/index.ts), port 3001 under `npm run dev`), the scheduler ([`backend/src/scheduler/index.ts`](./backend/src/scheduler/index.ts)), workers ([`backend/src/worker/index.ts`](./backend/src/worker/index.ts), three under `npm run dev`), and an all-in-one mode ([`backend/src/index.ts`](./backend/src/index.ts)). PostgreSQL holds jobs, executions and logs; Redis holds the leader lease, users, sessions, idempotency records and the worker registry. The React dashboard is in [`frontend/`](./frontend).
+
+### Production-grade patterns implemented
+
+| Pattern | Where | What it does |
+|---------|-------|--------------|
+| SKIP LOCKED claiming | [`db/execution-queue.ts`](./backend/src/db/execution-queue.ts) `claimExecutions` | One `WITH … FOR UPDATE SKIP LOCKED` + `UPDATE` statement; priority order; skips future `run_at` and paused jobs |
+| Leases, heartbeats, self-fencing | `renewLeases`; [`worker/index.ts`](./backend/src/worker/index.ts) | 30 s lease renewed every 10 s in one statement; local deadline aborts the handler if renewals fail |
+| Fencing tokens | `completeExecution`, `failExecution`, `releaseExecution` | Every outcome write is `WHERE fencing_token = $t AND status = 'RUNNING'`; rejections are counted |
+| Reaper | `reapExpiredLeases`, leader loop every 5 s | Lapsed lease = failed attempt → retry or dead letter |
+| Idempotent firing + misfire policy | [`db/schedule-repository.ts`](./backend/src/db/schedule-repository.ts) `fireDueJobs`, [`scheduler/cron.ts`](./backend/src/scheduler/cron.ts) | One transaction per batch; unique `(job_id, scheduled_at, attempt)`; 60 s grace; `fire_once`/`skip` |
+| Leader lease | [`queue/leader-election.ts`](./backend/src/queue/leader-election.ts) | `SET NX PX`, Lua compare-and-pexpire/delete, local deadline; standbys retry every tick |
+| Retries and dead letter | `applyFailure`, [`shared/backoff.ts`](./backend/src/shared/backoff.ts) | Equal-jitter exponential backoff; new row per attempt; `DEAD_LETTER` state; `NonRetryableError` |
+| Idempotency keys | [`shared/idempotency.ts`](./backend/src/shared/idempotency.ts) | On create, trigger and retry: `SET NX` claim, fingerprint → `422`, in-flight `409`, 5xx not stored, `503` if Redis is down |
+| Boundary validation | [`api/validation.ts`](./backend/src/api/validation.ts) | Cron (5/6 fields), registered handler, ranges; `400` with details instead of `500` |
+| Circuit breakers | [`shared/circuit-breaker.ts`](./backend/src/shared/circuit-breaker.ts) | Opossum per handler type; open breaker → execution released for 30 s without consuming an attempt |
+| Graceful shutdown | worker and scheduler `stop()` | Worker drains for `SHUTDOWN_GRACE_MS`, then hands executions back; scheduler releases its lease |
+| Metrics and logs | [`shared/metrics.ts`](./backend/src/shared/metrics.ts), [`utils/logger.ts`](./backend/src/utils/logger.ts) | prom-client (`/metrics` on the API; `METRICS_PORT` for scheduler and workers); Pino JSON logs |
+
+The core of the claim, as it runs:
+
+```sql
+WITH next AS (
+  SELECT e.id FROM job_executions e
+  WHERE e.status = 'PENDING' AND e.run_at <= NOW()
+    AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.id = e.job_id AND j.status = 'PAUSED')
+  ORDER BY e.priority DESC, e.run_at ASC
+  LIMIT $2
+  FOR UPDATE OF e SKIP LOCKED
+)
+UPDATE job_executions e
+SET status = 'RUNNING', worker_id = $1, started_at = NOW(), completed_at = NULL,
+    lease_expires_at = NOW() + ($3::int * INTERVAL '1 millisecond'),
+    fencing_token = nextval('execution_fencing_seq')
+FROM next WHERE e.id = next.id
+RETURNING e.*;
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                       Local Machine                           │
-│                                                               │
-│  ┌──────────────┐   ┌───────────────────────────────────┐    │
-│  │   Frontend   │   │          Backend Services          │    │
-│  │   Vite :5173 │──▶│                                   │    │
-│  │   React +    │   │  API Server      :3001             │    │
-│  │   TanStack   │   │  Scheduler       (background)     │    │
-│  │   Router +   │   │  Worker 1        (WORKER_ID=w-1)  │    │
-│  │   Zustand    │   │  Worker 2        (WORKER_ID=w-2)  │    │
-│  │              │   │  Worker 3        (WORKER_ID=w-3)  │    │
-│  └──────────────┘   └────────┬──────────────┬───────────┘    │
-│                              │              │                 │
-│                      ┌───────▼──────┐ ┌─────▼─────┐          │
-│                      │  PostgreSQL  │ │   Redis   │          │
-│                      │    :5432     │ │   :6379   │          │
-│                      │ job_scheduler│ │  (Valkey) │          │
-│                      └──────────────┘ └───────────┘          │
-│                                                               │
-│                      docker-compose up -d                     │
-└──────────────────────────────────────────────────────────────┘
-```
 
-### Production-Grade Patterns Implemented
+Tests: `npm test` runs 38 offline unit tests (backoff, cron and misfire planning, validation, the idempotency middleware against a real Express server, leader election with a fake clock, password hashing). With `TEST_DATABASE_URL` set it also runs 11 PostgreSQL integration tests: four concurrent claimers over 60 rows never share one, the highest priority is claimed first, a reaped lease rejects the stale worker's writes, cancel and release are fenced, redrive happens once, two concurrent firing passes fire each slot once, and both misfire policies.
 
-| Pattern | File(s) | Description |
-|---------|---------|-------------|
-| Leader election | `src/queue/leader-election.ts` | Redis `SET NX EX` with 30s TTL and 10s heartbeat. Standby instances auto-acquire on leader failure. |
-| Priority queue with visibility timeout | `src/queue/reliable-queue.ts` | Redis sorted sets for priority ordering and processing timeout tracking. ZPOPMIN for atomic dequeue. |
-| Circuit breaker (Opossum) | `src/shared/circuit-breaker.ts` | Per-handler circuit breakers with configurable thresholds, Prometheus metrics per state, and automatic recovery. |
-| Idempotency middleware | `src/shared/idempotency.ts` | Idempotency-Key header caching in Redis (24h TTL). Execution-level dedup via `SET NX EX` on `{job_id}:{scheduled_at}`. |
-| Prometheus metrics (prom-client) | `src/shared/metrics.ts` | 17+ metrics covering jobs, queue, workers, scheduler, HTTP, and circuit breakers. Metrics middleware auto-instruments all endpoints. Exposed at `GET /metrics`. |
-| Structured JSON logging (Pino) | `src/utils/logger.ts` | Pino with pino-pretty in dev. Contextual fields (jobId, executionId, workerId) on every log entry. |
-| Session-based RBAC | `src/shared/auth.ts` | Session auth with Redis storage. User/admin roles with permission matrix. Rate limiting on auth endpoints. |
-| Dead letter queue | `src/queue/reliable-queue.ts` | Failed jobs after max retries moved to Redis list for manual inspection and requeue. |
-| Exponential backoff retries | `src/worker/index.ts` | `min(initial * 2^attempt, max)` with configurable initial/max/retries per job. |
-| Data archival module | `src/shared/archival.ts` | Archival logic for moving old executions to cold storage. |
-| Multi-service architecture | `package.json` scripts | Separate `dev:api`, `dev:scheduler`, `dev:worker1-3` scripts for running each service independently. |
+### Simplified or substituted
 
-### Simplifications from Production Design
+- **One PostgreSQL, no shards or partitions.** `job_executions` is a plain table; `POST /api/v1/admin/cleanup` and the `system.maintenance` handler delete executions older than 30 days and logs older than 7. Nothing is archived to S3.
+- **UTC-only cron.** There is no per-job time zone; `cron-parser` always evaluates in UTC.
+- **No look-ahead firing.** Due slots are fired when due, so a large top-of-the-hour spike is not smoothed.
+- **Workers poll** every 500 ms (with jitter) instead of being woken by `LISTEN/NOTIFY`.
+- **Users live in Redis** (`job_scheduler:user:*`, salted scrypt hashes, legacy SHA-256 hashes upgraded on login). The PostgreSQL `users` table is seeded but unused. `admin` / `admin123` is created at API startup.
+- **Dashboard updates by polling** (dashboard and workers every 5 s, a running execution every 2 s) with Zustand stores and offset pagination; there is no SSE stream, no dead-letter page (the count and `/api/v1/dead-letter` exist), and no list virtualization.
 
-| Production Design | Local Substitute | Impact |
-|-------------------|-----------------|--------|
-| L7 Load Balancer + multiple API instances | Single API server (:3001) | No request distribution or failover |
-| Redis Cluster (sharded) | Single Valkey instance (:6379) | No sharding; queue is single point of failure |
-| PostgreSQL with read replicas | Single PostgreSQL (:5432) | No read scaling for execution history |
-| S3/MinIO cold storage | Archival module exists but no MinIO in docker-compose | No actual cold storage pipeline |
-| Prometheus + Grafana | Metrics endpoint only | Metrics exposed but no scraping or dashboards |
-| Multiple scheduler standby instances | Single scheduler process | No failover testing (but leader election code is functional) |
-| Container orchestration (K8s) | Manual process management via npm scripts | No auto-scaling, no health-based routing |
-| OAuth/JWT for external API access | Session-based auth only | Simpler but not suitable for service-to-service auth |
-| PostgreSQL partitioning (monthly) | Single unpartitioned tables | No partition pruning or easy archival |
-| Grafana alerting | Alert thresholds in code only | No active alerting infrastructure |
+### Omitted
 
-### What Was Omitted
+Sharding, read replicas, daily partitions and S3 archiving; per-team ownership and API keys; rate limiting (a `rateLimitConfig` object exists, no middleware applies it); webhook allow-lists and secret references; per-target circuit breakers; a load balancer and multi-region deployment; Kubernetes autoscaling; distributed tracing.
 
-- **Job dependencies (DAG workflows)**: Would require a dependency graph resolver and topological sorting for execution order. Deferred to avoid scope creep.
-- **Multi-tenancy**: Per-tenant job isolation, separate queues, and tenant-scoped rate limiting. Would require tenant_id on all tables and Redis key namespacing.
-- **Webhook notifications**: Callback on job completion/failure to external systems. Would use RabbitMQ for reliable delivery.
-- **Container-based execution**: Running job handlers in isolated Docker containers or Lambda functions for security and resource isolation.
-- **Kubernetes deployment**: HPA for auto-scaling workers based on queue depth, StatefulSet for scheduler, and Deployment for API servers.
-- **Grafana dashboards**: Visual monitoring of the comprehensive Prometheus metrics already being collected.
-- **Job rate limiting per type**: Preventing job flooding by limiting enqueue rate per handler type or user.
-- **Distributed tracing**: OpenTelemetry integration for tracing a job from creation through scheduling to execution.
+### Known limitations
+
+- **Cancellation is cooperative.** A cancelled or reclaimed handler is aborted through its `AbortSignal`; a handler that ignores the signal keeps running in the background until it finishes, though its result is rejected.
+- **No overlap policy.** If a run takes longer than its interval, the next slot still fires and both run (Kubernetes calls this `Allow`; `Forbid` is not implemented).
+- **Strict priority** can starve low-priority executions under sustained overload.
+- **Breakers are per handler type and per worker process**: one failing webhook host opens the breaker for every `http.webhook` job on that worker.
+- **Any authenticated user can trigger or retry any job**; there is no ownership model, and `shell.command` is registered in every environment.
+- **Seed jobs reference handlers that do not exist** (`database-backup`, `health-checker`, …); when they come due they are dead-lettered immediately as non-retryable.
+- The Docker `app` profile was updated (`dist/api/index.js`, `npm install` because no lockfile is committed) but not run in this pass.

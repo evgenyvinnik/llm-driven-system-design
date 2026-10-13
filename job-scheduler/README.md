@@ -18,46 +18,39 @@ A distributed task scheduling system with cron-like scheduling, priority queues,
 
 - **Job Management**: Create, update, delete, pause, resume, and trigger jobs
 - **Cron Scheduling**: Support for cron expressions for recurring jobs
-- **Priority Queues**: Jobs are executed based on priority (0-100)
+- **Priority Queue in PostgreSQL**: executions are claimed highest priority first with `FOR UPDATE SKIP LOCKED`
 - **Distributed Workers**: Scale horizontally with multiple worker instances
-- **Retry Logic**: Exponential backoff with configurable max retries
+- **Retry Logic**: Exponential backoff with jitter; `max_retries` counts retries after the first attempt
 - **Leader Election**: Scheduler uses Redis-based leader election for high availability
-- **At-Least-Once Execution**: Guaranteed job execution with visibility timeouts
-- **Dead Letter Queue**: Failed jobs are moved to DLQ for investigation
-- **Real-time Dashboard**: Monitor jobs, executions, and workers in real-time
+- **At-Least-Once Execution**: 30 s leases renewed by heartbeat, a reaper for lapsed leases, and fencing tokens
+- **Missed-Run Policy**: runs missed by more than 60 s are fired once (`fire_once`) or skipped (`skip`), per job
+- **Dead Letter**: runs that exhaust their retries (or fail permanently) wait in `DEAD_LETTER` for a redrive
+- **Dashboard**: monitor jobs, executions, and workers (polling every few seconds)
 
 ## Architecture
 
 ```
-                    ┌─────────────────┐
-                    │   Frontend      │
-                    │   Dashboard     │
-                    └────────┬────────┘
-                             │
-                    ┌────────▼────────┐
-                    │   API Server    │
-                    │   (Express)     │
-                    └────────┬────────┘
-                             │
-         ┌───────────────────┼───────────────────┐
-         │                   │                   │
-    ┌────▼────┐        ┌─────▼─────┐       ┌─────▼─────┐
-    │ Scheduler│        │PostgreSQL │       │   Redis   │
-    │ (Leader) │        │  (Jobs)   │       │  (Queue)  │
-    └────┬─────┘        └───────────┘       └─────┬─────┘
-         │                                        │
-         └──────────────┬─────────────────────────┘
-                        │
-    ┌───────────────────┼───────────────────┐
-    │                   │                   │
-┌───▼────┐         ┌────▼───┐          ┌────▼───┐
-│Worker 1│         │Worker 2│          │Worker N│
-└────────┘         └────────┘          └────────┘
+┌──────────────────────────┐  ┌──────────────────────────┐  ┌──────────────────────────┐
+│ React dashboard :5173    ├─▶│ API server :3001         ├─▶│ Redis                    │
+└──────────────────────────┘  └────────────┬─────────────┘  │ leader lease, sessions   │
+                                           │                └──────────────────────────┘
+                                           │ jobs, triggers
+                                           │
+                                           ▼
+┌──────────────────────────┐  ┌──────────────────────────┐  ┌──────────────────────────┐
+│ Scheduler (leader)       ├─▶│ PostgreSQL               │◀─┤ Workers 1..3             │
+│ fires slots, reaps       │  │ job_executions = queue   │  │ claim, lease, fence      │
+└──────────────────────────┘  └──────────────────────────┘  └──────────────────────────┘
 ```
+
+The execution table in PostgreSQL is the work queue: the scheduler fires each due slot in one
+transaction, and workers claim executions with `FOR UPDATE SKIP LOCKED`, hold them under a
+renewable lease, and record outcomes with writes fenced on the lease's token. Redis only holds
+coordination state that can be rebuilt. See [architecture.md](./architecture.md) for the design.
 
 ## Prerequisites
 
-- Node.js 18+
+- Node.js 20+
 - Docker and Docker Compose
 - npm or yarn
 
@@ -135,6 +128,19 @@ Access the dashboard at http://localhost:5173 and sign in with **`admin` /
 `admin123`** (created automatically on API startup; override with
 `ADMIN_USERNAME` / `ADMIN_PASSWORD`).
 
+### Tests
+
+```bash
+cd backend
+npm test        # unit tests (offline): backoff, cron/misfire planning, validation,
+                # Idempotency-Key middleware, leader election, password hashing
+
+# PostgreSQL integration tests for claiming, leases, fencing and firing.
+# They TRUNCATE tables, so point them at a throwaway database:
+createdb -U scheduler job_scheduler_test
+TEST_DATABASE_URL=postgres://scheduler:scheduler@localhost:5432/job_scheduler_test npm test
+```
+
 ## Running Distributed Workers
 
 To simulate a distributed environment, run multiple worker instances:
@@ -158,14 +164,14 @@ Each worker will register with Redis and pull jobs from the shared queue.
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| POST | `/api/v1/jobs` | Create a new job |
+| POST | `/api/v1/jobs` | Create a job (validated; optional `Idempotency-Key` header) |
 | GET | `/api/v1/jobs` | List all jobs |
 | GET | `/api/v1/jobs/:id` | Get job details |
 | PUT | `/api/v1/jobs/:id` | Update a job |
 | DELETE | `/api/v1/jobs/:id` | Delete a job |
 | POST | `/api/v1/jobs/:id/pause` | Pause a job |
 | POST | `/api/v1/jobs/:id/resume` | Resume a paused job |
-| POST | `/api/v1/jobs/:id/trigger` | Trigger immediate execution |
+| POST | `/api/v1/jobs/:id/trigger` | Run now (optional `Idempotency-Key`; `409` while paused) |
 
 #### Create Job Example
 
@@ -193,18 +199,19 @@ curl -X POST http://localhost:3001/api/v1/jobs \
 |--------|----------|-------------|
 | GET | `/api/v1/jobs/:id/executions` | List job executions |
 | GET | `/api/v1/executions/:id` | Get execution details |
-| POST | `/api/v1/executions/:id/cancel` | Cancel a running execution |
-| POST | `/api/v1/executions/:id/retry` | Retry a failed execution |
+| POST | `/api/v1/executions/:id/cancel` | Cancel a pending or running execution (`409` if finished) |
+| POST | `/api/v1/executions/:id/retry` | Run a failed, cancelled or dead-lettered run again as its next attempt |
 
 ### Metrics
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| GET | `/api/v1/health` | Health check |
-| GET | `/api/v1/metrics` | System metrics |
+| GET | `/api/v1/health`, `/api/v1/health/ready`, `/api/v1/health/live` | Health checks |
+| GET | `/api/v1/metrics/system` | Dashboard metrics (queue depth, workers, breakers) |
+| GET | `/metrics` | Prometheus scrape endpoint (scheduler and workers: set `METRICS_PORT`) |
 | GET | `/api/v1/metrics/executions` | Execution statistics |
 | GET | `/api/v1/workers` | List active workers |
-| GET | `/api/v1/dead-letter` | Dead letter queue items |
+| GET | `/api/v1/dead-letter` | Executions in `DEAD_LETTER` |
 
 ## Built-in Job Handlers
 
@@ -215,7 +222,10 @@ curl -X POST http://localhost:3001/api/v1/jobs \
 | `test.echo` | Echo the payload (testing) |
 | `test.delay` | Delay for specified duration (testing) |
 | `test.log` | Log a message (testing) |
-| `system.cleanup` | Clean up old executions |
+| `system.cleanup` | Logs what a cleanup would delete (no-op) |
+| `system.maintenance` | Deletes executions older than 30 days and logs older than 7 |
+
+Jobs naming any other handler are rejected with `400` at creation.
 
 ### Handler Payloads
 
@@ -267,14 +277,20 @@ curl -X POST http://localhost:3001/api/v1/jobs \
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PORT` | `3001` | API server port |
-| `DATABASE_URL` | - | PostgreSQL connection string |
-| `REDIS_URL` | - | Redis connection string |
-| `SCHEDULER_INSTANCE_ID` | `scheduler-1` | Unique scheduler ID |
-| `LEADER_LOCK_TTL` | `30` | Leader lock TTL in seconds |
-| `SCAN_INTERVAL_MS` | `1000` | Job scan interval |
-| `WORKER_ID` | `worker-1` | Unique worker ID |
-| `MAX_CONCURRENT_JOBS` | `5` | Max jobs per worker |
-| `VISIBILITY_TIMEOUT_MS` | `300000` | Job visibility timeout |
+| `DATABASE_URL` | `postgres://scheduler:scheduler@localhost:5432/job_scheduler` | PostgreSQL connection string |
+| `REDIS_URL` | `redis://localhost:6379` | Redis connection string |
+| `SCHEDULER_INSTANCE_ID` | `scheduler-<pid>` | Unique scheduler ID (the leader lease value) |
+| `LEADER_LOCK_TTL` | `30` | Leader lease TTL in seconds (renewed every third) |
+| `SCAN_INTERVAL_MS` | `1000` | Scheduler tick |
+| `MISFIRE_GRACE_MS` | `60000` | How late a slot may be and still count as on time |
+| `REAPER_INTERVAL_MS` | `5000` | How often the leader reclaims lapsed leases |
+| `WORKER_ID` | `worker-<pid>` | Unique worker ID |
+| `MAX_CONCURRENT_JOBS` | `5` | Executions a worker holds at once |
+| `POLL_INTERVAL_MS` | `500` | Claim interval when the queue is empty |
+| `LEASE_DURATION_MS` | `30000` | Execution lease; renewed every third, reclaimed when it lapses |
+| `SHUTDOWN_GRACE_MS` | `10000` | On SIGTERM, how long a worker drains before handing work back |
+| `METRICS_PORT` | unset | Serve `/metrics` from a scheduler or worker process |
+| `ADMIN_USERNAME` / `ADMIN_PASSWORD` | `admin` / `admin123` | Admin user created on API startup |
 
 ## Implementation Status
 
@@ -286,16 +302,16 @@ curl -X POST http://localhost:3001/api/v1/jobs \
 - [x] Scheduler service
 - [x] Frontend dashboard
 - [x] Docker support
-- [ ] Comprehensive testing
+- [x] Unit tests and PostgreSQL integration tests (vitest)
 - [ ] Performance optimization
 - [ ] Production hardening
 
 ## Key Design Decisions
 
-1. **Leader Election**: Uses Redis `SET NX EX` for simple, reliable leader election
-2. **At-Least-Once Delivery**: Jobs in processing have visibility timeouts; stalled jobs are recovered
-3. **Priority Queue**: Redis sorted sets with inverted priority scores
-4. **Exponential Backoff**: `min(initial * 2^attempt, max)` formula for retries
+1. **The execution table is the queue**: PostgreSQL rows claimed with `FOR UPDATE SKIP LOCKED`, so firing, retries and outcomes are single-database transactions (no Redis/PostgreSQL dual write)
+2. **Leases + fencing tokens**: a 30 s lease renewed by heartbeat; every outcome write is conditional on the claim's token, so a stalled worker cannot overwrite a newer attempt
+3. **Leader election is an optimization**: the Redis lease keeps one scheduler busy, but the firing transaction (row locks + unique `(job_id, scheduled_at, attempt)`) is what prevents double firing
+4. **Retries**: equal-jitter exponential backoff, one row per attempt, `DEAD_LETTER` after the budget; a lapsed lease counts as a failed attempt
 
 ## Troubleshooting
 
@@ -316,7 +332,8 @@ curl -X POST http://localhost:3001/api/v1/jobs \
 ### Worker not processing
 
 1. Check Redis connection
-2. Verify queue has items: `redis-cli ZCARD job_scheduler:queue`
+2. Check the queue: `SELECT status, count(*) FROM job_executions WHERE status IN ('PENDING','RUNNING','DEAD_LETTER') GROUP BY 1;`
+   PENDING rows whose job is `PAUSED` are held until the job is resumed
 3. Check worker logs for errors
 
 ### Database connection issues
