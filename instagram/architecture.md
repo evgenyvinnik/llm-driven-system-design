@@ -1,1124 +1,482 @@
-# Instagram - Photo Sharing - Architecture Design
+# Instagram (Photo Sharing) — Architecture
 
 ## System Overview
 
-A photo and video sharing social platform supporting photo uploads with filters, personalized feeds, ephemeral stories, direct messaging, and social graph interactions. This document describes two layers: a production-ready architecture for hundreds of millions of users, and the pocket-size implementation that actually runs locally.
+Instagram lets people upload photos, follow each other, and scroll a home feed of posts from the accounts they follow, alongside 24-hour stories and direct messages. Two problems make it a real design exercise. First, **media ingestion**: a 3 MB photo has to be uploaded over a phone connection, resized into several renditions, and published exactly once, even when the client retries and the processing fleet crashes half way. Second, **feed generation**: a feed load must be a cache lookup, yet one post from an account with a hundred million followers cannot turn into a hundred million cache writes. The answer is a hybrid: precompute timelines on write for normal accounts, merge in high-follower accounts on read.
 
----
+This document describes the production-scale design first. [Implementation Notes](#implementation-notes) describe what the local Express + PostgreSQL + Valkey + RabbitMQ + MinIO + Cassandra + React implementation actually runs.
 
-# Layer 1: Production-Ready Architecture
+**Learning goals**
 
-This section describes how Instagram would work at production scale -- hundreds of millions of daily active users, petabytes of media, and millions of requests per second.
+- Hybrid fan-out: push to cached follower timelines below a follower threshold, pull and merge above it.
+- Treating a precomputed timeline as a cache: lazy rebuild, capped size, expiry, keyset pagination.
+- An upload pipeline that survives retries and crashes: idempotency keys, a transactional outbox, idempotent workers, bounded retries and a dead-letter queue.
+- Visibility rules (private accounts, unpublished posts, conversation membership) enforced on every read path.
+- Polyglot persistence: PostgreSQL for the graph and posts, Redis for timelines, object storage for media, Cassandra for messages.
 
 ## Requirements
 
-### Functional Requirements
+### Functional requirements
 
-- **Photo/video upload**: Users upload media with captions, tags, location, and filters; media is processed into multiple resolutions and formats
-- **Personalized feed**: Timeline of posts from followed users, ranked by relevance signals (recency, engagement, relationship closeness)
-- **Stories**: Ephemeral 24-hour photo/video content with view tracking and auto-expiration
-- **Direct messaging**: Private text and media messages between users with read receipts and typing indicators
-- **Social graph**: Follow/unfollow, followers/following lists, mutual connections
-- **Engagement**: Likes, comments (with threading), saves/bookmarks
-- **Search**: Full-text search for users, hashtags, and locations
-- **Explore**: Discovery feed based on engagement signals and content similarity
-- **Notifications**: Push and in-app notifications for likes, comments, follows, DMs
+1. **Post**: upload one to ten photos with a caption, location and per-photo filter; the post appears once its images are processed.
+2. **Home feed**: posts from followed accounts (and your own), newest first, with infinite scroll.
+3. **Engage**: like, save and comment on posts; follow and unfollow accounts; private accounts approve who can see their posts.
+4. **Stories**: 24-hour posts shown as rings in a tray, with "seen" state and a viewer list for the author.
+5. **Direct messages**: one-to-one conversations with read receipts, typing indicators and reactions.
+6. **Explore**: popular posts from public accounts you don't follow.
 
-### Non-Functional Requirements
+Out of scope: video transcoding, feed ranking models, search, notifications, ads and content moderation (each mentioned where it would plug in).
 
-- **Availability**: 99.99% uptime (52 minutes downtime/year)
-- **Latency**: Feed load p99 < 200ms, photo upload acknowledgment p99 < 500ms, image serving p99 < 50ms via CDN, DM delivery p99 < 100ms
-- **Scalability**: 500M+ DAU, 100M+ photo uploads/day, 1B+ feed requests/day
-- **Consistency**: Eventual consistency for feeds (2-5s delay acceptable), strong consistency for follows and message delivery order
-- **Durability**: Zero data loss for user-generated content, 99.999999999% (11 nines) object storage durability
+### Non-functional requirements
+
+| Requirement | Target |
+|-------------|--------|
+| Feed load | p99 < 200 ms server-side for a page of 20 |
+| Post creation acknowledgement | p99 < 500 ms after the upload finishes |
+| Publish latency | Post visible to followers within 5 s (p95) of the upload |
+| Image delivery | p99 < 100 ms from the CDN edge |
+| Availability | 99.95% for feed and reads; uploads may queue but must never be lost |
+| Correctness | One "Share" creates at most one post; a private account's posts are never shown to non-followers |
+| Durability | No accepted upload is lost (originals kept until processing succeeds) |
 
 ## Capacity Estimation
 
-### Production Scale
+| Quantity | Estimate | Design consequence |
+|----------|----------|--------------------|
+| Daily active users | 500M | |
+| New posts | 100M/day → ~1.2K/s average, ~3.5K/s peak | Processing is asynchronous and sized for peaks |
+| Feed loads | 5B/day → ~58K/s average, ~150K/s peak | A feed read must be a cache lookup plus one hydration query |
+| Read:write ratio | ~50 feed loads per post | Precompute on write wherever it is affordable |
+| Original uploads | 3 MB × 100M ≈ 300 TB/day | Clients upload straight to object storage, never through API servers |
+| Renditions | ~1.5 MB per post ≈ 150 TB/day | Immutable keys, CDN with a one-year TTL |
+| Image egress | ~1 MB per feed page × 150K/s ≈ 1.2 Tbps peak | The CDN must absorb well over 95% |
+| Timelines | 500 ids × ~80 B ≈ 40 KB per user; 500M users ≈ 20 TB of RAM | Cap at 500 entries, expire idle timelines after 7 days |
+| Celebrity fan-out | One post to 100M followers = 100M writes ≈ 100 s of a 1M-writes/s cluster | Don't push for large accounts; pull them at read time |
+| Direct messages | 10B/day → ~115K/s average, ~300K/s peak | Write-optimized store partitioned by conversation |
 
-| Metric | Value | Calculation |
-|--------|-------|-------------|
-| Daily Active Users (DAU) | 500M | Global user base |
-| Posts per day | 100M | ~20% of DAU post daily |
-| Stories per day | 500M | Stories are more frequent than posts |
-| Average post size (original) | 3 MB | High-resolution photos |
-| Average post size (processed, all sizes) | 1.5 MB | Thumbnail + 4 resolutions + WebP |
-| Feed requests/day | 5B | ~10 feed loads per user |
-| Peak QPS (feed) | 150K | 5B/day with 3x peak factor, 86400s |
-| Peak QPS (upload) | 5K | 100M/day concentrated in active hours |
-| DM messages/day | 10B | Average 20 messages per active user |
-| Peak QPS (DM) | 300K | 10B/day with 2.5x peak factor |
+### Local Development Scale
 
-### Storage Growth
-
-| Component | Daily Growth | Annual Growth |
-|-----------|-------------|---------------|
-| Original media | 300 TB | 110 PB |
-| Processed media | 150 TB | 55 PB |
-| Database (metadata) | 5 TB | 1.8 PB |
-| Message storage (Cassandra) | 10 TB | 3.6 PB |
-| CDN cache | 50 TB (hot set) | N/A (eviction-based) |
-
-### Bandwidth
-
-| Direction | Peak | Calculation |
-|-----------|------|-------------|
-| Ingress (uploads) | 15 Gbps | 5K uploads/s x 3 MB |
-| Egress (feed + images) | 2 Tbps | 150K feed req/s x ~2 MB media per load |
-| CDN offload | ~90% | CDN serves cached media, origin handles 10% |
+One API process, one image worker, and PostgreSQL, Valkey, RabbitMQ, MinIO and Cassandra from Docker Compose. The seed has ten users and eighteen posts, so `FEED_CELEBRITY_THRESHOLD` (default 10,000) can be lowered to 4 to make the seeded account `alice` a "celebrity" and exercise the pull path. Ports and setup are in the [README](./README.md).
 
 ## High-Level Architecture
 
 ```
-┌──────────────────────────────────────────────────────────────────────────────────────┐
-│                                    Clients                                           │
-│                    (iOS / Android / Web / Progressive Web App)                        │
-└─────────────────────────────────┬────────────────────────────────────────────────────┘
-                                  │
-                    ┌─────────────▼─────────────┐
-                    │          CDN              │
-                    │  (CloudFront / Cloudflare) │
-                    │  Static assets + media     │
-                    └─────────────┬─────────────┘
-                                  │
-                    ┌─────────────▼─────────────┐
-                    │       API Gateway          │
-                    │   (Rate limiting, auth,     │
-                    │    routing, SSL termination)│
-                    └─────────────┬─────────────┘
-                                  │
-          ┌───────────────────────┼───────────────────────┐
-          │                       │                       │
-┌─────────▼─────────┐  ┌─────────▼─────────┐  ┌─────────▼─────────┐
-│   Load Balancer   │  │   Load Balancer   │  │   Load Balancer   │
-│   (Feed + Social) │  │   (Media + Story) │  │   (DM + Notif)    │
-└─────────┬─────────┘  └─────────┬─────────┘  └─────────┬─────────┘
-          │                       │                       │
-┌─────────▼─────────┐  ┌─────────▼─────────┐  ┌─────────▼─────────┐
-│                   │  │                   │  │                   │
-│   Feed Service    │  │   Media Service   │  │    DM Service     │
-│   Social Service  │  │   Story Service   │  │  Notification Svc │
-│   Search Service  │  │   Processing Svc  │  │  Presence Service │
-│                   │  │                   │  │                   │
-└────────┬──────────┘  └────────┬──────────┘  └────────┬──────────┘
-         │                      │                       │
-         │         ┌────────────┼────────────┐          │
-         │         │            │            │          │
-┌────────▼────┐ ┌──▼──────┐ ┌──▼──────┐ ┌───▼────┐ ┌──▼─────────┐
-│ PostgreSQL  │ │  Redis  │ │  S3 /   │ │ Kafka  │ │ Cassandra  │
-│  Cluster    │ │ Cluster │ │ Object  │ │Cluster │ │  Cluster   │
-│ (sharded)   │ │ (feed,  │ │ Storage │ │(events)│ │  (DMs)     │
-│             │ │ session,│ │         │ │        │ │            │
-│             │ │ cache)  │ │         │ │        │ │            │
-└─────────────┘ └─────────┘ └─────────┘ └────────┘ └────────────┘
+ ┌──────────────────────────────────────────┐                           ┌───────────────────────┐
+ │ Mobile app / web client                  │── GET image renditions ──▶│ CDN                   │
+ │ feed list, uploader, media cache         │── (1) PUT original ─┐     │ image renditions      │
+ └──────────────────┬───────────────────────┘                     │     └───────────┬───────────┘
+                    │ POST /api/v1/posts                 signed   │                 │
+                    ▼ (2) GET /api/v1/feed?cursor=       URL      │                 │
+ ┌────────────────────────────────────────────────────────────┐   │                 │ cache miss
+ │ API gateway · TLS, session check, rate limits              │   │                 │
+ └──────────┬─────────────────────────────────────┬───────────┘   │                 │
+            │                                     │               │                 │
+            ▼                                     ▼               │                 ▼
+ ┌──────────────────────┐              ┌──────────────────────┐   │     ┌───────────────────────┐
+ │ Feed service         ├───────────┐  │ Post service         │   └────▶│ Object storage (S3)   │
+ │ merge + hydrate      │           │  │ create, like, follow │         │ originals, renditions │
+ └──────────┬───────────┘ celebrity │  └──────────┬───────────┘         └───────────────────────┘
+            │ ZREVRANGE   posts,    │             │ INSERT post                 ▲
+            │ timeline    hydrate   │             │ + outbox                    │
+            ▼                       │             ▼                             │
+ ┌──────────────────────┐           │  ┌──────────────────────┐                 │ GET original,
+ │ Redis cluster        │           │  │ PostgreSQL (sharded) │                 │ PUT renditions
+ │ timelines, post cache│           └─▶│ posts, follows, likes│◀────────────┐   │
+ └──────────────────────┘              │ outbox               │ status =    │   │
+            ▲                          └──────────┬───────────┘ published   │   │
+            │                                     │                         │   │
+            │ ZADD to                             │ (3) outbox              │   │
+            │ followers                           │ relay                   │   │
+            │                                     ▼             media-jobs  │   │
+ ┌──────────┴─────────┐                ┌──────────────────────┐         ┌───┴───┴───────────────┐
+ │ Fan-out workers    │ post-published │ Kafka                ├────────▶│ Media workers         │
+ │ push to timelines  │◀───────────────┤ media-jobs, published│◀────────┤ resize, then publish  │
+ └────────────────────┘                └──────────────────────┘         └───────────────────────┘
+                                                                post-published
 ```
 
-## Service Decomposition
+1. **Create (1).** The client gets a signed upload URL and PUTs the original photo straight into object storage. It then calls `POST /api/v1/posts` with an `Idempotency-Key`; the Post service writes the post (status `processing`), its media rows, the key and an outbox event in one PostgreSQL transaction, and answers `202`.
+2. **Read (2).** `GET /api/v1/feed` reaches the Feed service, which reads the viewer's precomputed timeline from Redis, pulls recent posts of followed celebrity accounts from PostgreSQL, merges both by time and hydrates one page in a single query. Images come from the CDN.
+3. **Publish (3).** The outbox relay puts a media job on Kafka. A media worker resizes the original into renditions, marks the post `published` and emits `post-published`; fan-out workers push the post id into followers' cached timelines, except for authors with 10,000+ followers, whose posts are pulled at read time instead.
 
-### Feed Service
+| Component | Responsibility | Scales with | Notes |
+|-----------|----------------|-------------|-------|
+| CDN | Serves image renditions | Image requests | Keys are immutable, so nothing is ever purged |
+| API gateway | TLS, session check, rate limits, routing | Requests | Rejects abusive clients before any service work |
+| Post service | Signed URLs, post creation, likes, comments, follows | Writes (~3.5K posts/s peak) | Owns `posts`; the outbox relay runs beside it |
+| Feed service | Timeline read, celebrity merge, hydration | Feed loads (~150K/s peak) | Stateless; the hottest read path |
+| Object storage | Originals and renditions | Bytes stored | Originals deleted after processing |
+| PostgreSQL | Users, posts, follows, likes, comments, outbox | Rows; sharded by user id | Read replicas serve hydration |
+| Redis cluster | Timelines, post objects, sessions, rate limits | Active users (~20 TB) | A cache: losing it makes feeds slower, never wrong |
+| Kafka | `media-jobs`, `post-published` | Upload rate | Partitioned by author id |
+| Media workers | Resize and encode, then publish | Queue depth | CPU-bound; autoscaled on lag |
+| Fan-out workers | Push post ids into follower timelines | Follower edges written | Skip celebrity authors entirely |
 
-Responsible for generating and serving personalized feeds. Uses a hybrid push/pull model:
+Direct messages and stories are separate subsystems (a WebSocket gateway with Cassandra, and a stories service with its own tray cache); they are described under [Stories and direct messages](#stories-and-direct-messages).
 
-- **Fan-out on write** for users with < 10K followers: When a user posts, the post ID is pushed to each follower's precomputed timeline in Redis. This gives instant feed reads for the majority of users.
-- **Fan-out on read** for celebrities (> 10K followers): Celebrity posts are not fanned out. Instead, when a follower loads their feed, the system merges their precomputed timeline with recent posts from celebrities they follow. This avoids writing to millions of timelines on a single post.
+## Core Components / Request Flows
 
-Feed ranking applies lightweight ML scoring: `score = w1 * recency + w2 * engagement_prediction + w3 * relationship_closeness`. The ranker runs at read time on the merged candidate set.
+### Creating a post
 
-### Media Service
+```
+Client                               Post service   Object storage           PostgreSQL
+   │                                       │               │                      │
+   │ 1 POST /uploads                       │               │                      │
+   │──────────────────────────────────────▶│               │                      │
+   │ 2 upload ids + signed PUT URLs        │               │                      │
+   │◀──────────────────────────────────────│               │                      │
+   │ 3 PUT original (signed URL)                           │                      │
+   │──────────────────────────────────────────────────────▶│                      │
+   │ 4 POST /posts, Idempotency-Key K      │               │                      │
+   │──────────────────────────────────────▶│               │                      │
+   │                                       │ 5 key K seen for this user?          │
+   │                                       │─────────────────────────────────────▶│
+   │                                       │ 6 1 tx: post + media + key + outbox  │
+   │                                       │─────────────────────────────────────▶│
+   │ 7 202 post (status processing)        │               │                      │
+   │◀──────────────────────────────────────│               │                      │
+   ················ response lost, client retries with the same K ·················
+   │ 8 POST /posts, Idempotency-Key K      │               │                      │
+   │──────────────────────────────────────▶│               │                      │
+   │ 9 202 same post, Idempotent-Replayed  │               │                      │
+   │◀──────────────────────────────────────│               │                      │
+   │                                       │               │                      │
+```
 
-Handles upload, processing, and serving of photos and videos:
+- The upload goes straight to object storage, so a 10 MB photo never occupies an API server. The signed URL is scoped to one object key and expires after 15 minutes.
+- The `Idempotency-Key` is generated once per draft on the client. Step 5 returns the stored post if the same user already used that key with the same request fingerprint (caption, location, filters and a hash of each file), and `422` if the key was reused with a different request.
+- Step 6 is one transaction: the post, its media rows, the idempotency key and an outbox event either all commit or none do. The primary key on `(user_id, key)` serializes concurrent retries: the second insert waits for the first transaction and then conflicts, and that request answers with the winner's post.
+- `202 Accepted` is honest: the post exists but is not visible to followers until the pipeline publishes it.
 
-1. **Upload flow**: Client uploads to a pre-signed S3 URL (bypassing the API for large files). The API server receives the metadata and enqueues a processing job.
-2. **Processing pipeline**: A fleet of GPU/CPU workers consumes from the processing queue:
-   - Validate format (JPEG, PNG, WebP, HEIC, AVIF)
-   - Strip EXIF data for privacy
-   - Auto-orient based on EXIF rotation
-   - Generate 5 sizes: thumbnail (150x150), small (320x320), medium (640x640), large (1080x1080), original-aspect (2048 max dimension)
-   - Convert to WebP and AVIF for 30-50% size savings with JPEG fallback
-   - Apply server-side filter effects when requested
-3. **Serving**: All processed media is served through CDN with cache headers (`Cache-Control: public, max-age=31536000, immutable`). Content-addressed keys ensure cache correctness.
+### Reading the feed
 
-### Story Service
+```
+Client                   Feed service                            Redis   PostgreSQL
+   │                           │                                   │          │
+   │ 1 GET /feed?cursor=ms_id  │                                   │          │
+   │──────────────────────────▶│                                   │          │
+   │                           │ 2 timeline entries below cursor   │          │
+   │                           │──────────────────────────────────▶│          │
+   │                           │ 3 post ids + times, built marker  │          │
+   │                           │◀──────────────────────────────────│          │
+   │                           │ 4 followed celebrities' posts below cursor   │
+   │                           │─────────────────────────────────────────────▶│
+   │                           │ 5 merge by (time, id), keep 20    │          │
+   │                           │ 6 hydrate 20 posts (one query)               │
+   │                           │─────────────────────────────────────────────▶│
+   │ 7 posts + nextCursor      │                                   │          │
+   │◀──────────────────────────│                                   │          │
+   │                           │                                   │          │
+```
 
-Manages ephemeral 24-hour content:
+- The timeline is a Redis sorted set: score = post time in milliseconds, member = post id, capped at 500 entries. The cursor is `(time, id)` of the last item returned, so new posts arriving at the head never shift later pages.
+- Step 4 is the read-time half of the hybrid. It fetches recent posts of followed accounts above the celebrity threshold; production keeps each celebrity's last 100 post ids in a Redis list so this is one pipelined read rather than a database query.
+- Step 6 loads author, media, and the viewer's like and save state for the whole page in one round trip; posts that were deleted or are not published drop out here, so a stale timeline entry can never render.
+- If the timeline is missing (new user, evicted, idle for a week), the Feed service marks it as built and rebuilds it from PostgreSQL before reading. If the reader scrolls past the 500 cached entries, the next page comes from PostgreSQL with the same cursor.
 
-- Stories have `expires_at = created_at + 24h` and are filtered at query time
-- Story tray (the ring of user avatars at the top) is cached per user with unseen stories sorted first
-- View tracking uses `INSERT ... ON CONFLICT DO NOTHING` for deduplication
-- A background cron job runs every 15 minutes to hard-delete expired stories and their media from S3
-- Story media uses the same processing pipeline as posts but with fewer sizes (medium + thumbnail only)
+### Publishing and fan-out
 
-### DM Service
+```
+S3               Media worker           PostgreSQL    Kafka              Fan-out              Redis
+ │                     │                     │          │                   │                   │
+ │                     │ 1 media-job                    │                   │                   │
+ │                     │◀───────────────────────────────│                   │                   │
+ │                     │ 2 processing?       │          │                   │                   │
+ │                     │────────────────────▶│          │                   │                   │
+ │ 3 GET + PUT images  │                     │          │                   │                   │
+ │◀────────────────────│                     │          │                   │                   │
+ │                     │ 4 publish (locked)  │          │                   │                   │
+ │                     │────────────────────▶│          │                   │                   │
+ │                     │ 5 post-published               │                   │                   │
+ │                     │───────────────────────────────▶│                   │                   │
+ │                     │                     │          │ 6 post-published  │                   │
+ │                     │                     │          │──────────────────▶│                   │
+ │                     │                     │ 7 followers page             │                   │
+ │                     │                     │◀─────────────────────────────│                   │
+ │                     │                     │          │                   │ 8 ZADD timelines  │
+ │                     │                     │          │                   │──────────────────▶│
+ ·························· failure: retry in 5 s, 3 tries, then DLQ ····························
+ │                     │                     │          │                   │                   │
+```
 
-Real-time messaging service using WebSocket connections:
+- Every step is safe to repeat, because delivery is at least once: the relay may publish an event twice, and Kafka redelivers after a crash. Step 2 skips posts that are already published; step 3 writes deterministic keys (`images/{postId}/{index}/{size}`) so a retry overwrites rather than orphans; step 4 re-checks the status under a row lock so two concurrent deliveries can't both publish.
+- Fan-out reads followers a page at a time (keyset on follower id) and writes each page as one Redis pipeline. A Lua script adds the post only to timelines that already exist: inactive users get no writes and rebuild on their next visit.
+- A failed job is retried after 5 seconds, up to three attempts, then sent to a dead-letter queue and the post is marked `failed` so the author sees "Upload failed — retry".
 
-- Persistent WebSocket connections (via Socket.io or custom WS layer) for message delivery, typing indicators, and read receipts
-- Messages stored in Cassandra, partitioned by `conversation_id` with `TimeUUID` clustering keys for natural time ordering
-- Cassandra's high write throughput handles the 300K+ QPS for DM writes
-- Typing indicators use Cassandra TTL (5 seconds) -- no explicit cleanup needed
-- Read receipts update a per-user-per-conversation counter
-- Fallback to HTTP polling when WebSocket connections drop
+### Stories and direct messages
 
-### Notification Service
+**Stories** are posts with `expires_at = created_at + 24h`, processed synchronously into two sizes. The tray (the row of rings) is cached per viewer for at most 60 seconds and never past the earliest expiry in it; a ring is "seen" only when every active story in it has been viewed. Creating or deleting a story invalidates the trays of the author's followers, batched like fan-out and skipped for celebrity accounts, which rely on the short TTL.
 
-Delivers push and in-app notifications:
+**Direct messages** use a WebSocket gateway for delivery and Cassandra for storage. Messages are partitioned by conversation and clustered by a TimeUUID, so "newest 50 in this conversation" is one sequential read of one partition; the inbox is a second table partitioned by user and clustered by last-message time. Every conversation-scoped operation first checks that the caller is a participant.
 
-- Consumes events from Kafka (new_like, new_comment, new_follow, new_dm)
-- Deduplicates notifications (e.g., "alice and 5 others liked your post" instead of 6 separate notifications)
-- Routes to APNs (iOS), FCM (Android), and WebSocket (web) based on user device registration
-- Supports notification preferences (mute, DND schedules)
-- In-app notification feed stored in Redis sorted sets with 30-day retention
+## Database Schema
 
-### Search Service
+### Production schema
 
-Full-text search powered by Elasticsearch:
-
-- User search by username, display name (fuzzy matching, prefix completion)
-- Hashtag search with trending aggregation
-- Location search with geo-queries
-- Index updates propagated via Kafka CDC (Change Data Capture) from PostgreSQL
-- Autocomplete uses edge-ngram tokenizers for sub-100ms response times
-
-## Database Design at Scale
-
-### PostgreSQL (Relational Metadata)
-
-PostgreSQL handles ACID-critical data: users, posts, follows, likes, comments, stories.
-
-**Sharding strategy**: Hash-based sharding by `user_id` across 256 logical shards mapped to physical database clusters. This ensures all data for a single user is co-located (posts, likes, follows where the user is the actor).
-
-**Read replicas**: Each shard has 2-3 read replicas. Feed generation queries hit replicas; writes go to the primary. Replication lag is monitored and queries requiring strong consistency are routed to the primary.
-
-**Key tables**:
+PostgreSQL, sharded by user id into logical shards (the approach Instagram described publicly). Post ids are 64-bit and time-ordered (41 bits of milliseconds, 13 bits of shard, 10 bits of sequence), so the id itself sorts by time and doubles as the feed cursor.
 
 ```sql
--- Users table
-CREATE TABLE users (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    username VARCHAR(30) UNIQUE NOT NULL,
-    email VARCHAR(255) UNIQUE NOT NULL,
-    password_hash VARCHAR(255) NOT NULL,
-    display_name VARCHAR(100),
-    bio TEXT,
-    profile_picture_url VARCHAR(500),
-    is_private BOOLEAN DEFAULT FALSE,
-    follower_count INTEGER DEFAULT 0,
-    following_count INTEGER DEFAULT 0,
-    post_count INTEGER DEFAULT 0,
-    role VARCHAR(20) DEFAULT 'user' CHECK (role IN ('user', 'admin')),
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    updated_at TIMESTAMPTZ DEFAULT NOW()
-);
-
--- Posts table
 CREATE TABLE posts (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    caption TEXT,
-    location VARCHAR(255),
-    status VARCHAR(20) DEFAULT 'processing'
-        CHECK (status IN ('processing', 'published', 'failed')),
-    like_count INTEGER DEFAULT 0,
-    comment_count INTEGER DEFAULT 0,
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    updated_at TIMESTAMPTZ DEFAULT NOW()
+  id            BIGINT PRIMARY KEY,               -- time-ordered: ms | shard | sequence
+  user_id       BIGINT NOT NULL,
+  caption       TEXT CHECK (length(caption) <= 2200),
+  status        TEXT NOT NULL DEFAULT 'processing' CHECK (status IN ('processing', 'published', 'failed')),
+  like_count    INTEGER NOT NULL DEFAULT 0,
+  comment_count INTEGER NOT NULL DEFAULT 0,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-CREATE INDEX idx_posts_user_created ON posts(user_id, created_at DESC);
+CREATE INDEX posts_author_recent ON posts (user_id, id DESC) WHERE status = 'published';
 
--- Post media (carousel support)
 CREATE TABLE post_media (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    post_id UUID NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
-    media_type VARCHAR(10) NOT NULL CHECK (media_type IN ('image', 'video')),
-    media_url VARCHAR(500),
-    thumbnail_url VARCHAR(500),
-    original_key VARCHAR(500),
-    filter_applied VARCHAR(50),
-    width INTEGER,
-    height INTEGER,
-    order_index INTEGER DEFAULT 0,
-    processed_at TIMESTAMPTZ,
-    created_at TIMESTAMPTZ DEFAULT NOW()
+  post_id      BIGINT NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+  position     SMALLINT NOT NULL,
+  original_key TEXT,                              -- deleted after processing
+  rendition    TEXT,                              -- images/{postId}/{position}/
+  width        INTEGER,
+  height       INTEGER,
+  PRIMARY KEY (post_id, position)
 );
 
--- Social graph
-CREATE TABLE follows (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    follower_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    following_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    UNIQUE(follower_id, following_id),
-    CHECK (follower_id != following_id)
-);
-CREATE INDEX idx_follows_follower ON follows(follower_id);
-CREATE INDEX idx_follows_following ON follows(following_id);
+-- The graph is stored twice so both directions are single-shard reads:
+-- "who do I follow" (feed pull) and "who follows this author" (fan-out).
+CREATE TABLE following (follower_id BIGINT, followee_id BIGINT, created_at TIMESTAMPTZ,
+                        PRIMARY KEY (follower_id, followee_id));      -- sharded by follower
+CREATE TABLE followers (followee_id BIGINT, follower_id BIGINT, created_at TIMESTAMPTZ,
+                        PRIMARY KEY (followee_id, follower_id));      -- sharded by followee
 
--- Likes with idempotency via UNIQUE constraint
 CREATE TABLE likes (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    post_id UUID NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    UNIQUE(user_id, post_id)
+  post_id BIGINT, user_id BIGINT, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (post_id, user_id)                  -- a like is set membership: naturally idempotent
 );
 
--- Comments with threading
-CREATE TABLE comments (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    post_id UUID NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
-    parent_comment_id UUID REFERENCES comments(id) ON DELETE CASCADE,
-    content TEXT NOT NULL,
-    like_count INTEGER DEFAULT 0,
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    updated_at TIMESTAMPTZ DEFAULT NOW()
+CREATE TABLE outbox_events (
+  id BIGSERIAL PRIMARY KEY, aggregate_id BIGINT NOT NULL, event_type TEXT NOT NULL,
+  payload JSONB NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now(), published_at TIMESTAMPTZ
 );
-CREATE INDEX idx_comments_post ON comments(post_id, created_at);
+CREATE INDEX outbox_pending ON outbox_events (next_attempt_at, id) WHERE published_at IS NULL;
 
--- Stories (ephemeral, 24-hour)
-CREATE TABLE stories (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    media_url VARCHAR(500) NOT NULL,
-    media_type VARCHAR(10) NOT NULL CHECK (media_type IN ('image', 'video')),
-    thumbnail_url VARCHAR(500),
-    view_count INTEGER DEFAULT 0,
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    expires_at TIMESTAMPTZ DEFAULT (NOW() + INTERVAL '24 hours')
-);
-CREATE INDEX idx_stories_user_expires ON stories(user_id, expires_at DESC);
-
--- Story views (deduplicated)
-CREATE TABLE story_views (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    story_id UUID NOT NULL REFERENCES stories(id) ON DELETE CASCADE,
-    viewer_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    viewed_at TIMESTAMPTZ DEFAULT NOW(),
-    UNIQUE(story_id, viewer_id)
-);
-
--- Saved posts (bookmarks)
-CREATE TABLE saved_posts (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    post_id UUID NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    UNIQUE(user_id, post_id)
+CREATE TABLE idempotency_keys (
+  user_id BIGINT, idempotency_key TEXT, request_hash CHAR(64) NOT NULL,
+  post_id BIGINT, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (user_id, idempotency_key)          -- serializes concurrent retries
 );
 ```
 
-**Database triggers** maintain denormalized counts (follower_count, like_count, comment_count, post_count, story view_count) for efficient reads without expensive COUNT queries.
+Cassandra holds messages:
 
-### Cassandra (Direct Messages)
-
-Cassandra handles the write-heavy DM workload. Messages are partitioned by `conversation_id` with `TimeUUID` clustering keys for natural time ordering.
-
-**Keyspace**: `instagram_dm` with `NetworkTopologyStrategy`, replication factor 3 across data centers.
-
-```cql
--- Messages by conversation
+```sql
 CREATE TABLE messages_by_conversation (
-    conversation_id UUID,
-    message_id TIMEUUID,
-    sender_id UUID,
-    content TEXT,
-    content_type TEXT,       -- 'text', 'image', 'video', 'heart', 'story_reply'
-    media_url TEXT,
-    reply_to_message_id TIMEUUID,
-    created_at TIMESTAMP,
-    PRIMARY KEY (conversation_id, message_id)
-) WITH CLUSTERING ORDER BY (message_id DESC)
-  AND default_time_to_live = 31536000;  -- 1 year TTL
+  conversation_id UUID, message_id TIMEUUID, sender_id UUID, content TEXT,
+  PRIMARY KEY (conversation_id, message_id)
+) WITH CLUSTERING ORDER BY (message_id DESC);
 
--- Conversations by user (inbox)
 CREATE TABLE conversations_by_user (
-    user_id UUID,
-    last_message_at TIMESTAMP,
-    conversation_id UUID,
-    other_user_id UUID,
-    other_username TEXT,           -- Denormalized for fast display
-    other_profile_picture TEXT,
-    last_message_preview TEXT,
-    last_message_sender_id UUID,
-    unread_count INT,
-    is_muted BOOLEAN,
-    PRIMARY KEY (user_id, last_message_at, conversation_id)
+  user_id UUID, last_message_at TIMESTAMP, conversation_id UUID,
+  other_user_id UUID, other_username TEXT, last_message_preview TEXT, unread_count INT,
+  PRIMARY KEY (user_id, last_message_at, conversation_id)
 ) WITH CLUSTERING ORDER BY (last_message_at DESC);
-
--- Typing indicators (5-second TTL, no cleanup needed)
-CREATE TABLE typing_indicators (
-    conversation_id UUID,
-    user_id UUID,
-    started_at TIMESTAMP,
-    PRIMARY KEY (conversation_id, user_id)
-) WITH default_time_to_live = 5;
-
--- Message reactions
-CREATE TABLE message_reactions (
-    conversation_id UUID,
-    message_id TIMEUUID,
-    user_id UUID,
-    reaction TEXT,
-    created_at TIMESTAMP,
-    PRIMARY KEY ((conversation_id, message_id), user_id)
-);
-
--- Read receipts
-CREATE TABLE message_read_receipts (
-    conversation_id UUID,
-    user_id UUID,
-    last_read_message_id TIMEUUID,
-    last_read_at TIMESTAMP,
-    PRIMARY KEY (conversation_id, user_id)
-);
 ```
 
-**Why Cassandra for DMs?**
-- Write-heavy workload (100:1 write-to-read ratio) maps perfectly to Cassandra's log-structured merge trees
-- TimeUUID clustering provides natural chronological ordering without secondary indexes
-- Partition-per-conversation enables linear horizontal scaling -- each conversation is independent
-- Built-in TTL for typing indicators (5s) and message retention (1 year) with zero application logic
-- Denormalized `conversations_by_user` renders the inbox in a single partition read, avoiding cross-partition joins
+Redis keys:
 
-**Trade-off**: User info (username, profile_picture) is denormalized into `conversations_by_user`. On profile update, a background job propagates changes to all active conversations. This costs write amplification but avoids the latency of joining across databases at read time. The 2-5 second propagation lag is acceptable for display names.
+| Key | Type | Contents | Lifetime |
+|-----|------|----------|----------|
+| `timeline:{userId}` | Sorted set | Post ids scored by time, plus a "built" marker | 500 entries; expires after 7 idle days |
+| `user_posts:{userId}` | List | Last 100 post ids of a celebrity author | Rewritten on publish |
+| `post:{id}` | String | Post object for hydration (published posts only) | 5 min, deleted on every write |
+| `story_tray:{userId}` | String | Rings for the viewer | ≤ 60 s and ≤ the earliest expiry |
+| `sess:{sid}` | String | Session | 7 days |
+| `ratelimit:{action}:{user}` | Counter | Rate-limit window | Window length |
 
-### Elasticsearch (Search)
+### Local schema
 
-Indexes user profiles, hashtags, and locations for fast search and autocomplete. Updated via Kafka CDC from PostgreSQL with sub-second lag.
+The local schema is [`backend/src/db/init.sql`](./backend/src/db/init.sql). Every statement is guarded (`IF NOT EXISTS`, `CREATE OR REPLACE TRIGGER`), so it can be applied repeatedly to an existing database. The DM tables are in [`backend/db/cassandra-init.cql`](./backend/db/cassandra-init.cql).
 
-## Caching Layers
+| Production | Local | Difference |
+|------------|-------|------------|
+| `posts` with time-ordered `BIGINT` ids | `posts` with UUID ids | Order and cursors use `(created_ms, id)`, computed from `created_at` |
+| `following` + `followers` (two shardings) | One `follows` table | Indexed both ways, plus `(following_id, follower_id)` for keyset fan-out |
+| `likes`, `comments`, `comment_likes`, `saved_posts` | Same, with triggers | Triggers keep `like_count`, `comment_count`, comment likes and follower counts in step |
+| `outbox_events`, `idempotency_keys` | Same | — |
+| `user_posts:{id}` list for celebrities | — | Celebrity posts are read from PostgreSQL |
+| Stories and views in a dedicated store | `stories`, `story_views` tables | View dedup by a unique `(story_id, viewer_id)` |
 
-### CDN (Media Delivery)
+## API Design
 
-All processed media is served through CDN (CloudFront/Cloudflare):
-
-- Content-addressed object keys (`images/{hash}/{size}.webp`) make cache invalidation unnecessary
-- `Cache-Control: public, max-age=31536000, immutable` for infinite caching
-- CDN offloads ~90% of media bandwidth from origin
-- Geographic edge nodes reduce latency to < 50ms globally
-- WebP/AVIF content negotiation based on `Accept` header
-
-### Redis Cluster (Application Cache)
-
-| Key Pattern | Value | TTL | Purpose |
-|-------------|-------|-----|---------|
-| `session:{session_id}` | User session JSON | 7d | Authentication |
-| `timeline:{user_id}` | Sorted set of post IDs | None (managed) | Precomputed feed |
-| `feed:{user_id}:{cursor}` | Assembled feed JSON | 60s | Feed response cache |
-| `user:{user_id}` | User profile JSON | 5m | Profile lookups |
-| `story_tray:{user_id}` | Story ring data | 5m | Story feed |
-| `ratelimit:{prefix}:{id}` | Counter | Varies | Rate limiting |
-| `notifications:{user_id}` | Sorted set of notification IDs | 30d | In-app notifications |
-
-**Cache invalidation**: Write-through for critical data (follows trigger `feed:{user_id}` deletion). Time-based expiry for non-critical caches. Redis Pub/Sub propagates invalidation across cache nodes.
-
-**Timeline cache**: Redis sorted sets store the last 500 post IDs per user. On post creation, the image processing worker fans out the post ID to all followers' timelines. Feed reads merge the cached timeline with celebrity posts fetched on demand.
-
-## Media Pipeline
+### Production API
 
 ```
-┌──────────┐    ┌──────────────┐    ┌───────────────┐    ┌──────────────┐    ┌─────┐
-│  Client  │───▶│ Pre-signed   │───▶│  S3 / Object  │───▶│  Processing  │───▶│ CDN │
-│ (upload) │    │ Upload URL   │    │   Storage     │    │   Workers    │    │     │
-└──────────┘    └──────────────┘    └───────────────┘    └──────────────┘    └─────┘
-                                           │                    │
-                                    ┌──────▼──────┐     ┌──────▼──────┐
-                                    │  Original   │     │  Processed  │
-                                    │  (archive)  │     │  (5 sizes)  │
-                                    └─────────────┘     └─────────────┘
+POST   /api/v1/uploads                      signed PUT URLs for n files
+POST   /api/v1/posts                        Idempotency-Key → 202 post (processing) | 409 | 415 | 422
+GET    /api/v1/posts/{id}                   post, viewer's like/save state | 404 if not visible
+DELETE /api/v1/posts/{id}                   author or admin
+POST   /api/v1/posts/{id}/like              200 {idempotent} | 404 if not visible; DELETE to unlike
+GET    /api/v1/feed?cursor=&limit=20        {posts, nextCursor, degraded?}; cursor = "<ms>_<id>"
+GET    /api/v1/feed/explore?cursor=         popular public posts you don't follow
+POST   /api/v1/users/{id}/follow            idempotent; DELETE to unfollow
+GET    /api/v1/stories/tray                 rings with seen state
+WS     /api/v1/messages/socket              send, receive, typing, read receipts
 ```
 
-1. Client requests a pre-signed S3 URL from the API
-2. Client uploads directly to S3 (bypasses API servers for large files)
-3. API server creates a post record with `status: 'processing'` and enqueues a processing job
-4. Processing worker fetches the original from S3, generates 5 sizes in WebP + JPEG, uploads processed versions
-5. Worker updates the post to `status: 'published'` and fans out to follower timelines
-6. CDN serves processed images on first access, caches at edge for subsequent requests
-
-**Resolutions generated**:
-
-| Size | Dimensions | Use Case |
-|------|-----------|----------|
-| Thumbnail | 150x150 | Story rings, notifications, grid |
-| Small | 320x320 | Mobile grid view |
-| Medium | 640x640 | Mobile feed |
-| Large | 1080x1080 | Full-screen mobile, desktop feed |
-| XLarge | 2048 (max dim) | Desktop full-screen, zoom |
-
-## Feed Generation: Hybrid Push/Pull
-
-```
-┌──────────────────────────────────────────────────────────────┐
-│                   Post Published Event                       │
-└─────────────────────────┬────────────────────────────────────┘
-                          │
-              ┌───────────▼───────────┐
-              │ Follower count > 10K? │
-              └───────┬───────┬───────┘
-                      │       │
-                No    │       │  Yes
-                      │       │
-         ┌────────────▼──┐  ┌─▼──────────────┐
-         │ Fan-out Write │  │ Celebrity table │
-         │ Push post ID  │  │ (fetched at     │
-         │ to each       │  │  read time)     │
-         │ follower's    │  │                 │
-         │ Redis timeline│  │                 │
-         └───────────────┘  └─────────────────┘
-
-                    Feed Read Request
-                          │
-              ┌───────────▼───────────┐
-              │  1. Get timeline from │
-              │     Redis sorted set  │
-              │  2. Fetch celebrity   │
-              │     posts on demand   │
-              │  3. Merge + rank      │
-              │  4. Hydrate with      │
-              │     post metadata     │
-              └───────────────────────┘
-```
-
-**Why hybrid?** Pure push would mean a celebrity with 100M followers triggers 100M Redis writes per post, taking minutes and wasting storage for inactive users. Pure pull means every feed load queries all followed users' posts, creating hot partitions. The hybrid approach handles 99% of users with O(1) feed reads (push) while bounding the worst case for celebrities to O(celebrity_count) per read.
-
-## Real-Time Communication
-
-- **WebSocket** connections for DMs: persistent bidirectional channel for message delivery, typing indicators, read receipts, presence
-- **Server-Sent Events (SSE)** for notifications: unidirectional push for likes, comments, follows, story views
-- **Connection management**: WebSocket connections are load-balanced using sticky sessions (hashed by user ID). Each WS server maintains a local connection registry. Cross-server message delivery uses Redis Pub/Sub -- when user A sends a message to user B who is connected to a different WS server, the message is published to a Redis channel that the target server subscribes to.
-
-## Frontend Architecture
-
-### Component Hierarchy
-
-The frontend is a React 19 + TypeScript SPA built with Vite, using a component tree designed around Instagram's content-centric UI:
-
-```
-__root.tsx (Navbar + <Outlet />)
-├── /login, /register         → Auth forms (unprotected)
-├── /create                   → Post creation with file upload + preview
-├── /settings                 → Profile settings
-├── / (index)                 → HomePage
-│   ├── StoryTray             → Horizontal scrollable story rings
-│   │   └── StoryViewer       → Full-screen modal with progress bars, auto-advance
-│   └── Virtualized Feed      → @tanstack/react-virtual
-│       └── PostCard          → Media carousel + like/comment/save/share actions
-│           └── Avatar        → Reusable avatar with story ring indicator
-├── /profile/$username        → Profile page
-│   └── PostGrid              → Grid layout of post thumbnails
-├── /post/$postId             → Single post detail with comments
-└── /explore                  → Discovery grid
-```
-
-The root layout (`__root.tsx`) renders `Navbar` at the top and an `<Outlet />` for the active route. The Navbar contains the Instagram logo, navigation links (home, explore, create, profile), and search. This layout is applied to every page.
-
-### State Management (Zustand)
-
-The project uses a single Zustand store with the `persist` middleware:
-
-**`useAuthStore`** -- Manages authentication state (user object, isLoading, isAuthenticated). Uses Zustand's `persist` middleware to save `user` and `isAuthenticated` to localStorage under `auth-storage`, so the user remains logged in across page refreshes. The `partialize` option ensures only serializable state is persisted (not functions or loading flags).
-
-**Why Zustand over Redux**: Zustand requires no providers, no reducers, no action types. A store is a single `create()` call with state and actions in one object. Components subscribe to exactly the slices they need via selector hooks (`useAuthStore(state => state.user)`), minimizing unnecessary re-renders. For a project with one global store (auth), Redux's boilerplate (createSlice, configureStore, Provider wrapper) is overhead without benefit.
-
-**Why Zustand over React Context**: Context triggers re-renders for every consumer when any part of the context value changes. With auth state, a change to `isLoading` would re-render every component consuming the context, including those that only need `user`. Zustand's selector-based subscriptions avoid this entirely.
-
-**Local component state**: Feed posts, story data, and form inputs use React `useState` because they are page-scoped and do not need to survive navigation. The feed is loaded in `HomePage` and passed to child components via props. This avoids putting ephemeral data into global state.
-
-### Routing (TanStack Router)
-
-File-based routing with TanStack Router and the `@tanstack/router-vite-plugin` for automatic route generation:
-
-```
-routes/
-├── __root.tsx                → Root layout (Navbar + Outlet)
-├── index.tsx                 → / (home feed)
-├── login.tsx                 → /login
-├── register.tsx              → /register
-├── create.tsx                → /create (new post)
-├── settings.tsx              → /settings
-├── explore.tsx               → /explore
-├── post.$postId.tsx          → /post/:postId (single post view)
-└── profile.$username.tsx     → /profile/:username
-```
-
-**Route guards**: The home page checks `isAuthenticated` from the auth store and renders `<Navigate to="/login" />` if the user is not logged in. This is a component-level guard rather than a `beforeLoad` hook, allowing the page to show a loading spinner while the auth check completes.
-
-**Dynamic segments**: `$postId` and `$username` are dynamic route parameters accessed via `Route.useParams()`. TanStack Router provides type-safe params -- accessing `params.postId` in the wrong route is a compile-time error.
-
-### Data Fetching Pattern
-
-The API layer follows a service-object pattern with a shared `request()` helper:
-
-```
-Component (e.g., HomePage)
-  → calls feedApi.getFeed(cursor)
-    → request<T>('/feed', options)
-      → fetch('/api/v1/feed', { credentials: 'include', ... })
-        → Backend Express API
-```
-
-**`services/api.ts`** exports domain-specific API objects (`authApi`, `postsApi`, `feedApi`, `storiesApi`, `usersApi`, `commentsApi`). Each method calls the shared `request<T>()` function, which handles JSON serialization, error extraction, and credentials. A separate `requestFormData<T>()` handles multipart uploads (post creation, avatar updates) without the `Content-Type: application/json` header, letting the browser set the multipart boundary.
-
-**Session-based auth**: All requests include `credentials: 'include'` to send the session cookie. No auth tokens are managed client-side -- the session cookie is httpOnly and managed by the browser.
-
-**Cursor-based pagination**: Feed, comments, followers, and post grids all use cursor pagination. The API returns `{ data: [...], nextCursor: string | null }`. The component stores `nextCursor` in local state and passes it on the next request. When `nextCursor` is null, no more data is available.
-
-### Virtualization
-
-The home feed uses `@tanstack/react-virtual` to efficiently render a potentially unbounded list of posts. Without virtualization, rendering 500 PostCard components (each containing an image, action buttons, and caption) would create 500+ DOM nodes, consuming ~50MB of memory and causing visible jank on scroll.
-
-**How it works**: The virtualizer maintains a window of visible items based on the scroll position of the parent container. Only items within the viewport (plus an `overscan` buffer of 3 items above and below) are rendered to the DOM. As the user scrolls, items entering the viewport are mounted and items leaving are unmounted.
-
-**Dynamic height measurement**: Instagram posts have variable heights (different image aspect ratios, caption lengths, comment counts). The virtualizer uses `estimateSize: () => 600` as an initial guess (header 60px + image 400px + actions 60px + caption 80px), then measures the actual rendered height via `measureElement` using `getBoundingClientRect().height`. This measurement is cached so subsequent scroll passes use the real height.
-
-**Infinite scroll**: A scroll event listener checks if the user is within 500px of the bottom (`scrollHeight - scrollTop - clientHeight < 500`). When triggered, it calls `loadFeed(nextCursor)` to fetch the next page and appends results to the existing array.
-
-### Optimistic Updates
-
-Likes and saves use an optimistic update pattern. When the user taps the heart icon:
-
-1. The UI immediately updates: `setIsLiked(true)` and `setLikeCount(prev => prev + 1)`
-2. The API call fires in the background: `postsApi.like(postId)`
-3. If the API call fails, the UI reverts: `setIsLiked(false)` and `setLikeCount(prev => prev - 1)`
-
-This makes interactions feel instant (0ms perceived latency) instead of waiting 100-300ms for the server round trip. The user sees the heart fill immediately. If the server rejects the request (e.g., rate limit), the heart un-fills. In practice, failures are rare, so the optimistic path is correct 99%+ of the time.
-
-The double-tap-to-like gesture on the image also triggers this flow, with an additional heart animation overlay that fades after 800ms.
-
-### Key UI Patterns
-
-**Story viewer**: The `StoryTray` component renders a horizontal scrollable row of story rings. Clicking a user opens a full-screen modal (`StoryViewer`) that auto-advances through stories on a 5-second timer (100ms intervals incrementing a progress bar by 2%). Tapping the left/right halves of the screen navigates backward/forward. When all stories for a user are viewed, it automatically advances to the next user. Story view tracking fires `storiesApi.view()` when each story becomes visible.
-
-**Media carousel**: `PostCard` supports multi-image posts with left/right navigation arrows and a dot indicator. State tracks `currentMediaIndex`, and each media item checks `mediaType` to render either `<img>` or `<video>`.
-
-**Loading skeletons**: The feed shows 3 placeholder cards with `skeleton` CSS class (pulsing gray blocks) while the initial feed loads, matching the shape of real PostCards.
-
-**Responsive layout**: The feed uses `max-w-lg mx-auto` for a centered single-column layout (Instagram mobile web style). The profile page uses a 3-column post grid. Tailwind utility classes handle responsive breakpoints without custom media queries.
-
-## Observability
-
-### What Observability Solves
-
-In a distributed system with multiple services (API, image worker, feed generator), a slow request could be caused by any component. Without observability, debugging is guesswork: "Is the database slow? Is the cache down? Is the image worker backed up?" Observability provides three pillars -- metrics (what is happening), logs (why it happened), and traces (where in the call chain it happened) -- that together turn production debugging from hours of manual investigation into minutes of dashboard inspection.
-
-### Distributed Tracing
-
-Every request receives a `trace_id` (propagated via `x-trace-id` header) that follows the request across services, message queues, and background workers. This enables end-to-end latency analysis: "This feed load took 450ms -- 200ms in PostgreSQL, 150ms in Redis, 100ms in service logic."
-
-### Prometheus Metrics
-
-Prometheus is a time-series database that scrapes a `/metrics` HTTP endpoint on each service at regular intervals (typically every 15 seconds). It stores numeric measurements over time, enabling queries like "what was the p99 latency over the last hour?" Prometheus itself does not push data -- the application exposes metrics, and Prometheus pulls them. This pull model means a crashed service simply stops being scraped, rather than flooding a metrics pipeline with failure data.
-
-**Three metric types and when to use each:**
-
-- **Counter** -- A monotonically increasing number. Counts things that only go up: total requests, total errors, total posts created. You never reset a counter. To get "requests per second," Prometheus computes the rate of change: `rate(http_requests_total[5m])`.
-- **Histogram** -- Records the distribution of values (e.g., request durations). Prometheus pre-buckets the values, so you can query percentiles: "p99 latency was 450ms." This is critical because averages hide outliers -- an average of 50ms could mean 99% at 10ms and 1% at 4 seconds.
-- **Gauge** -- A value that goes up and down: current connection count, queue depth, circuit breaker state. Unlike counters, gauges represent a point-in-time snapshot.
-
-**The RED method** (Rate, Errors, Duration) is applied across all services:
-- **Rate**: `rate(http_requests_total[5m])` -- requests per second. Sudden drops indicate failures; spikes indicate traffic surges.
-- **Errors**: `rate(http_requests_total{status_code=~"5.."}[5m])` -- error rate. If this exceeds 0.1% for 5 minutes, page the on-call engineer.
-- **Duration**: `histogram_quantile(0.99, http_request_duration_seconds)` -- p99 latency. If this exceeds 500ms for 5 minutes, investigate.
-
-| Metric | Type | Labels | Purpose |
-|--------|------|--------|---------|
-| `http_requests_total` | Counter | method, route, status_code | Request volume |
-| `http_request_duration_seconds` | Histogram | method, route | Latency percentiles |
-| `feed_generation_seconds` | Histogram | cache_status | Feed performance |
-| `image_processing_seconds` | Histogram | size | Worker throughput |
-| `image_processing_errors_total` | Counter | error_type | Processing failures |
-| `posts_created_total` | Counter | - | Content velocity |
-| `likes_total` | Counter | action | Engagement rate |
-| `follows_total` | Counter | action | Growth metrics |
-| `circuit_breaker_state` | Gauge | name | Service health |
-| `circuit_breaker_events_total` | Counter | name, event | Failure patterns |
-| `db_query_duration_seconds` | Histogram | operation | Database performance |
-| `db_connection_pool_size` | Gauge | state | Pool saturation |
-| `rate_limit_hits_total` | Counter | action | Abuse detection |
-| `active_sessions` | Gauge | - | Concurrent users |
-
-### Structured Logging (Pino)
-
-`console.log("user liked post")` is useless in production. When you have 100 servers each producing thousands of log lines per second, you need to search, filter, and correlate logs programmatically. Structured logging means every log entry is a JSON object with consistent fields, not a free-form string. These JSON logs are fed to a log aggregation system (ELK stack: Elasticsearch + Logstash + Kibana, or Datadog) where you can query: "show me all ERROR logs for user_id=abc123 in the last hour."
-
-**Why Pino over Winston/console.log**: Pino is the fastest Node.js JSON logger (~5x faster than Winston). It achieves this by deferring string serialization to a worker thread. In a high-throughput service processing 10K requests/second, logger overhead matters -- Pino adds ~1ms per 1000 log calls, while Winston adds ~5ms.
-
-**Log levels** control verbosity without code changes:
-- **debug** -- Cache hits/misses, query details. Only enabled in development or when investigating a specific issue.
-- **info** -- Request completed, business events (post created, user followed). The baseline for production.
-- **warn** -- Rate limit hit, circuit breaker half-open, degraded but functional state. Signals that something needs attention but is not broken.
-- **error** -- 5xx responses, unhandled exceptions, service failures. Always triggers alerting.
-
-All services emit structured JSON logs via Pino with:
-- `trace_id` for request correlation across services -- when a feed load calls the image service, both log entries share the same trace_id
-- `user_id` for user-scoped debugging -- "show me everything this user did in the last hour"
-- `duration_ms` for performance tracking -- identify slow requests without Prometheus
-
-### Alert Thresholds
-
-| Alert | Condition | Severity |
-|-------|-----------|----------|
-| High error rate | 5xx rate > 0.1% for 5 minutes | Critical |
-| Feed latency | p99 > 500ms for 5 minutes | Warning |
-| Image processing backlog | Queue depth > 10K for 10 minutes | Warning |
-| Circuit breaker open | Any breaker in OPEN state | Critical |
-| Storage capacity | S3 bucket > 90% quota | Critical |
-| Replication lag | PostgreSQL replica > 30s behind primary | Warning |
-
-## Failure Handling
-
-### Circuit Breakers
-
-A circuit breaker prevents cascading failures in distributed systems. The problem: if the image processing service goes down, the API server keeps sending requests to it. Each request waits for a timeout (e.g., 30 seconds), consuming a thread/connection. With 1000 concurrent requests, all 1000 threads are blocked waiting for a dead service, and the API server itself becomes unresponsive. One failing service takes down the entire system.
-
-The circuit breaker sits between the caller and the dependency, monitoring failure rates. It has three states:
-
-- **CLOSED** (normal operation): Requests flow through to the downstream service. The breaker counts successes and failures.
-- **OPEN** (service is down, fail fast): When failures exceed a threshold (e.g., >50% error rate), the breaker "trips open." All subsequent requests immediately fail with a fallback response (e.g., return cached data or a 503) without ever calling the downstream service. This is the key insight: failing fast (1ms) is better than failing slow (30s timeout).
-- **HALF-OPEN** (testing recovery): After a cooldown period (e.g., 30 seconds), the breaker allows one test request through. If it succeeds, the breaker transitions back to CLOSED. If it fails, back to OPEN for another cooldown period. This automatic recovery detection means services self-heal without operator intervention.
-
-The local implementation uses the Opossum library, which provides configurable thresholds, timeout values, and fallback functions. Opossum also exposes Prometheus metrics for each breaker (state gauge, trip counter), enabling alerts like "circuit breaker for Cassandra has been OPEN for 5 minutes."
-
-| Service | Timeout | Fallback |
-|---------|---------|----------|
-| Image processing | 30s | Return 503 "temporarily unavailable" |
-| Feed generation | 10s | Return empty feed `{ posts: [] }` |
-| Cassandra (DMs) | 5s | Return 503, DMs degraded |
-| Elasticsearch (search) | 3s | Return empty results |
-
-### Retry Strategy
-
-| Operation | Max Retries | Backoff | Idempotency |
-|-----------|-------------|---------|-------------|
-| Image processing | 3 | Exponential (1s, 2s, 4s) | Safe (deterministic output) |
-| S3 upload | 3 | Exponential | Safe (overwrite by key) |
-| Database write | 0 | N/A | ACID transactions |
-| Kafka publish | 5 | Exponential | Idempotent producer |
-
-### Dead Letter Queues
-
-Failed image processing jobs (after 3 retries) are routed to a dead letter queue for manual inspection. The DLQ is monitored and alerts fire when depth > 0. Failed posts are marked `status: 'failed'` in PostgreSQL so users see "Upload failed, tap to retry."
-
-### Graceful Degradation
-
-| Failure | Degradation Strategy |
-|---------|---------------------|
-| Redis cluster down | Bypass cache, serve from PostgreSQL replicas (higher latency) |
-| Kafka down | Buffer events in-memory, flush when recovered |
-| Cassandra down | DMs unavailable, core features (feed, posts) unaffected |
-| S3 down | New uploads queued, existing media served from CDN cache |
-| Elasticsearch down | Search unavailable, autocomplete falls back to PostgreSQL LIKE |
-| PostgreSQL replica down | Route reads to remaining replicas or primary |
-
-## Security
-
-### Authentication and Authorization
-
-- **OAuth 2.0 + OIDC** for third-party login (Google, Facebook, Apple)
-- **JWT access tokens** (15-minute expiry) + **refresh tokens** (90-day, stored in Redis for revocation)
-- **Session revocation**: Revoking a refresh token immediately invalidates all access tokens derived from it
-- **Device management**: Users can see and revoke sessions from specific devices
-
-### Role-Based Access Control (RBAC)
-
-RBAC is an authorization model where permissions are assigned to roles, and users are assigned to roles -- not directly to permissions. Without RBAC, you would check `if (user.canDeletePosts && user.canBanUsers && user.canViewStats)` for every admin action, and adding a new permission means updating every user record. With RBAC, you check `if (user.role === 'admin')`, and the role defines what permissions it includes. Adding a new permission only requires updating the role definition, not every user.
-
-In this project, the `users` table has a `role` column (`user`, `admin`, etc.). The auth middleware reads the role from the session, and route-level middleware checks `requireRole('admin')` before allowing access to admin endpoints. The middleware chain works as: authenticate (verify session) -> authorize (check role) -> route handler.
-
-| Role | Permissions |
-|------|-------------|
-| anonymous | View public profiles and posts |
-| user | Create content, follow, like, comment, DM |
-| verified | All user + verification badge, priority support |
-| admin | All + delete any content, ban users, view system stats |
-
-### Rate Limiting
-
-Rate limiting prevents abuse, protects the database from overload, and ensures fair usage across all users. Without it, a single bot could create 10,000 posts per minute, overwhelming the database and degrading service for legitimate users.
-
-**Token Bucket algorithm**: Imagine each user has a bucket that holds N tokens. Each request consumes one token. Tokens are refilled at a fixed rate (e.g., 10 per minute). When the bucket is empty, requests are rejected with HTTP 429 (Too Many Requests). This allows bursts (a user can consume all tokens at once) while enforcing a long-term average rate.
-
-**Sliding Window algorithm** (used here): Counts requests in a rolling time window. More accurate than fixed windows (which allow double the rate at window boundaries). Implemented with Redis sorted sets: each request adds a timestamp, and the count is the number of entries within the window.
-
-**Per-user vs per-IP**: Authenticated users get per-user limits (tied to their user ID). Anonymous requests get per-IP limits (to prevent unauthenticated abuse). Per-user limits are stricter for expensive operations (post creation, follows) and more lenient for reads (feed requests).
-
-Distributed rate limiting via Redis sliding window:
-
-| Action | Limit | Window | Rationale |
-|--------|-------|--------|-----------|
-| Login | 5 | 1 minute | Brute force prevention |
-| Post creation | 10 | 1 hour | Content spam prevention |
-| Follow | 30 | 1 hour | Follow-bot prevention |
-| Like | 100 | 1 hour | Engagement spam prevention |
-| Comment | 50 | 1 hour | Comment spam prevention |
-| Story creation | 20 | 1 hour | Story spam prevention |
-| Feed requests | 60 | 1 minute | Scraping prevention |
-| General API | 1000 | 1 minute | DDoS mitigation |
-
-### Content Moderation
-
-- Pre-upload: Client-side NSFW detection (on-device ML)
-- Post-upload: Automated content scanning pipeline (image classification, text toxicity scoring)
-- Flagged content enters human review queue
-- Repeat offenders trigger progressive enforcement (warning, shadow ban, account suspension)
-
-### Input Validation
-
-- File uploads: Max 10 MB images, 100 MB videos; allowed types: image/jpeg, image/png, image/webp, image/heic, video/mp4
-- Captions: Max 2200 characters, HTML sanitized
-- Usernames: 3-30 chars, alphanumeric + underscore, case-insensitive
-- All UUID parameters validated before database queries
-
-## Consistency and Idempotency
-
-### Idempotency for Uploads
-
-Idempotency solves the "double-submit" problem. Consider this scenario: a user uploads a photo, the server processes it and creates the post, but the HTTP response is lost due to a network timeout. The client shows an error and the user taps "retry." Without idempotency, the server creates a second identical post. The user now has two copies of the same photo in their feed.
-
-The solution: the client generates a unique ID (UUID) and sends it as the `X-Idempotency-Key` header with the upload request. The server's flow is: (1) check Redis for this key, (2) if found, return the cached response from the first request, (3) if not found, process the request, store the response in Redis with a 24-hour TTL, and return it. The 24-hour TTL means the key auto-expires after the reasonable retry window, keeping Redis memory bounded.
-
-Post creation uses an idempotency key (`X-Idempotency-Key` header). If the client retries a failed upload, the server returns the existing post instead of creating a duplicate. Keys are stored in Redis with 24-hour TTL.
-
-### Idempotent Likes
-
-The `likes` table has a `UNIQUE(user_id, post_id)` constraint. `INSERT ... ON CONFLICT DO NOTHING` ensures duplicate like requests are silently absorbed. The `like_count` trigger only fires on actual inserts, preventing double-counting.
-
-### Exactly-Once DM Delivery
-
-Messages use `TimeUUID` as the message ID (generated server-side). The combination of `(conversation_id, message_id)` primary key in Cassandra ensures idempotent writes. Client retries with the same message ID result in an upsert, not a duplicate.
-
-### Feed Consistency
-
-Feeds are eventually consistent by design. A new post may take 2-5 seconds to appear in all followers' feeds due to:
-1. Async image processing (2-5s)
-2. Timeline fanout latency (< 1s for users with < 10K followers)
-3. Feed cache TTL (60s worst case)
-
-This is acceptable for a social media feed. Users see their own posts immediately (optimistic UI + self-timeline injection).
-
-## Scalability Considerations
-
-### Horizontal Scaling Path
-
-| Scale | Architecture Changes |
-|-------|---------------------|
-| 1M DAU | Single PostgreSQL with read replicas, Redis cluster, S3 + CDN |
-| 10M DAU | Shard PostgreSQL by user_id, separate feed/media/DM services |
-| 100M DAU | Multi-region deployment, geo-routing, Cassandra multi-DC |
-| 500M+ DAU | Cell-based architecture, dedicated celebrity feed path, edge compute |
-
-### What Breaks First
-
-1. **Feed generation** -- the JOIN across follows and posts becomes slow as the social graph grows. Solution: precomputed timelines in Redis (push model).
-2. **PostgreSQL follows table** -- the social graph is the hottest table. Solution: shard by follower_id, cache in Redis.
-3. **Image serving bandwidth** -- egress costs and latency. Solution: CDN with long cache TTLs.
-4. **DM write throughput** -- PostgreSQL cannot handle 300K writes/sec. Solution: Cassandra (already chosen).
-5. **Hot partitions** -- celebrity followers all query the same data. Solution: fan-out on read for celebrities, Redis caching.
+- Errors are JSON `{error}` with an honest status: `404` for anything the caller may not see (private posts, other people's conversations), `415` for non-image uploads, `422` for a reused idempotency key, `429` with `RateLimit` headers when limited.
+- Cursors are opaque to clients. Offsets are rejected: an offset into a feed that gains posts at the head repeats and skips items.
+
+### Local routes
+
+The local API serves everything from one Express process under `/api/v1`; see [Implementation Notes](#implementation-notes).
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| POST | `/auth/register`, `/auth/login`, `/auth/logout`; GET `/auth/me` | Session auth (session id regenerated on login) |
+| POST | `/posts` | Multipart create (`media` × ≤ 10, `caption`, `location`, `filters`), optional `Idempotency-Key` |
+| GET, DELETE | `/posts/:postId` | Detail (visibility-checked, includes `status`) and delete |
+| POST, DELETE | `/posts/:postId/like`, `/posts/:postId/save` | Idempotent toggles |
+| GET | `/posts/:postId/likes`, `/posts/:postId/comments`, `/comments/:id/replies` | Lists, visibility-checked |
+| POST, DELETE | `/posts/:postId/comments`, `/comments/:id`, `/comments/:id/like` | Comments and comment likes |
+| GET | `/feed?cursor&limit`, `/feed/explore?cursor&limit` | Home feed and Explore (keyset cursors) |
+| GET, PUT, POST, DELETE | `/users/:username`, `/users/me`, `/users/:userId/follow`, `/users/:username/{posts,followers,following}` | Profiles and the graph |
+| GET, POST, DELETE | `/stories`, `/stories/tray`, `/stories/user/:userId`, `/stories/:id/view`, `/stories/:id/viewers` | Stories |
+| GET, POST | `/messages/conversations[/:id[/read\|/typing\|/messages/:mid/reactions]]` | DMs over HTTP, participants only |
+| GET | `/api/health`, `/api/health/live`, `/api/health/ready`, `/api/health/detailed`, `/metrics` | Operations |
 
 ## Key Design Decisions
 
-### Decision 1: Pull vs Push vs Hybrid Feed
+### 1. Hybrid fan-out: push below 10,000 followers, pull above
 
-| Strategy | Pros | Cons |
-|----------|------|------|
-| Push (fanout on write) | O(1) reads, instant feed | Expensive for celebrities, wasted writes for inactive users |
-| Pull (fanout on read) | Simple, no wasted work | O(following_count) per read, slow for users following many accounts |
-| Hybrid (chosen) | Best of both, bounded worst case | Implementation complexity, two code paths |
+Reading a feed on demand means "posts from everyone I follow, newest first" — a merge over hundreds of authors on every app open, so the most engaged users get the slowest feed, at 150K loads per second. Pushing each post id into every follower's timeline at publish time turns that into one sorted-set read. Push breaks for large accounts: one post from an account with 100M followers is 100M writes, minutes of a whole Redis cluster, mostly to people who won't open the app that day. So authors at or above a follower threshold are never pushed; each feed read merges their recent posts in, which costs one extra read of the handful of celebrities a viewer follows. The cost is two code paths and a threshold to tune: I'd start at 10,000 followers and adjust it with two signals, fan-out lag and feed read latency.
 
-The hybrid approach handles 99% of cases with the push model's speed while bounding celebrity post fanout. The read-time merge adds ~20ms latency for users who follow celebrities -- negligible compared to network round-trip.
+### 2. The timeline is a cache, not a record
 
-### Decision 2: PostgreSQL + Cassandra Dual Database
+Timelines can be evicted, can expire, and are capped at 500 entries; PostgreSQL stays the source of truth. A timeline carries a "built" marker; a read that finds no marker rebuilds the timeline from PostgreSQL, marking it first so a fan-out that lands during the rebuild isn't lost. Fan-out writes only to timelines that exist, so dormant accounts cost nothing. A reader who scrolls past the cap continues from PostgreSQL with the same cursor. The cost is a slower first load after inactivity — one indexed query instead of a cache read.
 
-| Database | Use Case | Why |
-|----------|----------|-----|
-| PostgreSQL | Users, posts, follows, stories | ACID for social graph mutations, complex JOINs for feed assembly |
-| Cassandra | Direct messages, typing, reactions | 300K writes/sec, TimeUUID ordering, partition-per-conversation scaling |
+### 3. Direct uploads, asynchronous processing, and a transactional outbox
 
-The alternative (PostgreSQL for everything) would require sharding DMs across PostgreSQL instances, losing the natural partition isolation Cassandra provides. Cassandra's TimeUUID clustering gives free chronological ordering without maintaining a separate index.
+Resizing takes seconds of CPU; holding an HTTP request for it ties up a server per upload and couples the user's success to the image library not failing. So the client uploads to object storage, the API records the post as `processing`, and workers publish it later. The tricky part is the hand-off: "commit the post, then publish the job" loses the job whenever the broker is down or the process dies between the two steps, leaving a post stuck in `processing` forever. Writing the job as an outbox row in the same transaction as the post, and relaying it afterwards, makes the hand-off atomic. The cost is at-least-once delivery — the relay can publish twice — which is why every worker step is idempotent.
 
-### Decision 3: Async Image Processing
+### 4. Keyset cursors on (time, id)
 
-Synchronous processing would block the API server for 2-5 seconds per upload, consuming a thread/connection and degrading throughput. The async model (return 202 immediately, process in background) allows the API to handle 100x more concurrent uploads. The trade-off is UI complexity: the client must poll or receive a push notification when processing completes.
+The feed, Explore and lists are paged by the position of the last item, never by offset. With offsets, every new post at the head shifts page 2 by one, so the reader sees a duplicate; posts deleted above the offset make the reader skip one. A `(time, id)` cursor is stable under both and maps directly onto `ZREVRANGEBYSCORE` and an index range scan. The cost is that pages can't be jumped to by number, which a feed never needs.
+
+### 5. Cassandra for messages
+
+Messages are append-only, read newest-first within one conversation, and written far more often than read. Cassandra's partition-per-conversation with TimeUUID clustering makes that one sequential read, and writes are appends. TimeUUID rather than a timestamp keeps two messages in the same millisecond from overwriting each other. The cost is no joins and no transactions with PostgreSQL: the inbox denormalizes usernames and avatars, which must be refreshed by an event when a profile changes.
+
+## Consistency and Idempotency
+
+| Operation | Guarantee | Mechanism |
+|-----------|-----------|-----------|
+| Create post | One post per draft, across timeouts and concurrent retries | `Idempotency-Key` stored with a request hash; primary key `(user_id, key)` in the same transaction as the post |
+| Job hand-off | A committed post always gets its processing job | Transactional outbox, relay with broker publisher confirms |
+| Job processing | Effectively once | At-least-once delivery + skip if published + deterministic object keys + status re-check under a row lock |
+| Fan-out | Every follower with a cached timeline gets the post | Idempotent `ZADD`; a redelivered job re-runs fan-out; a missing timeline is rebuilt from PostgreSQL |
+| Likes and follows | No double counts | Unique keys; `INSERT … ON CONFLICT DO NOTHING`; counters in the same statement (trigger); `idempotent: true` tells the client its optimistic +1 was redundant |
+| Feed vs database | Eventually consistent, seconds | Hydration drops deleted and unpublished posts; unfollow removes the author's posts from the timeline |
+| Post cache | Never serves a processing post; stale ≤ 5 min for author name and avatar | Only published posts cached; invalidated on like, comment, delete, publish |
+| Messages | Ordered and unique per conversation | TimeUUID clustering key |
+
+## Security / Auth
+
+- **Sessions**: an `HttpOnly`, `SameSite=Lax` cookie backed by Redis; the session id is regenerated at login and registration, so a planted id can't ride an authenticated session.
+- **Visibility**: authors see their own posts in any state; others see only published posts, and private accounts' posts only if they follow. The rule applies to post detail, comments, replies, likes lists, like/save/comment actions and stories. A refused request is a `404`, so ids can't be used to probe.
+- **Messages**: every conversation-scoped request checks membership first (`404` otherwise).
+- **Rate limits**: per user (per IP when anonymous), in Redis so they hold across instances: 10 posts/hour, 30 follows/hour, 100 likes/hour, 5 failed logins/minute, 60 feed pages/minute.
+- **Input**: image MIME types only, known filter names, captions ≤ 2,200 characters, UUID-shaped ids; renditions are re-encoded, which strips EXIF metadata, including GPS location.
+
+## Observability
+
+- **Feed**: latency split by timeline hit or rebuild, pushed versus pulled posts per page, the degraded-response rate.
+- **Fan-out**: posts by mode (`push`, `pull`), timeline writes, fan-out lag (publish to last write) — this is the "visible within 5 s" SLO.
+- **Pipeline**: outbox backlog and the age of the oldest pending event (alert above 5 minutes), job outcomes (`published`, `duplicate`, `retried`, `dead_lettered`), dead-letter depth (alert above 0), processing duration.
+- **Correctness**: idempotent replays and key mismatches, duplicate likes absorbed.
+- **Health**: liveness is the process; readiness checks PostgreSQL and Redis and fails as soon as shutdown starts; the detailed check includes object storage, the broker and the outbox backlog.
+
+## Failure Handling
+
+| Failure | Behavior | Mitigation |
+|---------|----------|------------|
+| Broker down | Uploads still succeed; posts wait in `processing` | Events stay in the outbox; the relay reconnects with backoff and drains them |
+| Worker crash mid-job | Job redelivered | Idempotent steps; deterministic keys; status check under a row lock |
+| Image can't be processed | Post marked `failed` after 3 attempts | Retry queue (5 s), then dead-letter queue for inspection |
+| Fan-out fails after publish | Job fails and is retried | The retry finds the post published and re-runs only the fan-out |
+| Redis timeline lost | Slower first feed load | Rebuild from PostgreSQL on read |
+| PostgreSQL slow | Feed requests would pile up | Circuit breaker returns an empty page flagged `degraded`; the client shows a banner |
+| Object storage down | Uploads fail fast with `503`, nothing written | Client retries with the same idempotency key |
+| Client retries a create | Same post returned | Idempotency key replay |
+
+## Scalability Considerations
+
+1. **Fan-out for mid-size accounts breaks first.** Accounts just under the threshold generate the most writes per post; batching followers into pipelines keeps a 10,000-follower post to a few round trips, and the threshold can move down if fan-out lag grows.
+2. **Celebrity reads become hot keys.** Every follower of a celebrity reads that account's recent posts; keep them in a `user_posts:{id}` list replicated across Redis replicas, plus a short in-process cache in the Feed service.
+3. **Timeline memory** grows with active users (~20 TB); the cap and the 7-day expiry bound it, and a compact encoding of 64-bit ids halves it.
+4. **PostgreSQL** shards by user id with posts co-located with their author; the graph is stored twice (by follower and by followee) so fan-out and feed pulls each read one shard.
+5. **Media processing** is the most elastic tier: autoscale workers on queue lag; uploads queue rather than fail during spikes.
+6. **Multi-region**: reads (feed, CDN, replicas) are served regionally; post writes go to the author's home region, and `post-published` events replicate to other regions' fan-out.
 
 ## Trade-offs Summary
 
 | Decision | Chosen | Alternative | Rationale |
 |----------|--------|-------------|-----------|
-| Feed model | Hybrid push/pull | Pure push or pull | Bounded fanout for celebrities, instant reads for normal users |
-| Auth | OAuth 2.0 + JWT | Session cookies | Mobile-friendly, stateless validation, token refresh |
-| DM storage | Cassandra | PostgreSQL | 300K writes/sec, TimeUUID ordering, partition isolation |
-| Message queue | Kafka | RabbitMQ | Event sourcing, replay capability, higher throughput |
-| Image storage | S3 + CDN | Self-hosted | 11 nines durability, global CDN, pay-per-use |
-| Search | Elasticsearch | PostgreSQL full-text | Fuzzy matching, autocomplete, relevance scoring |
-| Notifications | SSE + push | WebSocket | Unidirectional suffices, simpler connection management |
-| DM real-time | WebSocket | Polling | Sub-100ms delivery, bidirectional for typing/presence |
+| Feed generation | Hybrid: push < 10K followers, pull above | Pure push or pure pull | Cheap reads without million-write posts |
+| Timeline store | Redis sorted set, capped, rebuildable | Durable timeline table | It's a cache; PostgreSQL is the record |
+| Fan-out targets | Cached timelines only | Every follower | Dormant accounts cost nothing; rebuild on return |
+| Pagination | Keyset `(time, id)` cursor | Offset | Stable while posts arrive and disappear |
+| Upload path | Direct to object storage, async processing | Through the API, synchronous resize | API servers never hold bytes or CPU work |
+| Job hand-off | Transactional outbox | Commit, then publish | A post can never be stuck without its job |
+| Create retries | Idempotency key in the post's transaction | Disable the button | Survives timeouts, refreshes and races |
+| Messages | Cassandra, partition per conversation | PostgreSQL | Append-heavy, newest-first reads |
+| Private content | `404` on every read path | Filter only in lists | No probing by id |
 
----
+## Implementation Notes
 
-# Layer 2: Pocket-Size Architecture (What We Actually Built)
+### What runs
 
-This section documents the actual local implementation -- what runs on a single developer machine with Docker Compose. The goal is to learn production patterns at a human-debuggable scale.
+[`backend/src/index.ts`](./backend/src/index.ts) starts one Express process ([`app.ts`](./backend/src/app.ts)) serving every route, the outbox relay, and a periodic purge of expired idempotency keys. [`workers/image-worker.ts`](./backend/src/workers/image-worker.ts) is the media worker. The frontend is React 19 + TanStack Router + Zustand + Tailwind, with a virtualized feed.
 
-## Actual Local Architecture
+### Production patterns implemented
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                     Frontend (Vite + React)                      │
-│                      http://localhost:5173                        │
-└──────────────────────────┬──────────────────────────────────────┘
-                           │ HTTP (REST API)
-                           │
-┌──────────────────────────▼──────────────────────────────────────┐
-│                   Express API Server                             │
-│                    http://localhost:3000                          │
-│                                                                  │
-│  Routes: auth, posts, feed, stories, users, comments, messages   │
-│  Middleware: session (Redis), rate limiting, metrics, logging     │
-└───┬──────────┬──────────┬───────────┬───────────┬───────────────┘
-    │          │          │           │           │
-    │          │          │           │           │
-┌───▼───┐ ┌───▼───┐ ┌───▼───┐ ┌─────▼────┐ ┌───▼──────┐
-│ Pg    │ │Valkey │ │ MinIO │ │ RabbitMQ │ │Cassandra │
-│:5432  │ │:6379  │ │:9000  │ │  :5672   │ │  :9042   │
-│       │ │       │ │       │ │          │ │          │
-│users  │ │session│ │images │ │image jobs│ │DM msgs   │
-│posts  │ │feed   │ │stories│ │          │ │typing    │
-│follows│ │cache  │ │avatars│ │          │ │reactions │
-│stories│ │rate   │ │       │ │          │ │receipts  │
-│likes  │ │limits │ │       │ │          │ │          │
-│etc.   │ │       │ │       │ │          │ │          │
-└───────┘ └───────┘ └───────┘ └─────┬────┘ └──────────┘
-                                    │
-                              ┌─────▼─────┐
-                              │  Image    │
-                              │  Worker   │
-                              │ (separate │
-                              │  process) │
-                              └───────────┘
+**Hybrid fan-out** — [`services/feedService.ts`](./backend/src/services/feedService.ts) and [`services/timeline.ts`](./backend/src/services/timeline.ts). After a post is published, `fanOutPost` checks the author's `follower_count`; below `FEED_CELEBRITY_THRESHOLD` it pages through followers by keyset (`FEED_FANOUT_BATCH_SIZE`, default 1,000) and writes each page as one Redis pipeline of a Lua script that only touches timelines that exist:
+
+```lua
+if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
+redis.call('ZADD', KEYS[1], ARGV[1], ARGV[2])
+redis.call('ZREMRANGEBYRANK', KEYS[1], 0, -(tonumber(ARGV[3]) + 1))
+return 1
 ```
 
-## What Actually Runs
+`getFeedPage` reads the timeline page and the celebrity candidates in parallel, rebuilds a timeline whose `~built` marker is missing (marker first, then the query), continues from PostgreSQL past the 500-entry cap, merges by `(created_ms, id)`, and hydrates the page in one SQL statement (author, media as a JSON array, the viewer's like and save state). Follow copies the author's 50 newest posts into a cached timeline; unfollow removes them; delete removes the post from every timeline it was pushed to. [`routes/feed.ts`](./backend/src/routes/feed.ts) validates cursors (`400` on offsets), clamps `limit` to 50, and wraps the read in an Opossum breaker whose fallback is an empty page flagged `degraded`. There is no feed response cache any more; it served stale like state for 60 seconds.
 
-### Single Express Server (Not Microservices)
+**Upload pipeline** — [`routes/posts.ts`](./backend/src/routes/posts.ts) validates (images only, known filters, caption length), replays a known `Idempotency-Key` ([`services/idempotency.ts`](./backend/src/services/idempotency.ts)), uploads originals to MinIO before opening a transaction, then commits post + media + key + outbox event together; a losing concurrent retry rolls back, deletes its uploads and returns the winner's post. [`services/outbox.ts`](./backend/src/services/outbox.ts) claims due events with `FOR UPDATE SKIP LOCKED`, publishes each with a broker confirm, and backs off failures (1 s doubling to 60 s); while RabbitMQ is down it claims nothing and reconnects in the background. [`services/queue.ts`](./backend/src/services/queue.ts) uses a confirm channel, retries failed jobs through a new `image-processing-retry` queue (5 s delay) up to `MEDIA_JOB_MAX_ATTEMPTS` (3), dead-letters poison messages immediately, and re-registers the consumer after a reconnect. The main queue's arguments are unchanged, so existing broker volumes keep working. [`services/mediaPipeline.ts`](./backend/src/services/mediaPipeline.ts) is the idempotent worker described in [Publishing and fan-out](#publishing-and-fan-out).
 
-The production architecture splits into Feed, Media, Story, DM, and Notification services. Locally, everything runs as a single Express server (`backend/src/index.ts`) with route modules:
+**Visibility and authorization** — [`services/visibility.ts`](./backend/src/services/visibility.ts) implements the rules in [Security / Auth](#security--auth) for posts, comments, replies, likes, saves and stories. [`routes/messages.ts`](./backend/src/routes/messages.ts) checks conversation membership before every conversation-scoped route. [`routes/auth.ts`](./backend/src/routes/auth.ts) regenerates the session id at login and registration and maps a racing duplicate sign-up to `409`.
 
-- `routes/auth.ts` -- register, login, logout, current user
-- `routes/posts.ts` -- CRUD + like/unlike with idempotency
-- `routes/feed.ts` -- pull-model feed with Redis caching
-- `routes/stories.ts` -- create, view, story tray with cache
-- `routes/users.ts` -- profile, follow/unfollow, followers/following
-- `routes/comments.ts` -- threaded comments with like support
-- `routes/messages.ts` -- DM conversations and messages via Cassandra
+**Caches with invalidation** — post detail entries (`post:v2:{id}`) are written only for published posts and deleted on like, unlike, comment, comment delete, post delete, publish and failure. Story trays live for at most 60 seconds, never past the earliest expiry in them, and are dropped when the viewer views a story or a followed author adds or deletes one.
 
-The server can run as multiple instances on ports 3001-3003 (`npm run dev:server1`, `dev:server2`, `dev:server3`) for testing distributed behavior, though no load balancer is wired up by default.
+**Operations** — graceful shutdown fails readiness, stops accepting connections, drains requests (up to 10 s), stops the relay, then closes PostgreSQL, Redis, Cassandra and RabbitMQ. `/api/health/detailed` reports object storage (it used to report "ok" with MinIO down), the broker, and the outbox backlog with the age of its oldest event. Metrics (prom-client) include `instagram_feed_fanout_total{mode}`, `instagram_feed_fanout_timeline_writes_total`, `instagram_outbox_pending_events`, `instagram_image_job_outcomes_total{outcome}` and `instagram_idempotent_replays_total{result}`. Logs are Pino JSON with a per-request trace id.
 
-### Separate Image Worker
+**Frontend** — likes and saves are optimistic with rollback through [`hooks/useOptimisticToggle.ts`](./frontend/src/hooks/useOptimisticToggle.ts): extra taps are ignored while a request is in flight, failures roll back and are announced in an `aria-live` region, and an `idempotent: true` response undoes the optimistic +1. The composer sends one `Idempotency-Key` per draft and lands on the new post's page, which shows the processing state. The feed passes opaque cursors, de-duplicates pages, and has error, retry and degraded states.
 
-The one piece that does run as a separate process: `backend/src/workers/image-worker.ts`. It consumes from a RabbitMQ queue, processes images with Sharp (resize to 4 sizes: 150x150, 320x320, 640x640, 1080x1080), and updates the database. This demonstrates the async processing pattern from the production architecture.
+**Tests** — 91 vitest tests in 7 files run offline with mocked infrastructure: routes ([`app.test.ts`](./backend/src/app.test.ts)), feed algorithm, timeline primitives, worker, queue (retry, dead-letter, reconnect), outbox relay and idempotency fingerprints.
 
-After processing, the worker fans out the post to followers' Redis timelines (`ZADD timeline:{userId} {timestamp} {postId}`), implementing a simplified version of the push model.
+### Simplified or substituted
 
-### Infrastructure (Docker Compose)
+- Uploads go through the API (multer, 10 MB per file) to MinIO instead of signed URLs to S3; there is no CDN.
+- RabbitMQ replaces Kafka, and the media worker performs fan-out itself instead of emitting `post-published` to separate fan-out workers.
+- One PostgreSQL instance with UUID ids; order and cursors use `created_at` in milliseconds plus the id. Celebrity posts are read from PostgreSQL rather than a `user_posts` list.
+- The feed is chronological; there is no ranking model. Explore orders by `likes + 2 × comments`.
+- Sessions in Redis instead of OAuth. Direct messages are HTTP endpoints on a single-node Cassandra, with no WebSocket push.
+- Stories are resized inside the request (behind a breaker). Renditions are four JPEG sizes plus a full-size copy, with no WebP or AVIF.
 
-The `docker-compose.yml` starts 5 services:
+### Omitted
 
-| Service | Image | Port | Purpose |
-|---------|-------|------|---------|
-| PostgreSQL 16 | `postgres:16-alpine` | 5432 | All relational data |
-| Valkey 7 | `valkey/valkey:7-alpine` | 6379 | Sessions, feed cache, rate limiting, timelines |
-| RabbitMQ 3 | `rabbitmq:3-management-alpine` | 5672 / 15672 | Image processing queue + management UI |
-| Cassandra 4.1 | `cassandra:4.1` | 9042 | Direct messages |
-| MinIO | `minio/minio:latest` | 9000 / 9001 | Object storage + console |
+Video, ranking, search beyond `ILIKE`, notifications, moderation, multi-region, sharding and read replicas.
 
-Initialization containers handle Cassandra schema (`cassandra-init.cql`) and MinIO bucket creation.
+### Known limitations
 
-### Frontend
-
-React + TypeScript + Vite with TanStack Router. Key routes:
-
-| Route | Component | Purpose |
-|-------|-----------|---------|
-| `/` | `index.tsx` | Home feed with virtualized list (@tanstack/react-virtual) |
-| `/login`, `/register` | auth routes | Session-based authentication |
-| `/create` | `create.tsx` | Post creation with filter preview |
-| `/profile/:username` | `profile.$username.tsx` | User profile with post grid |
-| `/post/:postId` | `post.$postId.tsx` | Single post detail view |
-| `/explore` | `explore.tsx` | Discover content |
-| `/settings` | `settings.tsx` | User settings |
-
-State management: Zustand (`authStore.ts`). API client: centralized in `services/api.ts`.
-
-## What's Simplified
-
-| Production | Local Implementation |
-|------------|---------------------|
-| S3 + CDN | MinIO (S3-compatible, no CDN) |
-| OAuth 2.0 + JWT | Session cookies in Valkey (simpler, web-only) |
-| Hybrid push/pull feed | Pull model with Redis cache (60s TTL) |
-| Sharded PostgreSQL | Single instance, no replicas |
-| Kafka event bus | RabbitMQ (simpler, sufficient for single-machine) |
-| WebSocket for DMs | HTTP polling (no real-time push) |
-| Elasticsearch search | PostgreSQL LIKE queries |
-| Push notifications | Not implemented |
-| Content moderation | Not implemented |
-| Pre-signed upload URLs | Multipart upload through API server |
-| 5 image sizes + WebP/AVIF | 4 JPEG sizes (thumbnail, small, medium, large) |
-| Multi-region deployment | Single machine |
-| Auto-scaling | Fixed process count |
-
-## Production Patterns Actually Implemented
-
-The following production-grade patterns are wired into the running code, not just listed as dependencies.
-
-### Circuit Breakers (Opossum)
-
-**File**: `backend/src/services/circuitBreaker.ts`
-
-The `createCircuitBreaker` factory wraps async functions with three-state protection (CLOSED / OPEN / HALF-OPEN). Configuration: 10s timeout, 50% error threshold, 30s reset timeout, minimum 5 requests before tripping.
-
-Circuit breakers are used in feed generation and image processing routes. When a downstream service fails repeatedly, the breaker opens and returns a fallback immediately (503 for processing, empty feed for feeds), preventing cascade failures.
-
-All state transitions emit Prometheus metrics (`instagram_circuit_breaker_state`, `instagram_circuit_breaker_events_total`) and structured log entries.
-
-### Prometheus Metrics (prom-client)
-
-**File**: `backend/src/services/metrics.ts`
-
-30+ metrics are defined and actively collected:
-
-- HTTP request duration and count (histogram + counter with method/route/status labels)
-- Business metrics: posts created, likes (with duplicate detection), follows, stories, story views
-- Feed performance: generation duration by cache hit/miss, cache hit/miss counters
-- Image processing: duration histogram, error counter by type
-- Circuit breaker: state gauge, event counter
-- Database: query duration, connection pool size
-- Auth: login/register attempts by result
-- Rate limiting: hits by action
-
-Metrics are exposed at `GET /metrics` in Prometheus text format and collected via the `metricsMiddleware` on every request.
-
-### Structured Logging (Pino)
-
-**File**: `backend/src/services/logger.ts`
-
-JSON-structured logging with:
-- Service context (name, env, port) on every log line
-- Request correlation via `traceId` (UUID assigned per request, propagated via `x-trace-id` header)
-- Child loggers with user context (`createRequestLogger`)
-- Specialized log functions: `logRequest` (with timing), `logError` (with stack), `logQuery` (with slow query warnings > 1s), `logCache` (hit/miss tracking)
-- Log level routing: 5xx = error, 4xx = warn, 2xx = info
-
-### Rate Limiting (express-rate-limit + Redis)
-
-**File**: `backend/src/services/rateLimiter.ts`
-
-Distributed rate limiting backed by Redis (works across multiple API server instances). Seven endpoint-specific limiters are configured:
-- Post creation: 10/hour
-- Follow: 30/hour
-- Login: 5/minute (skips successful requests)
-- Like: 100/hour
-- Comment: 50/hour
-- Story: 20/hour
-- Feed: 60/minute
-- General: 1000/minute (catch-all)
-
-Each limiter logs warnings on hits, increments Prometheus counters, and returns `429` with informative error messages. Key generation uses user ID when authenticated, IP when anonymous.
-
-### Health Checks
-
-**File**: `backend/src/app.ts`
-
-Four health endpoints are implemented:
-- `GET /api/health` -- simple liveness (200 if process is running)
-- `GET /api/health/live` -- Kubernetes-style liveness probe
-- `GET /api/health/ready` -- readiness probe (checks PostgreSQL + Redis connectivity)
-- `GET /api/health/detailed` -- comprehensive check of all 5 dependencies (PostgreSQL, Redis, MinIO, Cassandra, RabbitMQ) with latency measurements, memory usage, and uptime
-
-### Request Tracing
-
-Every request gets a `traceId` (from `x-trace-id` header or auto-generated UUID). This ID is returned in the response header, logged with every request, and passed to background jobs via RabbitMQ message payloads. This enables end-to-end request tracking across the API server and image worker.
-
-### Graceful Shutdown
-
-**File**: `backend/src/index.ts`
-
-On SIGTERM/SIGINT, the server closes connections in order: PostgreSQL pool, Redis, Cassandra, RabbitMQ. This prevents in-flight requests from failing and ensures clean resource cleanup.
-
-### Idempotent Likes
-
-Likes use `INSERT ... ON CONFLICT DO NOTHING RETURNING id` with a `UNIQUE(user_id, post_id)` constraint. Duplicate like attempts are silently absorbed, and the `like_count` trigger only fires on actual inserts. A Prometheus counter (`instagram_likes_duplicate_total`) tracks idempotent hits.
-
-### Dead Letter Queue
-
-**File**: `backend/src/services/queue.ts`
-
-Failed image processing jobs (after worker failure) are nacked without requeue, routing them to the `image-processing-dlq` dead letter queue via the `instagram-dlx` exchange. This prevents poison messages from blocking the queue.
-
-### Database Triggers
-
-**File**: `backend/src/db/init.sql`
-
-PostgreSQL triggers maintain denormalized counts:
-- `follow_count` / `following_count` on users (on follows INSERT/DELETE)
-- `post_count` on users (on posts INSERT/DELETE)
-- `like_count` on posts (on likes INSERT/DELETE)
-- `comment_count` on posts (on comments INSERT/DELETE)
-- `view_count` on stories (on story_views INSERT)
-
-This avoids expensive COUNT queries on every profile/post load.
-
-## What's Omitted
-
-These production features are not implemented:
-
-- CDN and edge caching
-- Multi-region deployment and geo-routing
-- Kubernetes orchestration
-- Database sharding and read replicas
-- ML-based feed ranking
-- Real-time WebSocket for DMs (uses HTTP polling)
-- Push notifications (APNs, FCM)
-- Content moderation pipeline
-- Video transcoding
-- Explore/discovery algorithm
-- Full-text search (Elasticsearch)
-- Pre-signed upload URLs (uploads go through the API server)
-- OAuth 2.0 / JWT (uses session cookies)
-
-## How to Run
-
-```bash
-# Terminal 1: Start infrastructure
-cd instagram
-docker-compose up -d
-
-# Terminal 2: Start backend API
-cd instagram/backend
-npm run dev          # Starts on port 3000
-
-# Terminal 3: Start image worker
-cd instagram/backend
-npm run dev:worker   # Consumes from RabbitMQ
-
-# Terminal 4: Start frontend
-cd instagram/frontend
-npm run dev          # Starts on port 5173
-```
-
-**Default credentials**:
-
-| Service | User | Password | Database |
-|---------|------|----------|----------|
-| PostgreSQL | instagram | instagram123 | instagram |
-| RabbitMQ | instagram | instagram123 | - |
-| MinIO | minioadmin | minioadmin123 | bucket: instagram-media |
-| Cassandra | - | - | keyspace: instagram_dm |
-
-**Useful URLs**:
-- Frontend: http://localhost:5173
-- API: http://localhost:3000/api/v1/
-- Metrics: http://localhost:3000/metrics
-- Health: http://localhost:3000/api/health/detailed
-- RabbitMQ UI: http://localhost:15672
-- MinIO Console: http://localhost:9001
+- Celebrity status is decided from the current `follower_count` at publish and at read. An author who drops below the threshold leaves posts made while above it out of timelines until a rebuild.
+- RabbitMQ classic queues have no delivery limit: a job that crashes the worker process (rather than throwing) is redelivered indefinitely. Retries use one fixed 5-second delay.
+- The Cassandra inbox moves a conversation to the top with a read, a delete and an insert, so two concurrent senders can leave a duplicate row; the unread count is read-modify-write; usernames and avatars in it are still not refreshed after a profile change.
+- Rate limits use `express-rate-limit` with a Redis fixed-window store, not a sliding window.
+- Likes, comments and follower lists still page on `created_at` alone, so equal timestamps can skip a row.
+- The frontend keeps server data in component state rather than a query cache, and Explore search requests are not cancelled when superseded.
+- Locally verified with PostgreSQL and Redis only; the RabbitMQ, MinIO and Cassandra paths are covered by unit tests with mocks.

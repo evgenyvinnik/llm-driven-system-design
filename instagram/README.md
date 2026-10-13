@@ -18,8 +18,8 @@ A photo and video sharing social platform with photo/video uploads, filters, fee
 
 ## Key Features
 
-- Photo/video upload with 12 Instagram-style CSS filters
-- Personalized feed from followed users
+- Photo upload (up to 10 per post) with 12 Instagram-style filters, safe to retry with an `Idempotency-Key`
+- Home feed with hybrid fan-out (push for most accounts, pull for high-follower accounts) and keyset pagination
 - Stories (24-hour ephemeral content with view tracking)
 - Likes, comments, and saves
 - Follow/unfollow system
@@ -43,7 +43,7 @@ A photo and video sharing social platform with photo/video uploads, filters, fee
 - [x] Core functionality implementation
 - [x] Database/Storage layer
 - [x] API endpoints
-- [ ] Testing
+- [x] Testing (backend: 91 offline vitest tests)
 - [ ] Performance optimization
 - [x] Documentation
 
@@ -111,7 +111,7 @@ brew services start postgresql@16
 
 # Create database
 createdb instagram
-psql instagram < backend/db/init.sql
+psql instagram < backend/src/db/init.sql   # re-runnable: safe to apply again after pulling changes
 ```
 
 #### Redis
@@ -170,7 +170,25 @@ SESSION_SECRET=your-super-secret-session-key-change-in-production
 # Server
 PORT=3001
 NODE_ENV=development
+
+# RabbitMQ and Cassandra
+RABBITMQ_URL=amqp://instagram:instagram123@localhost:5672
+CASSANDRA_HOSTS=localhost
+
+# Feed (hybrid fan-out)
+FEED_CELEBRITY_THRESHOLD=10000   # authors with this many followers are pulled at read time, not pushed
+FEED_TIMELINE_MAX_ENTRIES=500    # entries kept per Redis timeline
+FEED_TIMELINE_TTL_SECONDS=604800 # idle timelines expire and are rebuilt from PostgreSQL on read
+FEED_FANOUT_BATCH_SIZE=1000      # followers written per Redis pipeline
+FEED_FOLLOW_BACKFILL=50          # recent posts copied into your timeline when you follow someone
+
+# Media pipeline
+MEDIA_JOB_MAX_ATTEMPTS=3         # attempts before a job is dead-lettered and the post marked failed
+OUTBOX_RELAY_INTERVAL_MS=2000    # how often the API publishes pending outbox events
+OUTBOX_RELAY_BATCH_SIZE=50
 ```
+
+With the small seed data set `FEED_CELEBRITY_THRESHOLD=4` to exercise the pull path (`alice` has 4 followers).
 
 ### Running Multiple Backend Instances
 
@@ -195,12 +213,11 @@ Image processing is handled asynchronously via RabbitMQ. Start workers to proces
 # Single worker
 npm run dev:worker
 
-# Multiple workers for parallel processing
-npm run dev:worker1  # Terminal 1
-npm run dev:worker2  # Terminal 2
+# More workers for parallel processing: run the same command in another terminal
+npm run dev:worker
 ```
 
-Workers apply filters (resize, Sharp processing) to uploaded images in the background. Posts are returned immediately with status `processing` and updated to `published` once complete.
+Workers resize uploaded images with Sharp in the background (filters are applied by the browser). `POST /api/v1/posts` returns `202` with status `processing`; the job reaches RabbitMQ through a transactional outbox relayed by the API, so posts created while RabbitMQ is down are processed once it returns. A failed job is retried after 5 seconds, up to 3 attempts, then moved to `image-processing-dlq` and the post is marked `failed`.
 
 ## Service URLs
 
@@ -222,7 +239,7 @@ Workers apply filters (resize, Sharp processing) to uploaded images in the backg
 - `GET /api/v1/auth/me` - Get current user
 
 ### Posts
-- `POST /api/v1/posts` - Create post (multipart form)
+- `POST /api/v1/posts` - Create post (multipart form; optional `Idempotency-Key` header; images only)
 - `GET /api/v1/posts/:postId` - Get post
 - `DELETE /api/v1/posts/:postId` - Delete post
 - `POST /api/v1/posts/:postId/like` - Like post
@@ -250,7 +267,7 @@ Workers apply filters (resize, Sharp processing) to uploaded images in the backg
 - `GET /api/v1/users/search/users` - Search users
 
 ### Feed
-- `GET /api/v1/feed` - Get home feed
+- `GET /api/v1/feed?cursor=&limit=` - Get home feed (`cursor` is the opaque `nextCursor` of the previous page)
 - `GET /api/v1/feed/explore` - Get explore page
 
 ### Stories
@@ -285,18 +302,18 @@ See [architecture.md](./architecture.md) for detailed system design documentatio
 
 ## Development Notes
 
-See [claude.md](./claude.md) for development insights and iteration history.
+See [CLAUDE.md](./CLAUDE.md) for development insights and iteration history.
 
 ## Testing
 
 ```bash
-# Backend tests (when implemented)
+# Backend: 91 vitest tests, all infrastructure mocked (no Docker needed)
 cd backend
 npm test
 
-# Frontend tests (when implemented)
+# Frontend: no unit tests; type-check and build instead
 cd frontend
-npm test
+npm run build
 ```
 
 ## Stopping Services

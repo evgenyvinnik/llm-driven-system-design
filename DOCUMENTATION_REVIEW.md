@@ -72,7 +72,7 @@ Implementation Notes describing the code as it is after the changes. [bitly](./b
 | [hotel-booking](./hotel-booking/architecture.md) | Pending | — | — |
 | [icloud](./icloud/architecture.md) | Pending | — | — |
 | [imessage](./imessage/architecture.md) | Done | Per-conversation seq under row lock with membership check; client_message_id unique index (retry returns original, 422 on different content); per-device inbox written in the send transaction with ack + delivered events; forward-only read receipts; device revocation closes sockets; reaction participant check (IDOR); atomic Lua rate limiter on REST + WebSocket; frontend seq ordering, gap sync, outbox, reconnect with jitter | backend tsc + eslint + 20 vitest; frontend tsc + eslint + 10 vitest + build; 38-check WebSocket/REST runtime script against PostgreSQL + Redis; re-verified independently |
-| [instagram](./instagram/architecture.md) | Pending | — | — |
+| [instagram](./instagram/architecture.md) | Done | Hybrid fan-out feed (push below a follower threshold via pipelined Lua, pull+merge above) with keyset cursors and one-query hydration; Idempotency-Key uploads; transactional outbox relayed with publisher confirms, idempotent worker, retry queue + DLQ; DM participant checks (IDOR); private/unpublished content hidden (404); session regeneration on login; frontend optimistic like/save with rollback | backend tsc + 91 vitest + lint; frontend build; runtime feed/fan-out/outbox checks on PostgreSQL + Redis (RabbitMQ, MinIO, Cassandra not available); re-verified independently |
 | [jira](./jira/architecture.md) | Pending | — | — |
 | [job-scheduler](./job-scheduler/architecture.md) | Pending | — | — |
 | [kindle-highlights](./kindle-highlights/architecture.md) | Pending | — | — |
