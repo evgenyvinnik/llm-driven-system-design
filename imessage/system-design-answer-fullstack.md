@@ -1,680 +1,297 @@
-# iMessage - System Design Answer (Full-Stack Focus)
+# 💬 iMessage — System Design Answer (Full-Stack Focus)
 
-*45-minute system design interview format - Full-Stack Engineer Position*
+*45-minute full-stack interview. This is a proposed production design; what this repository actually runs is described in [architecture.md → Implementation Notes](./architecture.md#implementation-notes).*
 
-## Opening Statement (1 minute)
+> "As a full-stack engineer I want to follow one message from the Send button to every device it lands on, and get the contracts between client and server right — because in messaging, every guarantee is split across the wire. Three contracts carry the weight: a **client message ID** that makes retries safe, a **sequence number** that makes order and missing messages visible, and **acknowledgements and watermarks** that make 'Delivered' and 'Read' honest. The backend delivers at least once; the client turns that into exactly once on screen."
 
-"I'll design iMessage, Apple's end-to-end encrypted messaging platform. As a full-stack engineer, I'll focus on the complete message flow from client-side encryption through server routing to recipient decryption, the shared type contracts between frontend and backend, and building reliable real-time delivery with offline support on both ends.
+| Phase | Time | What I want the interviewer to leave with |
+|-------|------|--------------------------------------------|
+| Requirements & scale | 5 min | Scope and targets on both sides of the wire |
+| End-to-end architecture | 9 min | One diagram from the composer to the recipient's devices, plus the core flows |
+| Data model & API contract | 7 min | Server tables, client store, and the fields both sides rely on |
+| Deep dive 1: exactly one message per Send | 8 min | Client ID, unique index, ack with seq |
+| Deep dive 2: order and catch-up | 7 min | Seq, mailbox, gap detection, reconnect |
+| Deep dive 3: receipts end to end | 6 min | Acks become "Delivered", watermarks become "Read" on every device |
+| Failures, scale, wrap-up | 3 min | What each failure looks like to a user |
 
-The core full-stack challenges are: coordinating encryption workflows across client and server, implementing WebSocket-based real-time delivery, and ensuring consistent message state across multiple devices."
+---
 
-## Requirements Clarification (3 minutes)
+## 🎯 Requirements & Scale (5 min)
 
-### Functional Requirements
-- **E2E Encrypted Messaging**: Client encrypts, server routes, recipient decrypts
-- **Multi-Device Sync**: Messages appear on all user's devices
-- **Group Chats**: Efficient encryption for group messaging
-- **Offline Support**: Queue and sync when connectivity returns
-- **Delivery Status**: Pending, sent, delivered, read indicators
+**Functional.** 1:1 and group messaging (up to ~100 members) with replies and reactions; every message appears on all of the recipient's devices and on the sender's other devices; "Delivered" and "Read" receipts, with reading on one device clearing the badge on the others; offline compose and catch-up; typing and presence; end-to-end encryption with per-device keys. Out of scope: SMS fallback, server-side search, calls, cloud backup.
 
-### Non-Functional Requirements
-- **Security**: Server cannot decrypt message content
-- **Latency**: < 500ms for online message delivery
-- **Reliability**: Zero message loss, exactly-once delivery semantics
-- **Consistency**: Eventual consistency with causal ordering per conversation
+| Side | Requirement | Target |
+|------|-------------|--------|
+| Frontend | Send feedback | Bubble on screen < 50 ms after Enter, online or not |
+| Frontend | Long threads | INP < 200 ms while typing in a 10,000-message thread |
+| Frontend | Offline | Composed messages survive reconnects and reloads |
+| Backend | Send acknowledgement | p99 < 200 ms to "Sent" |
+| Backend | Delivery, both online | p99 < 500 ms device to device |
+| Backend | Offline window | 30 days of undelivered messages per device |
+| Both | Correctness | One order everywhere; nothing lost after "Sent"; nothing shown twice; statuses never move backwards |
 
-### Scale Estimates
-- **Users**: 1.5 billion+ active users
-- **Messages/day**: 10+ billion
-- **Devices per user**: 3-5 average
+**Scale.** 200M daily users with 2.3 devices each; 5B messages a day (~58K/s, ~100K/s peak); each message reaches ~3 devices, so ~300K device deliveries a second at peak; ~115M sockets open at peak. Message ciphertext is ~7.5 TB a day, kept 30 days on the server.
 
-### Full-Stack Questions
-1. How do we share encryption types between client and server?
-2. What's the WebSocket protocol for real-time delivery?
-3. How do we handle sync cursor management across devices?
+"The per-device fan-out tells me delivery state must be tracked per device, cheaply and idempotently; the client side tells me every incoming message must be safe to apply twice and in any order."
 
-## High-Level Architecture (5 minutes)
+---
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    React Frontend                                │
-│  ┌────────────────────────────────────────────────────────────┐ │
-│  │ Zustand Stores │ Crypto Service │ WebSocket │ IndexedDB    │ │
-│  └────────────────────────────────────────────────────────────┘ │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                   Shared Types (TypeScript)
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    Express Backend                               │
-│  ┌────────────────────────────────────────────────────────────┐ │
-│  │ Key Directory │ Message Service │ WebSocket Hub │ Sync     │ │
-│  └────────────────────────────────────────────────────────────┘ │
-└─────────────────────────────────────────────────────────────────┘
-         │                    │                    │
-         ▼                    ▼                    ▼
-┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐
-│   PostgreSQL    │  │     Valkey      │  │     MinIO       │
-│   (messages,    │  │   (sessions,    │  │  (encrypted     │
-│    keys, sync)  │  │    presence)    │  │   attachments)  │
-└─────────────────┘  └─────────────────┘  └─────────────────┘
-```
-
-### Integration Points
-
-| Component | Frontend | Backend | Shared |
-|-----------|----------|---------|--------|
-| Encryption | Web Crypto API | Key storage | Key format types |
-| Messages | Send/receive UI | Store/route | Message envelope types |
-| Real-time | WebSocket client | WebSocket hub | Protocol types |
-| Sync | IndexedDB + cursors | Delta queries | Sync response types |
-
-## Deep Dive: Shared Type Contracts (5 minutes)
-
-### Shared Types Package
-
-> "We use a monorepo with a shared TypeScript package to ensure compile-time type safety between frontend and backend. This prevents drift and catches breaking changes at build time."
+## 🏗️ End-to-End Architecture (9 min)
 
 ```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                     @imessage/shared Types                                    │
-├──────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  MessageEnvelope:                                                            │
-│  ┌─────────────────────────────────────────────────────────────────────────┐│
-│  │ id: string                     (message UUID)                           ││
-│  │ conversationId: string         (chat thread)                            ││
-│  │ senderId: string               (author)                                 ││
-│  │ contentType: 'text' | 'image' | 'video' | 'file'                       ││
-│  │ encryptedContent: string       (Base64 encoded ciphertext)              ││
-│  │ iv: string                     (AES-GCM initialization vector)          ││
-│  │ encryptedKeys: DeviceEncryptedKey[]  (per-device wrapped keys)         ││
-│  │ replyToId?: string             (for replies)                            ││
-│  │ timestamp: string              (ISO 8601)                               ││
-│  └─────────────────────────────────────────────────────────────────────────┘│
-│                                                                              │
-│  DeviceEncryptedKey:                                                         │
-│  ┌─────────────────────────────────────────────────────────────────────────┐│
-│  │ deviceId: string               (target device)                          ││
-│  │ encryptedKey: string           (message key wrapped with device key)    ││
-│  │ ephemeralPublicKey: string     (for X3DH key derivation)                ││
-│  └─────────────────────────────────────────────────────────────────────────┘│
-│                                                                              │
-│  DevicePublicKeys:                                                           │
-│  ┌─────────────────────────────────────────────────────────────────────────┐│
-│  │ deviceId: string                                                        ││
-│  │ identityPublicKey: string      (ECDSA P-256)                            ││
-│  │ signingPublicKey: string       (ECDSA P-256)                            ││
-│  │ preKey?: string                (one-time ECDH key)                      ││
-│  └─────────────────────────────────────────────────────────────────────────┘│
-│                                                                              │
-└──────────────────────────────────────────────────────────────────────────────┘
+ ┌───────────────────────────────┐  GET /keys/{user}   ┌────────────────────────────┐
+ │ Client app · chat store       ├────────────────────▶│ Key Directory              │
+ │ by seq · WS client, outbox    │                     │ device keys, prekeys       │
+ └───────────────┬───────────────┘                     └────────────────────────────┘
+                 │ (1) send    (3) sync, ack
+                 ▼
+ ┌───────────────────────────────┐   push to device    ┌────────────────────────────┐
+ │ WebSocket gateways · TLS      │◀────────────────────┤ Fan-out workers            │
+ │ ~100K sockets each            │                     │ mailbox append, push       │
+ └───────────────┬───────────────┘                     │ APNs wake when offline     │
+                 │ send · sync · ack                   └──┬────────────▲──────────┬─┘
+                 ▼                                        │ append     │ events   │ conn:{device}
+ ┌───────────────────────────────┐                        ▼            │          ▼
+ │ Message Service               │ drain, ack  ┌────────────────┐ ┌────┴────┐  ┌───────────────┐
+ │ seq · dedupe · receipts       ├────────────▶│ Mailbox shards │ │ Kafka   │  │ Redis         │
+ └───────────────┬───────────────┘             │ by device_id   │ └─────────┘  │ conn registry │
+                 │ txn: seq, message, outbox   └────────────────┘      ▲       └───────────────┘
+                 ▼                                                     │
+ ┌───────────────────────────────┐  (2) outbox relay                   │
+ │ PostgreSQL conversation       ├─────────────────────────────────────┘
+ │ shards · messages by seq      │
+ └───────────────────────────────┘
 ```
 
-### Sync Types
+1. **Send (1).** The client shows an optimistic bubble, generates a client message ID, and sends over its WebSocket (or keeps the frame in its outbox while offline). The Message Service, in one transaction on the conversation's shard, takes the next seq, inserts the message deduplicated by that ID, and writes an outbox row; the ack carries the stored message and its seq back to the client.
+2. **Fan-out (2).** The outbox row reaches Kafka; fan-out workers append a mailbox row for every recipient device — including the sender's other devices — and push to whichever gateway holds each device, or wake it through APNs.
+3. **Sync (3).** A reconnecting client drains its mailbox in batches, applies each message idempotently, and acks; the acks become "Delivered" receipts for the senders.
+
+| Layer | Choice | Why |
+|-------|--------|-----|
+| Client | React SPA; one store with a single merge path; WebSocket client with an outbox | Pushes are merges, not refetches; sends must survive drops |
+| Gateways | Stateless socket holders | Scale on connections; restart freely |
+| Message Service | Stateless; seq, dedupe, sync, acks, watermarks | Scales on message rate |
+| PostgreSQL conversation shards | Messages by `(conversation_id, seq)`, members, watermarks, outbox | One transaction gives order, dedupe and the fan-out event |
+| Kafka + fan-out workers | Asynchronous, idempotent delivery | The sender's "Sent" doesn't wait for fan-out |
+| Mailbox shards | Per-device undelivered messages | Catch-up is one scan per device |
+| Redis | Device → gateway registry, presence, sessions, rate limits | Ephemeral; never holds a message |
+
+### Flow: sending, across the wire
 
 ```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                     Sync Request/Response Types                               │
-├──────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  SyncRequest:                                                                │
-│  ┌─────────────────────────────────────────────────────────────────────────┐│
-│  │ conversationId: string         (which chat to sync)                     ││
-│  │ cursor?: string                (last synced message ID)                 ││
-│  │ limit?: number                 (pagination size)                        ││
-│  └─────────────────────────────────────────────────────────────────────────┘│
-│                                                                              │
-│  SyncResponse:                                                               │
-│  ┌─────────────────────────────────────────────────────────────────────────┐│
-│  │ messages: MessageEnvelope[]    (new messages since cursor)              ││
-│  │ readReceipts: ReadReceipt[]    (who read what)                          ││
-│  │ cursor: string                 (new cursor for next sync)               ││
-│  │ hasMore: boolean               (pagination continues?)                  ││
-│  └─────────────────────────────────────────────────────────────────────────┘│
-│                                                                              │
-│  ReadReceipt:                                                                │
-│  ┌─────────────────────────────────────────────────────────────────────────┐│
-│  │ userId: string                                                          ││
-│  │ lastReadMessageId: string                                               ││
-│  │ lastReadAt: string             (ISO 8601)                               ││
-│  └─────────────────────────────────────────────────────────────────────────┘│
-│                                                                              │
-└──────────────────────────────────────────────────────────────────────────────┘
+Chat store                WS client         Message Svc                      PostgreSQL    Bob
+     │                        │                  │                                │         │
+     │ 1 bubble, client ID K  │                  │                                │         │
+     │ 2 send {K}             │                  │                                │         │
+     │───────────────────────▶│                  │                                │         │
+     │                        │ 3 send {K}       │                                │         │
+     │                        │─────────────────▶│                                │         │
+     │                        │                  │ 4 seq+1; INSERT … ON CONFLICT  │         │
+     │                        │                  │───────────────────────────────▶│         │
+     │                        │                  │ 5 seq 812 (or original)        │         │
+     │                        │                  │◀───────────────────────────────│         │
+     │                        │ 6 sent {K, 812}  │                                │         │
+     │                        │◀─────────────────│                                │         │
+     │ 7 swap bubble: "Sent"  │                  │                                │         │
+     │◀───────────────────────│                  │                                │         │
+     │                        │                  │ 8 push + inbox row                       │
+     │                        │                  │─────────────────────────────────────────▶│
+     │                        │                  │                                │         │
 ```
 
-### WebSocket Protocol Types
+"Steps 1 and 4 are two halves of one contract. The client promises to reuse K for every retry of this message; the server promises that a repeated K returns the stored message instead of inserting again — enforced by a unique index inside the same transaction that takes the seq. Step 6 gives the client the seq, which is when the bubble moves to its final position."
+
+### Flow: receipts flowing back
 
 ```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                     WebSocketMessage Union Type                               │
-├──────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  type: 'new_message'                                                         │
-│    payload: { messageId, conversationId }                                    │
-│    direction: Server ──▶ Client                                              │
-│                                                                              │
-│  type: 'delivery_receipt'                                                    │
-│    payload: { messageId, deviceId }                                          │
-│    direction: Bidirectional                                                  │
-│                                                                              │
-│  type: 'read_receipt'                                                        │
-│    payload: { conversationId, userId, lastReadMessageId }                    │
-│    direction: Bidirectional                                                  │
-│                                                                              │
-│  type: 'typing'                                                              │
-│    payload: { conversationId, userId, isTyping }                             │
-│    direction: Bidirectional                                                  │
-│                                                                              │
-│  type: 'ping' | 'pong'                                                       │
-│    direction: Bidirectional (heartbeat)                                      │
-│                                                                              │
-└──────────────────────────────────────────────────────────────────────────────┘
+Alice UI                 Message Svc           Bob iPad    Bob Mac
+    │                         │                    │          │
+    │                         │ 1 new_message 812  │          │
+    │                         │───────────────────▶│          │
+    │                         │ 2 ack [812]        │          │
+    │                         │◀───────────────────│          │
+    │ 3 delivery_receipt      │                    │          │
+    │◀────────────────────────│                    │          │
+    │ 4 "Delivered"           │                    │          │
+    │                         │ 5 read 812         │          │
+    │                         │◀───────────────────│          │
+    │ 6 read_receipt seq 812  │                    │          │
+    │◀────────────────────────│                    │          │
+    │                         │ 7 read_receipt (own)          │
+    │                         │──────────────────────────────▶│
+    │ 8 "Read"                │                    │          │
+    │                         │                9 clear badge  │
+    │                         │                    │          │
 ```
 
-### API Request/Response Types
+"'Delivered' is the recipient device's ack (step 2) turned into an event for the sender. 'Read' is a watermark — read up to seq 812 — that goes to the sender *and* to the reader's own other devices, which is how reading on my iPad clears the badge on my Mac."
+
+### Flow: reconnecting
 
 ```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                     API Types                                                 │
-├──────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  SendMessageRequest:                                                         │
-│  ┌─────────────────────────────────────────────────────────────────────────┐│
-│  │ conversationId: string                                                  ││
-│  │ clientMessageId: string        (for idempotency)                        ││
-│  │ contentType: MessageEnvelope['contentType']                             ││
-│  │ encryptedContent: string                                                ││
-│  │ iv: string                                                              ││
-│  │ encryptedKeys: DeviceEncryptedKey[]                                     ││
-│  └─────────────────────────────────────────────────────────────────────────┘│
-│                                                                              │
-│  SendMessageResponse:                                                        │
-│  ┌─────────────────────────────────────────────────────────────────────────┐│
-│  │ messageId: string              (server-assigned ID)                     ││
-│  │ status: 'created' | 'duplicate'                                         ││
-│  │ timestamp: string              (server timestamp)                       ││
-│  └─────────────────────────────────────────────────────────────────────────┘│
-│                                                                              │
-│  GetDeviceKeysRequest/Response:                                              │
-│  ┌─────────────────────────────────────────────────────────────────────────┐│
-│  │ Request:  { userIds: string[] }                                         ││
-│  │ Response: { devices: Record<userId, DevicePublicKeys[]> }               ││
-│  └─────────────────────────────────────────────────────────────────────────┘│
-│                                                                              │
-└──────────────────────────────────────────────────────────────────────────────┘
+ Browser                  WS client           Chat store               Server
+    │                         │                    │                      │
+    │ 1 online / tab visible  │                    │                      │
+    │────────────────────────▶│                    │                      │
+    │                         │ 2 connect (backoff + jitter)              │
+    │                         │──────────────────────────────────────────▶│
+    │                         │ 3 sync_batch, has_more                    │
+    │                         │◀──────────────────────────────────────────│
+    │                         │ 4 receiveMessages  │                      │
+    │                         │───────────────────▶│                      │
+    │                         │                    │ 5 ack [ids]          │
+    │                         │                    │─────────────────────▶│
+    │                         │                    │ 6 sync (next batch)  │
+    │                         │                    │─────────────────────▶│
+    │                         │ 7 sync_batch, done                        │
+    │                         │◀──────────────────────────────────────────│
+    │                         │ 8 flush outbox (same K)                   │
+    │                         │──────────────────────────────────────────▶│
+    │                         │                    │                      │
 ```
 
-## Deep Dive: End-to-End Message Flow (10 minutes)
+"On connect the server pushes this device's backlog in batches; the client applies, acks and asks for more while `has_more` is set, then flushes its outbox with the original client IDs."
 
-### Step 1: Frontend - Compose and Encrypt
+---
 
-```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                     Send Message Flow (Frontend)                              │
-├──────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  1. Get Recipient Device Keys                                                │
-│     ┌─────────────────────────────────────────────────────────────────────┐ │
-│     │ participants = await api.getConversationParticipants(conversationId)│ │
-│     │ deviceKeys = await api.getDeviceKeys({ userIds })                   │ │
-│     │ allDevices = Object.values(deviceKeys.devices).flat()               │ │
-│     │            └──▶ Includes sender's OTHER devices for sync            │ │
-│     └─────────────────────────────────────────────────────────────────────┘ │
-│                                                                              │
-│  2. Encrypt Message                                                          │
-│     ┌─────────────────────────────────────────────────────────────────────┐ │
-│     │ encrypted = await encryptionService.encryptMessage(plaintext,       │ │
-│     │                                                    allDevices)      │ │
-│     │                                                                     │ │
-│     │ Returns:                                                            │ │
-│     │   encryptedContent: AES-GCM ciphertext                              │ │
-│     │   iv: initialization vector                                         │ │
-│     │   encryptedKeys: [...] per-device wrapped keys                      │ │
-│     └─────────────────────────────────────────────────────────────────────┘ │
-│                                                                              │
-│  3. Optimistic UI Update                                                     │
-│     ┌─────────────────────────────────────────────────────────────────────┐ │
-│     │ optimisticMessage = {                                               │ │
-│     │   id: clientMessageId,                                              │ │
-│     │   status: 'pending',                                                │ │
-│     │   ...encrypted                                                      │ │
-│     │ }                                                                   │ │
-│     │                                                                     │ │
-│     │ await offlineStorage.saveMessage(optimisticMessage)                 │ │
-│     │ useMessageStore.getState().addMessage(conversationId, ...)          │ │
-│     └─────────────────────────────────────────────────────────────────────┘ │
-│                                                                              │
-│  4. Send to Server                                                           │
-│     ┌─────────────────────────────────────────────────────────────────────┐ │
-│     │ try {                                                               │ │
-│     │   response = await api.sendMessage(request)                         │ │
-│     │   updateMessageStatus(clientMessageId, 'sent')                      │ │
-│     │ } catch {                                                           │ │
-│     │   offlineStorage.queuePendingOperation({                            │ │
-│     │     type: 'send_message', data: request                             │ │
-│     │   })                                                                │ │
-│     │ }                                                                   │ │
-│     └─────────────────────────────────────────────────────────────────────┘ │
-│                                                                              │
-└──────────────────────────────────────────────────────────────────────────────┘
-```
+## 💾 Data Model & API Contract (7 min)
 
-### Step 2: Backend - Receive and Route
+### Server side
+
+| Store | Table / key | Key columns | Notes |
+|-------|-------------|-------------|-------|
+| Conversation shard | `conversations` | `id`, `type`, `last_seq` | `last_seq` is the sequencer |
+| Conversation shard | `messages` | `(conversation_id, seq)`, `id`, `sender_id`, `client_message_id`, `ciphertext` | Unique `(conversation_id, sender_id, client_message_id)` |
+| Conversation shard | `read_watermarks` | `(conversation_id, user_id, device_id)`, `last_read_seq` | Only moves forward |
+| Conversation shard | `outbox` | `id`, `conversation_id`, `seq` | Same transaction as the message |
+| Mailbox shard | `device_mailbox` | `(device_id, message_id)`, `seq`, `wrapped_key`, `enqueued_at` | Deleted by the device's ack |
+| Redis | `conn:{device}`, `presence:{user}`, `session:{token}` | Gateway ID, connection IDs | TTLs |
+
+### Client side
+
+| Store entry | Holds | Updated by |
+|-------------|-------|------------|
+| `messages[conversationId]` | Messages ordered by `seq`; optimistic ones (no seq) last | One merge path for pushes, catch-up batches and history pages |
+| `conversations` | Last message (with `seq`), unread count | Server list, then incremented only above that seq |
+| Own message `status` | `sending` → `sent` → `delivered` → `read`, or `failed` | Ack, delivery receipt, read watermark; never backwards |
+| Outbox | Frames sent while offline, with their client IDs | Flushed on reconnect (IndexedDB in production) |
+| `installId` | This browser's installation ID | Generated once; survives logout |
+
+### The contract
 
 ```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                     Message Controller (Backend)                              │
-├──────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  1. Check Idempotency                                                        │
-│     ┌─────────────────────────────────────────────────────────────────────┐ │
-│     │ idempotencyKey = `${senderId}:${conversationId}:${clientMessageId}` │ │
-│     │                                                                     │ │
-│     │ existing = await idempotencyService.check(idempotencyKey)           │ │
-│     │   └──▶ if exists: return { messageId, status: 'duplicate' }         │ │
-│     └─────────────────────────────────────────────────────────────────────┘ │
-│                                                                              │
-│  2. Verify Participant                                                       │
-│     ┌─────────────────────────────────────────────────────────────────────┐ │
-│     │ if (!conversationService.isParticipant(conversationId, senderId))   │ │
-│     │   return 403 'Not a conversation participant'                       │ │
-│     └─────────────────────────────────────────────────────────────────────┘ │
-│                                                                              │
-│  3. Store in Transaction                                                     │
-│     ┌─────────────────────────────────────────────────────────────────────┐ │
-│     │ await db.transaction(async (tx) => {                                │ │
-│     │   // Insert message                                                 │ │
-│     │   INSERT INTO messages (...) VALUES (...)                           │ │
-│     │                                                                     │ │
-│     │   // Insert per-device encrypted keys                               │ │
-│     │   for (deviceKey of encryptedKeys)                                  │ │
-│     │     INSERT INTO message_keys (message_id, device_id,                │ │
-│     │                               encrypted_key, ephemeral_public_key)  │ │
-│     │                                                                     │ │
-│     │   // Record idempotency                                             │ │
-│     │   INSERT INTO idempotency_keys (key, result_id, status)             │ │
-│     │ })                                                                  │ │
-│     └─────────────────────────────────────────────────────────────────────┘ │
-│                                                                              │
-│  4. Notify Recipients                                                        │
-│     ┌─────────────────────────────────────────────────────────────────────┐ │
-│     │ for (participant of participants)                                   │ │
-│     │   for (device of participant.devices)                               │ │
-│     │     if (device.id !== currentDeviceId)                              │ │
-│     │       delivered = await wsHub.send(device.id, {                     │ │
-│     │         type: 'new_message',                                        │ │
-│     │         payload: { messageId, conversationId }                      │ │
-│     │       })                                                            │ │
-│     │       if (!delivered && device.pushToken)                           │ │
-│     │         await pushService.send(device.pushToken, ...)               │ │
-│     └─────────────────────────────────────────────────────────────────────┘ │
-│                                                                              │
-└──────────────────────────────────────────────────────────────────────────────┘
+WSS  /v1/stream                           client: send_message · ack · sync · read · typing
+                                          server: sync_batch · new_message · message_sent · receipts · error
+POST /v1/conversations/{id}/messages      client_message_id → 201 | 200 duplicate | 403 | 422 | 429
+GET  /v1/conversations/{id}/messages      ?before_seq=&after_seq=&limit= → oldest-first page with own-message status
+GET  /v1/sync  ·  POST /v1/sync/ack       mailbox batch + has_more; ack deletes rows
+POST /v1/conversations/{id}/read          seq → watermark (no-op if not higher)
+POST /v1/auth/login                       install_id → the same device row for the same installation
 ```
 
-### Step 3: Frontend - Receive and Decrypt
+| Contract element | The server guarantees | The client relies on it to |
+|------------------|----------------------|----------------------------|
+| `client_message_id` | Same ID → same message, forever; same ID with different content → `422` | Retry after timeouts, reconnects and reloads without duplicates |
+| `seq` | Dense, increasing, one order per conversation, equal to commit order | Order the thread, page history (`before_seq`), detect gaps (`after_seq` or sync) |
+| Mailbox + `ack` | Every message stays queued for this device until it acks | Treat live pushes as a fast path; anything missed arrives on sync |
+| `has_more` | Batches are oldest-first and complete | Keep asking until caught up |
+| Read watermark | Never moves backwards | Send "read" freely; render "Read" from one number |
+| `error.clientMessageId` + `code` | Every rejected send names its message | Mark exactly that bubble failed and offer Retry |
+| `install_id` | One device row per (user, installation) | Keep one inbox and one set of receipts across logins |
 
-```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                     WebSocket Message Handler (Frontend)                      │
-├──────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  on('new_message'):                                                          │
-│  ┌─────────────────────────────────────────────────────────────────────────┐│
-│  │ 1. Fetch message envelope from API                                      ││
-│  │    envelope = await api.getMessage(payload.messageId)                   ││
-│  │                                                                         ││
-│  │ 2. Find our device's encrypted key                                      ││
-│  │    ourKey = envelope.encryptedKeys.find(k => k.deviceId === deviceId)   ││
-│  │    if (!ourKey) return // Not intended for this device                  ││
-│  │                                                                         ││
-│  │ 3. Save to local storage (still encrypted)                              ││
-│  │    await offlineStorage.saveMessage({                                   ││
-│  │      id, conversationId, senderId,                                      ││
-│  │      encryptedContent, iv,                                              ││
-│  │      status: 'delivered',                                               ││
-│  │      timestamp                                                          ││
-│  │    })                                                                   ││
-│  │                                                                         ││
-│  │ 4. Update UI (decryption happens lazily on render)                      ││
-│  │    useMessageStore.getState().addMessage(conversationId, envelope)      ││
-│  │                                                                         ││
-│  │ 5. Send delivery receipt                                                ││
-│  │    ws.send({                                                            ││
-│  │      type: 'delivery_receipt',                                          ││
-│  │      payload: { messageId, deviceId }                                   ││
-│  │    })                                                                   ││
-│  └─────────────────────────────────────────────────────────────────────────┘│
-│                                                                              │
-└──────────────────────────────────────────────────────────────────────────────┘
-```
+---
 
-## Deep Dive: WebSocket Protocol (8 minutes)
+## 🔧 Deep Dive 1: Exactly One Message per Send (8 min)
 
-### Backend WebSocket Hub
+"The scenario: I hit Send in a tunnel, the socket dies before the ack, and the app retries when the signal returns. Did the first attempt commit? The client can't know. Every layer has a job."
 
-```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                     WebSocketHub Class (Backend)                              │
-├──────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  State:                                                                      │
-│  ┌─────────────────────────────────────────────────────────────────────────┐│
-│  │ connections: Map<deviceId, WebSocket>                                   ││
-│  └─────────────────────────────────────────────────────────────────────────┘│
-│                                                                              │
-│  Connection Flow:                                                            │
-│  ┌─────────────────────────────────────────────────────────────────────────┐│
-│  │ 1. Authenticate from query string token                                 ││
-│  │    url = new URL(req.url)                                               ││
-│  │    sessionToken = url.searchParams.get('token')                         ││
-│  │    session = await authService.validateSession(sessionToken)            ││
-│  │    if (!session) ws.close(4002, 'Invalid session')                      ││
-│  │                                                                         ││
-│  │ 2. Register connection                                                  ││
-│  │    connections.set(session.deviceId, ws)                                ││
-│  │                                                                         ││
-│  │ 3. Update presence in Redis                                             ││
-│  │    await redis.hset(`presence:${userId}`, deviceId, Date.now())         ││
-│  │    await redis.expire(`presence:${userId}`, 30)                         ││
-│  │                                                                         ││
-│  │ 4. Set up heartbeat (30s interval)                                      ││
-│  │    setInterval(() => ws.ping(), 30000)                                  ││
-│  │                                                                         ││
-│  │ 5. Handle disconnect                                                    ││
-│  │    ws.on('close', () => {                                               ││
-│  │      connections.delete(deviceId)                                       ││
-│  │      redis.hdel(`presence:${userId}`, deviceId)                         ││
-│  │    })                                                                   ││
-│  └─────────────────────────────────────────────────────────────────────────┘│
-│                                                                              │
-│  Message Handlers:                                                           │
-│  ┌─────────────────────────────────────────────────────────────────────────┐│
-│  │ 'delivery_receipt' ──▶ Record in DB, notify sender's devices            ││
-│  │ 'read_receipt' ──▶ Broadcast to conversation participants               ││
-│  │ 'typing' ──▶ Broadcast to other participants (+ Redis TTL backup)       ││
-│  │ 'ping' ──▶ Reply with 'pong'                                            ││
-│  └─────────────────────────────────────────────────────────────────────────┘│
-│                                                                              │
-└──────────────────────────────────────────────────────────────────────────────┘
-```
+**Client.** On Enter the store creates the bubble and a client ID with `crypto.randomUUID()`. The WebSocket client sends the frame or keeps it in an outbox; on reconnect it flushes the outbox with the same IDs. Retry after an error reuses the ID. In production the outbox lives in IndexedDB so a reload doesn't drop it.
 
-### Delivery Receipt Flow
+**Server.** One transaction: take the seq with `UPDATE … SET last_seq = last_seq + 1` (membership is checked in the same statement), insert with `ON CONFLICT DO NOTHING` on `(conversation_id, sender_id, client_message_id)`. Zero rows inserted means this is a retry: roll back — returning the seq, so no gap — and answer with the original message. Two retries arriving at once serialize on the conversation row and the index; one inserts, the other gets the original.
 
-```
-┌────────┐  delivery_receipt   ┌─────────────┐  INSERT   ┌────────────┐
-│Receiver│ ──────────────────▶ │  WebSocket  │ ────────▶ │ PostgreSQL │
-│ Device │                      │     Hub     │           │ delivery_  │
-└────────┘                      └──────┬──────┘           │ receipts   │
-                                       │                  └────────────┘
-                                       │ notify sender
-                                       ▼
-                                ┌─────────────┐
-                                │   Sender    │
-                                │   Devices   │
-                                └─────────────┘
-```
+**Back on the client**, the ack carries `{clientMessageId, message}`. The store finds the bubble by client ID and replaces it in place with the server's copy — new ID, real seq, status `sent` — keeping the React key, so nothing flickers.
 
-### Typing Indicator Flow
+| Approach | Verdict |
+|----------|---------|
+| ✅ Client ID + unique index in the insert transaction | Safe under timeouts, reloads and concurrent retries |
+| ❌ Idempotency store checked before the insert | Two concurrent retries both pass the check |
+| ❌ Dedupe by content | "ok" twice on purpose is normal |
+| ❌ Disable the button | Stops double taps, not retries |
 
-```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                     Typing Indicator                                          │
-├──────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  User starts typing:                                                         │
-│  ┌─────────────────────────────────────────────────────────────────────────┐│
-│  │ 1. Send { type: 'typing', payload: { conversationId, isTyping: true } } ││
-│  │ 2. Server broadcasts to all other participants                          ││
-│  │ 3. Store in Redis with 5s TTL: typing:{convId}:{userId}                 ││
-│  │    └──▶ For clients that reconnect and need current state              ││
-│  └─────────────────────────────────────────────────────────────────────────┘│
-│                                                                              │
-│  User stops typing:                                                          │
-│  ┌─────────────────────────────────────────────────────────────────────────┐│
-│  │ 1. Send { type: 'typing', payload: { conversationId, isTyping: false }} ││
-│  │ 2. Server broadcasts and deletes Redis key                              ││
-│  └─────────────────────────────────────────────────────────────────────────┘│
-│                                                                              │
-└──────────────────────────────────────────────────────────────────────────────┘
-```
+> "The original version of this repo had the dedupe logic but its WebSocket handler never passed the client ID to it — the path every message actually took had no protection. Contracts that span the wire need a test that exercises both halves; here that's an end-to-end check that sends the same ID twice over a real socket and counts rows."
 
-### Frontend WebSocket Client
+"What I give up: correctness depends on client discipline — a client that regenerates the ID per attempt gets nothing — and IDs must be unique per sender per conversation forever, which UUIDs make free."
 
-```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                     WebSocketManager (Frontend)                               │
-├──────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  connect(sessionToken):                                                      │
-│  ┌─────────────────────────────────────────────────────────────────────────┐│
-│  │ ws = new WebSocket(`${WS_URL}?token=${sessionToken}`)                   ││
-│  │                                                                         ││
-│  │ ws.onopen = () => {                                                     ││
-│  │   reconnectAttempts = 0                                                 ││
-│  │   syncMissedMessages()  // Catch up on anything missed                  ││
-│  │ }                                                                       ││
-│  │                                                                         ││
-│  │ ws.onclose = () => scheduleReconnect(sessionToken)                      ││
-│  └─────────────────────────────────────────────────────────────────────────┘│
-│                                                                              │
-│  syncMissedMessages():                                                       │
-│  ┌─────────────────────────────────────────────────────────────────────────┐│
-│  │ for (conv of await offlineStorage.getAllConversations())                ││
-│  │   cursor = await offlineStorage.getSyncCursor(conv.id)                  ││
-│  │   response = await api.sync({ conversationId: conv.id, cursor })        ││
-│  │   for (message of response.messages)                                    ││
-│  │     await offlineStorage.saveMessage(message)                           ││
-│  │   await offlineStorage.saveSyncCursor(conv.id, response.cursor)         ││
-│  └─────────────────────────────────────────────────────────────────────────┘│
-│                                                                              │
-│  Exponential Backoff Reconnect:                                              │
-│  ┌─────────────────────────────────────────────────────────────────────────┐│
-│  │ delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 30000)          ││
-│  │ setTimeout(() => {                                                      ││
-│  │   reconnectAttempts++                                                   ││
-│  │   connect(sessionToken)                                                 ││
-│  │ }, delay)                                                               ││
-│  └─────────────────────────────────────────────────────────────────────────┘│
-│                                                                              │
-└──────────────────────────────────────────────────────────────────────────────┘
-```
+---
 
-## Deep Dive: Sync Cursor Integration (7 minutes)
+## 🔧 Deep Dive 2: Order and Catch-up (7 min)
 
-### Backend Sync Endpoint
+"Messages reach a device three ways — a live push, a catch-up batch, a history page — in any order and sometimes twice. The thread must still show one order, the same on every device."
 
-```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                     POST /api/v1/messages/sync                                │
-├──────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  1. Verify Participant                                                       │
-│     ┌─────────────────────────────────────────────────────────────────────┐ │
-│     │ if (!isParticipant(conversationId, userId))                         │ │
-│     │   return 403 'Not a participant'                                    │ │
-│     └─────────────────────────────────────────────────────────────────────┘ │
-│                                                                              │
-│  2. Fetch Messages Since Cursor                                              │
-│     ┌─────────────────────────────────────────────────────────────────────┐ │
-│     │ SELECT m.* FROM messages m                                          │ │
-│     │ WHERE m.conversation_id = $conversationId                           │ │
-│     │   AND m.created_at > COALESCE(                                      │ │
-│     │     (SELECT created_at FROM messages WHERE id = $cursor),           │ │
-│     │     '1970-01-01'::timestamp                                         │ │
-│     │   )                                                                 │ │
-│     │ ORDER BY m.created_at ASC                                           │ │
-│     │ LIMIT $limit + 1  (extra to check hasMore)                          │ │
-│     └─────────────────────────────────────────────────────────────────────┘ │
-│                                                                              │
-│  3. Fetch Device-Specific Encrypted Keys                                     │
-│     ┌─────────────────────────────────────────────────────────────────────┐ │
-│     │ SELECT message_id, encrypted_key, ephemeral_public_key              │ │
-│     │ FROM message_keys                                                   │ │
-│     │ WHERE message_id = ANY($messageIds) AND device_id = $deviceId       │ │
-│     └─────────────────────────────────────────────────────────────────────┘ │
-│                                                                              │
-│  4. Build MessageEnvelope[] Response                                         │
-│     ┌─────────────────────────────────────────────────────────────────────┐ │
-│     │ envelopes = messages.map(m => ({                                    │ │
-│     │   id, conversationId, senderId, contentType,                        │ │
-│     │   encryptedContent, iv,                                             │ │
-│     │   encryptedKeys: keyMap.has(m.id) ? [keyMap.get(m.id)] : [],       │ │
-│     │   timestamp                                                         │ │
-│     │ }))                                                                 │ │
-│     └─────────────────────────────────────────────────────────────────────┘ │
-│                                                                              │
-│  5. Fetch Read Receipts                                                      │
-│     ┌─────────────────────────────────────────────────────────────────────┐ │
-│     │ SELECT user_id, last_read_message_id, last_read_at                  │ │
-│     │ FROM read_receipts                                                  │ │
-│     │ WHERE conversation_id = $conversationId AND device_id != $deviceId  │ │
-│     └─────────────────────────────────────────────────────────────────────┘ │
-│                                                                              │
-│  6. Update Sync Cursor for Device                                            │
-│     ┌─────────────────────────────────────────────────────────────────────┐ │
-│     │ INSERT INTO sync_cursors (device_id, conversation_id,               │ │
-│     │                           last_synced_message_id, last_synced_at)   │ │
-│     │ ON CONFLICT DO UPDATE SET last_synced_message_id = $lastId          │ │
-│     └─────────────────────────────────────────────────────────────────────┘ │
-│                                                                              │
-│  Return: { messages, readReceipts, cursor, hasMore }                         │
-│                                                                              │
-└──────────────────────────────────────────────────────────────────────────────┘
-```
+**The server's half.** The seq is assigned under the conversation row lock, so seq order is commit order: a client that has seen 812 will never later receive a new 811. Delivery is a per-device mailbox: the fan-out writes a row for every device, and only that device's ack deletes it. Pushes are a fast path on top; if a push is lost, the row is still there.
 
-### Frontend Sync Store
+**The client's half.** One merge function: dedupe by ID, place by seq, ack everything applied (including duplicates — the ack is what drains the mailbox). If a push arrives with seq 812 when the highest seq I know is 810, I don't guess: I ask for a sync, and 811 comes out of the mailbox. History uses the same seq as a cursor (`before_seq`), so loading older messages never shifts what's already on screen.
 
-```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                     useSyncStore (Zustand)                                    │
-├──────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  syncConversation(conversationId):                                           │
-│  ┌─────────────────────────────────────────────────────────────────────────┐│
-│  │ cursor = await offlineStorage.getSyncCursor(conversationId)             ││
-│  │                                                                         ││
-│  │ while (hasMore) {                                                       ││
-│  │   response = await api.sync({ conversationId, cursor })                 ││
-│  │                                                                         ││
-│  │   for (envelope of response.messages) {                                 ││
-│  │     existing = await offlineStorage.getMessage(envelope.id)             ││
-│  │     if (existing) {                                                     ││
-│  │       // Our own message came back - update status                      ││
-│  │       await offlineStorage.updateMessageStatus(envelope.id, 'delivered')││
-│  │     } else {                                                            ││
-│  │       // New message from server                                        ││
-│  │       await offlineStorage.saveMessage(envelope)                        ││
-│  │     }                                                                   ││
-│  │   }                                                                     ││
-│  │                                                                         ││
-│  │   for (receipt of response.readReceipts) {                              ││
-│  │     await offlineStorage.saveReadReceipt(conversationId, receipt)       ││
-│  │   }                                                                     ││
-│  │                                                                         ││
-│  │   await offlineStorage.saveSyncCursor({                                 ││
-│  │     conversationId,                                                     ││
-│  │     cursor: response.cursor,                                            ││
-│  │     syncedAt: Date.now()                                                ││
-│  │   })                                                                    ││
-│  │                                                                         ││
-│  │   hasMore = response.hasMore                                            ││
-│  │ }                                                                       ││
-│  │                                                                         ││
-│  │ // Refresh UI from storage                                              ││
-│  │ messages = await offlineStorage.getConversationMessages(conversationId) ││
-│  │ useMessageStore.getState().setMessages(conversationId, messages)        ││
-│  └─────────────────────────────────────────────────────────────────────────┘│
-│                                                                              │
-│  syncAll():                                                                  │
-│  ┌─────────────────────────────────────────────────────────────────────────┐│
-│  │ conversations = await offlineStorage.getAllConversations()              ││
-│  │ await Promise.all(conversations.map(c => syncConversation(c.id)))       ││
-│  └─────────────────────────────────────────────────────────────────────────┘│
-│                                                                              │
-└──────────────────────────────────────────────────────────────────────────────┘
-```
+**Reconnect.** The socket reconnects forever with exponential backoff capped at 30 seconds and randomized, so a server restart doesn't bring every client back in the same second; the `online` event and tab focus skip the wait. On connect the server pushes the backlog in batches of 200 with `has_more`.
 
-## Trade-offs and Alternatives (5 minutes)
+| Approach | Verdict |
+|----------|---------|
+| ✅ Server seq + per-device mailbox + client merge by ID and seq | Any arrival order, any duplicate, any drop → same thread |
+| ❌ Client sorts by `createdAt` | Clocks differ; ties |
+| ❌ Server tracks a cursor per device per conversation | Catch-up becomes a query across every conversation's shard on each reconnect |
+| ❌ Trust the push stream | A dropped pub/sub frame is a message lost until reload |
 
-### 1. Shared Types Strategy
+"What I give up: about three mailbox writes and deletes per message on the server, and a client that must keep per-conversation state — the highest seq it has seen — to notice gaps."
 
-| Approach | Pros | Cons |
-|----------|------|------|
-| **Monorepo with shared package (chosen)** | Type safety, single source of truth | Build complexity |
-| OpenAPI/Swagger generation | Language agnostic | Runtime validation overhead |
-| Copy-paste types | Simple | Drift risk |
+---
 
-> "We chose a shared TypeScript package in a monorepo for compile-time safety. Breaking changes are caught at build time rather than runtime."
+## 🔧 Deep Dive 3: Receipts End to End (6 min)
 
-### 2. WebSocket vs Server-Sent Events
+"Receipts are where client and server most often disagree, so I make both sides monotonic."
 
-| Approach | Pros | Cons |
-|----------|------|------|
-| **WebSocket (chosen)** | Bidirectional, typing indicators | Connection management |
-| SSE | Simpler, auto-reconnect | One-way only |
-| Long polling | Universal support | Higher latency |
+**Delivered.** When a recipient device acks, the server deletes the mailbox rows and emits one `delivery_receipt` per conversation to the senders, listing the message IDs. The delete returns only rows that were still pending, so a duplicate ack produces no second receipt. A user's own other devices acking their copy produce nothing — "Delivered" means the other side has it. In production the receipt itself rides the mailbox rails, so my offline laptop catches up on statuses like on messages.
 
-> "WebSocket is essential for bidirectional real-time features like typing indicators and receipts."
+**Read.** A device sends `read` with the last visible message. The server resolves its seq *inside that conversation* — a receipt naming a message from elsewhere is rejected — and upserts the device's watermark only if it's higher. The event goes to every participant, including the reader's other devices.
 
-### 3. Sync Strategy
+**On the client**, statuses only move forward: `sent` → `delivered` → `read`. A late delivery receipt can't overwrite "Read". A read receipt from someone else marks my messages up to its seq as Read; one from me (another device) clears the badge if it covers the latest message.
 
-| Approach | Pros | Cons |
-|----------|------|------|
-| **Cursor-based delta (chosen)** | Efficient, resumable | Cursor tracking complexity |
-| Timestamp-based | Simple | Clock skew issues |
-| Full sync | Simple | Bandwidth inefficient |
+**Unread counts** must agree on both sides. The server computes "messages from others above my highest watermark"; the client trusts that number, increments it only for messages with a seq above the list's `lastMessage.seq`, and zeroes it on read. That's what stops a catch-up batch from inflating badges a second time.
 
-> "Cursor-based sync with device-conversation granularity ensures efficient incremental updates."
+| Approach | Verdict |
+|----------|---------|
+| ✅ Ack → delivered event; watermark → read event to all devices | One number per device; correct under duplicates and reordering |
+| ❌ Per-message read flags | A row per message per reader, and a late event can un-read |
+| ❌ Client polls statuses | Latency and load, for state the server already pushes |
 
-### 4. Encryption Key Distribution
+"Reload safety: history pages include each of my messages' status, derived on the server from receipts and watermarks, so 'Read' doesn't revert to 'Sent' after a refresh."
 
-| Approach | Pros | Cons |
-|----------|------|------|
-| **Per-message key (chosen)** | Forward secrecy | O(devices) wrapping |
-| Session keys | Less overhead | Compromise affects session |
-| Group key | Simple | No forward secrecy |
+---
 
-> "Per-message keys wrapped for each device provides maximum security. The overhead is acceptable for the security guarantee."
+## 📈 Failures & Scale (2 min)
 
-## API Endpoints Summary (2 minutes)
+| Failure | What the sender sees | What the recipient sees | Mitigation |
+|---------|----------------------|-------------------------|------------|
+| Socket drops mid-send | "Sending", then "Sent" after reconnect | One copy | Outbox replays the same client ID |
+| Gateway crash | Brief "Reconnecting…" | Catch-up batch on reconnect | Mailbox holds everything; jittered reconnect |
+| Conversation shard failover | Sends wait ~30 s | — | Retries with the same ID |
+| Fan-out lag | "Sent", "Delivered" later | Message later | Outbox absorbs it; lag alert |
+| Redis down | No typing or presence | Push becomes APNs wake + sync | Messages unaffected |
+| Rate limited | "Not delivered · Retry" with a wait | — | Error frame names the message |
 
-### Message API
+**What breaks first as we grow:** mailbox write and delete volume (shard by device, drop day partitions), reconnect storms after a gateway failure (client jitter, one-scan sync), and hot group conversations on one row lock (group size cap).
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| POST | /api/v1/messages | Send encrypted message |
-| GET | /api/v1/messages/:id | Fetch message envelope |
-| POST | /api/v1/messages/sync | Sync conversation messages |
-| POST | /api/v1/messages/:id/read | Mark message as read |
+---
 
-### Key API
+## ⚖️ Trade-offs & Wrap-up (1 min)
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | /api/v1/devices/:userId | Get user's device keys |
-| POST | /api/v1/devices/register | Register device with keys |
-| POST | /api/v1/devices/:id/prekeys | Upload new prekeys |
+| Decision | ✅ Chosen | ❌ Alternative | Why |
+|----------|-----------|----------------|-----|
+| Send safety | Client ID + unique index in the insert | Separate idempotency store | No race between check and insert |
+| Order | Server seq under a row lock | Timestamps | Same order everywhere; gaps detectable |
+| Delivery | Per-device mailbox + acks; push as fast path | Trust pushes | Drops can't lose messages |
+| Client apply | One merge path, by ID and seq | Append on arrival | Exactly once on screen |
+| Receipts | Monotonic ack and watermark events | Polling, per-message flags | Cheap and never regresses |
+| Reconnect | Unlimited, jittered backoff + outbox | Give up after N attempts | Always comes back, no duplicates |
 
-### WebSocket Protocol
-
-| Message Type | Direction | Description |
-|--------------|-----------|-------------|
-| new_message | Server -> Client | New message notification |
-| delivery_receipt | Bidirectional | Message delivered to device |
-| read_receipt | Bidirectional | Message read by user |
-| typing | Bidirectional | Typing indicator |
-
-## Closing Summary (1 minute)
-
-"The iMessage full-stack system is built on three integration pillars:
-
-1. **Shared Type Contracts** ensuring compile-time safety for encryption envelopes, WebSocket protocols, and sync responses between frontend and backend.
-
-2. **End-to-End Message Flow** with client-side encryption using Web Crypto API, server-side routing without decryption capability, and recipient decryption with delivery receipts.
-
-3. **Real-Time Sync Architecture** combining WebSocket for instant delivery, cursor-based delta sync for reliability, and IndexedDB for offline persistence.
-
-The main trade-off is complexity vs. security. We accept the overhead of per-device encryption and idempotent delivery because messaging security is non-negotiable. Future improvements would include MLS for large groups and sealed sender for metadata protection."
+"With more time I'd persist the outbox and recent history in IndexedDB for instant, offline-capable opens, push edits and deletes as sequenced events so every device converges on them too, and add a shared contract test suite that runs the same scenarios against both the client merge rules and the server."

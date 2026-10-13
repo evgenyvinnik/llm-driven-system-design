@@ -71,7 +71,7 @@ Implementation Notes describing the code as it is after the changes. [bitly](./b
 | [health-data-pipeline](./health-data-pipeline/architecture.md) | Pending | — | — |
 | [hotel-booking](./hotel-booking/architecture.md) | Pending | — | — |
 | [icloud](./icloud/architecture.md) | Pending | — | — |
-| [imessage](./imessage/architecture.md) | Pending | — | — |
+| [imessage](./imessage/architecture.md) | Done | Per-conversation seq under row lock with membership check; client_message_id unique index (retry returns original, 422 on different content); per-device inbox written in the send transaction with ack + delivered events; forward-only read receipts; device revocation closes sockets; reaction participant check (IDOR); atomic Lua rate limiter on REST + WebSocket; frontend seq ordering, gap sync, outbox, reconnect with jitter | backend tsc + eslint + 20 vitest; frontend tsc + eslint + 10 vitest + build; 38-check WebSocket/REST runtime script against PostgreSQL + Redis; re-verified independently |
 | [instagram](./instagram/architecture.md) | Pending | — | — |
 | [jira](./jira/architecture.md) | Pending | — | — |
 | [job-scheduler](./job-scheduler/architecture.md) | Pending | — | — |
