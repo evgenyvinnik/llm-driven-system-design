@@ -1,349 +1,374 @@
-# Design Jira - System Design Answer (Backend Focus)
+# 🎫 Issue Tracker (Jira) — System Design Answer (Backend Focus)
 
-*45-minute system design interview format - Backend Engineer Position*
+*45-minute backend interview. This is a proposed production design; what this repository actually runs is described in [architecture.md → Implementation Notes](./architecture.md#implementation-notes).*
 
-## 📋 Problem Statement
+> "Jira looks like CRUD on one table. Two things make it a real design problem. First, almost nothing is fixed: every project brings its own workflow, its own permission scheme and its own board order, so the server runs user-defined rules on every write. Second, many people act on the same issues at once, so those rules have to hold under races. I'll build one transactional core in PostgreSQL that decides everything, and treat search, notifications and webhooks as derived systems that may lag but never disagree for long."
 
-Design the backend for Jira: an issue tracking and project management system. What makes this problem interesting from a backend perspective is that almost nothing is fixed — every team customizes its workflows, fields, and permissions. So the real design challenge is building *engines* rather than features: a workflow engine driven by data instead of code, a field system with per-team schemas, a permission system evaluated on every request, and a query language (JQL) that users compose freely. I'll focus on the workflow engine internals, the permission checking pipeline, and how the search path stays consistent with the write path.
+| Phase | Time | What I want the interviewer to leave with |
+|-------|------|--------------------------------------------|
+| Requirements & scale | 5 min | Scope, targets, and the 50:1 read/write ratio |
+| High-level architecture | 10 min | One overview diagram and the three core flows |
+| Data model & API | 7 min | What lives where, and the contract |
+| Deep dive 1: the workflow engine | 8 min | Rules as data, applied with a compare-and-swap |
+| Deep dive 2: permission schemes | 7 min | A check on every request that is cheap and revokes instantly |
+| Deep dive 3: concurrent edits and board order | 6 min | Versions, `412`, and rank keys |
+| Scale, failures, wrap-up | 2 min | What breaks first; the trade-offs I made |
 
-## 🎯 Requirements Clarification
+---
 
-Questions I would ask up front:
+## 🎯 Requirements & Scale (5 min)
 
-- **How customizable are workflows?** Fully — admins define statuses, transitions, and rules without deploys. This rules out hard-coded state machines and drives the whole design.
-- **Search freshness?** A just-created issue should be findable within a few seconds; I'll take eventual consistency for search but strong consistency for issue reads by key.
-- **Integration surface?** Webhooks and API automation are heavy in real Jira usage, which makes idempotent writes non-negotiable — automation retries constantly.
-- **Multi-tenancy model?** I'll assume a shared instance hosting many organizations' projects, since that's the harder version of the problem — a single-tenant deployment is a strict simplification of everything below.
+"Let me pin down scope, because 'Jira' covers a dozen products. I'll design the core: issues, workflows, permissions, boards and search."
 
-I'd also flag up front that I'm treating the workflow engine, permission system, and search pipeline as the three areas deserving deep dives, since they're where "just build CRUD" stops being sufficient and the configurability requirement forces real architecture.
+### Functional requirements
 
-One more clarifying question worth asking early: **is JQL user-facing syntax, or just an internal representation the UI builds through a visual filter builder?** I'll assume both — power users type raw JQL, casual users build the same query through dropdowns that serialize to JQL — because that dual-interface requirement is exactly why JQL needs a real grammar and AST rather than being special-cased per UI control.
+1. **Issues**: create, edit, comment, delete, with a complete audit trail of who changed what.
+2. **Workflows**: each project has statuses and transitions; a transition can have conditions (who may run it), validators (what must be true) and post-functions (side effects such as "assign to me").
+3. **Permission schemes**: reusable sets of grants — "edit issues: Developers", "administer: Administrators", "view: anyone" — attached to projects.
+4. **Boards**: a column per status, cards in an order the team chooses; dragging across columns runs a transition, dragging within a column reorders.
+5. **JQL search**: `project = DEMO AND assignee = currentUser() AND status IN ("To Do", "In Progress") ORDER BY priority DESC`.
+6. **Integrations**: an API that automation retries safely, plus webhooks and notifications.
 
-And a scope question I'll answer explicitly rather than leave implicit: **custom field scale**. I'll assume dozens of custom fields per project rather than hundreds — enough to stress the JSONB approach's query patterns without needing a fundamentally different storage model, but not so many that the GIN index itself becomes the bottleneck.
+Out of scope: time tracking, dashboards and reports, attachment processing, marketplace apps.
 
-### Functional Requirements
+### Non-functional requirements
 
-- **Issue CRUD**: create, update, comment, attach, link, with validation against per-project configuration
-- **Workflow engine**: user-defined state machines; transitions gated by conditions (who may), validators (what must be true), and post-functions (side effects)
-- **Custom fields**: admin-defined typed fields per project, queryable
-- **JQL**: a query DSL (`project = X AND status = "In Progress" AND assignee = currentUser()`) over all issues
-- **Permissions**: scheme-based grants resolved through roles, groups, and users
-- **Audit trail**: every change recorded with actor, timestamp, and old/new values
+| Requirement | Target | Why |
+|-------------|--------|-----|
+| Issue read latency | p99 < 200 ms | Issue views and boards are the bulk of traffic |
+| Write latency | p99 < 300 ms | Edits, transitions and drags must confirm quickly |
+| JQL latency | p99 < 1 s | Interactive filtering |
+| Search freshness | p99 < 5 s behind writes | The filter should agree with the board within seconds |
+| Availability | 99.9%; search may degrade on its own | Teams live in it all day |
+| Correctness | No lost updates; no transition that breaks the workflow or permissions | The history is a compliance record for many teams |
+| Revocation | Removing a member takes effect on their next request | Slow to revoke is a security incident |
 
-### Non-Functional Requirements
+### Capacity estimate
 
-- **Availability**: 99.9% with graceful degradation — search can lag; issue writes cannot fail silently
-- **Latency**: < 200ms for issue operations, < 1s for complex JQL
-- **Scale**: 1M projects, 100M issues, tens of thousands of concurrent users
-- **Consistency**: strong for issue state, eventual (seconds) for search
-- **Idempotency**: safe retries for API automation and webhook-driven writes
+| Quantity | Estimate | Consequence |
+|----------|----------|-------------|
+| Users | 10M registered, 1M daily, 100K concurrent | Stateless APIs; sessions in Redis |
+| Issues | 100M across 1M projects, +100K/day | Most projects are small; shard by project when needed |
+| Writes | 1M users × 20/day ≈ 230/s, ~1K/s peak | One PostgreSQL primary holds for years |
+| Reads | ~50× writes ≈ 50K/s peak | Cache configuration and permissions; search on Elasticsearch |
+| Permission checks | One per request ≈ 50K/s | Must be a cache hit, or it becomes the largest query load |
+| History | ~15 rows per issue ≈ 1.5B rows, ~225 GB | Append-only, partitioned by month |
+| Events | ~1K/s peak, three consumers | RabbitMQ is plenty |
 
-### Scale Estimates
+"Two numbers shape the design: 50,000 permission checks a second means authorization must be a Redis lookup that can still revoke instantly, and 1,000 writes a second against user-defined rules means the rules can't hold row locks while they run."
 
-- 100M issues, growing ~100K/day; issue writes ~1K/sec peak (updates dominate creates ~10:1)
-- Reads dominate: board loads and JQL queries run at 50–100x the write rate
-- History is the largest table by rows — a busy issue accumulates hundreds of change entries
-- Configuration data (workflows, schemes, fields) is tiny but read on *every* write — the perfect cache candidate
+---
 
-Working through the numbers a bit further: 1M projects averaging 100 issues each gives the 100M baseline, but the distribution is heavily skewed — a handful of enterprise instances run projects with tens of thousands of issues, while most small teams have a few dozen. That skew is why per-project sharding (not per-issue hashing) is the right long-term partitioning key: it keeps a project's issues, history, and configuration co-located, and only a few "hot" projects need special handling rather than the whole dataset. At 10 average transitions and 5 comments per issue over its lifetime, issue_history and comments together run 10–15x the row count of the issues table itself — the classic case of a small parent table driving a much larger child table, which is exactly why history gets partitioned separately in the scalability discussion below.
+## 🏗️ High-Level Architecture (10 min)
 
-**Local development scale**: for running this locally, a handful of projects with a few hundred issues each is enough to exercise every code path — the workflow engine, permission resolution, and JQL parser all behave identically at 500 issues as at 100M; only the storage and caching *strategy* changes with scale, not the logic.
-
-## 🏗️ High-Level Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                      API Gateway                                 │
-│              (Auth, Rate Limiting, Idempotency)                  │
-└─────────────────────────────────────────────────────────────────┘
-        │                     │                     │
-        ▼                     ▼                     ▼
-┌───────────────┐    ┌───────────────┐    ┌───────────────┐
-│ Issue Service │    │Workflow Engine│    │Search Service │
-│               │    │               │    │               │
-│ - CRUD        │    │ - Transitions │    │ - JQL Parser  │
-│ - Comments    │    │ - Validators  │    │ - ES Queries  │
-│ - Attachments │    │ - Post-funcs  │    │ - Aggregation │
-└───────────────┘    └───────────────┘    └───────────────┘
-        │                     │                     │
-        ▼                     ▼                     ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                         Data Layer                               │
-├─────────────────┬───────────────────┬───────────────────────────┤
-│   PostgreSQL    │       Redis       │     Elasticsearch          │
-│   - Issues      │   - Sessions      │     - Issue search         │
-│   - Workflows   │   - Cache         │     - JQL execution        │
-│   - History     │   - Idempotency   │     - Aggregations         │
-└─────────────────┴───────────────────┴───────────────────────────┘
-        │
-        ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                       RabbitMQ                                   │
-│     issue.events (fanout) → Search │ Notifications │ Webhooks    │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-The load-bearing decision: **PostgreSQL is the source of truth for issue state; Elasticsearch is a derived read model** fed asynchronously through the event bus. Every write path commits to Postgres first, publishes an event, and lets consumers (search indexer, notifications, webhooks) catch up. Nothing user-authoritative ever lives only in Elasticsearch.
-
-## 💾 Data Model
-
-Described as prose tables rather than DDL:
-
-| Table | Key Columns | Indexes | Notes |
-|-------|-------------|---------|-------|
-| projects | id (UUID PK), key ('PROJ', unique), name, permission_scheme_id, workflow_id | key | Schemes/workflows attached by reference — swap without touching issues |
-| issues | id, project_id, key ('PROJ-123', unique), summary, description, issue_type_id, status_id, priority_id, assignee_id, reporter_id, parent_id (subtasks), sprint_id, story_points, custom_fields (JSONB), version | (project_id, status_id); GIN on custom_fields; unique key | version column drives optimistic locking |
-| issue_types / statuses / priorities | id, name; statuses also carry category (todo / in_progress / done) | — | Small reference tables, cached aggressively |
-| workflows | id, name, is_default | — | A workflow is a named set of transitions |
-| transitions | id, workflow_id, name, from_status_id (NULL = any), to_status_id, conditions (JSONB list), validators (JSONB list), post_functions (JSONB list) | workflow_id | The entire state machine is rows, not code |
-| issue_history | id, issue_id, user_id, field, old_value, new_value, created_at | (issue_id, created_at) | Append-only audit trail; one row per changed field |
-| permission_schemes | id, name, is_default | — | A scheme is a reusable permission template |
-| permission_grants | scheme_id, permission ('edit_issue'…), grantee_type (role / user / group / anyone), grantee_id | PK across all four | Deny-by-default: no matching grant = no access |
-| project_members | project_id, user_id, role | PK (project_id, user_id) | Roles are per-project, not global |
-| idempotency_keys | key (PK), user_id, request_path, response_status, response_body (JSONB), expires_at (24h) | — | Replays return the stored response verbatim |
-
-Two schema decisions worth defending:
-
-**Custom fields as JSONB, not an EAV table.** The classic alternative — an entity-attribute-value table with one row per (issue, field, value) — turns "load an issue" into an N-row aggregation and "filter by two custom fields" into self-joins that the planner handles badly at 100M issues. JSONB keeps each issue's custom data in the row it belongs to, one read, and a GIN index makes containment queries efficient. What we give up: in-database type enforcement — the application must validate values against the field registry on write, and a bug there means silently corrupt field data. I accept that because the validation lives in exactly one code path (issue write), while EAV's cost is smeared across every read.
-
-**Workflow rules as JSONB configuration interpreted at runtime.** Conditions, validators, and post-functions are stored as typed config objects (e.g. type `user_in_role` with a role parameter) and interpreted by the engine. The alternative — code-defined workflows — would mean a deploy every time any team tweaks a process, which is disqualifying for a product whose selling point is self-serve customization.
-
-**Custom field type validation** deserves a word since it's the sharp edge of the JSONB choice. Each custom field is defined in a field registry (id, name, type: text/number/date/select/user/multi-select) scoped per project. On write, the issue service loads the field definitions for the target project once (cached, since they change rarely) and validates every custom_fields entry against its declared type before the row is written — a select field must match one of its configured options, a user field must reference a real account. This validation is the *only* place type safety exists for custom data, which is precisely the cost called out above: it must be exhaustive and it must run on every write path, including bulk operations, which is why the bulk pipeline deliberately reuses the single-issue write path rather than a bulk-optimized bypass.
-
-## 🔌 API Design
+"I'll draw the whole system, then walk through the three journeys: changing an issue, searching, and propagating the change."
 
 ```
-POST   /api/v1/projects/:key/issues          → Create issue (idempotency key honored)
-GET    /api/v1/issues/:key                   → Read issue (strong, from Postgres)
-PUT    /api/v1/issues/:key                   → Update fields (requires expected version)
-POST   /api/v1/issues/:key/transitions/:id   → Execute workflow transition
-GET    /api/v1/issues/:key/transitions       → Transitions available to THIS user now
-GET    /api/v1/issues/:key/history           → Audit trail, paginated
-POST   /api/v1/search?jql=...                → JQL search (eventual, from Elasticsearch)
-GET    /api/v1/projects/:key/workflows       → Workflow definition for rendering
-POST   /api/v1/admin/workflows               → Admin: create/edit workflows
-POST   /api/v1/admin/schemes                 → Admin: permission scheme management
+┌──────────────────────────────────────────────────────────────────────────────────────────────┐
+│ Browser SPA: board, backlog, issue view   ·   API clients: CI jobs, scripts                  │
+└────────────────┬────────────────────────────────────────────────────┬────────────────────────┘
+                 │ (1) PATCH /issues/:id, POST …/transitions/:t       │ (2) GET /search?jql=…
+                 ▼                                                    ▼
+┌──────────────────────────────────────────────────────────────────────────────────────────────┐
+│ Load balancer · TLS · rate limits per user and per API token                                 │
+└────────────────┬────────────────────────────────────────────────────┬────────────────────────┘
+                 │                                                    │
+                 ▼                                                    ▼
+┌──────────────────────────────────────┐                ┌──────────────────────────────────────┐
+│ Issue API (stateless)                │                │ Search API (stateless)               │
+│ permission checks · workflow engine  │                │ JQL parser → Elasticsearch query     │
+│ rank moves · idempotency keys        │                │ filter: projects the user may view   │
+└───────┬─────────────────────┬────────┘                └─────┬───────────────────────┬────────┘
+        │                     │                               │                       │
+        │                     │ permissions, keys             │ visible projects      │
+        │ one transaction:    │       ┌──────────────────┐    │                       │
+        │ UPDATE … WHERE      │       │ Redis            │    │                       │
+        │   version = v       └──────▶│ sessions, cached │◀───┘                       │
+        │ + history rows              │ permission sets, │                            │
+        │ + outbox row                │ idempotency keys │                            │
+        │                             └──────────────────┘          bool query + filter
+        ▼                                                                             ▼
+┌──────────────────────────────────────┐                ┌──────────────────────────────────────┐
+│ PostgreSQL · source of truth         │                │ Elasticsearch · issues index         │
+│ issues, history, workflows,          │                │ derived, rebuildable from PG         │
+│ permission schemes, outbox           │                └──────────────────────────────────────┘
+└────────────────┬─────────────────────┘                                    ▲
+                 │ (3) relay publishes outbox rows                          │ versioned upsert
+                 ▼                                                          │
+┌──────────────────────────────────────┐                ┌───────────────────┴──────────────────┐
+│ RabbitMQ · issue.events (fanout)     ├───────────────▶│ Index worker                         │
+└────────────────┬─────────────────────┘   issue event  │ re-reads the issue from PG           │
+                 │                                      └──────────────────────────────────────┘
+                 │ issue event
+                 ▼
+┌──────────────────────────────────────┐
+│ Notification and webhook workers     │
+└──────────────────────────────────────┘
 ```
 
-Note the split baked into the API: reads by issue key hit Postgres and are strongly consistent; JQL search hits Elasticsearch and is documented as eventually consistent. The "available transitions" endpoint exists so clients never guess — the server evaluates conditions per-user and returns only executable transitions, keeping authorization logic in exactly one place.
+1. **Edit or transition (1).** The Issue API checks permissions (a Redis hit), evaluates the workflow rules, and commits one transaction: the conditional `UPDATE`, the history rows, and an outbox row describing the change.
+2. **Search (2).** The Search API parses the JQL, resolves `currentUser()`, adds a filter for the projects the caller may view, and queries Elasticsearch.
+3. **Propagate (3).** A relay publishes outbox rows to RabbitMQ after commit; the index worker rebuilds the search document from PostgreSQL, and the notification and webhook workers consume the same events.
+
+| Component | Responsibility | Scales with | Notes |
+|-----------|----------------|-------------|-------|
+| Load balancer | TLS, routing, rate limits | Connections | Automation tokens get their own buckets |
+| Issue API | Issues, transitions, ranks, comments, permission checks | Writes, issue reads | Stateless; the workflow engine is a library inside it |
+| Search API | JQL parsing and compilation, permission filter | Searches | Stateless; can fail without affecting writes |
+| Redis | Sessions, permission sets, workflow definitions, idempotency records | Requests | Losing it makes requests slower, never wrong |
+| PostgreSQL | Source of truth, including the outbox | Writes, storage | Primary + replicas; shard by project later |
+| RabbitMQ | `issue.events` fanout | Events | Dead-letter queue per consumer |
+| Index worker | Rebuilds search documents | Event rate | Versioned, idempotent writes |
+| Elasticsearch | JQL and text search | Searches | Derived; rebuildable from PostgreSQL |
+
+"Why is the workflow engine a library inside the Issue API instead of its own service? Because a transition is one decision about one row: read the issue, check the rules, write status, history and outbox together. Splitting the engine out would turn that into a distributed transaction for no gain. What I do split out is search: it has a different store, a different failure mode, and a different scaling curve."
+
+### Flow 1: running a transition
+
+```
+ Browser                           Issue API                       Redis           PostgreSQL
+    │                                  │                             │                  │
+    │ 1 POST /issues/42/transitions/7  │                             │                  │
+    │─────────────────────────────────▶│                             │                  │
+    │                                  │ 2 cached permission set     │                  │
+    │                                  │────────────────────────────▶│                  │
+    │                                  │ 3 transition_issue granted  │                  │
+    │                                  │◀────────────────────────────│                  │
+    │                                  │ 4 SELECT issue: status, version 7              │
+    │                                  │───────────────────────────────────────────────▶│
+    │                                  │ 5 from-status, conditions, validators          │
+    │                                  │ 6 UPDATE … WHERE version = 7, history, outbox  │
+    │                                  │───────────────────────────────────────────────▶│
+    │                                  │ 7 1 row (0 rows: re-read, retry)               │
+    │                                  │◀───────────────────────────────────────────────│
+    │ 8 200 issue, ETag "8"            │                             │                  │
+    │◀─────────────────────────────────│                             │                  │
+    ················· after commit, the relay publishes the outbox row ··················
+    │                                  │                             │                  │
+```
+
+"Steps 4 and 5 read the issue and evaluate the rules without holding any lock. Step 6 is a compare-and-swap: update only if the version is still the one the rules saw. If zero rows match, someone changed the issue in between — maybe reassigned it, which matters for an 'only the assignee' condition — so I re-read and re-evaluate, up to three times. The outbox row commits with the change, so the event exists exactly when the change does."
+
+### Flow 2: searching with JQL
+
+```
+ Browser                      Search API                          Redis    Elasticsearch
+    │                              │                                │            │
+    │ 1 GET /search?jql=…          │                                │            │
+    │─────────────────────────────▶│                                │            │
+    │                              │ 2 parse; currentUser() → user id            │
+    │                              │ 3 visible project ids          │            │
+    │                              │───────────────────────────────▶│            │
+    │                              │ 4 ids (miss: from PostgreSQL)  │            │
+    │                              │◀───────────────────────────────│            │
+    │                              │ 5 bool query + terms filter                 │
+    │                              │────────────────────────────────────────────▶│
+    │                              │ 6 hits, total                               │
+    │                              │◀────────────────────────────────────────────│
+    │ 7 200 issues, lag p99 < 5 s  │                                │            │
+    │◀─────────────────────────────│                                │            │
+    │                              │                                │            │
+```
+
+"The parser is recursive descent over a small grammar — `field operator value`, `AND` binding tighter than `OR`, `NOT`, parentheses, `IN` lists, `EMPTY`, functions, `ORDER BY`. Anything it can't place is an error with a position: a parser that silently drops a clause returns the wrong issues, which is worse than refusing. The AST compiles to an Elasticsearch `bool` query, and the visible-project list goes into `filter` context so it is mandatory. `currentUser()` resolves to the caller's id and compares against `assignee_id`, never the display name."
+
+### Flow 3: keeping the index in step
+
+```
+PostgreSQL                    RabbitMQ                  Index worker                Elasticsearch
+     │                            │                           │                           │
+     │ 1 relay publishes event    │                           │                           │
+     │───────────────────────────▶│                           │                           │
+     │ 2 confirm; mark published  │                           │                           │
+     │◀───────────────────────────│                           │                           │
+     │                            │ 3 deliver {issue_id: 42}  │                           │
+     │                            │──────────────────────────▶│                           │
+     │ 4 SELECT issue + names                                 │                           │
+     │◀───────────────────────────────────────────────────────│                           │
+     │ 5 row, version 8                                       │                           │
+     │───────────────────────────────────────────────────────▶│                           │
+     │                            │                           │ 6 index v8, external_gte  │
+     │                            │                           │──────────────────────────▶│
+     │                            │                           │ 7 ok, or 409 if newer     │
+     │                            │                           │◀──────────────────────────│
+     │                            │ 8 ack                     │                           │
+     │                            │◀──────────────────────────│                           │
+     │                            │                           │                           │
+```
+
+"Events carry ids, not issue contents, so the worker always re-reads PostgreSQL — a stale event still produces a current document. Each document is written with the issue's version and `external_gte`, so a redelivered or late event can't overwrite a newer one. A nightly reconciliation compares `updated_at` against indexed versions to catch anything lost to bugs."
+
+---
+
+## 💾 Data Model (4 min)
+
+"PostgreSQL holds everything that decides behaviour; Redis and Elasticsearch hold copies."
+
+| Store | Table / key | Key columns | Indexes and notes |
+|-------|-------------|-------------|-------------------|
+| PostgreSQL | `workflows`, `statuses` | status: `workflow_id`, `name`, `category` (todo / in_progress / done) | Category drives board colours without hard-coding names |
+| PostgreSQL | `transitions` | `from_status_id` (null = from any), `to_status_id`, `conditions`, `validators`, `post_functions` (JSON lists) | The whole state machine is rows |
+| PostgreSQL | `permission_schemes`, `permission_grants` | grant: `scheme_id`, `permission`, `grantee_type` (anyone / user / role / group), `grantee_id` | Index on `(scheme_id, permission)`; no negative grants |
+| PostgreSQL | `projects`, `project_members` | project: `key`, `workflow_id`, `permission_scheme_id`; member: `(project_id, user_id)` → role | Schemes and workflows attached by reference |
+| PostgreSQL | `issues` | `id`, `key` (DEMO-42, unique), `project_id`, `status_id`, `assignee_id`, `sprint_id`, `custom_fields` (JSONB), `version`, `rank` | `(project_id, status_id)`; unique `(project_id, rank)`; GIN on custom fields |
+| PostgreSQL | `issue_history` | `issue_id`, `user_id`, `field`, `old_value`, `new_value`, `created_at` | Append-only, monthly partitions |
+| PostgreSQL | `outbox` | `issue_id`, `event_type`, `version`, `published_at` | Partial index on unpublished rows |
+| PostgreSQL | `idempotency_keys` | hash of (user, key), request fingerprint, stored response | 24 h expiry |
+| Redis | `perms:{project}:{user}`, `perms-gen:{project}` | Permission set tagged with a generation | 60 s TTL as a backstop |
+| Elasticsearch | `issues` index | Denormalized names, status, sprint, labels, custom fields, `version` | External versioning |
 
-## 🔧 Deep Dive 1: The Workflow Engine
+"Custom fields live in a JSONB column instead of an entity-attribute-value table. EAV turns 'load an issue' into an N-row aggregation and 'filter on two custom fields' into self-joins; JSONB keeps the data on the row and serializes straight into the search document. What I give up is type enforcement in the database, so a field registry validates values on the single write path."
 
-The heart of Jira. A transition like "Start Progress" is a row with three rule lists, executed in a strict pipeline:
+---
 
-1. **Load** the issue and its project's workflow; find the requested transition
-2. **Source check**: the transition's from_status must match the issue's current status (or be NULL = global transition like "Close from anywhere")
-3. **Conditions** — authorization: evaluate each condition (user_in_role, issue_assignee, user_in_group, always). Any failure → 403. Conditions answer *"may this user attempt this?"* and are also what the "available transitions" endpoint evaluates
-4. **Validators** — data correctness: evaluate against the issue *merged with the fields submitted alongside the transition* (field_required, field_value, custom expressions). Any failure → 422 with the specific field named. Validators answer *"is the issue fit to move?"* — e.g., "cannot resolve without a fix version"
-5. **Atomic commit**: in one database transaction — update the status with an optimistic-lock check on the version column, write one issue_history row per changed field. If the version check matches zero rows, another actor won the race: return 409, no partial state
-6. **Post-functions** — side effects, after commit: assign-to-current-user, clear/update a field, fire a notification. Field-mutating post-functions run synchronously (users expect to see them immediately); notification-type ones publish to RabbitMQ
-7. **Publish** an `issue.transitioned` event with a unique event_id for downstream consumers
+## 🔌 API Design (3 min)
 
-**Why optimistic locking instead of row locks?**
+```
+GET    /api/v1/issues/{key}                     issue + ETag "<version>"
+POST   /api/v1/issues                           create; Idempotency-Key → 201 | 403 | 422
+PATCH  /api/v1/issues/{id}                      edit; If-Match → 200 | 412 + current issue
+GET    /api/v1/issues/{id}/transitions          transitions this user may run now
+POST   /api/v1/issues/{id}/transitions/{tid}    → 200 | 403 condition | 409 moved | 422 validator
+PUT    /api/v1/issues/{id}/rank                 {afterId} or {beforeId} → 200 {rank}
+GET    /api/v1/issues/{id}/history?cursor=…     audit trail, keyset pagination
+GET    /api/v1/search?jql=…&cursor=…            → 200 | 400 invalid_jql | 503 unavailable
+GET    /api/v1/projects/{key}/permissions       what the caller may do (UI hints)
+```
 
-> "Two users act on PROJ-123 simultaneously — one transitions it, one edits the summary. With pessimistic row locking, every issue write holds a lock across condition checks and validator evaluation, which can involve rule lookups and role queries — tens of milliseconds of lock-hold. Boards make this worse: bulk operations like moving a whole sprint would serialize behind each other and deadlock risk grows with rule complexity. Optimistic locking lets everyone read and evaluate freely and only collides at commit, where the version check is a single-row conditional update. Conflicts are genuinely rare — two humans editing the same issue in the same second — so the retry cost is negligible, while the lock-hold cost would be paid on *every* write. What we give up: the loser sees a conflict and must refresh. That's the right UX anyway — silently merging concurrent workflow transitions could execute two contradictory sets of post-functions."
+- **Status is not a field.** `PATCH` rejects it; transitions are the only way to change status, so the workflow can't be bypassed through the edit endpoint.
+- **Refusals are structured.** `403` with the condition that blocked, `422` with the field a validator wants, `409` when the issue moved. Clients need to explain these, not just display "error".
+- **Not visible means not found.** Without `view_issue`, issue and project routes answer `404`, so keys can't be probed.
+- **Idempotency-Key** on creates and comments, because automation retries everything; a reused key with a different body is a `422`.
+- **Search admits it is down** with `503` rather than returning an empty list, which would read as "no issues match".
 
-**Why the three-phase rule split matters**: conditions before validators before commit means a user who *can't* perform a transition never sees validation errors for it (no information leak about required fields), and side effects can never fire for a transition that didn't commit. The ordering is a correctness property, not a style choice.
+---
 
-**Failure semantics for post-functions**: they run after commit, so a crashed post-function leaves a transitioned issue with a missing side effect — not a half-transitioned issue. Queued post-functions carry the event_id and are retried by the consumer with dedup on event_id. This is deliberate: I'd rather occasionally re-send a notification than ever roll back a user-visible status change because an email failed.
+## 🔧 Deep Dive 1: The Workflow Engine (8 min)
 
-**A worked example** grounds the pipeline: an engineer clicks "Resolve" on PROJ-456, which has a fix_version-required validator and a post-function that clears the assignee's "in review" flag.
+"A transition like 'Resolve' is a row with three rule lists. The engine has to run admin-written rules safely, in the right order, and atomically with respect to the state they examined."
 
-1. Load PROJ-456, current status "In Review"; find the "Resolve" transition targeting "Done"
-2. Source check: transition's from_status is "In Review" — matches
-3. Conditions: transition requires `issue_assignee` — the clicking user is the assignee, passes
-4. Validators: `field_required` on fix_version — the submitted fields include a fix_version, passes
-5. Commit: status → Done, version 7 → 8, one history row for the status field
-6. Post-function: clear the review flag (synchronous, visible immediately)
-7. Publish `issue.transitioned` — the search indexer, notification service, and any registered webhook each pick it up independently
+**Order of checks.** The transition must start from the issue's current status (otherwise `409`), then conditions decide *may this user run it* (`403`), then validators decide *is the issue ready* (`422` naming the field). Conditions first means someone who may not resolve issues never learns which fields resolution requires. All checks happen before any write, so a side effect can never fire for a transition that didn't happen.
 
-If step 4 had failed (no fix_version submitted), the response is a 422 naming the missing field, nothing commits, and no event publishes — the client can prompt for the field and resubmit the exact same transition request.
+**Atomicity without locks.** I evaluate rules on a plain read, then commit with `UPDATE issues SET status_id = $to, version = version + 1 WHERE id = $id AND version = $read`, together with the history row, any field changes from post-functions and their history rows, and the outbox row. Zero rows means the issue changed after I evaluated the rules; I re-read and re-evaluate, up to three times, then answer `409`.
 
-**Guarding the engine against its own configurability**: because workflows are admin-authored data, the system has to validate *workflow definitions themselves*, not just issues moving through them. Publishing a new workflow version runs a static check — every to_status_id must exist, every from_status_id (when non-null) must be reachable, and every status the workflow's issue types can start in must have at least one outbound transition, or issues get created into a dead end with no way to progress. This validation runs once at publish time, not on every transition, so it costs nothing on the hot path while still preventing an admin's typo from locking issues in place.
+| Approach | Behaviour | Verdict |
+|----------|-----------|---------|
+| ❌ Code-defined workflows | A deploy for every "Blocked" column | Fails the product's premise: self-service configuration |
+| ❌ Row lock, then evaluate | `SELECT … FOR UPDATE`, run rules, write | Locks held across rule evaluation; a bulk "close the sprint" serializes behind the slowest rule |
+| ❌ Check, then write unconditionally | Read, evaluate, `UPDATE … WHERE id = $id` | Two concurrent transitions both pass and both write; the history shows two moves out of the same status |
+| ✅ Evaluate unlocked, compare-and-swap on version | Re-evaluate on conflict | No lock across rules; a race costs one re-read |
 
-## 🔧 Deep Dive 2: The Permission Pipeline
+**Why it works here.** Contention on a single issue is rare — two humans rarely act on the same issue in the same second — so the compare-and-swap almost always succeeds the first time, and the expensive part (rules, role lookups) never runs under a lock. When a race does happen, the losing request re-evaluates against the new state, which is exactly right: if the issue is no longer in "In Review", "Resolve" should not apply.
 
-Every single read and write resolves permissions, so this path must be both correct and nearly free.
+**Failing closed.** Rules are admin-authored data, so a typo is a real risk. Unknown condition or validator types block the transition instead of allowing it — a condition is authorization, and authorization must not fail open. I also validate definitions when they're saved: unknown rule types and statuses from another workflow are rejected then, so the typo is caught once instead of blocking every issue later.
 
-**The model** is indirection by design: projects point to a permission *scheme*; a scheme holds *grants*; a grant maps a permission (edit_issue, transition_issue…) to a grantee (a role, a group, a specific user, or anyone). Checking whether a user has a permission on a project follows a fixed sequence:
+**Side effects.** Post-functions that change the issue (assign to the actor, set or clear a field) run inside the transaction and record history. Anything that talks to the outside world — notifications, webhooks — is driven by the committed outbox event. A slow webhook endpoint must never hold a row lock, and an email outage must never roll back a status change people already saw.
 
-1. Resolve the project's scheme id
-2. Fetch grants for (scheme, permission)
-3. Resolve the user's project roles and global groups
-4. Access granted if any grant matches: anyone-grant, direct user grant, role grant intersecting the user's roles, or group grant intersecting the user's groups
-5. No match → deny. There are no negative grants — absence is denial
+**What I give up.** Under real contention — an automation hammering one issue — requests retry and some fail with `409`. That's the honest outcome: the alternative is silently applying a transition against rules that no longer hold.
 
-**Why schemes rather than per-project ACLs?** An organization with 10,000 projects doesn't manage 10,000 permission matrices — it manages perhaps a dozen schemes ("open source", "default", "restricted") shared across projects. Changing "restricted" updates hundreds of projects in one write. The indirection costs one extra lookup, which caching erases.
+---
 
-**Caching and invalidation** — the real engineering here:
+## 🔧 Deep Dive 2: Permission Schemes on Every Request (7 min)
 
-- Computed permission sets are cached per (user, project) in Redis with a 10-minute TTL: one cache entry answers every permission question for that user in that project
-- Writes that change authorization (scheme edits, role membership changes, group changes) publish invalidation events that delete affected keys eagerly; the TTL is the backstop for missed invalidations
-- The asymmetry is deliberate: **granting** access may take up to 10 minutes to propagate through a missed invalidation (annoying, safe), while **revocation** paths are invalidated eagerly and, for the sensitive cases (user removed from project, user deactivated), also checked against the session layer — being slow to grant is a support ticket; being slow to revoke is a security incident
+"Every read and write asks 'may this user do this in this project?', 50,000 times a second. It has to be correct, nearly free, and it must revoke immediately."
 
-> "The trade-off I'm consciously making is a small window of stale *positive* permissions in exchange for taking permission checks off the database entirely. At 100x read amplification, resolving roles and grants from Postgres on every board load would be the single largest query source in the system. The cache turns it into a Redis hit. The failure mode I refuse to accept is the reverse — caching denials for a user who was just granted access is fine; serving cached access to a user who was just removed from a confidential project is not, so revocations bypass the TTL."
+**The model.** A project points to a scheme; a scheme holds grants mapping a permission to a grantee: anyone, a user, a project role, or a group. A user holds a permission if any grant matches. There are no negative grants. Ten thousand projects share a dozen schemes, so tightening "Restricted" fixes hundreds of projects in one write.
 
-**Search must respect permissions too**: JQL results are filtered by injecting the user's accessible-project set into every Elasticsearch query as a mandatory filter clause. The accessible-project list comes from the same cached permission layer, so search authorization and API authorization can't drift apart.
+**Evaluation.** Load the project's grants, load the caller's roles in the project, match. It's two indexed queries — cheap once, expensive at 50,000 per second. So I cache the evaluated set per (project, user) in Redis.
 
-**A concrete numbers check**: a large enterprise instance might have 50,000 users and 10,000 projects, but any individual user is a member of perhaps 5–20 projects. Caching per (user, project) rather than a single blob per user keeps cache entries small and invalidation targeted — removing a user from one project invalidates one key, not the user's entire permission surface. The alternative, one cache entry per user holding all their accessible projects and permissions, is simpler to read but means every membership change anywhere invalidates the whole entry, causing far more cache churn for power users who touch many projects.
+**The revocation problem.** A plain TTL cache serves revoked access until the entry expires. Deleting the entry on a membership change isn't enough either: a request that read the old membership a millisecond before the delete can write the stale set back afterwards. So each project has a generation counter. Cache entries record the generation they were computed under; any membership or scheme change bumps the counter; on read, an entry from an older generation is ignored. A racing refill writes an entry that is already obsolete. Revocations and grants both apply on the next request, and the 60-second TTL is only a backstop in case the bump itself fails.
 
-**Global permissions layer beneath the scheme system**: some actions (create project, manage users, view system admin panel) aren't project-scoped at all. These resolve through a small, separate global-role check that runs before the project-scheme pipeline even engages — keeping the two authorization surfaces (instance-level and project-level) independent means a bug in one can't silently widen the other.
+| Approach | Problem | Verdict |
+|----------|---------|---------|
+| ❌ Per-project ACLs | 10,000 matrices to keep consistent | Unmanageable |
+| ❌ Evaluate on every request | Two queries × 50K/s becomes the biggest load on PostgreSQL | Too expensive |
+| ❌ TTL cache, delete on change | Revocation can lag the TTL; a racing refill resurrects access | Unsafe |
+| ✅ Generation-tagged cache | One counter per project; obsolete entries ignored | Instant revocation at cache speed |
 
-## 🔧 Deep Dive 3: JQL — Parsing and the Dual-Store Problem
+**`404`, not `403`, for invisible projects.** If a caller can't view a project, its issues answer `404`. Otherwise `403` versus `404` tells an attacker which keys exist in confidential projects.
 
-JQL is a real grammar: clauses of the form field-operator-value, boolean combinators with parentheses, and functions like `currentUser()` and `startOfDay()`.
+**Search uses the same rule.** The Search API computes the caller's visible projects with the same evaluation function and adds them as a mandatory filter to every JQL query, suggestion and facet count. If search computed access its own way, the two would drift, and the failure mode is confidential issues showing up in someone's filter results.
 
-**Execution pipeline**:
+**Where groups and admins fit.** Instance administration (editing a workflow that many projects share, swapping a project's scheme) is a separate global role, checked before any project scheme. Group grants need a directory service; until there is one, they never match — failing closed again.
 
-1. **Tokenize** the query string into fields, operators, values, parens, and function calls
-2. **Parse** into an AST by recursive descent — clauses at the leaves, AND/OR nodes above, parentheses driving recursion
-3. **Resolve functions at query time** against the request context: `currentUser()` becomes the caller's id, `now()` a timestamp — resolution happens at translation, never stored, so saved filters stay correct for whoever runs them
-4. **Translate** the AST to an Elasticsearch bool query: AND maps to a must clause, OR to should with a minimum-match constraint, equality to term, contains to a full-text match, IN to terms, comparisons to range, "IS EMPTY" to a must-not-exist check; JQL field names map to index fields through an explicit field registry that also covers custom fields
-5. **Inject the permission filter** (accessible projects) as a top-level must clause
-6. Execute with pagination caps and a query timeout
+**What I give up.** A Redis round trip on every request, and a generation counter that every membership change must remember to bump. If Redis is down, I compute from PostgreSQL: slower, never more permissive.
 
-The grammar itself is small and worth stating precisely, since it's what the tokenizer and parser implement: a query is one or more clauses joined by AND/OR, with parentheses for grouping; a clause is a field, a comparison operator (equals, not-equals, contains, greater/less-than variants, IN, NOT IN, IS [NOT]), and a value; a value is a quoted string, a number, the literals EMPTY/NULL, or a zero-argument function call. Keeping the grammar this small — no nested functions, no arithmetic, no subqueries — is itself a design choice: it's expressive enough for the filtering users actually do, and small enough that the recursive-descent parser stays a few dozen lines with no ambiguity to resolve.
+---
 
-**Why Elasticsearch instead of translating JQL to SQL?**
+## 🔧 Deep Dive 3: Concurrent Edits and Board Order (6 min)
 
-> "Postgres full-text search plus indexes could handle simple JQL, and it would keep search strongly consistent — that's the genuine attraction. It breaks on three real usage patterns. First, text relevance: a query for issues containing 'login crash' wants ranked, stemmed, typo-tolerant matching, which is Elasticsearch's core competence and an afterthought in Postgres. Second, arbitrary predicate combinations: users compose filters across custom fields freely; Postgres needs the right index to exist for each shape, while ES indexes every field by construction. Third, aggregations — boards, sprint reports, and dashboards are group-bys over big result sets that ES executes in-memory across shards. The price is the dual-store problem: search lags writes by the indexing pipeline's latency, and can disagree with Postgres."
+"Two different races: two people editing the same issue, and two people dragging cards on the same board."
 
-**Managing the dual-store gap** — this is where the design earns its keep:
+### Edits: versions and `412`
 
-- The indexer consumes issue-change events from RabbitMQ, fetches the full issue from Postgres (events carry ids, not payloads — the database is always the authority on content), and upserts the search document
-- Indexing is idempotent by issue id and *versioned*: each document carries the issue's version; ES rejects out-of-order updates from a stale event, so retries and redeliveries can't regress a document
-- p99 index lag target of ~5 seconds, monitored; if the queue backs up, search returns slightly stale results while writes remain unaffected — the correct degradation direction
-- A nightly reconciliation sweep compares Postgres updated_at against indexed versions and re-indexes drift — the safety net for lost events
-- UX seam: after a write, the client updates its local view from the write response rather than re-querying search, hiding the lag where users would most notice it (create issue → see it on the board)
+```
+ Alice    Bob                                Issue API                                 PostgreSQL
+   │       │                                     │                                          │
+   │ 1 GET /issues/DEMO-5                        │                                          │
+   │────────────────────────────────────────────▶│                                          │
+   │ 2 200, ETag "7"                             │                                          │
+   │◀────────────────────────────────────────────│                                          │
+   │       │ 3 GET /issues/DEMO-5                │                                          │
+   │       │────────────────────────────────────▶│                                          │
+   │       │ 4 200, ETag "7"                     │                                          │
+   │       │◀────────────────────────────────────│                                          │
+   │ 5 PATCH priority, If-Match "7"              │                                          │
+   │────────────────────────────────────────────▶│                                          │
+   │       │                                     │ 6 lock row; UPDATE version 8 + history   │
+   │       │                                     │─────────────────────────────────────────▶│
+   │ 7 200, ETag "8"                             │                                          │
+   │◀────────────────────────────────────────────│                                          │
+   │       │ 8 PATCH summary, If-Match "7"       │                                          │
+   │       │────────────────────────────────────▶│                                          │
+   │       │                                     │ 9 lock row: version is 8, write nothing  │
+   │       │                                     │─────────────────────────────────────────▶│
+   │       │ 10 412 + current issue (version 8)  │                                          │
+   │       │◀────────────────────────────────────│                                          │
+   │       │                                     │                                          │
+```
 
-**Saved filters** are stored as the raw JQL string plus owner and sharing scope — not as a pre-computed result set. This keeps them trivially cheap to store (one row, one string) and always correct, since `currentUser()` and `now()` re-resolve fresh on every run rather than going stale like a cached result list would. A saved filter used as an email subscription runs on a schedule through the identical query path a human triggers manually — one execution engine, whether the caller is a browser or a cron trigger.
+Without a version, the last writer silently wins: Bob's summary change erases Alice's ten-minute description edit, and the history shows nothing wrong. Every issue has a `version`, exposed as an `ETag`; an edit sends the version it was based on in `If-Match`. If the row moved on, nothing is written and the response is `412` with the current issue, so the client can show both. Inside the request I lock the row for the few milliseconds of the write, so history records the value actually replaced — optimistic across minutes of think time, pessimistic for milliseconds.
 
-## 🔧 Deep Dive 4: Bulk Operations Without Locking the World
+| Approach | Verdict |
+|----------|---------|
+| ❌ Last write wins | Silent data loss with a clean-looking history |
+| ❌ Editing locks | Held across think time; need leases, expiry and "unlock" buttons |
+| ✅ Version + `If-Match` → `412` | One integer column; the person with context decides |
 
-"Move all 800 issues in this sprint to Done" is a routine action in real usage, and it stresses every mechanism above at once.
+### Board order: rank keys
 
-**The naive approach** — loop over issues, run the full transition pipeline per issue inside one HTTP request — fails in two ways: the request times out well before 800 sequential rule evaluations and commits finish, and a crash partway leaves an ambiguous "some issues moved" state with no way for the client to know which.
+Integer positions make a drag an `UPDATE` of every card below the drop point — a write that grows with the board and conflicts with every concurrent drag. Instead each issue has a short base-36 rank key compared byte-wise, one order per project shared by all columns and the backlog. Moving a card computes a key strictly between its new neighbours — between `i00100i` and `i00200i` the key is `i002` — so exactly one row changes. The client sends "put it after issue 17", and the server reads 17's current key and the next key after it inside the transaction, so a stale board still yields a sensible order. Two drops into the same gap compute the same key; a unique index on `(project_id, rank)` rejects the second, which re-reads and retries. New issues get a key after the project's maximum from a database trigger, so every insert path lands at the bottom.
 
-**The design**: bulk operations are asynchronous jobs, not synchronous requests.
+"What I give up: keys lengthen when many cards are inserted at one spot — about a character per five inserts — so a background job rebalances a project when keys pass ~32 characters, the same idea as Jira's LexoRank buckets. And rank changes don't bump `version`, so reordering the board never makes someone's summary edit fail with `412`."
 
-1. The API validates the request shape and enqueues a bulk job with the issue id list and target transition, returning a job id immediately
-2. A worker processes issues in small batches (e.g., 50 at a time), running the *exact same* per-issue pipeline — conditions, validators, atomic commit, post-functions — as a single-issue transition. There is no separate "bulk" code path to keep consistent with the real one
-3. Per-issue failures (a permission denial, a failed validator, a version conflict) are recorded individually; the job continues past them rather than aborting the whole batch
-4. The client polls job status, which reports counts: succeeded, failed with reasons, still pending
-5. Failed issues can be retried individually — because the job stored per-issue outcomes, retry is "run the pipeline again for exactly these 12 issues," which is naturally idempotent since the pipeline itself is idempotent-safe via optimistic locking
+---
 
-> "The key decision is reusing the single-issue pipeline unchanged rather than writing a bulk-optimized version that batches the database writes. A batched UPDATE across 800 rows is tempting for throughput, but it would have to duplicate every rule-evaluation and permission-check code path outside the transaction boundary — and that duplication is exactly where bulk operations historically diverge from single-issue behavior in ways that surprise users, like a bulk transition skipping a validator that the UI enforces everywhere else. I accept the throughput cost of 800 individual commits (they're small and fast) in exchange for a guarantee that bulk and single-issue transitions can never disagree about what's allowed."
+## 📈 Scale, Failures & Observability (2 min)
 
-At the batch size and concurrency I'd tune for (50 issues per batch, a handful of worker processes per bulk job), 800 issues completes in low single-digit seconds — well within what a user is willing to watch a progress bar for — while still hitting the database as 800 small, index-friendly writes rather than one enormous locking transaction.
+**What breaks first:** permission checks if the cache hit ratio drops (alert under 95%); board reads (replicas, then caching board queries per sprint); `issue_history` growth (monthly partitions, archive old ones); then the write primary around a few thousand writes per second (shard by project — everything that matters is project-scoped, and cross-project queries already go to Elasticsearch).
 
-**Why per-issue partial success instead of all-or-nothing**: an all-or-nothing bulk transaction across 800 rows, several of which touch different permission checks, means one user without edit rights on one issue blocks 799 legitimate transitions for everyone else in the batch. Partial success with a clear per-issue report is more useful and matches how humans actually think about "move the sprint" — they want progress, not a wall.
+| Failure | What users see | Mitigation |
+|---------|----------------|------------|
+| Elasticsearch down | JQL says "search unavailable"; boards and issues work | Boards read PostgreSQL |
+| RabbitMQ down | Nothing immediately; search and notifications lag | Outbox rows wait for the relay |
+| Redis down | Slower requests; users may need to log in again | Permissions from PostgreSQL, never "allow" |
+| PostgreSQL primary down | Writes fail with `503` | Failover; clients retry with the same idempotency key |
+| Poison event | One consumer's queue stops growing | Retries with backoff, then a dead-letter queue |
 
-This mirrors a broader pattern in the design: wherever an operation spans many issues (bulk transitions, sprint close, project-wide field migrations), it decomposes into independent per-issue operations coordinated by a job rather than a single all-encompassing transaction. That keeps the workflow engine's transactional guarantees scoped to what they were designed for — one issue's state — instead of stretching database transactions across operations that naturally want partial, observable progress.
+**What I'd watch:** transition refusals by code (a spike of `422`s after a workflow edit means an admin broke a workflow), `412` and compare-and-swap conflict rates (automation fighting people), permission-cache hit ratio, index lag from commit to searchable (alert above 30 s), outbox backlog, and dead-letter depth per consumer.
 
-## 🗂️ Boards, Sprints, and Comments
+---
 
-Three supporting pieces round out the picture, each with a distinct access pattern from the core issue path:
+## ⚖️ Trade-offs & Wrap-up (2 min)
 
-**Boards** (Kanban/Scrum) are not a stored entity so much as a saved JQL filter plus column-to-status mapping. A board's "columns" are configuration (which statuses map to which column), and its contents are a live JQL query re-run on load — this reuses the entire search pipeline instead of building a parallel board-materialization system. The trade-off is that board loads pay Elasticsearch's eventual-consistency lag; I mask this the same way as elsewhere — a card the user just dragged updates optimistically in the client and reconciles against the next board refresh rather than waiting on the index.
+| Decision | ✅ Chosen | ❌ Alternative | Why |
+|----------|-----------|----------------|-----|
+| Workflows | Data, interpreted at runtime | Code per workflow | Changes without deploys |
+| Transition safety | Compare-and-swap on version | Row lock across rule evaluation | No locks held across admin-written rules |
+| Unknown rules | Fail closed, validate on save | Fail open | A typo must block, not grant |
+| Concurrent edits | `If-Match` → `412` | Last write wins | No silent loss |
+| Permissions | Schemes + generation-tagged cache | Per-project ACLs or a TTL cache | Cheap checks, instant revocation |
+| Search | Elasticsearch via outbox, versioned writes | PostgreSQL full-text | Arbitrary predicates and facets; lag is bounded and monotonic |
+| Board order | Fractional rank keys | Integer positions | One-row moves; no renumbering |
 
-**Sprints** are a simple entity (project_id, name, start/end dates, state: future/active/closed) that issues reference by sprint_id. Starting a sprint is a bulk-ish operation — snapshot the committed scope — and closing one runs the same "move incomplete issues" flow as the bulk operations deep dive: incomplete issues transition or move to the next sprint through the standard per-issue pipeline, so sprint close can never leave issues in a state the workflow engine wouldn't otherwise allow. Backlog ordering (the rank users drag issues into) is stored as a lexicographic rank string per issue rather than an integer position — inserting between two issues just computes a string between their two ranks, so reordering never requires renumbering the whole backlog, which matters once a backlog holds thousands of issues and drag-and-drop needs to feel instant.
-
-**Comments** are append-only child rows of an issue, each optionally carrying a visibility restriction (role or group) checked against the commenter and, on read, against the viewer. Comments publish their own lightweight event for notification purposes (watchers, @mentions) without going through the full issue-transition pipeline, since a comment isn't a workflow event — this keeps the workflow engine's scope to state transitions, not general activity.
-
-**Attachments** are the one place large binary content enters the picture, and they're handled outside the relational path entirely: metadata (filename, size, uploader, content hash) lives in Postgres as a child row of the issue, while bytes go to object storage (MinIO/S3) keyed by content hash for natural deduplication — the same attachment dragged onto two issues stores once. Upload is a two-step handshake: the client requests a pre-signed upload URL scoped to the target issue and the permission check happens at URL-issuance time, not at storage time, so the storage layer itself never needs to know about Jira's permission model.
-
-**Watchers**, a small but heavily-read feature, are a simple join table (issue_id, user_id) consulted only by the notification path — deliberately not part of the permission model, since watching an issue is an opt-in convenience, not a grant of access.
-
-**Issue links** (blocks, relates-to, duplicates) are directed edges between two issue ids with a link type — another small join table, but one worth flagging because it's the one place the data model crosses project boundaries casually. A link from a PROJ-1 issue to a PROJ-2 issue must independently respect both projects' permissions on read, which is another argument for permission checks being resolved per-issue rather than assumed to be uniform across a result set.
-
-## 🛡️ Security and Multi-Tenancy
-
-Jira instances host confidential data (security incidents, HR issues, legal matters) inside otherwise-open organizations, so authorization has to be airtight, not just present:
-
-- **Project-level isolation by default**: every query for issues, comments, and attachments is scoped by project_id and passes through the permission pipeline — there is no "list all issues" endpoint that bypasses per-project checks
-- **Comment-level visibility**: comments can carry their own restriction (role or group), layered on top of issue-level permission — a support agent might see the issue but not internal-only comments
-- **Attachment storage** uses signed, time-limited URLs issued only after the permission check passes, so a leaked direct storage URL doesn't become a durable bypass
-- **Admin actions are the highest-risk surface** (workflow edits, permission scheme changes) — audited with actor and diff, and rate-limited separately from normal API traffic so a compromised admin token can't rewrite every workflow in a burst
-- **Session and API token auth**: browser sessions via Redis-backed cookies for interactive use; scoped API tokens for automation, each carrying its own rate limit bucket so one runaway integration script can't starve interactive users
-
-**Rate limiting tiers**, since "one bad actor" takes different shapes here: interactive users get generous per-session limits tuned for board polling and rapid clicking; automation tokens get lower per-minute limits but higher burst allowances for legitimate batch jobs (a CI pipeline creating 50 issues at once); webhook *registration* itself is limited per project to prevent an admin mistake from fanning out to thousands of destinations. Each tier is enforced with its own Redis-backed token bucket, keyed so that noisy automation never borrows from the interactive budget.
-
-## 🔁 Consistency and Idempotency
-
-**Idempotent writes**: automation and webhook retries mean the same logical request arrives multiple times. Any mutating request may carry an idempotency key; the gateway checks the idempotency_keys table, replays the stored response on a hit, and stores the status and body after first execution, expiring after 24 hours. Keys are stored in Postgres rather than Redis-only because a replayed *write* must be caught even across a cache flush — the same durability reasoning as the search pipeline: correctness anchors live in the durable store.
-
-**Event delivery**: RabbitMQ gives at-least-once, so every consumer dedups on event_id — the search indexer via versioned upserts, the webhook dispatcher via a delivery log keyed by event and endpoint, notifications via a sent-log. Exactly-once is achieved per-consumer through idempotent handling, not promised by the bus.
-
-**Ordering**: events for a single issue are processed in order (partitioned by issue id at the consumer); cross-issue ordering is unnecessary and not promised.
-
-## 🧯 Failure Handling
-
-Beyond the idempotency and dual-store mechanisms already covered, a few explicit degradation policies:
-
-- **Elasticsearch unreachable**: search returns a clear "search temporarily unavailable" rather than an empty result set — an empty page reads as "no issues match," which for a user hunting a bug is actively misleading. Direct issue-by-key lookups keep working since they never touch ES.
-- **RabbitMQ unreachable**: issue writes still commit to Postgres — the queue is downstream of the source of truth, never upstream. Publishing is wrapped in a circuit breaker; on an open breaker, events are held in a local outbox table and drained once the queue recovers, so notifications and search indexing catch up rather than silently losing the event.
-- **Permission cache (Redis) unreachable**: falls back to computing permissions directly from Postgres per request. Slower, but correct — the system degrades toward higher latency on the read path rather than toward wrong authorization decisions, which is the one place "fail open" is unacceptable.
-- **Webhook endpoint down**: retried with exponential backoff for a bounded window (e.g., 24 hours), then marked failed and surfaced to the admin who registered it — one integration's outage never blocks issue writes, since delivery is fully decoupled through the queue.
-
-The unifying principle: every external dependency (search, queue, cache, webhooks) can degrade the *experience* — slower search, delayed notifications, stale board counts — but none of them can compromise the *correctness* of issue state, which lives in exactly one place.
-
-**Outbox pattern detail**, since it's doing real work above: rather than publishing to RabbitMQ inside the same transaction as the issue commit (which would make the commit's success depend on the queue being reachable — exactly the coupling I'm trying to avoid), the event is written as a row in an outbox table in the *same* transaction as the issue update. A separate relay process tails the outbox and publishes to RabbitMQ, marking rows delivered. This gets transactional guarantees (the event exists if and only if the commit happened) without ever making Postgres availability depend on RabbitMQ availability, or vice versa.
-
-## 📊 Observability
-
-| Signal | Why it matters |
-|--------|----------------|
-| Issue write latency p50/p99 | The core interactive SLO; regressions usually trace to rule-evaluation or lock contention |
-| Transition rate by project and status pair | Business heartbeat; a project whose transitions stop often means a broken workflow config |
-| Conflict (version-mismatch) rate | Optimistic-lock health; a spike means some automation is fighting users |
-| Search index lag (event timestamp → indexed) | The dual-store gap made visible; alert past 30s |
-| Permission cache hit ratio | Below ~95%, Postgres starts feeling the 100x read amplification |
-| Queue depth per consumer | Webhook/notification backlogs are invisible to users until they're huge — alert early |
-| JQL latency histogram by query complexity | Separates "ES is slow" from "users write monstrous queries" |
-
-Structured logs carry issue key, user id, transition id, and event id so one issue's full lifecycle — API call, rule evaluation, commit, index update, webhook delivery — is traceable end to end.
-
-Dashboards are organized around the three engines rather than raw infrastructure metrics — a "workflow engine health" view (transition latency, conflict rate, post-function failures), a "permission pipeline health" view (cache hit ratio, resolution latency, denial rate anomalies), and a "search consistency" view (index lag, reconciliation drift count). This mirrors the architecture: when something feels wrong to a user, the on-call engineer should be able to name which engine owns the symptom within seconds, not correlate raw CPU and query graphs by hand.
-
-## 📈 Scalability: What Breaks First
-
-1. **First: JQL/board reads.** Reads outnumber writes 50–100x and boards refresh constantly. Fixes in order: permission-set caching (done), board query result caching with event-driven invalidation, then scaling Elasticsearch replicas — ES scales reads horizontally much more gracefully than Postgres.
-
-2. **Second: issue_history growth.** Hundreds of rows per busy issue across 100M issues makes history the biggest table by an order of magnitude. It's append-only and read only on demand (history tab, audits) — time-partition it, keep recent partitions hot, archive old partitions to cold storage. Never let audit reads compete with issue writes.
-
-3. **Third: Postgres write path.** At ~1K writes/sec a single primary holds; growth beyond that shards cleanly by project_id — issues, history, and configuration are all project-scoped, and cross-project operations (issue links, JQL) already flow through Elasticsearch, which is shard-agnostic. The project key prefix even gives humans a natural shard hint.
-
-4. **Fourth: webhook fan-out.** Big instances register thousands of webhooks; one slow endpoint must not delay others — per-endpoint queues with circuit breakers on failing destinations, and delivery isolation so a flapping integration only hurts itself.
-
-5. **Fifth, further out: the single Elasticsearch cluster becomes a noisy-neighbor problem.** One enterprise instance running enormous JQL aggregations can degrade search latency for everyone sharing the cluster. The fix is tenant isolation — dedicated indices per large instance, with routing at the search-service layer, so a heavy customer's query load is contained to their own shards rather than felt cluster-wide.
-
-Notice the pattern across all five: every bottleneck resolves by exploiting the same structural property — the system is fundamentally project-scoped and user-scoped, with cross-cutting concerns (search, permissions cache) built as derived, shardable layers on top. There is no natural "global" operation that would force a coordinator or a single point of contention as the system grows.
-
-## 🧭 A Note on Deep-Dive Selection
-
-I chose the workflow engine, permission pipeline, and JQL/search split as the three deep dives because they're where this system's defining requirement — full user-configurability — actually bites. Issue CRUD, comments, and attachments are straightforward once the data model is right; they don't reveal architectural judgment the way "how do you let 1M projects each define their own state machine without a deploy" does. If there were time for a fourth, I'd go into real-time collaboration on the issue detail view (concurrent editors seeing each other's changes as they type), which would pull in the same optimistic-concurrency ideas from the workflow engine but applied to field-level rather than status-level writes.
-
-## ⚖️ Trade-offs Summary
-
-| Decision | Chosen | Alternative | Rationale |
-|----------|--------|-------------|-----------|
-| Custom fields | ✅ JSONB + GIN | ❌ EAV table | One-row reads; app-level validation in a single write path |
-| Workflows | ✅ Data-driven, interpreted | ❌ Code-defined | Self-serve customization without deploys |
-| Concurrency | ✅ Optimistic version check | ❌ Row locks | Rare conflicts; no lock-hold across rule evaluation |
-| Search | ✅ Elasticsearch, async | ❌ Postgres FTS | Relevance, arbitrary predicates, aggregations |
-| Search feed | ✅ Events with id-only + DB fetch | ❌ Full payload events | DB stays the single authority on content |
-| Permissions | ✅ Schemes + cached per-user sets | ❌ Per-project ACLs, always-fresh | Manageable at 10K projects; reads off the DB |
-| Revocation | ✅ Eager invalidation for denies | ❌ Uniform TTL | Slow-to-grant is a ticket; slow-to-revoke is an incident |
-| Idempotency store | ✅ PostgreSQL | ❌ Redis-only | Duplicate writes must be caught across cache loss |
-| History | ✅ Append-only change table | ❌ Full event sourcing | UI reads history directly; no projection layer needed |
-
-## 🚀 Closing: What I'd Build Next
-
-With more time I'd cover:
-
-- **A rule sandbox for admin-defined *scripted* validators.** The moment a workflow allows arbitrary expressions ("require story_points > 0 AND priority != Low"), the interpreter needs execution limits, timeouts, and isolation — an admin's typo shouldn't be able to hang the transition pipeline for every user on that project.
-- **Board-level real-time updates** via WebSocket fan-out of the same issue events already flowing through RabbitMQ — teammates watching a board should see a card move without a manual refresh, which reuses the event bus rather than adding a new source of truth.
-- **Cross-project automation.** The workflow engine already generalizes past single-issue transitions — automation rules ("when issue moves to Done in any project, create a follow-up in another") are naturally just another consumer of the same event stream, evaluated against the same permission model.
-- **Archival tiering** for the long tail of dormant projects, which at 1M projects is most of them — old, inactive projects could move to cheaper storage and a slower query path without affecting active-project latency.
-
-The through-line of the design: configuration is data, Postgres is the only authority for issue state, and every derived system — search, notifications, webhooks, boards — is allowed to lag but never allowed to diverge permanently. That single discipline is what lets a highly customizable product stay both fast and correct at 100M issues.
+"With more time I'd add bulk operations as background jobs that run the same per-issue transition pipeline, a sandbox with time limits for scripted validators, and a live-update gateway that pushes the same issue events to open boards."

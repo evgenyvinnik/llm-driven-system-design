@@ -102,9 +102,23 @@ The frontend runs on http://localhost:5173
 Open http://localhost:5173 in your browser.
 
 **Demo Credentials:**
-- Admin: `admin@example.com` / `admin123`
-- User: `john@example.com` / `password123`
-- User: `jane@example.com` / `password123`
+
+`npm run seed` (`src/db/seed.ts`) creates:
+- Admin: `admin@example.com` / `admin123` (system administrator)
+- Users: `john@example.com`, `jane@example.com` / `password123` (Developers in DEMO)
+
+`db-seed/seed.sql` (used by the screenshot tooling) creates the same admin plus `alice@`, `bob@` and `carol@example.com` / `password123`. Permission schemes are enforced, so roles matter: alice is a Developer in DEMO and INFRA, bob a Developer in DEMO and Administrator of INFRA, carol a Viewer in DEMO (read-only).
+
+```bash
+PGPASSWORD=jira_password psql -h localhost -U jira -d jira -v ON_ERROR_STOP=1 -f backend/db-seed/seed.sql
+```
+
+### 5. Run the Tests
+
+```bash
+cd backend
+npm test        # vitest: rank keys, JQL parser, permissions, transitions, edits, idempotency, RabbitMQ reconnects
+```
 
 ## Project Structure
 
@@ -145,18 +159,20 @@ jira/
 ### Projects
 - `GET /api/projects` - List all projects
 - `GET /api/projects/:key` - Get project by key
+- `GET /api/projects/:key/permissions` - Permissions the current user holds in the project
 - `POST /api/projects` - Create project
 - `GET /api/projects/:id/sprints` - List sprints
 - `POST /api/projects/:id/sprints` - Create sprint
 - `GET /api/projects/:id/boards` - List boards
 
 ### Issues
-- `GET /api/issues/:key` - Get issue by key
-- `POST /api/issues` - Create issue
-- `PATCH /api/issues/:id` - Update issue
+- `GET /api/issues/:key` - Get issue by key (`ETag` carries the issue version)
+- `POST /api/issues` - Create issue (send `Idempotency-Key` to make retries safe)
+- `PATCH /api/issues/:id` - Update fields (send `If-Match: "<version>"`; a stale version gets `412` with the current issue)
 - `DELETE /api/issues/:id` - Delete issue
-- `GET /api/issues/:id/transitions` - Get available transitions
-- `POST /api/issues/:id/transitions/:transitionId` - Execute transition
+- `GET /api/issues/:id/transitions` - Transitions the current user may run
+- `POST /api/issues/:id/transitions/:transitionId` - Execute transition (`403` condition, `409` issue moved, `422` validator with `field`)
+- `PUT /api/issues/:id/rank` - Reorder: `{"afterId": 17}` or `{"beforeId": 17}`
 - `GET /api/issues/:id/comments` - Get comments
 - `POST /api/issues/:id/comments` - Add comment
 - `GET /api/issues/:id/history` - Get change history
@@ -186,9 +202,12 @@ priority = high AND status = "In Progress"
 
 # Combine conditions
 project = DEMO AND (status = "To Do" OR status = "In Progress")
+
+# Text, empty fields, relative dates, ordering
+text ~ "login crash" AND assignee IS EMPTY AND created > -7d ORDER BY priority DESC
 ```
 
-Supported operators: `=`, `!=`, `~` (contains), `IN`, `NOT IN`, `>`, `<`, `>=`, `<=`
+Supported operators: `=`, `!=`, `~` / `!~` (text match), `IN`, `NOT IN`, `IS [NOT] EMPTY`, `>`, `<`, `>=`, `<=`; `AND` binds tighter than `OR`; `NOT` and parentheses; functions `currentUser()`, `now()`, `startOfDay()`, `endOfDay()`, `startOfWeek()`, `endOfWeek()`. Syntax errors return `400` with a character position; searches only return issues from projects you may view, and answer `503` while Elasticsearch is unavailable.
 
 ## Running Multiple Backend Instances
 
@@ -255,7 +274,7 @@ See [architecture.md](./architecture.md) for detailed design documentation.
 
 ## Development Notes
 
-See [claude.md](./claude.md) for development insights and design decisions.
+See [CLAUDE.md](./CLAUDE.md) for development insights and design decisions.
 
 ## References & Inspiration
 

@@ -1,790 +1,535 @@
-# Design Jira - Architecture
+# Jira (Issue Tracking) — Architecture
 
 ## System Overview
 
-Jira is an issue tracking system with customizable workflows, dynamic field schemas, complex permission models, and a query language (JQL). The platform supports project-scoped boards, sprints, epics, and full audit history.
+An issue tracker in the style of Jira: projects hold issues that move through workflows, appear on Kanban boards in a team-chosen order, and are found with a small query language (JQL). It looks like CRUD over one `issues` table. What makes it a design problem is that almost nothing is fixed: **every project defines its own workflow** (a state machine stored as data), **its own permission scheme** (who may do what), and **its own board order**, while many people edit the same issues at the same time and expect search to agree with the board a few seconds later.
 
-**Learning Goals:**
-- Build configurable workflow state machines
-- Design dynamic field schemas with JSONB
-- Implement role-based permissions with project context
-- Create a query language parser (JQL)
+This document describes the production design first, then — in [Implementation Notes](#implementation-notes) — what the local Express + PostgreSQL + Valkey + Elasticsearch + RabbitMQ + React code actually does.
 
----
+**Learning goals**
+
+- Running a user-defined state machine safely: rules evaluated without locks, the write applied with a compare-and-swap.
+- Evaluating permission schemes on every request, cheaply, without serving revoked access from a cache.
+- Optimistic concurrency end to end: a `version` column, `ETag` / `If-Match`, `412 Precondition Failed`.
+- Ordering a board with fractional rank keys, so a drag rewrites one row instead of renumbering a column.
+- Keeping a search index (a derived read model) in step with the source of truth through an outbox and versioned writes.
+- Parsing a query language into an AST and compiling it into a search engine query with a mandatory permission filter.
 
 ## Requirements
 
-### Functional Requirements
+### Functional requirements
 
-1. **Issues**: Create, update, assign, and transition issues through workflows
-2. **Workflows**: Customizable state machines with conditions, validators, and post-functions
-3. **Boards**: Kanban and Scrum views with drag-and-drop
-4. **Search**: JQL-based issue search with Elasticsearch
-5. **Custom Fields**: Dynamic per-project field schemas stored as JSONB
-6. **Reports**: Burndown, velocity, and sprint statistics
-7. **Audit Trail**: Full history of all field changes
+1. **Issues**: create, edit, comment, delete; every change recorded in an audit trail.
+2. **Workflows**: per-project statuses and transitions; each transition carries conditions (who may run it), validators (what must be true) and post-functions (side effects).
+3. **Permission schemes**: per-project grants of permissions (view, edit, transition, administer…) to roles, users or everyone.
+4. **Boards and backlog**: columns per status, cards in a manual rank order; drag between columns to transition, within a column to reorder.
+5. **Search**: JQL such as `project = DEMO AND assignee = currentUser() AND status IN ("To Do", "In Progress") ORDER BY priority DESC`.
+6. **Integrations**: an API that automation can call and retry safely, plus webhooks and notifications on issue events.
 
-### Non-Functional Requirements
+Out of scope: time tracking, reports and dashboards beyond simple counts, attachments' content pipeline, marketplace apps, cross-instance federation.
 
-- **Availability**: 99.9% uptime
-- **Latency**: < 200ms p95 for issue operations, < 500ms for search
-- **Scale**: 1M projects, 100M issues, 10K concurrent users
-- **Audit**: Immutable history of every field change
-- **Consistency**: Strong consistency for issue writes, eventual for search index
+### Non-functional requirements
 
----
+| Requirement | Target | Why |
+|-------------|--------|-----|
+| Issue read latency | p99 < 200 ms | The issue view and board are the most frequent requests |
+| Write latency (edit, transition, rank) | p99 < 300 ms | Drags must feel immediate; the UI is optimistic but confirmations matter |
+| JQL search latency | p99 < 1 s | Interactive filtering, including large projects |
+| Search freshness | Index lag p99 < 5 s | "I just changed it and the filter disagrees" must be rare and short |
+| Availability | 99.9% for reads and writes; search may degrade separately | An internal tool many teams depend on all day |
+| Correctness | No lost updates; no transition that violates the workflow or permissions | The audit trail is a compliance artifact for many teams |
+| Revocation | Removing a member takes effect on their next request | Slow-to-revoke is a security incident, slow-to-grant is a ticket |
+
+## Capacity Estimation
+
+| Quantity | Estimate | Design consequence |
+|----------|----------|--------------------|
+| Users | 10M registered, 1M daily, 100K concurrent at peak | Stateless API instances behind a load balancer; sessions in Redis |
+| Projects / issues | 1M projects, 100M issues, +100K issues per day | Shard by project when one primary is not enough; most projects are small |
+| Writes (edits, transitions, comments, ranks) | 1M users × ~20/day ≈ 20M/day ≈ 230/s average, ~1K/s peak | One PostgreSQL primary holds this for years |
+| Reads (boards, issue views, JQL) | ~50× writes ≈ 12K/s average, ~50K/s peak | Cache configuration and permissions; boards read replicas; JQL goes to Elasticsearch |
+| Permission checks | One per request ≈ 50K/s peak | Must be a Redis hit (≥ 95%), otherwise permissions become the biggest query load |
+| History rows | ~15 per issue ≈ 1.5B rows × ~150 B ≈ 225 GB | Append-only, partitioned by month, read only when someone opens the history tab |
+| Issue rows + comments | 100M × 2 KB + 500M × 400 B ≈ 400 GB | Fits a handful of shards; custom fields stay in JSONB on the row |
+| Search index | ~1.5× issue data ≈ 300 GB plus replicas | A dedicated cluster; large tenants get their own indices |
+| Issue events | ~1K/s peak, fanned out to 3 consumers | RabbitMQ is plenty; PostgreSQL stays the system of record for replays |
+| Board size | Up to a few thousand cards per project | A rank key is 7–12 characters; a move rewrites one row |
+
+### Local Development Scale
+
+Two projects, nine issues and four users from [`seed.sql`](./backend/db-seed/seed.sql); one API process, optional workers, PostgreSQL and Valkey required, Elasticsearch and RabbitMQ optional (writes succeed without them; search answers `503`). Ports and setup are in the [README](./README.md).
 
 ## High-Level Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                         Client Layer                            │
-│           Web │ Mobile │ IDE Plugins │ CLI                      │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      API Gateway / CDN                          │
-│             (Rate Limiting, Auth, TLS Termination)              │
-└─────────────────────────────────────────────────────────────────┘
-        │                     │                     │
-        ▼                     ▼                     ▼
-┌───────────────┐    ┌───────────────┐    ┌───────────────┐
-│ Issue Service │    │Workflow Engine│    │Search Service │
-│               │    │               │    │               │
-│ - CRUD        │    │ - Transitions │    │ - JQL Parser  │
-│ - Comments    │    │ - Validators  │    │ - Indexing    │
-│ - Attachments │    │ - Actions     │    │ - Aggregation │
-└───────┬───────┘    └───────┬───────┘    └───────┬───────┘
-        │                    │                     │
-        ▼                    ▼                     ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      Message Queue (RabbitMQ)                   │
-│  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐            │
-│  │ issue.events │ │ search.index │ │notifications │            │
-│  │   (fanout)   │ │   (direct)   │ │   (direct)   │            │
-│  └──────────────┘ └──────────────┘ └──────────────┘            │
-└─────────────────────────────────────────────────────────────────┘
-        │                    │                     │
-        ▼                    ▼                     ▼
-┌───────────────┐   ┌───────────────┐   ┌───────────────┐
-│ Search Indexer│   │ Notification  │   │ Webhook       │
-│   Worker      │   │   Worker      │   │ Dispatcher    │
-└───────────────┘   └───────────────┘   └───────────────┘
-        │                    │                     │
-        ▼                    ▼                     ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                        Data Layer                               │
-├──────────────┬──────────────┬───────────────────────────────────┤
-│  PostgreSQL  │    Redis     │         Elasticsearch             │
-│  - Issues    │  - Sessions  │         - Issue search            │
-│  - Workflows │  - Cache     │         - JQL queries             │
-│  - History   │  - Idempotency│         - Aggregations           │
-└──────────────┴──────────────┴───────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────────────────┐
+│ Browser SPA: board, backlog, issue view   ·   API clients: CI jobs, scripts                  │
+└────────────────┬────────────────────────────────────────────────────┬────────────────────────┘
+                 │ (1) PATCH /issues/:id, POST …/transitions/:t       │ (2) GET /search?jql=…
+                 ▼                                                    ▼
+┌──────────────────────────────────────────────────────────────────────────────────────────────┐
+│ Load balancer · TLS · rate limits per user and per API token                                 │
+└────────────────┬────────────────────────────────────────────────────┬────────────────────────┘
+                 │                                                    │
+                 ▼                                                    ▼
+┌──────────────────────────────────────┐                ┌──────────────────────────────────────┐
+│ Issue API (stateless)                │                │ Search API (stateless)               │
+│ permission checks · workflow engine  │                │ JQL parser → Elasticsearch query     │
+│ rank moves · idempotency keys        │                │ filter: projects the user may view   │
+└───────┬─────────────────────┬────────┘                └─────┬───────────────────────┬────────┘
+        │                     │                               │                       │
+        │                     │ permissions, keys             │ visible projects      │
+        │ one transaction:    │       ┌──────────────────┐    │                       │
+        │ UPDATE … WHERE      │       │ Redis            │    │                       │
+        │   version = v       └──────▶│ sessions, cached │◀───┘                       │
+        │ + history rows              │ permission sets, │                            │
+        │ + outbox row                │ idempotency keys │                            │
+        │                             └──────────────────┘          bool query + filter
+        ▼                                                                             ▼
+┌──────────────────────────────────────┐                ┌──────────────────────────────────────┐
+│ PostgreSQL · source of truth         │                │ Elasticsearch · issues index         │
+│ issues, history, workflows,          │                │ derived, rebuildable from PG         │
+│ permission schemes, outbox           │                └──────────────────────────────────────┘
+└────────────────┬─────────────────────┘                                    ▲
+                 │ (3) relay publishes outbox rows                          │ versioned upsert
+                 ▼                                                          │
+┌──────────────────────────────────────┐                ┌───────────────────┴──────────────────┐
+│ RabbitMQ · issue.events (fanout)     ├───────────────▶│ Index worker                         │
+└────────────────┬─────────────────────┘   issue event  │ re-reads the issue from PG           │
+                 │                                      └──────────────────────────────────────┘
+                 │ issue event
+                 ▼
+┌──────────────────────────────────────┐
+│ Notification and webhook workers     │
+└──────────────────────────────────────┘
 ```
 
----
+1. **Edit or transition (1).** The Issue API checks the caller's permissions (a Redis hit), evaluates the workflow rules, and commits one transaction: the conditional `UPDATE` (only if the issue's version is the one the rules were evaluated against), the history rows, and an outbox row describing the change.
+2. **Search (2).** The Search API parses the JQL, resolves `currentUser()`, adds a filter limiting results to projects the caller may view, and queries Elasticsearch. Search never touches PostgreSQL.
+3. **Propagate (3).** A relay publishes outbox rows to RabbitMQ after commit. The index worker re-reads the issue from PostgreSQL and writes it to Elasticsearch with the issue's version; notification and webhook workers consume the same events.
 
-## Core Components
+| Component | Responsibility | Scales with | Notes |
+|-----------|----------------|-------------|-------|
+| Load balancer | TLS, routing, rate limits per user and per API token | Connections | Automation tokens get their own buckets so scripts can't starve people |
+| Issue API | Issues, transitions, ranks, comments, permission checks, idempotency | Writes and issue reads | Stateless; the workflow engine is a library inside it, not a separate hop |
+| Search API | JQL parsing, compilation to Elasticsearch, permission filter | Searches | Stateless; can fail without affecting writes |
+| Redis | Sessions, cached permission sets, idempotency records, workflow definitions | Requests | Losing it makes requests slower, never wrong |
+| PostgreSQL | Source of truth: issues, history, workflows, schemes, outbox | Writes, storage | Primary + replicas; shard by project later |
+| RabbitMQ | `issue.events` fanout | Events | Durable queues, dead-letter queues per consumer |
+| Index worker | Rebuilds search documents from PostgreSQL | Event rate | Idempotent: versioned writes |
+| Elasticsearch | Issue documents for JQL and text search | Searches, data size | Derived; rebuildable from PostgreSQL at any time |
+| Notification and webhook workers | Watchers, mentions, external integrations | Event rate | Retries with backoff; one failing endpoint never blocks writes |
 
-### 1. Workflow Engine
+The split that matters most is **PostgreSQL decides, everything else follows**. Issue state, workflow position, permissions and order are decided in one database transaction; search, notifications and webhooks are derived from committed changes and may lag, but never diverge permanently.
 
-The workflow engine is database-driven, allowing per-project customization without code changes. Each workflow defines a set of statuses (categorized as `todo`, `in_progress`, or `done`) and transitions between them.
+## Core Components / Request Flows
 
-**Transition Execution Flow:**
-1. Load the workflow for the issue's project
-2. Verify the transition exists and the issue's current status matches the `from_status`
-3. Evaluate all conditions (e.g., `user_in_role`, `issue_assignee`)
-4. Run all validators (e.g., `field_required`, `field_value`)
-5. Update the issue status atomically within a transaction
-6. Execute post-functions (e.g., `assign_to_current_user`, `clear_field`, `update_field`)
-7. Record the change in the issue history table
-8. Publish an event to the fanout exchange for async consumers
+### Running a workflow transition
 
-**Condition Types:**
-- `always` -- always allow the transition
-- `user_in_role` -- user must hold a specific project role
-- `issue_assignee` -- only the current assignee can transition
+```
+ Browser                           Issue API                       Redis           PostgreSQL
+    │                                  │                             │                  │
+    │ 1 POST /issues/42/transitions/7  │                             │                  │
+    │─────────────────────────────────▶│                             │                  │
+    │                                  │ 2 cached permission set     │                  │
+    │                                  │────────────────────────────▶│                  │
+    │                                  │ 3 transition_issue granted  │                  │
+    │                                  │◀────────────────────────────│                  │
+    │                                  │ 4 SELECT issue: status, version 7              │
+    │                                  │───────────────────────────────────────────────▶│
+    │                                  │ 5 from-status, conditions, validators          │
+    │                                  │ 6 UPDATE … WHERE version = 7, history, outbox  │
+    │                                  │───────────────────────────────────────────────▶│
+    │                                  │ 7 1 row (0 rows: re-read, retry)               │
+    │                                  │◀───────────────────────────────────────────────│
+    │ 8 200 issue, ETag "8"            │                             │                  │
+    │◀─────────────────────────────────│                             │                  │
+    ················· after commit, the relay publishes the outbox row ··················
+    │                                  │                             │                  │
+```
 
-**Post-Function Types:**
-- `assign_to_current_user` -- set assignee to the acting user
-- `clear_field` -- null out a field value
-- `update_field` -- set a field to a specific value
-- `send_notification` -- trigger a notification event
+- The workflow is data: statuses, and transitions with JSON lists of conditions, validators and post-functions. The definition is cached in Redis and invalidated when an administrator edits it.
+- Steps 4–5 evaluate the rules **without holding a lock**. Step 6 is the compare-and-swap: `UPDATE issues SET status_id = $to, version = version + 1 WHERE id = $id AND version = $read`. Zero rows means someone changed the issue after step 4 — perhaps reassigned it, which matters for an "only the assignee" condition — so the API re-reads and re-evaluates, up to three times.
+- The order of checks is a correctness property: the transition must start from the issue's current status (else `409`), conditions decide *may this user* (`403`), validators decide *is the issue ready* (`422` naming the field). A user who may not run a transition never learns which fields it requires.
+- Post-functions that change fields (assign to the actor, clear or set a field) run inside the same transaction and write their own history rows. Notifications are not post-functions here; they are driven by the committed event.
+- Unknown rule types fail closed: a typo in a condition blocks the transition instead of allowing it. Definitions are also validated when saved, so the typo is usually caught there.
 
-### 2. Custom Fields
+### Editing an issue that someone else is editing
 
-Custom field definitions are stored per-project with type metadata (`text`, `number`, `select`, `user`, `date`). Values are stored as JSONB on the issues table, keyed by field definition ID.
+```
+ Alice    Bob                                Issue API                                 PostgreSQL
+   │       │                                     │                                          │
+   │ 1 GET /issues/DEMO-5                        │                                          │
+   │────────────────────────────────────────────▶│                                          │
+   │ 2 200, ETag "7"                             │                                          │
+   │◀────────────────────────────────────────────│                                          │
+   │       │ 3 GET /issues/DEMO-5                │                                          │
+   │       │────────────────────────────────────▶│                                          │
+   │       │ 4 200, ETag "7"                     │                                          │
+   │       │◀────────────────────────────────────│                                          │
+   │ 5 PATCH priority, If-Match "7"              │                                          │
+   │────────────────────────────────────────────▶│                                          │
+   │       │                                     │ 6 lock row; UPDATE version 8 + history   │
+   │       │                                     │─────────────────────────────────────────▶│
+   │ 7 200, ETag "8"                             │                                          │
+   │◀────────────────────────────────────────────│                                          │
+   │       │ 8 PATCH summary, If-Match "7"       │                                          │
+   │       │────────────────────────────────────▶│                                          │
+   │       │                                     │ 9 lock row: version is 8, write nothing  │
+   │       │                                     │─────────────────────────────────────────▶│
+   │       │ 10 412 + current issue (version 8)  │                                          │
+   │       │◀────────────────────────────────────│                                          │
+   │       │                                     │                                          │
+```
 
-This approach avoids schema alterations when projects add fields, supports GIN indexing for queries, and allows Elasticsearch to index custom field values for JQL searches.
+Every issue has a `version`, exposed as a strong `ETag`. An edit carries the version the user was looking at in `If-Match`; if the row moved on, nothing is written and the response is `412` with the current issue so the client can show what changed. Inside the request the row is locked (`SELECT … FOR UPDATE`) for the few milliseconds of the write, so the history rows describe the value actually replaced. Optimistic across the user's think time (minutes), pessimistic for the write itself (milliseconds).
 
-### 3. JQL Parser
+### Reordering the board
 
-The JQL parser tokenizes input, builds an AST, and converts it to an Elasticsearch query.
+Each issue has a `rank`, a short base-36 string compared byte-wise (`COLLATE "C"`). One order per project serves every board column and the backlog. Moving a card computes a key strictly between its new neighbours, so only the moved row changes:
 
-**Supported grammar:**
-- Boolean operators: `AND`, `OR`
-- Parentheses for grouping
-- Comparison operators: `=`, `!=`, `~`, `>`, `<`, `>=`, `<=`, `IN`, `NOT IN`, `IS`, `IS NOT`
-- Functions: `currentUser()`, `now()`, `startOfDay()`, `endOfDay()`
+```typescript
+// backend/src/services/rank.ts (abridged)
+// Keys are base-36 fractions: "i002" sits between "i00100i" and "i00200i".
+export function rankBetween(lower: string | null, upper: string | null): string {
+  if (upper === null) return rankAfter(lower);   // append: advance a 6-char head by 36^2
+  return midpoint(lower ?? '', upper);            // insert: shortest key strictly between
+}
+```
 
-**Translation pipeline:** `JQL string` --> `Token stream` --> `AST` --> `Elasticsearch bool query`
+- The client says where the card went relative to a neighbour (`{"afterId": 17}`), not which key to use. The server reads the neighbour's current key and the next key after it inside the transaction, so a stale board still produces a sensible order.
+- Two people dropping cards into the same gap compute the same key; a unique index on `(project_id, rank)` rejects the second, which re-reads and retries.
+- New issues get a key after the project's current maximum from a database trigger, so every insert path (API, imports, seeds) lands at the bottom of the backlog.
+- Repeated inserts at one spot lengthen keys by about one character per five moves. Production runs a background rebalance per project when keys pass ~32 characters (Jira's LexoRank does the same with buckets); ranking does not bump the issue's `version`, so reordering never makes someone's edit fail with `412`.
 
-### 4. Permission System
+### Searching with JQL
 
-Permissions use a scheme-based model. Each project references a permission scheme. Schemes contain grants that map permissions (e.g., `create_issue`, `edit_issue`, `transition`) to grantees by type (`anyone`, `user`, `role`, `group`).
+```
+ Browser                      Search API                          Redis    Elasticsearch
+    │                              │                                │            │
+    │ 1 GET /search?jql=…          │                                │            │
+    │─────────────────────────────▶│                                │            │
+    │                              │ 2 parse; currentUser() → user id            │
+    │                              │ 3 visible project ids          │            │
+    │                              │───────────────────────────────▶│            │
+    │                              │ 4 ids (miss: from PostgreSQL)  │            │
+    │                              │◀───────────────────────────────│            │
+    │                              │ 5 bool query + terms filter                 │
+    │                              │────────────────────────────────────────────▶│
+    │                              │ 6 hits, total                               │
+    │                              │◀────────────────────────────────────────────│
+    │ 7 200 issues, lag p99 < 5 s  │                                │            │
+    │◀─────────────────────────────│                                │            │
+    │                              │                                │            │
+```
 
-Permission checks evaluate all grants in the project's scheme, matching against the user's roles, groups, and direct user grants.
+The parser is a recursive-descent parser over a small grammar: clauses (`field operator value`), `AND` binding tighter than `OR`, `NOT`, parentheses, lists for `IN`, `EMPTY`, functions, and `ORDER BY`. Any token it cannot place is an error with a position — a filter that silently drops a clause returns the wrong issues, which is worse than an error. The AST compiles to an Elasticsearch `bool` query: `AND` → `must`, `OR` → `should` with `minimum_should_match: 1`, `NOT` → `must_not`, keyword equality → case-insensitive `term`, `~` → `match`, comparisons → `range`, `IS EMPTY` → `must_not exists`. `currentUser()` resolves to the caller's id and is compared with `assignee_id`, not the display name. The permission filter goes into `filter` context, so it is mandatory and does not affect scoring.
 
----
+### Keeping the index in step
+
+```
+PostgreSQL                    RabbitMQ                  Index worker                Elasticsearch
+     │                            │                           │                           │
+     │ 1 relay publishes event    │                           │                           │
+     │───────────────────────────▶│                           │                           │
+     │ 2 confirm; mark published  │                           │                           │
+     │◀───────────────────────────│                           │                           │
+     │                            │ 3 deliver {issue_id: 42}  │                           │
+     │                            │──────────────────────────▶│                           │
+     │ 4 SELECT issue + names                                 │                           │
+     │◀───────────────────────────────────────────────────────│                           │
+     │ 5 row, version 8                                       │                           │
+     │───────────────────────────────────────────────────────▶│                           │
+     │                            │                           │ 6 index v8, external_gte  │
+     │                            │                           │──────────────────────────▶│
+     │                            │                           │ 7 ok, or 409 if newer     │
+     │                            │                           │◀──────────────────────────│
+     │                            │ 8 ack                     │                           │
+     │                            │◀──────────────────────────│                           │
+     │                            │                           │                           │
+```
+
+The outbox row commits with the change, so an event exists if and only if the change committed — no event for a rolled-back write, no lost event when the API crashes after commit. Events carry ids, not issue contents; the worker re-reads PostgreSQL, so even a stale event produces a current document. Each document carries the issue's version and is written with `version_type: external_gte`, so a late or redelivered event cannot replace a newer document. A nightly reconciliation compares `updated_at` with indexed versions to catch anything lost to bugs.
 
 ## Database Schema
 
+### Production schema
+
+PostgreSQL holds everything that must be correct. Abridged to the parts that carry the design:
+
 ```sql
--- Users
-CREATE TABLE users (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  email VARCHAR(200) UNIQUE NOT NULL,
-  password_hash VARCHAR(255) NOT NULL,
-  name VARCHAR(100),
-  avatar_url VARCHAR(500),
-  role VARCHAR(20) DEFAULT 'user',
-  created_at TIMESTAMP DEFAULT NOW(),
-  updated_at TIMESTAMP DEFAULT NOW()
-);
+CREATE TABLE workflows   (id SERIAL PRIMARY KEY, name TEXT NOT NULL, is_default BOOLEAN DEFAULT false);
+CREATE TABLE statuses    (id SERIAL PRIMARY KEY, workflow_id INT NOT NULL REFERENCES workflows(id),
+                          name TEXT NOT NULL, category TEXT NOT NULL CHECK (category IN ('todo','in_progress','done')),
+                          UNIQUE (workflow_id, name));
+CREATE TABLE transitions (id SERIAL PRIMARY KEY, workflow_id INT NOT NULL REFERENCES workflows(id),
+                          name TEXT NOT NULL,
+                          from_status_id INT REFERENCES statuses(id),       -- NULL = from any status
+                          to_status_id   INT NOT NULL REFERENCES statuses(id),
+                          conditions JSONB NOT NULL DEFAULT '[]',          -- [{"type":"issue_assignee"}]
+                          validators JSONB NOT NULL DEFAULT '[]',          -- [{"type":"field_required","config":{"field":"fix_version"}}]
+                          post_functions JSONB NOT NULL DEFAULT '[]');
 
--- Project Roles
-CREATE TABLE project_roles (
-  id SERIAL PRIMARY KEY,
-  name VARCHAR(100) UNIQUE NOT NULL,
-  description TEXT
-);
+CREATE TABLE permission_schemes (id SERIAL PRIMARY KEY, name TEXT NOT NULL);
+CREATE TABLE permission_grants  (scheme_id INT NOT NULL REFERENCES permission_schemes(id),
+                                 permission TEXT NOT NULL,                 -- view_issue, edit_issue, ...
+                                 grantee_type TEXT NOT NULL CHECK (grantee_type IN ('anyone','user','role','group')),
+                                 grantee_id TEXT,
+                                 UNIQUE (scheme_id, permission, grantee_type, grantee_id));
+CREATE TABLE project_members    (project_id UUID, user_id UUID, role_id INT, PRIMARY KEY (project_id, user_id));
 
--- Permission Schemes
-CREATE TABLE permission_schemes (
-  id SERIAL PRIMARY KEY,
-  name VARCHAR(100) NOT NULL,
-  description TEXT,
-  is_default BOOLEAN DEFAULT FALSE
-);
-
--- Permission Grants
-CREATE TABLE permission_grants (
-  id SERIAL PRIMARY KEY,
-  scheme_id INTEGER REFERENCES permission_schemes(id) ON DELETE CASCADE,
-  permission VARCHAR(100) NOT NULL,
-  grantee_type VARCHAR(50) NOT NULL,  -- 'anyone', 'user', 'role', 'group'
-  grantee_id VARCHAR(100)
-);
-
--- Workflows
-CREATE TABLE workflows (
-  id SERIAL PRIMARY KEY,
-  name VARCHAR(100) NOT NULL,
-  description TEXT,
-  is_default BOOLEAN DEFAULT FALSE
-);
-
--- Statuses
-CREATE TABLE statuses (
-  id SERIAL PRIMARY KEY,
-  workflow_id INTEGER REFERENCES workflows(id) ON DELETE CASCADE,
-  name VARCHAR(100) NOT NULL,
-  category VARCHAR(50) DEFAULT 'todo',  -- 'todo', 'in_progress', 'done'
-  color VARCHAR(20) DEFAULT '#6B7280',
-  position INTEGER DEFAULT 0,
-  UNIQUE(workflow_id, name)
-);
-
--- Transitions
-CREATE TABLE transitions (
-  id SERIAL PRIMARY KEY,
-  workflow_id INTEGER REFERENCES workflows(id) ON DELETE CASCADE,
-  name VARCHAR(100) NOT NULL,
-  from_status_id INTEGER REFERENCES statuses(id),  -- NULL = from any status
-  to_status_id INTEGER REFERENCES statuses(id) NOT NULL,
-  conditions JSONB DEFAULT '[]',
-  validators JSONB DEFAULT '[]',
-  post_functions JSONB DEFAULT '[]'
-);
-
--- Projects
-CREATE TABLE projects (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  key VARCHAR(10) UNIQUE NOT NULL,
-  name VARCHAR(200) NOT NULL,
-  description TEXT,
-  lead_id UUID REFERENCES users(id),
-  workflow_id INTEGER REFERENCES workflows(id),
-  permission_scheme_id INTEGER REFERENCES permission_schemes(id),
-  issue_counter INTEGER DEFAULT 0,
-  created_at TIMESTAMP DEFAULT NOW(),
-  updated_at TIMESTAMP DEFAULT NOW()
-);
-
--- Project Members
-CREATE TABLE project_members (
-  project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
-  user_id UUID REFERENCES users(id) ON DELETE CASCADE,
-  role_id INTEGER REFERENCES project_roles(id),
-  PRIMARY KEY (project_id, user_id)
-);
-
--- Sprints
-CREATE TABLE sprints (
-  id SERIAL PRIMARY KEY,
-  project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
-  name VARCHAR(200) NOT NULL,
-  goal TEXT,
-  start_date TIMESTAMP,
-  end_date TIMESTAMP,
-  status VARCHAR(20) DEFAULT 'planning',  -- 'planning', 'active', 'closed'
-  created_at TIMESTAMP DEFAULT NOW(),
-  updated_at TIMESTAMP DEFAULT NOW()
-);
-
--- Issues
 CREATE TABLE issues (
-  id SERIAL PRIMARY KEY,
-  project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
-  key VARCHAR(50) UNIQUE NOT NULL,              -- e.g., "PROJ-123"
-  summary VARCHAR(500) NOT NULL,
-  description TEXT,
-  issue_type VARCHAR(50) DEFAULT 'task',        -- 'task', 'story', 'bug', 'epic', 'subtask'
-  status_id INTEGER REFERENCES statuses(id),
-  priority VARCHAR(20) DEFAULT 'medium',
-  assignee_id UUID REFERENCES users(id),
-  reporter_id UUID REFERENCES users(id),
-  parent_id INTEGER REFERENCES issues(id),      -- Subtask parent
-  epic_id INTEGER REFERENCES issues(id),        -- Epic linkage
-  sprint_id INTEGER REFERENCES sprints(id),
-  story_points INTEGER,
-  custom_fields JSONB DEFAULT '{}',
-  created_at TIMESTAMP DEFAULT NOW(),
-  updated_at TIMESTAMP DEFAULT NOW()
+  id            BIGSERIAL PRIMARY KEY,
+  project_id    UUID NOT NULL REFERENCES projects(id),
+  key           TEXT NOT NULL UNIQUE,                    -- DEMO-42
+  status_id     INT NOT NULL REFERENCES statuses(id),
+  summary       TEXT NOT NULL,
+  assignee_id   UUID, reporter_id UUID NOT NULL, sprint_id INT, epic_id BIGINT,
+  custom_fields JSONB NOT NULL DEFAULT '{}',
+  version       INT NOT NULL DEFAULT 1,                  -- optimistic concurrency, exposed as ETag
+  rank          TEXT COLLATE "C" NOT NULL,               -- board / backlog order
+  updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+CREATE UNIQUE INDEX issues_project_rank ON issues (project_id, rank);
+CREATE INDEX issues_project_status ON issues (project_id, status_id);
+CREATE INDEX issues_custom_fields ON issues USING GIN (custom_fields);
 
-CREATE INDEX idx_issues_project ON issues(project_id);
-CREATE INDEX idx_issues_assignee ON issues(assignee_id);
-CREATE INDEX idx_issues_sprint ON issues(sprint_id);
-CREATE INDEX idx_issues_status ON issues(status_id);
+CREATE TABLE issue_history (                             -- append-only audit trail
+  id BIGSERIAL, issue_id BIGINT NOT NULL, user_id UUID NOT NULL,
+  field TEXT NOT NULL, old_value TEXT, new_value TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+) PARTITION BY RANGE (created_at);
 
--- Issue History (audit trail)
-CREATE TABLE issue_history (
-  id SERIAL PRIMARY KEY,
-  issue_id INTEGER REFERENCES issues(id) ON DELETE CASCADE,
-  user_id UUID REFERENCES users(id),
-  field VARCHAR(100) NOT NULL,
-  old_value TEXT,
-  new_value TEXT,
-  created_at TIMESTAMP DEFAULT NOW()
+CREATE TABLE outbox (                                     -- written in the same transaction as the change
+  id BIGSERIAL PRIMARY KEY, issue_id BIGINT NOT NULL, event_type TEXT NOT NULL,
+  version INT NOT NULL, payload JSONB NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  published_at TIMESTAMPTZ
 );
+CREATE INDEX outbox_unpublished ON outbox (id) WHERE published_at IS NULL;
 
-CREATE INDEX idx_issue_history_issue ON issue_history(issue_id, created_at DESC);
-
--- Comments
-CREATE TABLE comments (
-  id SERIAL PRIMARY KEY,
-  issue_id INTEGER REFERENCES issues(id) ON DELETE CASCADE,
-  author_id UUID REFERENCES users(id),
-  body TEXT NOT NULL,
-  created_at TIMESTAMP DEFAULT NOW(),
-  updated_at TIMESTAMP DEFAULT NOW()
-);
-
-CREATE INDEX idx_comments_issue ON comments(issue_id);
-
--- Boards
-CREATE TABLE boards (
-  id SERIAL PRIMARY KEY,
-  project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
-  name VARCHAR(200) NOT NULL,
-  type VARCHAR(20) DEFAULT 'kanban',  -- 'kanban', 'scrum'
-  filter_jql TEXT,
-  column_config JSONB DEFAULT '[]',
-  created_at TIMESTAMP DEFAULT NOW()
-);
-
--- Labels and Components
-CREATE TABLE labels (
-  id SERIAL PRIMARY KEY,
-  project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
-  name VARCHAR(100) NOT NULL,
-  color VARCHAR(20) DEFAULT '#6B7280',
-  UNIQUE(project_id, name)
-);
-
-CREATE TABLE components (
-  id SERIAL PRIMARY KEY,
-  project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
-  name VARCHAR(100) NOT NULL,
-  description TEXT,
-  lead_id UUID REFERENCES users(id)
-);
-
--- Idempotency Keys
 CREATE TABLE idempotency_keys (
-  key VARCHAR(64) PRIMARY KEY,
-  user_id UUID NOT NULL,
-  request_path VARCHAR(200) NOT NULL,
-  response_status INTEGER,
-  response_body JSONB,
-  created_at TIMESTAMP DEFAULT NOW(),
-  expires_at TIMESTAMP DEFAULT NOW() + INTERVAL '24 hours'
+  key TEXT PRIMARY KEY,                                   -- sha256(user id + client key)
+  user_id UUID NOT NULL, request_fingerprint TEXT NOT NULL,
+  response_status INT NOT NULL, response_body JSONB NOT NULL, expires_at TIMESTAMPTZ NOT NULL
 );
-
-CREATE INDEX idx_idempotency_expires ON idempotency_keys(expires_at);
 ```
 
----
+Redis keys: `session:{sid}`, `perms:{project}:{user}` (permission set tagged with the project's generation), `perms-gen:{project}` (bumped on membership or scheme changes), `workflow:{id}`, `idem:{user}:{key}`.
+
+At the sharding stage, everything project-scoped (issues, history, comments, members, ranks) shards by `project_id`; workflows and schemes are small and replicated. Cross-project queries already go to Elasticsearch, which is shard-agnostic.
+
+### Local schema
+
+The local schema is [`backend/src/db/init.sql`](./backend/src/db/init.sql), loaded by `npm run db:migrate` and safe to run repeatedly. It maps to the production design like this:
+
+| Production | Local | Difference |
+|------------|-------|------------|
+| `issues` with `version`, `rank COLLATE "C"`, unique `(project_id, rank)` | Same columns, added with `ADD COLUMN IF NOT EXISTS`; a trigger `issues_default_rank` assigns ranks on insert via `jira_rank_after()` | Same design; existing rows are backfilled oldest first |
+| `permission_grants` with a unique constraint | No unique constraint | Re-running `seed.sql` duplicates grants; harmless because evaluation builds a set |
+| `issue_history` partitioned by month | One unpartitioned table | Fine at local scale |
+| `outbox` + relay | — | Events are published right after commit instead (see Implementation Notes) |
+| `idempotency_keys` | Same, plus Redis as the first stop | Written after the response, not in the handler's transaction |
+| `custom_fields` with a field registry | JSONB column, no registry | No type validation for custom fields |
 
 ## API Design
 
-### REST Endpoints
+### Production API
 
 ```
-POST   /api/auth/register           Register new user
-POST   /api/auth/login              Login with email/password
-POST   /api/auth/logout             Destroy session
-
-GET    /api/projects                List all projects
-POST   /api/projects                Create project
-GET    /api/projects/:id            Get project details
-PATCH  /api/projects/:id            Update project
-DELETE /api/projects/:id            Delete project
-
-GET    /api/issues                  List issues (with filters)
-POST   /api/issues                  Create issue
-GET    /api/issues/:id              Get issue details
-PATCH  /api/issues/:id              Update issue fields
-DELETE /api/issues/:id              Delete issue
-POST   /api/issues/:id/transition   Execute workflow transition
-GET    /api/issues/:id/history      Get issue change history
-GET    /api/issues/:id/comments     List comments
-POST   /api/issues/:id/comments     Add comment
-
-GET    /api/search                  JQL search (query param: jql)
-GET    /api/search/quick            Quick text search
-
-GET    /api/workflows               List workflows
-GET    /api/workflows/:id           Get workflow with statuses and transitions
+GET    /api/v1/issues/{key}                     issue + ETag "<version>"
+POST   /api/v1/issues                           create; Idempotency-Key → 201 | 400 | 403 | 422
+PATCH  /api/v1/issues/{id}                      edit fields; If-Match → 200 | 412 + current issue | 422
+DELETE /api/v1/issues/{id}                      delete (delete_issue permission)
+GET    /api/v1/issues/{id}/transitions          transitions this user may run now (a rendering hint)
+POST   /api/v1/issues/{id}/transitions/{tid}    run one → 200 | 403 condition | 409 moved | 422 validator
+PUT    /api/v1/issues/{id}/rank                 {afterId} or {beforeId} → 200 {rank}
+GET    /api/v1/issues/{id}/history?cursor=…     audit trail, newest first, keyset pagination
+POST   /api/v1/issues/{id}/comments             add comment; Idempotency-Key
+GET    /api/v1/boards/{id}/issues?cursor=…      board cards in rank order
+GET    /api/v1/search?jql=…&cursor=…            JQL → 200 | 400 invalid_jql | 503 search unavailable
+GET    /api/v1/projects/{key}/permissions       permissions the caller holds (UI hints only)
+WS     /api/v1/projects/{key}/events?after=…    live board updates with resume
 ```
 
----
+- **Errors** carry a machine-readable `code` alongside the message (`version_conflict`, `condition_failed`, `validation_failed` with `field`, `invalid_from_status`, `forbidden`, `invalid_jql`); in production they follow RFC 9457 `application/problem+json`.
+- **Not found and not allowed look the same.** A caller who cannot view a project gets `404` for its issues, so issue keys cannot be probed.
+- **Status is not a field.** `PATCH` rejects `status`; the only way to change it is a transition, so the workflow can never be bypassed.
+
+### Local routes
+
+The local API is mounted under `/api` (no version prefix). Behaviour matches the list above except where Implementation Notes say otherwise.
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| POST | `/api/auth/login`, `/logout`, `/register`; GET `/api/auth/me` | Session auth (cookie) |
+| GET, POST, PATCH, DELETE | `/api/projects`, `/api/projects/:idOrKey` | Projects (list filtered to visible ones) |
+| GET | `/api/projects/:idOrKey/permissions` | Caller's permissions in the project |
+| GET, POST, DELETE | `/api/projects/:id/members`, `/sprints`, `/boards`, `/labels`, `/components` | Project configuration |
+| GET, POST, PATCH, DELETE | `/api/issues`, `/api/issues/:idOrKey` | Issues (`If-Match`, `Idempotency-Key`) |
+| GET, POST | `/api/issues/:id/transitions[/:transitionId]` | Workflow transitions |
+| PUT | `/api/issues/:id/rank` | Board order |
+| GET, POST, PATCH, DELETE | `/api/issues/:id/comments[/:commentId]`, GET `/history` | Comments, audit trail |
+| GET | `/api/issues/project/:projectId[/backlog]`, `/api/issues/sprint/:sprintId` | Lists in rank order |
+| GET, POST | `/api/search`, `/quick`, `/suggestions`, `/aggregations`, `/validate` | JQL and text search |
+| GET, POST, PATCH | `/api/workflows/...` | Workflows (edits: system administrators), sprint start/complete |
+| GET | `/health`, `/ready`, `/metrics` | Operations |
 
 ## Key Design Decisions
 
-### 1. JSONB for Custom Fields
+### 1. Workflows are data, executed with a compare-and-swap
 
-**Decision**: Store custom field values as JSONB on the issues table.
+Code-defined workflows would mean a deploy whenever a team adds a "Blocked" column — disqualifying for a product whose point is self-service configuration. So workflows are rows interpreted at runtime, which creates two obligations. First, the engine must be safe against its own configurability: rule types are validated when a workflow is saved, and anything the engine cannot evaluate at runtime blocks the transition rather than allowing it. Second, the transition must be atomic with respect to the state the rules saw. Evaluating rules inside a row lock would hold the lock across rule evaluation and any lookups it needs; with bulk moves ("close this sprint's 800 issues") that serializes everything behind the slowest rule. Evaluating without a lock and committing with `WHERE version = $read` costs nothing when there is no contention — the normal case, since two people rarely act on one issue in the same second — and turns a race into a cheap re-evaluation instead of a corrupted audit trail. What we give up: under heavy contention on one issue (a misbehaving automation) requests retry and eventually fail with `409`, which is the honest outcome.
 
-Custom fields are inherently schema-variable across projects. An Entity-Attribute-Value (EAV) table would require multi-join queries for every issue fetch and make Elasticsearch indexing more complex. JSONB stores all custom values inline, supports GIN indexing for containment queries, and serializes naturally for the search index. The trade-off is weaker type enforcement at the database level -- validation must happen in the application layer and during Elasticsearch indexing.
+### 2. Optimistic concurrency for edits, visible to the client
 
-### 2. Workflow as Database Configuration
+Without a version, the last writer silently wins: a ten-minute description edit can erase a teammate's change and the history shows nothing wrong. Pessimistic "editing locks" would be held across a person's think time and need lease expiry and unlock buttons. A `version` column with `If-Match` → `412` costs one integer and pushes the decision to the person who has the context: the client shows the current version next to the unsaved draft. Discrete fields (assignee, priority) could tolerate last-write-wins, but one rule for every field is easier to reason about, and the client can retry those automatically.
 
-**Decision**: Define workflows, statuses, and transitions in database tables rather than code.
+### 3. Permission schemes, cached per user and project with generation-tagged entries
 
-Code-driven workflows require deployments for every change and cannot be customized per-project. Database-driven workflows let administrators modify states and transitions through the UI, support per-project workflow assignment, and enable versioning. The trade-off is that complex business logic in conditions and post-functions is limited to a predefined set of types rather than arbitrary code execution.
+Ten thousand projects do not need ten thousand permission matrices; they need a dozen schemes, each shared by many projects, so changing "Restricted" fixes hundreds of projects in one write. The cost is an evaluation on every request: scheme → grants → the caller's roles in the project. Cached naively, revocation lags by the TTL — and a cache refill racing a revocation can put the old access back. So each cached permission set is tagged with a per-project generation number, and any membership or scheme change bumps the generation: entries from older generations are ignored on read. Grants and revocations both take effect on the next request; the 60-second TTL is only a backstop if the bump itself fails. Search uses the same evaluation to compute the visible-project filter, so the search box and the issue page can never disagree about access.
 
-### 3. JQL to Elasticsearch Translation
+### 4. Elasticsearch as a derived read model, fed through an outbox
 
-**Decision**: Parse JQL into an AST and translate to Elasticsearch queries.
+PostgreSQL could answer simple JQL and would be strongly consistent. It breaks on three things Jira users do constantly: free combinations of predicates across custom fields (each shape needs its own index), relevance-ranked text search, and facet counts over large result sets. Elasticsearch indexes every field by construction and aggregates across shards. The price is two stores that can disagree. The outbox makes that disagreement temporary — no lost or phantom events — and versioned writes make it monotonic. The client hides the remaining lag where users notice it most by rendering from write responses rather than re-querying search.
 
-PostgreSQL full-text search handles simple keyword matching but struggles with complex boolean logic across multiple field types, custom fields, and nested conditions. Elasticsearch supports all JQL operators naturally through its bool query DSL. The trade-off is eventual consistency -- the search index lags behind PostgreSQL by 100-500ms, meaning a just-created issue may not appear in search results immediately.
+### 5. Fractional rank keys instead of integer positions
 
-### 4. Cache-Aside for Issue Data
+Integer positions make a drag an `UPDATE … SET position = position + 1` over every card below the drop point: a write that grows with the board and conflicts with every concurrent drag. A fractional key changes one row; concurrency is handled by a unique index and a retry. The cost is key growth at hot spots and an occasional rebalance, which is a background job rather than part of the user's request.
 
-**Decision**: Use cache-aside (lazy loading) with Redis rather than write-through.
+### 6. Idempotency keys for writes that are not naturally idempotent
 
-Issue data changes frequently (status transitions, field edits, comments). Write-through caching would add latency to every write operation. Cache-aside allows brief staleness (5-minute TTL for issues, 1-minute for boards) while keeping writes fast. The pattern: check cache first, on miss read from database, populate cache. Explicit invalidation on updates ensures critical data freshness.
-
-### 5. RabbitMQ over Kafka for Event Processing
-
-**Decision**: Use RabbitMQ with fanout exchanges for issue event processing.
-
-The event volume (issue creates, updates, transitions) is moderate -- thousands per second at peak, not millions. RabbitMQ provides simpler setup, built-in retry with dead-letter queues, and per-message acknowledgment. Kafka would be warranted if we needed event replay, log compaction, or multi-datacenter replication. For an issue tracker where events are consumed and discarded, RabbitMQ's operational simplicity wins.
-
----
+Creating an issue or posting a comment twice is not harmless, and automation retries constantly. A client-chosen key, claimed atomically in Redis and stored with a fingerprint of the request, turns a retry into a replay of the original response; a different request with the same key gets `422` instead of the wrong replay.
 
 ## Consistency and Idempotency
 
-### Write Consistency Model
+| Operation | Guarantee | Mechanism |
+|-----------|-----------|-----------|
+| Edit fields | No lost updates | `version` + `If-Match` → `412`; row lock for the write |
+| Transition | Never applied from the wrong status or against stale rules | Compare-and-swap on `version`; re-evaluate on conflict; `409` |
+| Audit trail | History rows exist exactly for committed changes | Same transaction as the change |
+| Board order | A total order per project, no duplicate positions | Unique `(project_id, rank)`; retry on conflict |
+| Create / comment | At most once per client intent | `Idempotency-Key` claimed with `SET NX`; stored response; fingerprint check |
+| Search index | Eventually equal to PostgreSQL, never regressing | Outbox; events by id; external versioning; nightly reconciliation |
+| Permissions | Changes effective on the next request | Generation-tagged cache entries |
 
-**PostgreSQL (Source of Truth):** Strong consistency for all issue writes within a single project. An issue update writes the `issues` row and then appends one `issue_history` row per changed field. At production scale these would be wrapped in a single transaction, and concurrent conflicting transitions would be guarded by optimistic locking (a `version` column + compare-and-swap update); the local implementation issues the writes sequentially and does **not** yet carry a `version` column, so two simultaneous transitions on the same issue can both succeed. This is called out as a hardening step, not a claimed guarantee.
+Read-your-writes on the board holds because the client applies the write response; search may lag by seconds and says so.
 
-**Elasticsearch (Search Index):** Eventual consistency with PostgreSQL as authoritative source. Index updates happen asynchronously via RabbitMQ. Typical lag: 100-500ms.
+## Security / Auth
 
-| Operation | Consistency | Rationale |
-|-----------|-------------|-----------|
-| Issue create/update | Strong (PostgreSQL) | Single-project writes require immediate consistency |
-| Status transitions | Strong (PostgreSQL) | Workflow state written synchronously; optimistic locking is a production hardening step, not yet implemented |
-| Comment add | Strong | User expects immediate visibility |
-| Search results | Eventual (~500ms) | Slight delay acceptable for search |
-| Board views | Eventually consistent | Cached aggregations, refreshed periodically |
-
-### Idempotency Keys
-
-All mutating API operations accept an `X-Idempotency-Key` header. The middleware checks Redis for an existing response under that key. If found, it replays the cached response. If not, it processes the request and caches the response with a 24-hour TTL. A background job purges expired keys hourly.
-
-### Conflict Resolution
-
-Optimistic concurrency control for issue updates: the client sends the expected `version` number. The update query includes `WHERE version = expected_version` and increments it. If no rows are affected, the issue was modified concurrently and the client must refresh and retry.
-
----
-
-## Caching Strategy
-
-### Cache Keys and TTLs
-
-| Cache Type | Key Pattern | TTL | Invalidation |
-|------------|-------------|-----|--------------|
-| Issue data | `issue:{id}` | 5 min | On update, delete key |
-| Issue by key | `issue:key:{projectKey}-{number}` | 5 min | On update, delete key |
-| Project metadata | `project:{id}` | 15 min | On project update |
-| Workflow definition | `workflow:{id}` | 30 min | On workflow edit (rare) |
-| Permission scheme | `perm-scheme:{id}` | 30 min | On scheme edit (rare) |
-| User permissions | `user-perms:{userId}:{projectId}` | 10 min | On role change |
-| Board issues | `board:{id}:issues` | 1 min | On any issue update in project |
-| JQL saved filter | `filter:{id}:results` | 2 min | On filter execution |
-
-### Invalidation Rules
-
-Explicit invalidation (preferred for critical data): on issue update, delete both the `issue:{id}` and `issue:key:{key}` cache entries, then publish an event for search reindexing. Board caches are invalidated by any issue update within the board's project.
-
----
-
-## Async Queue and Background Jobs
-
-### Queue Architecture
-
-RabbitMQ processes events asynchronously to decouple issue operations from slow downstream work (search indexing, notifications, webhook delivery).
-
-| Queue | Message Type | Delivery | Retry Policy |
-|-------|--------------|----------|--------------|
-| `issue.events` (fanout) | Issue created/updated/deleted | At-least-once | N/A |
-| `search.index` (direct) | Reindex request | At-least-once | 3 retries, exponential backoff |
-| `notifications` (direct) | Email/in-app notification | At-least-once | 3 retries, then DLQ |
-| `webhooks` (direct) | Webhook payload | At-least-once | 5 retries, exponential backoff |
-
-**Deduplication:** Messages include an `event_id` (UUID). Consumers track processed event IDs in Redis with a 24-hour TTL. Duplicate messages are logged and skipped.
-
-**Dead Letter Queue:** Messages that fail all retries are routed to a DLQ for manual inspection and stored in a `failed_jobs` table for admin review.
-
----
-
-## Security and Auth
-
-- **Session-based authentication** with Redis-backed session store (prefixed `jira:session:`)
-- **CORS** restricted to frontend origins
-- **Permission checks** on every mutating API endpoint via the scheme-based permission model
-- **Input validation** with Zod schemas for all request bodies
-- **Parameterized SQL** via the pg library to prevent injection
-
----
+- **Authentication:** session cookie (`HttpOnly`, `SameSite=Lax`, `Secure`) backed by Redis; the session id is regenerated at login. Automation uses scoped API tokens with their own rate limits.
+- **Authorization:** every route checks a project permission; system administrators (an instance role) edit shared workflows and swap schemes. Lack of `view_issue` is answered with `404`.
+- **Workflow conditions are authorization too:** they fail closed.
+- **Input validation:** request bodies are validated at the boundary; `PATCH` rejects unknown fields; references (sprint, epic, parent) must belong to the issue's project, otherwise an issue could be pushed onto another project's board.
+- **Search:** the permission filter is part of every Elasticsearch query, including suggestions and facet counts.
+- **Rate limiting:** token buckets in Redis per user and per token; stricter limits on JQL and on webhook registration.
 
 ## Observability
 
-### Prometheus Metrics
-
-The `/metrics` endpoint exposes all application metrics for Prometheus scraping:
-
-- `jira_issues_created_total{project_key, issue_type}` -- issue creation rate
-- `jira_transitions_total{project_key, from_status, to_status}` -- workflow transition patterns
-- `jira_search_queries_total{query_type}` -- search usage by type (jql, text, quick)
-- `jira_search_latency_seconds{query_type}` -- search latency histogram (p50, p95, p99)
-- `jira_cache_hits_total{cache_type}` / `jira_cache_misses_total{cache_type}` -- cache effectiveness
-- `jira_idempotent_replays_total` -- duplicate request detection rate
-- `jira_messages_published_total{queue_name}` / `jira_messages_consumed_total{queue_name, status}` -- queue throughput
-- `jira_http_requests_total{method, path, status_code}` -- HTTP request counts
-- `jira_http_latency_seconds{method, path}` -- HTTP latency histogram
-
-### Structured Logging
-
-Pino JSON logger with request context (method, path, status, duration, user_id). Environment-aware: pretty-print in development, JSON in production for log aggregation.
-
-### Health Checks
-
-- `GET /health` -- checks PostgreSQL, Redis, and Elasticsearch connectivity with per-dependency latency. Returns 200 (healthy) or 503 (degraded).
-- `GET /ready` -- readiness probe for load balancers. Returns 200 only when PostgreSQL and Redis are reachable.
-
----
+- **Workflow engine:** transitions by project and status pair, refusals by code (`403`/`409`/`422`), compare-and-swap conflicts.
+- **Concurrency:** `412` and rank-collision rates; a spike usually means an automation fighting people.
+- **Permissions:** cache hit ratio (alert below 95%), denials by permission.
+- **Search consistency:** index lag (commit → searchable; alert above 30 s), outbox backlog, reconciliation drift.
+- **Queues:** depth and dead-letter counts per consumer.
+- Structured logs carry issue key, user id, transition id and event id, so one change can be followed from request to index to webhook.
 
 ## Failure Handling
 
-- **Graceful shutdown**: SIGTERM/SIGINT handlers close RabbitMQ, PostgreSQL pool, and Redis connections before exit
-- **Elasticsearch optional**: If ES is down, the server starts and serves issue CRUD; search is degraded
-- **RabbitMQ non-blocking**: Queue initialization retries in the background; issue operations work without it
-- **Uncaught exception handler**: Logs fatal error and exits to prevent undefined state
-
----
+| Failure | Behavior | Mitigation |
+|---------|----------|------------|
+| Elasticsearch down | JQL returns `503 search unavailable`; boards and issue pages keep working | Boards read PostgreSQL; an empty result would be misleading |
+| RabbitMQ down | Writes keep committing; outbox rows accumulate | Relay drains the backlog when the broker returns |
+| Redis down | Slower requests; permissions computed from PostgreSQL | Sessions fail closed (users re-login); never fall back to "allow" |
+| PostgreSQL primary down | Writes fail with `503`; replicas serve reads | Failover; clients retry with the same idempotency key |
+| Worker crash mid-event | Message redelivered | Idempotent consumers (versioned index writes, delivery logs) |
+| Poison message | Retried with backoff, then dead-lettered | Dead-letter queue per consumer, alert on depth |
+| Webhook endpoint down | Deliveries retried for up to 24 h | Per-endpoint queues and circuit breakers |
 
 ## Scalability Considerations
 
-| Bottleneck | Scaling Strategy |
-|------------|-----------------|
-| API throughput | Horizontal scaling behind load balancer (stateless services, Redis sessions) |
-| Database writes | Read replicas for board views, connection pooling, partition issues by project_id |
-| Search latency | Elasticsearch cluster with sharding by project, replicas for read throughput |
-| Queue throughput | Multiple consumer instances per queue with prefetch limits |
-| Large projects | Paginated API responses, cursor-based pagination for issue lists |
-| Custom field queries | GIN indexes on JSONB, materialized views for common aggregations |
-
----
+1. **Reads first.** Boards and issue views dominate: cache workflow and permission data, serve boards from replicas, keep JQL on Elasticsearch replicas.
+2. **History growth.** The largest table by rows: monthly partitions, old partitions moved to cheaper storage.
+3. **Write primary.** Around ~1K writes/s one primary holds; beyond that shard by `project_id` — issues, history, ranks and members are all project-scoped.
+4. **Noisy tenants.** One enterprise's huge JQL aggregations should not slow everyone: dedicated indices for large tenants, routed by the Search API.
+5. **Bulk operations.** "Move 800 issues" becomes a background job that runs the same per-issue transition pipeline and reports per-issue outcomes.
 
 ## Trade-offs Summary
 
 | Decision | Chosen | Alternative | Rationale |
 |----------|--------|-------------|-----------|
-| Custom fields | JSONB | EAV table | Simpler queries, inline storage, GIN indexing |
-| Search | Elasticsearch | PostgreSQL FTS | JQL complexity requires boolean query DSL |
-| Workflow | DB-driven | Code-driven | Per-project customization without deployment |
-| History | Event table | Event sourcing | Simpler queries, lower storage overhead |
-| Cache strategy | Cache-aside | Write-through | Write latency matters for frequent issue updates |
-| Message queue | RabbitMQ | Kafka | Simpler for moderate volume, built-in DLQ |
-| Consistency | Strong (PG) + Eventual (ES) | Full eventual | Issue state must be immediately consistent |
-| Idempotency | Request-level keys | Operation log | Simpler client integration |
-
----
-
-## Frontend Architecture
-
-This section describes the actual frontend implementation: component hierarchy, state management, routing, data fetching, and key UI patterns.
-
-### Component Hierarchy
-
-```
-__root.tsx (TanStack Router)
-├── / (index.tsx)                           (login or redirect to projects)
-├── /projects                               (project list)
-├── /projects/$projectKey                   (project shell)
-│   └── Layout                              (Header + Sidebar + main content)
-│       ├── Header                          (search bar, create button, user menu)
-│       ├── Sidebar                         (project selector, nav links)
-│       └── Outlet (nested routes)
-│           ├── /board                      (Kanban board)
-│           │   └── KanbanBoard
-│           │       └── BoardColumn (per status)
-│           │           └── BoardCard (per issue)
-│           ├── /backlog                    (sprint + backlog views)
-│           │   └── Backlog
-│           │       ├── BacklogItem (sprint issues)
-│           │       └── BacklogItem (backlog issues)
-│           ├── /issues                     (issue list table)
-│           └── /settings                   (project configuration)
-├── IssueDetail (modal overlay)             (issue view/edit)
-│   ├── IssueDetailHeader                   (key, type icon, actions)
-│   ├── IssueSummaryEditor                  (inline title editing)
-│   ├── IssueDetailTabs                     (comments / history tab bar)
-│   │   ├── CommentsTab                     (threaded comments)
-│   │   └── HistoryTab                      (field change audit trail)
-│   └── IssueDetailSidebar                  (status, assignee, priority, sprint, story points)
-└── CreateIssueModal                        (issue creation form)
-```
-
-The `IssueDetail` component uses a decomposition pattern: the container component (`IssueDetail.tsx`) manages data fetching and state, while sub-components in the `issue-detail/` directory handle rendering. This keeps the main component under 150 lines while the full detail view spans 6 files.
-
-### Zustand Stores
-
-The frontend uses four Zustand stores that separate concerns by domain.
-
-**`useAuthStore` -- Authentication**
-
-Manages the user session lifecycle. On app initialization, `checkAuth()` calls the `/api/auth/me` endpoint to restore session state from the server-side cookie. Unlike the Google Docs project, this store does not persist a token to `localStorage` -- it relies entirely on HTTP-only session cookies, which are sent automatically with every request.
-
-**`useProjectStore` -- Project Context**
-
-Manages the project list and the currently active project's full context. When a user navigates to a project route, `fetchProjectDetails(projectId)` loads four resources in parallel using `Promise.all`: the project metadata, its workflow (statuses and transitions), sprints, and boards. This parallel loading pattern reduces the initial project load time from ~400ms (sequential) to ~150ms (parallel, bound by the slowest query).
-
-**`useIssueStore` -- Issues and Backlog**
-
-Manages three issue lists: `issues` (current sprint or filtered view), `backlog` (issues not in any sprint), and `currentIssue` (selected for the detail modal). The `updateIssueInList` method performs cross-list optimistic updates -- when an issue's status changes, it is updated in both the `issues` and `backlog` arrays, as well as `currentIssue` if it is the currently selected issue. `removeIssueFromList` handles deletion cleanup across all three.
-
-**`useUIStore` -- UI State**
-
-Manages global UI state: sidebar visibility, and three modal states (issue detail, create issue, search). This store keeps UI concerns out of domain stores, preventing unnecessary re-renders when only visual state changes.
-
-### Routing
-
-The application uses TanStack Router with file-based routing and nested route layouts:
-
-| Route | File | Purpose |
-|-------|------|---------|
-| `/` | `routes/index.tsx` | Login page or redirect to projects |
-| `/projects` | `routes/projects/index.tsx` | Project list |
-| `/projects/$projectKey` | `routes/projects/$projectKey.tsx` | Project shell with Layout |
-| `/projects/$projectKey/board` | `routes/projects/$projectKey/board.tsx` | Kanban board |
-| `/projects/$projectKey/backlog` | `routes/projects/$projectKey/backlog.tsx` | Sprint planning |
-| `/projects/$projectKey/issues` | `routes/projects/$projectKey/issues.tsx` | Issue list table |
-| `/projects/$projectKey/settings` | `routes/projects/$projectKey/settings.tsx` | Project configuration |
-
-The `$projectKey` route acts as a layout route: it renders the `Layout` component (Header + Sidebar) and uses `Outlet` for child routes. This ensures the sidebar and header persist across board/backlog/issues navigation without re-mounting.
-
-### Data Fetching
-
-All API calls go through `services/api.ts`, which provides typed functions for every endpoint. The module exports individual functions (not a class), each wrapping `fetch()` with credentials mode `include` (to send session cookies). Functions are organized by resource: `login/logout/register/getCurrentUser` for auth, `getProjects/getProject/getProjectWorkflow/getProjectSprints/getProjectBoards` for projects, `getProjectIssues/getBacklogIssues/getSprintIssues/createIssue/updateIssue/deleteIssue` for issues, `getIssueTransitions/executeTransition` for workflow operations, and `getIssueComments/addComment` for comments.
-
-### Key UI Patterns
-
-- **Kanban board with drag-and-drop**: The `KanbanBoard` component groups issues by workflow status into `BoardColumn` components. Issues are draggable using the HTML5 Drag and Drop API. On drop, the component finds the appropriate workflow transition to the target status, executes it via the API (`executeTransition`), and updates the issue in the store. The drop target column highlights with a blue ring (`ring-2 ring-blue-400`) during drag-over.
-
-- **Workflow-aware transitions**: Dropping an issue on a status column is not a simple field update -- it must go through the workflow engine. The frontend fetches available transitions for the issue, finds one matching the target status, and executes it. If no valid transition exists (e.g., "Done" to "To Do" is not configured), the drop is silently rejected.
-
-- **Backlog with sprint planning**: The `Backlog` component shows two sections: the active sprint's issues and the backlog (unassigned issues). Issues can be moved between sections via action buttons that appear on hover. Moving to sprint updates the issue's `sprint_id`.
-
-- **Issue detail modal**: Clicking an issue anywhere (board card, backlog item, issue list) opens a modal with the full issue detail. The modal has two tabs (Comments and History) and a sidebar showing status, assignee, priority, sprint, and story points. Status changes in the modal sidebar trigger workflow transitions. The `useIssueDetail` custom hook manages the detail view's data fetching and mutation logic.
-
-- **Keyboard shortcuts**: The root component registers global keyboard shortcuts: `Ctrl+K` for search (placeholder), and potential `C` key for create issue (when no input is focused).
-
-- **Status category colors**: Board columns use color coding based on the workflow status category: gray for `todo`, blue for `in_progress`, green for `done`. This provides visual consistency regardless of custom status names.
-
----
-
-## Deep Pattern Explanations
-
-This section explains each production-grade pattern implemented in the backend, written for readers encountering these patterns for the first time.
-
-### RBAC (Role-Based Access Control)
-
-**What it is**: RBAC assigns permissions to roles rather than individual users. Users are granted roles within a specific context (e.g., a project), and the role determines what actions they can perform. This creates a layered permission system: system-level roles (user, admin), project-level roles (project lead, developer, viewer), and scheme-based permission grants.
-
-**Why it matters**: In an issue tracker used by multiple teams, permission requirements vary wildly. The security team needs "only the assignee can close security bugs." The design team wants "anyone can create issues." Without RBAC, these rules are hard-coded per project, making changes require code deployments. With scheme-based RBAC, an administrator configures permission schemes in the UI and assigns them to projects.
-
-**How it works in this project**: The permission system has three layers. `project_roles` defines reusable roles (e.g., Administrator, Developer, Viewer). `permission_schemes` groups permission grants into reusable configurations. `permission_grants` maps specific permissions (e.g., `create_issue`, `edit_issue`, `transition`) to grantees by type (`anyone`, `user`, `role`, `group`). Each project references a permission scheme via `permission_scheme_id`. When a user attempts an action, the system loads the project's scheme, evaluates all grants, and checks if any match the user's roles, groups, or direct user ID. This scheme-based approach means changing permissions for 50 projects that share the same scheme requires updating one scheme, not 50 project configurations.
-
-### Redis Cache-Aside
-
-**What it is**: Cache-aside is a caching pattern where the application checks the cache before querying the database. On a cache miss, the data is loaded from the database and stored in the cache for future requests. On a cache hit, the database query is skipped entirely.
-
-**Why it matters**: Issue trackers have a highly skewed read/write ratio. A board view showing 30 issues across 5 status columns requires fetching the project metadata, workflow definition, and all issues -- multiple queries that take 20-50ms total. With cache-aside, subsequent board loads complete in ~2ms. Workflow definitions and permission schemes are read thousands of times per change, making them ideal caching candidates.
-
-**How it works in this project**: The project service (`backend/src/services/projectService.ts`) implements cache-aside for projects, workflows, and permission schemes. Cache keys use descriptive patterns: `project:{id}` (15-min TTL), `workflow:{id}` (30-min TTL), `perm-scheme:{id}` (30-min TTL), `issue:{id}` (5-min TTL), `board:{id}:issues` (1-min TTL). Workflows and permission schemes have longer TTLs because they change rarely. Board issue caches have short TTLs because issues change frequently. On issue update, both `issue:{id}` and `issue:key:{key}` caches are explicitly deleted, and a search reindexing event is published.
-
-### Circuit Breaker
-
-**What it is**: A circuit breaker wraps calls to external dependencies and monitors their success/failure rate. When failures cross a threshold, the circuit "opens" and calls fail immediately (without contacting the dependency) for a cooldown period. This prevents a slow or failing dependency from cascading failures throughout the system.
-
-**Why it matters**: Jira depends on PostgreSQL, Redis, Elasticsearch, and RabbitMQ. If Elasticsearch becomes slow (e.g., due to a garbage collection pause), every search request blocks for 30 seconds waiting for a timeout. Without a circuit breaker, the server's event loop fills with blocked requests, and even non-search endpoints (creating issues, viewing boards) become unresponsive. With a circuit breaker, after a few Elasticsearch failures, search requests immediately return a "search unavailable" error while issue CRUD continues working normally.
-
-**How it works in this project**: The graceful degradation strategy is dependency-aware. Elasticsearch is treated as optional: if it is down, the server starts and serves all issue CRUD operations; search is degraded but the rest of the application works. RabbitMQ initialization retries in the background, so issue operations work without it (notifications and search indexing are delayed). PostgreSQL is critical: if it fails, the server enters a read-only mode serving cached data. Each dependency failure results in specific, predictable degradation rather than total system failure.
-
-### Structured Logging
-
-**What it is**: Structured logging outputs log entries as machine-parseable JSON rather than human-readable text. Each log entry is a JSON object with consistent fields: level, message, timestamp, and contextual metadata (user ID, request path, duration, issue key).
-
-**Why it matters**: When investigating a bug report -- "issue PROJ-123 was moved to Done but the assignee was not notified" -- you need to find the specific transition event, check if the post-function fired, and see if the notification was published to RabbitMQ. With structured logs, this is a simple query: `jq 'select(.issueKey == "PROJ-123" and .action == "transition")'`. Without structured logs, you search through thousands of text lines with regex patterns that break whenever someone changes a log message format.
-
-**How it works in this project**: Pino is used (`backend/src/config/logger.ts`) with environment-aware output: pretty-printed with colors in development for readability, raw JSON in production for log aggregation. Each HTTP request gets a child logger with `method`, `path`, `status`, `duration`, and `user_id`. Workflow transitions log the issue key, from/to status, and executing user. Queue operations log the queue name, message ID, and processing status. This context makes it possible to reconstruct the full lifecycle of any operation.
-
-### Prometheus Metrics
-
-**What it is**: Prometheus metrics are numeric measurements exposed at an HTTP endpoint (`/metrics`) that a Prometheus server periodically scrapes. Applications define counters (totals), histograms (latency distributions), and gauges (current values) with labels for dimensional analysis.
-
-**Why it matters**: Issue trackers need to answer questions like: "How many issues were created per project this week?" "What is the p95 latency for JQL searches?" "How deep is the search indexing queue?" Metrics provide these answers in real-time through dashboards and can trigger alerts when thresholds are breached.
-
-**How it works in this project**: The metrics module (`backend/src/config/metrics.ts`) exposes domain-specific metrics alongside standard HTTP metrics. `jira_issues_created_total{project_key, issue_type}` tracks issue creation rates by project and type. `jira_transitions_total{project_key, from_status, to_status}` reveals workflow patterns (e.g., which statuses are most commonly transitioned to). `jira_search_queries_total{query_type}` and `jira_search_latency_seconds{query_type}` track search performance by type (JQL, text, quick). `jira_cache_hits_total` and `jira_cache_misses_total` with `{cache_type}` labels measure cache effectiveness. `jira_idempotent_replays_total` tracks how often duplicate requests are caught.
-
-### Rate Limiting
-
-**What it is**: Rate limiting restricts the number of requests a client can make within a time window. It protects backend services from overload and ensures fair resource sharing.
-
-**Why it matters**: A JQL search query can be expensive -- it is parsed, translated to an Elasticsearch query, executed, and results are fetched. A user repeatedly pressing "Search" or a misbehaving integration hitting the search endpoint 100 times per second could saturate Elasticsearch and degrade search for all users. Rate limiting caps search requests at a sustainable rate while allowing normal usage.
-
-**How it works in this project**: While the full rate limiting middleware is listed as omitted from the local build, the architecture design specifies rate limits per endpoint category. Authentication endpoints have strict limits to prevent credential stuffing. Search endpoints are limited to prevent Elasticsearch overload. Issue mutation endpoints are limited per user to prevent bulk operations from overwhelming the database. The implementation would use a sliding window counter in Redis, keyed by user ID or IP address.
-
-### Idempotency
-
-**What it is**: An operation is idempotent if executing it multiple times produces the same result as executing it once. In an API, this means that retrying a request that may or may not have been processed will not cause duplicate side effects.
-
-**Why it matters**: Creating an issue is not naturally idempotent. If a user clicks "Create" and the network drops before the response arrives, the client retries. Without idempotency protection, the system creates two identical issues -- both with the key "PROJ-124," both assigned to the same sprint. The user now has to find and delete the duplicate, and the issue counter is off.
-
-**How it works in this project**: All mutating API endpoints accept an `X-Idempotency-Key` header. The idempotency middleware (`backend/src/middleware/idempotency.ts`) checks Redis for a cached response under the key `idempotency:{userId}:{key}`. If found, it returns the cached response (status code + body) without executing the handler. If not found, it processes the request, caches the response with a 24-hour TTL, and returns it. The `idempotency_keys` table in PostgreSQL serves as a backup store, with a background job purging expired entries hourly (keyed by `expires_at`). This dual-layer approach ensures idempotency survives Redis restarts.
-
-### Health Checks
-
-**What it is**: Health checks are lightweight HTTP endpoints that report the operational status of an application instance and its dependencies. Load balancers and orchestrators use them to make routing and restart decisions.
-
-**Why it matters**: In a system with four dependencies (PostgreSQL, Redis, Elasticsearch, RabbitMQ), any one can fail independently. Health checks enable the infrastructure to detect which dependency is down and whether the instance can still serve useful traffic. An instance with a failed Elasticsearch connection can still serve issue CRUD and board views -- it should remain in the load balancer pool. An instance with a failed PostgreSQL connection is useless and should be removed.
-
-**How it works in this project**: Two endpoints exist. `GET /health` performs checks against PostgreSQL (`SELECT 1`), Redis (`PING`), and Elasticsearch (cluster health). Each check reports individual status and latency. The response returns `200` if all are healthy, `503` if any are degraded, with a JSON body listing per-dependency results. `GET /ready` is a simpler readiness probe that checks only PostgreSQL and Redis -- the minimum required for the application to process requests. Kubernetes uses `/ready` for initial pod readiness gates and `/health` for ongoing liveness probes.
-
----
+| Workflow definition | Data in PostgreSQL, interpreted | Code per workflow | Teams change workflows without deploys |
+| Transition atomicity | Evaluate unlocked, compare-and-swap on version | Row lock across evaluation | No lock held across rules; conflicts are rare |
+| Concurrent edits | `version` + `If-Match` → `412` | Last write wins | No silent loss of a teammate's change |
+| Permissions | Schemes + generation-tagged cache | Per-project ACLs, or uncached checks | Manageable at 1M projects; instant revocation |
+| Unknown rule types | Fail closed | Fail open | A typo must block, not grant |
+| Search | Elasticsearch read model | PostgreSQL full-text | Arbitrary predicates, relevance, facets |
+| Index feed | Outbox + versioned writes | Publish in the request | No lost or phantom events; no regressions |
+| Board order | Fractional rank keys | Integer positions | One-row moves; no renumbering |
+| Retries | Idempotency keys with fingerprints | Disable the button | Covers timeouts and automation retries |
+| Event bus | RabbitMQ | Kafka | ~1K events/s; PostgreSQL is the replay source |
 
 ## Implementation Notes
 
-This section documents the actual local setup and maps production concepts to the Docker + Node.js + React implementation.
+### What actually runs
 
-### Local Architecture
+One Express process ([`backend/src/index.ts`](./backend/src/index.ts)) serves the Issue API and the Search API routes together; three optional workers in [`backend/src/workers/`](./backend/src/workers/) consume RabbitMQ. [`docker-compose.yml`](./docker-compose.yml) starts PostgreSQL 16, Valkey 7, Elasticsearch 8.11 and RabbitMQ 3.12. Only PostgreSQL and Valkey are required: without Elasticsearch, search answers `503`; without RabbitMQ, writes still commit and the client reconnects in the background. The React 19 frontend uses TanStack Router and Zustand. Ports, credentials and commands are in the [README](./README.md).
 
+### Production patterns implemented
+
+| Pattern | Where | What it does locally |
+|---------|-------|----------------------|
+| Permission schemes | [`permissionService.ts`](./backend/src/services/permissionService.ts), [`middleware/authorize.ts`](./backend/src/middleware/authorize.ts) | Every project, issue, sprint, board and workflow route checks a permission; `404` without `view_issue`, `403` otherwise. System administrators (`users.role = 'admin'`) hold every permission and alone edit workflows or swap schemes |
+| Generation-tagged permission cache | `permissionService.ts` | Redis entry per (project, user), 60 s TTL, ignored once `jira:perms-gen:{project}` moves on; bumped on membership and scheme changes |
+| Search permission filter | [`searchService.ts`](./backend/src/services/searchService.ts) | `terms` filter on visible project ids in JQL, quick search, suggestions and facets; built with the same `evaluateGrants` rule |
+| Atomic transitions | [`services/issue/transitions.ts`](./backend/src/services/issue/transitions.ts), [`workflowService.ts`](./backend/src/services/workflowService.ts) | Rules evaluated unlocked, then `UPDATE … WHERE version = $read`; history and post-functions in the same transaction; up to three re-evaluations; `403`/`409`/`422`; unknown rules fail closed and are rejected when a transition is created |
+| Optimistic concurrency | [`services/issue/update.ts`](./backend/src/services/issue/update.ts), [`utils/http.ts`](./backend/src/utils/http.ts) | `version` column, `ETag` on reads and writes, `If-Match` → `412` with the current issue; `SELECT … FOR UPDATE` for the write so history old values are exact |
+| Rank keys | [`services/rank.ts`](./backend/src/services/rank.ts), [`services/issue/rank.ts`](./backend/src/services/issue/rank.ts), [`init.sql`](./backend/src/db/init.sql) | `PUT /api/issues/:id/rank`; unique `(project_id, rank)` with retry; `jira_rank_after()` trigger for inserts, kept identical to `rankAfter()` |
+| JQL parser | [`jqlParser.ts`](./backend/src/services/jqlParser.ts) | Precedence, `NOT`, strict errors with positions, field registry, case-insensitive keyword terms, `currentUser()` against `assignee_id`, relative dates (`-7d`), `ORDER BY` |
+| After-commit indexing | [`services/issue/afterCommit.ts`](./backend/src/services/issue/afterCommit.ts), [`config/elasticsearch.ts`](./backend/src/config/elasticsearch.ts) | Index and publish only after `COMMIT`; documents written with `version_type: external_gte`; the index worker reuses the same function |
+| Idempotency keys | [`middleware/idempotency.ts`](./backend/src/middleware/idempotency.ts) | `Idempotency-Key` (or `X-Idempotency-Key`) claimed with `SET NX`, `409` while in flight, `422` for a different body, 5xx not stored, durable copy in `idempotency_keys` |
+| Consumer recovery | [`config/messageQueue.ts`](./backend/src/config/messageQueue.ts) | Consumers re-registered after every reconnect; reconnect backs off 5 s → 60 s indefinitely; poison messages dead-lettered after three attempts |
+| Boundary validation | [`routes/issues.ts`](./backend/src/routes/issues.ts) | zod schemas; `PATCH` rejects unknown fields (including status); sprint, epic and parent must be in the issue's project |
+| Session fixation | [`routes/auth.ts`](./backend/src/routes/auth.ts) | Session id regenerated on login and registration |
+| Metrics, logs, probes | [`config/metrics.ts`](./backend/src/config/metrics.ts), [`config/logger.ts`](./backend/src/config/logger.ts) | Transitions, permission denials, concurrency conflicts, idempotent replays, search latency; Pino; `/health`, `/ready`, `/metrics` |
+
+The heart of the transition engine is the compare-and-swap:
+
+```typescript
+// backend/src/services/issue/transitions.ts (abridged)
+const { rows } = await client.query(
+  `UPDATE issues SET status_id = $1, version = version + 1, updated_at = NOW()
+   WHERE id = $2 AND version = $3 RETURNING *`,
+  [transition.to_status_id, issue.id, issue.version]
+);
+if (rows.length === 0) return null; // changed since the rules were evaluated: re-read, retry
 ```
-┌──────────────────────┐          ┌──────────────────────┐
-│  Frontend (React 19) │  :5173   │   Backend (Express)  │  :3000
-│  Vite + Zustand +    │ ──────▶  │   Routes + Services  │
-│  TanStack Router +   │          │   + Middleware        │
-│  Tailwind CSS        │          └──────────┬───────────┘
-└──────────────────────┘                     │
-                                    ┌────────┼────────┐────────┐
-                                    ▼        ▼        ▼        ▼
-                              ┌─────────┐┌───────┐┌─────┐┌─────────┐
-                              │Postgres ││ Redis ││ ES  ││RabbitMQ │
-                              │ :5432   ││ :6379 ││:9200││ :5672   │
-                              └─────────┘└───────┘└─────┘└─────────┘
-```
 
-### Production-Grade Patterns Actually Implemented
+On the frontend, [`components/board/`](./frontend/src/components/board/) applies drags optimistically and restores only the moved card on `403`/`409`/`422`, announcing results in an `aria-live` region; `Alt+Arrow` reorders a focused card. [`hooks/useIssueDetail.ts`](./frontend/src/hooks/useIssueDetail.ts) sends `If-Match` on every edit and, on `412`, shows the current issue while keeping the user's draft. Create and comment requests carry idempotency keys from [`utils/idempotency.ts`](./frontend/src/utils/idempotency.ts), reused only after an uncertain failure.
 
-| Pattern | Implementation | File Path |
-|---------|---------------|-----------|
-| Idempotency middleware | `X-Idempotency-Key` header, Redis-backed response caching | `backend/src/middleware/idempotency.ts` |
-| Prometheus metrics | prom-client with custom counters, histograms, /metrics endpoint | `backend/src/config/metrics.ts` |
-| Structured logging | Pino JSON logger with request context | `backend/src/config/logger.ts` |
-| Health checks | /health (PG + Redis + ES), /ready (PG + Redis) | `backend/src/index.ts` |
-| Message queue | RabbitMQ with fanout exchange, durable queues, DLQ | `backend/src/config/messageQueue.ts` |
-| Background workers | Search indexer, notification worker, webhook dispatcher | `backend/src/workers/` |
-| JQL parser | Tokenizer + AST builder + ES query generator | `backend/src/services/jqlParser.ts` |
-| Workflow engine | DB-driven transitions with conditions, validators, post-functions | `backend/src/services/workflowService.ts` |
-| Cache-aside | Redis caching for projects with TTL and explicit invalidation | `backend/src/services/projectService.ts` |
-| Session auth | Redis-backed sessions via express-session + connect-redis | `backend/src/index.ts` |
-| Input validation | Zod schemas for request body validation | `backend/src/routes/*.ts` |
-| Graceful shutdown | SIGTERM/SIGINT handlers for clean resource cleanup | `backend/src/index.ts` |
+Tests: `npm test` in `backend/` runs 62 vitest tests covering rank keys (including a 2,000-insert fuzz), the JQL parser and compiler, permission evaluation and caching, the transition engine (conflicts, rule failures, post-functions), edit conflicts, the idempotency middleware through Express, and consumer re-registration.
 
-### What Was Simplified or Substituted
+### Simplified or substituted
 
-| Production Concept | Local Substitute |
-|-------------------|-----------------|
-| API Gateway with rate limiting | Single Express server with CORS |
-| Microservices (Issue, Workflow, Search) | Monolithic Express app with route modules |
-| Elasticsearch cluster | Single-node ES 8.11 in Docker |
-| RabbitMQ cluster | Single-node RabbitMQ 3.12 in Docker |
-| Redis Cluster | Single Valkey 7 instance |
-| OAuth / SSO | Session-based auth with bcrypt passwords |
-| CDN for static assets | Vite dev server |
-| Kubernetes / container orchestration | Docker Compose for infrastructure services |
-| Multi-region deployment | Single machine, localhost |
-| Database sharding | Single PostgreSQL 16 instance |
+| Production | Local |
+|------------|-------|
+| Separate Issue API and Search API services | One Express process with route modules |
+| Outbox table + relay | Index and publish right after `COMMIT`; a crash in between loses the event (search lags until the issue changes again) |
+| TanStack Query for server state | Zustand stores with hand-written fetching; the board updates the store directly |
+| WebSocket live board | None; the board refetches on a `409` conflict |
+| Keyset pagination | `LIMIT/OFFSET`, capped at 200; the "All issues" board shows the first 50 issues by rank |
+| Rank rebalancing job | None; keys grow at hot spots (about one character per five inserts at one spot) |
+| Scoped API tokens, rate limiting | Session cookies only; no rate limiting |
+| Field registry for custom fields | JSONB without type checks |
+| Groups | Not modeled: group grants and `user_in_group` conditions never match (fail closed) |
 
-### What Was Omitted
+### Omitted
 
-- CDN and edge caching for API responses
-- Multi-region deployment and geo-routing
-- Kubernetes with horizontal pod autoscaling
-- Database read replicas and sharding
-- OAuth/SSO/SAML integration
-- Real-time WebSocket updates for board changes
-- Attachment storage (S3/MinIO)
-- Advanced JQL functions (linked issues, sprint functions)
-- Branch protection and merge checks
-- Full audit log viewer in admin UI
-- Rate limiting middleware
-- CI/CD pipeline integration
+CDN, multi-region deployment, sharding and read replicas, history partitioning, the reconciliation job, bulk operations as background jobs, workflow editor UI, transition screens (fields submitted with a transition; validators check the stored issue), saved filters, attachments, OAuth/SSO.
 
-### Frontend Architecture
+### Known limitations
 
-The frontend uses React 19 + TypeScript + Vite + TanStack Router + Zustand + Tailwind CSS.
-
-Key components:
-- `Board.tsx` -- Kanban/Scrum board with columns per status
-- `IssueDetail.tsx` -- Container component with sub-components split into `issue-detail/` directory
-- `CreateIssueModal.tsx` -- Issue creation form
-- `Layout.tsx` -- App shell with sidebar navigation
-
-Routes follow TanStack Router file-based conventions under `frontend/src/routes/`, with nested routes for project views (board, backlog, issues, settings).
+- The notification and webhook workers query tables and columns that the schema does not define (`issue_watchers`, `project_watchers`, `notifications`, `email_log`, `webhooks`, `webhook_deliveries`, `users.display_name`, `users.email_notifications`), so every message they receive fails and is dead-lettered after three attempts. Webhook delivery and its signature are simulated.
+- Issues are indexed twice per change (inline after commit and by the index worker); external versioning makes this harmless but wasteful.
+- The idempotency record is written after the response, outside the handler's transaction: a crash between the commit and the record can still let one retry through.
+- Routes log with `console.error` rather than the Pino logger.
+- The frontend hides drags from users without `transition_issue` or `edit_issue` but not other controls; the server refuses them with a message.
+- `npm run seed` (`seed.ts`) and `db-seed/seed.sql` create different demo users; see the README.

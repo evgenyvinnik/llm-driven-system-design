@@ -1,325 +1,314 @@
-# Design Jira - System Design Answer (Fullstack Focus)
+# 🎫 Issue Tracker (Jira) — System Design Answer (Full-Stack Focus)
 
-*45–60 minute system design interview — Fullstack Engineer position*
+*45-minute full-stack interview. This is a proposed production design; what this repository actually runs is described in [architecture.md → Implementation Notes](./architecture.md#implementation-notes).*
 
-## 📋 Problem Statement
+> "Jira's hard parts sit on the seam between browser and server. The server owns every rule — the workflow, the permissions, the board order — yet the board has to respond instantly to drags it isn't qualified to approve, while other people change the same issues. I'll design the contracts that let both sides do their jobs: a version that makes concurrent edits safe, structured refusals that let the UI explain a rejected drag, an idempotency key that makes retries safe, and a rank contract that keeps every board in the same order."
 
-"I'm designing Jira: projects containing issues that move through admin-configured workflows, with a Kanban board, a backlog, and a query language for finding things.
+| Phase | Time | What I want the interviewer to leave with |
+|-------|------|--------------------------------------------|
+| Requirements & scale | 5 min | Scope and the targets on both sides of the wire |
+| End-to-end architecture | 8 min | One diagram from the board to the search index, plus two core flows |
+| Data model & API contract | 7 min | Server tables, client cache, the fields both sides rely on |
+| Deep dive 1: a drag, from pointer to commit | 8 min | Optimistic UI over a compare-and-swap, with honest refusals |
+| Deep dive 2: two people, one issue | 7 min | Versions, `If-Match` and a conflict UI that keeps drafts |
+| Deep dive 3: order and freshness | 7 min | Rank keys, search lag, live updates |
+| Failures, scale, wrap-up | 3 min | What each failure looks like to a user |
 
-As a fullstack engineer I'd argue the defining property of this system is **where authority sits**. The rules that decide whether an issue may move from 'In Review' to 'Done' are data, authored by an admin, evaluated on the server. The client can't know them. But the board is a bulk tool — people drag twenty cards during sprint planning — so the UI has to respond instantly to an action it isn't qualified to approve.
+---
 
-Everything interesting here lives on that seam: what crosses the wire, who owns which decision, and how a rejection travels back without the interface lying in the meantime."
+## 🎯 Requirements & Scale (5 min)
 
-## 🎯 Requirements Clarification
+**Functional.** Projects contain issues that move through per-project workflows (statuses and transitions with conditions, validators and post-functions). Boards show a column per status with cards in a team-chosen order; dragging across columns runs a transition, within a column reorders. An issue panel edits fields and shows comments and history. JQL finds issues across projects. Permission schemes decide who may do what. Out of scope: reports, attachments, the workflow editor.
 
-### Functional Requirements
+| Side | Requirement | Target |
+|------|-------------|--------|
+| Backend | Issue reads / writes | p99 < 200 ms / < 300 ms |
+| Backend | JQL | p99 < 1 s; index lag p99 < 5 s |
+| Backend | Correctness | No lost updates; transitions always obey workflow and permissions |
+| Backend | Revocation | Effective on the member's next request |
+| Frontend | Drag feedback | Applied in < 100 ms; INP < 200 ms on a 500-card board |
+| Frontend | Honesty | A refused change is undone within a second and explained |
+| Both | Retries | No duplicate issues or comments after a timeout |
 
-1. **Projects and issues** — CRUD, with issues carrying type, status, priority, assignee, sprint, story points, labels
-2. **Configurable workflows** — statuses and transitions defined per project as data, with authorization and validation rules
-3. **Board and backlog** — drag to transition; move issues between sprints
-4. **Search** — JQL with boolean logic, comparison operators, and functions like `currentUser()`
-5. **Audit trail** — every field change recorded with actor and timestamp
-6. **Comments** — threaded per issue
+**Scale.** 1M daily users, 100M issues across 1M projects. About 1K writes/s at peak against ~50K reads/s — boards and issue views dominate — and one permission check per request. Boards up to a few thousand cards.
 
-### Non-Functional Requirements
+"The read ratio tells me permissions and workflow definitions must be cached. The board tells me the client must be optimistic, which in turn tells me the server's refusals must be structured enough for the client to explain."
 
-| Requirement | Target | Rationale |
-|-------------|--------|-----------|
-| Perceived interaction latency | < 100ms | Board is a bulk tool; serialized confirmation destroys it |
-| Read p99 | < 200ms | Board load is the most common request in the system |
-| Read:write ratio | ~100:1 | Everyone watches boards; few people change them |
-| Durability of the audit trail | No loss | It's a compliance artifact for many teams |
-| Search freshness | < 5s p99 | Users tolerate slight lag; they don't tolerate wrong |
-| Availability | 99.9% | Internal tool; brief degradation beats inconsistency |
+---
 
-### Questions I'd Ask
-
-> "The one that changes the architecture most is how configurable workflows are. If every project can define its own statuses and rules, nothing about the state machine can be hardcoded on either side of the wire — the client renders whatever it's handed, and the server interprets rules at runtime. That's a very different system from one with four fixed statuses, and it's the assumption I'll design against.
-
-> Second: does search need to be strongly consistent with writes? I'll assume no, because assuming yes rules out a search engine entirely and I think that's the wrong trade for this product."
-
-## 🏗️ Architecture
+## 🏗️ End-to-End Architecture (8 min)
 
 ```
-┌────────────────────────────────────────────────────────────────────┐
-│  CLIENT                                                             │
-│    Board · Backlog · Issue list · Detail panel                     │
-│    ├─ one issue record per id, views derived from it               │
-│    └─ API client: idempotency keys, error normalization            │
-└─────────────────────────────┬──────────────────────────────────────┘
-                              │ REST + session cookie
-                              ▼
-┌────────────────────────────────────────────────────────────────────┐
-│  API                                                                │
-│    auth · projects · issues · search · workflows                   │
-│    ├─ permission check on every read and write                     │
-│    └─ idempotency middleware on mutations                          │
-└──┬───────────────┬────────────────┬───────────────────┬────────────┘
-   │               │                │                   │
-   ▼               ▼                ▼                   ▼
-┌────────┐   ┌──────────┐   ┌──────────────┐   ┌────────────────┐
-│Postgres│   │  Redis   │   │Elasticsearch │   │   RabbitMQ     │
-│ truth: │   │ sessions │   │ search index │   │ issue events   │
-│ issues │   │ cache    │   │ (derived)    │   │      │         │
-│ history│   │ idem.    │   │      ▲       │   │      ▼         │
-│workflow│   └──────────┘   └──────┼───────┘   │ ┌────────────┐ │
-└────────┘                         └───────────┼─│  indexer   │ │
-                                               │ │ notifier   │ │
-                                               │ │  webhooks  │ │
-                                               │ └────────────┘ │
-                                               └────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ Browser SPA: board, issue panel, JQL search · query cache with optimistic updates               │
+│ API client: If-Match on edits, Idempotency-Key on creates, errors by class                      │
+└───────────────────┬────────────────────────────────────────────────────┬────────────────────────┘
+ ▲ (3)              │ (1) PATCH …/:id + If-Match                         │ (2) GET /search?jql=…
+ │                  ▼                                                    ▼
+ │ ┌──────────────────────────────────────────────────────────────────────────────────────────────┐
+ │ │ Load balancer · TLS · rate limits per user and per API token                                 │
+ │ └────────────────┬────────────────────────────────────────────────────┬────────────────────────┘
+ │                  │                                                    │
+ │                  ▼                                                    ▼
+ │ ┌──────────────────────────────────────┐                ┌──────────────────────────────────────┐
+ │ │ Issue API (stateless)                │                │ Search API (stateless)               │
+ │ │ permission checks · workflow engine  │                │ JQL parser → Elasticsearch query     │
+ │ │ rank moves · idempotency keys        │                │ filter: projects the user may view   │
+ │ └───────┬─────────────────────┬────────┘                └─────┬───────────────────────┬────────┘
+ │         │                     │                               │                       │
+ │         │                     │ permissions, keys             │ visible projects      │
+ │         │ one transaction:    │       ┌──────────────────┐    │                       │
+ │         │ UPDATE … WHERE      │       │ Redis            │    │                       │
+ │         │   version = v       └──────▶│ sessions, cached │◀───┘                       │
+ │         │ + history rows              │ permission sets, │                            │
+ │         │ + outbox row                │ idempotency keys │                            │
+ │         │                             └──────────────────┘          bool query + filter
+ │         ▼                                                                             ▼
+ │ ┌──────────────────────────────────────┐                ┌──────────────────────────────────────┐
+ │ │ PostgreSQL · source of truth         │                │ Elasticsearch · issues index         │
+ │ │ issues, history, workflows,          │                │ derived, rebuildable from PG         │
+ │ │ permission schemes, outbox           │                └──────────────────────────────────────┘
+ │ └────────────────┬─────────────────────┘                                    ▲
+ │                  │ relay publishes outbox rows                              │ versioned upsert
+ │                  ▼                                                          │
+ │ ┌──────────────────────────────────────┐                ┌───────────────────┴──────────────────┐
+ │ │ RabbitMQ · issue.events (fanout)     ├───────────────▶│ Index worker                         │
+ │ └────────────────┬─────────────────────┘   issue event  │ re-reads the issue from PG           │
+ │                  │                                      └──────────────────────────────────────┘
+ │                  │ issue event
+ │                  ▼
+ │ ┌──────────────────────────────────────┐
+ └─┤ Realtime gateway (WebSocket)         │
+   │ per-project rooms, resume by event   │
+   └──────────────────────────────────────┘
 ```
 
-**PostgreSQL is the only authority.** Elasticsearch is a derived view that can be rebuilt from it; Redis holds nothing that can't be recomputed. That single rule is what makes the async fan-out safe — a dropped event costs freshness, never truth.
+1. **Change (1).** The SPA applies the change to its cache at once and sends it with `If-Match` (edits) or `Idempotency-Key` (creates). The Issue API checks permissions, evaluates workflow rules, and commits the update, history and an outbox row in one transaction.
+2. **Search (2).** The Search API compiles JQL to an Elasticsearch query with a mandatory filter for the projects the user may view.
+3. **Push (3).** After commit, the relay publishes the event; the index worker updates Elasticsearch and the realtime gateway pushes the event to every open board in that project.
 
-## 🔀 The Client/Server Contract
+| Layer | Choice | Why |
+|-------|--------|-----|
+| SPA | React, TanStack Query for server state, URL for filters, Zustand for session and permissions | Optimistic updates with rollback without hand-written caching |
+| Issue API | Stateless; workflow engine and permission checks in-process | A transition is one transaction about one row |
+| Search API | Stateless; JQL compiler | Different store, different failure mode |
+| PostgreSQL | Source of truth, including the outbox | Every decision commits in one place |
+| Redis | Sessions, permission sets, idempotency records | Checks at cache speed |
+| RabbitMQ + workers | Index, realtime and notification consumers | Derived systems lag; they never decide |
+| Elasticsearch | JQL and text search | Arbitrary predicates and facets |
 
-Rather than enumerate types, the useful thing to state is **who owns each decision**, because that's what determines the API shape:
-
-| Decision | Owner | How the other side learns it |
-|----------|-------|------------------------------|
-| Which statuses exist | Server (workflow data) | Fetched with the project; client renders columns from it |
-| Whether a transition is permitted | Server (conditions) | Per-issue available-transitions list; enforced again on execute |
-| Whether an issue is ready to transition | Server (validators) | 422 naming the failing field |
-| What the user is looking at | Client | Route params |
-| Optimistic intent | Client | Applied locally, then reconciled from the write response |
-| Field-level audit | Server | History endpoint |
-
-> "The important discipline is that the available-transitions list is a *hint for rendering*, never a substitute for enforcement. The server re-evaluates every rule on execute. If it didn't, the check would be advisory — anyone with a terminal could bypass it, and worse, the legitimate client would still be wrong whenever a rule changed between fetching the list and acting on it. So the same evaluation runs twice on purpose: once to decide what buttons to draw, once to decide what actually happens."
-
-**Errors are part of the contract.** The API returns a discriminated shape — 403 for authorization, 422 with a field name for validation, 409 for conflict, 5xx for transient — because the client's response to each is genuinely different. A single generic error blob would force the UI to string-match messages to decide whether retrying could possibly help.
-
-## 💾 Data Model
-
-Described as prose tables rather than DDL:
-
-| Table | Key Columns | Indexes | Notes |
-|-------|-------------|---------|-------|
-| projects | id (UUID PK), key ('DEMO', unique), name, lead_id, workflow_id, permission_scheme_id | key | Workflow and scheme attached by reference — swap without touching issues |
-| issues | id, project_id, key ('DEMO-5', unique), summary, description, issue_type, status_id, priority, assignee_id, reporter_id, parent_id, epic_id, sprint_id, story_points, labels, components, custom_fields (JSONB) | (project_id, status_id); GIN on labels and custom_fields | The board's primary read |
-| statuses | id, workflow_id, name, category (todo / in_progress / done) | workflow_id | Category drives client colouring without hardcoding names |
-| transitions | id, workflow_id, name, from_status_id (NULL = from anywhere), to_status_id, conditions / validators / post_functions (JSONB lists) | workflow_id | The entire state machine is rows, not code |
-| issue_history | id, issue_id, user_id, field, old_value, new_value, created_at | (issue_id, created_at) | Append-only; one row per changed field |
-| comments | id, issue_id, user_id, body, created_at | (issue_id, created_at) | |
-| sprints | id, project_id, name, status (future / active / completed), start/end dates | project_id | Board filters on the active sprint |
-| permission_grants | scheme_id, permission, grantee_type (role / user / group / anyone), grantee_id | PK across all four | Deny-by-default: no matching grant = no access |
-| idempotency_keys | key (PK), user_id, response_status, response_body (JSONB), expires_at | — | Replays return the stored response verbatim |
-
-Three decisions worth defending:
-
-**Custom fields as JSONB rather than an EAV table.** EAV — one row per (issue, field, value) — turns "load an issue" into an N-row aggregation and "filter on two custom fields" into self-joins the planner handles badly at scale. JSONB keeps the data in the row it describes and serializes cleanly into the search document. The cost is no database-level type enforcement, so the application must validate against a field registry on write; I accept that because the validation lives in one code path while EAV's cost is smeared across every read.
-
-**Workflow rules as interpreted JSONB config.** Conditions, validators, and post-functions are stored as typed objects and evaluated at runtime. Code-defined workflows would mean a deploy every time a team tweaks its process — disqualifying for a product whose premise is self-serve customization. The trade-off is that a workflow can be saved in a broken state, so definitions are statically checked at publish time (every target status exists, no status is a dead end) rather than failing mid-transition.
-
-**Timestamps carry a time zone.** Naive timestamp columns store wall-clock and silently acquire the *reader's* offset on the way back out, so a comment posted seconds ago can render as hours in the future. For a system whose audit trail is the compliance artifact, storing absolute instants isn't a preference — a history whose ordering depends on who's reading it isn't an audit trail.
-
-## 🔌 API Design
+### Flow: a drag that becomes a transition
 
 ```
-POST   /api/auth/login                        → Session cookie
-GET    /api/projects                          → Projects visible to this user
-GET    /api/projects/:key                     → Project + workflow (drives board columns)
-GET    /api/issues/project/:id                → Board / issue list data
-GET    /api/issues/project/:id/backlog        → Unscheduled issues
-GET    /api/issues/:idOrKey                   → Single issue (strong, from Postgres)
-POST   /api/issues                            → Create (idempotency key honored)
-PATCH  /api/issues/:id                        → Update fields
-GET    /api/issues/:id/transitions            → Transitions available to THIS user now
-POST   /api/issues/:id/transitions/:tid       → Execute transition
-GET    /api/issues/:id/history                → Audit trail
-GET    /api/issues/:id/comments               → Comments
-POST   /api/search?jql=...                    → JQL search (eventual, from Elasticsearch)
+User                      SPA                        Issue API                      PostgreSQL
+  │                        │                             │                               │
+  │ 1 drag DEMO-5 to Done  │                             │                               │
+  │───────────────────────▶│                             │                               │
+  │                        │ 2 move card now, snapshot   │                               │
+  │                        │ 3 POST …/5/transitions/12   │                               │
+  │                        │────────────────────────────▶│                               │
+  │                        │                             │ 4 permission + rules          │
+  │                        │                             │ 5 UPDATE … WHERE version = 7  │
+  │                        │                             │──────────────────────────────▶│
+  │                        │                             │ 6 1 row; history + outbox     │
+  │                        │                             │◀──────────────────────────────│
+  │                        │ 7 200 v8 | 403 | 409 | 422  │                               │
+  │                        │◀────────────────────────────│                               │
+  │                        │ 8 merge v8, or restore + say why                            │
+  │                        │                             │                               │
 ```
 
-The consistency split is deliberate and documented in the API itself: reads by id or key hit Postgres and are strongly consistent, while JQL search hits Elasticsearch and is eventually consistent. Clients that just wrote something read it back from the write response or by key — never from search.
+"Step 2 is the client's half: move the card, remember the old one. Steps 4–6 are the server's half: evaluate the rules on a plain read, then `UPDATE … WHERE version = 7` so the write only lands if nothing changed since the rules looked. Step 7 is the contract between them: a full issue on success, or a refusal the UI can explain."
 
-## 🔧 Deep Dive 1: A Transition, End to End
-
-This is the system's signature path. Walk it once and most of the architecture falls out.
+### Flow: a create that survives a timeout
 
 ```
- user drags DEMO-5 to "Done"
-        │
-   ┌────▼─────────────────────────────┐
-   │ CLIENT: apply move locally       │  ← instant; may be wrong
-   │ POST /issues/5/transitions/12    │
-   │   X-Idempotency-Key: <uuid>      │
-   └────┬─────────────────────────────┘
-        ▼
-   ┌──────────────────────────────────────────────────┐
-   │ SERVER                                            │
-   │  1 idempotency: replay cached response if seen    │
-   │  2 permission check on the project                │
-   │  3 load issue + its project's workflow            │
-   │  4 source check: transition.from == current       │
-   │  5 CONDITIONS  (may this user?)      fail → 403   │
-   │  6 VALIDATORS  (is it ready?)        fail → 422   │
-   │  ┌──────────── one transaction ─────────────────┐ │
-   │  │ 7 UPDATE issue status                        │ │
-   │  │ 8 INSERT one issue_history row per field     │ │
-   │  └──────────────────────────────────────────────┘ │
-   │  9 POST-FUNCTIONS (side effects, after commit)    │
-   │ 10 publish issue.transitioned → RabbitMQ          │
-   └────┬──────────────────────────────────────────────┘
-        ▼
-   ┌──────────────────────────────────────────────────┐
-   │ CLIENT: merge returned issue (not a refetch)     │
-   │ or revert + explain, by error class               │
-   └──────────────────────────────────────────────────┘
-        │
-        ├──▶ indexer   → Elasticsearch upsert
-        ├──▶ notifier  → watchers
-        └──▶ webhooks  → external integrations
+ SPA                               Issue API                         Redis   PostgreSQL
+  │                                    │                               │          │
+  │ 1 freeze form with key K           │                               │          │
+  │ 2 POST /issues, Idempotency-Key K  │                               │          │
+  │───────────────────────────────────▶│                               │          │
+  │                                    │ 3 SET idem:{user}:K NX EX 60  │          │
+  │                                    │──────────────────────────────▶│          │
+  │                                    │ 4 INSERT DEMO-9 + history                │
+  │                                    │─────────────────────────────────────────▶│
+  │                                    │ 5 store 201 under K (24 h)    │          │
+  │                                    │──────────────────────────────▶│          │
+  │ 6 201 lost (timeout)               │                               │          │
+  │◀───────────────────────────────────│                               │          │
+  │ 7 retry: same K, same body         │                               │          │
+  │───────────────────────────────────▶│                               │          │
+  │ 8 201 DEMO-9, replayed             │                               │          │
+  │◀───────────────────────────────────│                               │          │
+  │                                    │                               │          │
 ```
 
-### Why conditions before validators before commit
+"The key belongs to the user's intent — this submitted form — not to the HTTP attempt. The browser reuses it only when it doesn't know what happened (timeout, `5xx`); a definite answer retires it."
 
-The ordering is a correctness property, not style:
+---
 
-> "Conditions answer 'may this user attempt this?' and validators answer 'is the issue fit to move?'. Running conditions first means a user who isn't allowed to resolve issues never sees 'fix version is required' — otherwise the error messages leak the workflow configuration to people who can't act on it. And both run before the transaction so side effects can't fire for a transition that never committed. Reorder these and you get either an information leak or notifications about status changes that didn't happen."
+## 💾 Data Model & API Contract (7 min)
 
-### Why post-functions run after commit
+### Server side
 
-> "Post-functions include sending notifications and firing webhooks — I/O against systems I don't control. Inside the transaction they'd hold row locks for the duration of an HTTP call to someone else's server, and a slow webhook endpoint would become database contention. So the transaction covers only the status update and its history rows, and side effects run after. The trade-off is real and I'd state it plainly: a crash between commit and post-functions leaves a transitioned issue with a missing notification. I'd take that over the alternative, which is rolling back a user-visible status change because an email server was down."
+| Table | Key columns | Notes |
+|-------|-------------|-------|
+| `issues` | `id`, `key`, `project_id`, `status_id`, `assignee_id`, `custom_fields` (JSONB), `version`, `rank` | Unique `(project_id, rank)`; `version` is the ETag |
+| `transitions` | `from_status_id` (null = any), `to_status_id`, `conditions`, `validators`, `post_functions` | The workflow is data |
+| `permission_grants` | `scheme_id`, `permission`, `grantee_type`, `grantee_id` | Shared schemes; no negative grants |
+| `issue_history` | `issue_id`, `user_id`, `field`, `old_value`, `new_value` | Same transaction as the change |
+| `outbox` | `issue_id`, `event_type`, `version`, `published_at` | Feeds index, realtime and webhooks |
+| `idempotency_keys` | hash(user, key), request fingerprint, stored response | 24 h; Redis in front |
 
-### The client's half
+### Client side
 
-The client applies the move immediately and reconciles from the response rather than refetching the board — a refetch would clobber a second drag already in flight. Rejections branch by class: 403 reverts and explains who may act, 422 reverts and surfaces the named field, transient errors retry once under the same idempotency key before reverting.
+| Cache key | Holds | Updated by |
+|-----------|-------|------------|
+| `['board', project, sprint]` | Issues in rank order (columns are derived by status) | Optimistic moves, write responses, live events |
+| `['issue', key]` | One issue with `version` | Edits, `412` bodies, live events |
+| `['workflow', project]` | Statuses and transitions | Rarely; long stale time |
+| `['search', jql]` | Results and total | Refetch; may lag writes by seconds |
+| Zustand | Session, permissions in the current project | Login, project switch |
 
-> "The reason optimistic UI needs this much care here — more than in a typical CRUD app — is that rejection isn't an anomaly, it's a *rule working correctly*. A user without permission to close issues will be rejected every single time they try. That's reproducible, not flaky, so 'apply optimistically and hope' doesn't degrade gracefully; it produces a UI that consistently lies to a specific user until they reload."
-
-## 🔧 Deep Dive 2: Concurrent Edits
-
-Two people act on the same issue. What happens depends on a choice I'd make explicitly.
-
-| Approach | Behaviour | Cost |
-|----------|-----------|------|
-| ❌ Pessimistic row locks | Serializes; correct | Locks held across rule evaluation and role lookups — tens of ms per write; bulk sprint moves deadlock-prone |
-| ❌ Last-write-wins, silent | Never fails | Loses a long description edit with no trace |
-| ✅ Version column + compare-and-swap | Fails loudly, only on real collision | Client must handle 409 |
-
-> "I'd put a version column on the issue and make the status update a conditional write — update where id and version match, and if it affects zero rows, someone else won and I return 409. Pessimistic locking is the option that looks safer and isn't: because the workflow engine evaluates admin-authored rules, which means role lookups and condition checks, a lock taken before evaluation is held across all of it. Multiply that by 'move all 800 issues in this sprint to Done' and you've serialized a bulk operation behind per-issue rule evaluation. Optimistic concurrency lets every one of those reads and evaluations proceed in parallel and only collides at the commit, which is a single conditional update.
->
-> What I give up is that the loser gets an error instead of a merge. For a status transition I think that's actually correct rather than merely acceptable — silently merging two concurrent transitions would run two contradictory sets of post-functions, so you'd send 'moved to Done' and 'moved to Blocked' notifications for the same issue. A 409 that says 'this moved while you were looking at it, here's where it is now' is the honest outcome."
-
-**Where I'd differentiate by field.** Discrete fields like assignee or priority tolerate last-write-wins fine — small, and the history shows what happened. Long-form description edits don't; losing those is losing real work. So a conflict on description should offer the user both versions rather than a bare error, and the client already holds the original and the edit, so it can.
-
-## 🔧 Deep Dive 3: Keeping Boards In Sync
-
-During sprint planning, several people are on the same board simultaneously — the one moment this system is genuinely multi-user.
-
-| Approach | Fit | Cost |
-|----------|-----|------|
-| ❌ Poll the board on a timer | Re-requests a large payload forever | Load scales with idle tabs, not activity |
-| ❌ CRDTs / collaborative editing | Wrong model — issues are field records, not shared documents | Large complexity, no benefit |
-| ✅ Refresh on focus | Covers "come back to the tab" | Divergence during concurrent planning |
-| ✅ Server-pushed issue events | Matches the existing event stream | Connection lifecycle and backfill |
-
-> "Jira isn't Google Docs and treating it like one would be a mis-read. Two people rarely edit the same *field* of the same issue — they work on different issues on the same board. So I don't need character-level merge; I need each client to learn that some issue changed and re-render one card. The backend already publishes issue events for indexing and notifications, so the fan-out exists and pushing to clients is mostly a delivery problem.
->
-> The genuinely hard part isn't the socket, it's reconnection. A laptop that sleeps for ten minutes wakes up having missed events, and a naive subscription will show a stale board while *looking* live — which is worse than obviously stale, because the user has no cue to refresh. So the connection has to carry a resume point and fall back to a full board refetch when it can't backfill. That's why I'd ship refresh-on-focus first: it's the honest 80% and it never claims to be live when it isn't."
-
-Delivery across multiple API instances goes through Redis pub/sub, since a user's socket may be on a different instance than the one that served the write. And the hub skips the actor — they already applied the change optimistically, so echoing it back only risks re-render churn and races with their own reconciliation.
-
-## 🔧 Deep Dive 4: JQL and the Dual-Store Problem
-
-JQL is a real grammar: field-operator-value clauses, AND/OR with parentheses, and functions like `currentUser()`.
-
-**Server pipeline**: tokenize → parse to an AST by recursive descent → resolve functions against the request context → translate to an Elasticsearch bool query (AND→must, OR→should with minimum-match, IN→terms, comparisons→range) → **inject the user's accessible-project set as a mandatory filter** → execute with pagination caps.
-
-Functions resolve at query time, never at save time — that's what lets a saved filter using `currentUser()` stay correct for whoever runs it.
-
-**Why Elasticsearch rather than translating JQL to SQL:**
-
-> "Postgres would keep search strongly consistent with writes, which is genuinely attractive and is the reason to consider it. It breaks on three things this product actually does. Text relevance — 'login crash' wants stemmed, ranked, typo-tolerant matching. Arbitrary predicate combinations — users compose filters across custom fields freely, and Postgres needs an index per query shape while ES indexes every field by construction. And aggregations for boards and sprint reports, which are group-bys over large result sets. The price is the dual-store problem: search lags writes and can disagree with the database."
-
-**Managing the gap**, which is where the design earns its keep:
-
-- Events carry **ids, not payloads** — the indexer re-reads from Postgres, so the database is always the authority on content and a stale event can't write stale data
-- Indexing is idempotent per issue and versioned, so retries and out-of-order redeliveries can't regress a document
-- A reconciliation sweep compares `updated_at` against indexed versions to catch lost events
-- **The UX seam**: after a create or edit, the client renders from the write response rather than re-querying search — which hides the lag exactly where users would otherwise notice it hardest ("I just made this issue and it's not in my filter")
-
-That last point is the fullstack move: the consistency gap is a backend property, but it's closed on the client, and neither side could have solved it alone.
-
-## 🛡️ Permissions Across the Stack
-
-Projects point to a permission *scheme*; a scheme holds grants mapping a permission to a grantee (role, group, user, or anyone). Checking access resolves the scheme, fetches grants, resolves the user's roles, and grants if any match. There are no negative grants — absence is denial.
-
-Computed permission sets are cached per (user, project) in Redis behind a short TTL, with eager invalidation on membership and scheme changes.
-
-> "The asymmetry is deliberate: being slow to *grant* is a support ticket, being slow to *revoke* is a security incident. So grants may take until the TTL expires to propagate, but revocations invalidate eagerly. And search authorization reuses the identical accessible-project set that the REST layer uses — if search computed its own, the two would eventually disagree, and the failure mode is confidential issues surfacing in someone's filter. One source of truth for authorization, two consumers."
-
-## 🔁 Idempotency and Retries
-
-This is the seam where "the client retries" and "the server is safe" have to be designed together, not separately.
-
-The problem: a transition request times out. The client doesn't know whether the server never received it, processed it and lost the response, or is still working. Retrying risks applying it twice; not retrying risks losing a change the user believes they made.
-
-**The mechanism**: every mutation carries a client-generated `X-Idempotency-Key`. Middleware checks it before the handler runs — a key already seen returns the stored response verbatim instead of re-executing. Keys and their responses live in Redis for fast replay, with a Postgres table as the durable backstop so a cache flush can't turn a replay into a re-execution.
+### The contract
 
 ```
-  client                          server
-    │  POST /transitions  key=K     │
-    │──────────────────────────────▶│  no K seen → execute, store (K → response)
-    │        ✗ response lost        │
-    │  POST /transitions  key=K     │
-    │──────────────────────────────▶│  K seen → replay stored response, no re-execute
-    │◀──────────────────────────────│
+PATCH /api/v1/issues/{id}                 If-Match: "7" → 200 Issue | 412 {issue}
+POST  /api/v1/issues/{id}/transitions/{t}  → 200 Issue | 403 | 409 | 422 {field}
+PUT   /api/v1/issues/{id}/rank            {afterId} → 200 {rank}
+POST  /api/v1/issues                      Idempotency-Key: K → 201 (replayed on retry)
+GET   /api/v1/search?jql=…                → 200 | 400 {position} | 503
+WS    /api/v1/projects/{key}/events       ?after=seq → {seq, issueId, version, type}
 ```
 
-> "The key has to be generated at the point of *user intent* — when the drag is released — and reused for every retry of that same action. Generating it per HTTP attempt would make each retry look like a new request, which defeats the entire mechanism while appearing to implement it. That's why I treat the retry policy and key generation as one decision: an automatic retry without a stable key isn't a safety feature, it's a duplicate-transition generator.
->
-> The cost is an extra write on every mutation. I'd pay it, because the alternative in a system with an append-only audit trail is duplicate history rows — and unlike a duplicated read, you can't clean those up without corrupting the very record people rely on to reconstruct what happened."
+| Contract element | The server guarantees | The client relies on it to |
+|------------------|----------------------|----------------------------|
+| `version` / `ETag` / `If-Match` | Writes apply only to the version the user saw; `412` returns the current issue | Never overwrite a teammate's change; show what changed |
+| Refusal codes | `403 condition_failed`, `422 validation_failed` + `field`, `409 invalid_from_status` | Undo the drag and explain it, or open the field |
+| `Idempotency-Key` | Same key + body → same response; same key + other body → `422` | Retry after timeouts without duplicates |
+| `{afterId}` | The issue lands directly after that issue, as of now | Send intent, not positions |
+| Event `version` | Monotonic per issue | Ignore events older than the cached copy |
+| `503` from search | Search is down, not empty | Say "unavailable", never "no results" |
 
-Note the interaction with concurrency control: idempotency handles *the same request arriving twice*, while the version check handles *two different requests colliding*. They solve different problems and you need both — a retried request should replay, but a genuinely concurrent second edit should get a 409.
+---
 
-## 🧯 Failure Handling
+## 🔧 Deep Dive 1: A Drag, From Pointer to Commit (8 min)
 
-| Failure | Behaviour | Why acceptable |
-|---------|-----------|----------------|
-| Elasticsearch down | Search fails; issue CRUD and boards unaffected | Boards read Postgres directly — the core product still works |
-| RabbitMQ down | Writes succeed; publish failure logged | Postgres is authoritative; index catches up via reconciliation |
-| Redis down | Sessions lost; permission checks fall back to Postgres | Degraded latency, not incorrect results |
-| Postgres down | Writes rejected | Nothing else can substitute for the source of truth |
-| Worker crash mid-event | Message redelivered | Consumers are idempotent on event id |
+"The scenario: Alice drags DEMO-5 from In Review to Done. Whether that is allowed depends on rules the browser doesn't have, and Bob may be changing DEMO-5 at the same moment."
 
-The ordering here is the point: **every dependency except Postgres degrades to reduced functionality rather than wrong answers.**
+**In the browser.** The card moves on drop. The board asks for the transitions available from the card's status — a rendering hint, already filtered by the user's permissions and conditions — and runs the one into the target column. On success it merges the returned issue into the cache: one card, not a board refetch that would clobber Alice's next drag. On failure it restores that one card and explains by class: `403` names who may do it, `422` opens the panel on the missing field, `409` says the card already moved and refetches the board. Each card's moves are numbered so a slow response to an older drag can't overwrite a newer one.
 
-## 📊 Observability
+**On the server.** Permission check from the cached set; then the rule order: the transition must start from the current status, conditions decide *may this user*, validators decide *is the issue ready*. Then one transaction: `UPDATE … SET status_id = …, version = version + 1 WHERE id = … AND version = <read>`, the history row, post-function field changes with their own history, and the outbox row. If the update matches zero rows, the server re-reads and re-evaluates — if Bob reassigned the issue, an "only the assignee" condition now gives a different answer, which is the point.
 
-Beyond standard RED metrics, the signals specific to this system:
+| Approach | Verdict |
+|----------|---------|
+| ✅ Optimistic UI + server compare-and-swap + structured refusals | Instant, never wrong for long, always explained |
+| ❌ Client evaluates workflow rules | Two implementations of every admin-written rule; the client's drifts |
+| ❌ Server locks the row while evaluating rules | Locks held across rule evaluation; bulk moves serialize |
+| ❌ Generic error toast | `403` and `422` need different user actions; string matching breaks |
 
-- **Transition counter by (workflow, transition, outcome)** — a spike in 422s after a workflow edit means an admin published a rule that blocks real work, and it's otherwise invisible
-- **Index lag** — time from commit to searchable, as the SLO backing the freshness target
-- **Queue depth per consumer** — separates "indexer is slow" from "RabbitMQ is down"
-- **Permission cache hit rate** — a drop signals an invalidation storm, which precedes a Postgres load spike
+"The available-transitions list and the execution check run the same rules twice, on purpose: once to decide what to draw, once to decide what happens. If the list were authoritative, anyone with a terminal could bypass it — and the honest client would still be wrong whenever a rule changed between fetching the list and acting."
 
-## 📈 Scalability: What Breaks First
+**What I give up.** For a moment the board shows something the server may refuse. Refusals here are reproducible (the same user is refused every time), which is exactly why they must be explained rather than silently reverted.
 
-1. **Board queries under read amplification** — at 100:1 reads, board loads dominate. Fix: cache computed board state per (project, sprint), invalidated on issue writes for that project.
-2. **The `issues` table** — grows without bound and is hot. Fix: read replicas first, then partition by project; project is in essentially every query, so it's a natural boundary.
-3. **`issue_history`** — grows fastest of anything (a row per field per change) and is read rarely. Fix: time-partition and archive cold partitions.
-4. **Single indexer consumer** — becomes the bottleneck during bulk operations. Fix: partition the queue by project id so ordering per issue is preserved while throughput scales.
-5. **Bulk transitions** — "move 800 issues to Done" can't be a synchronous request. Fix: enqueue as a job, return a job id, report progress.
+---
 
-## ⚖️ Trade-offs Summary
+## 🔧 Deep Dive 2: Two People, One Issue (7 min)
 
-| Decision | Chosen | Alternative | Rationale |
-|----------|--------|-------------|-----------|
-| Workflow definition | Data in Postgres | Code | Admins reconfigure without a deploy |
-| Concurrency | Version + 409 | Pessimistic locks | Locks would be held across rule evaluation |
-| Post-functions | After commit | Inside transaction | Never hold row locks across third-party I/O |
-| Search store | Elasticsearch | Postgres FTS | Relevance, arbitrary predicates, aggregations |
-| Event payloads | Ids only | Full issue | DB stays authoritative; stale events can't write stale data |
-| Index freshness | Eventual + client-side seam | Synchronous index | Keeps writes fast; hides lag where it's felt |
-| Real-time | Focus refresh → pushed events | Polling | Polling scales with idle tabs, not activity |
-| Permission cache | Eager revoke, lazy grant | Uniform TTL | Slow revoke is a security incident |
-| Custom fields | JSONB column | EAV tables | No join per issue; serializes cleanly to the index |
-| Client rejection UX | Branch by error class | Generic toast | 403 and 422 demand different user actions |
+```
+ Alice    Bob                                Issue API                                 PostgreSQL
+   │       │                                     │                                          │
+   │ 1 GET /issues/DEMO-5                        │                                          │
+   │────────────────────────────────────────────▶│                                          │
+   │ 2 200, ETag "7"                             │                                          │
+   │◀────────────────────────────────────────────│                                          │
+   │       │ 3 GET /issues/DEMO-5                │                                          │
+   │       │────────────────────────────────────▶│                                          │
+   │       │ 4 200, ETag "7"                     │                                          │
+   │       │◀────────────────────────────────────│                                          │
+   │ 5 PATCH priority, If-Match "7"              │                                          │
+   │────────────────────────────────────────────▶│                                          │
+   │       │                                     │ 6 lock row; UPDATE version 8 + history   │
+   │       │                                     │─────────────────────────────────────────▶│
+   │ 7 200, ETag "8"                             │                                          │
+   │◀────────────────────────────────────────────│                                          │
+   │       │ 8 PATCH summary, If-Match "7"       │                                          │
+   │       │────────────────────────────────────▶│                                          │
+   │       │                                     │ 9 lock row: version is 8, write nothing  │
+   │       │                                     │─────────────────────────────────────────▶│
+   │       │ 10 412 + current issue (version 8)  │                                          │
+   │       │◀────────────────────────────────────│                                          │
+   │       │                                     │                                          │
+```
 
-## 🚀 Closing
+**Server.** Every issue carries `version`, returned as `ETag`. `PATCH` with `If-Match: "7"` locks the row for the write, compares, and either applies the change with history and `version = 8`, or writes nothing and answers `412` with the current issue. Status can't be changed through `PATCH` at all — only transitions — so the edit path can't bypass the workflow.
 
-"The spine of this design is that PostgreSQL owns truth and everything else is derived, cached, or advisory. That's what makes the async fan-out safe to be best-effort, what lets Elasticsearch be rebuilt at will, and what lets the client be aggressively optimistic without risking divergence — it always reconciles against something authoritative.
+**Client.** Every save sends the version on screen. On `412` the panel swaps in the current issue, keeps the user's draft in the editor, and says what happened. Discrete fields save on change; text saves on blur or Enter, never per keystroke, because each save writes audit history.
 
-The piece I'd build next is pushed issue events, and the reason is fullstack rather than backend or frontend: the server already publishes exactly the right events for indexing, and the client already merges server-shaped issue records on every optimistic reconcile. The gap between those two facts is a delivery layer, not a redesign — which is mostly a consequence of having drawn the client/server contract around issue records rather than around screens."
+| Approach | Verdict |
+|----------|---------|
+| ✅ Version + `If-Match` → `412` with the current issue | No silent loss; the person with context decides |
+| ❌ Last write wins | Bob's change erases Alice's, and the history looks normal |
+| ❌ Field-level merge on the server | Works for discrete fields, corrupts free text; needs a merge policy per field |
+| ❌ Edit locks | Held across think time; need expiry and "unlock" buttons |
+
+"Idempotency and versions solve different problems and I need both. A retried request with the same idempotency key should replay its original result; a genuinely different request based on an old version should get `412`. Without the key, a retry after a lost response would hit `412` against its own first write and confuse the user."
+
+---
+
+## 🔧 Deep Dive 3: Order and Freshness (7 min)
+
+### Board order
+
+Each issue has a short base-36 rank key, compared byte-wise, one order per project. The client sends intent — `PUT /rank {afterId: 17}` — and the server reads 17's key and the next key after it inside the transaction, picks a key between them, and writes one row. Two drops into the same gap compute the same key; a unique index on `(project_id, rank)` rejects one, which re-reads and retries. The client moves the card at once and, on failure, sorts the list by rank, which undoes the move because the card still carries its old key.
+
+| Approach | Verdict |
+|----------|---------|
+| ✅ Server-computed fractional keys, client sends `afterId` | One-row moves; works from a stale board |
+| ❌ Integer positions | A drag rewrites every card below; concurrent drags conflict |
+| ❌ Client computes keys | Two implementations of ordering; collisions resolved nowhere |
+
+### Search lag
+
+Search is fed by the outbox, so it lags writes by a few seconds. The UI never re-queries search to confirm a write it just made: the write response updates the board and the panel directly. The lag is a backend property, closed on the client — neither side could hide it alone.
+
+### Live updates
+
+The realtime gateway consumes the same `issue.events` and pushes `{seq, issueId, version}` to open boards. The client applies an event only if its version is newer than the cached issue, so an event that crosses Alice's own write can't regress her card. After a reconnect the socket resumes from its last sequence; if the gateway no longer holds those events, the client refetches the board. The gateway doesn't echo events to the tab that caused them: that tab already has the write response.
+
+"What I give up: a WebSocket connection per open board, and a resume window to operate. Polling would be simpler, but load would scale with idle tabs instead of with changes, and planning sessions are when people notice staleness most."
+
+### Permissions across the stack
+
+The server checks a project permission on every request, from a cache whose entries are tagged with a per-project generation that any membership change bumps, so revocation applies on the next request. The client fetches the user's permissions per project only to hide controls — drag handles for viewers, edit fields — and still handles a `403` gracefully. Search applies the same rule as a mandatory filter, so the search box can't surface an issue the issue page would refuse.
+
+---
+
+## 📈 Failures & Scale (3 min)
+
+| Failure | What the user sees | What the system does |
+|---------|--------------------|----------------------|
+| Elasticsearch down | "Search is temporarily unavailable"; boards and issues work | `503`; boards read PostgreSQL |
+| RabbitMQ down | Teammates' changes stop appearing live; search lags | Outbox rows wait; writes keep committing |
+| Redis down | Slower pages; maybe a re-login | Permissions computed from PostgreSQL, never "allow" |
+| Transition refused | Card slides back with the reason | `403` / `409` / `422` with code and field |
+| Edit conflict | Current values shown; draft kept | `412` with the current issue |
+| Timeout on create | Retry button; no duplicate issue | Same idempotency key replays the `201` |
+
+**What breaks first as we grow:** permission checks if the cache hit ratio drops; board reads (replicas, cached board queries); `issue_history` growth (monthly partitions); then the write primary (shard by project — every core table is project-scoped). On the client: very large boards (cap columns, virtualize the backlog) and long-lived tabs (live channel resume).
+
+---
+
+## ⚖️ Trade-offs & Wrap-up (2 min)
+
+| Decision | ✅ Chosen | ❌ Alternative | Why |
+|----------|-----------|----------------|-----|
+| Drags | Optimistic UI + server compare-and-swap | Wait for the server, or client-side rules | Instant, correct, explained |
+| Refusals | Structured codes with fields | Generic errors | Each needs a different user action |
+| Concurrent edits | `If-Match` → `412`, keep drafts | Last write wins | No silent loss |
+| Retries | Idempotency key per intent | Disable the button | Covers timeouts and automation |
+| Order | Server rank keys, client sends `afterId` | Integer positions | One-row moves, one source of truth |
+| Search freshness | Outbox + render from write responses | Synchronous indexing | Writes stay fast; lag hidden where it's felt |
+| Live updates | WebSocket events with versions and resume | Polling | Load follows changes, not tabs |
+
+"With more time I'd add bulk moves as background jobs reporting per-issue results, offline queuing of edits with the same idempotency keys, and a workflow editor that validates definitions before they're saved."
