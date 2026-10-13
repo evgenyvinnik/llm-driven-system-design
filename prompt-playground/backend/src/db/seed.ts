@@ -374,8 +374,19 @@ async function seed(): Promise<void> {
       const v = p.versions[p.versions.length - 1]
       const comparisonId = randomUUID()
       const at = new Date(now - 40 * 60_000)
-      for (const config of [CONFIGS[0], CONFIGS[2]]) {
-        await insertRun(client, { workspaceId: acme, ...triage, system: v.system, template: v.template, inputs: p.inputs[0], config, userId: users.alice, createdAt: at, status: 'completed', comparisonId })
+      for (const [i, config] of [CONFIGS[0], CONFIGS[2]].entries()) {
+        await insertRun(client, {
+          workspaceId: acme,
+          ...triage,
+          system: v.system,
+          template: v.template,
+          inputs: p.inputs[0],
+          config,
+          userId: users.alice,
+          createdAt: new Date(at.getTime() + i),
+          status: 'completed',
+          comparisonId,
+        })
       }
       const shared = await client.query<{ id: string }>(
         `SELECT id FROM runs WHERE prompt_id = $1 AND status = 'completed' AND model = 'sim-quality' ORDER BY created_at DESC LIMIT 1`,

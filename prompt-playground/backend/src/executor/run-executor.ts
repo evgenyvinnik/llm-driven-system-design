@@ -176,7 +176,10 @@ export async function executeRun(runId: string, executorId: string, inFlight: Ma
         )) {
           if (event.type === 'token') {
             if (outputTokens === 0) {
-              await pool.query('UPDATE runs SET first_token_at = now() WHERE id = $1 AND attempt = $2', [runId, attempt])
+              await pool.query(
+                `UPDATE runs SET first_token_at = now() WHERE id = $1 AND attempt = $2 AND status = 'running'`,
+                [runId, attempt],
+              )
               runTtftSeconds.observe({ model: run.model }, (Date.now() - run.started_at.getTime()) / 1000)
             }
             lastTokenAt = Date.now()

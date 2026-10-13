@@ -26,7 +26,10 @@ export const RUN_QUEUE_GROUP = 'executors'
 /** Pub/sub channel the API uses to tell the owning executor to abort a run. */
 export const RUN_CANCEL_CHANNEL = 'runs:cancel'
 
-export const runEventsKey = (runId: string) => `run:${runId}:events`
+// The {runId} hash tag keeps a run's keys in one cluster slot, so the Lua
+// script below can touch both atomically on a Valkey/Redis cluster.
+export const runEventsKey = (runId: string) => `run:{${runId}}:events`
+const runEndedKey = (runId: string) => `run:{${runId}}:ended`
 
 export interface RunUsage {
   inputTokens: number | null
@@ -50,12 +53,31 @@ export type RunEvent =
       at: string
     }
 
-export async function appendRunEvent(redis: Redis, runId: string, event: RunEvent): Promise<string> {
-  const key = runEventsKey(runId)
+/**
+ * Appends to the run's stream unless the run has already ended. The first
+ * `end` event closes the stream for good, so an executor that wakes up after
+ * the sweeper failed its run cannot add output after the end, and a run can
+ * never get two different endings. Returns null when the append was refused.
+ */
+const APPEND_SCRIPT = `
+if redis.call('EXISTS', KEYS[2]) == 1 then return false end
+if ARGV[1] == 'end' then redis.call('SET', KEYS[2], '1', 'EX', ARGV[3]) end
+local id = redis.call('XADD', KEYS[1], '*', 'type', ARGV[1], 'data', ARGV[2])
+if ARGV[1] == 'end' then redis.call('EXPIRE', KEYS[1], ARGV[3]) end
+return id`
+
+export async function appendRunEvent(redis: Redis, runId: string, event: RunEvent): Promise<string | null> {
   const { type, ...data } = event
-  const id = await redis.xadd(key, '*', 'type', type, 'data', JSON.stringify(data))
-  if (type === 'end') await redis.expire(key, config.eventStreamTtlSeconds)
-  return id as string
+  const id = await redis.eval(
+    APPEND_SCRIPT,
+    2,
+    runEventsKey(runId),
+    runEndedKey(runId),
+    type,
+    JSON.stringify(data),
+    String(config.eventStreamTtlSeconds),
+  )
+  return (id as string | null) ?? null
 }
 
 /** Rings the doorbell. Trimmed approximately so the queue stream never grows without bound. */

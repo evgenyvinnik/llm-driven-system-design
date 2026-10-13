@@ -25,11 +25,14 @@ const startedAt = new Date().toISOString()
 let stopping = false
 let wakeLoop: (() => void) | null = null
 
-try {
-  await redis.xgroup('CREATE', RUN_QUEUE_STREAM, RUN_QUEUE_GROUP, '0', 'MKSTREAM')
-} catch (err) {
-  if (!String((err as Error).message).includes('BUSYGROUP')) throw err
+async function ensureGroup() {
+  try {
+    await redis.xgroup('CREATE', RUN_QUEUE_STREAM, RUN_QUEUE_GROUP, '0', 'MKSTREAM')
+  } catch (err) {
+    if (!String((err as Error).message).includes('BUSYGROUP')) throw err
+  }
 }
+await ensureGroup()
 
 // Cancel signals: the API publishes a run ID; only the executor running it acts.
 const subscriber = createRedisConnection('cancel-subscriber')
@@ -91,6 +94,13 @@ async function pullLoop() {
       }
     } catch (err) {
       if (stopping) break
+      // A Valkey restart without persistence drops the consumer group; recreate it.
+      // Runs enqueued meanwhile are still 'queued' in PostgreSQL and the sweeper re-enqueues them.
+      if (String((err as Error).message).includes('NOGROUP')) {
+        logger.warn('queue consumer group missing; recreating')
+        await ensureGroup().catch(() => undefined)
+        continue
+      }
       logger.warn({ err }, 'queue read failed; retrying')
       await new Promise((resolve) => setTimeout(resolve, 1000))
     }

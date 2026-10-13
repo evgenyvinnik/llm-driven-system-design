@@ -95,7 +95,7 @@ runsRouter.get(
       `${RUN_SELECT}
          JOIN workspace_members m ON m.workspace_id = r.workspace_id AND m.user_id = $2
         WHERE r.comparison_id = $1
-        ORDER BY r.created_at`,
+        ORDER BY r.created_at, r.id`,
       [comparisonId, req.user!.id],
     )
     if (rows.length === 0) throw new HttpError(404, 'NOT_FOUND', 'Comparison not found')
