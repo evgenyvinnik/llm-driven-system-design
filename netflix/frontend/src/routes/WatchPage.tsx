@@ -64,7 +64,7 @@ export function WatchPage() {
   }
 
   // Determine title and subtitle
-  let title = video.title;
+  const title = video.title;
   let subtitle: string | undefined;
 
   if (episode) {

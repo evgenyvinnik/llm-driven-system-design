@@ -6,7 +6,7 @@ INSERT INTO accounts (id, email, password_hash, subscription_tier, country)
 VALUES (
     'a0000000-0000-0000-0000-000000000001',
     'demo@netflix.local',
-    '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', -- password: demo123
+    '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', -- password: password123
     'premium',
     'US'
 );
@@ -122,3 +122,13 @@ INSERT INTO experiments (id, name, description, allocation_percent, variants, ta
  NOW() - INTERVAL '7 days',
  NOW() + INTERVAL '23 days'
 );
+
+-- Episode rows carry their series in video_id (Continue Watching groups by title,
+-- genre rows read series completions). Same backfill as init.sql.
+UPDATE viewing_progress vp SET video_id = s.video_id
+FROM episodes e JOIN seasons s ON s.id = e.season_id
+WHERE vp.episode_id = e.id AND vp.video_id IS NULL;
+
+UPDATE watch_history wh SET video_id = s.video_id
+FROM episodes e JOIN seasons s ON s.id = e.season_id
+WHERE wh.episode_id = e.id AND wh.video_id IS NULL;

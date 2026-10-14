@@ -1,500 +1,276 @@
-# Design Netflix - Fullstack System Design Answer
+# 🎬 Netflix — System Design Answer (Full-Stack Focus)
 
-## 45-Minute Interview Format - Fullstack Engineering Focus
+*45-minute full-stack interview. This is a proposed production design; what this repository actually runs is described in [architecture.md → Implementation Notes](./architecture.md#implementation-notes).*
 
----
+> "As a full-stack engineer I want to follow one evening of viewing end to end — pick a profile, browse, press Play, stop halfway, finish on another device — and get the contracts between the player and the backend right. Three contracts carry the weight: a playback session that says yes or no exactly once and hands the player signed URLs, a progress report stamped with the time the player saw that position so late reports can never move you backwards, and a profile scope that both the server's queries and the client's caches respect."
 
-## Introduction (2 minutes)
-
-"Thanks for having me. I'll design Netflix as a fullstack system, focusing on how the frontend and backend integrate to deliver seamless video streaming, personalized browsing, and cross-device continuity.
-
-Key integration challenges include:
-1. **Streaming manifest flow** from CDN to player with quality selection
-2. **Progress synchronization** for Continue Watching across devices
-3. **Personalization pipeline** from viewing history to homepage rows
-4. **A/B testing** that spans both frontend and backend
-
-Let me walk through the end-to-end architecture."
+| Phase | Time | What I want the interviewer to leave with |
+|-------|------|--------------------------------------------|
+| Requirements & scale | 5 min | Scope and targets on both sides of the wire |
+| End-to-end architecture | 8 min | One diagram from the player to the CDN and back, plus the core flows |
+| Data model & API contract | 7 min | Server stores, client state, and the fields both sides rely on |
+| Deep dive 1: pressing Play | 8 min | Session, entitlement and screen limits, and what the UI does with each answer |
+| Deep dive 2: a resume point that never goes backwards | 8 min | Heartbeats, timestamps, exit flushes, last writer wins |
+| Deep dive 3: profile-scoped personalization | 6 min | Maturity, caches on both sides, My List |
+| Failures, scale, wrap-up | 3 min | What each failure looks like to a member |
 
 ---
 
-## Requirements Clarification (3 minutes)
+## 🎯 Requirements & Scale (5 min)
 
-### Functional Requirements
+**Functional.** Members pick a profile, browse a personalized homepage, search, open a title, and play a movie or episode with quality that adapts to the network. Playback resumes where the profile stopped, on any device. Profiles have maturity levels; plans cap resolution (720p/1080p/4K) and screens (1/2/4). Members keep a My List. Out of scope: billing, offline downloads, live events, encoding tools.
 
-"Fullstack scope:
+| Side | Requirement | Target |
+|------|-------------|--------|
+| Frontend | Time to first frame | p95 < 2 s after pressing Play |
+| Frontend | Browse | LCP < 2.5 s on a mid-range TV; 60 fps row scrolling; INP < 200 ms |
+| Frontend | Rebuffering | < 0.5% of viewing time |
+| Backend | Playback start | Entitlement + manifest + license < 200 ms server-side |
+| Backend | Homepage | p99 < 300 ms server-side |
+| Both | Resume | Within one heartbeat of where you stopped; never backwards |
+| Both | Safety | A kids profile never receives a restricted title, URL or license |
 
-1. **Streaming Pipeline**: Manifest generation, CDN URL signing, player integration
-2. **Progress Tracking**: Real-time position updates, cross-device resume
-3. **Personalized Homepage**: Backend row generation, frontend rendering
-4. **A/B Testing**: Consistent allocation, feature flags, experiment tracking
-5. **Profile System**: Multi-profile accounts with maturity filtering"
+**Scale.** About 300M accounts and 750M profiles; 15M concurrent streams at peak, which is roughly 75 Tbps of video and — with a heartbeat every 30 seconds — 500K position writes a second. Homepage loads peak around 100K a second.
 
-### Non-Functional Requirements
-
-"Cross-cutting concerns:
-
-- **Playback Start**: < 2 seconds end-to-end
-- **Progress Sync**: < 5 second latency for cross-device updates
-- **Homepage Load**: < 1 second for personalized content
-- **Consistency**: Same user always sees same experiment variant"
+"Those numbers split the design in two. Video bytes must come from a CDN inside internet providers, and the API must never be on the path of a segment. And the heartbeat write must be blind — no read before write — so the client has to send enough information for the server to order writes without looking."
 
 ---
 
-## End-to-End Architecture (5 minutes)
+## 🏗️ End-to-End Architecture (8 min)
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                          Frontend (React)                                    │
-├─────────────────┬─────────────────┬─────────────────────────────────────────┤
-│   VideoPlayer   │   BrowsePage    │              ProfilePage                │
-│   + ABR Logic   │   + VideoRows   │              + Settings                 │
-└────────┬────────┴────────┬────────┴─────────────────┬───────────────────────┘
-         │                 │                          │
-         └─────────────────┼──────────────────────────┘
-                           │
-         ┌─────────────────┴─────────────────┐
-         │          Zustand Stores            │
-         │  authStore │ browseStore │ player  │
-         └─────────────────┬─────────────────┘
-                           │
-         ┌─────────────────┴─────────────────┐
-         │         API Service Layer          │
-         │  streaming.ts │ browse.ts │ etc.   │
-         └─────────────────┬─────────────────┘
-                           │ HTTP/REST
-                           ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                          Backend (Express)                                   │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                           API Gateway                                        │
-│              Authentication │ Rate Limiting │ Routing                        │
-├───────────────────┬───────────────────┬─────────────────────────────────────┤
-│  Playback Service │  Personalization  │          Experiment Service          │
-│  - Manifest       │  - Homepage       │          - Allocation                │
-│  - Progress       │  - Ranking        │          - Metrics                   │
-│  - CDN URLs       │  - My List        │          - Analysis                  │
-└─────────┬─────────┴─────────┬─────────┴──────────────────┬──────────────────┘
-          │                   │                            │
-          └───────────────────┼────────────────────────────┘
-                              │
-         ┌────────────────────┴────────────────────┐
-         │              Data Layer                  │
-         ├──────────────────────────────────────────┤
-         │  PostgreSQL (catalog, profiles, exps)   │
-         │  Cassandra (progress, watch history)    │
-         │  Redis (sessions, cache, rate limits)   │
-         │  MinIO (video segments, manifests)      │
-         └─────────────────────────────────────────┘
+ ┌────────────────────────────┐                                 ┌────────────────────────────────┐
+ │ Web app (React SPA)        │  GET segments (signed URLs)     │ Open Connect CDN               │
+ │ query cache · player       ├────────────────────────────────▶│ appliances inside ISPs         │
+ │ MSE + EME (DRM)            │                                 │ video segments on disk         │
+ └────────────┬───────────────┘                                 └────────────────────────────────┘
+              │ (1) GET /homepage   (2) POST /playback                            ▲
+              │ (3) POST /progress every 10 s                                     │ fill nightly
+              ▼                                                                   │
+ ┌────────────────────────────────────────────────────────────┐   ┌───────────────┴───────────────┐
+ │ API gateway · session check · routing · rate limits        │   │ Encoding pipeline + S3 origin │
+ └────────────┬────────────────────────────────────────────┬──┘   │ transcode · package · encrypt │
+              │ (1)                                (2) (3) │      └───────────────────────────────┘
+              │                                            │
+              ▼                                            ▼
+ ┌─────────────────────────┐     ┌────────────────────────────────────────────────────┐
+ │ Homepage API            │     │ Playback API                                       │
+ │ rows · search           │     │ entitlement · manifest · stream slots              │
+ │ A/B layout              │     │ DRM licenses · progress writes                     │
+ └──────┬───────────────┬──┘     └──────┬───────────────────┬─────────────────────┬───┘
+        │ GET rows      │ in-progress   │ (3) LWW write     │ slot lease          │ (3) event
+        │               │               │                   │                     │
+        ▼               ▼               ▼                   ▼                     ▼
+ ┌─────────────────┐  ┌────────────────────────────┐  ┌───────────────┐  ┌─────────────────┐
+ │ EVCache         │  │ Cassandra                  │  │ Redis         │  │ Kafka           │
+ │ rows · catalog  │  │ progress · viewing history │  │ stream slots  │  │ playback-events │
+ └───┬─────────────┘  └────────────────────────────┘  └───────────────┘  └────────┬────────┘
+     │ miss      ▲                           ▲                                    │ consume
+     ▼           │ ranked rows, hourly       │ append views                       │
+ ┌────────────┐  │                           │                                    ▼
+ │ PostgreSQL │ ┌───────────────────────────────────────────────────────────────────────────┐
+ │ accounts   │ │ Recommendation + history pipeline · Flink stream jobs, Spark batch        │
+ │ catalog    │ │ completions → viewing history · features → ranked rows per profile        │
+ └────────────┘ └───────────────────────────────────────────────────────────────────────────┘
 ```
+
+1. **Browse (1).** The SPA asks for the selected profile's homepage. The Homepage API reads precomputed ranked rows from EVCache, merges Continue Watching from Cassandra, filters by maturity, and returns title ids and artwork; the SPA's query cache keys everything by profile.
+2. **Play (2).** The player creates a playback session. The Playback API checks maturity, region and plan, claims a screen in Redis, reads the resume point and returns a manifest of signed segment URLs; the player then fetches segments from an Open Connect appliance, not from us.
+3. **Heartbeat (3).** While playing, the player posts `{position, timestamp, session}` every 10–30 seconds and on pause and exit. The server keeps the newest position by timestamp, renews the screen lease, and emits an event that stream jobs turn into history and recommendations.
+
+| Layer | Choice | Why |
+|-------|--------|-----|
+| Web app | React SPA; TanStack Query for server state; a small player store | Authenticated app, no SEO; query cache handles dedupe, retries and profile-scoped invalidation |
+| Player | MSE for segments, EME for DRM, ABR picker | Segment-by-segment quality switching; keys never touch JavaScript |
+| Playback API | Stateless; sessions, entitlement, licenses, heartbeats | The one place that says "yes, play" |
+| Homepage API | Stateless; reads precomputed rows | Ranking can't happen at 100K requests a second |
+| Cassandra | Resume positions and history, by profile | 500K blind writes a second |
+| Redis | Screen leases | Atomic acquire-or-renew script |
+| Open Connect | Segments | Appliances inside ISPs; verifies URL tokens locally |
+
+### Flow: pressing Play across the wire
+
+```
+User              Player (SPA)                  Playback API          Redis    CDN
+  │                     │                             │                 │       │
+  │ 1 click Play        │                             │                 │       │
+  │────────────────────▶│                             │                 │       │
+  │                     │ 2 POST /playback            │                 │       │
+  │                     │────────────────────────────▶│                 │       │
+  │                     │                             │ 3 acquire slot  │       │
+  │                     │                             │────────────────▶│       │
+  │                     │ 4 201 manifest | 403 | 409  │                 │       │
+  │                     │◀────────────────────────────│                 │       │
+  │                     │ 5 pick rung by bandwidth    │                 │       │
+  │                     │ 6 GET segment?token                                   │
+  │                     │──────────────────────────────────────────────────────▶│
+  │                     │ 7 media bytes                                         │
+  │                     │◀──────────────────────────────────────────────────────│
+  │ 8 resumes at 41:20  │                             │                 │       │
+  │◀────────────────────│                             │                 │       │
+  │                     │                             │                 │       │
+```
+
+"Step 4 is a three-way contract the UI has to handle: `201` with a manifest, `403 maturity_restricted` with a 'not available on this profile' screen, or `409 stream_limit` with 'your plan allows 2 screens — stop playback on another device'. Step 5 happens in the player, not on the server: the manifest lists every rendition the plan allows, and the player chooses per segment."
+
+### Flow: heartbeats and leaving
+
+```
+Player (SPA)                    Playback API                Cassandra
+      │                               │                         │
+      │ 1 every 10 s: {pos, ts, sid}  │                         │
+      │──────────────────────────────▶│                         │
+      │                               │ 2 write if ts is newer  │
+      │                               │────────────────────────▶│
+      │ 3 200 {applied, lease}        │                         │
+      │◀──────────────────────────────│                         │
+      │ 4 retry: same {pos, ts}       │                         │
+      │──────────────────────────────▶│                         │
+      │ 5 200 {applied: false}        │                         │
+      │◀──────────────────────────────│                         │
+      ······················· tab closed ························
+      │ 6 final pos (keepalive)       │                         │
+      │──────────────────────────────▶│                         │
+      │ 7 DELETE /sessions/{sid}      │                         │
+      │──────────────────────────────▶│                         │
+      │                               │                         │
+```
+
+"Steps 4 and 5 are why I can retry heartbeats blindly: the retry carries the original timestamp, so the server sees nothing newer and answers `applied: false`. Steps 6 and 7 are the exit path. A normal `fetch` is cancelled when the tab closes, so both requests use `keepalive`, and the final report omits the session id so it doesn't renew the screen it's about to free."
 
 ---
 
-## Deep Dive: Streaming Pipeline (12 minutes)
+## 💾 Data Model & API Contract (7 min)
 
-### Manifest Generation and Delivery
+### Server side
 
-"The streaming flow connects backend manifest generation with frontend ABR:"
+| Store | Table / key | Key columns | Notes |
+|-------|-------------|-------------|-------|
+| PostgreSQL | `accounts`, `profiles` | plan; `maturity_level`, `is_kids` | Plan drives ladder cap and screen limit |
+| PostgreSQL | `titles`, `episodes` | `maturity_level`, `genres`; `(title_id, season, number)` | Cached in EVCache |
+| Cassandra | `viewing_progress` | partition `profile_id`; clustering `(title_id, content_id)` | Write timestamp = client's position time |
+| Cassandra | `viewing_history` | partition `profile_id`; clustering `(watched_at, content_id)` | One row per completed view, replay-safe |
+| Redis | `streams:{account_id}` | session → lease expiry | Screen leases |
+| EVCache | `rows:{profile_id}:v{n}` | ranked rows | Version bumped by My List and profile edits |
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                    GET /stream/:videoId/manifest                             │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  1. Authenticate request (session check)                                    │
-│                                                                              │
-│  2. Fetch video metadata from PostgreSQL                                    │
-│     └── Return 404 if not found                                             │
-│                                                                              │
-│  3. Check maturity level against profile                                    │
-│     ├── Map rating: G=1, PG=2, PG-13=3, R=4, TV-MA=5                        │
-│     └── Return 403 if video rating > profile maturity                       │
-│                                                                              │
-│  4. Generate manifest with signed CDN URLs                                  │
-│     ┌───────────────────────────────────────────────────────────────────┐   │
-│     │  Quality Levels:                                                   │   │
-│     │  ├── 4K:    15 Mbps, 3840x2160                                    │   │
-│     │  ├── 1080p: 5.8 Mbps, 1920x1080                                   │   │
-│     │  ├── 720p:  3 Mbps, 1280x720                                      │   │
-│     │  ├── 480p:  1 Mbps, 854x480                                       │   │
-│     │  └── 360p:  560 Kbps, 640x360                                     │   │
-│     │                                                                    │   │
-│     │  Each source gets signed URL with 1-hour expiry (JWT)             │   │
-│     └───────────────────────────────────────────────────────────────────┘   │
-│                                                                              │
-│  5. Fetch resume position from Cassandra                                    │
-│                                                                              │
-│  6. Track streaming start for analytics                                     │
-│                                                                              │
-│  7. Return: { manifest, resumePosition, video: { title, duration } }        │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+### Client side
 
-### Frontend ABR Controller
+| State | Owner | Notes |
+|-------|-------|-------|
+| `['home', profileId]`, `['title', id]`, `['search', profileId, q]` | TanStack Query | Every key includes the profile, so a profile switch can never show the previous profile's data |
+| Playback session, current position, lease state | Player store (Zustand) | Updated four times a second; components subscribe to slices |
+| Selected profile and its maturity | Session store, filled from `/me` | Display only — the server enforces maturity |
+| Title, episode, timestamp to resume at | URL (`/watch/$id?episode=&t=`) | Deep links and back/forward work |
 
-"The frontend consumes the manifest and handles quality switching:"
+### The contract
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                      useAdaptiveBitrate Hook                                 │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  State:                                                                      │
-│  ├── currentQuality: string ('auto' or specific quality)                    │
-│  └── bandwidthEstimate: number (initial 5 Mbps)                             │
-│                                                                              │
-│  measureBandwidth(downloadTime, bytes):                                     │
-│  ├── Calculate instant bandwidth: (bytes * 8) / downloadTime                │
-│  └── Apply exponential moving average: prev * 0.7 + instant * 0.3           │
-│                                                                              │
-│  selectQuality():                                                           │
-│  ├── If currentQuality !== 'auto' ──▶ return current                        │
-│  ├── Calculate buffer level from video element                              │
-│  ├── Filter sources by bandwidth * 0.8 (headroom)                           │
-│  ├── Sort by bitrate descending                                             │
-│  ├── If buffer < 5s ──▶ use conservative 0.5x threshold                     │
-│  └── Return highest sustainable quality                                     │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
+POST   /api/v1/playback                 {title_id, episode_id?} → 201 | 403 | 409
+POST   /api/v1/playback/{sid}/progress  {position_s, duration_s, ts} → 200 {applied, lease}
+DELETE /api/v1/playback/{sid}           → 204 (sent with keepalive on exit)
+GET    /api/v1/homepage                 rows for the session's profile
+PUT    /api/v1/my-list/{title_id}       idempotent add (DELETE removes)
+GET    https://{oca}/…/{segment}?t=…    signed segment URL
 ```
 
-### Progress Synchronization
-
-"Progress updates flow from player to backend with debouncing:"
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                    Frontend: playerStore.saveProgress()                      │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  1. Check if moved >= 10 seconds since last save                            │
-│     └── Skip if delta < 10 seconds                                          │
-│                                                                              │
-│  2. Debounce: Clear existing timeout, set new 2-second timer                │
-│                                                                              │
-│  3. POST /api/stream/progress { videoId, position, duration }               │
-│                                                                              │
-│  4. Update lastSavedPosition on success                                     │
-│     └── Retry on next update if failed                                      │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                    Backend: POST /stream/progress                            │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  1. Determine completion: position / duration > 0.95                        │
-│                                                                              │
-│  2. Upsert to Cassandra viewing_progress table:                             │
-│     ├── profile_id, content_id, position_seconds, duration_seconds          │
-│     ├── progress_percent, completed (boolean), last_watched_at              │
-│     └── High-write workload - Cassandra handles scale                       │
-│                                                                              │
-│  3. If completed:                                                           │
-│     ├── Add to watch_history table                                          │
-│     └── Increment genre_preferences counter for each genre                  │
-│                                                                              │
-│  4. Invalidate homepage cache: redis.del(`homepage:${profileId}`)           │
-│                                                                              │
-│  5. Return { saved: true, completed }                                       │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+| Contract element | The server guarantees | The client relies on it to |
+|------------------|----------------------|----------------------------|
+| Playback session | One entitlement decision; a ladder already capped by plan; URLs valid for hours | Render the quality menu from the manifest without knowing plan rules |
+| `403` / `409` codes | Machine-readable reason, screen count and limit | Show the right message instead of a generic error |
+| `ts` on progress | Newest position by `ts` wins; equal or older is a no-op | Retry and flush freely, from any device |
+| `applied` | Tells whether this write changed the stored position | Ignore stale responses; no rollback needed |
+| `lease.active` | False once another device took the last screen | Pause and explain, instead of playing on |
+| Profile in the session | Every response is filtered for that profile | Treat a profile switch as a cache boundary |
 
 ---
 
-## Deep Dive: Personalization Pipeline (10 minutes)
+## 🔧 Deep Dive 1: Pressing Play (8 min)
 
-### Homepage Row Generation
+"Pressing Play is where the most rules meet, and where a wrong answer is either a safety bug or a member locked out of the plan they pay for."
 
-"Backend generates personalized rows, frontend renders them:"
+**Server.** The Playback API loads the profile with its plan, and the title with its rating and regional availability. It checks maturity, region, and that the requested episode belongs to the requested series — otherwise a harmless series id in the path could carry a restricted episode id in the body. Then it claims a screen: an atomic script on the account's sorted set of sessions removes expired leases, renews this session if present, and admits a new one only under the plan's limit. The manifest's ladder is filtered by plan, and every segment URL is signed with an HMAC over session, title, rendition and expiry, which appliances verify without calling us.
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                    GET /browse/homepage                                      │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  1. Check Redis cache: `homepage:${profileId}`                              │
-│     └── Return cached JSON if found                                         │
-│                                                                              │
-│  2. Fetch profile for maturity filtering                                    │
-│                                                                              │
-│  3. Generate rows in parallel (Promise.all):                                │
-│     ├── getContinueWatching(profileId)                                      │
-│     ├── getTrending(language)                                               │
-│     ├── getTopGenres(profileId)                                             │
-│     ├── getRecentlyWatched(profileId)                                       │
-│     └── getMyList(profileId)                                                │
-│                                                                              │
-│  4. Assemble rows array:                                                    │
-│     ┌───────────────────────────────────────────────────────────────────┐   │
-│     │  Row Order (if non-empty):                                         │   │
-│     │  1. Continue Watching (always first)                               │   │
-│     │  2. My List                                                        │   │
-│     │  3. Trending Now                                                   │   │
-│     │  4. Top 3 Genre Rows (based on viewing history)                    │   │
-│     │  5. "Because You Watched X" (2 most recent completed videos)       │   │
-│     └───────────────────────────────────────────────────────────────────┘   │
-│                                                                              │
-│  5. Apply A/B test treatments (row order, artwork selection)                │
-│                                                                              │
-│  6. Cache for 5 minutes: redis.setex(..., 300, ...)                         │
-│                                                                              │
-│  7. Return { rows: ContentRow[] }                                           │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+**Client.** The SPA calls `POST /playback` when the watch route mounts, keyed by an idempotency key per click, so a retried request after a timeout returns the same session instead of holding a second screen. It renders the three answers as three screens. On `201` it seeks to the resume point before the first frame, starting at a modest rung (480p or 720p) so the first segment is small, then lets ABR climb. A manual quality change swaps the rendition but keeps the current position.
 
-### Continue Watching Query
+| Approach | Verdict |
+|----------|---------|
+| ✅ One session call; signed URLs; DRM license; leases | One decision, enforced at the edge; dead devices free their screen |
+| ❌ Check entitlement in the client before playing | The client can't be trusted, and the rules (region, plan) live on the server |
+| ❌ Authorize every segment at the origin | ~4M checks a second, and an API outage stops every stream |
+| ❌ Count screens with start/stop events | Stop events go missing; members get locked out of their own plan |
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                    getContinueWatching(profileId)                            │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  1. Query Cassandra viewing_progress:                                       │
-│     ├── WHERE profile_id = ? AND completed = false                          │
-│     ├── ORDER BY last_watched_at DESC                                       │
-│     └── LIMIT 20                                                            │
-│                                                                              │
-│  2. Filter to items with progress > 5%                                      │
-│                                                                              │
-│  3. Enrich with PostgreSQL video metadata:                                  │
-│     └── title, thumbnail_url, duration_minutes, rating, type                │
-│                                                                              │
-│  4. Merge progress data with video metadata:                                │
-│     └── { ...video, resumePosition, progressPercent, lastWatchedAt }        │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
-
-### Frontend Homepage Rendering
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                    BrowsePage Component                                      │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  browseStore State:                                                         │
-│  ├── rows: ContentRow[]                                                     │
-│  ├── isLoading: boolean                                                     │
-│  ├── error: string | null                                                   │
-│  └── fetchHomepage(): Promise<void>                                         │
-│                                                                              │
-│  useEffect:                                                                 │
-│  └── Fetch homepage when activeProfile changes                              │
-│                                                                              │
-│  Render Structure:                                                          │
-│  ┌───────────────────────────────────────────────────────────────────────┐  │
-│  │  <Navbar />                                                            │  │
-│  │                                                                        │  │
-│  │  <HeroBanner video={featuredVideo} />                                  │  │
-│  │                                                                        │  │
-│  │  <div className="relative -mt-32 z-10">                               │  │
-│  │    {rows.map((row) =>                                                  │  │
-│  │      row.type === 'continue_watching'                                  │  │
-│  │        ? <ContinueWatchingRow key={row.id} ... />                      │  │
-│  │        : <VideoRow key={row.id} ... />                                 │  │
-│  │    )}                                                                  │  │
-│  │  </div>                                                                │  │
-│  └───────────────────────────────────────────────────────────────────────┘  │
-│                                                                              │
-│  ContinueWatchingRow:                                                       │
-│  └── Renders VideoCards with progress bar overlay                           │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+"What I give up: a URL stays valid until it expires, so a copied URL works for hours. That's acceptable only because segments are encrypted and the DRM license — device-bound, short-lived, renewed during playback — is the real gate. And screen limits are soft: if Redis is down I let people watch."
 
 ---
 
-## Deep Dive: A/B Testing Integration (8 minutes)
+## 🔧 Deep Dive 2: A Resume Point That Never Goes Backwards (8 min)
 
-### Consistent Experiment Allocation
+"The promise is simple: open Netflix on any device and it starts where you stopped. Breaking it is easy in three ways — the client never sends the position, a late request overwrites a newer one, or the last few minutes vanish when the tab closes."
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                    getExperimentVariant(profileId, experimentId)             │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  1. Check cache: `exp:${profileId}:${experimentId}`                         │
-│     └── Return cached variant if found                                      │
-│                                                                              │
-│  2. Fetch experiment from PostgreSQL                                        │
-│     └── Return null if not found or status !== 'running'                    │
-│                                                                              │
-│  3. Calculate consistent hash:                                              │
-│     ├── hash = murmurhash.v3(`${profileId}:${experimentId}`)                │
-│     └── bucket = hash % 100                                                 │
-│                                                                              │
-│  4. Check allocation:                                                       │
-│     └── If bucket >= allocation_percent ──▶ return null (control)           │
-│                                                                              │
-│  5. Determine variant by weights:                                           │
-│     ├── Accumulate weights across variants                                  │
-│     ├── Find variant where bucket < threshold                               │
-│     └── Threshold = (allocation_percent * accumulated_weight) / 100         │
-│                                                                              │
-│  6. Cache for 24 hours                                                      │
-│                                                                              │
-│  7. Return variant with config                                              │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+**Client: send it.** The player reports every 10 seconds while playing (production devices use up to 30), on pause, and on exit. The interval timer must not be tied to `timeupdate` — that event fires four times a second, and an effect that restarts its timer on every tick never fires at all. Each report carries the position, the duration, the session id, and `ts`: the client clock at the moment the position was read.
 
-### Apply Experiments to Homepage
+**Client: don't lose the end.** Leaving the watch page and closing the tab both flush: the final report and the session `DELETE` go out with `keepalive`, from a snapshot taken before the player state is cleared. The final report deliberately omits the session id so it can't renew the screen it's about to release.
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                    applyExperiments(profileId, rows)                         │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  Experiment: Row Ordering                                                   │
-│  ├── Get variant for 'row_order_test'                                       │
-│  └── If config.prioritizeGenres ──▶ sort genre rows higher                  │
-│                                                                              │
-│  Experiment: Artwork Style                                                  │
-│  ├── Get variant for 'artwork_style_test'                                   │
-│  └── If config.usePersonalizedArtwork ──▶ fetch personalized thumbnails    │
-│                                                                              │
-│  Return modified rows                                                       │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+**Server: order by `ts`, not arrival.** The write keeps the position with the newest `ts`; in Cassandra that's simply the write timestamp, so there's no read before the write. A retried report has the same `ts` and changes nothing; a report delayed behind a newer one loses; a phone that reconnects and flushes yesterday's position loses to today's TV. The server clamps `ts` more than a minute in the future, so one device with a fast clock can't win forever.
 
-### Frontend Experiment Integration
+**Server: completion once.** Crossing 95% means watched. That transition is detected downstream from the event stream and written with a key derived from the event, so the dozen heartbeats during the credits produce one view, and a Kafka replay rewrites it rather than adding another.
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                    useExperiments Hook                                       │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  State: allocations: { [experimentName]: variantName | null }               │
-│                                                                              │
-│  useEffect:                                                                 │
-│  └── Fetch allocations from /api/experiments/allocations when authenticated│
-│                                                                              │
-│  Methods:                                                                   │
-│  ├── isInVariant(experimentName, variantName): boolean                      │
-│  └── getVariant(experimentName): string | null                              │
-│                                                                              │
-│  Usage Example - VideoCard:                                                 │
-│  ├── const showMatchScore = isInVariant('match_score_test', 'show_score')  │
-│  └── Conditionally render match percentage                                  │
-│                                                                              │
-│  Usage Example - HeroBanner:                                                │
-│  ├── Track impression: POST /api/analytics/impression                       │
-│  └── Render CTA based on variant ('Play Now' vs 'Watch')                    │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+| Approach | Verdict |
+|----------|---------|
+| ✅ Client `ts` + last writer wins + keepalive exit flush | Retries are free; late writes lose; the last minutes survive closing the tab |
+| ❌ Server arrival order | Flaky networks move resume points backwards |
+| ❌ Save only on exit | Crashes, dead batteries and killed apps lose the whole session |
+| ❌ Read-compare-write per heartbeat | Correct but 500K locked read-modify-writes a second |
+
+"What I give up: trusting client clocks, bounded by the clamp, and up to one heartbeat of accuracy if a device dies without flushing."
 
 ---
 
-## Shared Type Definitions (5 minutes)
+## 🔧 Deep Dive 3: Profile-Scoped Personalization (6 min)
 
-"Shared types ensure frontend and backend stay in sync:"
+"A profile is a boundary on both sides of the wire: the server must never select a title above the profile's maturity, and the client must never show one profile's cached data to another."
 
-### Video Types
-- **Video**: id, title, type (movie/series), releaseYear, durationMinutes, rating, genres[], description, thumbnailUrl, backdropUrl, previewUrl?
-- **Episode**: id, seasonId, episodeNumber, title, durationMinutes, description
+**Server: maturity is a predicate, not a filter.** Every row source, the title-details endpoint, search, the playback session and the license server carry `maturity_level <= profile's`. Filtering at the response boundary would mean the restricted titles were already fetched — into a cache entry or a payload a child can read in devtools.
 
-### Profile Types
-- **Profile**: id, accountId, name, avatarUrl, isKids, maturityLevel, language
+**Server: precompute suggestions, merge facts.** Ranked rows are built hourly offline; Continue Watching is read live, because it's the row you just changed. My List writes and profile edits bump a per-profile version in the homepage cache key instead of deleting the entry, so a rebuild that started a moment earlier can't store the old rows back — which, after a parent lowers a maturity level, would mean five more minutes of adult titles.
 
-### Streaming Types
-- **StreamingManifest**: videoId, sources: QualityLevel[], segmentDuration, generatedAt
-- **QualityLevel**: quality, bitrate, width, height, url
+**Client: the profile is part of every cache key.** Switching profiles calls the server (the session now holds the new profile), then clears the query cache and the player store. Keys include the profile id anyway, so even a stale in-flight response lands under the old profile's key and is never rendered.
 
-### Browse Types
-- **ContentRow**: id, title, type (continue_watching/my_list/trending/genre/because_you_watched), items
-- **ContinueWatchingItem**: extends Video with resumePosition, progressPercent, lastWatchedAt
+**Client: optimistic My List.** Adding a title flips the button immediately, writes the title into the cached My List row, and sends `PUT`. On failure it rolls back and shows a toast. `PUT` and `DELETE` are idempotent, so the query cache can retry them safely while offline.
 
-### Experiment Types
-- **Experiment**: id, name, description, allocationPercent, variants[], status, startDate, endDate?
-- **Variant**: id, name, weight, config: Record<string, unknown>
-
-### API Response Types
-- **ApiResponse<T>**: data, error?
-- **PaginatedResponse<T>**: items, total, page, pageSize, hasMore
+| Approach | Verdict |
+|----------|---------|
+| ✅ Server-side maturity predicate + profile-keyed client caches | Restricted data never reaches the device; no cross-profile leaks |
+| ❌ Client-side maturity filter | The data is already on the device |
+| ❌ Delete-on-write homepage cache | A racing rebuild restores stale rows until the TTL |
 
 ---
 
-## Error Handling Strategy (3 minutes)
+## 📈 Failures & Scale (3 min)
 
-### Backend Error Middleware
+| Failure | What the member sees | What the system does |
+|---------|----------------------|----------------------|
+| Appliance down | A brief quality dip | Player fails over to the next appliance in the manifest |
+| Playback API down | "Can't play right now" on new plays; current stream continues | The player already has a manifest and license; heartbeats retry with backoff |
+| Redis (screens) down | Nothing | Slot checks fail open; overage is counted |
+| Cassandra slow | Resume may be one heartbeat old | Heartbeats time out quickly; the next one supersedes |
+| Homepage cache miss | A less personal homepage | Popular-in-region rows instead of an error |
+| Offline mid-session | Playback continues from buffer; My List changes queue | Query cache pauses mutations and retries on reconnect |
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                    Error Handler Middleware                                  │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  Known Error Types:                                                         │
-│  ├── ValidationError ──▶ 400 { error, fields }                              │
-│  ├── AuthenticationError ──▶ 401 { error: 'Authentication required' }       │
-│  ├── AuthorizationError ──▶ 403 { error: 'Access denied' }                  │
-│  └── NotFoundError ──▶ 404 { error: message }                               │
-│                                                                              │
-│  Circuit Breaker:                                                           │
-│  └── 'Circuit breaker is OPEN' ──▶ 503 { error, retryAfter: 30 }            │
-│                                                                              │
-│  Default:                                                                   │
-│  └── 500 { error: 'Internal server error' }                                 │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
-
-### Frontend Error Handling
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                    ErrorBoundary Component                                   │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  State: { hasError, error }                                                 │
-│                                                                              │
-│  getDerivedStateFromError:                                                  │
-│  └── Set hasError: true, capture error                                      │
-│                                                                              │
-│  componentDidCatch:                                                         │
-│  └── Log to monitoring service                                              │
-│                                                                              │
-│  Render:                                                                    │
-│  └── If hasError ──▶ Show "Something went wrong" + Try Again button        │
-│                                                                              │
-│  API Interceptor:                                                           │
-│  ├── 401 ──▶ Logout and redirect to /login                                  │
-│  └── 503 ──▶ Throw ServiceUnavailableError for retry UI                     │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+**What breaks first:** the heartbeat write path if it ever reads before writing; playback starts at a premiere (ten times normal); and appliance fill for a surprise hit.
 
 ---
 
-## Trade-offs and Alternatives (2 minutes)
+## ⚖️ Trade-offs & Wrap-up (2 min)
 
-| Decision | Chosen | Alternative | Rationale |
-|----------|--------|-------------|-----------|
-| Progress Storage | Cassandra | PostgreSQL | High-write throughput for position updates |
-| Session Storage | Redis | JWT | Immediate revocation, debugging visibility |
-| Homepage Caching | Redis (5 min TTL) | No cache | Balance freshness vs. personalization latency |
-| Shared Types | Duplicated files | Monorepo package | Simpler project structure for learning |
-| Experiment Allocation | Server-side | Client-side | Consistent allocation, no flickering |
-| CDN URLs | Signed JWT | Pre-signed S3 | Flexibility, custom expiration |
+| Decision | ✅ Chosen | ❌ Alternative | Why |
+|----------|-----------|----------------|-----|
+| Playback auth | One session; signed URLs; DRM | Per-segment origin auth | Control plane off the data path |
+| Screen limit | Leases renewed by heartbeats | Start/stop counter | Dead devices free their screen |
+| Resume ordering | Client `ts`, last writer wins | Arrival order | Late reports can't move it back |
+| Exit save | `keepalive` flush + periodic reports | Save on exit only | Survives crashes and closed tabs |
+| Maturity | Server predicate in every query | Client filter | Restricted data never ships |
+| Client state | Query cache keyed by profile + small player store | Everything in one global store | Profile switch is a clean boundary |
+| Homepage | Offline rows + live Continue Watching | Rank per request | 100K/s in 300 ms |
 
----
-
-## Summary
-
-"I've designed Netflix's fullstack architecture with:
-
-1. **Streaming pipeline** with backend manifest generation and frontend ABR controller
-2. **Progress synchronization** using Cassandra for high-write workloads with debounced frontend updates
-3. **Personalization pipeline** generating rows server-side with Redis caching and frontend rendering
-4. **A/B testing** with consistent MurmurHash allocation and frontend experiment hooks
-5. **Shared type definitions** ensuring type safety across the stack
-6. **Error handling** with backend middleware, circuit breakers, and frontend error boundaries
-
-The architecture prioritizes cross-device consistency, low-latency personalization, and reliable playback across varying network conditions.
-
-What aspect would you like me to elaborate on?"
+"With more time: profile PINs so a kid can't just switch to a parent's profile, a downloads mode with offline licenses, and per-title server-side ABR hints from QoE data so the first segment is right more often."

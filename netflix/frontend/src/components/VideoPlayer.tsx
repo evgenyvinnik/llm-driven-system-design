@@ -58,6 +58,8 @@ export function VideoPlayer({ videoId, episodeId, title, subtitle }: VideoPlayer
     isFullscreen,
     showControls,
     isLoading,
+    error,
+    leaseLost,
     loadManifest,
     setQuality,
     setPlaying,
@@ -103,23 +105,34 @@ export function VideoPlayer({ videoId, episodeId, title, subtitle }: VideoPlayer
     loadManifest(videoId, episodeId);
   }, [videoId, episodeId, loadManifest]);
 
-  // Save progress periodically (every 10 seconds)
+  // Report progress every 10 seconds while playing. The interval must not depend
+  // on currentTime: timeupdate fires ~4x a second, and re-creating the interval
+  // on every tick meant it never fired. saveProgress reads the latest position.
   React.useEffect(() => {
+    if (!isPlaying) return;
     const interval = setInterval(() => {
-      if (isPlaying && currentTime > 0) {
-        saveProgress();
-      }
+      saveProgress();
     }, 10000);
 
     return () => clearInterval(interval);
-  }, [isPlaying, currentTime, saveProgress]);
+  }, [isPlaying, saveProgress]);
 
-  // Save progress on unmount
+  // Tab closed or navigated away: flush the position with a keepalive request.
+  // (Leaving the page in-app is handled by the store's reset().)
   React.useEffect(() => {
-    return () => {
-      saveProgress();
+    const handlePageHide = () => {
+      saveProgress({ final: true });
     };
+    window.addEventListener('pagehide', handlePageHide);
+    return () => window.removeEventListener('pagehide', handlePageHide);
   }, [saveProgress]);
+
+  // Another device took the account's last stream slot: stop playback.
+  React.useEffect(() => {
+    if (leaseLost) {
+      videoRef.current?.pause();
+    }
+  }, [leaseLost]);
 
   /**
    * Updates current time in store when video time changes.
@@ -138,9 +151,11 @@ export function VideoPlayer({ videoId, episodeId, title, subtitle }: VideoPlayer
     if (videoRef.current) {
       setDuration(videoRef.current.duration);
 
-      // Resume from saved position
-      if (manifest?.resumePosition) {
-        videoRef.current.currentTime = manifest.resumePosition;
+      // Resume where we are: the saved position on first load, the current
+      // position after a quality switch (which reloads the source).
+      const resumeAt = usePlayerStore.getState().currentTime || manifest?.resumePosition || 0;
+      if (resumeAt > 0) {
+        videoRef.current.currentTime = resumeAt;
       }
     }
   };
@@ -169,10 +184,13 @@ export function VideoPlayer({ videoId, episodeId, title, subtitle }: VideoPlayer
     }
   };
 
-  // Get stream URL - for demo, use a sample video
-  const streamUrl =
-    currentQuality?.url ||
-    'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4';
+  // Only ever play a URL the server signed for this session.
+  const streamUrl = currentQuality?.url;
+  const blockingMessage = error
+    ? error
+    : leaseLost
+      ? 'Playback stopped: this account is now streaming on the maximum number of screens for its plan.'
+      : null;
 
   return (
     <div
@@ -187,7 +205,10 @@ export function VideoPlayer({ videoId, episodeId, title, subtitle }: VideoPlayer
         src={streamUrl}
         className="w-full h-full"
         onPlay={() => setPlaying(true)}
-        onPause={() => setPlaying(false)}
+        onPause={() => {
+          setPlaying(false);
+          saveProgress();
+        }}
         onTimeUpdate={handleTimeUpdate}
         onLoadedMetadata={handleLoadedMetadata}
         onEnded={handleNavigateBack}
@@ -199,6 +220,22 @@ export function VideoPlayer({ videoId, episodeId, title, subtitle }: VideoPlayer
       {isLoading && (
         <div className="absolute inset-0 flex items-center justify-center bg-black/50">
           <div className="w-16 h-16 border-4 border-netflix-red border-t-transparent rounded-full animate-spin" />
+        </div>
+      )}
+
+      {/* Entitlement / stream-limit errors */}
+      {blockingMessage && !isLoading && (
+        <div
+          className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-4 bg-black/80 px-6 text-center"
+          role="alert"
+        >
+          <p className="max-w-lg text-lg text-white">{blockingMessage}</p>
+          <button
+            onClick={handleNavigateBack}
+            className="rounded bg-white px-6 py-2 font-semibold text-black hover:bg-white/80"
+          >
+            Back to browse
+          </button>
         </div>
       )}
 

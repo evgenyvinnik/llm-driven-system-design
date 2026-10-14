@@ -64,9 +64,7 @@ router.post('/login', strictRateLimit('auth'), async (req: Request, res: Respons
       return;
     }
 
-    // For demo purposes, accept any password for the demo account
-    const isDemo = account.email === 'demo@netflix.local';
-    const isValidPassword = isDemo || await bcrypt.compare(password, account.password_hash);
+    const isValidPassword = await bcrypt.compare(password, account.password_hash);
 
     if (!isValidPassword) {
       authLogger.warn({ email: email.toLowerCase(), accountId: account.id }, 'Login attempt with invalid password');

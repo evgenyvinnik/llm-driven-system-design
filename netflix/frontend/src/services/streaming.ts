@@ -15,45 +15,52 @@ interface ProgressResponse {
   completed: boolean;
 }
 
+/** Response to a progress report (which doubles as the stream-slot heartbeat). */
+interface ProgressReportResponse {
+  success: boolean;
+  applied: boolean;
+  completed: boolean;
+  lease?: { active: boolean; activeStreams: number; limit: number };
+}
+
+/** A progress report. `clientTimestamp` orders reports (last writer wins). */
+export interface ProgressReport {
+  episodeId?: string;
+  positionSeconds: number;
+  durationSeconds: number;
+  clientTimestamp: number;
+  playbackSessionId?: string;
+}
+
 /**
  * Streaming service for video playback.
  */
 export const streamService = {
   /**
-   * Gets streaming manifest with available quality levels and resume position.
-   *
-   * @param videoId - Video ID to get manifest for
-   * @param episodeId - Optional episode ID for series
-   * @returns Promise resolving to stream manifest
+   * Starts a playback session. The server checks maturity, plan and the
+   * concurrent-stream limit, and returns rendition URLs signed for this session
+   * plus the resume position. 403 = not allowed on this profile, 409 = too many
+   * screens in use.
    */
-  getManifest: async (
-    videoId: string,
-    episodeId?: string
-  ): Promise<StreamManifest> => {
-    const params = episodeId ? `?episodeId=${episodeId}` : '';
-    return api.get<StreamManifest>(`/stream/${videoId}/manifest${params}`);
+  startSession: async (videoId: string, episodeId?: string): Promise<StreamManifest> => {
+    return api.post<StreamManifest>(`/stream/${videoId}/sessions`, episodeId ? { episodeId } : {});
   },
 
   /**
-   * Updates viewing progress on the server.
-   * Called periodically during playback for resume functionality.
-   *
-   * @param videoId - Video ID being watched
-   * @param data - Progress data including position and duration
-   * @returns Promise indicating success and completion status
+   * Reports the playback position. Sent every 10 s while playing (with the
+   * session id, renewing the stream slot), on pause, and on exit (keepalive).
    */
   updateProgress: async (
     videoId: string,
-    data: {
-      episodeId?: string;
-      positionSeconds: number;
-      durationSeconds: number;
-    }
-  ): Promise<{ success: boolean; completed: boolean }> => {
-    return api.post<{ success: boolean; completed: boolean }>(
-      `/stream/${videoId}/progress`,
-      data
-    );
+    report: ProgressReport,
+    options?: { keepalive?: boolean }
+  ): Promise<ProgressReportResponse> => {
+    return api.post<ProgressReportResponse>(`/stream/${videoId}/progress`, report, options);
+  },
+
+  /** Ends a playback session, freeing its stream slot. Survives page unload. */
+  endSession: async (playbackSessionId: string): Promise<void> => {
+    await api.del<void>(`/stream/sessions/${playbackSessionId}`, { keepalive: true });
   },
 
   /**
@@ -69,20 +76,5 @@ export const streamService = {
   ): Promise<ProgressResponse> => {
     const params = episodeId ? `?episodeId=${episodeId}` : '';
     return api.get<ProgressResponse>(`/stream/${videoId}/progress${params}`);
-  },
-
-  /**
-   * Generates direct stream URL for video playback.
-   * Returns API URL that redirects to presigned storage URL.
-   *
-   * @param videoId - Video ID to stream
-   * @param quality - Quality level (e.g., "720p", "1080p")
-   * @param episodeId - Optional episode ID for series
-   * @returns Stream URL for video element
-   */
-  getStreamUrl: (videoId: string, quality: string, episodeId?: string): string => {
-    const params = new URLSearchParams({ quality });
-    if (episodeId) params.set('episodeId', episodeId);
-    return `/api/stream/${videoId}/play?${params.toString()}`;
   },
 };

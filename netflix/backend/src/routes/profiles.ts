@@ -1,7 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { query, queryOne } from '../db/index.js';
 import { authenticate } from '../middleware/auth.js';
-import { setSession, getSession } from '../services/redis.js';
+import { setSession, getSession, invalidateHomepage } from '../services/redis.js';
 
 /**
  * Profiles router.
@@ -148,6 +148,9 @@ router.put('/:id', authenticate, async (req: Request, res: Response) => {
       res.status(500).json({ error: 'Failed to update profile' });
       return;
     }
+
+    // A lowered maturity level must not keep serving a homepage built for the old one.
+    await invalidateHomepage(id);
 
     res.json({
       profile: {

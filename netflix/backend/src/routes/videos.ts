@@ -221,6 +221,19 @@ router.get('/:id', optionalAuth, async (req: Request, res: Response) => {
       return;
     }
 
+    // The same maturity rule as every listing query: a profile cannot open a
+    // restricted title by id either.
+    if (req.profileId) {
+      const profile = await queryOne<{ maturity_level: number }>(
+        'SELECT maturity_level FROM profiles WHERE id = $1',
+        [req.profileId]
+      );
+      if (profile && video.maturity_level > profile.maturity_level) {
+        res.status(403).json({ error: 'This title is not available on this profile', code: 'maturity_restricted' });
+        return;
+      }
+    }
+
     const result: Record<string, unknown> = {
       ...mapVideoRow(video),
     };

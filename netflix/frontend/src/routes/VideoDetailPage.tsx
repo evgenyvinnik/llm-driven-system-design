@@ -240,7 +240,7 @@ interface EpisodeCardProps {
   onPlay: () => void;
 }
 
-function EpisodeCard({ episode, seasonNumber: _seasonNumber, onPlay }: EpisodeCardProps) {
+function EpisodeCard({ episode, onPlay }: EpisodeCardProps) {
   return (
     <div
       onClick={onPlay}

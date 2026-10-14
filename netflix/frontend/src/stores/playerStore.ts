@@ -25,13 +25,15 @@ interface PlayerState {
   showControls: boolean;
   isLoading: boolean;
   error: string | null;
+  /** Another device took this account's last stream slot while we were idle. */
+  leaseLost: boolean;
 
   // For series
   videoId: string | null;
   episodeId: string | null;
 
   // Actions
-  /** Loads streaming manifest and initializes playback */
+  /** Starts a playback session (entitlement + stream slot) and loads its manifest */
   loadManifest: (videoId: string, episodeId?: string) => Promise<void>;
   /** Changes video quality level */
   setQuality: (quality: StreamQuality) => void;
@@ -51,9 +53,9 @@ interface PlayerState {
   setFullscreen: (fullscreen: boolean) => void;
   /** Shows/hides player controls */
   setShowControls: (show: boolean) => void;
-  /** Saves current progress to server */
-  saveProgress: () => Promise<void>;
-  /** Resets player to initial state */
+  /** Saves current progress; `final` (exit/unload) uses keepalive and skips the heartbeat */
+  saveProgress: (options?: { final?: boolean }) => Promise<void>;
+  /** Flushes progress, frees the stream slot, and resets player to initial state */
   reset: () => void;
 }
 
@@ -74,13 +76,19 @@ export const usePlayerStore = create<PlayerState>((set, get) => ({
   showControls: true,
   isLoading: false,
   error: null,
+  leaseLost: false,
   videoId: null,
   episodeId: null,
 
   loadManifest: async (videoId, episodeId) => {
-    set({ isLoading: true, error: null, videoId, episodeId });
+    set({ isLoading: true, error: null, leaseLost: false, videoId, episodeId });
     try {
-      const manifest = await streamService.getManifest(videoId, episodeId);
+      const manifest = await streamService.startSession(videoId, episodeId);
+      // The player may have been closed while the session was being created.
+      if (get().videoId !== videoId || get().episodeId !== episodeId) {
+        streamService.endSession(manifest.playbackSessionId).catch(() => undefined);
+        return;
+      }
       const defaultQuality = manifest.qualities.find((q) => q.quality === '720p') ||
                             manifest.qualities[0];
 
@@ -132,22 +140,42 @@ export const usePlayerStore = create<PlayerState>((set, get) => ({
     set({ showControls: show });
   },
 
-  saveProgress: async () => {
-    const { videoId, episodeId, currentTime, duration } = get();
-    if (!videoId || currentTime === 0) return;
+  saveProgress: async (options) => {
+    // Read everything synchronously: reset() calls this right before clearing state.
+    const { videoId, episodeId, currentTime, duration, manifest } = get();
+    if (!videoId || !manifest || currentTime === 0) return;
+
+    // Some containers report Infinity until fully buffered; fall back to the catalog duration.
+    const durationSeconds = Number.isFinite(duration) && duration > 0 ? duration : manifest.durationSeconds;
+    const final = options?.final === true;
 
     try {
-      await streamService.updateProgress(videoId, {
-        episodeId: episodeId || undefined,
-        positionSeconds: Math.floor(currentTime),
-        durationSeconds: Math.floor(duration),
-      });
+      const result = await streamService.updateProgress(
+        videoId,
+        {
+          episodeId: episodeId || undefined,
+          positionSeconds: Math.floor(currentTime),
+          durationSeconds: Math.floor(durationSeconds),
+          clientTimestamp: Date.now(),
+          // The exit save must not renew the slot it is about to release.
+          playbackSessionId: final ? undefined : manifest.playbackSessionId,
+        },
+        { keepalive: final }
+      );
+      if (!final && result.lease && !result.lease.active && get().manifest === manifest) {
+        set({ leaseLost: true, isPlaying: false });
+      }
     } catch (error) {
       console.error('Failed to save progress:', error);
     }
   },
 
   reset: () => {
+    const { manifest } = get();
+    if (manifest) {
+      void get().saveProgress({ final: true });
+      streamService.endSession(manifest.playbackSessionId).catch(() => undefined);
+    }
     set({
       isPlaying: false,
       manifest: null,
@@ -159,6 +187,7 @@ export const usePlayerStore = create<PlayerState>((set, get) => ({
       showControls: true,
       isLoading: false,
       error: null,
+      leaseLost: false,
       videoId: null,
       episodeId: null,
     });

@@ -62,7 +62,7 @@ services:
       mc alias set myminio http://minio:9000 minioadmin minioadmin123;
       mc mb myminio/videos --ignore-existing;
       mc mb myminio/thumbnails --ignore-existing;
-      mc anonymous set download myminio/videos;
+      mc anonymous set none myminio/videos;
       mc anonymous set download myminio/thumbnails;
       exit 0;
       "

@@ -23,7 +23,15 @@ async function handleResponse<T>(response: Response): Promise<T> {
     const error: ApiError = await response.json().catch(() => ({ error: 'Network error' }));
     throw new Error(error.error || 'Request failed');
   }
+  if (response.status === 204) {
+    return undefined as T;
+  }
   return response.json();
+}
+
+/** Per-request options. `keepalive` lets a request outlive the page (exit saves). */
+interface RequestOptions {
+  keepalive?: boolean;
 }
 
 /**
@@ -48,9 +56,10 @@ async function get<T>(path: string): Promise<T> {
  * @param body - Request body (will be JSON-serialized)
  * @returns Promise resolving to typed response
  */
-async function post<T>(path: string, body?: unknown): Promise<T> {
+async function post<T>(path: string, body?: unknown, options?: RequestOptions): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, {
     method: 'POST',
+    keepalive: options?.keepalive,
     headers: {
       'Content-Type': 'application/json',
     },
@@ -87,9 +96,10 @@ async function put<T>(path: string, body?: unknown): Promise<T> {
  * @param path - API endpoint path (without /api prefix)
  * @returns Promise resolving to typed response
  */
-async function del<T>(path: string): Promise<T> {
+async function del<T>(path: string, options?: RequestOptions): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, {
     method: 'DELETE',
+    keepalive: options?.keepalive,
     credentials: 'include',
   });
   return handleResponse<T>(response);

@@ -25,8 +25,8 @@ A simplified Netflix-like platform demonstrating video streaming, adaptive bitra
 - Popularity scoring
 
 ### 2. Video Streaming
-- Adaptive bitrate streaming (ABR) with quality selection
-- Multiple quality levels (240p to 4K)
+- Playback sessions: maturity check, plan-capped quality ladder (240p to 4K), concurrent-screen limit, signed stream URLs
+- Manual quality selection (no segment-level ABR yet)
 - Progress tracking and resume playback
 - Cross-device continuation
 
@@ -145,6 +145,13 @@ npm run dev
 3. Select a profile
 4. Browse the catalog!
 
+## Tests
+
+```bash
+cd backend
+npm test        # 22 offline vitest tests: playback authorization and last-writer-wins progress
+```
+
 ## Running Multiple Backend Instances
 
 For testing load balancing or distributed scenarios:
@@ -191,10 +198,11 @@ npm run dev:server3  # Port 3003
 - `GET /api/browse/search?q=...` - Search videos
 
 ### Streaming
-- `GET /api/stream/:videoId/manifest` - Get stream manifest
-- `GET /api/stream/:videoId/play` - Get video stream
-- `POST /api/stream/:videoId/progress` - Update watch progress
+- `POST /api/stream/:videoId/sessions` - Start playback (body `{episodeId?}`): `201` manifest with signed URLs and resume position, `403` not available on this profile, `409` screen limit reached
+- `GET /api/stream/:videoId/play?quality&episodeId&sid&exp&sig` - Verify the signed URL and redirect to a presigned MinIO URL
+- `POST /api/stream/:videoId/progress` - Save position (`{positionSeconds, durationSeconds, clientTimestamp, playbackSessionId?}`; last writer wins; also renews the screen lease)
 - `GET /api/stream/:videoId/progress` - Get watch progress
+- `DELETE /api/stream/sessions/:sessionId` - End playback and free the screen
 
 ### Experiments
 - `GET /api/experiments` - List experiments
@@ -212,7 +220,7 @@ For actual video playback, upload videos to MinIO:
 3. Create folder structure: `videos/{videoId}/{quality}/video.mp4`
 4. Upload video files
 
-For testing, the player defaults to a sample video (Big Buck Bunny).
+`npm run db:seed` uploads a small CC0 clip for every title and quality. The `videos` bucket is private: the player only ever plays the signed URLs from its playback session.
 
 ## Environment Variables
 
@@ -232,6 +240,9 @@ For testing, the player defaults to a sample video (Big Buck Bunny).
 | MINIO_ACCESS_KEY | minioadmin | MinIO access key |
 | MINIO_SECRET_KEY | minioadmin123 | MinIO secret key |
 | CORS_ORIGIN | http://localhost:5173 | Frontend origin |
+| PLAYBACK_TOKEN_SECRET | dev value | HMAC key for signed stream URLs (set in production) |
+| PLAYBACK_URL_TTL_SECONDS | 14400 | Lifetime of signed stream URLs |
+| STREAM_LEASE_SECONDS | 90 | Screen lease; renewed by progress reports |
 
 ## Implementation Status
 

@@ -1,6 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { query, queryOne } from '../db/index.js';
 import { authenticate } from '../middleware/auth.js';
+import { requirePermission } from '../middleware/rbac.js';
 import crypto from 'crypto';
 
 /**
@@ -55,7 +56,7 @@ function murmurhash(str: string): number {
  * GET /api/experiments
  * Lists all experiments sorted by creation date.
  */
-router.get('/', authenticate, async (_req: Request, res: Response) => {
+router.get('/', authenticate, requirePermission('experiments:read'), async (_req: Request, res: Response) => {
   try {
     const experiments = await query<ExperimentRow>(
       `SELECT * FROM experiments ORDER BY created_at DESC`
@@ -85,7 +86,7 @@ router.get('/', authenticate, async (_req: Request, res: Response) => {
  * GET /api/experiments/:id
  * Returns experiment details including variants and targeting rules.
  */
-router.get('/:id', authenticate, async (req: Request, res: Response) => {
+router.get('/:id', authenticate, requirePermission('experiments:read'), async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
 
@@ -123,7 +124,7 @@ router.get('/:id', authenticate, async (req: Request, res: Response) => {
  * POST /api/experiments
  * Creates a new experiment with variants (must have at least 2, weights sum to 100).
  */
-router.post('/', authenticate, async (req: Request, res: Response) => {
+router.post('/', authenticate, requirePermission('experiments:create'), async (req: Request, res: Response) => {
   try {
     const {
       name,
@@ -189,7 +190,7 @@ router.post('/', authenticate, async (req: Request, res: Response) => {
  * PUT /api/experiments/:id/status
  * Updates experiment status (draft, active, paused, completed).
  */
-router.put('/:id/status', authenticate, async (req: Request, res: Response) => {
+router.put('/:id/status', authenticate, requirePermission('experiments:write'), async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
     const { status } = req.body;

@@ -123,6 +123,8 @@ export interface HomepageRow {
  * Contains available quality levels and resume position.
  */
 export interface StreamManifest {
+  /** Playback session the signed URLs and the stream slot belong to. */
+  playbackSessionId: string;
   videoId: string;
   episodeId?: string;
   durationSeconds: number;

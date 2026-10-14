@@ -6,7 +6,7 @@ import { test, expect, Page } from '@playwright/test';
 async function login(page: Page) {
   await page.goto('/login');
   await page.locator("input[name='email'], input[type='email']").first().fill('demo@netflix.local');
-  await page.locator("input[name='password'], input[type='password']").first().fill('demo123');
+  await page.locator("input[name='password'], input[type='password']").first().fill('password123');
   await page.locator("button[type='submit']").first().click();
   // Wait for navigation after login
   await page.waitForURL(/(?!.*login).*/);
