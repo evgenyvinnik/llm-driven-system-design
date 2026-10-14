@@ -2,7 +2,7 @@ import express, { Request, Response } from 'express';
 import { query } from '../db.js';
 import { authenticate, requireAdmin } from '../middleware/auth.js';
 import { getConnectionStats } from '../services/websocket.js';
-import { closeAuction } from '../services/scheduler.js';
+import { cancelAuction, closeAuction } from '../services/auctionLifecycle.js';
 
 const router = express.Router();
 
@@ -137,7 +137,15 @@ router.post('/auctions/:id/close', async (req: Request, res: Response): Promise<
   const id = req.params.id as string;
 
   try {
-    const result = await closeAuction(id);
+    const result = await closeAuction(id, { force: true });
+    if (result.outcome === 'not_found') {
+      res.status(404).json({ error: 'Auction not found' });
+      return;
+    }
+    if (result.outcome === 'not_active') {
+      res.status(409).json({ error: 'Auction is not active' });
+      return;
+    }
     res.json({ message: 'Auction closed', ...result });
   } catch (error) {
     console.error('Error closing auction:', error);
@@ -150,7 +158,15 @@ router.post('/auctions/:id/cancel', async (req: Request, res: Response): Promise
   const id = req.params.id as string;
 
   try {
-    await query("UPDATE auctions SET status = 'cancelled' WHERE id = $1", [id]);
+    const result = await cancelAuction(id, { allowWithBids: true });
+    if (result === 'not_found') {
+      res.status(404).json({ error: 'Auction not found' });
+      return;
+    }
+    if (result === 'not_active') {
+      res.status(409).json({ error: 'Can only cancel active auctions' });
+      return;
+    }
     res.json({ message: 'Auction cancelled' });
   } catch (error) {
     console.error('Error cancelling auction:', error);

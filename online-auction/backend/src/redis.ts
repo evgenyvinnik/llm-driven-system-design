@@ -1,6 +1,8 @@
+import { randomUUID } from 'node:crypto';
 import { Redis } from 'ioredis';
 import { lockAcquireTotal, lockHoldDuration, cacheHitsTotal, cacheMissesTotal } from './shared/metrics.js';
-import type { Lock, RateLimitResult, HealthStatus, Bid, CurrentBidInfo, IdempotentBidResult, Auction } from './types.js';
+import { interpretIdempotencyRecord, type IdempotencyLookup } from './shared/idempotency.js';
+import type { Lock, RateLimitResult, HealthStatus, Bid, CurrentBidInfo, Auction } from './types.js';
 
 const redis = new Redis({
   host: process.env.REDIS_HOST || 'localhost',
@@ -18,19 +20,32 @@ redis.on('connect', () => {
 });
 
 // Distributed lock implementation with metrics
-/** Acquires a distributed lock with SET NX and records metrics. */
-export const acquireLock = async (key: string, ttlSeconds: number = 5): Promise<Lock | null> => {
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Metric label for a lock key: `auction:<uuid>` -> `auction`, so label cardinality stays bounded. */
+const lockName = (key: string): string => key.split(':')[0];
+
+/**
+ * Acquires a distributed lock with SET NX. With `waitMs > 0` it polls (10-40 ms
+ * with jitter) until the deadline instead of failing on the first collision, so
+ * a burst of bids on one auction queues briefly in Redis rather than holding
+ * pooled database connections while blocked on the row lock.
+ */
+export const acquireLock = async (key: string, ttlSeconds: number = 5, waitMs: number = 0): Promise<Lock | null> => {
   const lockKey = `lock:${key}`;
-  const lockValue = Date.now().toString();
-  const startTime = Date.now();
+  const lockValue = randomUUID();
+  const deadline = Date.now() + waitMs;
 
-  const acquired = await redis.set(lockKey, lockValue, 'EX', ttlSeconds, 'NX');
-
-  if (acquired) {
-    lockAcquireTotal.inc({ lock_name: key, status: 'acquired' });
-    return { lockKey, lockValue, startTime };
+  for (;;) {
+    const acquired = await redis.set(lockKey, lockValue, 'EX', ttlSeconds, 'NX');
+    if (acquired) {
+      lockAcquireTotal.inc({ lock_name: lockName(key), status: 'acquired' });
+      return { lockKey, lockValue, startTime: Date.now() };
+    }
+    if (Date.now() >= deadline) break;
+    await sleep(10 + Math.random() * 30);
   }
-  lockAcquireTotal.inc({ lock_name: key, status: 'failed' });
+  lockAcquireTotal.inc({ lock_name: lockName(key), status: 'failed' });
   return null;
 };
 
@@ -40,7 +55,7 @@ export const releaseLock = async (lock: Lock | null): Promise<void> => {
 
   // Record lock hold duration
   const holdDuration = (Date.now() - lock.startTime) / 1000;
-  lockHoldDuration.observe({ lock_name: lock.lockKey.replace('lock:', '') }, holdDuration);
+  lockHoldDuration.observe({ lock_name: lockName(lock.lockKey.replace('lock:', '')) }, holdDuration);
 
   const script = `
     if redis.call("get", KEYS[1]) == ARGV[1] then
@@ -74,9 +89,26 @@ export const removeAuctionFromSchedule = async (auctionId: string): Promise<void
   await redis.zrem('auction_endings', auctionId);
 };
 
-/** Returns auction IDs whose end times are before the given timestamp. */
-export const getEndingAuctions = async (beforeTimestamp: number): Promise<string[]> => {
-  return redis.zrangebyscore('auction_endings', 0, beforeTimestamp);
+/** Returns up to `limit` auction IDs whose end times are at or before the given timestamp. */
+export const getEndingAuctions = async (beforeTimestamp: number, limit: number = 100): Promise<string[]> => {
+  return redis.zrangebyscore('auction_endings', '-inf', beforeTimestamp, 'LIMIT', 0, limit);
+};
+
+/**
+ * Claims a due auction by removing it from the sorted set. ZREM returns 1 to
+ * exactly one caller, so with several API instances only one attempts each
+ * close. Correctness does not depend on this (the close re-checks the row
+ * under FOR UPDATE); it only avoids duplicate work.
+ */
+export const claimAuctionEnd = async (auctionId: string): Promise<boolean> => {
+  return (await redis.zrem('auction_endings', auctionId)) === 1;
+};
+
+/** Bulk ZADD used by the reconciler that rebuilds the schedule from PostgreSQL. */
+export const scheduleAuctionEnds = async (entries: Array<{ id: string; end_time: Date | string }>): Promise<void> => {
+  if (entries.length === 0) return;
+  const args = entries.flatMap((e) => [new Date(e.end_time).getTime(), e.id]);
+  await redis.zadd('auction_endings', ...args);
 };
 
 // Session management
@@ -117,47 +149,41 @@ export const invalidateAuctionCache = async (auctionId: string): Promise<void> =
 // Idempotency Support for Bid Placement
 // ============================================
 
-/**
- * Check if a bid with this idempotency key has already been processed
- */
-export const getIdempotentBid = async (idempotencyKey: string): Promise<IdempotentBidResult | null> => {
-  const key = `idempotent:bid:${idempotencyKey}`;
-  const data = await redis.get(key);
-  if (data) {
-    cacheHitsTotal.inc({ cache_type: 'idempotent_bid' });
-    return JSON.parse(data);
-  }
-  cacheMissesTotal.inc({ cache_type: 'idempotent_bid' });
-  return null;
-};
+const idempotencyKey = (scope: string, key: string): string => `idempotency:bid:${scope}:${key}`;
 
 /**
- * Store a bid result with its idempotency key
+ * Claims a client's Idempotency-Key (scoped to the user, so two users can never
+ * see each other's responses). The first request gets `claimed`; later ones get
+ * the stored response, `in_flight` while the first is still running, or
+ * `mismatch` if the same key arrives with a different body.
  */
-export const setIdempotentBid = async (
-  idempotencyKey: string,
-  bidResult: IdempotentBidResult,
+export const claimIdempotencyKey = async (
+  scope: string,
+  key: string,
+  fingerprint: string,
+  ttlSeconds: number = 60
+): Promise<{ state: 'claimed' } | IdempotencyLookup> => {
+  const redisKey = idempotencyKey(scope, key);
+  const claimed = await redis.set(redisKey, JSON.stringify({ state: 'pending', fingerprint }), 'EX', ttlSeconds, 'NX');
+  if (claimed) return { state: 'claimed' };
+  return interpretIdempotencyRecord(await redis.get(redisKey), fingerprint);
+};
+
+/** Stores the committed response under the key for replay (24 h). */
+export const completeIdempotencyKey = async (
+  scope: string,
+  key: string,
+  fingerprint: string,
+  status: number,
+  body: unknown,
   ttlSeconds: number = 86400
 ): Promise<void> => {
-  const key = `idempotent:bid:${idempotencyKey}`;
-  await redis.setex(key, ttlSeconds, JSON.stringify(bidResult));
+  await redis.set(idempotencyKey(scope, key), JSON.stringify({ state: 'done', fingerprint, status, body }), 'EX', ttlSeconds);
 };
 
-/**
- * Mark an idempotency key as "in progress" to prevent duplicate concurrent requests
- */
-export const markBidInProgress = async (idempotencyKey: string, ttlSeconds: number = 30): Promise<boolean> => {
-  const key = `idempotent:bid:progress:${idempotencyKey}`;
-  const result = await redis.set(key, 'processing', 'EX', ttlSeconds, 'NX');
-  return result !== null;
-};
-
-/**
- * Clear the in-progress marker for an idempotency key
- */
-export const clearBidInProgress = async (idempotencyKey: string): Promise<void> => {
-  const key = `idempotent:bid:progress:${idempotencyKey}`;
-  await redis.del(key);
+/** Drops a claim whose request failed, so the client can retry with the same key. */
+export const releaseIdempotencyKey = async (scope: string, key: string): Promise<void> => {
+  await redis.del(idempotencyKey(scope, key));
 };
 
 // ============================================
@@ -242,8 +268,16 @@ export const getCachedBidHistory = async (auctionId: string): Promise<Bid[] | nu
 // Rate Limiting
 // ============================================
 
+// INCR and the first EXPIRE in one atomic step: a crash between the two used to
+// leave a counter without a TTL, blocking that user forever.
+const RATE_LIMIT_SCRIPT = `
+  local count = redis.call('INCR', KEYS[1])
+  if count == 1 then redis.call('EXPIRE', KEYS[1], ARGV[1]) end
+  return {count, redis.call('TTL', KEYS[1])}
+`;
+
 /**
- * Check and increment rate limit for a user action
+ * Check and increment a fixed-window rate limit for a user action
  */
 export const checkRateLimit = async (
   userId: string,
@@ -251,30 +285,14 @@ export const checkRateLimit = async (
   limit: number,
   windowSeconds: number
 ): Promise<RateLimitResult> => {
-  const key = `rate:${userId}:${action}`;
-
-  const multi = redis.multi();
-  multi.incr(key);
-  multi.ttl(key);
-
-  const results = await multi.exec();
-  if (!results) {
-    return { allowed: false, remaining: 0, resetIn: windowSeconds };
-  }
-
-  const count = results[0][1] as number;
-  let ttl = results[1][1] as number;
-
-  // Set expiry if this is the first request in the window
-  if (ttl === -1) {
-    await redis.expire(key, windowSeconds);
-    ttl = windowSeconds;
-  }
-
+  const [count, ttl] = (await redis.eval(RATE_LIMIT_SCRIPT, 1, `rate:${userId}:${action}`, windowSeconds)) as [
+    number,
+    number,
+  ];
   return {
     allowed: count <= limit,
     remaining: Math.max(0, limit - count),
-    resetIn: ttl,
+    resetIn: ttl > 0 ? ttl : windowSeconds,
   };
 };
 

@@ -187,6 +187,22 @@ export interface WebSocketMessage {
   timestamp?: string;
   /** Whether connection is authenticated */
   authenticated?: boolean;
+  /**
+   * Auction version after this event. It increases by one on every price
+   * change, close and cancel, so the client can drop stale events and detect
+   * missed ones (a jump of more than one means "refetch").
+   */
+  version?: number;
+  /** End time after this bid (moves when snipe protection extends the auction) */
+  end_time?: string;
+  /** True when this bid extended the auction */
+  extended?: boolean;
+  /** Current leader after this bid */
+  leader_id?: string;
+  /** Bid rows written by this event, so the history updates without a refetch */
+  bids?: Bid[];
+  /** How the auction ended: sold, reserve_not_met, no_bids or cancelled */
+  outcome?: string;
   /** Error or info message */
   message?: string;
 }

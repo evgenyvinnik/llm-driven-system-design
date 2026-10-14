@@ -23,30 +23,16 @@ export const setupWebSocket = (server: Server): WebSocketServer => {
 
   console.log('WebSocket server initialized');
 
-  wss.on('connection', async (ws: AuctionWebSocket, req) => {
+  wss.on('connection', (ws: AuctionWebSocket, req) => {
     console.log('New WebSocket connection');
 
-    let userId: string | null = null;
-
-    // Try to authenticate via query param
-    const url = new URL(req.url || '', 'http://localhost');
-    const token = url.searchParams.get('token');
-
-    if (token) {
-      const sessionUserId = await getSession(token);
-      if (sessionUserId) {
-        const result = await query('SELECT id, username FROM users WHERE id = $1', [sessionUserId]);
-        if (result.rows.length > 0) {
-          userId = result.rows[0].id;
-          ws.userId = userId ?? undefined;
-          ws.username = result.rows[0].username;
-        }
-      }
-    }
-
+    // Register every listener synchronously. They used to be attached after
+    // awaiting the session lookup, so a client that subscribed right after the
+    // socket opened (which the frontend store does on every connect) had its
+    // message emitted with no listener and silently lost.
     clientSubscriptions.set(ws, new Set());
 
-    ws.on('message', async (data) => {
+    ws.on('message', (data) => {
       try {
         const message: WebSocketMessage = JSON.parse(data.toString());
 
@@ -86,18 +72,19 @@ export const setupWebSocket = (server: Server): WebSocketServer => {
       cleanupClient(ws);
     });
 
-    // Send welcome message
-    ws.send(
-      JSON.stringify({
-        type: 'connected',
-        authenticated: !!userId,
-        timestamp: Date.now(),
-      })
-    );
+    // Auction updates are public, so subscriptions never wait for this; the
+    // session only tells the client whether it is signed in.
+    void identifyClient(ws, req.url).then((authenticated) => {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'connected', authenticated, timestamp: Date.now() }));
+      }
+    });
   });
 
-  // Subscribe to Redis pub/sub for bid updates
-  subscriber.on('message', (channel: string, message: string) => {
+  // Subscribe to Redis pub/sub for bid updates. A pattern subscription
+  // (psubscribe) delivers 'pmessage' events, not 'message': listening for
+  // 'message' here meant no bid or close event ever reached a browser.
+  subscriber.on('pmessage', (_pattern: string, channel: string, message: string) => {
     if (channel.startsWith('auction:')) {
       const auctionId = channel.replace('auction:', '');
       broadcastToAuction(auctionId, message);
@@ -108,6 +95,24 @@ export const setupWebSocket = (server: Server): WebSocketServer => {
   subscriber.psubscribe('auction:*');
 
   return wss;
+};
+
+/** Resolves the optional `?token=` session to a user; returns whether it succeeded. */
+const identifyClient = async (ws: AuctionWebSocket, requestUrl: string | undefined): Promise<boolean> => {
+  try {
+    const token = new URL(requestUrl || '', 'http://localhost').searchParams.get('token');
+    if (!token) return false;
+    const sessionUserId = await getSession(token);
+    if (!sessionUserId) return false;
+    const result = await query('SELECT id, username FROM users WHERE id = $1', [sessionUserId]);
+    if (result.rows.length === 0) return false;
+    ws.userId = result.rows[0].id;
+    ws.username = result.rows[0].username;
+    return true;
+  } catch (error) {
+    console.error('WebSocket authentication failed:', error);
+    return false;
+  }
 };
 
 const handleSubscribe = (ws: AuctionWebSocket, auctionId: string): void => {

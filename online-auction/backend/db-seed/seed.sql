@@ -39,13 +39,13 @@ INSERT INTO auctions (id, seller_id, title, description, image_url, starting_pri
  'Leica M6 rangefinder, 1988',
  'Classic 35mm rangefinder in excellent cosmetic condition. Recently CLA''d by a certified technician; shutter speeds verified accurate across the range. Includes original strap and body cap. No lens.',
  'https://images.unsplash.com/photo-1512790182412-b19e6d62bc39?w=800',
- 1200.00, 1685.00, 1500.00, 25.00, NOW() - INTERVAL '3 days', NOW() + INTERVAL '11 minutes', 'active', NULL, 2),
+ 1200.00, 1710.00, 1500.00, 25.00, NOW() - INTERVAL '3 days', NOW() + INTERVAL '11 minutes', 'active', NULL, 2),
 
 ('20000000-0000-4000-8000-000000000002', '10000000-0000-4000-8000-000000000001',
  'Herman Miller Aeron, size B, fully loaded',
  'Remastered Aeron in graphite. PostureFit SL, fully adjustable arms, tilt limiter. Bought new in 2022, light home-office use. Collection preferred, will ship at buyer''s cost.',
  'https://images.unsplash.com/photo-1580480055273-228ff5388ef8?w=800',
- 400.00, 615.00, NULL, 15.00, NOW() - INTERVAL '2 days', NOW() + INTERVAL '4 hours', 'active', NULL, 2),
+ 400.00, 630.00, NULL, 15.00, NOW() - INTERVAL '2 days', NOW() + INTERVAL '4 hours', 'active', NULL, 2),
 
 ('20000000-0000-4000-8000-000000000003', '10000000-0000-4000-8000-000000000001',
  'Vintage Omega Seamaster, cal. 562',
@@ -124,7 +124,14 @@ INSERT INTO bids (id, auction_id, bidder_id, amount, is_auto_bid, created_at) VA
 
 -- Eames (ended, reserve not met)
 ('30000000-0000-4000-8000-000000000010', '20000000-0000-4000-8000-000000000008', '10000000-0000-4000-8000-000000000005', 3100.00, false, NOW() - INTERVAL '6 days'),
-('30000000-0000-4000-8000-000000000011', '20000000-0000-4000-8000-000000000008', '10000000-0000-4000-8000-000000000003', 3400.00, false, NOW() - INTERVAL '1 day 4 hours')
+('30000000-0000-4000-8000-000000000011', '20000000-0000-4000-8000-000000000008', '10000000-0000-4000-8000-000000000003', 3400.00, false, NOW() - INTERVAL '1 day 4 hours'),
+
+-- Proxy responses, listed last so their sequence_num follows the bids they
+-- answered: tomas's proxy (max 1800) answered marcus's 1685 on the Leica, and
+-- marcus's proxy (max 700) answered nadia's 615 on the Aeron. An active proxy
+-- below a competing bid is a state the bid path never leaves behind.
+('30000000-0000-4000-8000-000000000012', '20000000-0000-4000-8000-000000000001', '10000000-0000-4000-8000-000000000003', 1710.00, true,  NOW() - INTERVAL '38 minutes'),
+('30000000-0000-4000-8000-000000000013', '20000000-0000-4000-8000-000000000002', '10000000-0000-4000-8000-000000000005', 630.00,  true,  NOW() - INTERVAL '3 hours')
 ON CONFLICT (id) DO NOTHING;
 
 -- Point each ended auction at its winning bid.
@@ -134,10 +141,11 @@ UPDATE auctions SET winning_bid_id = '30000000-0000-4000-8000-00000000000f'
 -- ---------------------------------------------------------------------------
 -- Proxy (auto) bids
 --
--- An active proxy on the Leica: tomas is willing to go to 1800 but the visible
--- price is only raised to the increment needed to lead. The proxy that has
--- already been outbid past its maximum is left inactive, which is what the bid
--- path does when it exhausts a competing proxy.
+-- Only the current leader may hold an active proxy. tomas leads the Leica at
+-- 1710 with a 1800 maximum (the visible price is only one increment over the
+-- next-best bid); marcus leads the Aeron at 630 with a 700 maximum. nadia's 1250
+-- proxy was exhausted long ago and is inactive, which is what the bid path does
+-- to every beaten proxy.
 -- ---------------------------------------------------------------------------
 INSERT INTO auto_bids (id, auction_id, bidder_id, max_amount, is_active) VALUES
 ('40000000-0000-4000-8000-000000000001', '20000000-0000-4000-8000-000000000001', '10000000-0000-4000-8000-000000000003', 1800.00, true),
@@ -156,17 +164,18 @@ INSERT INTO watchlist (id, user_id, auction_id) VALUES
 ON CONFLICT (id) DO NOTHING;
 
 -- ---------------------------------------------------------------------------
--- Notifications — the outcomes the closing path produces.
+-- Notifications — the outcomes the closing path produces, with the same type
+-- names it writes (auction_won / auction_sold / auction_lost / reserve_not_met).
 -- ---------------------------------------------------------------------------
 INSERT INTO notifications (id, user_id, auction_id, type, message, is_read, created_at) VALUES
 ('60000000-0000-4000-8000-000000000001', '10000000-0000-4000-8000-000000000001', '20000000-0000-4000-8000-000000000004', 'outbid',
  'You have been outbid on "Fender Stratocaster, American Professional II". The current price is now $1,105.00.', false, NOW() - INTERVAL '7 hours'),
-('60000000-0000-4000-8000-000000000002', '10000000-0000-4000-8000-000000000001', '20000000-0000-4000-8000-000000000007', 'sold',
+('60000000-0000-4000-8000-000000000002', '10000000-0000-4000-8000-000000000001', '20000000-0000-4000-8000-000000000007', 'auction_sold',
  'Your auction "Rolleiflex 2.8F medium format" sold for $2,340.00.', false, NOW() - INTERVAL '2 days'),
 ('60000000-0000-4000-8000-000000000003', '10000000-0000-4000-8000-000000000001', '20000000-0000-4000-8000-000000000008', 'reserve_not_met',
  'Your auction "Eames lounge chair and ottoman, rosewood" ended at $3,400.00 without meeting its reserve.', true, NOW() - INTERVAL '1 day'),
-('60000000-0000-4000-8000-000000000004', '10000000-0000-4000-8000-000000000004', '20000000-0000-4000-8000-000000000007', 'won',
+('60000000-0000-4000-8000-000000000004', '10000000-0000-4000-8000-000000000004', '20000000-0000-4000-8000-000000000007', 'auction_won',
  'You won "Rolleiflex 2.8F medium format" at $2,340.00.', false, NOW() - INTERVAL '2 days'),
-('60000000-0000-4000-8000-000000000005', '10000000-0000-4000-8000-000000000003', '20000000-0000-4000-8000-000000000007', 'lost',
+('60000000-0000-4000-8000-000000000005', '10000000-0000-4000-8000-000000000003', '20000000-0000-4000-8000-000000000007', 'auction_lost',
  'You were outbid on "Rolleiflex 2.8F medium format". It sold for $2,340.00.', true, NOW() - INTERVAL '2 days')
 ON CONFLICT (id) DO NOTHING;

@@ -1,541 +1,346 @@
-# Design Online Auction System (Backend Focus)
+# 🔨 Online Auction (eBay-style) — System Design Answer (Backend Focus)
 
-## 45-Minute Backend Interview Answer
+*45-minute backend interview. This is a proposed production design; what this repository actually runs is described in [architecture.md → Implementation Notes](./architecture.md#implementation-notes).*
 
-### 1. Requirements Clarification (3 minutes)
+> "An auction site doesn't have a throughput problem — ten million bids a day is about a hundred per second. It has two sharper problems. First, contention: one item can take fifty bids in its last ten seconds, and every one of them is a read-modify-write on the same row, where getting it wrong means two people are told they're winning. Second, the clock: auctions end at a wall-clock time that a last-second bid can move, and when that time passes something has to pick exactly one winner and tell everyone exactly once. Most of my design is about those two."
 
-**Interviewer:** Design an online auction system like eBay.
-
-**Candidate:** I'll focus on the backend architecture. Let me clarify the requirements:
-
-**Functional Requirements:**
-- Sellers create auctions with title, description, images, starting/reserve prices, end time
-- Users place bids exceeding current highest bid by minimum increment
-- Auto-bidding (proxy bids) where system bids automatically up to user's max
-- Auction end handling with winner determination
-- Anti-sniping protection (extend auction if bid in final 2 minutes)
-
-**Non-Functional Requirements:**
-- Strong consistency for bid ordering (no race conditions)
-- p95 bid latency < 200ms, p99 < 500ms
-- 99.9% availability
-- Support 10,000 concurrent auctions, 1,000 bids/second peak
-
-**Key Challenge:**
-Ensuring correct bid ordering and winner determination when thousands of bids arrive simultaneously.
+| Phase | Time | What I want the interviewer to leave with |
+|-------|------|--------------------------------------------|
+| Requirements & scale | 5 min | Scope, targets, and why contention beats throughput |
+| High-level architecture | 10 min | One overview diagram and the three core flows |
+| Data model & API | 7 min | What lives where; the bid contract |
+| Deep dive 1: hot auctions | 8 min | Serializing bids without melting the database |
+| Deep dive 2: proxy bids and retries | 7 min | Second-price resolution and exactly-once bids |
+| Deep dive 3: closing on time | 5 min | One winner, a moving deadline, many workers |
+| Scale, failures, wrap-up | 3 min | What breaks first; the trade-offs I made |
 
 ---
 
-### 2. High-Level Architecture (5 minutes)
+## 🎯 Requirements & Scale (5 min)
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                           Load Balancer (nginx:3000)                     │
-└────────────────────────────────┬────────────────────────────────────────┘
-                                 │
-         ┌───────────────────────┼───────────────────────┐
-         ▼                       ▼                       ▼
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│  API Server 1   │     │  API Server 2   │     │  API Server 3   │
-│  (Express:3001) │     │  (Express:3002) │     │  (Express:3003) │
-└────────┬────────┘     └────────┬────────┘     └────────┬────────┘
-         │                       │                       │
-         └───────────────────────┼───────────────────────┘
-                                 │
-    ┌────────────────────────────┼────────────────────────────┐
-    │                            │                            │
-    ▼                            ▼                            ▼
-┌──────────────┐          ┌──────────────┐          ┌──────────────┐
-│  PostgreSQL  │          │ Valkey/Redis │          │  RabbitMQ    │
-│  (Primary)   │          │  (Cache +    │          │  (Queues)    │
-│              │          │   Locking)   │          │              │
-└──────────────┘          └──────────────┘          └──────────────┘
-                                                          │
-                                 ┌────────────────────────┼────────┐
-                                 ▼                        ▼        ▼
-                          ┌──────────────┐        ┌──────────────┐ │
-                          │ Bid Worker   │        │ Notification │ │
-                          │              │        │ Worker       │ │
-                          └──────────────┘        └──────────────┘ │
-                                                                   │
-                          ┌──────────────┐        ┌──────────────┐ │
-                          │ Scheduler    │        │ Elasticsearch│◀┘
-                          │ (Auction End)│        │ (Search)     │
-                          └──────────────┘        └──────────────┘
-```
+"Let me pin down scope, because 'auction site' could mean eBay's entire marketplace."
 
----
+### Functional requirements
 
-### 3. Database Schema Deep Dive (8 minutes)
+1. **List** an item: title, images, starting price, bid increment, optional hidden reserve, duration.
+2. **Bid** manually (at least current price + increment), or set a **proxy maximum** that bids for me only as much as needed to lead.
+3. **Watch** live: price, leader, bid history and countdown update in real time.
+4. **Anti-sniping:** a bid in the last two minutes pushes the end out so two minutes remain.
+5. **Close:** at the end, declare the winner, or "reserve not met", or "no bids", and notify winner, seller and losing bidders.
+6. **Admin:** force-close or cancel any auction; sellers cancel only before the first bid.
 
-#### Schema Overview
+Out of scope: payments and escrow, shipping, ratings, fraud scoring, Buy It Now.
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                           DATABASE SCHEMA                                │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  ┌───────────────────────┐          ┌───────────────────────┐          │
-│  │        users          │          │       auctions        │          │
-│  ├───────────────────────┤          ├───────────────────────┤          │
-│  │ id: UUID (PK)         │◀─────────│ seller_id: UUID (FK)  │          │
-│  │ email: VARCHAR(255)   │          │ id: UUID (PK)         │          │
-│  │ password_hash         │          │ title: VARCHAR(255)   │          │
-│  │ display_name          │          │ description: TEXT     │          │
-│  │ role: user/admin      │          │ category: VARCHAR     │          │
-│  │ created_at            │          │ starting_price: DEC   │          │
-│  │ updated_at            │          │ reserve_price: DEC    │          │
-│  └───────────────────────┘          │ bid_increment: DEC    │          │
-│                                     │ current_high_bid: DEC │          │
-│  ┌───────────────────────┐          │ current_high_bidder_id│          │
-│  │         bids          │          │ status: enum          │          │
-│  ├───────────────────────┤          │ start_time            │          │
-│  │ id: UUID (PK)         │          │ end_time              │          │
-│  │ auction_id: UUID (FK) │──────────│ original_end_time     │          │
-│  │ bidder_id: UUID (FK)  │          │ version: INT          │          │
-│  │ amount: DECIMAL       │          └───────────────────────┘          │
-│  │ max_amount: DECIMAL   │                                             │
-│  │ is_proxy_bid: BOOL    │          ┌───────────────────────┐          │
-│  │ is_winning: BOOL      │          │      auto_bids        │          │
-│  │ created_at            │          ├───────────────────────┤          │
-│  │ idempotency_key       │          │ id: UUID (PK)         │          │
-│  └───────────────────────┘          │ auction_id: UUID (FK) │          │
-│                                     │ bidder_id: UUID (FK)  │          │
-│                                     │ max_amount: DECIMAL   │          │
-│                                     │ is_active: BOOL       │          │
-│                                     │ created_at            │          │
-│                                     │ UNIQUE(auction,bidder)│          │
-│                                     └───────────────────────┘          │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+### Non-functional requirements
 
-#### Key Indexes
+| Requirement | Target | Why |
+|-------------|--------|-----|
+| Bid correctness | Judged against the latest committed price; a retry never bids twice; nothing accepted after the end | Money the user authorized, and legally binding |
+| Bid latency | p99 < 300 ms, including waiting behind other bids | The final seconds are when it matters |
+| Live updates | Watchers see a new price within 1 s (p95 < 500 ms) | Bidders react to each other |
+| Closing | Winner decided within 2 s of the end, exactly once | People are watching the countdown hit zero |
+| Availability | 99.95% for bidding, 99.99% for browsing | Browse can be served from caches |
+| Durability | An acknowledged bid is never lost | Synchronous replica commit |
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                           INDEXES                                        │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  auctions:                                                               │
-│  ├── idx_auctions_status_end ON (status, end_time)                      │
-│  ├── idx_auctions_seller ON (seller_id)                                 │
-│  ├── idx_auctions_category ON (category)                                │
-│  └── idx_auctions_ending_soon ON (end_time) WHERE status = 'active'     │
-│                                                                          │
-│  bids:                                                                   │
-│  ├── idx_bids_auction ON (auction_id, created_at DESC)                  │
-│  ├── idx_bids_bidder ON (bidder_id)                                     │
-│  └── UNIQUE idx_bids_idempotency ON (idempotency_key)                   │
-│                                                                          │
-│  auto_bids:                                                              │
-│  └── idx_auto_bids_auction ON (auction_id) WHERE is_active = TRUE       │
-│                                                                          │
-│  notifications:                                                          │
-│  └── idx_notifications_user_unread ON (user_id, created_at DESC)        │
-│         WHERE read_at IS NULL                                            │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+### Capacity estimate
 
-#### Auction Status Flow
+| Quantity | Estimate | Consequence |
+|----------|----------|-------------|
+| Users | 2M daily active, 200K concurrent at the evening peak | Stateless API and gateway tiers |
+| Live auctions | 1M at once; 300K new listings/day | Listing writes are ~3.5/s, trivial |
+| Bids | 10M/day → ~115/s average, ~1,500/s peak | One PostgreSQL primary is plenty |
+| Hot auction | 50 bids in the last 10 s, 10K watchers | Contention on one row; 500K pushes in 10 s |
+| Endings | 300K/day; ~5K in one peak minute | The closer needs ~100 closes/s with no misses |
+| Storage | ~1.5 GB of bids/day (~550 GB/year); images ~600 GB/day | Relational data fits one sharded cluster; images go to object storage + CDN |
 
-```
-┌──────────┐    ┌──────────┐    ┌──────────┐
-│  draft   │───▶│  active  │───▶│  ended   │
-└──────────┘    └────┬─────┘    └────┬─────┘
-                     │               │
-                     │         ┌─────┴─────┐
-                     │         ▼           ▼
-                     │    ┌────────┐  ┌────────┐
-                     │    │  sold  │  │ unsold │
-                     │    └────────┘  └────────┘
-                     │
-                     └────────────────▶┌───────────┐
-                                       │ cancelled │
-                                       └───────────┘
-```
+"The two numbers that drive the design: the site needs only ~1,500 bids per second, but a single auction takes 50 bids in 10 seconds. So the problem is one contended row, not volume. And one accepted bid on a hot item becomes 10,000 pushes, so fan-out has to happen at the edge, not in the database."
 
 ---
 
-### 4. Bid Processing with Distributed Locking (10 minutes)
+## 🏗️ High-Level Architecture (10 min)
 
-#### The Concurrency Challenge
-
-Multiple API servers receive simultaneous bids for the same auction. Without coordination, race conditions occur.
-
-#### Solution: Redis Distributed Lock + PostgreSQL Row Lock
+"I'll draw the system, then walk through the three journeys: placing a bid, pushing the new price to watchers, and closing the auction."
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                      BID PROCESSING FLOW                                 │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │ 1. Check Idempotency                                             │   │
-│  │    SELECT * FROM bids WHERE idempotency_key = $1                 │   │
-│  │    └─▶ If exists, return existing bid                            │   │
-│  └─────────────────────────────────────────────────────────────────┘   │
-│                              │                                           │
-│                              ▼                                           │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │ 2. Acquire Redis Distributed Lock                                │   │
-│  │    SET auction:lock:{auctionId} {uuid} PX 5000 NX                │   │
-│  │    └─▶ If failed: "Too many concurrent bids, please try again"  │   │
-│  └─────────────────────────────────────────────────────────────────┘   │
-│                              │                                           │
-│                              ▼                                           │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │ 3. BEGIN PostgreSQL Transaction                                  │   │
-│  │    SELECT ... FROM auctions WHERE id = $1 FOR UPDATE             │   │
-│  └─────────────────────────────────────────────────────────────────┘   │
-│                              │                                           │
-│                              ▼                                           │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │ 4. Validate Bid                                                  │   │
-│  │    - status === 'active'                                         │   │
-│  │    - now < end_time                                              │   │
-│  │    - amount >= current_high_bid + bid_increment                  │   │
-│  │    - bidder !== current_high_bidder                              │   │
-│  └─────────────────────────────────────────────────────────────────┘   │
-│                              │                                           │
-│                              ▼                                           │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │ 5. Resolve Auto-Bids (if any competing)                          │   │
-│  │    See Auto-Bid Resolution diagram below                         │   │
-│  └─────────────────────────────────────────────────────────────────┘   │
-│                              │                                           │
-│                              ▼                                           │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │ 6. Insert Bid Record                                             │   │
-│  │    INSERT INTO bids (auction_id, bidder_id, amount, ...)         │   │
-│  └─────────────────────────────────────────────────────────────────┘   │
-│                              │                                           │
-│                              ▼                                           │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │ 7. Update Auction State                                          │   │
-│  │    UPDATE auctions SET current_high_bid = $1,                    │   │
-│  │           current_high_bidder_id = $2, version = version + 1     │   │
-│  └─────────────────────────────────────────────────────────────────┘   │
-│                              │                                           │
-│                              ▼                                           │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │ 8. Handle Anti-Sniping                                           │   │
-│  │    If timeRemaining < 2 minutes: extend end_time by 2 minutes    │   │
-│  │    ZADD auction:endings {newEndTime} {auctionId}                 │   │
-│  └─────────────────────────────────────────────────────────────────┘   │
-│                              │                                           │
-│                              ▼                                           │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │ 9. COMMIT Transaction                                            │   │
-│  └─────────────────────────────────────────────────────────────────┘   │
-│                              │                                           │
-│                              ▼                                           │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │ 10. Post-Commit Actions (after releasing lock)                   │   │
-│  │    - Invalidate cache: DEL auction:{id}, auction:{id}:bids       │   │
-│  │    - Publish event: PUBLISH auction:{id}:events BID_PLACED       │   │
-│  └─────────────────────────────────────────────────────────────────┘   │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
+  ┌──────────────────────────────────────────────────────────────────────────────────────────────┐
+  │ Bidder's browser · React SPA, WebSocket client                                               │
+  └─────┬────────────────────────────────────────────────────────────────────────────────────────┘
+        │ (1) POST /api/v1/auctions/{id}/bids, Idempotency-Key                          ▲
+        │                                                                (2) WebSocket  │
+        ▼                                                                               ▼
+  ┌──────────────────────────────────────────────────────────────────────────────────────────────┐
+  │ Load balancer · TLS · /api/* → Auction API · /ws → Realtime gateway                          │
+  └─────┬────────────────────────────────────────────────────────────────────────────────────────┘
+        │                                                                     WebSocket ▲
+        ▼                                                                               ▼
+  ┌───────────────┐          ┌────────────────────┐          ┌───────────────┐ ┌─────────────────┐
+  │ Auction API   │ lock, key│ Redis              │ (3) claim│ Closing       │ │ Realtime        │
+  │ bids, browse  │─────────▶│ bid locks, idem    │◀─────────│ workers       │ │ gateway: subs,  │
+  │ stateless     │          │ keys, endings ZSET │ due, ZREM│ every 1 s     │ │ fan-out         │
+  └──────┬────────┘          └────────────────────┘          └──────┬────────┘ └─────────────────┘
+         │ row-locked bid tx + outbox row                           │ close tx          ▲
+         │                                                          │                   │ consume
+         ▼                                                          ▼                   │
+  ┌─────────────────────────────────────────────────────────────────────┐      ┌────────┴────────┐
+  │ PostgreSQL · auctions, bids, auto_bids, notifications, outbox       │─────▶│ Kafka           │
+  │ source of truth · primary + read replicas                           │relay │ auction-events  │
+  └─────────────────────────────────────────────────────────────────────┘      └────────┬────────┘
+                                                                                        │ consume
+                                                                                        ▼
+                                                                               ┌─────────────────┐
+                                                                               │ Notification    │
+                                                                               │ workers: email, │
+                                                                               │ push, in-app    │
+                                                                               └─────────────────┘
 ```
 
-#### Redis Lock Release (Lua Script)
+1. **Bid (1).** The browser posts a bid with an idempotency key. The Auction API claims the key and a per-auction admission lock in Redis, then runs one PostgreSQL transaction under the auction's row lock. That transaction resolves proxies, inserts the bids, moves the price, version and end time, and writes an outbox row. Then it answers.
+2. **Live update (2).** A relay publishes committed outbox rows to Kafka, keyed by auction ID. Every realtime gateway consumes the stream and pushes `new_bid` to the sockets watching that auction.
+3. **Close (3).** Closing workers pull due auction IDs from a Redis sorted set scored by end time, claim each with `ZREM`, and close it in PostgreSQL under the same row lock. The outbox carries `auction_ended` to gateways and notification workers.
 
-"I use a Lua script for atomic check-and-delete to prevent accidentally releasing someone else's lock."
+| Component | Responsibility | Scales with | Notes |
+|-----------|----------------|-------------|-------|
+| Load balancer | TLS; routes `/api` and `/ws` | Connections | WebSocket upgrades pinned to a gateway |
+| Auction API | Bids, listings, browse, auth | ~1,500 bids/s peak | Stateless; all bid state is in the transaction |
+| Redis | Admission locks, idempotency keys, endings sorted set, sessions | Hot keys | Losing it slows things down; never corrupts a bid |
+| Closing workers | Close due auctions exactly once | Endings per second | Separate pool so a closing spike can't starve bids |
+| PostgreSQL | Source of truth, including the outbox | Sharded by auction ID | Primary + synchronous replica |
+| Kafka | `auction-events`, keyed by auction ID | ~1,500 events/s | Per-auction order; replayable |
+| Realtime gateways | Sockets, subscriptions, local fan-out | 200K sockets | Each consumes all events, filters locally |
+| Notification workers | Email, push, in-app | Notifications | Idempotent by event ID |
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                    ATOMIC LOCK RELEASE                                   │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  if redis.call("get", KEYS[1]) == ARGV[1] then                          │
-│      return redis.call("del", KEYS[1])                                  │
-│  else                                                                    │
-│      return 0                                                            │
-│  end                                                                     │
-│                                                                          │
-│  KEYS[1] = auction:lock:{auctionId}                                     │
-│  ARGV[1] = {uuid} (the token we used to acquire)                        │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+"Why a separate closer and gateway tier instead of doing everything in the API? Their failure profiles differ. A gateway holds 200K long-lived sockets and must restart without touching bids. The closer has a hard deadline at round times like 8 p.m. on Sunday, and I don't want a closing spike competing with bids for the same processes. They share the database and the event stream, so splitting them costs little."
 
-#### Auto-Bid Resolution
+### Flow 1: placing a bid
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                      AUTO-BID RESOLUTION                                 │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  Incoming bid: $100 (max: $150)                                          │
-│  Existing auto-bid: $200 max                                             │
-│                                                                          │
-│  ┌───────────────────────────────────────────────────────────────┐      │
-│  │ Case 1: New bidder max > Existing max                         │      │
-│  │                                                               │      │
-│  │   newBidderMax ($150) > existingMax ($120)                    │      │
-│  │   finalPrice = min(existingMax + increment, newBidderMax)     │      │
-│  │             = min($121, $150) = $121                          │      │
-│  │   Winner: New bidder at $121                                  │      │
-│  │   Deactivate losing auto-bid                                  │      │
-│  └───────────────────────────────────────────────────────────────┘      │
-│                                                                          │
-│  ┌───────────────────────────────────────────────────────────────┐      │
-│  │ Case 2: Existing max > New bidder max                         │      │
-│  │                                                               │      │
-│  │   existingMax ($200) > newBidderMax ($150)                    │      │
-│  │   finalPrice = min(newBidAmount + increment, existingMax)     │      │
-│  │             = min($101, $200) = $101                          │      │
-│  │   Winner: Existing auto-bidder (proxy bid) at $101            │      │
-│  └───────────────────────────────────────────────────────────────┘      │
-│                                                                          │
-│  ┌───────────────────────────────────────────────────────────────┐      │
-│  │ Case 3: No competing auto-bids                                │      │
-│  │                                                               │      │
-│  │   finalPrice = incoming bid amount                            │      │
-│  │   If maxAmount provided, create new auto-bid for this user    │      │
-│  └───────────────────────────────────────────────────────────────┘      │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
+Bidder                                Auction API                            Redis   PostgreSQL
+   │                                       │                                   │          │
+   │ 1 POST /bids/{id}, Idempotency-Key K  │                                   │          │
+   │──────────────────────────────────────▶│                                   │          │
+   │                                       │ 2 SET idem:K pending NX           │          │
+   │                                       │──────────────────────────────────▶│          │
+   │                                       │ 3 SET lock:{id} NX, wait ≤ 1.5 s  │          │
+   │                                       │──────────────────────────────────▶│          │
+   │                                       │ 4 BEGIN; SELECT … FOR UPDATE                 │
+   │                                       │─────────────────────────────────────────────▶│
+   │                                       │ 5 price, leader, live proxies                │
+   │                                       │◀─────────────────────────────────────────────│
+   │                                       │ 6 resolveBid → rows, price        │          │
+   │                                       │ 7 INSERT bids; UPDATE; COMMIT                │
+   │                                       │─────────────────────────────────────────────▶│
+   │                                       │ 8 store 201 under K; DEL lock     │          │
+   │                                       │──────────────────────────────────▶│          │
+   │ 9 201 {price, is_winning, version}    │                                   │          │
+   │◀──────────────────────────────────────│                                   │          │
+   │                                       │                                   │          │
 ```
+
+"Steps 2 and 3 happen before I take a database connection. The idempotency claim turns a retried request into a replay. The admission lock keeps a burst of bidders waiting in Redis rather than in my connection pool. Step 4 is the real guarantee: `SELECT … FOR UPDATE` on the auction row serializes every bid, proxy change, close and cancel on that auction. Step 6 is a pure function I'll come back to. Step 7 commits the bid rows, the new price, `version + 1`, any snipe extension, the outbid notifications and the outbox row together, or not at all."
+
+### Flow 2: pushing the new price
+
+```
+PostgreSQL               Relay                        Kafka       Gateway          Watcher
+     │                     │                            │            │                │
+     │ 1 read outbox rows  │                            │            │                │
+     │◀────────────────────│                            │            │                │
+     │ 2 new_bid v42       │                            │            │                │
+     │────────────────────▶│                            │            │                │
+     │                     │ 3 publish, key auction_id  │            │                │
+     │                     │───────────────────────────▶│            │                │
+     │                     │                            │ 4 consume  │                │
+     │                     │                            │◀───────────│                │
+     │                     │                            │            │ 5 new_bid v42  │
+     │                     │                            │            │───────────────▶│
+     │                     │                            │       6 42 = 41 + 1: apply  │
+     ·························· socket drops and reconnects ···························
+     │                     │                            │            │ 7 new_bid v45  │
+     │                     │                            │            │───────────────▶│
+     │                     │                            │    8 gap: refetch snapshot  │
+     │                     │                            │            │                │
+```
+
+"Every state change increments `auctions.version` in the same transaction, and every event carries it. A client at version 41 applies 42, ignores anything at or below 41 (duplicates, late delivery), and refetches if it sees 45. That single integer turns an at-least-once, possibly reordered stream into a correct view, and gateways never need replay buffers."
+
+### Flow 3: closing
+
+```
+Closing worker                           Redis   PostgreSQL                                  Kafka
+       │                                   │          │                                        │
+       │ 1 ZRANGEBYSCORE endings -inf now  │          │                                        │
+       │──────────────────────────────────▶│          │                                        │
+       │ 2 [a7, c2]                        │          │                                        │
+       │◀──────────────────────────────────│          │                                        │
+       │ 3 ZREM endings a7                 │          │                                        │
+       │──────────────────────────────────▶│          │                                        │
+       │ 4 1 = claimed (others get 0)      │          │                                        │
+       │◀──────────────────────────────────│          │                                        │
+       │ 5 BEGIN; SELECT a7 FOR UPDATE                │                                        │
+       │─────────────────────────────────────────────▶│                                        │
+       │ 6 active, end_time, leading bid              │                                        │
+       │◀─────────────────────────────────────────────│                                        │
+       │ 7 end moved? ZADD new end, stop   │          │                                        │
+       │ 8 ended, winner, notices, outbox; COMMIT     │                                        │
+       │─────────────────────────────────────────────▶│                                        │
+       ····································· outbox relay ······································
+       │                                   │          │ 9 auction_ended {winner, final_price}  │
+       │                                   │          │───────────────────────────────────────▶│
+       │                                   │          │                                        │
+```
+
+"Step 3 makes the work cheap to split: `ZREM` returns 1 to exactly one worker. Step 5 makes it correct: the close re-reads the auction under the row lock, so a second worker waits and then finds it already ended. Step 7 handles the moving deadline: if a last-second bid extended the auction, the worker puts the new end time back in the set and walks away."
 
 ---
 
-### 5. Auction Scheduler Service (5 minutes)
+## 💾 Data Model (4 min)
 
-#### Scheduler Architecture
+"PostgreSQL holds everything that must be right; Redis holds coordination state that can be rebuilt; Kafka holds events."
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                      AUCTION SCHEDULER                                   │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  Redis Sorted Set: auction:endings                                       │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │ Score = end_time timestamp (ms)                                  │   │
-│  │ Member = auction_id                                              │   │
-│  └─────────────────────────────────────────────────────────────────┘   │
-│                                                                          │
-│  Startup:                                                                │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │ SELECT id, end_time FROM auctions                                │   │
-│  │ WHERE status = 'active' AND end_time > NOW()                     │   │
-│  │                                                                  │   │
-│  │ For each: ZADD auction:endings {end_time_ms} {auction_id}        │   │
-│  └─────────────────────────────────────────────────────────────────┘   │
-│                                                                          │
-│  Scheduler Loop (every 1 second):                                        │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │ 1. ZRANGEBYSCORE auction:endings 0 (now + 5000)                  │   │
-│  │ 2. For each ending auction:                                      │   │
-│  │    a. ZREM auction:endings {auctionId}                           │   │
-│  │    b. Queue to RabbitMQ: auction_end queue                       │   │
-│  └─────────────────────────────────────────────────────────────────┘   │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+| Store | Table / key | Key columns | Indexes and notes |
+|-------|-------------|-------------|-------------------|
+| PostgreSQL | `auctions` | `id`, `seller_id`, `current_cents`, `increment_cents`, `reserve_cents` (hidden), `status`, `end_time`, `snipe_window`, `extension_count`, `winner_id`, `version` | Partial index on `end_time` where active; `version` bumps on every price change, close and cancel |
+| PostgreSQL | `bids` | `id`, `auction_id`, `bidder_id`, `amount_cents`, `is_auto`, `seq`, `idempotency_key` | Append-only; `(auction_id, amount DESC, seq)` finds the leader; unique `(bidder_id, idempotency_key)` |
+| PostgreSQL | `proxies` | `(auction_id, bidder_id)` PK, `max_cents`, `is_active`, `updated_at` | Only the leader's proxy is ever active |
+| PostgreSQL | `outbox` | `id`, `auction_id`, `type`, `version`, `payload` | Same transaction as the change; relay marks published |
+| PostgreSQL | `notifications` | `user_id`, `auction_id`, `type`, `read_at` | Sharded by user |
+| Redis | `lock:auction:{id}` | Random token, 5 s TTL | Admission control only |
+| Redis | `idem:{user}:{key}` | Fingerprint, state, stored response | 60 s claim, 24 h result |
+| Redis | `auction_endings` | Sorted set: member = auction ID, score = end time (ms) | Rebuilt from PostgreSQL by a reconciler |
 
-#### Auction End Worker
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                    AUCTION END WORKER                                    │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  ┌───────────────────────────────────────────────────────────────┐      │
-│  │ 1. Acquire end-processing lock (prevent duplicates)           │      │
-│  │    SET auction:end:lock:{auctionId} {uuid} PX 30000 NX         │      │
-│  └───────────────────────────────────────────────────────────────┘      │
-│                              │                                           │
-│                              ▼                                           │
-│  ┌───────────────────────────────────────────────────────────────┐      │
-│  │ 2. SELECT * FROM auctions WHERE id = $1 FOR UPDATE            │      │
-│  │    Verify status === 'active'                                 │      │
-│  └───────────────────────────────────────────────────────────────┘      │
-│                              │                                           │
-│                              ▼                                           │
-│  ┌───────────────────────────────────────────────────────────────┐      │
-│  │ 3. Determine Outcome                                          │      │
-│  │                                                               │      │
-│  │    hasWinner = current_high_bid IS NOT NULL                   │      │
-│  │    reserveMet = current_high_bid >= reserve_price             │      │
-│  │                                                               │      │
-│  │    ┌─────────────────┐    ┌─────────────────┐                │      │
-│  │    │ hasWinner AND   │    │ Otherwise       │                │      │
-│  │    │ reserveMet      │    │                 │                │      │
-│  │    │     ▼           │    │     ▼           │                │      │
-│  │    │ status = 'sold' │    │ status = 'unsold│                │      │
-│  │    └─────────────────┘    └─────────────────┘                │      │
-│  └───────────────────────────────────────────────────────────────┘      │
-│                              │                                           │
-│                              ▼                                           │
-│  ┌───────────────────────────────────────────────────────────────┐      │
-│  │ 4. UPDATE auctions SET status = $1                            │      │
-│  │    UPDATE bids SET is_winning = TRUE WHERE ... (if sold)      │      │
-│  └───────────────────────────────────────────────────────────────┘      │
-│                              │                                           │
-│                              ▼                                           │
-│  ┌───────────────────────────────────────────────────────────────┐      │
-│  │ 5. Queue Notifications                                        │      │
-│  │    - Seller: AUCTION_SOLD or AUCTION_ENDED_NO_SALE            │      │
-│  │    - Winner: AUCTION_WON                                      │      │
-│  └───────────────────────────────────────────────────────────────┘      │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+"Three modeling choices are worth saying out loud. Money is integer cents, because floats drift and `pg` hands decimals back as strings. The leader is not a column: it's the earliest bid at the highest amount, so it can't disagree with the bid history. And auctions, bids and proxies share the shard key `auction_id`, so every bid transaction touches one shard. At ~550 GB of bids per year I'd start with one primary and hash-shard when storage or write volume forces it."
 
 ---
 
-### 6. Caching Strategy (4 minutes)
-
-#### Cache TTLs and Keys
+## 🔌 API Design (3 min)
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        CACHING STRATEGY                                  │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  ┌───────────────────────────────────────────────────────────────┐      │
-│  │ Cache Key             │ TTL      │ Content                    │      │
-│  ├───────────────────────┼──────────┼────────────────────────────┤      │
-│  │ auction:{id}          │ 60s      │ Full auction details       │      │
-│  │ auction:{id}:bids     │ 30s      │ Bid history (last 20)      │      │
-│  │ auction:{id}:current  │ 10s      │ Current high bid only      │      │
-│  │ auction:hot           │ 3600s    │ Sorted set by bid amount   │      │
-│  └───────────────────────────────────────────────────────────────┘      │
-│                                                                          │
-│  Cache Patterns:                                                         │
-│  ┌───────────────────────────────────────────────────────────────┐      │
-│  │ Read: Cache-aside with lazy loading                           │      │
-│  │ Write: Write-through for current_bid (immediate update)       │      │
-│  │ Invalidation: DEL on bid placement for other caches           │      │
-│  └───────────────────────────────────────────────────────────────┘      │
-│                                                                          │
-│  Hot Auctions Leaderboard:                                              │
-│  ┌───────────────────────────────────────────────────────────────┐      │
-│  │ On new bid: ZADD auction:hot {amount} {auctionId}             │      │
-│  │ Query: ZREVRANGE auction:hot 0 9  (top 10)                    │      │
-│  └───────────────────────────────────────────────────────────────┘      │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
+POST   /api/v1/auctions/{id}/bids           {amount} + Idempotency-Key → 201 | 400 | 409 | 422 | 429
+PUT    /api/v1/auctions/{id}/proxy          {max_amount} + Idempotency-Key → 200
+DELETE /api/v1/auctions/{id}/proxy          withdraw maximum (takes the row lock)
+GET    /api/v1/auctions/{id}                auction + leader-first bids + version
+GET    /api/v1/auctions?q&status&cursor     browse, keyset pagination
+DELETE /api/v1/auctions/{id}                seller cancel, only before the first bid
+POST   /api/v1/admin/auctions/{id}/close    force close through the same close transaction
+GET    /ws                                  subscribe {auction_id} → new_bid, auction_ended
 ```
 
-#### Read Flow
-
-```
-┌────────┐     ┌─────────┐     ┌───────┐     ┌────────────┐
-│ Client │     │   API   │     │ Redis │     │ PostgreSQL │
-└───┬────┘     └────┬────┘     └───┬───┘     └─────┬──────┘
-    │               │              │               │
-    │ GET /auction  │              │               │
-    ├──────────────▶│              │               │
-    │               │              │               │
-    │               │ GET auction:123              │
-    │               ├─────────────▶│               │
-    │               │◀─────────────┤               │
-    │               │              │               │
-    │               │ [Cache Miss]                 │
-    │               │                              │
-    │               │ SELECT * FROM auctions       │
-    │               ├─────────────────────────────▶│
-    │               │◀─────────────────────────────┤
-    │               │              │               │
-    │               │ SETEX 60     │               │
-    │               ├─────────────▶│               │
-    │               │              │               │
-    │◀──────────────┤              │               │
-    │   Response    │              │               │
-    ▼               ▼              ▼               ▼
-```
+- **A `201` is a decision, not a receipt.** The body says `current_price`, `is_winning`, `version` and `end_time`, so the bidder knows immediately whether a proxy outbid them, without waiting for the WebSocket.
+- **Errors are specific.** `400` carries the real `minimum_bid`. `409 already_leading` means "raise your maximum instead". `422` means the idempotency key was reused with a different body. `429` carries `Retry-After`. All use `application/problem+json`.
+- **Synchronous, not `202 Accepted`.** I considered queueing bids and answering `202`, but then the user doesn't learn the outcome of the most time-sensitive action on the site. Since one row lock handles 100+ bids/s per auction, a queue buys nothing.
 
 ---
 
-### 7. Rate Limiting (3 minutes)
+## 🔧 Deep Dive 1: Serializing Bids on a Hot Auction (8 min)
 
-#### Rate Limit Configuration
+"Two bidders read $100 and both bid $101. Exactly one of them may win. I have three ways to enforce that."
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        RATE LIMITS                                       │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  Action            │ Window  │ Max Requests                             │
-│  ──────────────────┼─────────┼─────────────                             │
-│  bid               │ 60s     │ 10 bids                                  │
-│  create_auction    │ 3600s   │ 5 auctions                               │
-│  search            │ 60s     │ 30 searches                              │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+| Approach | How it works | Where it breaks |
+|----------|--------------|-----------------|
+| ❌ Optimistic version check | `UPDATE … WHERE version = $seen`; retry on 0 rows | A retry can't be automatic — the price has moved past what the user authorized |
+| ❌ Single-consumer queue per auction | Bids go to a partition; one worker applies them | Correct, but the bidder waits for an async answer and we operate a queue to do what a row lock already does |
+| ✅ Row lock + Redis admission lock | `SELECT … FOR UPDATE` inside the bid transaction, with a short Redis lock in front | Bids on one auction are strictly serial |
 
-#### Sliding Window Implementation
+**Why the row lock works.** Inside the transaction I lock the auction row and read the current price and leader, then decide and write. A second bidder's transaction waits at the lock and then sees the committed result. Locally, eight simultaneous $101 bids against a $100 auction produce exactly one acceptance and seven "minimum is now $102". A lock holds for ~5 ms, so one auction sustains 100–200 bids per second. That's more than twenty times the hottest realistic closing burst, and separate auctions never contend.
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                   SLIDING WINDOW RATE LIMITER                            │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  Key: rate:{userId}:{action}                                             │
-│  Data Structure: Sorted Set (score = timestamp)                          │
-│                                                                          │
-│  Pipeline Operations:                                                    │
-│  ┌───────────────────────────────────────────────────────────────┐      │
-│  │ 1. ZREMRANGEBYSCORE key 0 (now - window)  // Remove expired   │      │
-│  │ 2. ZCARD key                              // Count in window  │      │
-│  │ 3. ZADD key {now} {now}                   // Add this request │      │
-│  │ 4. EXPIRE key {window}                    // Set TTL          │      │
-│  └───────────────────────────────────────────────────────────────┘      │
-│                                                                          │
-│  Response:                                                               │
-│  ┌───────────────────────────────────────────────────────────────┐      │
-│  │ If count >= max:                                              │      │
-│  │   { allowed: false, remaining: 0, retryAfter: N seconds }     │      │
-│  │ Else:                                                         │      │
-│  │   { allowed: true, remaining: max - count - 1 }               │      │
-│  └───────────────────────────────────────────────────────────────┘      │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+**Why optimistic locking fails here specifically.** It's the textbook answer for contention, and it works when the loser can simply retry. A bid can't be retried blindly. If I lost the race at $101, resubmitting $101 is now invalid, and resubmitting $102 spends money I never agreed to. So every version conflict becomes a user-visible "try again". Conflicts cluster in the last seconds, exactly when the user can least afford it. With a lock, the loser waits a few milliseconds and gets a true answer instead.
+
+**Why the admission lock exists.** The row lock alone is correct, but each waiter holds a pooled database connection while it waits. A 50-bidder burst on one item would park 50 connections and stall browse and login for everyone. So each bid first takes `SET lock:auction:{id} NX EX 5` in Redis, polling with 10–40 ms of jitter for up to 1.5 s. Only one bidder per auction holds a database connection at a time. I don't need fencing tokens: if the Redis lock expires mid-transaction, the next request still serializes on the row lock. Redis only decides who waits where.
+
+**What I give up.** Per-auction throughput is capped by lock hold time, so I keep the transaction short: no network calls inside it, notifications as rows, events through the outbox. A request that can't get the admission lock within 1.5 s gets `429` with `Retry-After`. An earlier design rejected on the first collision, which turned ordinary contention into errors.
 
 ---
 
-### 8. Prometheus Metrics (3 minutes)
+## 🔧 Deep Dive 2: Proxy Bids and Exactly-Once Bids (7 min)
 
-The metrics are chosen to answer the two questions this system actually fails on: *is the bid path getting slower under contention*, and *is the lock rejecting more people than it's protecting*.
+"Proxy bidding is where naive implementations quietly cheat users, and retries are where they quietly double-charge them."
 
-| Metric | Type | Labels | What it tells you |
-|--------|------|--------|-------------------|
-| `bid_placement_duration_seconds` | Histogram | status | Where the bid path's tail latency lives; buckets run 10ms→5s because the interesting movement is under a second |
-| `bids_placed_total` | Counter | status, is_auto_bid | Accept/reject ratio, and how much volume is proxy bids rather than humans |
-| `distributed_lock_hold_duration_seconds` | Histogram | lock_type | How long one bidder blocks the rest — this is the auction's real throughput ceiling |
-| `distributed_lock_contention_total` | Counter | lock_type | Every 429 a bidder saw. Rising contention with flat hold duration means genuine demand; rising both means the transaction got slower |
-| `auctions_ended_total` | Counter | outcome (sold/unsold/cancelled) | Whether reserve prices are set sensibly — a high unsold rate is a pricing problem, not a systems one |
-| `active_auctions_count` | Gauge | — | Scheduler load, and a sanity check that closings are actually happening |
-| `cache_hits_total` / `cache_misses_total` | Counter | cache_type | Whether the auction cache is earning its invalidation complexity |
+### Second-price resolution
 
-> "The pairing I'd watch on a dashboard is lock hold duration against contention count. Contention alone doesn't tell you anything — a popular auction *should* have contention. But if hold duration starts climbing at the same time, the transaction itself has slowed down and every bidder behind it is now waiting longer for the same answer. That's the signal that the bid path needs work, and it arrives well before users start complaining."
+A proxy is a maximum: the system bids only one increment above the strongest competitor, never above the maximum. I resolve every bid with a pure function that takes the locked state — price, increment, reserve, leader, active proxies — and returns the rows to insert, the new price, the proxies to switch off, and who was outbid. Everything is in integer cents.
+
+| Situation | Outcome |
+|-----------|---------|
+| Manual $120 vs leader's proxy max $150 (increment $1) | Proxy stays ahead at $121; rows: $120 manual, then $121 auto |
+| Manual $150 vs proxy max $150 | Tie goes to the proxy, which committed first: price $150 |
+| Manual $200 vs proxy max $150 | New leader at exactly $200; the proxy is recorded at $150 and switched off |
+| New proxy $300 vs proxy $150 | New proxy leads at $151 |
+| Leader bids again | `409 already_leading`: raise your maximum instead |
+| Winning maximum covers an unmet reserve | Price jumps to the reserve |
+
+**Why a pure function.** The bugs here are subtle. A naive version charged a manual bidder an increment above what they typed when they tied a proxy, let a proxy bid past its own maximum, and ignored the second-best proxy entirely. Each of those is a one-line unit test against a pure function, and nearly impossible to test against inline SQL.
+
+**Two invariants keep it small.** Only the leader may hold an active proxy, because every beaten proxy is switched off in the same transaction. And the leader is the earliest bid at the highest amount: rows are inserted in ascending amount, earlier commitment first at equal amounts. The closer uses the same ordering, so "who's winning" and "who won" can never disagree.
+
+### Exactly-once bids
+
+The failure I design for: a bidder on a train taps Bid, the request times out, and they tap again. Without care that's two bids, or a bid at a price they didn't intend.
+
+1. **The client sends an `Idempotency-Key`**, one per submitted bid, reused only when retrying that same bid.
+2. **The API claims it** with `SET idem:{user}:{key} pending NX EX 60` before doing any work. If the key has finished, it replays the stored response with `Idempotent-Replayed: true`. If it's still in flight, it answers `409` with `Retry-After: 1`. If it was used with a different body, it answers `422`.
+3. **The bid row carries the key** under a unique `(bidder_id, idempotency_key)` index. If Redis loses the record, or the process dies between commit and storing the response, the retry finds the bid in PostgreSQL instead of placing another.
+
+| Approach | Verdict |
+|----------|---------|
+| ✅ Client key + Redis claim + durable unique index | Correct across timeouts, double taps, concurrent duplicates and a lost Redis record |
+| ❌ Server dedupe by `{auction, user, amount, second}` | Merges or misses depending on clock edges; can't tell a retry from a deliberate bid |
+| ❌ Disable the button | Stops a double click, not a retry after a timeout |
+
+"Keys are scoped by user, so one user's key can never replay another user's response. What I give up is a Redis round trip and a stored response per bid — cheap at ~1,500 bids/s."
 
 ---
 
-### 9. Trade-offs and Decisions
+## 🔧 Deep Dive 3: Closing on Time, Exactly Once (5 min)
 
-| Decision | Chosen Approach | Alternative | Rationale |
-|----------|----------------|-------------|-----------|
-| **Bid ordering** | Distributed lock + DB lock | Optimistic locking | Correctness critical, low contention per auction |
-| **Auto-bid resolution** | Synchronous in transaction | Async queue | Simpler, immediate feedback |
-| **Auction scheduling** | Redis sorted set | Database polling | O(log N) operations, sub-ms latency |
-| **Cache strategy** | Write-through for current bid | Pure invalidation | Real-time feel for watchers |
-| **Idempotency** | DB unique constraint | Redis TTL key | Permanent protection, audit trail |
-| **Anti-sniping** | 2-minute extension | Fixed end time | Fair to all bidders |
+"At 8:00:00 p.m. nothing calls my API, yet five thousand auctions need a winner within seconds — and some of them were extended at 7:59:59."
+
+**The index.** `auction_endings` is a Redis sorted set: member = auction ID, score = end time. Each worker tick reads up to 100 due IDs with `ZRANGEBYSCORE`. A snipe extension is just a re-`ZADD` of the new end time.
+
+**The claim.** For each due ID, the worker calls `ZREM`; only the worker that gets `1` proceeds. That spreads ~100 closes per second across the pool without a coordinator.
+
+**The guarantee.** The close runs as one transaction that starts with `SELECT … FOR UPDATE` on the auction, the same lock bids take. It re-checks everything: not active means someone else closed it, so stop. `end_time` in the future means a last-second bid extended it, so re-add the new time and stop. Otherwise it reads the leading bid, compares it to the reserve in cents, sets `status`, `winner_id` and `winning_bid_id`, writes the winner, seller and loser notifications, switches off proxies and writes the outbox event — all in one commit. A second worker that somehow claims the same auction waits for that commit and finds it ended. Notifications are written exactly once because they're part of the state change.
+
+**The safety net.** The sorted set is an index, not the truth. A reconciler re-adds every active auction ending within the next two minutes, or already overdue, from a partial index on `end_time`. A flushed Redis, a worker that died after its claim, or rows written straight to SQL delay a close by one reconcile interval instead of stranding it forever.
+
+| Approach | Verdict |
+|----------|---------|
+| ✅ Sorted set + `ZREM` claim + close under the row lock + reconciler | Fast "what's due", work split without coordination, correctness from the database |
+| ❌ Poll `WHERE end_time <= now()` every second from every worker | Works at small scale, but N workers race for the same rows and the primary pays forever |
+| ❌ A timer per auction in process memory | Lost on restart; a moving deadline means cancelling and re-arming timers everywhere |
+| ❌ Trust the sorted set alone | If Redis loses it, auctions silently never close |
+
+"One more property matters: bids never depend on the closer. A bid is rejected once `end_time` has passed, checked under the row lock. A lagging closer delays the announcement but can never let a late bid in. What I give up is an unbounded tail — sustained bidding keeps extending the auction — so I cap extensions with `extension_count`."
 
 ---
 
-### 10. Future Backend Enhancements
+## 📈 Scale, Failures & Observability (3 min)
 
-1. **Read replicas** - Scale read queries with PostgreSQL streaming replication
-2. **Sharding** - Partition by auction_id hash for horizontal scaling
-3. **WebSocket real-time** - Replace polling with push notifications
-4. **Fraud detection** - ML model for suspicious bidding patterns
-5. **Multi-currency** - Support international auctions with currency conversion
-6. **Circuit breaker** - Protect against payment gateway failures
+**What breaks first:** fan-out on hot items (10K watchers × 50 bids), long before the bid path. I handle it at the gateways, one event per bid across the backbone. Next is the closing spike at round times (more workers; the claim spreads them). Then bid storage at ~550 GB/year (shard by auction ID; every transaction stays single-shard).
+
+| Failure | What users see | Mitigation |
+|---------|----------------|------------|
+| Burst on one auction | A short wait; rarely `429` | Bounded admission wait; correctness from the row lock |
+| Redis down | Bidding refused with `503` | I won't bid without retry safety; closer falls back to the partial index |
+| API dies after commit | Response lost | Retry with the same key is answered from the durable index |
+| Closer dies after claim | Close delayed | Reconciler re-adds it within one interval |
+| Kafka or relay lag | Prices update late | The bid response is authoritative; clients refetch on reconnect |
+| Gateway restart | Sockets reconnect | Clients resubscribe and refetch the snapshot by version |
+| Primary failover | Bids pause for seconds | Synchronous replica, so no acknowledged bid is lost |
+
+**What I'd watch:** bid latency by outcome; admission-lock wait and failures, labeled by lock type and never by auction ID (per-auction labels would explode Prometheus); idempotent replays and conflicts; seconds between `end_time` and close commit (the closing SLO, alert above 5 s); reschedules from snipe extensions; reconciler re-adds; outbox relay lag; gateway consumer lag and push rate.
+
+---
+
+## ⚖️ Trade-offs & Wrap-up (2 min)
+
+| Decision | ✅ Chosen | ❌ Alternative | Why |
+|----------|-----------|----------------|-----|
+| Bid concurrency | Row lock | Optimistic version check | A lost race can't be retried without exceeding what the user authorized |
+| Burst control | Redis admission lock, 1.5 s bounded wait | Wait in the DB pool, or reject at once | Protects the shared pool without failing every collision |
+| Bid response | Synchronous `201` with the outcome | Queue + `202` | The bidder needs to know immediately; one row lock is fast enough |
+| Proxy logic | Pure second-price resolver in cents | Inline SQL branches | Every tie and cap is unit-testable |
+| Retries | Client key + durable unique index | Server fingerprint | Never duplicates, never merges intentional bids |
+| Closing | Sorted set + `ZREM` + close under row lock + reconciler | DB polling or in-memory timers | Fast, parallel, and PostgreSQL stays the truth |
+| Events | Outbox → Kafka, versioned | Publish after commit | No lost or phantom events; clients detect gaps |
+
+"With more time I'd add the payment and escrow flow after the close, with its own idempotent state machine. I'd also add shill-bidding detection on the event stream, and a server-time endpoint so every countdown agrees with the closer to within a few hundred milliseconds."

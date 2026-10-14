@@ -258,16 +258,21 @@ export const api = {
 
   /**
    * Places a manual bid on an auction.
-   * Uses optimistic locking to prevent race conditions.
+   * The server serializes bids per auction with a row lock; the idempotency key
+   * makes a retry of the same submitted bid safe (it replays, never re-bids).
    *
    * @param auctionId - Target auction ID
    * @param amount - Bid amount in dollars
+   * @param idempotencyKey - One key per submitted bid, reused only when retrying it
    * @returns Bid result including new price and winning status
    */
-  async placeBid(auctionId: string, amount: number) {
+  async placeBid(auctionId: string, amount: number, idempotencyKey?: string) {
     const response = await fetch(`${API_BASE}/bids/${auctionId}`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        ...(idempotencyKey ? { 'Idempotency-Key': idempotencyKey } : {}),
+      },
       credentials: 'include',
       body: JSON.stringify({ amount }),
     });
@@ -284,12 +289,16 @@ export const api = {
    *
    * @param auctionId - Target auction ID
    * @param maxAmount - Maximum amount willing to bid
+   * @param idempotencyKey - One key per submitted maximum, reused only when retrying it
    * @returns Auto-bid configuration and current status
    */
-  async setAutoBid(auctionId: string, maxAmount: number) {
+  async setAutoBid(auctionId: string, maxAmount: number, idempotencyKey?: string) {
     const response = await fetch(`${API_BASE}/bids/${auctionId}/auto`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        ...(idempotencyKey ? { 'Idempotency-Key': idempotencyKey } : {}),
+      },
       credentials: 'include',
       body: JSON.stringify({ max_amount: maxAmount }),
     });

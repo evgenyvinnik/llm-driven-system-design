@@ -28,8 +28,8 @@ export const httpRequestDuration = new client.Histogram({
 // Bid metrics
 export const bidsPlacedTotal = new client.Counter({
   name: 'bids_placed_total',
-  help: 'Total number of bids placed',
-  labelNames: ['auction_id', 'is_auto_bid', 'status'] as const,
+  help: 'Total number of bid requests by kind (manual/proxy) and outcome (success/rejected/error)',
+  labelNames: ['kind', 'status'] as const,
   registers: [register],
 });
 

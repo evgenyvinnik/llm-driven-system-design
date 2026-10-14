@@ -1,183 +1,82 @@
 import { query } from '../db.js';
-import { getEndingAuctions, removeAuctionFromSchedule, publishBidUpdate } from '../redis.js';
-import type { Auction, Bid } from '../types.js';
+import { claimAuctionEnd, getEndingAuctions, scheduleAuctionEnd, scheduleAuctionEnds } from '../redis.js';
+import logger from '../shared/logger.js';
+import { closeAuction } from './auctionLifecycle.js';
 
-interface CloseAuctionResult {
-  winnerId: string | null;
-  winningAmount: number | null;
-}
+/**
+ * Auction-ending scheduler, run in every API instance.
+ *
+ * Three layers, each with one job:
+ * 1. The Redis sorted set `auction_endings` (score = end time in ms) answers
+ *    "what is due now" cheaply; every tick reads at most 100 due entries.
+ * 2. ZREM is the claim: only the instance that removes an entry closes it.
+ * 3. closeAuction() re-checks the row under FOR UPDATE, so even a double claim
+ *    cannot close twice, and a snipe-extended auction is rescheduled instead.
+ *
+ * PostgreSQL stays the source of truth. The reconciler re-adds every active
+ * auction ending within the next window (and any overdue one) at startup and
+ * then periodically, so a flushed Redis, a crash between claim and close, or
+ * rows inserted straight into SQL (the seed) delay a close by at most one
+ * reconcile interval instead of stranding the auction forever.
+ */
 
-// Close an auction and determine winner
-/** Closes an auction, determines the winner, sends notifications, and publishes the result. */
-export const closeAuction = async (auctionId: string): Promise<CloseAuctionResult | undefined> => {
+const TICK_MS = parseInt(process.env.SCHEDULER_TICK_MS || '1000');
+const RECONCILE_MS = parseInt(process.env.SCHEDULER_RECONCILE_MS || '30000');
+const RECONCILE_WINDOW_MS = parseInt(process.env.SCHEDULER_RECONCILE_WINDOW_MS || '120000');
+const RETRY_DELAY_MS = 5000;
+
+/** Re-adds active auctions that end within the window (or are overdue) to the sorted set. */
+export const reconcileSchedule = async (): Promise<number> => {
+  const result = await query(
+    `SELECT id, end_time FROM auctions
+     WHERE status = 'active' AND end_time <= NOW() + ($1::double precision * INTERVAL '1 millisecond')`,
+    [RECONCILE_WINDOW_MS]
+  );
+  await scheduleAuctionEnds(result.rows);
+  return result.rows.length;
+};
+
+let ticking = false;
+
+/** Claims and closes every due auction; returns how many were actually closed. */
+export const processDueAuctions = async (now: number = Date.now()): Promise<number> => {
+  if (ticking) return 0; // a slow tick must not overlap the next one
+  ticking = true;
+  let closed = 0;
   try {
-    console.log(`Closing auction: ${auctionId}`);
-
-    // Get auction details
-    const auctionResult = await query('SELECT * FROM auctions WHERE id = $1 AND status = $2', [
-      auctionId,
-      'active',
-    ]);
-
-    if (auctionResult.rows.length === 0) {
-      console.log(`Auction ${auctionId} not found or already closed`);
-      return;
-    }
-
-    const auction = auctionResult.rows[0] as Auction;
-
-    // Get the highest bid
-    const highestBidResult = await query(
-      `SELECT b.*, u.username as bidder_name, u.email as bidder_email
-       FROM bids b
-       JOIN users u ON b.bidder_id = u.id
-       WHERE b.auction_id = $1
-       ORDER BY b.amount DESC, b.sequence_num ASC
-       LIMIT 1`,
-      [auctionId]
-    );
-
-    let winnerId: string | null = null;
-    let winningBidId: string | null = null;
-    let winningAmount: number | null = null;
-
-    if (highestBidResult.rows.length > 0) {
-      const winningBid = highestBidResult.rows[0] as Bid & { bidder_name: string; bidder_email: string };
-
-      // Check if reserve price was met
-      if (auction.reserve_price && winningBid.amount < auction.reserve_price) {
-        console.log(`Auction ${auctionId} did not meet reserve price`);
-        // Notify seller that reserve was not met
-        await query(
-          `INSERT INTO notifications (user_id, auction_id, type, message)
-           VALUES ($1, $2, 'reserve_not_met', $3)`,
-          [
-            auction.seller_id,
-            auctionId,
-            `Your auction "${auction.title}" has ended but the reserve price was not met.`,
-          ]
-        );
-      } else {
-        winnerId = winningBid.bidder_id;
-        winningBidId = winningBid.id;
-        winningAmount = winningBid.amount;
-
-        // Notify winner
-        await query(
-          `INSERT INTO notifications (user_id, auction_id, type, message)
-           VALUES ($1, $2, 'auction_won', $3)`,
-          [
-            winnerId,
-            auctionId,
-            `Congratulations! You won the auction for "${auction.title}" with a bid of $${winningAmount.toFixed(2)}.`,
-          ]
-        );
-
-        // Notify seller
-        await query(
-          `INSERT INTO notifications (user_id, auction_id, type, message)
-           VALUES ($1, $2, 'auction_sold', $3)`,
-          [
-            auction.seller_id,
-            auctionId,
-            `Your auction "${auction.title}" has been sold for $${winningAmount.toFixed(2)}.`,
-          ]
-        );
-
-        console.log(`Auction ${auctionId} won by ${winningBid.bidder_name} for $${winningAmount}`);
-      }
-    } else {
-      console.log(`Auction ${auctionId} ended with no bids`);
-      // Notify seller that there were no bids
-      await query(
-        `INSERT INTO notifications (user_id, auction_id, type, message)
-         VALUES ($1, $2, 'no_bids', $3)`,
-        [auction.seller_id, auctionId, `Your auction "${auction.title}" has ended with no bids.`]
-      );
-    }
-
-    // Update auction status
-    await query(
-      `UPDATE auctions
-       SET status = 'ended', winner_id = $1, winning_bid_id = $2
-       WHERE id = $3`,
-      [winnerId, winningBidId, auctionId]
-    );
-
-    // Remove from schedule
-    await removeAuctionFromSchedule(auctionId);
-
-    // Notify all bidders who didn't win
-    if (winnerId) {
-      const otherBidders = await query(
-        `SELECT DISTINCT b.bidder_id, u.email
-         FROM bids b
-         JOIN users u ON b.bidder_id = u.id
-         WHERE b.auction_id = $1 AND b.bidder_id != $2`,
-        [auctionId, winnerId]
-      );
-
-      for (const bidder of otherBidders.rows) {
-        await query(
-          `INSERT INTO notifications (user_id, auction_id, type, message)
-           VALUES ($1, $2, 'auction_lost', $3)`,
-          [
-            bidder.bidder_id,
-            auctionId,
-            `The auction for "${auction.title}" has ended. Unfortunately, you were not the winning bidder.`,
-          ]
-        );
+    for (const auctionId of await getEndingAuctions(now, 100)) {
+      if (!(await claimAuctionEnd(auctionId))) continue; // another instance has it
+      try {
+        const result = await closeAuction(auctionId);
+        if (['sold', 'reserve_not_met', 'no_bids'].includes(result.outcome)) closed++;
+      } catch (error) {
+        logger.error({ err: error, auctionId }, 'Failed to close auction; retrying shortly');
+        await scheduleAuctionEnd(auctionId, new Date(Date.now() + RETRY_DELAY_MS));
       }
     }
-
-    // Deactivate all auto-bids for this auction
-    await query('UPDATE auto_bids SET is_active = false WHERE auction_id = $1', [auctionId]);
-
-    // Publish auction ended event
-    await publishBidUpdate(auctionId, {
-      type: 'auction_ended',
-      auction_id: auctionId,
-      winner_id: winnerId,
-      final_price: winningAmount,
-      timestamp: new Date().toISOString(),
-    });
-
-    return { winnerId, winningAmount };
-  } catch (error) {
-    console.error(`Error closing auction ${auctionId}:`, error);
-    throw error;
+  } finally {
+    ticking = false;
   }
+  return closed;
 };
 
-// Scheduler service that checks for ending auctions
-/** Starts a 1-second polling loop that closes auctions past their end time. */
-export const startScheduler = (): void => {
-  console.log('Starting auction scheduler...');
-
-  const checkEndingAuctions = async (): Promise<void> => {
-    try {
-      const now = Date.now();
-      const endingAuctions = await getEndingAuctions(now);
-
-      for (const auctionId of endingAuctions) {
-        try {
-          await closeAuction(auctionId);
-        } catch (error) {
-          console.error(`Failed to close auction ${auctionId}:`, error);
-        }
-      }
-    } catch (error) {
-      console.error('Scheduler error:', error);
-    }
+/** Starts the tick and reconcile loops; returns a function that stops both. */
+export const startScheduler = (): (() => void) => {
+  const run = (fn: () => Promise<unknown>, label: string) => (): void => {
+    fn().catch((error) => logger.error({ err: error }, label));
   };
+  const reconcile = run(reconcileSchedule, 'Schedule reconcile failed');
+  const tick = run(processDueAuctions, 'Scheduler tick failed');
 
-  // Check every second for ending auctions
-  setInterval(checkEndingAuctions, 1000);
+  reconcile();
+  const tickTimer = setInterval(tick, TICK_MS);
+  const reconcileTimer = setInterval(reconcile, RECONCILE_MS);
+  logger.info({ tickMs: TICK_MS, reconcileMs: RECONCILE_MS, windowMs: RECONCILE_WINDOW_MS }, 'Auction scheduler started');
 
-  // Also check immediately on startup
-  checkEndingAuctions();
-
-  console.log('Auction scheduler started');
+  return () => {
+    clearInterval(tickTimer);
+    clearInterval(reconcileTimer);
+  };
 };
 
-export default { closeAuction, startScheduler };
+export default { startScheduler };

@@ -1,10 +1,14 @@
 -- Online Auction Database Schema
+--
+-- Re-runnable: every statement is IF NOT EXISTS / OR REPLACE / guarded, so this
+-- file can be applied to an existing database to pick up new columns and
+-- indexes without dropping data.
 
 -- Enable UUID extension
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
 -- Users table
-CREATE TABLE users (
+CREATE TABLE IF NOT EXISTS users (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     username VARCHAR(50) UNIQUE NOT NULL,
     email VARCHAR(255) UNIQUE NOT NULL,
@@ -23,7 +27,7 @@ CREATE TABLE users (
 -- 7h 10m", and the scheduler's "what is due now" comparison was wrong by the
 -- same amount. An auction platform is a clock with a shop attached; this column
 -- type is load-bearing.
-CREATE TABLE auctions (
+CREATE TABLE IF NOT EXISTS auctions (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     seller_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     title VARCHAR(255) NOT NULL,
@@ -46,18 +50,24 @@ CREATE TABLE auctions (
 );
 
 -- Bids table (append-only for audit trail)
-CREATE TABLE bids (
+CREATE TABLE IF NOT EXISTS bids (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     auction_id UUID NOT NULL REFERENCES auctions(id) ON DELETE CASCADE,
     bidder_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     amount DECIMAL(12,2) NOT NULL CHECK (amount > 0),
     is_auto_bid BOOLEAN DEFAULT false,
     created_at TIMESTAMPTZ DEFAULT NOW(),
-    sequence_num SERIAL
+    sequence_num SERIAL,
+    idempotency_key VARCHAR(255)
 );
 
+-- Added after the first release; ADD COLUMN IF NOT EXISTS upgrades old volumes.
+-- The bidder's Idempotency-Key, stored on the bid it produced (see the unique
+-- index below): the durable half of bid idempotency.
+ALTER TABLE bids ADD COLUMN IF NOT EXISTS idempotency_key VARCHAR(255);
+
 -- Auto-bid configuration (proxy bids)
-CREATE TABLE auto_bids (
+CREATE TABLE IF NOT EXISTS auto_bids (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     auction_id UUID NOT NULL REFERENCES auctions(id) ON DELETE CASCADE,
     bidder_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -69,7 +79,7 @@ CREATE TABLE auto_bids (
 );
 
 -- Watchlist for users to track auctions
-CREATE TABLE watchlist (
+CREATE TABLE IF NOT EXISTS watchlist (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     auction_id UUID NOT NULL REFERENCES auctions(id) ON DELETE CASCADE,
@@ -78,7 +88,7 @@ CREATE TABLE watchlist (
 );
 
 -- Notifications table
-CREATE TABLE notifications (
+CREATE TABLE IF NOT EXISTS notifications (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     auction_id UUID REFERENCES auctions(id) ON DELETE CASCADE,
@@ -89,7 +99,7 @@ CREATE TABLE notifications (
 );
 
 -- Sessions table for authentication
-CREATE TABLE sessions (
+CREATE TABLE IF NOT EXISTS sessions (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     token VARCHAR(255) UNIQUE NOT NULL,
@@ -98,20 +108,31 @@ CREATE TABLE sessions (
 );
 
 -- Indexes for performance
-CREATE INDEX idx_auctions_end_time ON auctions(end_time) WHERE status = 'active';
-CREATE INDEX idx_auctions_status ON auctions(status);
-CREATE INDEX idx_auctions_seller ON auctions(seller_id);
-CREATE INDEX idx_bids_auction ON bids(auction_id, sequence_num);
-CREATE INDEX idx_bids_bidder ON bids(bidder_id, created_at);
-CREATE INDEX idx_auto_bids_auction ON auto_bids(auction_id) WHERE is_active = true;
-CREATE INDEX idx_notifications_user ON notifications(user_id, is_read);
-CREATE INDEX idx_watchlist_user ON watchlist(user_id);
-CREATE INDEX idx_sessions_token ON sessions(token);
-CREATE INDEX idx_sessions_expires ON sessions(expires_at);
+CREATE INDEX IF NOT EXISTS idx_auctions_end_time ON auctions(end_time) WHERE status = 'active';
+CREATE INDEX IF NOT EXISTS idx_auctions_status ON auctions(status);
+CREATE INDEX IF NOT EXISTS idx_auctions_seller ON auctions(seller_id);
+CREATE INDEX IF NOT EXISTS idx_bids_auction ON bids(auction_id, sequence_num);
+CREATE INDEX IF NOT EXISTS idx_bids_bidder ON bids(bidder_id, created_at);
+-- The leader of an auction is the earliest bid at the highest amount; the bid
+-- path and the closing path both read it with this ordering.
+CREATE INDEX IF NOT EXISTS idx_bids_leader ON bids(auction_id, amount DESC, sequence_num);
+-- One bid per (bidder, Idempotency-Key), even if Redis loses the key.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_bids_idempotency ON bids(bidder_id, idempotency_key)
+    WHERE idempotency_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_auto_bids_auction ON auto_bids(auction_id) WHERE is_active = true;
+CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, is_read);
+CREATE INDEX IF NOT EXISTS idx_watchlist_user ON watchlist(user_id);
+CREATE INDEX IF NOT EXISTS idx_sessions_token ON sessions(token);
+CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
 
 -- Add foreign key for winning_bid_id after bids table is created
-ALTER TABLE auctions ADD CONSTRAINT fk_winning_bid
-    FOREIGN KEY (winning_bid_id) REFERENCES bids(id);
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_winning_bid') THEN
+        ALTER TABLE auctions ADD CONSTRAINT fk_winning_bid
+            FOREIGN KEY (winning_bid_id) REFERENCES bids(id);
+    END IF;
+END $$;
 
 -- Create function to update timestamps
 CREATE OR REPLACE FUNCTION update_updated_at_column()
@@ -123,13 +144,13 @@ END;
 $$ language 'plpgsql';
 
 -- Create triggers for updated_at
-CREATE TRIGGER update_users_updated_at BEFORE UPDATE ON users
+CREATE OR REPLACE TRIGGER update_users_updated_at BEFORE UPDATE ON users
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
-CREATE TRIGGER update_auctions_updated_at BEFORE UPDATE ON auctions
+CREATE OR REPLACE TRIGGER update_auctions_updated_at BEFORE UPDATE ON auctions
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
-CREATE TRIGGER update_auto_bids_updated_at BEFORE UPDATE ON auto_bids
+CREATE OR REPLACE TRIGGER update_auto_bids_updated_at BEFORE UPDATE ON auto_bids
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
 -- Seed data is in db-seed/seed.sql

@@ -1,412 +1,297 @@
-# Online Auction System - Fullstack System Design Interview Answer
+# 🔨 Online Auction (eBay-style) — System Design Answer (Full-Stack Focus)
 
-## Introduction (2 minutes)
+*45-minute full-stack interview. This is a proposed production design; what this repository actually runs is described in [architecture.md → Implementation Notes](./architecture.md#implementation-notes).*
 
-"Thanks for this problem. I'll be designing an online auction platform covering both frontend and backend, with emphasis on the integration points between them. I'll focus on real-time bid synchronization, the API contract, type safety across the stack, and ensuring a consistent experience during high-activity periods."
+> "As a full-stack engineer I want to follow one bid through its whole life: tapped in a browser, judged against a contended row, pushed to ten thousand watchers, and — when the clock runs out — turned into exactly one winner and one notification. Three contracts between the layers carry most of the weight. An idempotency key makes a bid safe to retry. A version number lets every screen agree on the latest price and notice what it missed. And a server-owned end time keeps a last-second extension from fooling anyone's countdown."
 
----
-
-## 1. Requirements Clarification (5 minutes)
-
-### Functional Requirements
-
-1. **Auction Lifecycle** - Create, list, bid, auto-bid, end auctions
-2. **Real-Time Sync** - Bidders see updates instantly across devices
-3. **Anti-Sniping** - Extend auctions on last-minute bids
-4. **User Management** - Registration, authentication, watchlists
-5. **Admin Operations** - Cancel auctions, ban users, view analytics
-
-### Integration-Focused Non-Functional Requirements
-
-- **Type Safety** - Shared types between frontend and backend
-- **Real-Time Latency** - Bid updates delivered within 500ms
-- **Optimistic Updates** - Immediate UI feedback with server reconciliation
-- **Idempotency** - Safe retries for all mutation operations
-- **Graceful Degradation** - Fallback when WebSocket fails
+| Phase | Time | What I want the interviewer to leave with |
+|-------|------|--------------------------------------------|
+| Requirements & scale | 5 min | Scope and the targets on both sides of the wire |
+| End-to-end architecture | 8 min | One diagram from the Bid button to the database and back to every watcher |
+| Data model & API contract | 7 min | Server tables, client cache, and the fields both sides rely on |
+| Deep dive 1: one tap, one bid | 8 min | Idempotency from the button to a unique index |
+| Deep dive 2: a price everyone agrees on | 7 min | Row lock, versioned events, client gap detection |
+| Deep dive 3: the last ten seconds | 7 min | Snipe extensions, the countdown, exactly-once closing |
+| Failures, scale, wrap-up | 3 min | What each failure looks like to a user |
 
 ---
 
-## 2. Shared Type Definitions (5 minutes)
+## 🎯 Requirements & Scale (5 min)
 
-"Shared types ensure contract consistency between frontend and backend."
+**Functional.** Sellers list items with a starting price, increment, optional hidden reserve and duration. Bidders place manual bids or set a proxy maximum that bids for them. Everyone watching sees price, leader, bid history and countdown update live. A bid in the last two minutes extends the auction. At the end the system declares the winner, "reserve not met" or "no bids", and notifies everyone involved. Admins can force-close or cancel. Out of scope: payment, shipping, ratings.
 
-### Core Domain Types
+| Side | Requirement | Target |
+|------|-------------|--------|
+| Backend | Bid latency | p99 < 300 ms, including waiting behind other bids |
+| Backend | Closing | Winner decided within 2 s of the end, exactly once |
+| Backend | Durability | An acknowledged bid is never lost |
+| Frontend | Item page load | LCP < 2.0 s on mid-range mobile (server-rendered) |
+| Frontend | Responsiveness | INP < 200 ms while prices and timers tick |
+| Both | Live freshness | New price on every watcher's screen < 1 s after acceptance |
+| Both | Correctness | One tap places at most one bid; no screen shows a price going backwards; "You won" only from the server |
 
-The system defines shared TypeScript interfaces in a `shared/types/` directory used by both frontend and backend:
+**Scale.** 2M daily users, 200K concurrent at peak, 1M live auctions, 10M bids/day (~115/s average, ~1,500/s peak). A hot item can take 50 bids in its final 10 seconds with 10K people watching.
 
-**Auction**: Contains id, sellerId, title, description, category, startingPrice, currentBid, currentBidderId, reservePrice, bidIncrement, bidCount, status (draft | active | ended | sold | unsold | cancelled), startTime, endTime, originalEndTime, createdAt, updatedAt.
-
-**Bid**: Contains id, auctionId, bidderId, bidderName (anonymized), amount, maxAmount (only visible to owner), isProxyBid, isWinning, createdAt.
-
-**AutoBid**: Contains id, auctionId, bidderId, maxAmount, currentBid, isActive, createdAt.
-
-### API Request/Response Types
-
-**PlaceBidRequest**: amount (number), maxAmount (optional for auto-bid).
-
-**PlaceBidResponse**: bidId, status (accepted | pending | rejected), finalAmount, isHighestBidder, message, auctionEndTime.
-
-**PaginatedResponse<T>**: data array, pagination object with page, limit, total, totalPages.
-
-**ApiError**: error code, message, optional details map.
-
-### WebSocket Message Types
-
-```
-┌──────────────────────────────────────────────────────────────┐
-│                    WebSocket Message Types                    │
-├──────────────────────────────────────────────────────────────┤
-│                                                              │
-│  Server → Client                Client → Server              │
-│  ┌──────────────────┐          ┌──────────────────┐         │
-│  │ bid_update       │          │ subscribe        │         │
-│  │ auction_extended │          │ unsubscribe      │         │
-│  │ auction_ended    │          │ ping             │         │
-│  │ outbid_notif     │          └──────────────────┘         │
-│  │ connection_ack   │                                        │
-│  │ error            │                                        │
-│  └──────────────────┘                                        │
-│                                                              │
-└──────────────────────────────────────────────────────────────┘
-```
+"Those last numbers shape both sides. On the server, the problem is contention on one row, not throughput. On the wire, one accepted bid becomes 10,000 pushes, so every client must be able to apply an event without calling back. Otherwise the last ten seconds of a hot auction turn into 10,000 refetches per bid."
 
 ---
 
-## 3. WebSocket Integration (10 minutes)
-
-"Real-time synchronization is critical for auction UX. Here's the full-stack implementation."
-
-### Backend: WebSocket Server Architecture
+## 🏗️ End-to-End Architecture (8 min)
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                   AuctionWebSocketServer                        │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  ┌─────────────────┐    ┌─────────────────┐                    │
-│  │ WebSocketServer │    │ Redis Pub/Sub   │                    │
-│  │ (ws library)    │    │                 │                    │
-│  └────────┬────────┘    └────────┬────────┘                    │
-│           │                      │                              │
-│           ▼                      ▼                              │
-│  ┌─────────────────────────────────────────┐                   │
-│  │           State Maps                    │                   │
-│  ├─────────────────────────────────────────┤                   │
-│  │ clients: Map<WebSocket, ConnectedClient>│                   │
-│  │ auctionSubscribers: Map<auctionId, Set> │                   │
-│  └─────────────────────────────────────────┘                   │
-│                                                                 │
-│  ConnectedClient = { ws, userId, watchedAuctions: Set }        │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
+  ┌──────────────────────────────────────────────────────────────────────────────────────────────┐
+  │ Browser · auction page: BidForm (one Idempotency-Key per draft), BidHistory                  │
+  │ WebSocket store: version-gated events, refetch on gap or reconnect                           │
+  └─────┬────────────────────────────────────────────────────────────────────────────────────────┘
+        │ (1) POST /api/v1/auctions/{id}/bids, Idempotency-Key                          ▲
+        │                                                                (2) WebSocket  │
+        ▼                                                                               ▼
+  ┌──────────────────────────────────────────────────────────────────────────────────────────────┐
+  │ Load balancer · TLS · /api/* → Auction API · /ws → Realtime gateway                          │
+  └─────┬────────────────────────────────────────────────────────────────────────────────────────┘
+        │                                                                     WebSocket ▲
+        ▼                                                                               ▼
+  ┌───────────────┐          ┌────────────────────┐          ┌───────────────┐ ┌─────────────────┐
+  │ Auction API   │ lock, key│ Redis              │ (3) claim│ Closing       │ │ Realtime        │
+  │ bids, browse  │─────────▶│ bid locks, idem    │◀─────────│ workers       │ │ gateway: subs,  │
+  │ stateless     │          │ keys, endings ZSET │ due, ZREM│ every 1 s     │ │ fan-out         │
+  └──────┬────────┘          └────────────────────┘          └──────┬────────┘ └─────────────────┘
+         │ row-locked bid tx + outbox row                           │ close tx          ▲
+         │                                                          │                   │ consume
+         ▼                                                          ▼                   │
+  ┌─────────────────────────────────────────────────────────────────────┐      ┌────────┴────────┐
+  │ PostgreSQL · auctions, bids, auto_bids, notifications, outbox       │─────▶│ Kafka           │
+  │ source of truth · primary + read replicas                           │relay │ auction-events  │
+  └─────────────────────────────────────────────────────────────────────┘      └────────┬────────┘
+                                                                                        │ consume
+                                                                                        ▼
+                                                                               ┌─────────────────┐
+                                                                               │ Notification    │
+                                                                               │ workers: email, │
+                                                                               │ push, in-app    │
+                                                                               └─────────────────┘
 ```
 
-**Redis Subscription Setup**: Server pattern-subscribes to `auction:*` channels. On pmessage, extracts auctionId from channel and broadcasts to local subscribers.
+1. **Bid (1).** `BidForm` freezes the draft with an idempotency key and posts it. The Auction API claims the key and a per-auction admission lock in Redis, then decides the bid in one PostgreSQL transaction under the auction's row lock, and answers with the outcome and the new version.
+2. **Live update (2).** The committed change goes through an outbox to Kafka, keyed by auction ID. Realtime gateways push `new_bid` to every subscribed socket, and each browser applies it by version.
+3. **Close (3).** Closing workers claim due auctions from a Redis sorted set and close each under the same row lock. `auction_ended` flows back through the outbox to every watching browser and to the notification workers.
 
-**WebSocket Handlers**:
-- On connection: Create ConnectedClient, send connection_ack with connectionId
-- On "subscribe" message: Add client to auctionSubscribers map
-- On "unsubscribe" message: Remove client from auction map
-- On "ping" message: Respond with pong
-- On disconnect: Cleanup all auction subscriptions
+| Layer | Choice | Why |
+|-------|--------|-----|
+| Item and browse pages | Server-rendered, then hydrated SPA | Search traffic and shared links need fast, indexable item pages |
+| Client state | Query cache for server data, one version-checked writer; Zustand for the socket and session | One place decides what's newest |
+| Auction API | Stateless; synchronous bid decisions | The bidder must know the outcome immediately |
+| PostgreSQL | Source of truth, row lock per auction, outbox | Correctness lives in one transaction |
+| Redis | Admission locks, idempotency keys, endings sorted set | Coordination that can be rebuilt |
+| Kafka + gateways | Versioned events, local fan-out | One event per bid across the backbone, not one per watcher |
 
-**Cross-Server Broadcasting**: When a bid occurs, server calls `publishBidUpdate()` which publishes to `auction:{id}` Redis channel. All servers subscribed to that pattern receive and broadcast to their local clients.
-
-### Frontend: WebSocket Hook
+### Flow: a bid across the wire
 
 ```
-┌────────────────────────────────────────────────────────────────┐
-│                    useAuctionSocket Hook                        │
-├────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  State                                                          │
-│  ├── wsRef: WebSocket reference                                │
-│  ├── reconnectAttempts: number                                 │
-│  └── isConnected: boolean                                      │
-│                                                                 │
-│  Connection Lifecycle                                           │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │ 1. Create WebSocket connection                          │   │
-│  │ 2. onopen: setConnected(true), send subscribe message   │   │
-│  │ 3. onmessage: Route by type to handlers                 │   │
-│  │ 4. onclose: Exponential backoff reconnect (max 5 tries) │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                 │
-│  Message Handlers                                               │
-│  ├── bid_update → updateFromSocket(currentBid, bidCount)       │
-│  ├── auction_extended → updateFromSocket(endTime)              │
-│  ├── auction_ended → updateFromSocket(status)                  │
-│  └── outbid_notification → onOutbid callback                   │
-│                                                                 │
-│  Reconnect Formula: delay = min(1000 * 2^attempts, 30000)      │
-│                                                                 │
-└────────────────────────────────────────────────────────────────┘
+Bidder                       BidForm                    Auction API           PostgreSQL
+   │                            │                            │                     │
+   │ 1 Place bid $1,735         │                            │                     │
+   │───────────────────────────▶│                            │                     │
+   │                            │ 2 key K for "manual:1735"  │                     │
+   │                            │ 3 POST /bids/{id}, key K   │                     │
+   │                            │───────────────────────────▶│                     │
+   │                            │                            │ 4 row lock, COMMIT  │
+   │                            │                            │────────────────────▶│
+   │                            │ 5 201 {1760, winning: no}  │                     │
+   │                            │◀───────────────────────────│                     │
+   │ 6 "Outbid by an auto-bid"  │                            │                     │
+   │◀───────────────────────────│                            │                     │
+   ························ timeout instead of a response ··························
+   │                            │ 7 retry with the same K    │                     │
+   │                            │───────────────────────────▶│                     │
+   │                            │ 8 same 201, replayed       │                     │
+   │                            │◀───────────────────────────│                     │
+   │                            │                            │                     │
 ```
+
+"Step 2 and the retry in step 7 are two halves of one contract. The browser promises to send the same key for the same bid — even after a refresh, because the key lives with the draft in `sessionStorage`. The server promises that a repeated key returns the original answer instead of bidding again. And step 6 shows why the bid is not optimistic: a hidden proxy maximum beat this bidder instantly, which only the server could know."
+
+### Flow: the end of an auction
+
+```
+Auction page          Gateway                         Closing worker               PostgreSQL
+      │                  │                                   │                          │
+      │ 1 timer hits 0: "Closing…"                           │                          │
+      │                  │                                   │ 2 close tx, FOR UPDATE   │
+      │                  │                                   │─────────────────────────▶│
+      │                  │                                   │ 3 sold to tomas, $1,800  │
+      │                  │                                   │◀─────────────────────────│
+      │                  │ 4 auction_ended (outbox → Kafka)  │                          │
+      │                  │◀──────────────────────────────────│                          │
+      │ 5 auction_ended  │                                   │                          │
+      │◀─────────────────│                                   │                          │
+      │ 6 refetch: "You won" / "Sold"                        │                          │
+      │                  │                                   │                          │
+```
+
+"At zero, the page shows 'Closing…' rather than a winner. The server owns the deadline, and a bid may have landed in the final second and extended it. The winner appears when `auction_ended` arrives. If it hasn't come within a few seconds, the page refetches."
 
 ---
 
-## 4. API Integration Layer (8 minutes)
+## 💾 Data Model & API Contract (7 min)
 
-### Backend: Express Routes
+### Server side
 
-The auction routes implement validation with Zod, authentication middleware, and rate limiting.
+| Store | Table / key | Key columns | Notes |
+|-------|-------------|-------------|-------|
+| PostgreSQL | `auctions` | `id`, `current_cents`, `increment_cents`, `reserve_cents`, `status`, `end_time`, `version`, `winner_id` | `version` +1 on every price change, close, cancel |
+| PostgreSQL | `bids` | `auction_id`, `bidder_id`, `amount_cents`, `is_auto`, `seq`, `idempotency_key` | Leader = first by `(amount DESC, seq)`; unique `(bidder_id, idempotency_key)` |
+| PostgreSQL | `proxies` | `(auction_id, bidder_id)`, `max_cents`, `is_active` | Only the leader's proxy is active |
+| PostgreSQL | `outbox` | `auction_id`, `type`, `version`, `payload` | Committed with the change |
+| Redis | `idem:{user}:{key}` | Fingerprint, state, response | Claim 60 s, result 24 h |
+| Redis | `auction_endings` | Sorted set by end time | Rebuilt from PostgreSQL by a reconciler |
 
-**POST /:auctionId/bids** (Place bid):
-1. Validate request body with placeBidSchema (amount positive, multipleOf 0.01)
-2. Extract idempotency key from X-Idempotency-Key header
-3. Call bidService.placeBid() with auctionId, bidderId, amount, maxAmount, idempotencyKey
-4. Return PlaceBidResponse with bidId, status, finalAmount, isHighestBidder, message, auctionEndTime
+### Client side
 
-**POST /:auctionId/proxy** (Set auto-bid):
-1. Validate maxAmount
-2. Call bidService.setAutoBid()
-3. Return current auto-bid state
+| Cache key / store | Holds | Updated by |
+|-------------------|-------|------------|
+| `['auction', id]` | Snapshot: price, end time, status, version, leader-first bids, my proxy | Events (version rule), bid responses (version rule), refetch on gap |
+| `['auctions', filters]` | Cursor pages of cards | 30 s refresh while visible |
+| Realtime store | One socket, subscriptions, listeners | Reconnect with backoff, resubscribe, then refetch |
+| `sessionStorage['bid-draft']` | Frozen amount, kind, idempotency key | Cleared on a definitive answer |
 
-**GET /:auctionId/bids** (Bid history):
-1. Parse page/limit query params
-2. Return paginated bid list
-
-**Error Handling Middleware**: Maps domain errors to HTTP responses:
-- BidTooLowError → 400 BID_TOO_LOW
-- AuctionEndedError → 409 AUCTION_ENDED
-- LockError → 429 TOO_MANY_BIDS
-
-### Frontend: API Client
+### The contract
 
 ```
-┌────────────────────────────────────────────────────────────────┐
-│                      ApiClient Class                            │
-├────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  Base Configuration                                             │
-│  └── BASE_URL: VITE_API_URL or http://localhost:3000/api/v1    │
-│                                                                 │
-│  Core request() Method                                          │
-│  ├── Adds credentials: 'include' for session cookies           │
-│  ├── Sets Content-Type: application/json                       │
-│  ├── Throws ApiClientError on non-ok response                  │
-│  └── Returns parsed JSON                                        │
-│                                                                 │
-│  Methods                                                         │
-│  ├── getAuctions(params?) → PaginatedResponse<Auction>         │
-│  ├── getAuction(id) → Auction                                  │
-│  ├── placeBid(id, data, idempotencyKey) → PlaceBidResponse     │
-│  ├── setAutoBid(id, data) → SetAutoBidResponse                 │
-│  ├── getBidHistory(id, page, limit) → PaginatedResponse<Bid>   │
-│  ├── getWatchlist() → Auction[]                                │
-│  ├── addToWatchlist(auctionId) → void                          │
-│  └── removeFromWatchlist(auctionId) → void                     │
-│                                                                 │
-└────────────────────────────────────────────────────────────────┘
+POST   /api/v1/auctions/{id}/bids     {amount} + Idempotency-Key → 201 {current_price, is_winning, version, end_time}
+PUT    /api/v1/auctions/{id}/proxy    {max_amount} + Idempotency-Key → 200 {same fields}
+GET    /api/v1/auctions/{id}          → {auction (with version), bids (leader first), my_proxy}
+WS     /ws  subscribe {auction_id}    ← new_bid {version, current_price, leader_id, end_time, bids}
+                                      ← auction_ended {version, outcome, winner_id, final_price}
 ```
 
-### Frontend: React Query Hooks
-
-**useAuction(auctionId)**: Query with 5s staleTime, 30s refetchInterval as WebSocket fallback.
-
-**useBidHistory(auctionId, page)**: Query with 10s staleTime.
-
-**usePlaceBid()**: Mutation with optimistic update pattern:
-1. onMutate: Cancel outgoing queries, snapshot previous value, optimistically update currentBid/bidCount
-2. onError: Rollback to previous snapshot
-3. onSettled: Invalidate auction and bids queries
-
-**useSetAutoBid()**: Simple mutation that invalidates auction query on success.
+| Contract element | The server guarantees | The client relies on it to |
+|------------------|----------------------|----------------------------|
+| `Idempotency-Key` | Same key + same body → same answer for 24 h; different body → `422`; in flight → `409` + `Retry-After` | Retry after timeouts and refreshes without bidding twice |
+| `version` | +1 per change, in the same transaction, on every event and snapshot | Apply `v+1`, drop stale, refetch on a gap |
+| `is_winning` + `current_price` in the `201` | The decision, including hidden proxy effects | Say "You're winning" or "Outbid by an auto-bid" without guessing |
+| `minimum_bid` in `400` | The real next minimum under the lock | Correct the input in place |
+| `end_time` on events and responses | The authoritative deadline, moved by snipe protection | Drive the countdown; show "Extended" |
+| `auction_ended.outcome` | Decided once under the row lock | Switch to "You won", "Sold" or "Reserve not met" |
 
 ---
 
-## 5. Bid Processing Flow (8 minutes)
+## 🔧 Deep Dive 1: One Tap, One Bid (8 min)
 
-### Complete Bid Flow: Frontend to Backend to Real-Time Update
+"The scenario: a bidder on a train taps Bid, the request times out, and they tap again. Without care we place two bids — maybe at two different prices — or show 'failed' for a bid that actually went through. Each layer has a job."
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         Bid Processing Pipeline                          │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  Step 1: Idempotency Check                                              │
-│  └── Check Redis for existing idempotency key → return cached result    │
-│                                                                          │
-│  Step 2: Distributed Lock                                               │
-│  └── Acquire lock:auction:{id} with 5s TTL using SET NX                 │
-│  └── If lock fails → throw LockError (429)                              │
-│                                                                          │
-│  Step 3: Database Transaction                                           │
-│  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │ BEGIN                                                           │    │
-│  │ ├── SELECT auction FOR UPDATE (row lock)                        │    │
-│  │ ├── Validate bid (status, timing, seller check, minimum)        │    │
-│  │ ├── Fetch competing auto-bids                                   │    │
-│  │ ├── Resolve auto-bid competition                                │    │
-│  │ ├── INSERT bid record                                           │    │
-│  │ ├── UPDATE previous winning bid (is_winning = false)            │    │
-│  │ ├── Check anti-sniping window (2 min)                           │    │
-│  │ ├── If within window: UPDATE end_time, update Redis scheduler   │    │
-│  │ ├── UPDATE auction state (current_high_bid, bidder_id)          │    │
-│  │ COMMIT                                                          │    │
-│  └─────────────────────────────────────────────────────────────────┘    │
-│                                                                          │
-│  Step 4: Post-Transaction Actions                                        │
-│  ├── Invalidate Redis cache (auction, bids)                             │
-│  ├── Publish bid_update via Redis Pub/Sub                               │
-│  ├── Publish auction_extended if time changed                           │
-│  └── Notify outbid user                                                 │
-│                                                                          │
-│  Step 5: Release Lock                                                    │
-│  └── Lua script: only delete if we own the lock                         │
-│                                                                          │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+**Browser.** On submit, `BidForm` freezes the draft (amount and kind) and generates a key with `crypto.randomUUID()`, stored with the draft in `sessionStorage`. Every retry of that draft resends the key: the Retry button, an automatic retry on a network error, or a reload that finds a pending draft. Changing the amount makes a new draft and a new key. The button is disabled while pending, but correctness never depends on that.
 
-### Auto-Bid Resolution Logic
+**API.** Before touching the database, the API claims the key with `SET idem:{user}:{key} pending NX EX 60`, storing a fingerprint of the request. If the key has finished, it replays the stored answer with `Idempotent-Replayed: true`. If it's still in flight, it answers `409` and `Retry-After: 1`, and the client tries again shortly. If the fingerprint differs, it answers `422`, because reusing a key for a different bid is a client bug and should fail loudly. A failed attempt releases the claim so the same key can be retried.
 
-When a new bid comes in against existing auto-bids:
+**Database.** The caller's bid row stores the key under a unique `(bidder_id, idempotency_key)` index. That covers the gap Redis can't: the process committing the bid and dying before it stores the response, or Redis losing the record. The retry then finds the bid inside the transaction and answers from it.
 
-1. If no competing auto-bids: New bidder wins at their amount
-2. If new bidder's effective max > highest auto-bid max: New bidder wins at (highest max + increment) or their max, whichever is lower
-3. If existing auto-bidder has higher max: Auto-bidder wins at (new amount + increment) or their max, whichever is lower
+| Approach | Verdict |
+|----------|---------|
+| ✅ Key per draft + Redis claim + unique index | Correct across double taps, timeouts, refreshes, concurrent duplicates and a lost Redis record |
+| ❌ Disable the button only | Stops a double click; does nothing for a retry after a timeout or a reload |
+| ❌ Server dedupe by `{user, auction, amount, second}` | Misses retries that straddle a second; can merge deliberate bids |
+| ❌ Optimistic "bid placed" in the UI | The outcome depends on hidden proxies and the latest price |
 
-### Bid Validation Rules
-
-- Auction must exist
-- Status must be 'active'
-- End time must be in future
-- Bidder cannot be the seller
-- Amount must be >= (current_high_bid OR starting_price) + bid_increment
+"What I give up: one Redis round trip per bid, stored responses for a day, and a client that has to manage a draft lifecycle. That's cheap for the most consequential button on the site."
 
 ---
 
-## 6. State Synchronization Pattern (5 minutes)
+## 🔧 Deep Dive 2: A Price Everyone Agrees On (7 min)
 
-### Frontend Store with Server Reconciliation
+"Ten thousand screens, one price. The server has to decide bids in one order, and every screen has to converge on that order — even if it misses events or receives them twice."
 
-```
-┌────────────────────────────────────────────────────────────────────┐
-│                    Zustand Auction Store                            │
-├────────────────────────────────────────────────────────────────────┤
-│                                                                     │
-│  State Shape                                                        │
-│  ├── auctions: Record<string, Auction>                             │
-│  ├── pendingBids: Record<string, { amount, timestamp }>            │
-│  └── lastServerSync: Record<string, number>                        │
-│                                                                     │
-│  Actions                                                            │
-│  ┌─────────────────────────────────────────────────────────────┐   │
-│  │ setAuction(auction)                                         │   │
-│  │   └── Store auction, update lastServerSync timestamp        │   │
-│  ├─────────────────────────────────────────────────────────────┤   │
-│  │ updateFromSocket(auctionId, update)                         │   │
-│  │   └── If pendingBid.amount > update.currentBid: skip update │   │
-│  │   └── Otherwise: merge update, update sync timestamp        │   │
-│  ├─────────────────────────────────────────────────────────────┤   │
-│  │ optimisticBid(auctionId, amount)                            │   │
-│  │   └── Store in pendingBids with timestamp                   │   │
-│  │   └── Update auction.currentBid and bidCount                │   │
-│  ├─────────────────────────────────────────────────────────────┤   │
-│  │ confirmBid(auctionId, serverData)                           │   │
-│  │   └── Clear pendingBid                                      │   │
-│  │   └── Apply server's finalAmount                            │   │
-│  ├─────────────────────────────────────────────────────────────┤   │
-│  │ rollbackBid(auctionId)                                      │   │
-│  │   └── Delete pendingBid, next WS update restores state      │   │
-│  └─────────────────────────────────────────────────────────────┘   │
-│                                                                     │
-│  Selectors                                                          │
-│  ├── useAuctionById(id) → Auction                                  │
-│  └── useHasPendingBid(id) → boolean                                │
-│                                                                     │
-└────────────────────────────────────────────────────────────────────┘
-```
+**Server: one order.** Every bid takes `SELECT … FOR UPDATE` on the auction row, so bids on one auction are strictly serial. Each sees the committed result of the previous one. Proxy resolution happens inside that lock, as a pure second-price function in integer cents. The resulting price, the inserted rows, `version + 1` and an outbox event commit together. A Redis admission lock with a 1.5 s bounded wait keeps a burst queued in Redis instead of in the database connection pool.
 
-**Key Insight**: When a WebSocket update arrives with a lower bid than our pending bid, we skip the update because the server hasn't processed our bid yet. This prevents UI flickering.
-
----
-
-## 7. Error Handling Across Stack (3 minutes)
-
-### Shared Error Types
-
-The system defines a base AppError class with code, message, and httpStatus. Specific errors extend this:
-
-- **BidTooLowError** (400): Includes minimumBid amount
-- **AuctionEndedError** (409): Auction has ended
-- **LockError** (429): Too many concurrent requests
-- **NotFoundError** (404): Resource not found
-
-### Frontend Error Handling Pattern
-
-The BidForm component handles errors from usePlaceBid mutation:
+**Transport: keep the order.** The outbox relay publishes to Kafka with the auction ID as the key, so events for one auction stay in order. Gateways keep no history: they forward each event to the sockets subscribed to that auction.
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                    Frontend Error Mapping                        │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  Error Code          │ User-Facing Message                      │
-│  ────────────────────┼──────────────────────────────────────────│
-│  BID_TOO_LOW         │ "Your bid is too low. Minimum: $X"       │
-│  AUCTION_ENDED       │ "Sorry, this auction has ended."         │
-│  LOCK_TIMEOUT        │ "Too many bids right now. Try again."    │
-│  (default)           │ "Failed to place bid. Please try again." │
-│  (network error)     │ "Network error. Check your connection."  │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
+PostgreSQL               Relay                        Kafka       Gateway          Watcher
+     │                     │                            │            │                │
+     │ 1 read outbox rows  │                            │            │                │
+     │◀────────────────────│                            │            │                │
+     │ 2 new_bid v42       │                            │            │                │
+     │────────────────────▶│                            │            │                │
+     │                     │ 3 publish, key auction_id  │            │                │
+     │                     │───────────────────────────▶│            │                │
+     │                     │                            │ 4 consume  │                │
+     │                     │                            │◀───────────│                │
+     │                     │                            │            │ 5 new_bid v42  │
+     │                     │                            │            │───────────────▶│
+     │                     │                            │       6 42 = 41 + 1: apply  │
+     ·························· socket drops and reconnects ···························
+     │                     │                            │            │ 7 new_bid v45  │
+     │                     │                            │            │───────────────▶│
+     │                     │                            │    8 gap: refetch snapshot  │
+     │                     │                            │            │                │
 ```
 
----
+**Client: converge.** The page holds a snapshot with its version. Event `v+1` is applied in place — price, end time, leader, new rows merged by ID, leader-first. Anything at or below the current version is ignored. A gap triggers one refetch, as does a re-subscription after reconnect. A refetched snapshot replaces the current one only if it's at least as new. The bid's own `201` response goes through the same version check, because the WebSocket event for a later bid may already have arrived.
 
-## 8. Trade-offs and Alternatives (3 minutes)
+| Approach | Verdict |
+|----------|---------|
+| ✅ Row lock + versioned events + client version rule | One order on the server; every screen converges; missed events detected |
+| ❌ Refetch the auction on every event | 10K watchers × 50 bids of extra load in the final seconds; slow responses can roll the price back |
+| ❌ Optimistic version check on the server | A losing bid can't be retried without spending more than the user authorized |
+| ❌ Gateways replaying history per client | Stateful gateways; the version rule plus a refetch achieves the same with none |
 
-| Decision | Chosen Approach | Trade-off | Alternative |
-|----------|----------------|-----------|-------------|
-| WebSocket vs SSE | WebSocket | Bidirectional, but more complex | SSE simpler, one-way only |
-| Shared types | Monorepo with shared folder | Build complexity | Code generation from OpenAPI |
-| Optimistic updates | Immediate UI update | Brief inconsistency | Wait for server (slower UX) |
-| Auto-bid resolution | Server-side only | Client doesn't see outcome instantly | Client prediction (complex) |
-| Idempotency | UUID per request | Client must generate | Server-generated (less control) |
-| State sync | Zustand + WebSocket | Dual source of truth | Single source with polling |
+"What I give up: every event carries a version and the rows it created, and the client funnels every write through one function. That function is the whole client-side consistency model, so it's the first thing I'd unit-test."
 
 ---
 
-## 9. Testing Strategy (2 minutes)
+## 🔧 Deep Dive 3: The Last Ten Seconds (7 min)
 
-### Integration Test Approach
+"Two things change in the last seconds: the deadline can move, and someone has to declare a winner while people are still bidding."
 
-Tests use vitest with supertest for HTTP assertions. Setup includes:
-- seedTestAuction() with known currentBid and bidIncrement
-- seedTestUser() for authenticated requests
-- getAuthCookie() for session management
+**Snipe protection lives in the bid transaction.** If a price change lands with less than the snipe window left, `end_time` moves to now + window in the same transaction, under the same row lock. No bid is ever judged against a deadline another request is in the middle of changing. The new end time is in the `201` and in the `new_bid` event, so every countdown jumps forward together with an "Extended +2:00" cue. I cap extensions with a counter so a bidding war can't run forever.
 
-**Key Test Cases**:
+**The countdown follows the server.** The client keeps a server-time offset and counts down to the server's `end_time`. At zero it says "Closing…" and disables the form — it never declares a result itself.
 
-1. **Accept valid bid**: POST with amount above minimum returns 201 with finalAmount and isHighestBidder=true
+**The closer is exactly-once.** End times live in a Redis sorted set. Each closing worker reads due IDs every second and claims each with `ZREM`; only one worker gets it. The close then runs under the auction's row lock and re-checks the state:
 
-2. **Reject low bid**: POST with amount at or below current returns 400 BID_TOO_LOW
+- already ended → stop;
+- `end_time` moved → put the new time back in the set and stop;
+- otherwise → pick the leader (earliest bid at the highest amount), compare to the reserve in cents, and commit status, winner, notifications and the `auction_ended` event together.
 
-3. **Handle duplicate idempotency key**: Second request with same key returns 200 with cached result
+A reconciler re-adds active auctions that end within two minutes, from PostgreSQL, so a lost Redis entry delays a close instead of stranding it.
+
+**Late bids are impossible regardless.** The bid transaction rejects anything after `end_time`, under the lock, so a slow closer delays the announcement but never lets a bid in.
+
+| Approach | Verdict |
+|----------|---------|
+| ✅ Extend in the bid tx; server-time countdown; close under the row lock | Deadline, bids and close are serialized by the same lock; the UI never guesses |
+| ❌ Client declares "Ended" at zero | Wrong whenever a last-second bid extended the auction |
+| ❌ Closer without re-checking under the lock | Closes an extended auction early, or two workers notify twice |
+| ❌ Hard close with no extension | Simpler, but rewards sniping bots over people |
+
+"What I give up: a second or two of 'Closing…' instead of an instant result, and an auction that can run longer than its listing said. Both are easier to explain to users than a wrong winner."
 
 ---
 
-## 10. Future Enhancements
+## 📈 Failures & Scale (2 min)
 
-1. **GraphQL Subscriptions** - Replace WebSocket with GraphQL for unified data layer
-2. **Offline Bid Queue** - Queue bids when offline, sync when reconnected
-3. **End-to-End Type Generation** - Generate types from OpenAPI or tRPC
-4. **Event Sourcing** - Full bid history as event log for audit
-5. **Multi-Region** - Geo-distributed deployment with conflict resolution
-6. **Mobile Apps** - React Native with shared business logic
+| Failure | What the bidder sees | What a watcher sees | Mitigation |
+|---------|----------------------|---------------------|------------|
+| Burst on one auction | A short pending state; rarely "try again in 1 s" | Prices update in quick succession | Bounded admission wait; row lock |
+| Bid response lost | "Still sending…", then the original result | Nothing unusual | Same key; durable unique index |
+| Socket drops | "Reconnecting…" badge; bidding still works | Same | Resubscribe, then refetch by version |
+| Kafka lag | Own bid result is immediate | Prices late by seconds | The `201` is authoritative; the version rule catches up |
+| Redis down | "Bidding is temporarily unavailable" | Prices freeze | Fail closed with `503`; closer falls back to the partial index |
+| Closer slow at 8 p.m. | "Closing…" a little longer | Same | More workers; claims spread the load; late bids still rejected |
+
+**What breaks first:** fan-out on hot items (handled at the gateways), then closing spikes at round times (more workers), then bid storage (~550 GB/year, sharded by auction ID so each bid stays on one shard).
 
 ---
 
-## Summary
+## ⚖️ Trade-offs & Wrap-up (1 min)
 
-"I've designed a fullstack online auction platform with:
+| Decision | ✅ Chosen | ❌ Alternative | Why |
+|----------|-----------|----------------|-----|
+| Bid safety | Key per draft + Redis claim + unique index | Disabled button or server fingerprint | Retries can't duplicate; deliberate bids are never merged |
+| Bid concurrency | Row lock, synchronous `201` | Optimistic checks, or queue + `202` | Correct answers without asking users to re-bid |
+| Live view | Versioned events applied in place | Refetch per event, or polling | Constant load per bid; gaps detected; never backwards |
+| Bid UI | Pessimistic, server-decided outcome | Optimistic "You're winning" | Hidden proxies decide; the UI must not lie |
+| Deadline | Snipe extension in the bid tx; server-time countdown | Client-side end; hard close | One lock serializes bids, extensions and the close |
+| Closing | Sorted set + `ZREM` + close under the row lock | DB polling or timers | Parallel, exactly once, PostgreSQL stays the truth |
 
-1. **Shared type definitions** - Consistent contracts between frontend and backend
-2. **WebSocket integration** - Real-time bid updates with Redis pub/sub for multi-server support
-3. **Optimistic UI updates** - Immediate feedback with server reconciliation
-4. **Robust bid processing** - Distributed locking, idempotency, auto-bid resolution
-5. **Error handling** - Shared error types with appropriate HTTP status codes
-6. **State synchronization** - Zustand store that merges optimistic and server state
-
-The key insight is treating the bid as a multi-phase transaction: client optimistic update, server validation and processing, then real-time broadcast to all watchers. This gives users immediate feedback while maintaining correctness through server-side locks and idempotency."
+"With more time: a post-close checkout with its own idempotent payment state machine, push notifications for 'outbid' and 'ending soon' on watched items, and offline-first caching of the item shell so a bidder on a bad connection still sees the last known price and its age."

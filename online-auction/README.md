@@ -77,7 +77,11 @@ This will start:
 - PostgreSQL on port 5432
 - Redis on port 6379
 
-The database will be automatically initialized with the schema from `backend/db/init.sql`.
+The database will be automatically initialized with the schema from `backend/src/db/init.sql` (re-runnable, so it is also safe to apply to an existing database). Load the sample data with:
+
+```bash
+PGPASSWORD=auction123 psql -h localhost -U auction -d auction_db -f backend/db-seed/seed.sql
+```
 
 2. Start the backend server:
 
@@ -114,8 +118,9 @@ CREATE USER auction WITH PASSWORD 'auction123';
 CREATE DATABASE auction_db OWNER auction;
 \q
 
-# Initialize schema
-psql -U auction -d auction_db -f backend/db/init.sql
+# Initialize schema (re-runnable) and sample data
+psql -U auction -d auction_db -f backend/src/db/init.sql
+psql -U auction -d auction_db -f backend/db-seed/seed.sql
 ```
 
 2. **Redis Setup**:
@@ -147,6 +152,18 @@ REDIS_PORT=6379
 # Server
 PORT=3001
 FRONTEND_URL=http://localhost:5173
+
+# Auction scheduler (runs inside every API process)
+SCHEDULER_TICK_MS=1000                # how often due auctions are claimed and closed
+SCHEDULER_RECONCILE_MS=30000          # how often the Redis schedule is rebuilt from PostgreSQL
+SCHEDULER_RECONCILE_WINDOW_MS=120000  # re-add active auctions ending within this window
+```
+
+## Running Tests
+
+```bash
+cd backend
+npm test        # vitest: proxy-bid resolution, close decisions, idempotency helpers (offline)
 ```
 
 ## Running Multiple Backend Instances
@@ -169,10 +186,10 @@ npm run dev:server3  # Port 3003
 
 ## Demo Credentials
 
-The database is initialized with an admin user:
+The seed (`backend/db-seed/seed.sql`) creates:
 
-- **Email**: admin@auction.com
-- **Password**: admin123
+- **Admin**: admin@auction.com / password123
+- **Bidders**: nadia@auction.com, tomas@auction.com, priya@auction.com, marcus@auction.com (all password123)
 
 ## API Endpoints
 
@@ -195,10 +212,12 @@ The database is initialized with an admin user:
 - `GET /api/auctions/user/bids` - Get user's bid history
 
 ### Bidding
-- `POST /api/bids/:auctionId` - Place a bid
-- `POST /api/bids/:auctionId/auto` - Set auto-bid
+- `POST /api/bids/:auctionId` - Place a bid (`{amount}`); 201 `{bid, current_price, is_winning, version, end_time, extended}`
+- `POST /api/bids/:auctionId/auto` - Set or raise an auto-bid maximum (`{max_amount}`)
 - `DELETE /api/bids/:auctionId/auto` - Cancel auto-bid
-- `GET /api/bids/:auctionId` - Get bid history
+- `GET /api/bids/:auctionId` - Get bid history, leader first (highest amount, earliest first)
+
+Both POST endpoints accept an `Idempotency-Key` header (legacy `X-Idempotency-Key` also works): a retry with the same key replays the original response (`Idempotent-Replayed: true`), a key still in flight returns 409, and the same key with a different body returns 422. A leader bidding again gets `409 already_leading`; raise the auto-bid maximum instead.
 
 ### Notifications
 - `GET /api/notifications` - Get user's notifications
@@ -223,8 +242,8 @@ Connect to `ws://localhost:3001/ws?token=<session_token>`
 ### Server Messages
 - `{ type: "connected", authenticated: boolean }` - Connection established
 - `{ type: "subscribed", auction_id: "..." }` - Subscription confirmed
-- `{ type: "new_bid", auction_id, current_price, bidder_id, ... }` - New bid placed
-- `{ type: "auction_ended", auction_id, winner_id, final_price }` - Auction ended
+- `{ type: "new_bid", auction_id, version, current_price, leader_id, end_time, extended, bids }` - Price changed; `version` increases by one per change, so clients drop stale events and refetch on gaps
+- `{ type: "auction_ended", auction_id, version, outcome, winner_id, final_price }` - Auction closed (`sold`, `reserve_not_met`, `no_bids`) or `cancelled`
 
 ## Implementation Status
 
@@ -241,7 +260,7 @@ Connect to `ws://localhost:3001/ws?token=<session_token>`
 - [x] Real-time WebSocket updates
 - [x] Frontend implementation
 - [x] Admin dashboard
-- [ ] Testing
+- [x] Backend unit tests (`cd backend && npm test`)
 - [ ] Performance optimization
 
 ## Architecture
@@ -250,7 +269,7 @@ See [architecture.md](./architecture.md) for detailed system design documentatio
 
 ## Development Notes
 
-See [claude.md](./claude.md) for development insights and iteration history.
+See [CLAUDE.md](./CLAUDE.md) for development insights and iteration history.
 
 ## References & Inspiration
 

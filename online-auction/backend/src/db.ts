@@ -23,4 +23,24 @@ export const query = (text: string, params?: unknown[]): Promise<QueryResult> =>
 /** Acquires a client from the pool for manual transaction control. */
 export const getClient = (): Promise<PoolClient> => pool.connect();
 
+/**
+ * Runs `fn` inside BEGIN/COMMIT on one pooled connection and rolls back if it
+ * throws. Every multi-statement write (a bid, a close, a cancel) goes through
+ * this so a failure can never leave half of it applied.
+ */
+export const withTransaction = async <T>(fn: (client: PoolClient) => Promise<T>): Promise<T> => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await fn(client);
+    await client.query('COMMIT');
+    return result;
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    throw error;
+  } finally {
+    client.release();
+  }
+};
+
 export default pool;

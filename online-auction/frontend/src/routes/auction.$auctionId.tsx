@@ -1,11 +1,12 @@
 import { createFileRoute, useNavigate } from '@tanstack/react-router';
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { api } from '../services/api';
 import { useAuthStore } from '../stores/authStore';
 import { useAuctionSubscription } from '../hooks/useAuctionSubscription';
 import { CountdownTimer } from '../components/CountdownTimer';
 import { BidForm } from '../components/BidForm';
 import { BidHistory } from '../components/BidHistory';
+import { applyBidEvent, isNewerOrSame } from '../utils/auctionEvents';
 import type { AuctionDetail, WebSocketMessage } from '../types';
 
 /**
@@ -26,9 +27,10 @@ export const Route = createFileRoute('/auction/$auctionId')({
  * - Complete bid history
  * - Watch/unwatch toggle
  *
- * Subscribes to WebSocket for real-time updates on:
- * - New bids (updates price and refetches bid history)
- * - Auction end events
+ * Subscribes to WebSocket for real-time updates:
+ * - New bids are applied from the event payload, gated by the auction version
+ *   (stale events are dropped; a missed event triggers one refetch)
+ * - Auction end events and re-subscriptions after a reconnect refetch
  *
  * @returns JSX element for the auction detail page
  */
@@ -42,10 +44,15 @@ function AuctionPage() {
   const [error, setError] = useState<string | null>(null);
   const [isWatching, setIsWatching] = useState(false);
 
+  const auctionDataRef = useRef<AuctionDetail | null>(null);
+  auctionDataRef.current = auctionData;
+  const hasSubscribed = useRef(false);
+
   const fetchAuction = useCallback(async () => {
     try {
       const data = await api.getAuction(auctionId);
-      setAuctionData(data);
+      // A slow response must not overwrite a newer state applied from an event.
+      setAuctionData((prev) => (isNewerOrSame(prev, data) ? data : prev));
       setIsWatching(data.isWatching);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load auction');
@@ -58,26 +65,30 @@ function AuctionPage() {
     fetchAuction();
   }, [fetchAuction]);
 
+  // Stable callback (no dependency on auctionData), so a new bid no longer
+  // tears down and re-creates the subscription.
   const handleWebSocketMessage = useCallback(
     (message: WebSocketMessage) => {
-      if (message.type === 'new_bid' && auctionData) {
-        setAuctionData((prev) => {
-          if (!prev) return prev;
-          return {
-            ...prev,
-            auction: {
-              ...prev.auction,
-              current_price: String(message.current_price || prev.auction.current_price),
-            },
-          };
-        });
-        // Refetch to get updated bid history
-        fetchAuction();
+      if (message.type === 'new_bid') {
+        const current = auctionDataRef.current;
+        if (!current) return;
+        const result = applyBidEvent(current, message);
+        if (result.kind === 'applied') {
+          auctionDataRef.current = result.detail;
+          setAuctionData(result.detail);
+        } else if (result.kind === 'gap') {
+          fetchAuction();
+        }
       } else if (message.type === 'auction_ended') {
         fetchAuction();
+      } else if (message.type === 'subscribed') {
+        // The first ack follows the initial fetch; later ones mean the socket
+        // reconnected and events may have been missed while it was down.
+        if (hasSubscribed.current) fetchAuction();
+        hasSubscribed.current = true;
       }
     },
-    [auctionData, fetchAuction]
+    [fetchAuction]
   );
 
   useAuctionSubscription(auctionId, handleWebSocketMessage);

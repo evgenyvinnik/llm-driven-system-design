@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { useAuthStore } from '../stores/authStore';
 import { api } from '../services/api';
 import type { Auction, AutoBid } from '../types';
@@ -39,6 +39,16 @@ export function BidForm({ auction, userAutoBid, onBidPlaced }: BidFormProps) {
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
   const [showAutoBid, setShowAutoBid] = useState(false);
+  // One Idempotency-Key per submitted draft: resubmitting the same amount after
+  // a failure or timeout reuses it (the server replays instead of bidding
+  // twice); any other amount is a new request with a new key.
+  const draftKey = useRef<{ draft: string; key: string } | null>(null);
+  const keyFor = (draft: string): string => {
+    if (draftKey.current?.draft !== draft) {
+      draftKey.current = { draft, key: crypto.randomUUID() };
+    }
+    return draftKey.current.key;
+  };
 
   const minBid =
     parseFloat(auction.current_price) + parseFloat(auction.bid_increment || '1');
@@ -56,7 +66,8 @@ export function BidForm({ auction, userAutoBid, onBidPlaced }: BidFormProps) {
 
     setIsSubmitting(true);
     try {
-      const result = await api.placeBid(auction.id, amount);
+      const result = await api.placeBid(auction.id, amount, keyFor(`manual:${amount}`));
+      draftKey.current = null;
       setSuccess(
         result.is_winning
           ? `You are now the highest bidder at $${result.current_price.toFixed(2)}!`
@@ -84,7 +95,8 @@ export function BidForm({ auction, userAutoBid, onBidPlaced }: BidFormProps) {
 
     setIsSubmitting(true);
     try {
-      const result = await api.setAutoBid(auction.id, amount);
+      const result = await api.setAutoBid(auction.id, amount, keyFor(`proxy:${amount}`));
+      draftKey.current = null;
       setSuccess(
         `Auto-bid set! Maximum: $${parseFloat(result.auto_bid.max_amount).toFixed(2)}. ` +
           (result.is_winning
@@ -136,12 +148,12 @@ export function BidForm({ auction, userAutoBid, onBidPlaced }: BidFormProps) {
   return (
     <div className="bg-white rounded-lg border border-gray-200 p-6">
       {error && (
-        <div className="mb-4 p-3 bg-red-50 border border-red-200 rounded-md text-red-700">
+        <div role="alert" className="mb-4 p-3 bg-red-50 border border-red-200 rounded-md text-red-700">
           {error}
         </div>
       )}
       {success && (
-        <div className="mb-4 p-3 bg-green-50 border border-green-200 rounded-md text-green-700">
+        <div role="status" aria-live="polite" className="mb-4 p-3 bg-green-50 border border-green-200 rounded-md text-green-700">
           {success}
         </div>
       )}

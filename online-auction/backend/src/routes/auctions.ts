@@ -1,9 +1,10 @@
 import express, { Request, Response } from 'express';
 import multer from 'multer';
 import path from 'path';
-import { query } from '../db.js';
+import { query, withTransaction } from '../db.js';
 import { authenticate, optionalAuth } from '../middleware/auth.js';
-import { scheduleAuctionEnd, removeAuctionFromSchedule, invalidateAuctionCache } from '../redis.js';
+import { scheduleAuctionEnd, invalidateAuctionCache } from '../redis.js';
+import { cancelAuction } from '../services/auctionLifecycle.js';
 import type { AuthenticatedRequest, Auction } from '../types.js';
 
 const router = express.Router();
@@ -142,11 +143,11 @@ router.get(
 
       // Get bid history
       const bidsResult = await query(
-        `SELECT b.id, b.amount, b.is_auto_bid, b.created_at, u.username as bidder_name, u.id as bidder_id
+        `SELECT b.id, b.amount, b.is_auto_bid, b.created_at, b.sequence_num, u.username as bidder_name, u.id as bidder_id
        FROM bids b
        JOIN users u ON b.bidder_id = u.id
        WHERE b.auction_id = $1
-       ORDER BY b.sequence_num DESC
+       ORDER BY b.amount DESC, b.sequence_num ASC
        LIMIT 50`,
         [id]
       );
@@ -273,31 +274,37 @@ router.put(
         return;
       }
 
-      // Check if there are any bids
-      const bidCount = await query('SELECT COUNT(*) FROM bids WHERE auction_id = $1', [id]);
+      const imageUrl = req.file ? `/uploads/${req.file.filename}` : auction.image_url;
 
-      if (parseInt(bidCount.rows[0].count) > 0) {
+      // Check for bids and update under the auction row lock (which every bid
+      // takes), so a bid cannot land between the check and the update - a seller
+      // must never be able to raise the reserve after bidding has started.
+      const updated = await withTransaction(async (client) => {
+        await client.query('SELECT 1 FROM auctions WHERE id = $1 FOR UPDATE', [id]);
+        const bids = await client.query('SELECT 1 FROM bids WHERE auction_id = $1 LIMIT 1', [id]);
+        if (bids.rows.length > 0) return null;
+        const result = await client.query(
+          `UPDATE auctions
+         SET title = COALESCE($1, title),
+             description = COALESCE($2, description),
+             reserve_price = COALESCE($3, reserve_price),
+             snipe_protection_minutes = COALESCE($4, snipe_protection_minutes),
+             image_url = COALESCE($5, image_url)
+         WHERE id = $6
+         RETURNING *`,
+          [title, description, reserve_price, snipe_protection_minutes, imageUrl, id]
+        );
+        return result.rows[0];
+      });
+
+      if (!updated) {
         res.status(400).json({ error: 'Cannot update auction with existing bids' });
         return;
       }
 
-      const imageUrl = req.file ? `/uploads/${req.file.filename}` : auction.image_url;
-
-      const result = await query(
-        `UPDATE auctions
-       SET title = COALESCE($1, title),
-           description = COALESCE($2, description),
-           reserve_price = COALESCE($3, reserve_price),
-           snipe_protection_minutes = COALESCE($4, snipe_protection_minutes),
-           image_url = COALESCE($5, image_url)
-       WHERE id = $6
-       RETURNING *`,
-        [title, description, reserve_price, snipe_protection_minutes, imageUrl, id]
-      );
-
       await invalidateAuctionCache(id);
 
-      res.json({ auction: result.rows[0] });
+      res.json({ auction: updated });
     } catch (error) {
       console.error('Error updating auction:', error);
       res.status(500).json({ error: 'Failed to update auction' });
@@ -327,22 +334,16 @@ router.delete(
         return;
       }
 
-      if (auction.status !== 'active') {
+      // Admins may cancel an auction that already has bids; sellers may not.
+      const result = await cancelAuction(id, { allowWithBids: req.user?.role === 'admin' });
+      if (result === 'not_active') {
         res.status(400).json({ error: 'Can only cancel active auctions' });
         return;
       }
-
-      // Check if there are any bids
-      const bidCount = await query('SELECT COUNT(*) FROM bids WHERE auction_id = $1', [id]);
-
-      if (parseInt(bidCount.rows[0].count) > 0) {
+      if (result === 'has_bids') {
         res.status(400).json({ error: 'Cannot cancel auction with existing bids' });
         return;
       }
-
-      await query("UPDATE auctions SET status = 'cancelled' WHERE id = $1", [id]);
-      await removeAuctionFromSchedule(id);
-      await invalidateAuctionCache(id);
 
       res.json({ message: 'Auction cancelled successfully' });
     } catch (error) {
