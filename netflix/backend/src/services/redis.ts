@@ -128,3 +128,34 @@ export async function deleteCachePattern(pattern: string): Promise<void> {
     await redis.del(...keys);
   }
 }
+
+/** Per-profile version counter for the cached homepage. */
+const HOMEPAGE_VERSION_PREFIX = 'homepage-version:';
+
+/**
+ * Returns the cache key for a profile's homepage at its current version.
+ *
+ * Read the key *before* querying the database: a write that lands while the
+ * homepage is being built bumps the version, so the stale result is stored
+ * under an old key nobody reads, instead of overwriting a fresh invalidation
+ * (the race a plain DEL loses).
+ */
+export async function getHomepageCacheKey(profileId: string): Promise<string> {
+  const version = (await redis.get(`${HOMEPAGE_VERSION_PREFIX}${profileId}`)) || '0';
+  return `homepage:${profileId}:v${version}`;
+}
+
+/**
+ * Invalidates a profile's cached homepage by bumping its version. Called after
+ * every write that changes a row: My List add/remove, a title entering or
+ * leaving Continue Watching, and profile changes (maturity level). Old entries
+ * expire on their own TTL.
+ */
+export async function invalidateHomepage(profileId: string): Promise<void> {
+  try {
+    await redis.incr(`${HOMEPAGE_VERSION_PREFIX}${profileId}`);
+  } catch (error) {
+    // The cached homepage stays stale until its 5-minute TTL; the write itself succeeded.
+    console.error('Homepage invalidation failed:', error);
+  }
+}

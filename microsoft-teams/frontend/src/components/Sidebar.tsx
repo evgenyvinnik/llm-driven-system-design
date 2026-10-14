@@ -11,9 +11,9 @@ interface SidebarProps {
 /** Left sidebar with org selector, team list, user info, and logout action. */
 export function Sidebar({ organizations }: SidebarProps) {
   const { user, logout } = useAuthStore();
-  const { teams, currentTeamId, setCurrentTeam } = useChatStore();
+  const { teams } = useChatStore();
   const navigate = useNavigate();
-  const params = useParams({ strict: false }) as { orgId?: string };
+  const params = useParams({ strict: false }) as { orgId?: string; teamId?: string };
 
   const handleLogout = async () => {
     await logout();
@@ -36,9 +36,16 @@ export function Sidebar({ organizations }: SidebarProps) {
         {teams.map((team) => (
           <button
             key={team.id}
-            onClick={() => setCurrentTeam(team.id)}
+            onClick={() =>
+              params.orgId &&
+              navigate({
+                to: '/org/$orgId/team/$teamId',
+                params: { orgId: params.orgId, teamId: team.id },
+              })
+            }
+            aria-current={params.teamId === team.id ? 'page' : undefined}
             className={`w-12 h-12 rounded-lg flex items-center justify-center text-sm font-bold transition-colors ${
-              currentTeamId === team.id
+              params.teamId === team.id
                 ? 'bg-teams-primary text-white'
                 : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
             }`}

@@ -114,7 +114,7 @@ export const cacheMissesTotal = new client.Counter({
 export const crawlerFetchTotal = new client.Counter({
   name: 'crawler_fetch_total',
   help: 'Total number of feed fetch attempts',
-  labelNames: ['status'], // 'success', 'error', 'timeout', 'circuit_open'
+  labelNames: ['status'], // 'success', 'not_modified', 'error', 'timeout', 'circuit_open'
   registers: [register],
 });
 
@@ -127,6 +127,19 @@ export const crawlerFetchDuration = new client.Histogram({
   help: 'Duration of RSS feed fetches in seconds',
   labelNames: ['source_id'],
   buckets: [0.1, 0.5, 1, 2, 5, 10, 30],
+  registers: [register],
+});
+
+/**
+ * Story clustering outcomes.
+ * 'joined' means the article matched an existing story through the SimHash
+ * band index; 'created' means it started a new story. A sudden drop in the
+ * joined share usually means the threshold or tokenization changed.
+ */
+export const storyAssignmentsTotal = new client.Counter({
+  name: 'story_assignments_total',
+  help: 'Articles assigned to stories, by outcome',
+  labelNames: ['result'], // 'joined', 'created'
   registers: [register],
 });
 

@@ -111,12 +111,12 @@ PORT=3001
 
 ### Backend
 ```bash
-npm run dev          # Start dev server with hot reload
+npm run dev          # Start dev server with hot reload (port 3001, or $PORT)
 npm run dev:server1  # Port 3001
-npm run dev:server2  # Port 3002
+npm run dev:server2  # Port 3002 - a second instance; SSE fan-out crosses instances via Redis
 npm run dev:server3  # Port 3003
 npm run build        # Compile TypeScript
-npm run test         # Run tests
+npm run test         # Run tests (vitest: access rules, SSE replay/gap fill, message routes)
 npm run lint         # Run ESLint
 npm run format       # Run Prettier
 npm run db:migrate   # Run database migrations
@@ -129,6 +129,7 @@ npm run build        # Production build
 npm run lint         # Run ESLint
 npm run format       # Run Prettier
 npm run type-check   # TypeScript type checking
+npm run test         # Run tests (vitest: message/stream event reducers)
 ```
 
 ## Features
@@ -136,7 +137,9 @@ npm run type-check   # TypeScript type checking
 - **Organizations**: Create and manage organizations with member roles
 - **Teams**: Create teams within organizations (public/private)
 - **Channels**: Topic-based channels within teams
-- **Messaging**: Real-time chat with message editing and deletion
+- **Messaging**: Real-time chat; sends are retry-safe (client-generated `clientMessageId`) and appear instantly with a pending state. Edit and delete exist in the API (`PUT`/`DELETE /api/messages/:id`, delete leaves a tombstone) but have no UI yet
+- **Ordered, resumable live updates**: every change in a channel gets a per-channel sequence number; the SSE stream carries it as the event id, so a reconnecting client replays exactly what it missed (`Last-Event-ID`)
+- **Access control**: organization membership is the tenant boundary; private teams and private channels are limited to their members; everything else answers 404
 - **Threading**: Reply to messages in side-panel threads
 - **Reactions**: Emoji reactions on messages
 - **File Sharing**: Upload and download files via MinIO

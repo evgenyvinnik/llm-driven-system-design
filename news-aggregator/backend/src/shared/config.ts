@@ -106,6 +106,35 @@ export const config = {
     domainDelayMs: parseIntEnv('CRAWLER_DOMAIN_DELAY_MS', 1000),
     /** User agent for requests */
     userAgent: process.env.CRAWLER_USER_AGENT || 'NewsAggregator/1.0 (Learning Project)',
+    /**
+     * Run the scheduled crawler (cron + startup crawl) in this process.
+     * Set to false on extra API instances; admin-triggered crawls still work.
+     */
+    enabled: parseBoolEnv('CRAWLER_ENABLED', true),
+    /** Sources claimed per scheduling pass */
+    claimBatchSize: parseIntEnv('CRAWLER_CLAIM_BATCH', 50),
+    /**
+     * Lease length in seconds. Claiming a source pushes its next_crawl this far
+     * ahead, so a crawler that dies mid-fetch releases the source automatically.
+     * Must exceed the worst-case time to fetch and ingest one feed.
+     */
+    leaseSeconds: parseIntEnv('CRAWLER_LEASE_SECONDS', 600),
+    /** Upper bound for per-source failure backoff and honored Retry-After */
+    maxBackoffMinutes: parseIntEnv('CRAWLER_MAX_BACKOFF_MINUTES', 1440),
+  },
+
+  /**
+   * Story clustering and breaking-news detection.
+   */
+  clustering: {
+    /** A story accepts new articles while its newest article is this recent */
+    windowHours: parseIntEnv('CLUSTER_WINDOW_HOURS', 48),
+    /** Distinct sources within the window below that flag a story as breaking */
+    breakingMinSources: parseIntEnv('BREAKING_MIN_SOURCES', 3),
+    /** Sliding window for velocity and breaking detection, in minutes */
+    velocityWindowMinutes: parseIntEnv('VELOCITY_WINDOW_MINUTES', 30),
+    /** How long a story stays in the breaking banner after it was flagged */
+    breakingTtlHours: parseIntEnv('BREAKING_TTL_HOURS', 6),
   },
 
   /**
@@ -148,6 +177,11 @@ export const config = {
     trendingTtl: parseIntEnv('CACHE_TRENDING_TTL', 60),
     /** Session TTL */
     sessionTtl: parseIntEnv('CACHE_SESSION_TTL', 86400),
+    /**
+     * Lifetime of a ranked feed snapshot. Pages 2..n of a feed are served from
+     * the snapshot that page 1 created, so the cursor stays valid this long.
+     */
+    feedSnapshotTtl: parseIntEnv('CACHE_FEED_SNAPSHOT_TTL', 900),
   },
 
   /**

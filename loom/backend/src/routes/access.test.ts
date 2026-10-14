@@ -4,6 +4,7 @@ import request from 'supertest';
 vi.mock('../services/db.js', () => ({ pool: { query: vi.fn(), connect: vi.fn() } }));
 vi.mock('../services/redis.js', () => ({
   redis: { call: vi.fn(), ping: vi.fn(), on: vi.fn(), get: vi.fn(), set: vi.fn(), del: vi.fn() },
+  rateLimitRedis: { call: vi.fn(), on: vi.fn() },
   connectRedis: vi.fn(),
 }));
 vi.mock('../services/storageService.js', () => ({

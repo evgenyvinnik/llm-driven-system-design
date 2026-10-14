@@ -4,7 +4,9 @@ import { useChatStore } from '../stores/chatStore';
 
 function TeamPage() {
   const { orgId, teamId } = Route.useParams();
-  const { channels, loadChannels } = useChatStore();
+  const channels = useChatStore((s) => s.channels);
+  const channelsTeamId = useChatStore((s) => s.currentTeamId);
+  const loadChannels = useChatStore((s) => s.loadChannels);
   const navigate = useNavigate();
   // The channel comes from the child route when the URL already names one.
   const { channelId } = useParams({ strict: false }) as { channelId?: string };
@@ -13,19 +15,18 @@ function TeamPage() {
     loadChannels(teamId);
   }, [teamId, loadChannels]);
 
-  // Same guard as the org layout: only pick a default channel when the URL
-  // doesn't already name one. Unguarded, this effect fires as soon as
-  // `channels` loads and rewrites the path to `channels[0]`, so deep links and
-  // reloads always landed on the team's first channel no matter what was
-  // requested.
+  // Pick a default channel only when the URL doesn't already name one (otherwise deep links and
+  // reloads bounce to the first channel), and only from *this* team's list: right after a team
+  // switch the store still holds the previous team's channels.
   useEffect(() => {
-    if (channels.length > 0 && !channelId) {
+    if (!channelId && channelsTeamId === teamId && channels.length > 0) {
       navigate({
         to: '/org/$orgId/team/$teamId/channel/$channelId',
         params: { orgId, teamId, channelId: channels[0].id },
+        replace: true,
       });
     }
-  }, [channels, orgId, teamId, channelId, navigate]);
+  }, [channels, channelsTeamId, orgId, teamId, channelId, navigate]);
 
   return <Outlet />;
 }

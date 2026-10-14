@@ -54,6 +54,22 @@ export const queueDepthGauge: Gauge<string> = new client.Gauge({
   registers: [register],
 });
 
+// Counter for outbox rows the relay published (confirmed by the broker)
+export const outboxPublishedCounter: Counter<string> = new client.Counter({
+  name: 'notification_system_outbox_published_total',
+  help: 'Outbox rows published to RabbitMQ and confirmed',
+  labelNames: ['channel', 'priority'],
+  registers: [register],
+});
+
+// Counter for what a worker did with each delivery message
+export const deliveryOutcomesCounter: Counter<string> = new client.Counter({
+  name: 'notification_system_delivery_outcomes_total',
+  help: 'Delivery message outcomes: sent, failed, retry_scheduled, deferred, skipped, dead_lettered',
+  labelNames: ['channel', 'outcome'],
+  registers: [register],
+});
+
 // Counter for rate-limited requests
 export const rateLimitedCounter: Counter<string> = new client.Counter({
   name: 'notification_system_rate_limited_total',

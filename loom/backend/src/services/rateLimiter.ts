@@ -2,7 +2,7 @@ import rateLimit, { type Options } from 'express-rate-limit';
 import { RedisStore, type RedisReply } from 'rate-limit-redis';
 import type { Request } from 'express';
 import { config } from '../config/index.js';
-import { redis } from './redis.js';
+import { rateLimitRedis } from './redis.js';
 
 /**
  * Counters live in Redis so every API instance shares one budget per client; with the
@@ -14,7 +14,7 @@ function redisStore(name: string): RedisStore | undefined {
   const store = new RedisStore({
     prefix: `loom:rl:${name}:`,
     sendCommand: (command: string, ...args: string[]) =>
-      redis.call(command, ...args) as Promise<RedisReply>,
+      rateLimitRedis.call(command, ...args) as Promise<RedisReply>,
   });
   // The store loads its Lua scripts eagerly. If Redis is still connecting those promises
   // can reject before anything awaits them; the store reloads on first use anyway.

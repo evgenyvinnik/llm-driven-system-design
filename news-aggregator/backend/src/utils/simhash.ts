@@ -8,6 +8,20 @@
  */
 
 /**
+ * Two fingerprints belong to the same story when fewer than this many of
+ * their 64 bits differ. Shared by clustering and the helpers below so the
+ * threshold lives in one place.
+ */
+export const SIMHASH_MATCH_THRESHOLD = 3;
+
+/** Number of bands the fingerprint is split into for candidate lookup. */
+export const SIMHASH_BAND_COUNT = 4;
+
+/** Bits per band (64 / 4). */
+const BAND_BITS = 16n;
+const BAND_MASK = (1n << BAND_BITS) - 1n;
+
+/**
  * Compute a 64-bit FNV-1a hash of a string.
  * FNV-1a provides good distribution and is fast for short strings.
  * @param str - The string to hash
@@ -123,7 +137,7 @@ export function hammingDistance(a: bigint, b: bigint): number {
  * @param threshold - Maximum Hamming distance for similarity (default: 3)
  * @returns True if fingerprints are within threshold distance
  */
-export function areSimilar(fp1: bigint, fp2: bigint, threshold: number = 3): boolean {
+export function areSimilar(fp1: bigint, fp2: bigint, threshold: number = SIMHASH_MATCH_THRESHOLD): boolean {
   return hammingDistance(fp1, fp2) < threshold;
 }
 
@@ -138,7 +152,7 @@ export function areSimilar(fp1: bigint, fp2: bigint, threshold: number = 3): boo
 export function findSimilar(
   target: bigint,
   candidates: { id: string; fingerprint: bigint }[],
-  threshold: number = 3
+  threshold: number = SIMHASH_MATCH_THRESHOLD
 ): { id: string; distance: number }[] {
   return candidates
     .map(c => ({
@@ -147,4 +161,24 @@ export function findSimilar(
     }))
     .filter(c => c.distance < threshold)
     .sort((a, b) => a.distance - b.distance);
+}
+
+/**
+ * Split a 64-bit fingerprint into four 16-bit bands, lowest bits first.
+ * Mirrors the generated columns fp_band0..fp_band3 on `stories`.
+ *
+ * Why bands work: if two fingerprints differ in at most 3 bits, those bits
+ * can fall into at most 3 of the 4 bands, so at least one band is identical.
+ * Looking up stories that share any band is therefore guaranteed to find
+ * every story within distance 3 (the pigeonhole principle), and the exact
+ * Hamming check only runs on those candidates.
+ * @param fingerprint - Unsigned 64-bit SimHash
+ * @returns Four integers in [0, 65535]
+ */
+export function fingerprintBands(fingerprint: bigint): number[] {
+  const bands: number[] = [];
+  for (let i = 0n; i < BigInt(SIMHASH_BAND_COUNT); i++) {
+    bands.push(Number((fingerprint >> (i * BAND_BITS)) & BAND_MASK));
+  }
+  return bands;
 }

@@ -140,4 +140,47 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE INDEX IF NOT EXISTS idx_sessions_token ON sessions(token);
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
 
+-- ---------------------------------------------------------------------------
+-- Delivery pipeline (2026-10 review). Every statement is re-runnable.
+-- ---------------------------------------------------------------------------
+
+-- Per-recipient dedupe key, e.g. campaign:{campaign_id}:{user_id}. A repeated
+-- fan-out hits the unique index and creates nothing, however late the retry.
+ALTER TABLE notifications ADD COLUMN IF NOT EXISTS dedupe_key VARCHAR(200);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_notifications_dedupe_key
+  ON notifications(dedupe_key) WHERE dedupe_key IS NOT NULL;
+
+-- delivery_status is the per-(notification, channel) state machine:
+--   pending -> sending -> sent | retrying -> sending ... | failed | cancelled
+-- A worker claims a row by moving it to 'sending' with a lease; `attempts` is
+-- incremented by every claim and doubles as a fencing token, so a worker whose
+-- lease expired cannot overwrite the result of the worker that took over.
+ALTER TABLE delivery_status ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ;
+ALTER TABLE delivery_status ALTER COLUMN attempts SET DEFAULT 0;
+
+-- Transactional outbox. The API writes the notification, its delivery rows and
+-- one outbox row per channel in a single transaction; a relay in the worker
+-- process publishes due rows (available_at <= now) to the channel/priority
+-- queue with publisher confirms. Scheduled sends, quiet-hours deferrals and
+-- retry backoff are all just rows with a later available_at.
+CREATE TABLE IF NOT EXISTS delivery_outbox (
+  id BIGSERIAL PRIMARY KEY,
+  notification_id UUID NOT NULL REFERENCES notifications(id) ON DELETE CASCADE,
+  channel VARCHAR(20) NOT NULL,
+  priority VARCHAR(20) NOT NULL,
+  priority_rank SMALLINT NOT NULL, -- 0 critical .. 3 low; the relay drains in this order
+  payload JSONB NOT NULL,
+  available_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  published_at TIMESTAMPTZ,
+  publish_attempts INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_outbox_due
+  ON delivery_outbox(priority_rank, available_at, id) WHERE published_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_outbox_published
+  ON delivery_outbox(published_at) WHERE published_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_outbox_notification ON delivery_outbox(notification_id);
+
 -- Seed data is in db-seed/seed.sql

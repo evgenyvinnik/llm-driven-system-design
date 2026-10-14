@@ -1,7 +1,9 @@
 import { Router, Request, Response } from 'express';
 import { query, queryOne } from '../db/index.js';
-import { getCached, setCache } from '../services/redis.js';
+import { getCached, setCache, getHomepageCacheKey, invalidateHomepage } from '../services/redis.js';
 import { authenticate, requireProfile } from '../middleware/auth.js';
+
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
  * Browse router.
@@ -86,18 +88,26 @@ function mapVideoRow(row: VideoRow) {
 /**
  * GET /api/browse/homepage
  * Returns personalized homepage rows (Continue Watching, My List, Trending, etc.).
- * Results are cached per-profile for 5 minutes.
+ * Results are cached per profile for 5 minutes under a versioned key; writes that
+ * change a row bump the version (see invalidateHomepage). A cache outage
+ * degrades to building the page from PostgreSQL.
  */
 router.get('/homepage', authenticate, requireProfile, async (req: Request, res: Response) => {
   try {
     const profileId = req.profileId!;
 
-    // Check cache first
-    const cacheKey = `homepage:${profileId}`;
-    const cached = await getCached<{ rows: unknown[] }>(cacheKey);
-    if (cached) {
-      res.json(cached);
-      return;
+    // Resolve the versioned key before reading the database, so a write that
+    // lands mid-build makes this result unreachable instead of stale.
+    let cacheKey: string | null = null;
+    try {
+      cacheKey = await getHomepageCacheKey(profileId);
+      const cached = await getCached<{ rows: unknown[] }>(cacheKey);
+      if (cached) {
+        res.json(cached);
+        return;
+      }
+    } catch (error) {
+      console.error('Homepage cache read failed, building from database:', error);
     }
 
     const profile = await queryOne<ProfileRow>(
@@ -199,7 +209,11 @@ router.get('/homepage', authenticate, requireProfile, async (req: Request, res: 
     const result = { rows };
 
     // Cache for 5 minutes
-    await setCache(cacheKey, result, 300);
+    if (cacheKey) {
+      await setCache(cacheKey, result, 300).catch((error) => {
+        console.error('Homepage cache write failed:', error);
+      });
+    }
 
     res.json(result);
   } catch (error) {
@@ -253,13 +267,28 @@ router.get('/my-list', authenticate, requireProfile, async (req: Request, res: R
 router.post('/my-list/:videoId', authenticate, requireProfile, async (req: Request, res: Response) => {
   try {
     const { videoId } = req.params;
+    if (!UUID_PATTERN.test(videoId)) {
+      res.status(404).json({ error: 'Video not found' });
+      return;
+    }
 
-    await query(
+    const inserted = await query<{ id: string }>(
       `INSERT INTO my_list (profile_id, video_id)
-       VALUES ($1, $2)
-       ON CONFLICT (profile_id, video_id) DO NOTHING`,
+       SELECT $1, id FROM videos WHERE id = $2
+       ON CONFLICT (profile_id, video_id) DO NOTHING
+       RETURNING id`,
       [req.profileId, videoId]
     );
+
+    if (inserted.length === 0) {
+      const exists = await queryOne<{ id: string }>('SELECT id FROM videos WHERE id = $1', [videoId]);
+      if (!exists) {
+        res.status(404).json({ error: 'Video not found' });
+        return;
+      }
+    } else {
+      await invalidateHomepage(req.profileId!);
+    }
 
     res.json({ success: true });
   } catch (error) {
@@ -276,10 +305,18 @@ router.delete('/my-list/:videoId', authenticate, requireProfile, async (req: Req
   try {
     const { videoId } = req.params;
 
-    await query(
-      'DELETE FROM my_list WHERE profile_id = $1 AND video_id = $2',
+    if (!UUID_PATTERN.test(videoId)) {
+      res.json({ success: true });
+      return;
+    }
+
+    const removed = await query<{ id: string }>(
+      'DELETE FROM my_list WHERE profile_id = $1 AND video_id = $2 RETURNING id',
       [req.profileId, videoId]
     );
+    if (removed.length > 0) {
+      await invalidateHomepage(req.profileId!);
+    }
 
     res.json({ success: true });
   } catch (error) {
@@ -355,27 +392,29 @@ router.get('/search', authenticate, requireProfile, async (req: Request, res: Re
  * @returns Array of continue watching items with progress info
  */
 async function getContinueWatching(profileId: string, maturityLevel: number) {
+  // One card per title: for a series, the most recently watched in-progress
+  // episode. video_id is the title for episode rows too (see init.sql).
   const items = await query<ContinueWatchingRow>(
-    `SELECT
-      vp.video_id, vp.episode_id, vp.position_seconds, vp.duration_seconds, vp.last_watched_at,
-      v.id as v_id, v.title as v_title, v.type as v_type, v.poster_url as v_poster_url, v.backdrop_url as v_backdrop_url, v.genres as v_genres,
-      e.id as e_id, e.title as e_title, e.episode_number as e_episode_number, e.thumbnail_url as e_thumbnail_url,
-      s.season_number as s_season_number
-     FROM viewing_progress vp
-     LEFT JOIN videos v ON vp.video_id = v.id OR (vp.episode_id IS NOT NULL AND v.id = (
-       SELECT s2.video_id FROM episodes e2
-       JOIN seasons s2 ON e2.season_id = s2.id
-       WHERE e2.id = vp.episode_id
-     ))
-     LEFT JOIN episodes e ON vp.episode_id = e.id
-     LEFT JOIN seasons s ON e.season_id = s.id
-     WHERE vp.profile_id = $1
-       AND vp.completed = false
-       AND vp.position_seconds > 0
-       AND (vp.position_seconds::float / vp.duration_seconds::float) > 0.05
-       AND (vp.position_seconds::float / vp.duration_seconds::float) < 0.95
-       AND v.maturity_level <= $2
-     ORDER BY vp.last_watched_at DESC
+    `SELECT * FROM (
+       SELECT DISTINCT ON (vp.video_id)
+         vp.video_id, vp.episode_id, vp.position_seconds, vp.duration_seconds, vp.last_watched_at,
+         v.id as v_id, v.title as v_title, v.type as v_type, v.poster_url as v_poster_url,
+         v.backdrop_url as v_backdrop_url, v.genres as v_genres,
+         e.id as e_id, e.title as e_title, e.episode_number as e_episode_number, e.thumbnail_url as e_thumbnail_url,
+         s.season_number as s_season_number
+       FROM viewing_progress vp
+       JOIN videos v ON v.id = vp.video_id
+       LEFT JOIN episodes e ON e.id = vp.episode_id
+       LEFT JOIN seasons s ON s.id = e.season_id
+       WHERE vp.profile_id = $1
+         AND vp.completed = false
+         AND vp.position_seconds > 0
+         AND (vp.position_seconds::float / NULLIF(vp.duration_seconds, 0)) > 0.05
+         AND (vp.position_seconds::float / NULLIF(vp.duration_seconds, 0)) < 0.95
+         AND v.maturity_level <= $2
+       ORDER BY vp.video_id, vp.last_watched_at DESC
+     ) latest
+     ORDER BY last_watched_at DESC
      LIMIT 20`,
     [profileId, maturityLevel]
   );

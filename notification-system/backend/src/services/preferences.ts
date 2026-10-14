@@ -1,5 +1,6 @@
 import { query } from '../utils/database.js';
 import { cacheGet, cacheSet, cacheDelete } from '../utils/redis.js';
+import { isWithinQuietHours } from './quietHours.js';
 
 export interface ChannelPreference {
   enabled: boolean;
@@ -113,8 +114,10 @@ export class PreferencesService {
         userId,
         JSON.stringify(mergedChannels),
         JSON.stringify(mergedCategories),
-        updates.quietHoursStart ?? current.quietHoursStart,
-        updates.quietHoursEnd ?? current.quietHoursEnd,
+        // `!== undefined`, not `??`: an explicit null must clear quiet hours.
+        // With `??` a request to disable quiet hours silently kept the old window.
+        updates.quietHoursStart !== undefined ? updates.quietHoursStart : current.quietHoursStart,
+        updates.quietHoursEnd !== undefined ? updates.quietHoursEnd : current.quietHoursEnd,
         updates.timezone ?? current.timezone,
       ]
     );
@@ -132,25 +135,9 @@ export class PreferencesService {
     });
   }
 
-  isQuietHours(preferences: UserPreferences): boolean {
-    if (
-      preferences.quietHoursStart === null ||
-      preferences.quietHoursEnd === null
-    ) {
-      return false;
-    }
-
-    const now = new Date();
-    const currentMinutes = now.getHours() * 60 + now.getMinutes();
-    const start = preferences.quietHoursStart;
-    const end = preferences.quietHoursEnd;
-
-    if (start < end) {
-      return currentMinutes >= start && currentMinutes < end;
-    } else {
-      // Quiet hours span midnight
-      return currentMinutes >= start || currentMinutes < end;
-    }
+  /** Quiet hours are evaluated in the user's own time zone, not the server's. */
+  isQuietHours(preferences: UserPreferences, at: Date = new Date()): boolean {
+    return isWithinQuietHours(preferences, at);
   }
 
   normalizePreferences(prefs: Partial<DatabasePreferences> & Partial<UserPreferences>): UserPreferences {

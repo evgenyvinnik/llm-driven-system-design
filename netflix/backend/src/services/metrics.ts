@@ -109,6 +109,38 @@ export const activeStreams = new Gauge({
   registers: [metricsRegistry],
 });
 
+/**
+ * Playback session requests by outcome
+ * (started, maturity_restricted, stream_limit, not_found).
+ */
+export const playbackSessions = new Counter({
+  name: 'playback_sessions_total',
+  help: 'Playback session requests by outcome',
+  labelNames: ['outcome'],
+  registers: [metricsRegistry],
+});
+
+/**
+ * Progress reports by outcome: applied, or stale (an equal-or-newer position
+ * was already stored -- retries and late arrivals).
+ */
+export const progressWrites = new Counter({
+  name: 'progress_writes_total',
+  help: 'Progress reports by last-writer-wins outcome',
+  labelNames: ['outcome'],
+  registers: [metricsRegistry],
+});
+
+/**
+ * Stream URL requests rejected at /play (invalid or expired token).
+ */
+export const streamUrlRejections = new Counter({
+  name: 'stream_url_rejections_total',
+  help: 'Stream URL requests rejected by token verification',
+  labelNames: ['reason'],
+  registers: [metricsRegistry],
+});
+
 // =========================================================
 // Circuit Breaker Metrics
 // =========================================================

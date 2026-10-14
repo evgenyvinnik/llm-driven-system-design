@@ -1,7 +1,7 @@
 import { app } from './app.js';
 import { config } from './config/index.js';
 import { logger } from './services/logger.js';
-import { connectRedis, redis } from './services/redis.js';
+import { connectRedis, redis, rateLimitRedis } from './services/redis.js';
 import { pool } from './services/db.js';
 import { ensureBucket } from './services/storageService.js';
 import { sweepStaleUploads } from './services/uploadService.js';
@@ -61,6 +61,7 @@ async function start() {
       server.close(async () => {
         await pool.end().catch(() => undefined);
         await redis.quit().catch(() => undefined);
+        rateLimitRedis.disconnect();
         logger.info('Server shut down');
         process.exit(0);
       });

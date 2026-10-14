@@ -1,53 +1,75 @@
 import { Router, Request, Response } from 'express';
+import { randomUUID } from 'crypto';
+import { z } from 'zod';
 import { query, queryOne } from '../db/index.js';
 import { authenticate, requireProfile } from '../middleware/auth.js';
 import { rateLimit } from '../middleware/rate-limit.js';
 import { getVideoStreamUrl } from '../services/storage.js';
 import { withStorageCircuitBreaker } from '../services/circuit-breaker.js';
 import { streamingLogger } from '../services/logger.js';
+import { invalidateHomepage } from '../services/redis.js';
 import {
   recordStreamingStart,
   recordStreamingEnd,
   recordBufferEvent,
   recordPlaybackError,
+  playbackSessions,
+  progressWrites,
+  streamUrlRejections,
 } from '../services/metrics.js';
-import { STREAMING_CONFIG, MINIO_CONFIG as _MINIO_CONFIG } from '../config.js';
+import {
+  resolvePlayable,
+  loadViewer,
+  evaluateEntitlement,
+  planFor,
+  qualitiesForPlan,
+  acquireStreamSlot,
+  releaseStreamSlot,
+  buildStreamUrl,
+  verifyStreamToken,
+  type QualityRung,
+  type ResolveError,
+} from '../services/playback.js';
+import { recordProgress, resolvePositionTimestamp, isProgressComplete } from '../services/progress.js';
+import { PLAYBACK_CONFIG } from '../config.js';
 
 /**
  * Streaming router.
- * Handles video playback including manifest generation, stream URLs,
- * and viewing progress tracking for resume functionality.
+ *
+ * Playback is a short protocol:
+ * 1. `POST /:videoId/sessions` checks entitlement (maturity, episode belongs to
+ *    the title, plan quality cap, concurrent-stream slot) and returns a manifest
+ *    whose rendition URLs are signed for this session.
+ * 2. The player fetches `GET /:videoId/play?...&sig=` -- verified from the token
+ *    alone, like a CDN edge -- which 302s to a presigned MinIO URL.
+ * 3. `POST /:videoId/progress` every 10 s saves the resume position
+ *    (last-writer-wins by position timestamp) and renews the stream slot.
+ * 4. `DELETE /sessions/:sessionId` frees the slot when the player closes.
  */
 const router = Router();
 
-/** Database row type for video queries (minimal fields for streaming) */
-interface VideoRow {
-  id: string;
-  title: string;
-  type: 'movie' | 'series';
-  duration_minutes: number | null;
-}
+const uuid = z.string().uuid();
 
-/** Database row type for episode queries */
-interface EpisodeRow {
-  id: string;
-  season_id: string;
-  episode_number: number;
-  title: string;
-  duration_minutes: number | null;
-  video_key: string | null;
-}
+const sessionBodySchema = z.object({
+  episodeId: uuid.optional(),
+});
+
+const progressBodySchema = z.object({
+  episodeId: uuid.optional(),
+  positionSeconds: z.number().min(0),
+  durationSeconds: z.number().positive().max(24 * 60 * 60),
+  /** When the position was observed (ms since epoch) -- the last-writer-wins clock. */
+  clientTimestamp: z.number().int().positive().optional(),
+  /** Renews this session's stream slot (progress reports double as heartbeats). */
+  playbackSessionId: uuid.optional(),
+});
 
 /** Database row type for video file (quality variant) queries */
 interface VideoFileRow {
-  id: string;
-  video_id: string | null;
-  episode_id: string | null;
   quality: string;
   bitrate: number | null;
   width: number | null;
   height: number | null;
-  video_key: string;
 }
 
 /** Database row type for viewing progress queries */
@@ -56,169 +78,228 @@ interface ViewingProgressRow {
   duration_seconds: number;
 }
 
+function sendResolveError(res: Response, error: ResolveError): void {
+  if (error === 'episode_required') {
+    res.status(400).json({ error: 'Episode ID required for series' });
+  } else if (error === 'episode_not_in_title') {
+    res.status(404).json({ error: 'Episode not found in this title' });
+  } else {
+    res.status(404).json({ error: 'Video not found' });
+  }
+}
+
 /**
- * GET /api/stream/:videoId/manifest
- * Returns streaming manifest with available quality levels and resume position.
- * For series, requires episodeId query parameter.
+ * POST /api/stream/:videoId/sessions
+ * Starts a playback session: entitlement checks, a concurrent-stream slot, and
+ * a manifest with signed rendition URLs and the resume position.
+ * 403 maturity_restricted | 409 stream_limit | 404 unknown title or episode.
  */
-router.get(
-  '/:videoId/manifest',
+router.post(
+  '/:videoId/sessions',
   authenticate,
   requireProfile,
   rateLimit('playback'),
   async (req: Request, res: Response) => {
     try {
-      const { videoId } = req.params;
-      const { episodeId } = req.query;
-
-      let durationMinutes: number;
-      let contentId: string;
-      let contentType: 'video' | 'episode';
-
-      if (episodeId) {
-        // Get episode info
-        const episode = await queryOne<EpisodeRow>(
-          'SELECT * FROM episodes WHERE id = $1',
-          [episodeId]
-        );
-
-        if (!episode) {
-          res.status(404).json({ error: 'Episode not found' });
-          return;
-        }
-
-        durationMinutes = episode.duration_minutes || 45;
-        contentId = episode.id;
-        contentType = 'episode';
-      } else {
-        // Get video info
-        const video = await queryOne<VideoRow>(
-          'SELECT * FROM videos WHERE id = $1',
-          [videoId]
-        );
-
-        if (!video) {
-          res.status(404).json({ error: 'Video not found' });
-          return;
-        }
-
-        if (video.type === 'series') {
-          res.status(400).json({ error: 'Episode ID required for series' });
-          return;
-        }
-
-        durationMinutes = video.duration_minutes || 120;
-        contentId = video.id;
-        contentType = 'video';
+      const videoId = uuid.safeParse(req.params.videoId);
+      const body = sessionBodySchema.safeParse(req.body ?? {});
+      if (!videoId.success || !body.success) {
+        res.status(400).json({ error: 'Invalid video or episode id' });
+        return;
       }
 
-      // Get available qualities from database (or use defaults)
-      const videoFiles = await query<VideoFileRow>(
-        contentType === 'episode'
-          ? 'SELECT * FROM video_files WHERE episode_id = $1'
-          : 'SELECT * FROM video_files WHERE video_id = $1',
-        [contentId]
+      const viewer = await loadViewer(req.profileId!, req.accountId!);
+      if (!viewer) {
+        res.status(404).json({ error: 'Profile not found' });
+        return;
+      }
+
+      const content = await resolvePlayable(videoId.data, body.data.episodeId);
+      if (typeof content === 'string') {
+        playbackSessions.labels('not_found').inc();
+        sendResolveError(res, content);
+        return;
+      }
+
+      const entitlement = evaluateEntitlement(viewer, content);
+      if (!entitlement.allowed) {
+        playbackSessions.labels(entitlement.reason).inc();
+        streamingLogger.warn({
+          profileId: viewer.profileId,
+          videoId: content.videoId,
+          titleMaturity: content.maturityLevel,
+          profileMaturity: viewer.maturityLevel,
+        }, 'Playback refused: maturity level');
+        res.status(403).json({ error: 'This title is not available on this profile', code: entitlement.reason });
+        return;
+      }
+
+      const plan = planFor(viewer.subscriptionTier);
+      const sessionId = randomUUID();
+      const slot = await acquireStreamSlot(viewer.accountId, sessionId, plan.maxStreams);
+      if (!slot.granted) {
+        playbackSessions.labels('stream_limit').inc();
+        res.status(409).json({
+          error: `Your plan allows ${slot.limit} screen${slot.limit === 1 ? '' : 's'} at a time. Stop playback on another device to watch here.`,
+          code: 'stream_limit',
+          activeStreams: slot.activeStreams,
+          limit: slot.limit,
+        });
+        return;
+      }
+
+      // Renditions recorded for this content, if any; otherwise the default ladder.
+      const files = await query<VideoFileRow>(
+        content.episodeId
+          ? 'SELECT quality, bitrate, width, height FROM video_files WHERE episode_id = $1'
+          : 'SELECT quality, bitrate, width, height FROM video_files WHERE video_id = $1',
+        [content.contentId]
       );
+      const recorded: QualityRung[] = files.map((f) => ({
+        quality: f.quality,
+        bitrate: f.bitrate || 1000,
+        width: f.width || 1280,
+        height: f.height || 720,
+      }));
+      const ladder = qualitiesForPlan(viewer.subscriptionTier, recorded.length > 0 ? recorded : undefined);
 
-      // Build quality list
-      let qualities;
-      if (videoFiles.length > 0) {
-        qualities = videoFiles.map((vf) => ({
-          quality: vf.quality,
-          bitrate: vf.bitrate || 1000,
-          width: vf.width || 1280,
-          height: vf.height || 720,
-          url: `${req.protocol}://${req.get('host')}/api/stream/${videoId}/play?quality=${vf.quality}${episodeId ? `&episodeId=${episodeId}` : ''}`,
-        }));
-      } else {
-        // Use default qualities for demo
-        qualities = STREAMING_CONFIG.qualities.map((q) => ({
-          quality: q.name,
-          bitrate: q.bitrate,
-          width: q.width,
-          height: q.height,
-          url: `${req.protocol}://${req.get('host')}/api/stream/${videoId}/play?quality=${q.name}${episodeId ? `&episodeId=${episodeId}` : ''}`,
-        }));
-      }
+      const expiresAt = Math.floor(Date.now() / 1000) + PLAYBACK_CONFIG.urlTtlSeconds;
+      const qualities = ladder.map((q) => ({
+        ...q,
+        url: buildStreamUrl({
+          sessionId,
+          videoId: content.videoId,
+          episodeId: content.episodeId,
+          quality: q.quality,
+          expiresAt,
+        }),
+      }));
 
-      // Get resume position
-      let resumePosition = 0;
       const progress = await queryOne<ViewingProgressRow>(
-        contentType === 'episode'
-          ? 'SELECT position_seconds, duration_seconds FROM viewing_progress WHERE profile_id = $1 AND episode_id = $2'
-          : 'SELECT position_seconds, duration_seconds FROM viewing_progress WHERE profile_id = $1 AND video_id = $2',
-        [req.profileId, contentId]
+        'SELECT position_seconds, duration_seconds FROM viewing_progress WHERE profile_id = $1 AND content_id = $2',
+        [viewer.profileId, content.contentId]
       );
+      const resumePosition =
+        progress && !isProgressComplete(progress.position_seconds, progress.duration_seconds)
+          ? progress.position_seconds
+          : 0;
 
-      if (progress && !isProgressComplete(progress.position_seconds, progress.duration_seconds)) {
-        resumePosition = progress.position_seconds;
-      }
+      const startQuality = ladder.find((q) => q.quality === '720p') || ladder[0];
+      playbackSessions.labels('started').inc();
+      recordStreamingStart(startQuality?.quality || 'unknown', content.episodeId ? 'episode' : 'movie');
 
       streamingLogger.info({
-        videoId,
-        episodeId,
-        profileId: req.profileId,
-        contentType,
-      }, 'Generated streaming manifest');
+        sessionId,
+        videoId: content.videoId,
+        episodeId: content.episodeId,
+        profileId: viewer.profileId,
+        plan: viewer.subscriptionTier,
+        activeStreams: slot.activeStreams,
+        failedOpen: slot.failedOpen,
+      }, 'Playback session started');
 
-      res.json({
-        videoId,
-        episodeId: episodeId || undefined,
-        durationSeconds: durationMinutes * 60,
+      res.status(201).json({
+        playbackSessionId: sessionId,
+        videoId: content.videoId,
+        episodeId: content.episodeId ?? undefined,
+        durationSeconds: content.durationSeconds,
         qualities,
         resumePosition,
+        urlExpiresAt: new Date(expiresAt * 1000).toISOString(),
+        lease: {
+          ttlSeconds: PLAYBACK_CONFIG.streamLeaseSeconds,
+          heartbeatSeconds: PLAYBACK_CONFIG.progressIntervalSeconds,
+          activeStreams: slot.activeStreams,
+          limit: slot.limit,
+        },
       });
     } catch (error) {
-      streamingLogger.error({ error }, 'Get manifest error');
+      streamingLogger.error({ error }, 'Start playback session error');
       res.status(500).json({ error: 'Internal server error' });
     }
   }
 );
 
 /**
- * GET /api/stream/:videoId/play
- * Redirects to presigned video stream URL in MinIO/S3.
- * For demo, returns error info if video file doesn't exist.
+ * DELETE /api/stream/sessions/:sessionId
+ * Ends a playback session and frees its stream slot. Idempotent (always 204).
+ */
+router.delete('/sessions/:sessionId', authenticate, async (req: Request, res: Response) => {
+  const sessionId = uuid.safeParse(req.params.sessionId);
+  if (!sessionId.success) {
+    res.status(400).json({ error: 'Invalid session id' });
+    return;
+  }
+
+  const released = await releaseStreamSlot(req.accountId!, sessionId.data);
+  if (released) {
+    recordStreamingEnd();
+  }
+  res.status(204).end();
+});
+
+/**
+ * GET /api/stream/:videoId/play?quality&episodeId&sid&exp&sig
+ * Verifies the signed URL and redirects to a presigned MinIO URL.
+ *
+ * No session cookie and no database lookup: the token is the credential, as on
+ * a CDN edge. The object key is derived only from signed fields, so a caller
+ * cannot swap in another title or quality.
  */
 router.get(
   '/:videoId/play',
-  authenticate,
   rateLimit('playback'),
   async (req: Request, res: Response) => {
     try {
-      const { videoId } = req.params;
-      const { quality = '720p', episodeId } = req.query;
-      const qualityStr = String(quality);
+      const { quality, episodeId, sid, exp, sig } = req.query;
+      if (typeof quality !== 'string' || typeof sid !== 'string' || typeof exp !== 'string' || typeof sig !== 'string') {
+        streamUrlRejections.labels('missing').inc();
+        res.status(401).json({ error: 'Signed stream URL required; start a playback session first' });
+        return;
+      }
 
-      // Build video key
-      const contentId = episodeId || videoId;
-      const videoKey = `videos/${contentId}/${qualityStr}/video.mp4`;
-      const contentType = episodeId ? 'episode' : 'movie';
+      const claims = {
+        sessionId: sid,
+        videoId: req.params.videoId,
+        episodeId: typeof episodeId === 'string' && episodeId ? episodeId : null,
+        quality,
+        expiresAt: Number(exp),
+      };
+      const verdict = verifyStreamToken(claims, sig);
+      if (verdict !== 'ok') {
+        streamUrlRejections.labels(verdict).inc();
+        res.status(403).json({
+          error: verdict === 'expired' ? 'Stream URL expired; start a new playback session' : 'Invalid stream URL signature',
+        });
+        return;
+      }
+
+      const contentId = claims.episodeId || claims.videoId;
+      const videoKey = `videos/${contentId}/${quality}/video.mp4`;
+      const contentType = claims.episodeId ? 'episode' : 'movie';
+      // The storage URL must not outlive the stream URL it was minted for.
+      const presignSeconds = Math.max(60, Math.min(3600, claims.expiresAt - Math.floor(Date.now() / 1000)));
 
       try {
-        // Try to get presigned URL with circuit breaker
         const streamUrl = await withStorageCircuitBreaker(() =>
-          getVideoStreamUrl(videoKey)
+          getVideoStreamUrl(videoKey, presignSeconds)
         );
 
-        // Record streaming start metric
-        recordStreamingStart(qualityStr, contentType as 'movie' | 'episode');
-
         streamingLogger.info({
-          videoId,
-          episodeId,
-          quality: qualityStr,
-          profileId: req.profileId,
-        }, 'Streaming started');
+          videoId: claims.videoId,
+          episodeId: claims.episodeId,
+          quality,
+          sessionId: sid,
+        }, 'Stream URL redirected');
 
         res.redirect(streamUrl);
       } catch (error) {
         // If file doesn't exist or circuit is open, return fallback
-        recordPlaybackError('storage_error', contentType as 'movie' | 'episode');
+        recordPlaybackError('storage_error', contentType);
 
         streamingLogger.warn({
-          videoId,
-          quality: qualityStr,
+          videoId: claims.videoId,
+          quality,
           error: String(error),
         }, 'Video file not found or storage unavailable');
 
@@ -237,8 +318,12 @@ router.get(
 
 /**
  * POST /api/stream/:videoId/progress
- * Updates viewing progress for resume functionality.
- * Also adds to watch history when content is completed (>95%).
+ * Saves the resume position (last-writer-wins by `clientTimestamp`), records a
+ * view in watch history on the transition to completed (>95%), and renews the
+ * stream slot when `playbackSessionId` is sent.
+ *
+ * Retries and late arrivals return 200 with `applied: false` -- the stored
+ * position is already as new or newer.
  */
 router.post(
   '/:videoId/progress',
@@ -247,63 +332,71 @@ router.post(
   rateLimit('progress'),
   async (req: Request, res: Response) => {
     try {
-      const { videoId } = req.params;
-      const { episodeId, positionSeconds, durationSeconds } = req.body;
-
-      if (typeof positionSeconds !== 'number' || typeof durationSeconds !== 'number') {
-        res.status(400).json({ error: 'Position and duration required' });
+      const videoId = uuid.safeParse(req.params.videoId);
+      const body = progressBodySchema.safeParse(req.body);
+      if (!videoId.success || !body.success) {
+        res.status(400).json({
+          error: 'Invalid progress report',
+          details: body.success ? undefined : body.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`),
+        });
         return;
       }
 
-      const completed = isProgressComplete(positionSeconds, durationSeconds);
+      const { episodeId, clientTimestamp, playbackSessionId } = body.data;
+      const durationSeconds = Math.floor(body.data.durationSeconds);
+      const positionSeconds = Math.min(Math.floor(body.data.positionSeconds), durationSeconds);
 
-      if (episodeId) {
-        // Update episode progress
-        await query(
-          `INSERT INTO viewing_progress (profile_id, episode_id, position_seconds, duration_seconds, completed, last_watched_at)
-           VALUES ($1, $2, $3, $4, $5, NOW())
-           ON CONFLICT (profile_id, video_id, episode_id)
-           DO UPDATE SET position_seconds = $3, duration_seconds = $4, completed = $5, last_watched_at = NOW()`,
-          [req.profileId, episodeId, positionSeconds, durationSeconds, completed]
+      const viewer = await loadViewer(req.profileId!, req.accountId!);
+      if (!viewer) {
+        res.status(404).json({ error: 'Profile not found' });
+        return;
+      }
+
+      const content = await resolvePlayable(videoId.data, episodeId);
+      if (typeof content === 'string') {
+        sendResolveError(res, content);
+        return;
+      }
+      if (!evaluateEntitlement(viewer, content).allowed) {
+        res.status(403).json({ error: 'This title is not available on this profile', code: 'maturity_restricted' });
+        return;
+      }
+
+      const result = await recordProgress({
+        profileId: viewer.profileId,
+        videoId: content.videoId,
+        episodeId: content.episodeId,
+        positionSeconds,
+        durationSeconds,
+        positionTimestamp: resolvePositionTimestamp(clientTimestamp),
+      });
+      progressWrites.labels(result.applied ? 'applied' : 'stale').inc();
+
+      if (result.continueWatchingChanged) {
+        await invalidateHomepage(viewer.profileId);
+      }
+
+      // Progress reports double as the stream-slot heartbeat.
+      let lease: { active: boolean; activeStreams: number; limit: number } | undefined;
+      if (playbackSessionId) {
+        const slot = await acquireStreamSlot(
+          viewer.accountId,
+          playbackSessionId,
+          planFor(viewer.subscriptionTier).maxStreams
         );
-
-        // If completed, add to watch history
-        if (completed) {
-          await query(
-            `INSERT INTO watch_history (profile_id, episode_id, watched_at)
-             VALUES ($1, $2, NOW())
-             ON CONFLICT DO NOTHING`,
-            [req.profileId, episodeId]
-          );
-
-          // Record streaming end
-          recordStreamingEnd();
-        }
-      } else {
-        // Update movie progress
-        await query(
-          `INSERT INTO viewing_progress (profile_id, video_id, position_seconds, duration_seconds, completed, last_watched_at)
-           VALUES ($1, $2, $3, $4, $5, NOW())
-           ON CONFLICT (profile_id, video_id, episode_id)
-           DO UPDATE SET position_seconds = $3, duration_seconds = $4, completed = $5, last_watched_at = NOW()`,
-          [req.profileId, videoId, positionSeconds, durationSeconds, completed]
-        );
-
-        // If completed, add to watch history
-        if (completed) {
-          await query(
-            `INSERT INTO watch_history (profile_id, video_id, watched_at)
-             VALUES ($1, $2, NOW())
-             ON CONFLICT DO NOTHING`,
-            [req.profileId, videoId]
-          );
-
-          // Record streaming end
-          recordStreamingEnd();
+        lease = { active: slot.granted, activeStreams: slot.activeStreams, limit: slot.limit };
+        if (!slot.granted) {
+          streamingLogger.info({ accountId: viewer.accountId, playbackSessionId }, 'Stream slot lost');
         }
       }
 
-      res.json({ success: true, completed });
+      res.json({
+        success: true,
+        applied: result.applied,
+        completed: result.completed,
+        positionSeconds: result.positionSeconds,
+        lease,
+      });
     } catch (error) {
       streamingLogger.error({ error }, 'Update progress error');
       res.status(500).json({ error: 'Internal server error' });
@@ -321,14 +414,18 @@ router.get(
   requireProfile,
   async (req: Request, res: Response) => {
     try {
-      const { videoId } = req.params;
       const { episodeId } = req.query;
+      const contentId = uuid.safeParse(typeof episodeId === 'string' && episodeId ? episodeId : req.params.videoId);
+      if (!contentId.success) {
+        res.status(400).json({ error: 'Invalid video or episode id' });
+        return;
+      }
 
       const progress = await queryOne<ViewingProgressRow & { completed: boolean }>(
-        episodeId
-          ? 'SELECT position_seconds, duration_seconds, completed FROM viewing_progress WHERE profile_id = $1 AND episode_id = $2'
-          : 'SELECT position_seconds, duration_seconds, completed FROM viewing_progress WHERE profile_id = $1 AND video_id = $2',
-        [req.profileId, episodeId || videoId]
+        `SELECT position_seconds, duration_seconds, completed
+         FROM viewing_progress
+         WHERE profile_id = $1 AND content_id = $2`,
+        [req.profileId, contentId.data]
       );
 
       if (!progress) {
@@ -405,17 +502,5 @@ router.post(
   }
 );
 
-/**
- * Determines if viewing is complete based on position and duration.
- * Content is considered complete when more than 95% has been watched.
- *
- * @param position - Current position in seconds
- * @param duration - Total duration in seconds
- * @returns True if viewing is complete
- */
-function isProgressComplete(position: number, duration: number): boolean {
-  if (duration === 0) return false;
-  return (position / duration) > 0.95;
-}
 
 export default router;

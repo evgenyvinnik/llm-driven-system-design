@@ -1,957 +1,498 @@
-# Local Delivery Service - Architecture Design
+# Local Delivery — Architecture
 
 ## System Overview
 
-A last-mile delivery platform for local goods and services, similar to DoorDash, Instacart, or Uber Eats. The core challenges are real-time driver location tracking, efficient driver-order matching, route optimization, and handling the three-sided marketplace dynamics between customers, merchants, and drivers.
+A last-mile delivery platform in the style of DoorDash, Instacart or Gopuff: customers order from local merchants, the platform finds a nearby courier, and the customer watches the order arrive. Three problems make it interesting. **Location is a firehose**: every online courier reports a position every few seconds, roughly a thousand times more writes than orders. **Assignment must be exactly once**: an order goes to one courier, and a courier who accepts must never find the order cancelled or given to someone else, because drivers cannot be rolled back. **Tracking must survive bad networks**: phones drop off in tunnels and elevators, and the screen must catch up without missing a state.
+
+This document describes the production design first, then — in [Implementation Notes](#implementation-notes) — what the local Express + PostgreSQL + Redis + React implementation actually does.
+
+**Learning goals**
+
+- A geospatial index for "who is near this merchant", and why it lives in Redis instead of the order database.
+- Sequential offers with an atomic claim: compare-and-set updates plus partial unique indexes so one order gets one courier.
+- An order state machine where every transition is a guarded `UPDATE`.
+- Leases with expiry, and `FOR UPDATE SKIP LOCKED`, so matching survives a crashed process.
+- Idempotent order placement in the same transaction as the order.
+- Live tracking with WebSockets: one Redis subscriber per node, snapshot then stream, versioned events.
 
 ## Requirements
 
-### Functional Requirements
+### Functional requirements
 
-1. **Order placement** - Customers browse merchant menus and place orders
-2. **Driver matching** - Match orders to nearby available drivers using a scoring algorithm
-3. **Real-time tracking** - Live driver location and ETA updates via WebSocket
-4. **Route optimization** - Efficient routing for pickups and deliveries
-5. **Notifications** - Order status updates to customers, merchants, and drivers
-6. **Ratings** - Two-way ratings for drivers, customers, and merchants
+1. Customers browse nearby merchants and menus, build a cart from one merchant, see the server's price, and place an order.
+2. The platform offers each order to nearby couriers, one at a time, until one accepts.
+3. Couriers go online and offline, receive offers with a countdown, accept or decline, and move the order through pickup and delivery.
+4. Customers track their order live: status changes, the courier's position and an ETA.
+5. Customers cancel before preparation starts; after delivery they rate the courier and the merchant.
+6. Administrators see orders, couriers, merchants and platform statistics.
 
-### Non-Functional Requirements
+Out of scope: payments (an authorization step would sit before dispatch), batching several orders onto one courier, surge pricing, and the merchant tablet app.
 
-- **Latency**: Driver match within 30 seconds, location updates every 3 seconds, p99 API response < 200ms
-- **Scale**: 1M orders/day, 100K concurrent drivers, 10K location updates/second
-- **Availability**: 99.99% for order placement (four nines)
-- **Accuracy**: ETA within 3 minutes 90% of the time
-- **Durability**: Zero order loss; idempotent order creation
+### Non-functional requirements
+
+| Requirement | Target | Why |
+|-------------|--------|-----|
+| Order placement availability | 99.99% | Revenue moment; must not depend on courier supply |
+| Order placement latency | p99 < 300 ms | Placement returns before matching starts |
+| Time to assign a courier | p50 < 30 s, p99 < 2 min | Food is cooking; customers watch a spinner |
+| Location freshness | Courier position at most 3 s old on the customer's map | Below this a moving dot looks broken |
+| Assignment correctness | Exactly one courier per order, never a cancelled order | Two couriers at one restaurant cannot be undone |
+| Duplicate orders | Zero from retries | A double charge is a support ticket and a refund |
+| ETA accuracy | Within 3 minutes for 90% of orders | The trust metric |
 
 ## Capacity Estimation
 
-### Production Scale
+| Quantity | Estimate | Design consequence |
+|----------|----------|--------------------|
+| Orders | 1M/day → ~12/s average, ~35/s at the dinner peak | One PostgreSQL primary handles the order writes |
+| Online couriers | 100K drivers, ~30% online → 30K concurrent | Sizes the geo index and the WebSocket fleet |
+| Location pings | 30K couriers ÷ 3 s → ~10K writes/s | Hot path goes to Redis only, never to the order database |
+| Location history if every ping were stored | 10K/s × ~100 B ≈ 1 MB/s ≈ 86 GB/day | Sample (1 in 3) and stream to Kafka and cold storage |
+| Live trackers | ~50K customers watching at peak, 1 update per 3 s | ~17K pushed messages/s across the gateway fleet |
+| Geo index size | 30K members × ~100 B ≈ 3 MB per region | Fits in one Redis per metro with room to spare |
+| Offers | ~1.5 offers per order → ~50/s at peak | Durable offer rows in PostgreSQL are cheap |
 
-**Order volume:**
-- 1 million orders per day
-- Peak hours (lunch/dinner): 3x average = 35 orders/second
-- Average order: $25, 3 items
-
-**Driver fleet:**
-- 100,000 active drivers
-- 30% online at any time = 30,000 concurrent
-- Location updates every 3 seconds = 10,000 updates/second
-
-**Storage:**
-- Orders: ~1KB each = 1GB/day, 365GB/year
-- Driver location history: 10K updates/sec x 100 bytes = 1MB/s = 86GB/day
-- Session tokens: 30K concurrent x 200 bytes = 6MB (Redis)
+The ratio drives everything: locations outnumber orders about 300 to 1 per second, but an order that is lost or double-assigned costs far more than a lost ping. Orders get transactions; locations get a volatile index that refreshes itself every 3 seconds.
 
 ### Local Development Scale
 
-- 3 test merchants with sample menus
-- 3 test drivers with simulated locations
-- ~10 concurrent users maximum
+One Express process serves the API, the WebSocket endpoint, the matching loops and the background jobs, against one PostgreSQL and one Redis. The seed has 3 merchants, 15 menu items, 2 customers, 3 couriers and an admin. `dev:server1..3` start extra instances on ports 3001–3003 against the same database and Redis, which is enough to watch dispatch leases move between instances. Ports and setup are in the [README](./README.md).
 
 ## High-Level Architecture
 
 ```
-                                ┌─────────────────────────────────────┐
-                                │            Client Apps               │
-                                │   Customer    Driver    Admin        │
-                                │   (React)     (React)   (React)     │
-                                └────────────┬────────────────────────┘
-                                             │
-                                    ┌────────┴────────┐
-                                    │   CDN / Edge    │
-                                    │  (CloudFront)   │
-                                    └────────┬────────┘
-                                             │
-                              ┌──────────────┴──────────────┐
-                              │         API Gateway          │
-                              │  (Rate limiting, Auth, TLS)  │
-                              └──────┬──────────────┬───────┘
-                                     │              │
-                            HTTPS    │              │ WSS
-                                     │              │
-                  ┌──────────────────┼──────────────┼──────────────────┐
-                  │                  │              │                  │
-         ┌────────▼────────┐ ┌──────▼───────┐ ┌────▼──────┐ ┌────────▼────────┐
-         │  Order Service  │ │  Location    │ │ Tracking  │ │  Notification   │
-         │                 │ │  Service     │ │ Service   │ │  Service        │
-         │ - Create order  │ │              │ │           │ │                 │
-         │ - State machine │ │ - Geo index  │ │ - Pub/Sub │ │ - Push / SMS    │
-         │ - Idempotency   │ │ - Nearby     │ │ - ETA     │ │ - Email         │
-         └────────┬────────┘ │   search     │ │ - WS fan  │ └─────────────────┘
-                  │          └──────┬───────┘ │   out     │
-         ┌────────▼────────┐       │         └───────────┘
-         │ Matching Service│       │
-         │                 │       │
-         │ - Driver scoring│       │
-         │ - Sequential    │       │
-         │   offers        │       │
-         │ - Circuit       │       │
-         │   breaker       │       │
-         └────────┬────────┘       │
-                  │                │
-      ┌───────────┴────────────────┴───────────────────────┐
-      │                    Data Layer                       │
-      │                                                    │
-      │  ┌────────────┐  ┌────────────┐  ┌──────────────┐ │
-      │  │ PostgreSQL │  │   Redis    │  │    Kafka     │ │
-      │  │ (Primary)  │  │  Cluster   │  │              │ │
-      │  │            │  │            │  │ - Location   │ │
-      │  │ - Users    │  │ - Geo idx  │  │   events     │ │
-      │  │ - Orders   │  │ - Sessions │  │ - Order      │ │
-      │  │ - Merchants│  │ - Pub/Sub  │  │   events     │ │
-      │  │ - Ratings  │  │ - Cache    │  │ - Analytics  │ │
-      │  └────────────┘  └────────────┘  └──────────────┘ │
-      └────────────────────────────────────────────────────┘
+  ┌──────────────────────────┐                          ┌────────────────────────────┐
+  │ Customer app             │                          │ Courier app                │
+  │ cart · order tracking    │                          │ offers · GPS every 3 s     │
+  └───┬──────────────────────┘                          └───────────────────┬────────┘
+      │                  ▲                                  ▲               │
+      │ (1) POST /orders │ WSS: status,                     │ WSS: offers   │ (3) POST /location
+      │ Idempotency-Key  │ location, ETA                    │               │ POST …/accept
+      ▼                  ▼                                  ▼               ▼
+  ┌───────────────────────────────────────────────────────────────────────────────────────────┐
+  │ Load balancer · TLS · session auth · rate limits · routes /api/* and /ws                  │
+  └────────┬───────────────────────┬───────────────────────────────────────────────┬──────────┘
+           │                       │                       ▲                       │
+           │ /orders               │ /offers               │ /ws                   │ /location
+           ▼                       ▼                       ▼                       ▼
+  ┌───────────────────┐   ┌───────────────────┐   ┌───────────────────┐   ┌───────────────────┐
+  │ Order Service     │   │ Dispatch Service  │   │ Tracking Gateway  │   │ Location Service  │
+  │ pricing · states  │   │ matching · offers │   │ WebSocket fan-out │   │ ping ingest       │
+  └────────┬──────────┘   └───┬───────────┬───┘   └───────────┬───────┘   └───┬─────────┬─────┘
+           │                  │           │                   ▲               │         │
+           │ INSERT order,    │ offer,    │ (2) GEOSEARCH     │ SUBSCRIBE     │ GEOADD  │
+           │ key, lease       │ claim     │                   │               │ PUBLISH │
+           ▼                  ▼           ▼                   │               │         │ sample
+  ┌────────────────────────────────┐    ┌─────────────────────┴──────┐        │         │
+  │ PostgreSQL · source of truth   │    │ Redis · one per metro      │◀───────┘         │
+  │ orders, offers, couriers, keys │    │ geo, last-seen, pub/sub    │                  │
+  └────────────────────────────────┘    └────────────────────────────┘                  │
+                                                                                        ▼
+                                                                          ┌────────────────────┐
+                                                                          │ Kafka · locations  │
+                                                                          │ → history, ETA ML  │
+                                                                          └────────────────────┘
 ```
 
-### Core Components
+1. **Place an order (1).** The customer app posts the cart with an `Idempotency-Key`. The Order Service prices it from the menu and, in one transaction, writes the order, its items, the idempotency record and a dispatch lease. It answers `201` straight away; finding a courier happens afterwards, so placement never waits on courier supply.
+2. **Dispatch (2).** The Dispatch Service instance holding the order's lease searches the metro's Redis geo index for couriers who pinged recently, scores them, and writes a 30-second offer for the best one. The gateway pushes the offer to that courier. Accepting is one PostgreSQL transaction that claims the offer, assigns the order and marks the courier busy; a decline or timeout moves to the next courier.
+3. **Track (3).** Courier apps post their position every 3 seconds (and every 10 seconds when parked, as a heartbeat). The Location Service writes it to Redis — geo index, last-seen time, and a publish on the courier's channel — and samples one ping in three to Kafka. Tracking Gateway nodes subscribed to that channel push the position and an ETA to the customer's socket.
 
-1. **Order Service** - Manages order lifecycle with a state machine (`pending` -> `confirmed` -> `preparing` -> `ready_for_pickup` -> `driver_assigned` -> `picked_up` -> `in_transit` -> `delivered`). Uses idempotency keys to prevent duplicate orders on network retry.
+| Component | Responsibility | Scales with | Notes |
+|-----------|----------------|-------------|-------|
+| Load balancer / API gateway | TLS, session auth, rate limits, routes `/api/*` and `/ws` | Connections | Sticky routing is not needed: any gateway node can serve any socket |
+| Order Service | Pricing, order creation, state transitions, cancellation | Orders (~35/s peak) | Stateless; writes PostgreSQL; emits order events through an outbox |
+| Dispatch Service | Matching loop, offers, the atomic claim, lease sweeper | Unassigned orders | Partitioned by metro; any instance can resume another's order after its lease expires |
+| Location Service | Ping ingest | Online couriers (~10K/s) | Stateless; Redis-only hot path, sampled durable writes |
+| Tracking Gateway | WebSocket fan-out of status, offers, positions and ETAs | Open sockets | One Redis subscriber per node; heartbeats; no replay, clients resync by snapshot |
+| PostgreSQL | Orders, items, offers, couriers, idempotency keys | Orders | Source of truth; primary plus read replicas; partition `orders` by month |
+| Redis (one per metro) | Geo index, last-seen times, pub/sub channels, sessions | Couriers per metro | Volatile by design: rebuilt from pings within seconds |
+| Kafka | Sampled location events, order events | Pings | Feeds location history, ETA model training and notifications |
 
-2. **Location Service** - Ingests driver location updates at 10K/second. Maintains a real-time geo-index in Redis using `GEOADD`/`GEORADIUS`. Supports nearby driver queries with sub-millisecond latency.
+## Core Components / Request Flows
 
-3. **Matching Service** - Assigns orders to drivers using a scoring algorithm that weighs distance (40%), rating (25%), acceptance rate (20%), and current load (15%). Offers are sent sequentially with a 30-second acceptance timeout. Protected by a circuit breaker to prevent cascade failures.
+### Placing an order
 
-4. **Tracking Service** - Streams real-time driver location to customers via WebSocket. Calculates ETA using Haversine distance. Uses Redis Pub/Sub for message distribution across server instances.
+```
+Customer app                         Order Service                         PostgreSQL   Dispatch
+      │                                    │                                    │           │
+      │ 1 POST /orders, Idempotency-Key K  │                                    │           │
+      │───────────────────────────────────▶│                                    │           │
+      │                                    │ 2 BEGIN; INSERT key K ON CONFLICT  │           │
+      │                                    │───────────────────────────────────▶│           │
+      │                                    │ 3 1 row = new (0 = replay)         │           │
+      │                                    │◀───────────────────────────────────│           │
+      │                                    │ 4 INSERT order, items, lease       │           │
+      │                                    │───────────────────────────────────▶│           │
+      │                                    │ 5 store 201 under K; COMMIT        │           │
+      │                                    │───────────────────────────────────▶│           │
+      │ 6 201 {status: pending, v1}        │                                    │           │
+      │◀───────────────────────────────────│                                    │           │
+      ···································· after COMMIT ·····································
+      │                                    │ 7 order.created (outbox)                       │
+      │                                    │───────────────────────────────────────────────▶│
+      │                                    │                                    │           │
+```
 
-5. **Notification Service** - Sends order status updates to all parties (push notifications, SMS, email). Decoupled via Kafka for reliable async delivery.
+- **Idempotency.** The client creates one key per checkout attempt and reuses it for every retry of that attempt. Step 2 inserts the key; a concurrent duplicate blocks on the unique index until the first transaction commits, then finds the stored `201` and returns it with `Idempotent-Replayed: true`. The same key from another user, or with a different body, gets `422` and learns nothing about the other request.
+- **One transaction.** The key, the order, its line items and the dispatch lease commit together. A crash before `COMMIT` leaves nothing behind, so the client's retry simply runs again; there is no "pending forever" key.
+- **Server-side pricing.** Prices come from the menu table, the delivery fee from the merchant-to-customer distance, and the arithmetic is in integer cents. The client sends item ids and quantities, never amounts. The cart page shows a quote from the same function (`POST /orders/quote`), so the total on the button is the total charged.
+- **Hand-off.** Step 7 is an outbox event in production; the Dispatch instance that consumes it takes the lease. Matching never runs inside the customer's request.
+
+### Dispatching: sequential offers and the atomic claim
+
+```
+Dispatch Service                              Redis   PostgreSQL    Courier app
+        │                                       │          │             │
+        │ 1 renew lease WHERE owner = me                   │             │
+        │─────────────────────────────────────────────────▶│             │
+        │ 2 GEOSEARCH 5 km + ZMSCORE last_seen  │          │             │
+        │──────────────────────────────────────▶│          │             │
+        │ 3 fresh couriers, nearest first       │          │             │
+        │◀──────────────────────────────────────│          │             │
+        │ 4 score; skip already offered         │          │             │
+        │ 5 INSERT offer, expires in 30 s                  │             │
+        │─────────────────────────────────────────────────▶│             │
+        │ 6 push offer (via gateway)                                     │
+        │───────────────────────────────────────────────────────────────▶│
+        │ 7 POST /offers/{id}/accept                                     │
+        │◀───────────────────────────────────────────────────────────────│
+        │ 8 one tx: offer, order, courier                  │             │
+        │─────────────────────────────────────────────────▶│             │
+        │ 9 200 order | 409 taken                                        │
+        │───────────────────────────────────────────────────────────────▶│
+        │                                       │          │             │
+```
+
+- **Lease (step 1).** `orders.dispatch_owner` and `orders.dispatch_lease_until` say which instance runs the loop and until when. The owner renews before every offer and stops as soon as the renewal matches nothing: the order was assigned, cancelled, or taken over. Every instance runs a sweeper that claims unassigned orders with a missing or expired lease using `FOR UPDATE SKIP LOCKED`, so a crashed instance's orders resume within seconds on another.
+- **Fresh couriers only (steps 2–3).** `GEOSEARCH` returns the nearest members; `ZMSCORE` on the last-seen sorted set drops anyone who has not pinged in 30 seconds. A phone that died keeps its last position in the geo index until a prune removes it, and without this check every order near it would wait 30 seconds for a ghost.
+- **Scoring (step 4).** Distance 40%, rating 25%, acceptance rate 20%, current load 15%. Couriers already offered this order are skipped, read from the durable `driver_offers` table so a resumed loop does not re-offer to someone who declined.
+- **Offer (step 5).** Partial unique indexes allow one pending offer per order and one per courier. The pending row is the courier's lease: while it lives, no other order can offer to them.
+- **Claim (step 8).** One transaction: the offer goes `pending → accepted` only if unexpired and owned by this courier; the order goes to `driver_assigned` only if it is unassigned and still dispatchable; the courier goes to `busy` only if online. Any failure rolls back all three and the courier sees `409`. A third unique index allows at most one accepted offer per order.
+- **Timeouts.** When the 30-second window closes the loop expires the offer with a compare-and-set. If that matches nothing, the courier answered in the last instant and their answer stands. After 5 offers, or 5 minutes without anyone nearby, the order is cancelled — but only if it is still unassigned.
+
+### Courier location and live tracking
+
+```
+ Courier          Location Svc                   Redis                Gateway             Customer
+    │                   │                          │                     │                    │
+    │ 1 POST /location  │                          │                     │                    │
+    │──────────────────▶│                          │                     │                    │
+    │                   │ 2 GEOADD, ZADD, PUBLISH  │                     │                    │
+    │                   │─────────────────────────▶│                     │                    │
+    │                   │ 3 SET gate NX PX 10s     │                     │                    │
+    │                   │─────────────────────────▶│                     │                    │
+    │                   │                          │ 4 location message  │                    │
+    │                   │                          │────────────────────▶│                    │
+    │                   │                          │                     │ 5 stage-aware ETA  │
+    │                   │                          │                     │ 6 lat, lng, eta    │
+    │                   │                          │                     │───────────────────▶│
+    ·································· customer reconnects ····································
+    │                   │                          │                     │ 7 subscribe_order  │
+    │                   │                          │                     │◀───────────────────│
+    │                   │                          │                     │ 8 snapshot v4      │
+    │                   │                          │                     │───────────────────▶│
+    │                   │                          │                     │                    │
+```
+
+- **Hot path (step 2).** One Redis pipeline: `GEOADD` to the metro's geo set, `ZADD` the ping time to the last-seen set, refresh a small per-courier hash, and `PUBLISH` on `driver:{id}:location`. No database write.
+- **Sampling (step 3).** `SET driver:{id}:persist_gate NX PX 10000` succeeds for the first ping in each 10-second window across all instances; that ping is also sent to Kafka (production) or written to PostgreSQL's last-known position and history (local).
+- **Fan-out (steps 4–6).** Each gateway node holds one Redis subscriber and a reference-counted map from channel to local sockets: the first socket interested in a channel subscribes, the last one leaving unsubscribes. The gateway computes the ETA for each socket's order: before pickup, courier to merchant plus any wait for the food plus merchant to customer; after pickup, the last leg only. Distances are straight-line times a 1.3 road factor.
+- **Courier assignment.** A status event carries the new courier's id; the gateway moves the customer's location subscription to that courier's channel, so the dot appears without the app resubscribing.
+- **Reconnects (steps 7–8).** Pub/sub keeps nothing, so a reconnecting client resubscribes and the gateway answers with a fresh snapshot of the order. Status events are absolute and carry the order's `version`; the client keeps whichever copy has the higher version, so a late or duplicated event never moves the screen backwards.
+
+### Order lifecycle
+
+```
+  pending ──▶ confirmed ──▶ preparing ──▶ ready_for_pickup        merchant progress
+     │            │             │                 │
+     └────────────┴──────┬──────┴─────────────────┘
+                         │
+         ┌───────────────┴───────────────┐
+         ▼                               ▼
+     cancelled                    driver_assigned ──▶ picked_up ──▶ in_transit ──▶ delivered
+  customer: pending, confirmed    the atomic claim                  (picked_up ──▶ delivered
+  dispatch: deadline, 5 offers    (offer, order, courier)            is also allowed)
+```
+
+Every transition is one `UPDATE … WHERE id = $1 AND status = ANY($allowed) [AND owner checks] RETURNING *` that also increments `version`. Zero rows means the move is illegal right now; the service reads the current row to answer `404`, `403` or `409`. Cancelling after a courier is assigned is not in the table: it would also have to release the courier, and that path (with reassignment) is listed under [known limitations](#known-limitations).
 
 ## Database Schema
 
-### Entity-Relationship Diagram
+### Production schema
 
-```
-                                    ┌─────────────────────────┐
-                                    │      users              │
-                                    │─────────────────────────│
-                                    │ id (PK, UUID)           │
-                                    │ email (UNIQUE)          │
-                                    │ password_hash           │
-                                    │ name, phone             │
-                                    │ role (customer/driver/  │
-                                    │       merchant/admin)   │
-                                    │ created_at, updated_at  │
-                                    └───────────┬─────────────┘
-                                                │
-              ┌─────────────────────────────────┼─────────────────────────────────┐
-              │                                 │                                 │
-              │ 1:1 (id = users.id)             │ 1:N (owner_id)                  │ 1:N (user_id)
-              ▼                                 │                                 ▼
-┌─────────────────────────────┐                 │                   ┌─────────────────────────────┐
-│       drivers               │                 │                   │       sessions              │
-│─────────────────────────────│                 │                   │─────────────────────────────│
-│ id (PK, FK -> users)        │                 │                   │ id (PK, UUID)               │
-│ vehicle_type                │                 │                   │ user_id (FK -> users)       │
-│ license_plate               │                 │                   │ token (UNIQUE)              │
-│ status                      │                 │                   │ expires_at                  │
-│ rating, total_deliveries    │                 │                   │ created_at                  │
-│ acceptance_rate             │                 │                   └─────────────────────────────┘
-│ current_lat, current_lng    │                 │
-│ location_updated_at         │                 ▼
-│ created_at, updated_at      │   ┌─────────────────────────────┐
-└──────────────┬──────────────┘   │       merchants             │
-               │                  │─────────────────────────────│
-               │                  │ id (PK, UUID)               │
-               │                  │ owner_id (FK -> users)      │
-               │                  │ name, description           │
-               │                  │ address, lat, lng           │
-               │                  │ category                    │
-               │                  │ avg_prep_time_minutes       │
-               │                  │ rating, is_open             │
-               │                  │ opens_at, closes_at         │
-               │                  │ created_at, updated_at      │
-               │                  └──────────────┬──────────────┘
-               │                                 │
-               │  1:N (driver_id)                │  1:N (merchant_id)
-               │                                 ▼
-               │                  ┌─────────────────────────────┐
-               │                  │       menu_items            │
-               │                  │─────────────────────────────│
-               │                  │ id (PK, UUID)               │
-               │                  │ merchant_id (FK)            │
-               │                  │ name, description, price    │
-               │                  │ category, image_url         │
-               │                  │ is_available                │
-               │                  │ created_at, updated_at      │
-               │                  └──────────────┬──────────────┘
-               │                                 │
-               │                                 │  N:1 (menu_item_id)
-               ▼                                 │
-┌─────────────────────────────┐                  │
-│       orders                │◄─────────────────┘
-│─────────────────────────────│
-│ id (PK, UUID)               │
-│ customer_id (FK -> users)   │
-│ merchant_id (FK)            │
-│ driver_id (FK -> drivers)   │
-│ status                      │
-│ delivery_address/lat/lng    │
-│ subtotal, delivery_fee, tip │
-│ total                       │
-│ estimated_delivery_time     │
-│ actual_delivery_time        │
-│ archived_at, retention_days │
-│ timestamps (created, etc.)  │
-└──────────────┬──────────────┘
-               │
-               │  1:N (order_id)
-    ┌──────────┼──────────┬───────────────┐
-    ▼          ▼          ▼               ▼
-┌────────────┐ ┌────────────┐ ┌────────────┐ ┌────────────────────────┐
-│order_items │ │driver_offers│ │  ratings   │ │driver_location_history │
-│────────────│ │────────────│ │────────────│ │────────────────────────│
-│id (PK)     │ │id (PK)     │ │id (PK)     │ │id (PK)                 │
-│order_id FK │ │order_id FK │ │order_id FK │ │driver_id (FK -> drivers)│
-│menu_item_id│ │driver_id FK│ │rater_id FK │ │lat, lng                │
-│name, qty   │ │status      │ │rated_user  │ │speed, heading          │
-│unit_price  │ │offered_at  │ │rated_merch │ │recorded_at             │
-│special_inst│ │expires_at  │ │rating 1-5  │ └────────────────────────┘
-│created_at  │ │responded_at│ │comment     │
-└────────────┘ └────────────┘ │created_at  │
-                              └────────────┘
-
-┌─────────────────────────────┐  ┌─────────────────────────────┐  ┌─────────────────────────────┐
-│     delivery_zones          │  │     idempotency_keys        │  │     retention_policies      │
-│─────────────────────────────│  │─────────────────────────────│  │─────────────────────────────│
-│ id (PK, UUID)               │  │ key (PK, VARCHAR(64))       │  │ id (PK, UUID)               │
-│ name                        │  │ user_id (FK -> users)       │  │ table_name (UNIQUE)         │
-│ center_lat, center_lng      │  │ operation                   │  │ hot_storage_days            │
-│ radius_km                   │  │ response (JSONB)            │  │ warm_storage_days           │
-│ is_active                   │  │ status                      │  │ archive_enabled             │
-│ base_delivery_fee           │  │ created_at, expires_at      │  │ last_cleanup_at             │
-│ per_km_fee                  │  └─────────────────────────────┘  │ created_at, updated_at      │
-│ created_at                  │                                   └─────────────────────────────┘
-└─────────────────────────────┘
-```
-
-### Complete PostgreSQL Schema
+PostgreSQL holds everything that must be correct. Amounts are integer cents.
 
 ```sql
--- Enable UUID extension
-CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
-
--- Users: Central identity table for all user types
-CREATE TABLE users (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    email VARCHAR(255) UNIQUE NOT NULL,
-    password_hash VARCHAR(255) NOT NULL,
-    name VARCHAR(255) NOT NULL,
-    phone VARCHAR(20),
-    role VARCHAR(20) NOT NULL CHECK (role IN ('customer', 'driver', 'merchant', 'admin')),
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
--- Drivers: Extended profile for users with role='driver'
-CREATE TABLE drivers (
-    id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-    vehicle_type VARCHAR(20) NOT NULL CHECK (vehicle_type IN ('bicycle', 'motorcycle', 'car', 'van')),
-    license_plate VARCHAR(20),
-    status VARCHAR(20) NOT NULL DEFAULT 'offline' CHECK (status IN ('offline', 'available', 'busy')),
-    rating DECIMAL(3,2) DEFAULT 5.00,
-    total_deliveries INTEGER DEFAULT 0,
-    acceptance_rate DECIMAL(5,4) DEFAULT 1.0000,
-    current_lat DECIMAL(10,8),
-    current_lng DECIMAL(11,8),
-    location_updated_at TIMESTAMP,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
--- Merchants: Business profiles
-CREATE TABLE merchants (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    owner_id UUID REFERENCES users(id) ON DELETE SET NULL,
-    name VARCHAR(255) NOT NULL,
-    description TEXT,
-    address TEXT NOT NULL,
-    lat DECIMAL(10,8) NOT NULL,
-    lng DECIMAL(11,8) NOT NULL,
-    category VARCHAR(50) NOT NULL,
-    avg_prep_time_minutes INTEGER DEFAULT 15,
-    rating DECIMAL(3,2) DEFAULT 5.00,
-    is_open BOOLEAN DEFAULT true,
-    opens_at TIME DEFAULT '09:00',
-    closes_at TIME DEFAULT '22:00',
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
--- Menu Items: Products available from merchants
-CREATE TABLE menu_items (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    merchant_id UUID NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
-    name VARCHAR(255) NOT NULL,
-    description TEXT,
-    price DECIMAL(10,2) NOT NULL,
-    category VARCHAR(50),
-    image_url TEXT,
-    is_available BOOLEAN DEFAULT true,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
--- Orders: Core transaction table
 CREATE TABLE orders (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    customer_id UUID REFERENCES users(id) ON DELETE SET NULL,
-    merchant_id UUID REFERENCES merchants(id) ON DELETE SET NULL,
-    driver_id UUID REFERENCES drivers(id) ON DELETE SET NULL,
-    status VARCHAR(30) NOT NULL DEFAULT 'pending'
-        CHECK (status IN ('pending','confirmed','preparing','ready_for_pickup',
-                          'driver_assigned','picked_up','in_transit','delivered','cancelled')),
-    delivery_address TEXT NOT NULL,
-    delivery_lat DECIMAL(10,8) NOT NULL,
-    delivery_lng DECIMAL(11,8) NOT NULL,
-    delivery_instructions TEXT,
-    subtotal DECIMAL(10,2) NOT NULL,
-    delivery_fee DECIMAL(10,2) NOT NULL DEFAULT 0,
-    tip DECIMAL(10,2) DEFAULT 0,
-    total DECIMAL(10,2) NOT NULL,
-    estimated_prep_time_minutes INTEGER,
-    estimated_delivery_time TIMESTAMP,
-    actual_delivery_time TIMESTAMP,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    confirmed_at TIMESTAMP,
-    picked_up_at TIMESTAMP,
-    delivered_at TIMESTAMP,
-    cancelled_at TIMESTAMP,
-    cancellation_reason TEXT,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    archived_at TIMESTAMP,
-    retention_days INTEGER DEFAULT 90
-);
+  id                    UUID PRIMARY KEY,
+  customer_id           UUID NOT NULL REFERENCES users(id),
+  merchant_id           UUID NOT NULL REFERENCES merchants(id),
+  driver_id             UUID REFERENCES drivers(id),       -- set only by the atomic claim
+  status                TEXT NOT NULL DEFAULT 'pending',   -- see the lifecycle above
+  version               INT  NOT NULL DEFAULT 1,           -- bumped by every transition
+  delivery_lat          DOUBLE PRECISION NOT NULL,
+  delivery_lng          DOUBLE PRECISION NOT NULL,
+  subtotal_cents        INT NOT NULL CHECK (subtotal_cents >= 0),
+  delivery_fee_cents    INT NOT NULL CHECK (delivery_fee_cents >= 0),
+  tip_cents             INT NOT NULL DEFAULT 0 CHECK (tip_cents >= 0),
+  total_cents           INT NOT NULL CHECK (total_cents >= 0),
+  dispatch_owner        TEXT,                              -- instance running the matching loop
+  dispatch_lease_until  TIMESTAMPTZ,                       -- sweepers may claim after this
+  created_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+  picked_up_at          TIMESTAMPTZ,
+  delivered_at          TIMESTAMPTZ,
+  cancelled_at          TIMESTAMPTZ,
+  cancellation_reason   TEXT
+) PARTITION BY RANGE (created_at);                         -- monthly partitions
 
--- Order Items: Line items within orders
+CREATE INDEX orders_waiting_for_courier ON orders (created_at)
+  WHERE driver_id IS NULL AND status IN ('pending', 'confirmed', 'preparing', 'ready_for_pickup');
+CREATE INDEX orders_by_customer ON orders (customer_id, created_at DESC);
+CREATE INDEX orders_active_by_courier ON orders (driver_id)
+  WHERE status IN ('driver_assigned', 'picked_up', 'in_transit');
+
 CREATE TABLE order_items (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    order_id UUID NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
-    menu_item_id UUID REFERENCES menu_items(id) ON DELETE SET NULL,
-    name VARCHAR(255) NOT NULL,
-    quantity INTEGER NOT NULL DEFAULT 1,
-    unit_price DECIMAL(10,2) NOT NULL,
-    special_instructions TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  order_id         UUID NOT NULL,
+  menu_item_id     UUID,
+  name             TEXT NOT NULL,                          -- copied: the receipt never changes
+  quantity         INT  NOT NULL CHECK (quantity > 0),
+  unit_price_cents INT  NOT NULL
 );
 
--- Driver Offers: Assignment tracking
 CREATE TABLE driver_offers (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    order_id UUID NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
-    driver_id UUID NOT NULL REFERENCES drivers(id) ON DELETE CASCADE,
-    status VARCHAR(20) NOT NULL DEFAULT 'pending'
-        CHECK (status IN ('pending', 'accepted', 'rejected', 'expired')),
-    offered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    expires_at TIMESTAMP NOT NULL,
-    responded_at TIMESTAMP
+  id           UUID PRIMARY KEY,
+  order_id     UUID NOT NULL,
+  driver_id    UUID NOT NULL,
+  status       TEXT NOT NULL DEFAULT 'pending',            -- pending | accepted | rejected | expired
+  offered_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  expires_at   TIMESTAMPTZ NOT NULL,
+  responded_at TIMESTAMPTZ
 );
+CREATE UNIQUE INDEX one_pending_offer_per_order   ON driver_offers (order_id)  WHERE status = 'pending';
+CREATE UNIQUE INDEX one_pending_offer_per_courier ON driver_offers (driver_id) WHERE status = 'pending';
+CREATE UNIQUE INDEX one_accepted_offer_per_order  ON driver_offers (order_id)  WHERE status = 'accepted';
 
--- Ratings: Two-way ratings for completed deliveries
-CREATE TABLE ratings (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    order_id UUID NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
-    rater_id UUID REFERENCES users(id) ON DELETE SET NULL,
-    rated_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
-    rated_merchant_id UUID REFERENCES merchants(id) ON DELETE SET NULL,
-    rating INTEGER NOT NULL CHECK (rating BETWEEN 1 AND 5),
-    comment TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
--- Delivery Zones: Geographic areas with pricing
-CREATE TABLE delivery_zones (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    name VARCHAR(100) NOT NULL,
-    center_lat DECIMAL(10,8) NOT NULL,
-    center_lng DECIMAL(11,8) NOT NULL,
-    radius_km DECIMAL(5,2) NOT NULL,
-    is_active BOOLEAN DEFAULT true,
-    base_delivery_fee DECIMAL(10,2) DEFAULT 2.99,
-    per_km_fee DECIMAL(10,2) DEFAULT 0.50,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
--- Sessions: Authentication sessions
-CREATE TABLE sessions (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    token VARCHAR(255) UNIQUE NOT NULL,
-    expires_at TIMESTAMP NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
--- Driver Location History: Time-series for analytics
-CREATE TABLE driver_location_history (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    driver_id UUID NOT NULL REFERENCES drivers(id) ON DELETE CASCADE,
-    lat DECIMAL(10,8) NOT NULL,
-    lng DECIMAL(11,8) NOT NULL,
-    speed DECIMAL(6,2),
-    heading DECIMAL(5,2),
-    recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
--- Idempotency Keys: Prevent duplicate operations
 CREATE TABLE idempotency_keys (
-    key VARCHAR(64) PRIMARY KEY,
-    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    operation VARCHAR(50) NOT NULL,
-    response JSONB,
-    status VARCHAR(20) NOT NULL DEFAULT 'pending'
-        CHECK (status IN ('pending', 'completed', 'failed')),
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    expires_at TIMESTAMP NOT NULL
-);
-
--- Retention Policies: Data lifecycle configuration
-CREATE TABLE retention_policies (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    table_name VARCHAR(100) UNIQUE NOT NULL,
-    hot_storage_days INTEGER NOT NULL DEFAULT 30,
-    warm_storage_days INTEGER NOT NULL DEFAULT 365,
-    archive_enabled BOOLEAN DEFAULT true,
-    last_cleanup_at TIMESTAMP,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  key          TEXT PRIMARY KEY,
+  user_id      UUID NOT NULL,
+  operation    TEXT NOT NULL,
+  request_hash TEXT NOT NULL,                              -- SHA-256 of the canonical request
+  response     JSONB,
+  expires_at   TIMESTAMPTZ NOT NULL                        -- 24 h
 );
 ```
 
-### Database Indexes
+`drivers` holds the courier's intent (`offline`, `available`, `busy`), rating, acceptance rate and a sampled last-known position; `merchants`, `menu_items`, `users`, `ratings` and `sessions` are conventional.
 
-| Index Name | Table | Columns | Type | Purpose |
-|------------|-------|---------|------|---------|
-| idx_orders_status | orders | status | B-tree | Filter by order status |
-| idx_orders_customer | orders | customer_id | B-tree | Customer order history |
-| idx_orders_driver | orders | driver_id | Partial (active statuses) | Active driver orders |
-| idx_orders_merchant | orders | merchant_id | B-tree | Merchant order history |
-| idx_orders_created | orders | created_at DESC | B-tree | Recent orders listing |
-| idx_orders_archive | orders | created_at, archived_at | Partial (not archived) | Archive job queries |
-| idx_drivers_status | drivers | status | B-tree | Available driver lookup |
-| idx_drivers_location | drivers | current_lat, current_lng | Partial (available) | Nearby driver search |
-| idx_merchants_location | merchants | lat, lng | B-tree | Nearby merchant search |
-| idx_merchants_category | merchants | category | B-tree | Category filtering |
-| idx_menu_items_merchant | menu_items | merchant_id | B-tree | Menu listing |
-| idx_driver_offers_order | driver_offers | order_id | B-tree | Offers per order |
-| idx_driver_offers_driver | driver_offers | driver_id | B-tree | Offers per driver |
-| idx_sessions_token | sessions | token | B-tree | Session lookup |
-| idx_driver_location_history | driver_location_history | driver_id, recorded_at DESC | B-tree | Driver path queries |
-| idx_idempotency_keys_expires | idempotency_keys | expires_at | B-tree | Cleanup job |
+Redis, one instance per metro:
 
-### Foreign Key Cascade Behaviors
+| Key | Type | Purpose |
+|-----|------|---------|
+| `drivers:locations` | GEO set | Position of every reachable courier |
+| `drivers:last_seen` | Sorted set, score = epoch ms | Liveness; search ignores entries older than 30 s, a prune removes them after 2 min |
+| `driver:{id}` | Hash, TTL 10 min | Latest position by id (seeds a new tracker's map) |
+| `driver:{id}:persist_gate` | String, `PX 10000` | One durable sample per courier per 10 s |
+| `driver:{id}:location`, `driver:{id}:offers`, `order:{id}:status` | Pub/sub channels | Fan-out to Tracking Gateway nodes |
+| `session:{token}` | String, TTL = session expiry | Session cache |
 
-| Parent Table | Child Table | FK Column | ON DELETE | Rationale |
-|-------------|-------------|-----------|-----------|-----------|
-| users | drivers | id | CASCADE | Driver profile meaningless without user |
-| users | merchants | owner_id | SET NULL | Keep merchant for business continuity |
-| users | orders | customer_id | SET NULL | Preserve order history |
-| users | sessions | user_id | CASCADE | Sessions deleted with user |
-| drivers | orders | driver_id | SET NULL | Preserve order history |
-| drivers | driver_offers | driver_id | CASCADE | Offers are driver-specific |
-| drivers | driver_location_history | driver_id | CASCADE | History is driver-specific |
-| merchants | menu_items | merchant_id | CASCADE | Menu belongs to merchant |
-| merchants | orders | merchant_id | SET NULL | Preserve order history |
-| orders | order_items | order_id | CASCADE | Items belong to order |
-| orders | driver_offers | order_id | CASCADE | Offers are order-specific |
-| orders | ratings | order_id | CASCADE | Rating belongs to order |
-| menu_items | order_items | menu_item_id | SET NULL | Preserve ordered item history |
+### Local schema
 
-### Redis Data Structures
+The local schema is [`backend/src/db/init.sql`](./backend/src/db/init.sql); Docker loads it into a fresh volume and it is safe to load again by hand (every statement is guarded). The seed is [`backend/db-seed/seed.sql`](./backend/db-seed/seed.sql), also re-runnable. The constraints that carry the design are verbatim:
 
-```
-# Driver locations (geo index)
-drivers:locations          -> GEOADD (lng, lat, driver_id)
-
-# Driver metadata
-driver:{id}                -> HASH (lat, lng, status, updated_at)
-
-# Active orders by driver
-driver:{id}:orders         -> SET [order_ids]
-
-# Session storage
-session:{token}            -> JSON (userId, role, expiresAt)
-
-# Real-time location pub/sub
-driver:{id}:location       -> PUBSUB channel
-order:{id}:status          -> PUBSUB channel
-
-# Message replay (WebSocket reconnect)
-order:{id}:events          -> XADD stream (MAXLEN 100)
+```sql
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_driver_offers_pending_per_order
+  ON driver_offers(order_id) WHERE status = 'pending';
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_driver_offers_pending_per_driver
+  ON driver_offers(driver_id) WHERE status = 'pending';
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_driver_offers_accepted_per_order
+  ON driver_offers(order_id) WHERE status = 'accepted';
 ```
 
-### Data Flow Between Tables
-
-**Order Placement Flow:**
-```
-1. Customer selects items from menu_items
-2. Order created in orders with customer_id, merchant_id, status='pending'
-3. Order items copied to order_items with denormalized name/price
-4. Matching service finds nearby drivers (via Redis GEORADIUS)
-5. Driver offers created in driver_offers with 30-second expiry
-6. When driver accepts, orders.driver_id set, status='driver_assigned'
-7. Status transitions recorded via timestamp columns
-8. Rating created in ratings after delivery
-```
-
-**Driver Location Flow:**
-```
-1. Driver logs in, session created in sessions + Redis
-2. Driver goes online, drivers.status='available'
-3. Location updates: Redis GEOADD (real-time) + drivers.current_lat/lng (persistent)
-4. Historical points logged to driver_location_history
-5. Retention job archives location history after 7 days
-```
+| Production | Local | Difference |
+|------------|-------|------------|
+| Amounts in integer cents | `DECIMAL(10,2)` columns; the code prices in integer cents and writes 2-decimal strings | `NOT VALID` CHECKs reject negative amounts and quantities on new rows |
+| `orders` partitioned by month | One unpartitioned table with `archived_at` / `retention_days` | `retention.ts` marks and deletes by age |
+| `TIMESTAMPTZ` | `TIMESTAMP` | Comparisons that matter (`expires_at > NOW()`) happen inside PostgreSQL |
+| `idempotency_keys.request_hash NOT NULL` | Nullable (added with `ADD COLUMN IF NOT EXISTS`) | Rows from before the column existed are compared without it |
+| — | `delivery_zones`, `retention_policies` | Seeded but not read by the request path |
 
 ## API Design
 
-### Customer API
+### Production API
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/api/v1/merchants` | Browse nearby merchants |
-| GET | `/api/v1/merchants/:id/menu` | Get merchant menu |
-| POST | `/api/v1/orders` | Place order (idempotent with `X-Idempotency-Key`) |
-| GET | `/api/v1/orders/:id` | Get order details |
-| GET | `/api/v1/orders` | Order history |
-| WebSocket | `/ws` | Subscribe to order tracking updates |
+```
+POST /api/v1/orders/quote                 price a cart: subtotal, delivery fee, tip, total
+POST /api/v1/orders                       create; Idempotency-Key → 201 | 409 in flight | 422 reused or invalid
+GET  /api/v1/orders/{id}                  snapshot incl. version (customer, assigned courier, admin)
+POST /api/v1/orders/{id}/cancel           → 200 | 409 too late
+POST /api/v1/orders/{id}/tip              → 200 | 409 cancelled
+POST /api/v1/driver/go-online | go-offline   go-offline → 409 while a delivery is active
+POST /api/v1/driver/location              {lat, lng, speed?, heading?} every 3 s; heartbeat every 10 s
+GET  /api/v1/driver/offers/pending        the courier's live offer with expires_in_seconds
+POST /api/v1/driver/offers/{id}/accept    the atomic claim → 200 order | 409 offer or order unavailable
+POST /api/v1/driver/offers/{id}/reject
+POST /api/v1/driver/orders/{id}/picked-up | in-transit | delivered   → 200 | 403 not yours | 409 wrong state
+WSS  /ws                                  subscribe_order → order_snapshot, status_update, location_update
+                                          subscribe_driver_offers → new_offer
+```
 
-### Driver API
+- Errors are `{ success: false, error, code }` with stable codes (`INVALID_TRANSITION`, `ORDER_INVALID`, `IDEMPOTENCY_KEY_REUSED`, `ORDER_UNAVAILABLE`, …), so clients branch on the code, not the message.
+- Every state-changing courier call is safe to retry: a repeated `picked-up` gets `409` with the current state instead of re-stamping the time.
+- A status event looks like `{"order_id": "…", "status": "picked_up", "driver_id": "…", "version": 4}`; a location event like `{"lat": 37.78, "lng": -122.41, "eta_seconds": 540}`.
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| POST | `/api/v1/driver/go-online` | Start accepting orders |
-| POST | `/api/v1/driver/go-offline` | Stop accepting orders |
-| POST | `/api/v1/driver/location` | Update driver location |
-| POST | `/api/v1/driver/offers/:id/accept` | Accept order offer |
-| POST | `/api/v1/driver/offers/:id/reject` | Reject order offer |
-| POST | `/api/v1/driver/orders/:id/picked-up` | Mark order picked up |
-| POST | `/api/v1/driver/orders/:id/delivered` | Complete delivery |
+### Local routes
 
-### Admin API
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/api/v1/admin/stats` | Dashboard statistics |
-| GET | `/api/v1/admin/orders` | View all orders |
-| GET | `/api/v1/admin/drivers` | View all drivers |
-| GET | `/metrics` | Prometheus metrics |
-| GET | `/health` | Health check |
+Everything above exists locally under `/api/v1`, plus `auth/*` (register, login, logout, me), `merchants` (nearby, search, categories, menu), `orders/{id}/rate/driver|merchant`, and `admin/*` (stats, orders, drivers, merchants, customers, hourly and daily analytics). Operations: `/health/live` (liveness), `/health` (readiness; `503` during shutdown), `/metrics`.
 
 ## Key Design Decisions
 
-### 1. Redis Geo-Index for Driver Locations vs PostgreSQL PostGIS
+### 1. Redis geo index with liveness, not PostGIS in the order database
 
-**Chosen: Redis GEOADD/GEORADIUS.** Driver location queries happen during the critical path of order matching -- every second of delay means a hungrier customer. Redis provides sub-millisecond geo queries compared to PostgreSQL PostGIS at ~5-10ms. With 10K location updates per second, Redis handles the write throughput without breaking a sweat.
+Matching asks "which available couriers are within 5 km of this merchant" for every order, and the answer changes every few seconds. A Redis geo set answers `GEOSEARCH` in well under a millisecond and absorbs 10K position writes a second without touching the order database. PostGIS would answer the query in a few milliseconds, but the 10K writes a second would share the WAL, buffer cache and connection pool with order placement — checkout would slow down because couriers are driving. The cost is volatility: lose Redis and every courier disappears. That is acceptable because the data refreshes itself: every online courier pings within 3 seconds (10 when parked), so the index is whole again in one heartbeat. Liveness gets its own sorted set because a geo set cannot express "last seen"; without it a courier whose phone died stays matchable forever.
 
-**Trade-off acknowledged:** Redis is volatile. If Redis crashes, the geo-index is lost and all drivers appear offline. Recovery requires drivers to re-authenticate and send a new location update. PostgreSQL stores the last-known location as a fallback for rebuilding, but there is a brief outage window. This is acceptable because the location data has a 3-second shelf life anyway.
+### 2. Sequential offers with an atomic claim, not broadcast
 
-### 2. Sequential Driver Offers vs Broadcast
+Offering an order to every nearby courier fills it faster, but 50 couriers racing to accept one order produce 49 failures, a thundering herd on one row, and a product where the fastest thumb wins. Sequential offers give one courier an exclusive 30-second window and let the scoring function pick who gets first refusal. The price is tail latency: five declines cost two and a half minutes. Correctness does not come from the sequencing, though; it comes from the claim. Accepting is a transaction of compare-and-set updates, and partial unique indexes make the database refuse a second live offer for an order, a second live offer for a courier, or a second acceptance. Those guarantees hold even if two dispatchers briefly believe they own the same order.
 
-**Chosen: Sequential offers with 30-second timeout.** When an order is ready, the matching service selects the top-scoring driver and sends a single offer. If declined or expired, it moves to the next candidate. Broadcasting to all nearby drivers creates a thundering herd -- 50 drivers racing to accept one order leads to 49 wasted API calls, potential double-assignments, and UI confusion. Sequential offers are fairer (higher-rated drivers get first pick) and eliminate race conditions entirely.
+### 3. Dispatch leases instead of in-memory matching loops
 
-**Trade-off acknowledged:** Sequential offers are slower. In the worst case, cycling through 5 drivers with 30-second timeouts takes 2.5 minutes. We mitigate this by reducing timeout to 15 seconds after the second rejection and by using circuit breakers to skip drivers who are consistently unresponsive.
+A matching loop that only exists in one process dies with that process, and the order then waits forever. A lease row (`dispatch_owner`, `dispatch_lease_until`) makes the loop resumable: the owner renews it before each offer, and any instance's sweeper claims orders whose lease lapsed, with `FOR UPDATE SKIP LOCKED` so two sweepers never take the same order and never wait on each other. The loop's memory — who has been offered the order — is read back from `driver_offers`. A slow owner that loses its lease stops at its next renewal; if it was mid-offer, the offer still resolves safely through the claim transaction. This costs one `UPDATE` per offer and a sweep every 5 seconds per instance.
 
-### 3. WebSocket for Real-time Updates vs Polling
+### 4. Order placement returns before matching
 
-**Chosen: Native WebSocket (ws library) with Redis Pub/Sub.** A delivery tracking page needs sub-second location updates. Polling at 1-second intervals creates 60 requests per minute per customer; with 10K concurrent tracking sessions, that is 600K requests per minute hitting the API. WebSocket delivers push updates with a single persistent connection. Redis Pub/Sub distributes messages across multiple API server instances, so any server can serve any client.
+If placement waited for a courier it would hold a request open for up to minutes, time out on mobile networks while succeeding on the server, and tie 99.99% availability to whether enough people want to drive at 7 p.m. on a Friday. Placement commits the order and returns; the customer app moves to a live tracking screen that shows "finding your courier". The consequence is that the client must model an order as a subscription, not a request–response.
 
-**Trade-off acknowledged:** WebSocket connections are stateful, complicating horizontal scaling. We need heartbeat mechanisms to detect stale connections (30-second ping interval), graceful reconnection logic when clients switch networks, and message replay via Redis Streams for missed updates during reconnection.
+### 5. Idempotency key in the same database as the order
 
-### 4. Session-Based Authentication vs JWT
-
-**Chosen: Session tokens stored in Redis.** Session-based auth enables instant token revocation on logout or account compromise -- a single Redis `DEL` invalidates the session immediately. JWT tokens are irrevocable until expiry, which is unacceptable for a delivery platform where compromised driver accounts can steal orders. Redis lookup adds ~0.5ms per request, which is negligible compared to the security benefit.
+Everywhere else Redis would be the natural home for a short-lived key, but a key that commits separately from the order can disagree with it: written but the order never created (the retry is blocked), or the order created but the key lost (the retry creates a second order). Because both live in PostgreSQL, they commit in one transaction and cannot disagree. The cost is an extra row per order for 24 hours and, for a concurrent duplicate, a connection held for up to 5 seconds while it waits on the first request's lock.
 
 ## Consistency and Idempotency
 
-### Consistency Model
+| Operation | Guarantee | Mechanism |
+|-----------|-----------|-----------|
+| Place order | At most one order per checkout attempt | `Idempotency-Key` row in the order's transaction; stored response replayed; `422` on reuse |
+| Price | Server-authoritative, exact | Menu prices, integer cents, quote and create share one function |
+| Assign courier | Exactly one courier, never a cancelled order | Claim transaction (offer, order, courier) + three partial unique indexes |
+| Status transitions | Legal moves only, once each | `UPDATE … WHERE status = ANY($allowed)`; `409` otherwise |
+| Cancel vs accept | One of them wins | Both are compare-and-set updates on the same order row; cancel also expires the live offer |
+| Matching after a crash | Resumes within ~5 s of lease expiry | Lease + sweeper with `SKIP LOCKED`; exclusions from `driver_offers` |
+| Courier location | At most ~3 s stale, lossy | Redis only; the next ping overwrites |
+| Tracking events | Newest wins on the client | Absolute, versioned status events; snapshot on every (re)subscribe |
+| Durable location sample | One per courier per 10 s | `SET NX PX` gate shared by all instances |
 
-| Entity | Consistency | Rationale |
-|--------|-------------|-----------|
-| Orders | Strong (PostgreSQL transactions) | State transitions must be atomic; no duplicate orders or lost payments |
-| Driver locations | Eventual (Redis, 3-second lag) | Stale location is tolerable; freshness traded for throughput |
-| Session tokens | Eventual (Redis, TTL-based) | Logout propagation within seconds is acceptable |
-| Ratings | Eventual (async write) | Ratings can lag behind order completion |
+Order status events are published after `COMMIT`. In production the publish goes through a transactional outbox so a crash between commit and publish cannot lose it; locally the publish is best effort and a client that misses one catches up from the snapshot when it next subscribes.
 
-### Idempotency Keys
+## Security / Auth
 
-Order creation uses client-generated idempotency keys to prevent duplicate orders on network retries:
-
-1. Client sends `X-Idempotency-Key` header (UUID v4) with order request
-2. Server checks if key exists in `idempotency_keys` table
-3. If found with `status='completed'`: return cached response (200 OK)
-4. If found with `status='pending'`: reject as concurrent request (409 Conflict)
-5. If not found: create pending record, execute order creation, cache response
-6. Keys expire after 24 hours via cleanup job
-
-**Order status transitions** use optimistic locking:
-```sql
-UPDATE orders
-SET status = 'picked_up', picked_up_at = NOW()
-WHERE id = $1 AND status = 'preparing'
-RETURNING *;
-```
-If affected rows = 0, the transition was already applied or invalid.
-
-### Conflict Resolution
-
-| Scenario | Resolution |
-|----------|------------|
-| Two drivers accept same order | First `UPDATE` wins (PostgreSQL row lock); second gets "already assigned" |
-| Driver goes offline with active order | Order stays assigned; admin can reassign after 10-min timeout |
-| Simultaneous location updates | Redis `GEOADD` is atomic; latest timestamp wins |
-| Duplicate order submission | Idempotency key returns cached response |
-
-## Security
-
-- **Password hashing**: bcrypt with cost factor 12
-- **Session tokens**: Cryptographically random, stored in Redis with 24h TTL
-- **Role-based access control**: Middleware checks user role before endpoint access
-- **Input validation**: All endpoints validate and sanitize inputs
-- **CORS**: Restricted to known frontend origins
-- **Rate limiting**: Per-IP and per-user limits on order creation
+- **Sessions, not JWTs.** A stolen courier session can accept real orders; revocation must be one `DEL`. Session tokens are cached in Redis and stored in PostgreSQL.
+- **Roles and ownership in the query.** Customer, courier, merchant and admin routes are role-gated, and ownership is part of the guarded `UPDATE` (`customer_id = $me`, `driver_id = $me`), not a separate read. A courier cannot advance another courier's order, and an idempotency key cannot return another user's order.
+- **Validation at the boundary.** Order, quote, tip and location bodies are schema-validated (types, ranges, at most 50 lines, quantities 1–50, tips 0–500, coordinates in range, delivery within 15 km).
+- **Rate limits** at the gateway: per user for order creation, per courier slightly above one ping per 3 seconds, per IP for login.
+- **Location spoofing** is the interesting abuse: a courier faking a position near busy merchants to win offers. Detection is statistical (impossible speeds, positions inconsistent with pickup and drop-off times), run on the Kafka stream.
+- **WebSocket auth.** Browsers cannot set headers on a WebSocket, so the token travels in the query string and must be kept out of access logs; production would use a short-lived ticket exchanged over HTTPS.
 
 ## Observability
 
-### Metrics (Prometheus)
+| Signal | Why |
+|--------|-----|
+| Time to assign (histogram, p50/p99 per metro) | The core SLO; the tail is where sequential offers hurt |
+| Offers per assignment; accept / reject / expire counts | Health of the scoring function and of courier supply |
+| Orders unassigned for > 5 min; lease takeovers by the sweeper | Catches stuck dispatch and crashing instances |
+| Location pings/s vs couriers online; stale entries pruned | A gap means apps are failing to report and the index is going stale |
+| ETA error (predicted vs actual delivery) | The trust metric and the training signal for a better ETA |
+| WebSocket connections, reconnect rate, snapshot rate | Reconnect storms after deploys; tracking quality |
+| Idempotent replays and `422`s | Retry behavior of clients; misuse of keys |
 
-| Metric | Type | Labels | Purpose |
-|--------|------|--------|---------|
-| `delivery_orders_created_total` | Counter | merchant_category | Order creation rate |
-| `delivery_orders_completed_total` | Counter | status | Completion/cancellation rates |
-| `delivery_order_duration_seconds` | Histogram | status | End-to-end order time |
-| `delivery_driver_matching_duration_seconds` | Histogram | - | Matching algorithm latency |
-| `delivery_driver_assignments_total` | Counter | result (accepted/rejected/expired) | Driver acceptance tracking |
-| `delivery_http_request_duration_seconds` | Histogram | method, route, status_code | API latency |
-| `delivery_circuit_breaker_state` | Gauge | name | Circuit breaker health |
-| `delivery_db_query_duration_seconds` | Histogram | operation, table | Database performance |
-| `delivery_redis_operation_duration_seconds` | Histogram | operation | Redis performance |
-
-### Health Checks
-
-- `GET /health` checks PostgreSQL and Redis connectivity
-- Returns `{ status, postgres, redis, latency_ms }` for load balancer integration
-
-### Structured Logging
-
-JSON-structured logs via Pino with service/module context, request correlation IDs, and configurable log levels. Child loggers for each module (orders, drivers, matching, auth) enable filtered log analysis.
+Locally, `prom-client` exposes HTTP, order, matching, assignment, delivery and circuit-breaker metrics at `/metrics`; Pino writes JSON logs with module context; `/health` reports database, Redis, the breaker state, the instance id and the number of open sockets.
 
 ## Failure Handling
 
-### Circuit Breaker (Matching Service)
+| Failure | Behavior | Mitigation |
+|---------|----------|------------|
+| Dispatch instance crashes | Its orders stop being matched | Leases lapse in ≤ 45 s; another instance's sweeper resumes them |
+| Graceful deploy | — | Readiness fails, sockets close with 1001, leases are released for immediate takeover |
+| Redis (metro) down | No geo search: matching pauses; tracking stalls | Orders stay unassigned (never assigned blindly); circuit breaker defers matching with back-off; index rebuilds from pings |
+| PostgreSQL primary down | No new orders or claims | `503`; replica promotion; tracking of positions continues from Redis |
+| Courier phone dies | Stops pinging | Dropped from search after 30 s, pruned after 2 min |
+| Offer unanswered | 30 s window lapses | Compare-and-set expiry; a last-instant acceptance still wins |
+| Customer cancels during an offer | Cancel and accept race | One `UPDATE` wins; the loser gets `409` |
+| Client reconnects | Missed events | Resubscribe → snapshot; versions discard stale events |
+| Duplicate order submit | Retry storm | Idempotency key replays the first response |
 
-The driver matching service wraps external calls with an Opossum circuit breaker:
-- **Closed**: Normal operation; 5-second timeout per request
-- **Open**: After 50% failure rate over 5+ requests; fails fast for 10 seconds
-- **Half-open**: Allows one test request; closes on success, reopens on failure
-
-This prevents the matching service from hanging when a downstream dependency (Redis geo-query or PostgreSQL) is degraded, allowing orders to queue rather than timeout.
-
-### Graceful Degradation
-
-| Failure | Degradation |
-|---------|-------------|
-| Redis down | Sessions fall back to PostgreSQL lookup; geo-queries unavailable; matching paused |
-| PostgreSQL down | Read from Redis cache for active orders; new orders rejected with 503 |
-| WebSocket disconnect | Client auto-reconnects; missed messages replayed from Redis Stream |
-| Matching service circuit open | Orders queue in `pending` state; admin notification sent |
+The rule: degrade tracking before matching, and matching before order placement. An order accepted while matching is down is recoverable; a lost order is not.
 
 ## Scalability Considerations
 
-### Geographic Sharding
-
-At production scale, partition by metro area. Each region gets its own Redis instance for geo-queries (drivers don't cross regions). Cross-region orders route through a regional gateway.
-
-### Horizontal Scaling Path
-
-1. **API servers**: Stateless, behind a load balancer. Add instances to handle more concurrent connections
-2. **Redis**: Redis Cluster with hash-slot sharding for geo data. Pub/Sub scales via Redis Streams with consumer groups
-3. **PostgreSQL**: Read replicas for dashboard/analytics queries. Write primary handles order mutations. Table partitioning by month for orders
-4. **Kafka**: Decouple location ingestion and notification delivery from the critical order path
-
-### Data Lifecycle
-
-| Data Type | Hot Storage | Warm Storage | Archive | Deletion |
-|-----------|-------------|--------------|---------|----------|
-| Active orders | PostgreSQL | - | - | - |
-| Completed orders | PostgreSQL (30 days) | Partitioned (1 year) | MinIO CSV (7 years) | After 7 years |
-| Driver locations (Redis) | Current only | - | - | Overwritten continuously |
-| Driver location history | PostgreSQL (7 days) | - | Aggregated to MinIO | After 30 days |
-| Session tokens | Redis (24h TTL) | - | - | Auto-expire |
-| Idempotency keys | PostgreSQL (24h) | - | - | Daily cleanup job |
+1. **Shard by metro.** Couriers do not deliver across metros, so each metro gets its own Redis geo index and its own dispatch partition, with no cross-shard queries. A metro that outgrows one Redis splits into zones.
+2. **Location ingest** scales horizontally (stateless); Redis per metro handles 10K+ writes/s; Kafka partitions by courier id.
+3. **Tracking gateways** scale with sockets. One subscriber per node keeps Redis connections at nodes, not users; a very hot channel is still one message per node.
+4. **PostgreSQL** carries ~35 order writes/s at peak, which one primary handles easily. The table grows (~1 GB/day); partition by month and move delivered orders to cold storage after 30 days. Dashboards and history read from replicas.
+5. **Matching quality** is the first thing to improve after scale: greedy per-order matching ignores the next order. Batched assignment (solve all unassigned orders in a 30–60 s window as a bipartite matching) and multi-order routes raise fleet efficiency at the cost of latency and complexity — worth it once courier idle time shows the waste.
+6. **ETA** is the first thing to fail users: straight-line distance ignores roads and parking. A routing engine first, then a model trained on the Kafka location history.
 
 ## Trade-offs Summary
 
 | Decision | Chosen | Alternative | Rationale |
 |----------|--------|-------------|-----------|
-| Driver geo-index | Redis GEOADD | PostgreSQL PostGIS | Sub-ms queries for real-time matching at 10K updates/sec |
-| Driver offers | Sequential | Broadcast | Fair, no race conditions; slower worst-case mitigated by timeout reduction |
-| Real-time updates | WebSocket + Pub/Sub | HTTP polling | Push model avoids 600K req/min at 10K concurrent trackers |
-| Authentication | Session tokens | JWT | Instant revocation for compromised driver accounts |
-| Location update frequency | 3 seconds | 1 second / 10 seconds | Balanced accuracy vs bandwidth/battery; ETA within 3 min target |
-| Order idempotency | DB-backed keys | Redis-only keys | Durable across Redis restart; 24h TTL prevents unbounded growth |
+| Courier index | Redis geo set + last-seen set | PostGIS in the order database | Sub-ms search; keeps 10K writes/s off the order database |
+| Location durability | Volatile, sampled 1 in 3 to Kafka | Store every ping | Data expires in 3 s; 86 GB/day otherwise |
+| Offer protocol | Sequential offers | Broadcast to all nearby | No herd, fair first refusal; costs tail latency |
+| One courier per order | Claim transaction + partial unique indexes | Application locks | The database enforces it whatever the code path |
+| Matching ownership | Leases + `SKIP LOCKED` sweeper | In-memory loop per order | Survives crashes and deploys |
+| Status changes | Guarded `UPDATE` per transition | Read, check, write | No lost races; retries get `409` |
+| Placement | Return on commit, match after | Wait for a courier | Availability independent of supply |
+| Idempotency store | PostgreSQL, same transaction | Redis | Key and order cannot disagree |
+| Tracking transport | WebSocket, snapshot + versioned events | Polling | Push every 3 s without 600K requests/min |
+| Pub/sub fan-out | One subscriber per gateway node | One Redis connection per socket | Redis connections scale with nodes |
+| ETA | Stage-aware, straight line × 1.3 | Courier-to-customer distance | Counts the trip to the merchant and the wait for food |
 
 ## Implementation Notes
 
-This section maps the production architecture above to the actual local implementation running on Docker + Node.js + React.
-
-### Local Setup Diagram
-
-```
-┌──────────────────────────────────────────────────────────────────┐
-│                    localhost                                       │
-│                                                                   │
-│  ┌──────────────┐    HTTP     ┌──────────────────────────────┐   │
-│  │   Frontend   │ ──────────▶ │      Backend (Express)       │   │
-│  │  Vite + React│             │        Port 3000             │   │
-│  │  Port 5173   │ ◀─── WS ── │                              │   │
-│  │              │             │  ┌──────────┐ ┌───────────┐  │   │
-│  │  - Customer  │             │  │  Auth    │ │ Location  │  │   │
-│  │    view      │             │  │  Routes  │ │ Service   │  │   │
-│  │  - Driver    │             │  ├──────────┤ ├───────────┤  │   │
-│  │    dashboard │             │  │  Order   │ │ Matching  │  │   │
-│  │  - Admin     │             │  │  Routes  │ │ Service   │  │   │
-│  │    dashboard │             │  ├──────────┤ ├───────────┤  │   │
-│  │              │             │  │  Driver  │ │ WebSocket │  │   │
-│  │              │             │  │  Routes  │ │ Handler   │  │   │
-│  └──────────────┘             │  └──────────┘ └───────────┘  │   │
-│                               └──────────┬───────────────────┘   │
-│                                          │                        │
-│                            ┌─────────────┴─────────────┐         │
-│                            │                           │         │
-│                     ┌──────▼──────┐            ┌───────▼──────┐  │
-│                     │  PostgreSQL │            │    Valkey    │  │
-│                     │  Port 5432  │            │  Port 6379   │  │
-│                     │             │            │              │  │
-│                     │  delivery   │            │  - Geo index │  │
-│                     │  DB (13     │            │  - Sessions  │  │
-│                     │  tables)    │            │  - Pub/Sub   │  │
-│                     └─────────────┘            └──────────────┘  │
-│                                                                   │
-│  Docker Compose containers: delivery-postgres, delivery-redis     │
-└──────────────────────────────────────────────────────────────────┘
-```
-
-### Production-Grade Patterns Implemented
-
-| Pattern | Library | File Path | Why It Matters |
-|---------|---------|-----------|----------------|
-| Circuit breaker | Opossum | `backend/src/shared/circuitBreaker.ts` | Prevents cascade failures when matching service is overwhelmed; auto-recovers after 10s cooldown |
-| Idempotency keys | Custom (PostgreSQL-backed) | `backend/src/shared/idempotency.ts` | Prevents duplicate orders on network retry; 24h TTL with status tracking (pending/completed/failed) |
-| Prometheus metrics | prom-client | `backend/src/shared/metrics.ts` | 25+ metrics covering orders, deliveries, driver assignments, circuit breaker, HTTP, DB, and Redis |
-| Structured logging | Pino | `backend/src/shared/logger.ts` | JSON logs with module context (orders, drivers, matching, auth); pretty-print in dev, machine-parseable in prod |
-| Data retention | Custom cleanup jobs | `backend/src/shared/retention.ts` | Configurable per-table retention (orders 30d, locations 7d, sessions 1d); `npm run db:cleanup` runs all jobs |
-| WebSocket real-time | ws (native) | `backend/src/websocket/` | Driver location streaming and order status updates via Redis Pub/Sub |
-| Geo-indexing | Redis GEOADD | `backend/src/services/driverService.ts` | Sub-millisecond nearby driver search with GEORADIUS |
-| Health checks | Custom | `backend/src/routes/` | `/health` endpoint checks PostgreSQL and Redis connectivity |
-
-### Simplifications from Production Design
-
-| Production Design | Local Substitute | Impact |
-|-------------------|------------------|--------|
-| API Gateway (Kong/Envoy) | Express middleware (CORS, auth) | No centralized rate limiting or TLS termination |
-| CDN (CloudFront) | Vite dev server serves assets directly | No edge caching |
-| Kafka for event streaming | Redis Pub/Sub | No event persistence or replay beyond 1h Redis Stream |
-| Multiple microservices | Single Express process with route-based modules | No independent scaling |
-| Redis Cluster | Single Valkey instance | No sharding; single point of failure |
-| PostgreSQL read replicas | Single PostgreSQL instance | All reads and writes on same instance |
-| Geographic sharding | Single region (test data) | No multi-region support |
-| Notification service (SMS/push) | WebSocket-only notifications | No out-of-app notifications |
-| OAuth/SSO | Session-based auth with bcrypt | Simpler but no third-party auth |
-
-### What Was Omitted
-
-- CDN and edge caching for static assets
-- Multi-region deployment and geographic sharding
-- Kubernetes orchestration and auto-scaling
-- Payment processing and financial ledger
-- Surge pricing and demand prediction
-- ML-based ETA estimation (using Haversine distance instead)
-- Message queue (Kafka/RabbitMQ) for async processing
-- Grafana dashboards (metrics exposed at `/metrics` but no visualization)
-- Distributed tracing (OpenTelemetry)
-- Map visualization in the frontend (coordinates only, no map tiles)
-
-## Frontend Architecture
-
-This section describes the React frontend implementation: component hierarchy, state management, routing, data fetching patterns, and key UI behaviors.
-
-### Technology Stack
-
-| Technology | Purpose |
-|-----------|---------|
-| React 19 + TypeScript | UI framework with type safety |
-| TanStack Router | File-based routing with type-safe params |
-| Zustand | Lightweight global state management with localStorage persistence |
-| WebSocket (native) | Real-time order tracking and driver offer notifications |
-| Tailwind CSS | Utility-first CSS styling |
-| Vite | Development server and build tool with path aliases (`@/`) |
-
-### Route Structure
-
-TanStack Router file-based routing in `frontend/src/routes/`:
-
-| File | Path | Description |
-|------|------|-------------|
-| `__root.tsx` | (layout) | Root layout with Navbar, auth load on mount |
-| `index.tsx` | `/` | Customer home: merchant discovery with geo-based search and category filters |
-| `login.tsx` | `/login` | Login form with role-aware registration |
-| `register.tsx` | `/register` | Registration with role selection (customer/driver/merchant) and vehicle fields |
-| `merchants.$merchantId.tsx` | `/merchants/:merchantId` | Merchant menu with add-to-cart functionality |
-| `cart.tsx` | `/cart` | Shopping cart with delivery address, instructions, tip, and checkout |
-| `orders.index.tsx` | `/orders` | Customer order history list |
-| `orders.$orderId.tsx` | `/orders/:orderId` | Order detail with real-time status tracking via WebSocket |
-| `driver.tsx` | `/driver` | Driver dashboard with online/offline toggle, offers, active deliveries |
-| `admin.tsx` | `/admin` | Admin dashboard with platform stats, orders, drivers, merchants |
-
-### Zustand Stores
-
-The frontend uses three Zustand stores for orthogonal state domains:
-
-**`authStore.ts`** -- Authentication state with `persist` middleware. Stores user object and session token, persisting only the token to localStorage via `partialize`. On app load, `loadUser()` reads the token from localStorage and validates it via `GET /api/v1/auth/me`. The store supports role-aware registration (customer, driver, merchant) with vehicle type and license plate fields for driver accounts. Actions: `login`, `register`, `logout`, `loadUser`, `clearError`. Error state is tracked within the store for display in the login/register forms.
-
-**`cartStore.ts`** -- Shopping cart state (not persisted -- resets on page reload). Enforces a single-merchant constraint: adding an item from a different merchant clears the existing cart. This mirrors real delivery platforms where an order can only come from one restaurant. Key behaviors: `addItem()` checks if the new item's `merchant_id` differs from the current cart's merchant and clears the cart if so, then either increments quantity for existing items or appends new items. `getSubtotal()` and `getItemCount()` are computed methods that reduce over the items array. `updateInstructions()` allows per-item special instructions (e.g., "no onions"). The cart stores full `MenuItem` objects (not just IDs) so the UI can display names and prices without additional API calls.
-
-**`locationStore.ts`** -- Geolocation state for browser-based location tracking. Used by both customers (for finding nearby merchants) and drivers (for sharing real-time location). `getCurrentLocation()` wraps the browser Geolocation API with a fallback to San Francisco coordinates (37.7749, -122.4194) when geolocation is unavailable or denied. `watchLocation()` starts continuous tracking via `navigator.geolocation.watchPosition()`, calling a callback on each update -- the driver dashboard uses this to send location updates to the server via both HTTP API and WebSocket simultaneously. `stopWatching()` clears the watcher ID. Configuration: high accuracy enabled, 10-second timeout, 5-second maximum age for watched positions (60-second for one-shot).
-
-### API Service Layer
-
-The API client (`services/api.ts`) uses a generic `request<T>()` wrapper that attaches the Bearer token from localStorage and parses JSON responses with typed `ApiResponse<T>` structure. Methods are organized by domain: auth (register with role, login, logout, getMe), merchants (nearby search with lat/lng/radius, categories, text search), orders (create, list, detail, cancel, rate driver, rate merchant), driver (profile, go online/offline, location update, orders, offers, status transitions), and admin (stats, orders, drivers, merchants, customers, analytics).
-
-### WebSocket Service
-
-The `WebSocketService` class (`services/websocket.ts`) manages a persistent WebSocket connection with automatic reconnection using exponential backoff. It provides typed message handling for four message types: `connected` (initial handshake), `location_update` (driver position changes), `status_update` (order status transitions), and `new_offer` (delivery offer for drivers). The service is instantiated as a singleton (`wsService`).
-
-Key capabilities:
-- `subscribeToOrder(orderId)` -- customer subscribes to real-time tracking for a specific order
-- `subscribeToDriverOffers()` -- driver subscribes to receive delivery offer notifications
-- `updateLocation(lat, lng)` -- driver sends location via WebSocket (supplement to HTTP API)
-- Automatic reconnection with exponential backoff (1s, 2s, 4s, 8s, 16s), max 5 attempts
-- Clean disconnect on logout or navigation away
-
-### Component Hierarchy
-
-```
-__root (Navbar + Outlet)
-├── HomePage (Customer)
-│   ├── Hero section (title, tagline)
-│   ├── Search bar (text input + button)
-│   ├── Category filter (horizontal scroll pills: All, Fast Food, Pizza, etc.)
-│   └── MerchantCard[] (3-column grid: name, category, rating, prep time)
-├── MerchantMenu
-│   ├── Merchant header (name, description, address, hours)
-│   └── MenuItemCard[] (name, description, price, add-to-cart button)
-├── Cart
-│   ├── Cart items (quantity controls, special instructions, remove)
-│   ├── Delivery address input
-│   ├── Delivery instructions input
-│   ├── Tip selector
-│   ├── Price summary (subtotal, delivery fee, tip, total)
-│   └── Place order button
-├── OrderHistory (OrderCard[] with status badges)
-├── OrderDetail
-│   ├── Status timeline
-│   ├── Order items list
-│   ├── Driver info (when assigned)
-│   └── Rating form (when delivered)
-├── DriverDashboard
-│   ├── DeliveryOfferModal (popup with order details, countdown timer, accept/decline)
-│   ├── DriverStatusHeader (online/offline toggle, status indicator, driver name)
-│   ├── DriverStatsGrid (rating, total deliveries, acceptance rate)
-│   └── ActiveDeliveryCard[] (order details with status transition buttons)
-│       ├── Mark picked up button
-│       ├── Mark in transit button
-│       └── Mark delivered button
-└── AdminDashboard
-    ├── Platform stats (orders, drivers, merchants, customers)
-    ├── Recent orders table
-    ├── Driver list with status
-    └── Analytics charts
-```
-
-### Custom Hook: `useDriverDashboard`
-
-The `useDriverDashboard` hook (`hooks/useDriverDashboard.ts`) encapsulates all driver dashboard logic, keeping the route component purely presentational. It manages:
-
-1. **Data loading**: Fetches driver profile and active orders in parallel via `Promise.all`
-2. **WebSocket connection**: Connects when the driver is online and subscribes to delivery offers
-3. **Offer countdown**: Runs a 1-second interval timer that decrements `expiresIn` on pending offers, auto-dismissing when expired
-4. **Online/offline toggle**: `handleGoOnline()` gets the current location (or requests it), sends it to the API, and starts continuous location watching. `handleGoOffline()` checks for active orders first and prevents going offline if any exist.
-5. **Location tracking**: When online, uses `locationStore.watchLocation()` to continuously send position updates via both HTTP API (`api.updateLocation`) and WebSocket (`wsService.updateLocation`) -- dual-channel ensures updates get through even if one transport fails
-6. **Order lifecycle**: Handlers for `handlePickedUp`, `handleInTransit`, and `handleDelivered` call the API and then refresh all driver data
-
-### Key UI Patterns
-
-**Three-sided marketplace UI**: The frontend serves three distinct user personas (customer, driver, admin) from a single React application. The Navbar conditionally renders different navigation links based on `user.role`. The home page (`/`) is customer-focused (merchant discovery), the `/driver` route is role-guarded (redirects non-drivers to login), and `/admin` shows platform-wide data.
-
-**Single-merchant cart enforcement**: When a customer adds an item from Merchant B while the cart contains items from Merchant A, the cart is silently cleared and the new item is added. This prevents impossible orders (a driver cannot pick up from two restaurants simultaneously). The `cartStore.addItem()` method checks `merchant.id !== menuItem.merchant_id` to detect cross-merchant additions.
-
-**Real-time delivery offer modal**: When the driver is online and a new order matches them, the server sends a `new_offer` WebSocket message. The `useDriverDashboard` hook sets `pendingOffer` state, which triggers a `DeliveryOfferModal` overlay showing order details (merchant, items, delivery address) and a countdown timer. The countdown uses `setInterval` at 1-second granularity. If the timer reaches zero, the offer auto-dismisses. Accept/decline buttons call the API and clear the modal.
-
-**Geo-based merchant discovery**: The home page uses `locationStore.getCurrentLocation()` on mount to detect the user's position (falling back to San Francisco if unavailable). Merchants are then loaded via `api.getMerchants(lat, lng, radius, category)`, which returns results sorted by distance. Category filter pills at the top allow narrowing results without a full page reload.
-
-## Deep Pattern Explanations
-
-This section explains each production-grade pattern implemented in the backend as if the reader has never encountered it before. Each explanation covers what the pattern is, what problem it solves, and how it works in this project.
-
-### RBAC (Role-Based Access Control)
-
-**What it is**: RBAC is an authorization model where permissions are assigned to roles, and roles are assigned to users. Instead of per-user permission checks, the system checks if a user's role grants the required access.
-
-**What problem it solves**: A delivery platform has four user types (customer, driver, merchant, admin), each with fundamentally different capabilities. Customers place orders and track deliveries. Drivers accept offers and update delivery status. Merchants manage menus. Admins view platform-wide data. Without RBAC, every endpoint would need complex conditional logic to determine what the current user can do. With RBAC, a single middleware check (`requireRole('driver')`) protects all driver endpoints.
-
-**How it works in this project**: The `users` table has a `role` column constrained to `('customer', 'driver', 'merchant', 'admin')`. The auth middleware loads the session from Redis, retrieves the user with their role, and attaches it to the request. Endpoint groups are protected: `/api/v1/driver/*` requires the `driver` role, `/api/v1/admin/*` requires `admin`. Customer endpoints use ownership checks in addition to role checks -- a customer can only view their own orders. Driver endpoints additionally verify that the driver is the one assigned to an order before allowing status transitions (prevents a different driver from marking someone else's delivery as complete).
-
-### Redis Cache-Aside
-
-**What it is**: Cache-aside is a caching strategy where the application checks the cache before querying the database. On a cache miss, the database is queried, the result is cached with a TTL, and returned. On a cache hit, the cached value is returned directly.
-
-**What problem it solves**: In a delivery platform, the hottest data path is "find nearby available drivers." With 30,000 concurrent drivers sending location updates every 3 seconds, querying a traditional database for nearby drivers would require expensive spatial queries on a rapidly changing dataset. Redis's in-memory GEOADD/GEORADIUS operations provide sub-millisecond geo queries that can handle 10,000 updates per second.
-
-**How it works in this project**: Redis serves as both a cache and a real-time data store. Driver locations use `GEOADD` on the `drivers:locations` key with longitude, latitude, and driver_id. When a new order needs a driver, `GEORADIUS` returns all available drivers within a configurable radius, sorted by distance. Driver metadata (status, lat, lng, updated_at) is stored in a Redis hash (`driver:{id}`) for fast lookups without hitting PostgreSQL. Session tokens are cached in Redis with 24-hour TTL. The PostgreSQL `drivers` table stores `current_lat`/`current_lng` as a persistent fallback -- if Redis crashes, the last known position is still available for rebuilding the geo-index.
-
-### Circuit Breaker
-
-**What it is**: A circuit breaker wraps calls to potentially failing services and monitors their success rate. When failures exceed a threshold, it opens and fails fast. After a recovery period, it allows test requests. If tests succeed, normal operation resumes.
-
-**What problem it solves**: The driver matching service calls Redis (for geo-queries) and PostgreSQL (for driver details and order updates). If either dependency is degraded, the matching service would hang waiting for timeouts, blocking the order assignment pipeline. Without a circuit breaker, orders would pile up in `pending` state while workers wait for responses that will never arrive. The circuit breaker detects the degradation and fails fast, allowing the system to queue orders for later processing instead of blocking.
-
-**How it works in this project**: The Opossum library (`backend/src/shared/circuitBreaker.ts`) wraps the driver matching service. Configuration: 5-second timeout per matching attempt, circuit opens at 50% failure rate (over at least 5 requests), stays open for 10 seconds before allowing one test request in half-open state. When the circuit is open, the matching service returns a "no drivers available" response and the order remains in `pending` state. An admin notification is sent so operators can investigate. The circuit breaker state is exposed as a Prometheus gauge (`delivery_circuit_breaker_state`). This prevents a Redis outage from cascading into an API outage -- orders can still be created and queued, they just cannot be matched to drivers until the circuit closes.
-
-### Structured Logging
-
-**What it is**: Structured logging means emitting log entries as machine-parseable JSON rather than free-form text. Each entry has defined fields that can be searched, filtered, and aggregated.
-
-**What problem it solves**: When investigating "why was order X never assigned a driver?", operators need to trace the order through the matching pipeline: was a match attempted? Were drivers found nearby? Did the circuit breaker prevent matching? Was an offer sent? Did the offer expire? Free-form logs like "Matching failed for order" are useless without context. Structured entries like `{"msg":"matching_attempt","order_id":"abc","nearby_drivers":5,"top_score":0.82,"circuit_state":"closed"}` answer these questions immediately.
-
-**How it works in this project**: Pino (`backend/src/shared/logger.ts`) outputs JSON logs with module-specific child loggers (orders, drivers, matching, auth). Each child logger automatically tags entries with a `module` field. Request correlation IDs enable tracing a single order through creation, matching, offer sending, acceptance, and delivery. Key logged events: `order_created`, `matching_started`, `driver_scored` (with score breakdown), `offer_sent`, `offer_accepted`/`offer_rejected`/`offer_expired`, `order_picked_up`, `order_delivered`. In development, `pino-pretty` reformats JSON for human readability.
-
-### Prometheus Metrics
-
-**What it is**: Prometheus is a time-series monitoring system where the application exposes numerical measurements at a `/metrics` endpoint, scraped periodically. Dashboards and alerts are built on top of this data.
-
-**What problem it solves**: A delivery platform needs real-time visibility into several critical flows. How long does driver matching take? What percentage of offers are accepted vs rejected vs expired? Is the average delivery time increasing? Without metrics, degradation is only noticed when customers complain. With metrics, "driver acceptance rate dropped from 85% to 40% in the last hour" triggers an investigation before customers are affected.
-
-**How it works in this project**: The `prom-client` library (`backend/src/shared/metrics.ts`) registers 25+ custom metrics. Order metrics: `delivery_orders_created_total` (counter by merchant category), `delivery_orders_completed_total` (counter by final status -- delivered/cancelled), `delivery_order_duration_seconds` (histogram of end-to-end order time). Matching metrics: `delivery_driver_matching_duration_seconds` (histogram measuring how long the scoring algorithm takes), `delivery_driver_assignments_total` (counter by result -- accepted/rejected/expired, key for monitoring driver engagement). Infrastructure metrics: `delivery_http_request_duration_seconds` (histogram by method, route, status), `delivery_circuit_breaker_state` (gauge -- 0=closed, 1=open, 0.5=half-open), `delivery_db_query_duration_seconds` (histogram by operation and table), `delivery_redis_operation_duration_seconds` (histogram by operation type).
-
-### Rate Limiting
-
-**What it is**: Rate limiting restricts how many requests a client can make within a time window, rejecting excess requests with HTTP 429.
-
-**What problem it solves**: A delivery platform faces abuse vectors from multiple directions. Customers could spam the order creation endpoint (accidentally or maliciously), drivers could flood the location update endpoint (buggy GPS tracker sending updates 100 times per second), and bots could scrape merchant menus. Rate limiting prevents any single client from monopolizing server resources.
-
-**How it works in this project**: Rate limiting operates at two levels. Per-IP limits on the API protect against unauthenticated abuse (login attempts, registration). Per-user limits on sensitive operations protect against authenticated abuse (order creation is limited to prevent accidental double-orders). Driver location updates are not rate-limited in the traditional sense -- instead, the system accepts only the latest position and discards intermediate updates if they arrive faster than the 3-second processing interval. The `session:{token}` pattern in Redis enables per-user tracking without additional lookups.
-
-### Idempotency
-
-**What it is**: An idempotent operation produces the same result whether executed once or multiple times. For APIs, retrying a request due to network failure is safe because the server detects the duplicate and returns the original response.
-
-**What problem it solves**: Order creation is the most critical write operation in a delivery platform. A customer taps "Place Order" and the network drops before the response. The app retries. Without idempotency, the customer gets two identical orders, two charges, and two drivers dispatched. This is both a terrible user experience and a financial liability.
-
-**How it works in this project**: The client sends an `X-Idempotency-Key` header (UUID v4) with every order creation request. The server flow: (1) Check `idempotency_keys` table for the key. (2) If found with `status='completed'`, return the cached JSONB response (200 OK). (3) If found with `status='pending'`, reject as concurrent duplicate (409 Conflict). (4) If not found, insert a pending record, process the order, update the record to `completed` with the cached response, and return it. Keys expire after 24 hours via a cleanup job (`npm run db:cleanup`). The idempotency table is in PostgreSQL (not Redis) for durability -- if Redis crashes during order processing, the idempotency record survives. Order status transitions use optimistic locking (`UPDATE orders SET status = 'picked_up' WHERE id = $1 AND status = 'preparing' RETURNING *`) as an additional idempotency mechanism: if `affected_rows = 0`, the transition was already applied.
-
-### Health Checks
-
-**What it is**: Health check endpoints are HTTP routes that report whether the application is functioning correctly. They are consumed by load balancers and monitoring systems to make automated traffic routing decisions.
-
-**What problem it solves**: A delivery platform API server might be running but unable to process orders because PostgreSQL is unreachable, or unable to match drivers because Redis (with the geo-index) is down. Without health checks, the load balancer keeps routing traffic to the broken instance, and orders fail silently until someone notices.
-
-**How it works in this project**: `GET /health` checks both PostgreSQL (via a simple query) and Redis (via `PING`), returning a JSON response with per-component status and overall latency. The response includes `{ status: 'healthy'|'degraded', postgres: 'connected'|'error', redis: 'connected'|'error', latency_ms: number }`. A load balancer can route traffic based on the overall status: `healthy` means all dependencies are connected, `degraded` means at least one is down. The health check is designed to be fast (no expensive queries) so it can be called frequently (every 5-10 seconds) without impacting application performance. For this project, the single health endpoint serves both liveness and readiness purposes since the backend is a monolithic Express process.
+### What runs locally
+
+[`backend/src/index.ts`](./backend/src/index.ts) is one Express process that serves the REST API, the WebSocket endpoint at `/ws`, and three background jobs: hourly idempotency-key cleanup, a geo-index prune every 30 seconds, and the dispatch sweeper every 5 seconds. [Docker Compose](./docker-compose.yml) runs PostgreSQL 16 and Valkey 7. The React 19 frontend (TanStack Router, Zustand, Tailwind) has customer, courier and admin screens. Backend unit tests: `npm test` (vitest, 61 tests, all offline).
+
+### Production patterns implemented
+
+| Pattern | Where | What it does |
+|---------|-------|--------------|
+| Guarded state machine | [`services/order/stateMachine.ts`](./backend/src/services/order/stateMachine.ts) | Transition table; every change is one compare-and-set `UPDATE` that also bumps `version`; `404`/`403`/`409` from the current row |
+| Atomic claim | [`services/order/assignment.ts`](./backend/src/services/order/assignment.ts) | Offer, order and courier in one transaction; unique-index violations mapped to "courier busy" or "order has an offer"; compare-and-set offer expiry that keeps a last-instant acceptance |
+| Cancellation | [`services/order/cancel.ts`](./backend/src/services/order/cancel.ts) | Guarded cancel that expires the live offer in the same transaction |
+| Dispatch leases | [`services/order/dispatch.ts`](./backend/src/services/order/dispatch.ts), [`matching.ts`](./backend/src/services/order/matching.ts) | Lease renewal per offer, release with back-off, `FOR UPDATE SKIP LOCKED` sweeper, lease release on shutdown; exclusions read from `driver_offers` |
+| Circuit breaker | [`shared/circuitBreaker.ts`](./backend/src/shared/circuitBreaker.ts) | Opossum around a matching run; the fallback releases the lease with a 30 s back-off (the "retry queue") |
+| Idempotent create | [`shared/idempotency.ts`](./backend/src/shared/idempotency.ts) | Key, order and items in one transaction; per-user; SHA-256 request fingerprint; `lock_timeout` 5 s → `409` |
+| Server-side pricing | [`services/order/pricing.ts`](./backend/src/services/order/pricing.ts) | zod validation; menu prices in integer cents; same function behind `/orders/quote` and create |
+| Geo liveness | [`utils/redis.ts`](./backend/src/utils/redis.ts) | `GEOSEARCH` + `ZMSCORE` freshness filter (30 s, `LOCATION_STALE_MS`), Lua prune after 2 min |
+| Sampled persistence | [`services/driverService.ts`](./backend/src/services/driverService.ts) | `SET NX PX 10000` gate; one statement updates the last-known position and appends history |
+| Tracking fan-out | [`websocket/handler.ts`](./backend/src/websocket/handler.ts), [`channelRegistry.ts`](./backend/src/websocket/channelRegistry.ts) | One subscriber per process, reference-counted channels, snapshot on subscribe, courier channel switch on assignment, 30 s ping/pong heartbeat |
+| Stage-aware ETA | [`utils/geo.ts`](./backend/src/utils/geo.ts) | Courier → merchant → wait for food → customer before pickup; last leg after |
+| Graceful shutdown | [`index.ts`](./backend/src/index.ts) | Readiness `503`, sockets closed with 1001, leases released, bounded drain, pools closed |
+| Metrics, logs | [`shared/metrics.ts`](./backend/src/shared/metrics.ts), [`shared/logger.ts`](./backend/src/shared/logger.ts) | prom-client counters and histograms; Pino JSON logs with module context |
+
+The client side of the same contracts: the cart sends one `Idempotency-Key` per checkout attempt and shows the server's quote ([`routes/cart.tsx`](./frontend/src/routes/cart.tsx)); the tracking page applies snapshots and status events by `version` and re-fetches details after each event ([`routes/orders.$orderId.tsx`](./frontend/src/routes/orders.$orderId.tsx)); the WebSocket client reconnects with capped, jittered back-off ([`services/websocket.ts`](./frontend/src/services/websocket.ts)); the courier dashboard re-fetches its pending offer on every (re)connect, sends a 10-second heartbeat, and sends each ping over the socket or, when it is down, over HTTP — never both ([`hooks/useDriverDashboard.ts`](./frontend/src/hooks/useDriverDashboard.ts)).
+
+### Simplified or substituted
+
+| Production | Local |
+|------------|-------|
+| Separate Order, Dispatch, Location and Tracking services | One Express process with route modules; matching loops run in the API process |
+| Redis per metro | One Valkey/Redis instance, one geo set |
+| Kafka for location events and the outbox | Sampled writes to `drivers.current_lat/lng` and `driver_location_history` in PostgreSQL; status published to Redis after `COMMIT` (best effort) |
+| Offer answers delivered as events | The matching loop polls the offer row every second (≤ 31 s per offer) |
+| Load balancer with rate limiting | None; no rate limiting is implemented |
+| Short-lived WebSocket tickets, httpOnly cookies | Bearer token in `localStorage`, passed to `/ws` in the query string |
+
+### Omitted
+
+CDN, multi-region, metro sharding, payments, push and SMS notifications, batched or multi-stop assignment, surge pricing, a routing-engine ETA, a merchant API, Kubernetes, and a map widget (the tracking page shows coordinates and the ETA).
+
+### Known limitations
+
+- **No merchant flow.** Nothing sets `confirmed`, `preparing` or `ready_for_pickup`; matching starts as soon as an order is `pending`, and prep time feeds only the ETA, not when dispatch begins.
+- **No reassignment.** If an assigned courier goes dark, the order stays `driver_assigned`; there is no liveness lease on active deliveries and no cancel-after-assignment path that releases the courier.
+- **Matching is per-process work.** The circuit breaker counts whole matching runs and only thrown errors trip it.
+- **Frontend data layer.** Pages fetch with `useEffect` into component state; there is no shared server-state cache, and lists are not paginated.
+- **Retention.** [`shared/retention.ts`](./backend/src/shared/retention.ts) archives and deletes orders by age regardless of status.
+- **Smoke test.** [`tests/smoke.spec.ts`](./tests/smoke.spec.ts) logs in as `alice@example.com`, which this project does not seed (the screenshot config uses `admin@delivery.local`).

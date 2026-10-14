@@ -7,14 +7,18 @@ import { MemberList } from '../components/MemberList';
 
 function ChannelPage() {
   const { channelId } = Route.useParams();
-  const { setCurrentChannel, threadParentId, showMemberList, disconnectSSE } = useChatStore();
+  const openChannel = useChatStore((s) => s.openChannel);
+  const closeChannel = useChatStore((s) => s.closeChannel);
+  const threadParentId = useChatStore((s) => s.threadParentId);
+  const showMemberList = useChatStore((s) => s.showMemberList);
 
+  // Open on mount and close on unmount or channel change. Closing always resets the store, so a
+  // remount of the same channel (React StrictMode runs effects twice in development) reopens it
+  // instead of being skipped as "already open" with no stream attached.
   useEffect(() => {
-    setCurrentChannel(channelId);
-    return () => {
-      disconnectSSE();
-    };
-  }, [channelId, setCurrentChannel, disconnectSSE]);
+    void openChannel(channelId);
+    return () => closeChannel();
+  }, [channelId, openChannel, closeChannel]);
 
   return (
     <div className="flex-1 flex overflow-hidden">

@@ -9,7 +9,7 @@ interface ChannelListProps {
 
 /** Displays grouped channel list organized by teams with channel creation modal. */
 export function ChannelList({ orgId }: ChannelListProps) {
-  const { channels, teams, currentTeamId, currentChannelId, setCurrentTeam } = useChatStore();
+  const { channels, teams, currentTeamId, currentChannelId } = useChatStore();
   const navigate = useNavigate();
   const params = useParams({ strict: false }) as { teamId?: string };
   const [showCreateChannel, setShowCreateChannel] = useState(false);
@@ -30,7 +30,10 @@ export function ChannelList({ orgId }: ChannelListProps) {
       <div className="p-3 border-b border-teams-border">
         <select
           value={activeTeamId || ''}
-          onChange={(e) => setCurrentTeam(e.target.value)}
+          onChange={(e) =>
+            navigate({ to: '/org/$orgId/team/$teamId', params: { orgId, teamId: e.target.value } })
+          }
+          aria-label="Team"
           className="w-full bg-teams-bg border border-teams-border rounded-md px-2 py-1.5 text-sm text-teams-text focus:outline-none focus:ring-1 focus:ring-teams-primary"
         >
           <option value="" disabled>
@@ -64,6 +67,7 @@ export function ChannelList({ orgId }: ChannelListProps) {
           <button
             key={channel.id}
             onClick={() => handleChannelClick(channel.id)}
+            aria-current={currentChannelId === channel.id ? 'page' : undefined}
             className={`w-full text-left px-3 py-1.5 text-sm flex items-center gap-2 transition-colors ${
               currentChannelId === channel.id
                 ? 'bg-teams-chat text-teams-primary font-semibold'

@@ -53,3 +53,27 @@ export async function execute(text: string, params?: unknown[]): Promise<number>
   const result = await pool.query(text, params);
   return result.rowCount || 0;
 }
+
+/**
+ * Run a function inside a single database transaction.
+ * Commits when the function resolves, rolls back when it throws, and always
+ * releases the client back to the pool. Use it for multi-statement writes that
+ * must succeed or fail together (an article and its story assignment, a user
+ * and their preferences row).
+ * @param fn - Work to run with the transaction's dedicated client
+ * @returns Whatever the function returns
+ */
+export async function withTransaction<T>(fn: (client: pg.PoolClient) => Promise<T>): Promise<T> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await fn(client);
+    await client.query('COMMIT');
+    return result;
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    throw error;
+  } finally {
+    client.release();
+  }
+}

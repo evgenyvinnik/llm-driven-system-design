@@ -5,34 +5,29 @@ import { ChannelList } from '../components/ChannelList';
 
 function OrgPage() {
   const { orgId } = Route.useParams();
-  const { teams, channels, loadTeams, loadChannels, currentTeamId } = useChatStore();
+  const teams = useChatStore((s) => s.teams);
+  const teamsOrgId = useChatStore((s) => s.currentOrgId);
+  const loadTeams = useChatStore((s) => s.loadTeams);
   const navigate = useNavigate();
-  // Read the channel from the *child* route, if the URL already names one.
-  const { channelId } = useParams({ strict: false }) as { channelId?: string };
+  // Read the team from the *child* route, if the URL already names one.
+  const { teamId } = useParams({ strict: false }) as { teamId?: string };
 
   useEffect(() => {
     loadTeams(orgId);
   }, [orgId, loadTeams]);
 
+  // Land on the first team only when the URL doesn't name one, and only once this org's teams
+  // have loaded. Deep links and reloads keep whatever the URL says; the team route then picks a
+  // channel the same way.
   useEffect(() => {
-    if (teams.length > 0 && !currentTeamId) {
-      loadChannels(teams[0].id);
-    }
-  }, [teams, currentTeamId, loadChannels]);
-
-  // Land on the team's first channel only when the URL doesn't already name
-  // one. Without the `!channelId` guard this fires whenever `channels` loads
-  // and rewrites the path to `channels[0]`, so deep links and page reloads
-  // silently bounced to the first channel — every other channel was reachable
-  // by clicking but not by URL.
-  useEffect(() => {
-    if (channels.length > 0 && currentTeamId && !channelId) {
+    if (!teamId && teamsOrgId === orgId && teams.length > 0) {
       navigate({
-        to: '/org/$orgId/team/$teamId/channel/$channelId',
-        params: { orgId, teamId: currentTeamId, channelId: channels[0].id },
+        to: '/org/$orgId/team/$teamId',
+        params: { orgId, teamId: teams[0].id },
+        replace: true,
       });
     }
-  }, [channels, orgId, currentTeamId, channelId, navigate]);
+  }, [teams, teamsOrgId, orgId, teamId, navigate]);
 
   return (
     <>

@@ -26,6 +26,7 @@ export function ThreadPanel() {
           onClick={closeThread}
           className="text-teams-secondary hover:text-teams-text text-lg"
           title="Close thread"
+          aria-label="Close thread"
         >
           x
         </button>

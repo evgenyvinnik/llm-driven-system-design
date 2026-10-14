@@ -11,10 +11,11 @@
     "dev:server3": "PORT=3003 tsx watch src/index.ts",
     "build": "tsc",
     "start": "node dist/index.js",
-    "crawl": "tsx src/scripts/crawl.ts",
     "seed": "tsx src/db/seed.ts",
     "format": "prettier --write src/**/*.ts",
     "lint": "eslint src/**/*.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "db:seed": "tsx src/db/seed.ts"
   },
   "dependencies": {
@@ -48,6 +49,7 @@
     "prettier": "^3.4.2",
     "tsx": "^4.7.0",
     "typescript": "^5.3.3",
-    "typescript-eslint": "^8.18.2"
+    "typescript-eslint": "^8.18.2",
+    "vitest": "~4.0.18"
   }
 }

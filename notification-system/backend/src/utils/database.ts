@@ -36,3 +36,23 @@ export async function query<T extends QueryResultRow = QueryResultRow>(
   }
   return result;
 }
+
+/**
+ * Runs `fn` inside a single transaction on one pooled client. Commits when `fn`
+ * resolves, rolls back when it throws. Used wherever several rows must change
+ * together (notification + deliveries + outbox, delivery status + aggregate).
+ */
+export async function withTransaction<T>(fn: (client: pg.PoolClient) => Promise<T>): Promise<T> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await fn(client);
+    await client.query('COMMIT');
+    return result;
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    throw error;
+  } finally {
+    client.release();
+  }
+}

@@ -1,4 +1,4 @@
-import { redis, incrementCounter, getCounter } from '../utils/redis.js';
+import { redis, getCounter } from '../utils/redis.js';
 
 interface RateLimitConfig {
   count: number;
@@ -42,66 +42,87 @@ const LIMITS: RateLimits = {
   },
 };
 
+/**
+ * Checks every counter first and increments them only if none would exceed its
+ * limit, in one Lua call. Fixed windows: EXPIRE is set on the first increment
+ * (and repaired for any legacy key left without a TTL), atomically with INCR.
+ *
+ * KEYS: counter keys. ARGV: limit and window seconds for each key, in pairs.
+ * Returns {0} when admitted, or {index, current, ttl} for the first full key.
+ */
+const ADMIT_ALL_OR_NOTHING = `
+for i, key in ipairs(KEYS) do
+  local limit = tonumber(ARGV[(i - 1) * 2 + 1])
+  local current = tonumber(redis.call('GET', key) or '0')
+  if current + 1 > limit then
+    return {i, current, redis.call('TTL', key)}
+  end
+end
+for i, key in ipairs(KEYS) do
+  local window = tonumber(ARGV[(i - 1) * 2 + 2])
+  local value = redis.call('INCR', key)
+  if value == 1 or redis.call('TTL', key) == -1 then
+    redis.call('EXPIRE', key, window)
+  end
+end
+return {0}
+`;
+
+interface CounterSpec {
+  key: string;
+  limit: number;
+  window: number;
+  reason: 'user_limit' | 'global_limit';
+  channel: string;
+}
+
 /** Enforces per-user and global rate limits across push, email, and SMS channels. */
 export class RateLimiter {
+  /**
+   * Admits a send on all `channels` or on none. The old version incremented
+   * counters one channel at a time, so a request rejected on email had already
+   * spent the user's push budget, and a crash between INCR and EXPIRE left a
+   * counter with no TTL that rate-limited the user forever.
+   */
   async checkLimit(userId: string, channels: string[]): Promise<RateLimitResult> {
-    for (const channel of channels) {
-      // Check user limit
-      const userResult = await this.checkUserLimit(userId, channel);
-      if (userResult.limited) {
-        return userResult;
+    const specs: CounterSpec[] = [];
+    for (const channel of new Set(channels)) {
+      const user = LIMITS.user[channel];
+      const global = LIMITS.global[channel];
+      if (user) {
+        specs.push({ key: `ratelimit:user:${userId}:${channel}`, limit: user.count, window: user.window, reason: 'user_limit', channel });
       }
-
-      // Check global limit
-      const globalResult = await this.checkGlobalLimit(channel);
-      if (globalResult.limited) {
-        return globalResult;
+      if (global) {
+        specs.push({ key: `ratelimit:global:${channel}`, limit: global.count, window: global.window, reason: 'global_limit', channel });
       }
     }
-
-    return { limited: false };
-  }
-
-  async checkUserLimit(userId: string, channel: string): Promise<RateLimitResult> {
-    const limit = LIMITS.user[channel];
-    if (!limit) return { limited: false };
-
-    const key = `ratelimit:user:${userId}:${channel}`;
-    const count = await incrementCounter(key, limit.window);
-
-    if (count > limit.count) {
-      return {
-        limited: true,
-        reason: 'user_limit',
-        channel,
-        limit: limit.count,
-        current: count,
-        retryAfter: await this.getTTL(key),
-      };
+    if (specs.length === 0) {
+      return { limited: false };
     }
 
-    return { limited: false };
-  }
+    const args = specs.flatMap((spec) => [String(spec.limit), String(spec.window)]);
+    const reply = (await redis.eval(
+      ADMIT_ALL_OR_NOTHING,
+      specs.length,
+      ...specs.map((spec) => spec.key),
+      ...args
+    )) as number[];
 
-  async checkGlobalLimit(channel: string): Promise<RateLimitResult> {
-    const limit = LIMITS.global[channel];
-    if (!limit) return { limited: false };
-
-    const key = `ratelimit:global:${channel}`;
-    const count = await incrementCounter(key, limit.window);
-
-    if (count > limit.count) {
-      return {
-        limited: true,
-        reason: 'global_limit',
-        channel,
-        limit: limit.count,
-        current: count,
-        retryAfter: await this.getTTL(key),
-      };
+    const index = Number(reply[0]);
+    if (index === 0) {
+      return { limited: false };
     }
 
-    return { limited: false };
+    const spec = specs[index - 1];
+    const ttl = Number(reply[2]);
+    return {
+      limited: true,
+      reason: spec.reason,
+      channel: spec.channel,
+      limit: spec.limit,
+      current: Number(reply[1]),
+      retryAfter: ttl > 0 ? ttl : spec.window,
+    };
   }
 
   async getUsage(userId: string): Promise<UsageByChannel> {

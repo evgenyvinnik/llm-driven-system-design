@@ -62,3 +62,26 @@ export const STREAMING_CONFIG = {
     { name: '4k', width: 3840, height: 2160, bitrate: 15000 },
   ],
 };
+
+/**
+ * Playback authorization configuration.
+ *
+ * - Stream URLs carry an HMAC token (session, title, quality, expiry) that `/play`
+ *   verifies without touching the database -- the same check a CDN edge performs.
+ * - Each plan caps the quality ladder and the number of concurrent streams. A
+ *   stream slot is a lease in Redis that progress heartbeats keep alive; a device
+ *   that stops sending them (closed tab, long pause) frees its slot.
+ */
+export const PLAYBACK_CONFIG = {
+  urlTokenSecret: process.env.PLAYBACK_TOKEN_SECRET || 'dev-playback-token-secret-change-in-prod',
+  urlTtlSeconds: parseInt(process.env.PLAYBACK_URL_TTL_SECONDS || String(4 * 60 * 60)),
+  streamLeaseSeconds: parseInt(process.env.STREAM_LEASE_SECONDS || '90'),
+  progressIntervalSeconds: 10,
+  /** Client clocks may run ahead; position timestamps beyond this are clamped to server time. */
+  maxClockSkewMs: 60 * 1000,
+  plans: {
+    basic: { maxStreams: 1, maxHeight: 720 },
+    standard: { maxStreams: 2, maxHeight: 1080 },
+    premium: { maxStreams: 4, maxHeight: 2160 },
+  } as Record<string, { maxStreams: number; maxHeight: number }>,
+};
