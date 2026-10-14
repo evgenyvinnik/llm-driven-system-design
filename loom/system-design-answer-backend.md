@@ -1,352 +1,352 @@
-# Loom - System Design Answer (Backend Focus)
+# 🎥 Loom (Async Video Messaging) — System Design Answer (Backend Focus)
 
-## 1. Clarifying Questions (2 minutes)
+*45-minute backend interview. This is a proposed production design; what this repository actually runs is described in [architecture.md → Implementation Notes](./architecture.md#implementation-notes).*
 
-> "Before I dive in, let me confirm scope. We're building a Loom-like platform where users record video in the browser, upload it, and share via link. I'll focus on the backend: upload pipeline, storage, sharing, analytics, and comments. Should I cover transcoding or adaptive streaming, or just raw video delivery?"
+> "Loom looks like a video upload site, but the product promise is about time: you press Stop and the link works a second later. Two things make that hard. First, a 50 MB recording has to already be in storage when recording ends, so the upload has to happen *during* the recording, in parts, straight to object storage — the API should never touch a video byte. Second, a share link is a capability handed to people without accounts, so revoking it has to actually cut access, even after we've handed out playback credentials."
 
-Assuming raw video delivery for this exercise, with notes on where transcoding fits.
+| Phase | Time | What I want the interviewer to leave with |
+|-------|------|--------------------------------------------|
+| Requirements & scale | 5 min | Scope, targets, and the two numbers that drive the design |
+| High-level architecture | 10 min | One overview and the three core flows |
+| Data model & API | 7 min | What lives where, and the upload protocol |
+| Deep dive 1: upload while recording | 8 min | Multipart parts, verified completion, abandoned uploads |
+| Deep dive 2: revocable share links | 7 min | Tokens, one-time password checks, short-lived playback credentials |
+| Deep dive 3: processing without waiting | 5 min | Leases, fencing, playing the original first |
+| Scale, failures, wrap-up | 3 min | What breaks first; the trade-offs I made |
 
-> "A few more constraints I want to clarify. Are we supporting team workspaces with shared libraries, or is this individual-only? And should I design for mobile recording or browser-only?"
+---
 
-Assuming individual use with browser-only recording. Teams and mobile would be follow-up features.
+## 🎯 Requirements & Scale (5 min)
 
-## 2. Functional Requirements
+"Let me pin the scope down first, because 'Loom' covers recording, editing, transcripts and team workspaces, and I want to spend the time on the parts that are architecturally interesting."
 
-- Users record video in the browser and upload it
-- Videos are stored in object storage with metadata in a relational database
-- Users can share videos via generated links with optional password, expiry, and download permissions
-- Viewers can leave time-anchored comments on specific moments in a video
-- Video owners see analytics: view count, unique viewers, watch duration, completion rate
-- Videos can be organized into hierarchical folders
-- Public share pages work without authentication
+### Functional requirements
 
-## 3. Non-Functional Requirements
+1. **Record** screen, camera or both, with microphone and pause/resume, in the browser, for up to an hour.
+2. **Upload while recording**, so the video is playable about a second after Stop, without losing the recording when the network drops.
+3. **Share** a link, optionally with a password and an expiry, and revoke it at any time.
+4. **Watch** from the link without an account, and jump to time-anchored comments.
+5. **Comment**, optionally anchored to a moment, with one level of replies.
+6. **Analytics** for the owner: views, unique viewers, average watch time, completion rate.
 
-- Upload latency: presigned URL generation under 100ms at p99
-- Share link resolution: token validation under 50ms at p99
-- Availability: 99.95% for playback and sharing paths
-- Storage: support recordings up to 2GB
-- Analytics freshness: view counts updated within 5 seconds
-- Handle 10K concurrent viewers on a popular video
-- Graceful degradation: if analytics service is down, video playback and sharing still work
+Out of scope: editing and trimming, live streaming, team workspaces and SSO, native mobile apps, transcripts.
 
-## 4. Capacity Estimation
+### Non-functional requirements
 
-> "Let me size the system to understand where bottlenecks will emerge."
+| Requirement | Target | Why |
+|-------------|--------|-----|
+| Stop → shareable link | p95 < 2 s | The product promise |
+| Part URL issuance | p99 < 50 ms | On the recording's path every ~20 s |
+| Upload durability | An acknowledged part is never lost | A recording can't be recreated |
+| Share open | p99 < 100 ms server-side; first frame p95 < 1.5 s | Recipients judge us by the first second |
+| Revocation | New opens blocked at once; in-progress playback within 10 min | "I sent it to the wrong person" must be fixable |
+| Analytics freshness | < 1 minute | Creators check right after sending |
+| Availability | Playback 99.99%, recording 99.95% | Playback is what recipients see |
 
-- 500K daily active users, 100K daily recordings
-- Average recording: 3 minutes at ~2Mbps, approximately 50MB file size
-- Daily new storage: 100K recordings x 50MB = 5TB/day, 150TB/month
-- With 30-day retention default: steady-state storage around 150TB
-- Peak upload throughput: 200 concurrent uploads during work hours (9AM-5PM accounts for 70% of recordings)
-- View events: 10M daily views, ~115 views/second average, ~500/second peak
-- Share link lookups: 5M daily, ~60/second average
-- Comment writes: 500K daily, ~6/second (low-frequency compared to views)
-- Database size: metadata is small -- 100K videos x 1KB = 100MB/day
+### Capacity estimate
 
-> "Storage dominates infrastructure costs. Compute is modest because the API server handles only metadata -- kilobytes, not gigabytes. This is the core architectural decision."
+| Quantity | Estimate | Consequence |
+|----------|----------|-------------|
+| Recordings | 1M/day → ~12/s average, ~35/s peak | Tiny metadata write rate |
+| Recording size | 3 min at ~2.2 Mbps ≈ 50 MB | Bytes must bypass the API |
+| Concurrent recorders | 35/s × 180 s ≈ 6,300 at peak | Each streams to storage |
+| Upload ingress | 6,300 × 2.2 Mbps ≈ 14 Gbps | Object storage takes it; the API sees none |
+| Part URL requests | One 5 MiB part per ~19 s per recorder → ~330/s | A few stateless API instances |
+| Storage | 50 TB/day ≈ 18 PB/year of sources | Tiering; lazy renditions |
+| Views | 50M/day → ~2,000 view starts/s at peak | Cheap |
+| Heartbeats | ~240K concurrent viewers ÷ 15 s ≈ 16K/s | A log and a column store |
+| Playback egress | ~1.5 PB/day ≈ 140 Gbps | CDN |
 
-## 5. High-Level Architecture
+"Two numbers drive everything: 14 Gbps of recordings arriving at peak, which is why the API only signs URLs, and 16,000 heartbeats a second, which is why analytics is a log plus a column store and not row updates."
 
-```
-┌──────────────┐     ┌──────────────┐     ┌──────────────────┐
-│   Browser    │────▶│   CDN/Edge   │────▶│   API Gateway    │
-│  (Recording) │     │  (Video      │     │  (Auth, Rate     │
-└──────┬───────┘     │   Delivery)  │     │   Limiting)      │
-       │             └──────────────┘     └────────┬─────────┘
-       │                                           │
-       │  Presigned PUT URL                ┌───────┴────────┐
-       │                                   │                │
-       ▼                           ┌───────┴──────┐ ┌───────┴──────┐
-┌──────────────┐                   │  Video API   │ │  Analytics   │
-│  S3 / Object │◀── direct upload──│  Service     │ │  Service     │
-│  Storage     │                   └──────┬───────┘ └───────┬──────┘
-└──────────────┘                          │                 │
-                                   ┌──────┴───────┐ ┌───────┴──────┐
-                                   │  PostgreSQL  │ │  ClickHouse  │
-                                   │  (metadata)  │ │  (events)    │
-                                   └──────────────┘ └──────────────┘
-                                          │
-                                   ┌──────┴───────┐
-                                   │    Redis     │
-                                   │  (sessions,  │
-                                   │   cache)     │
-                                   └──────────────┘
-```
+---
 
-> "The key insight is that video bytes never touch the API server. The browser uploads directly to object storage via presigned URLs. The API server only handles metadata operations -- kilobytes, not gigabytes. This separation is what makes the system horizontally scalable without expensive bandwidth-heavy instances."
+## 🏗️ High-Level Architecture (10 min)
 
-## 6. Data Model
-
-> "I'll describe the six core tables and their relationships. I'm choosing PostgreSQL for metadata because we need ACID transactions for video-folder associations and foreign key integrity for cascade deletes."
-
-| Table | Key Columns | Indexes | Notes |
-|-------|-------------|---------|-------|
-| users | id (UUID PK), username (unique), email (unique), password_hash, display_name, avatar_url, role | email, username | Session-based auth, bcrypt passwords |
-| videos | id (UUID PK), user_id (FK), title, description, duration_seconds, status, storage_path, thumbnail_path, file_size_bytes, view_count | (user_id, created_at DESC), status | Status enum: processing, ready, failed. view_count is denormalized |
-| comments | id (UUID PK), video_id (FK CASCADE), user_id (FK), content, timestamp_seconds (nullable float), parent_id (self-FK) | (video_id, created_at), parent_id | Null timestamp = general comment, non-null = time-anchored |
-| shares | id (UUID PK), video_id (FK CASCADE), token (unique, 64 chars), password_hash (nullable), expires_at (nullable), allow_download | token, video_id | 256-bit crypto-random tokens |
-| view_events | id (UUID PK), video_id (FK CASCADE), viewer_id (FK nullable), session_id, watch_duration_seconds, completed, ip_address, user_agent | (video_id, created_at DESC), viewer_id | Insert-only append log for analytics |
-| folders | id (UUID PK), user_id (FK), name, parent_id (self-FK) | user_id, parent_id | Hierarchical organization with adjacency list |
-
-Plus a junction table `video_folders (video_id, folder_id)` for many-to-many assignment.
-
-> "The `timestamp_seconds` nullable float on comments is a deliberate choice over a polymorphic comment model. Null means general, non-null means time-anchored. One table, one query, one API endpoint. The float type preserves sub-second precision for future features like frame-accurate annotations."
-
-> "The view_count on videos is intentionally denormalized from view_events. The video library needs view counts for sorting and display -- running COUNT(*) on view_events for every video in a grid would be prohibitively slow. We increment view_count atomically on each view event insertion."
-
-## 7. API Design
-
-> "The API separates video metadata operations from upload/download operations to keep concerns clean. Upload endpoints handle the presigned URL dance. Share endpoints use tokens instead of video IDs for security isolation."
+"I'll draw the system, then walk the three journeys: recording and uploading, watching through a share link, and counting the view."
 
 ```
-POST /api/auth/register          Create account
-POST /api/auth/login             Session login
-POST /api/auth/logout            Destroy session
-GET  /api/auth/me                Current user info
-
-GET    /api/videos               List user's videos (paginated, filterable by folder/search)
-GET    /api/videos/:id           Get video with author info
-POST   /api/videos               Create video metadata (returns video ID for upload)
-PUT    /api/videos/:id           Update title/description
-DELETE /api/videos/:id           Delete video + cascade storage objects
-
-POST /api/upload/presigned       Generate presigned PUT URL for MinIO/S3
-POST /api/upload/complete        Mark video ready after upload completes
-GET  /api/upload/download/:id    Generate presigned GET URL for playback
-
-GET  /api/videos/:id/comments    List all comments for a video (chronological)
-POST /api/videos/:id/comments    Create comment (with optional timestamp_seconds and parentId)
-DELETE /api/videos/:id/comments/:commentId  Delete own comment
-
-POST   /api/share/:videoId/share           Create share link with options
-GET    /api/share/:token                   Validate share and return video + presigned URL
-GET    /api/share/:videoId/shares          List all shares for a video (owner only)
-DELETE /api/share/:videoId/shares/:shareId Revoke share link
-
-POST /api/analytics/view                  Record view event
-GET  /api/analytics/:videoId/analytics    Get aggregated stats (owner only)
-
-GET    /api/folders              List user's folders
-POST   /api/folders              Create folder (with optional parentId)
-PUT    /api/folders/:id          Rename folder
-DELETE /api/folders/:id          Delete folder
-POST   /api/folders/:id/videos   Add video to folder
-DELETE /api/folders/:id/videos/:videoId  Remove video from folder
+ ┌─────────────────────────┐                                          ┌──────────────────────────┐
+ │ Creator's browser       │                                          │ Viewer's browser         │
+ │ recorder + uploader     │                                          │ share page + player      │
+ └──┬─────────────────┬────┘                                          └───────┬───────┬──────────┘
+    │ (1) PUT part n  │ (1) start, part URLs,       (2) GET /share/{t}        │       │ (2) HLS
+    │ presigned URL   │     complete              ┌───────────────────────────┘       │ segments
+    │                 ▼                           ▼ (3) POST /views                   ▼
+    │    ┌────────────────────────────────────────────────────┐            ┌─────────────────────┐
+    │    │ Load balancer · TLS · rate limits · /api/*         │            │ CDN                 │
+    │    └──────────────────────────┬─────────────────────────┘            │ signed cookie       │
+    │                               │ JSON                                 └──────────┬──────────┘
+    │                               ▼                                                 │
+    │    ┌────────────────────────────────────────────────────┐                       │ miss:
+    │    │ Video API (stateless)                              │                       │ origin
+    │    │ uploads · shares · comments · views · stats        │                       │
+    │    └──┬─────────────┬──────────────────┬────────────┬───┘                       │
+    │       │             │                  │            │                           │
+    │       │ complete    │ rows +           │ (3) events └────────────────┐          │
+    │       │ upload      │ outbox           │                             │ stats    │
+    │       │             ▼                  ▼                             ▼          │
+    │       │   ┌────────────────────┐   ┌─────────────────────┐   ┌────────────────┐ │
+    │       │   │ PostgreSQL         │   │ Kafka               │   │ ClickHouse     │ │
+    │       │   │ videos, shares,    │   │ video-uploaded,     ├──▶│ view rollups   │ │
+    │       │   │ jobs, outbox       │   │ view-events         │   └────────────────┘ │
+    │       │   └─────────┬──────────┘   └────────┬────────────┘                      │
+    │       │             ▲                       │ consume                           │
+    │       │             │                       ▼                                   │
+    │       │             │ mark ready   ┌─────────────────────┐                      │
+    │       │             │              │ Transcode workers   │                      │
+    │       │             └──────────────┤ FFmpeg, leased jobs │                      │
+    │       │                            └────────┬────────────┘                      │
+    │       │                                     │ read source, write HLS            │
+    ▼       ▼                                     ▼                                   ▼
+ ┌───────────────────────────────────────────────────────────────────────────────────────────────┐
+ │ Object storage (S3) · source uploads, HLS renditions, posters                                 │
+ └───────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-> "Notice that the share validation endpoint (GET /api/share/:token) is unauthenticated. This is intentional -- anyone with the token can access the video, subject to password and expiration checks. This is the same model as Google Docs share links."
+1. **Record and upload (1).** When recording starts, the browser creates the video and opens a multipart upload through the Video API. Every ~5 MiB of recording becomes a part that the browser `PUT`s straight to storage with a presigned URL. On Stop it sends the small last part and calls complete; the API verifies the parts, marks the video playable, and an outbox row triggers processing.
+2. **Watch (2).** The viewer opens the link; the API checks the share row (and the password, once) and hands back short-lived CDN credentials. The player streams from the CDN, which fills from storage on a miss.
+3. **Count (3).** The player sends a view on first play and a heartbeat every 15 seconds of watching, all under one view ID. The API publishes them to Kafka, and ClickHouse keeps one row per view session plus daily rollups for the owner's dashboard.
 
-## 8. Deep Dives
+| Component | Responsibility | Scales with | Notes |
+|-----------|----------------|-------------|-------|
+| Load balancer | TLS, routing, coarse rate limits | Requests | Never sees video bytes |
+| Video API | Upload protocol, shares, comments, views, stats | ~1K requests/s | Stateless; presigning is local HMAC |
+| Object storage | Sources, renditions, posters | ~14 Gbps in | Multipart upload; lifecycle rules |
+| CDN | Playback | ~140 Gbps out | Signed cookies per video prefix |
+| PostgreSQL | Videos, upload state, shares, comments, jobs, outbox | Metadata | Primary + replicas |
+| Redis | Sessions, rate-limit counters | Active users | Not needed to watch a share link |
+| Kafka | `video-uploaded`, `view-events` | Events | Partitioned by video |
+| Transcode workers | Remux, poster, HLS ladder | Minutes recorded | Largest compute bill |
+| ClickHouse | View sessions, rollups | ~16K events/s | Ingests from Kafka |
 
-### Deep Dive 1: Video Upload and Processing Pipeline
+"Why keep bytes off the API entirely? A proxied 50 MB upload holds a request open for the whole transfer, so the API tier would scale with bandwidth — 14 Gbps at peak — instead of with requests. Presigned URLs move the transfer to the one system designed for it, and the API's whole involvement in a recording becomes a few dozen small JSON calls."
 
-> "This is the most architecturally interesting part -- how to handle gigabyte-sized uploads without overwhelming the API tier."
+### Flow 1: recording and uploading
 
-**The problem:** A naive approach proxies video bytes through the API server. At 200 concurrent uploads averaging 50MB each, that is 10GB of in-flight data consuming API server memory. Node.js with Express buffers request bodies by default, so each upload would consume 50-500MB of heap memory per request. The server becomes a memory bottleneck, and horizontal scaling means provisioning bandwidth-heavy instances that are expensive and underutilized for the 99% of requests that are metadata-only.
-
-**The solution: Presigned URL pattern.**
-
-The upload flow has four steps:
-
-1. Client calls POST `/api/videos` to create metadata (title, description). Returns a video ID with status "processing." The video exists in the database but has no file associated yet
-2. Client calls POST `/api/upload/presigned` with the video ID. The server verifies ownership, generates a time-limited (1-hour) presigned PUT URL using the S3/MinIO SDK, and stores the object path (`userId/videoId/uuid.webm`) on the video record
-3. Client uploads the Blob directly to object storage via XMLHttpRequest (not fetch -- XHR supports upload progress events). The API server is completely uninvolved in this step. The presigned URL contains a cryptographic signature that authorizes the PUT operation
-4. Client calls POST `/api/upload/complete`. The server queries MinIO for the file size via `statObject`, updates the video status to "ready" and stores `file_size_bytes`
-
-**Object key structure:** `{userId}/{videoId}/{uuid}.webm`. The userId prefix groups a user's files together for efficient listing and bulk operations (account deletion, data export). The uuid suffix prevents collisions if the upload is retried.
-
-**Why not multipart upload through the API?** Three reasons. First, memory: Express buffers request bodies, so a 500MB upload consumes 500MB of Node.js heap per request -- you would need 10GB of heap to handle 20 concurrent large uploads. Second, bandwidth: API server egress costs are 3-5x higher than S3 ingress in most cloud providers. Third, availability: if the API server restarts mid-upload, the entire upload is lost. With presigned URLs, S3 handles the upload independently -- an API restart doesn't affect in-progress uploads.
-
-**Why not chunked/resumable upload (tus protocol)?** For recordings under 500MB, a single PUT with retry is sufficient. The browser can retry the entire upload on failure -- at 50MB on a 20Mbps connection, a full retry takes 20 seconds. For recordings over 1GB, we would add S3 multipart upload -- the presigned URL pattern extends naturally to presigned multipart, where each 10MB part gets its own presigned URL. The client uploads parts in parallel and calls CompleteMultipartUpload when done.
-
-**Failure handling:** If the upload fails at any step, the video stays in "processing" status. The client can request a new presigned URL and retry. A background cleanup job (cron, not implemented locally) would garbage-collect videos stuck in "processing" for over 24 hours, deleting both the metadata row and any partial uploads from object storage. This prevents orphaned storage consumption.
-
-**Status transitions:**
 ```
-processing ──▶ ready    (upload/complete succeeds)
-processing ──▶ failed   (transcoding fails, or cleanup marks it)
-ready      ──▶ deleted  (user deletes, cascade removes storage)
+Recorder                               Video API                      PostgreSQL   S3
+    │                                      │                               │        │
+    │ 1 POST /videos {id}; /uploads/start  │                               │        │
+    │─────────────────────────────────────▶│                               │        │
+    │                                      │ 2 INSERT video (uploading)    │        │
+    │                                      │──────────────────────────────▶│        │
+    │                                      │ 3 CreateMultipartUpload                │
+    │                                      │───────────────────────────────────────▶│
+    ························· every ~20 s while recording ···························
+    │ 4 POST part-url {n}                  │                               │        │
+    │─────────────────────────────────────▶│                               │        │
+    │ 5 PUT part n (presigned URL)                                                  │
+    │──────────────────────────────────────────────────────────────────────────────▶│
+    ······························ user presses Stop ································
+    │ 6 PUT last part (< 5 MiB)                                                     │
+    │──────────────────────────────────────────────────────────────────────────────▶│
+    │ 7 POST /complete {partCount}         │                               │        │
+    │─────────────────────────────────────▶│                               │        │
+    │                                      │ 8 ListParts; CompleteMultipartUpload   │
+    │                                      │───────────────────────────────────────▶│
+    │                                      │ 9 processing + outbox (1 tx)  │        │
+    │                                      │──────────────────────────────▶│        │
+    │ 10 200: share link works now         │                               │        │
+    │◀─────────────────────────────────────│                               │        │
+    │                                      │                               │        │
 ```
 
-**The trade-off:** Client complexity increases significantly. The frontend must handle XHR progress tracking, retry logic on network failure, presigned URL expiration handling, and the multi-step upload ceremony (4 API calls instead of 1). We accept this complexity because it keeps the API tier stateless, horizontally scalable, and free from large binary data processing. An API server that only handles JSON metadata can run on the smallest instance type.
+"The recorder generates the video's UUID itself, so if the create call times out and is retried, the second insert hits the primary key and returns the same row instead of creating a duplicate. Steps 4 and 5 repeat every ~19 seconds while the user talks. When they press Stop, at most one partial part is left — that's why steps 6 to 10 take about a second. Step 8 is the important one: I list the parts storage actually has, not the ones the client claims, before I stitch them."
+
+### Flow 2: opening a share link
+
+```
+Viewer                          Video API                PostgreSQL    CDN                      S3
+   │                                │                         │         │                        │
+   │ 1 GET /share/{t}               │                         │         │                        │
+   │───────────────────────────────▶│                         │         │                        │
+   │                                │ 2 share row: live? pw?  │         │                        │
+   │                                │────────────────────────▶│         │                        │
+   │ 3 401 password required        │                         │         │                        │
+   │◀───────────────────────────────│                         │         │                        │
+   │ 4 POST /share/{t}/unlock {pw}  │                         │         │                        │
+   │───────────────────────────────▶│                         │         │                        │
+   │                                │ 5 bcrypt once; sign grant         │                        │
+   │ 6 video, grant, CDN cookie     │                         │         │                        │
+   │◀───────────────────────────────│                         │         │                        │
+   │ 7 GET manifest, segments                                           │                        │
+   │───────────────────────────────────────────────────────────────────▶│                        │
+   │                                │                         │         │ 8 miss: GET rendition  │
+   │                                │                         │         │───────────────────────▶│
+   ································ every ~10 min while watching ·································
+   │ 9 refresh (share re-checked)   │                         │         │                        │
+   │───────────────────────────────▶│                         │         │                        │
+   │                                │                         │         │                        │
+```
+
+"The password is checked once, in a `POST` body so it never lands in an access log. After that the browser holds a signed grant cookie, and every later request — refreshing the playback cookie, sending heartbeats, reading comments — re-reads the share row. Revoking the share is one `DELETE`, and it bites on the next request. The CDN cookie is the one credential I can't recall, so it lives 10 minutes; that's my revocation bound for someone mid-playback."
+
+### Flow 3: processing
+
+```
+ Relay                    Kafka           Transcoder                      PostgreSQL   S3
+   │                        │                  │                               │        │
+   │ 1 video-uploaded {id}  │                  │                               │        │
+   │───────────────────────▶│                  │                               │        │
+   │                        │ 2 deliver        │                               │        │
+   │                        │─────────────────▶│                               │        │
+   │                        │                  │ 3 claim job (lease)           │        │
+   │                        │                  │──────────────────────────────▶│        │
+   │                        │                  │ 4 GET source.webm                      │
+   │                        │                  │───────────────────────────────────────▶│
+   │                        │                  │ 5 remux, probe, poster, HLS ladder     │
+   │                        │                  │ 6 PUT renditions (fixed keys)          │
+   │                        │                  │───────────────────────────────────────▶│
+   │                        │                  │ 7 ready, if lease still held  │        │
+   │                        │                  │──────────────────────────────▶│        │
+   │                        │ 8 commit offset  │                               │        │
+   │                        │◀─────────────────│                               │        │
+   │                        │                  │                               │        │
+```
+
+"The video was playable from step 0 — the original upload. This pipeline only makes it better: a copy-only remux that adds the seek index MediaRecorder leaves out, a poster frame, then the HLS ladder. Step 3 is a lease, not a lock, and step 7 only succeeds if the lease is still ours."
+
+---
+
+## 💾 Data Model (4 min)
+
+"PostgreSQL holds anything that must be correct, object storage holds bytes, and ClickHouse holds events."
+
+| Store | Table / key | Key columns | Indexes and notes |
+|-------|-------------|-------------|-------------------|
+| PostgreSQL | `videos` | `id` (client UUID, PK), `owner_id`, `status`, `source_key`, `playback_key`, `poster_key`, `upload_id`, `upload_activity_at`, `duration_seconds`, `size_bytes`, `failure_reason` | `(owner_id, created_at DESC)` for the library; partial index on `upload_activity_at` where `status = 'uploading'` for the sweeper |
+| PostgreSQL | `shares` | `id`, `video_id`, `token_hash` (unique), `password_hash`, `expires_at`, `allow_download` | Token stored as SHA-256, so a database leak leaks no working links |
+| PostgreSQL | `comments` | `id`, `video_id`, `author_id`, `parent_id`, `timestamp_seconds` (nullable), `body` | `(video_id, created_at)`; replies cascade with their parent |
+| PostgreSQL | `video_jobs` | `video_id` + `kind` (unique), `status`, `attempts`, `locked_by`, `locked_until`, `run_after`, `last_error` | Partial index on runnable jobs |
+| PostgreSQL | `outbox` | `id`, `topic`, `key`, `payload`, `published_at` | Written in the completing transaction |
+| Object storage | `{owner}/{video}/source.webm`, `…/hls/…`, `…/poster.jpg` | — | Fixed keys, so retried jobs overwrite |
+| ClickHouse | `view_sessions` | `video_id`, `view_id`, `viewer_key`, `watched_seconds`, `completed` | `ReplacingMergeTree` keeping max `watched_seconds`; daily rollup view |
+| Redis | `sess:{id}`, `rl:{limiter}:{key}` | — | Sessions and rate-limit counters |
 
-### Deep Dive 2: Analytics Aggregation at Scale
+"A time-anchored comment is just a nullable `timestamp_seconds`. Splitting general and anchored comments into two tables would mean a union on every read to express one optional field. The application checks that the anchor falls inside the video's duration, since a check constraint can't look across tables."
+
+"Why PostgreSQL rather than DynamoDB for metadata? At about 365 GB a year it fits one primary for years, and the operations I care about — 'flip uploading to processing and enqueue a job, atomically' and 'claim one job without blocking other workers' — are a transaction and `FOR UPDATE SKIP LOCKED`. When it outgrows one node I'd shard by owner, which keeps a library on one shard."
+
+---
+
+## 🔌 API Design (3 min)
+
+```
+POST   /api/v1/videos                       {id, title} → 201, or 200 with the same video on retry
+POST   /api/v1/videos/{id}/upload           open multipart upload → {uploadId, partSize}
+POST   /api/v1/videos/{id}/upload/parts     {partNumber} → presigned PUT URL (15 min)
+GET    /api/v1/videos/{id}/upload/parts     parts storage already holds (resume)
+POST   /api/v1/videos/{id}/upload/complete  {partCount} → video (processing) | 409 missing parts
+GET    /api/v1/videos/{id}                  owner or share grant → video + playback credentials
+POST   /api/v1/videos/{id}/shares           {password?, expiresAt?, allowDownload?} → token
+DELETE /api/v1/videos/{id}/shares/{shareId} revoke
+GET    /api/v1/shares/{token}               200 | 401 password required | 404 | 410 expired
+POST   /api/v1/shares/{token}/unlock        {password} → 200 + grant cookie | 401 | 429
+POST   /api/v1/views                        {videoId, viewId, watchedSeconds, completed}
+GET    /api/v1/videos/{id}/stats            ?from&to&tz → series + as_of
+```
+
+A few decisions worth saying out loud:
+
+- **Every upload call is idempotent.** Create uses the client's UUID, starting returns the already-open upload, re-uploading a part number replaces it, and completing twice returns the video the first call produced.
+- **`404`, not `403`,** for videos the caller can't see. Every read path — details, playback, comments, views — goes through one rule: you own it, or you hold a grant for a live share of it.
+- **`410 Gone` for expired links,** so the share page can say "this link expired" instead of "not found".
+- **Rate limits** in Redis with `RateLimit` headers: a general per-client budget, and 10 failed password attempts per link per 15 minutes.
 
-> "View tracking looks simple but has hidden challenges around counting accuracy, storage growth, and query performance."
+---
 
-**The problem:** At 10M daily views, the `view_events` table grows by 300M rows per month. Aggregation queries (unique viewers, average watch time, completion rate) become increasingly slow as the table grows -- a full-table scan over 1B rows takes minutes, not milliseconds. Additionally, naive view counting is vulnerable to inflation from bots, refreshes, and embedded iframes auto-playing.
+## 🔧 Deep Dive 1: Uploading While Recording (8 min)
 
-**The local solution:** PostgreSQL handles analytics at local scale. The `view_events` table stores raw events, and aggregation uses standard SQL:
+"The requirement is a working link one or two seconds after Stop, for recordings up to an hour long, on laptop Wi-Fi. Where the bytes go, and when, decides whether that's possible."
 
-- Total views: `COUNT(*)`
-- Unique viewers: `COUNT(DISTINCT COALESCE(viewer_id::text, session_id))`
-- Average watch time: `AVG(watch_duration_seconds)`
-- Completion rate: `COUNT(*) FILTER (WHERE completed) * 100.0 / COUNT(*)`
-- Daily breakdown: `GROUP BY DATE(created_at)`
+| Approach | How it works | Where it breaks |
+|----------|--------------|-----------------|
+| ❌ Proxy through the API | Browser streams to an API endpoint, which writes to storage | The API scales with bandwidth (14 Gbps at peak), and a deploy kills in-flight uploads |
+| ❌ One presigned PUT after Stop | Record into memory, upload the whole file | 50 MB on a 20 Mbps uplink is 20 seconds of "Uploading…"; an hour (~1 GB) fails as one unit at 95% |
+| ⚠️ tus resumable protocol | A tus server accepts chunks and reassembles them | Solves resumption, but adds a server tier that holds bytes we then copy into storage |
+| ✅ S3 multipart, parts uploaded during recording | Every ~5 MiB of recording becomes a part, presigned and `PUT` directly | More client logic; a 5 MiB floor on part size |
 
-The composite index on `(video_id, created_at DESC)` makes per-video time-range queries efficient. For a video with 10K views, the aggregation takes < 50ms.
+**Why it works.** Multipart upload already is a resumable protocol: parts are independent, each one is retried on its own, and storage stitches them server-side. MediaRecorder hands the page a chunk every second; the recorder buffers chunks until it has 5 MiB — S3's minimum for every part except the last — and uploads that part while recording continues, two at a time. At 2.2 Mbps that's a part every 19 seconds. When the user presses Stop, only the tail is left, so the link is live about a second later regardless of how long the recording was.
 
-**The production evolution -- three stages:**
+**Completion trusts storage, not the client.** The complete call carries only `partCount`. I list the parts storage holds; if any of 1..N is missing, or a non-final part is under 5 MiB, I answer `409` with the missing part numbers and the client re-sends them. Otherwise I stitch with storage's own ETags — so the browser never has to read `ETag` response headers, a CORS detail that breaks a lot of multipart uploaders — stat the result, and flip the row from `uploading` to `processing` in the same transaction as the outbox row. The conditional update (`WHERE status = 'uploading'`) means two concurrent completes produce one transition and one job.
 
-Stage 1 (now, < 100M events): Direct PostgreSQL aggregation. Works well with proper indexes. Query time: 50-200ms per video.
+**Abandoned uploads.** If the tab is closed mid-recording, nobody will ever call complete, and the open multipart upload keeps billing for its parts. A sweeper finds videos that have been `uploading` with no part URL requested for 30 minutes — measured from the last activity, not creation, so an hour-long recording isn't mistaken for a dead one — marks them `failed` and aborts the multipart upload. The claim is a single `UPDATE` over rows selected `FOR UPDATE SKIP LOCKED`, so every API instance can run it without double work, and the storage calls happen after the claim, outside any transaction. A bucket lifecycle rule that aborts incomplete uploads after seven days is the backstop.
 
-Stage 2 (100M-1B events): Pre-computed materialized views refreshed every 5 minutes. Create a `video_analytics_daily` materialized view that aggregates by (video_id, date). Analytics queries hit this view instead of scanning raw events. The trade-off is up to 5 minutes of data staleness.
+**What I give up.** Client complexity — part cutting, ordering, retries, a resumable session — and some loss granularity: if the tab crashes, everything since the last uploaded part is lost unless the client also journals chunks to IndexedDB, which I'd add for long recordings. I also lose the ability to cap upload size per URL, because a presigned `PUT` can't bound its body; completion checks sizes and per-user quotas bound the total.
 
-Stage 3 (> 1B events): Move view events to ClickHouse, a columnar OLAP database optimized for aggregation over append-only data. Raw events flow through Kafka to ClickHouse. PostgreSQL retains only video metadata. ClickHouse handles billion-row aggregations in sub-second because it stores columns contiguously, enabling SIMD-vectorized scans.
+---
 
-**Unique viewer counting at scale:** COUNT DISTINCT over millions of rows is O(n) in memory. Redis HyperLogLog provides approximate unique counts (< 0.81% standard error) with constant memory (12KB per counter, regardless of cardinality). Each view event adds the viewer ID to a HyperLogLog key namespaced by video ID. The PFCOUNT command returns the approximate unique count in O(1). For a video analytics dashboard, 99.2% accuracy is indistinguishable from 100% to the video creator.
+## 🔧 Deep Dive 2: Share Links That Can Be Revoked (7 min)
 
-**Bot and duplicate prevention:**
+"A share link is a capability: whoever has it can watch. The questions are how to make one, how to protect it with a password without making every request expensive, and how to take it back."
 
-1. Session-based deduplication: the same session_id can only count as one view per video per hour
-2. Minimum watch duration threshold: views with watch_duration < 3 seconds are recorded but excluded from "meaningful" view counts
-3. Rate limiting on the `/analytics/view` endpoint: max 10 view events per minute per IP prevents programmatic inflation
-4. User-agent filtering: known bot user-agents are excluded from analytics but still recorded for audit
+| Approach | Revocable | Cost per request | Verdict |
+|----------|-----------|------------------|---------|
+| ❌ Signed URL (HMAC of video + expiry) | Only by rotating the key for every link | None | Can't undo one mistaken share |
+| ❌ Token, password re-checked every request | Yes | bcrypt, ~100 ms CPU | A protected video becomes a denial-of-service target |
+| ❌ Cache "this token is unlocked" | Yes | None | The cache key is the URL, so anyone with the link skips the password |
+| ✅ Token row + signed per-viewer grant + short playback cookies | Yes, next request | One indexed lookup | Password checked once per viewer |
 
-**View count consistency:** The `view_count` on the videos table is incremented atomically with `UPDATE videos SET view_count = view_count + 1`. This can diverge slightly from the true count in view_events if a transaction fails after inserting the event but before incrementing the counter. We accept this -- the dashboard aggregation from view_events is authoritative, while view_count is an approximate counter for display in the video grid.
+**Why it works.** The token is 256 random bits, looked up by its hash. Expiry, password and download permission are columns on that row, so revoking is deleting it. When a viewer enters the right password, I issue a grant: an `HttpOnly` cookie, signed with HMAC, that names the share and the video. Every later request presents the grant, and I re-read the share row — an indexed lookup that costs far less than bcrypt — so revocation and expiry take effect on the very next request, while bcrypt runs once per viewer instead of once per request.
 
-**The trade-off:** We accept slight inaccuracy (HyperLogLog approximation, view_count divergence) for massive performance gains. We also accept analytics delay (up to 5 seconds at local scale, up to 5 minutes with materialized views) in exchange for not blocking the video playback path on analytics writes. If the analytics service is completely down, video playback and sharing still work -- degraded analytics don't affect the core experience.
+**Why the alternatives fail.** A signed URL can't be revoked individually: it's valid until it expires, and rotating the signing key kills every link we've ever issued. Re-checking the password every request turns each protected video into a CPU sink — twenty requests a second is two cores doing nothing but bcrypt. Caching the unlock by token is the subtle failure: the token *is* the link, so the cache would wave through anyone who has the URL, which is exactly who the password was meant to stop.
 
-### Deep Dive 3: Share Link Security and Access Control
+**The credential I can't take back.** The bytes come from the CDN, which can't call my database per segment, so playback uses CDN signed cookies scoped to that video's prefix. Once issued, they're valid until they expire. I make them short — 10 minutes — and the player refreshes them through the API, which re-checks the share. So revocation is immediate for new requests and takes at most 10 minutes for someone already watching. That number goes into the product copy.
 
-> "Share links are the primary distribution mechanism. Getting the security model wrong means either unauthorized access to private videos or broken sharing workflows."
+**Abuse.** Password attempts are rate-limited per link and per client — 10 failures per 15 minutes, counted in Redis so the limit holds across instances. That limiter fails *closed*: if Redis is down, password attempts are refused rather than let an attacker run bcrypt guesses unmetered. The general API limiter fails *open*, because blocking everyone during a Redis blip would be worse than briefly not limiting.
 
-**The problem:** Share links must be simultaneously easy to create and use (one click to generate, one click to view) and secure (unguessable, revocable, optionally password-protected and time-limited). We need to balance convenience against security, and we need to support different access policies (public, password-protected, time-limited, download-allowed) without creating a complex permission system.
+---
 
-**Token design:** Share tokens are `crypto.randomBytes(32).toString('hex')` -- 256 bits of entropy encoded as 64 hex characters. At 256 bits, even generating 1 billion tokens per second for 100 years, the probability of a collision is approximately 2^-196 -- effectively zero. Tokens are stored in the `shares` table with a UNIQUE index, and lookups use this index for O(log n) performance.
+## 🔧 Deep Dive 3: Processing Without Making Anyone Wait (5 min)
 
-**Why not UUIDs?** UUID v4 has 122 bits of randomness, which is cryptographically adequate for most purposes. But share tokens are user-facing and security-critical. Three reasons to use crypto.randomBytes instead:
+"Transcoding a three-minute recording into an HLS ladder takes about as long as the recording. If the link waited for it, Stop-to-link would be minutes. So the rule is: playable first, better later."
 
-1. 256 bits vs 122 bits provides 2^134 more combinations -- defense in depth against future cryptographic advances
-2. The 64-character hex format is visually distinct from UUIDs (no hyphens), preventing confusion with internal resource IDs
-3. UUIDs include version and variant bits that reduce effective entropy; crypto.randomBytes is pure randomness
+1. **The original is playable immediately.** Completion verifies the upload and the status becomes `processing`, which the player treats as watchable. Processing only upgrades the video.
+2. **The first job is a remux.** MediaRecorder writes WebM without a duration or a seek index, so a browser can't seek until it has downloaded everything — which breaks clicking a comment at 4:20. A copy-only remux fixes that in seconds without re-encoding, and the same pass probes the real duration and grabs a poster.
+3. **Jobs are leased, and leases are fenced.** A worker claims a job with `FOR UPDATE SKIP LOCKED`, sets `locked_until`, and increments `attempts`. If it dies, the lease expires and another worker takes the job. Its final write only succeeds if the row still carries its (worker, attempt) pair, so a worker that stalled past its lease can't overwrite the new owner's results.
+4. **Outputs are idempotent.** Renditions go to fixed keys next to the source, so a retry overwrites rather than duplicates.
+5. **Failure has a floor.** After five attempts with exponential backoff the job is dead-lettered and the video becomes `ready` on its original file, with the failure recorded. A recording FFmpeg can't process is still a recording.
 
-**Why not signed URLs (HMAC)?** Signed URLs encode the video ID and permissions into the URL itself, verified by an HMAC signature. This avoids database lookups on every view -- the server validates the signature cryptographically without touching the database. But signed URLs have two critical weaknesses:
+| Option | Verdict |
+|--------|---------|
+| ✅ Play the original, process in the background | Link works at Stop; quality improves within minutes |
+| ❌ Block the link until transcoded | Minutes of waiting on every recording |
+| ❌ Exclusive lock held for the whole job | A crashed worker strands the job until someone intervenes |
 
-1. **Revocation:** To revoke a single signed URL, you must rotate the signing key, which invalidates ALL signed URLs. With token-based shares, revocation is `DELETE FROM shares WHERE id = $1` -- instant and surgical.
+"What I give up is a window where seeking is weak and there's no adaptive bitrate. Most recipients open the link minutes later, when processing is done, so they never see it. And since transcoding is the biggest compute bill — about 2,100 minutes of new video per minute at peak — I'd produce only the first rendition eagerly and build the higher rungs for videos that actually get watched."
 
-2. **Password protection:** Adding a password to a signed URL requires embedding a password hash in the URL itself (insecure -- visible in browser history) or maintaining a server-side record (which defeats the "no database lookup" benefit). Token-based shares store the password hash in the database row alongside the token.
+---
 
-> "Token-based shares trade a database lookup per access for surgical revocability and clean password support. At 60 lookups/second, this trade-off is heavily in our favor."
+## 📈 Scale, Failures & Observability (2 min)
 
-**Password protection flow:**
+**What breaks first, in order:** transcode capacity at peak (lazy renditions and autoscaling on queue age), the analytics pipeline (Kafka partitions and ClickHouse shards; the dashboard reports its lag), then PostgreSQL storage in a few years (shard by owner).
 
-1. Owner creates a share with a password. The password is bcrypt-hashed (10 rounds, ~100ms) and stored on the share row. The plaintext password is never stored
-2. Viewer accesses the share URL `/share/:token`. The server finds the share row, detects a password_hash exists, and returns 401 with `{ requiresPassword: true }`
-3. The client shows a password prompt. The viewer enters the password
-4. The client retries with `?password=...`. The server bcrypt-compares the input against the stored hash. On match, it returns the video with a presigned playback URL. On failure, it returns 401
+| Failure | What users see | Mitigation |
+|---------|----------------|------------|
+| Network drops while recording | "Upload paused", recording continues | Parts queue; per-part retries with fresh URLs |
+| Tab closed mid-recording | The video fails or ends at the last part | Sweeper after 30 idle minutes; lifecycle rule |
+| Complete response lost | Nothing | Completion is idempotent |
+| Object storage down | Can't start or finish uploads | Breaker fails fast with `503`; the recorder keeps buffering |
+| Worker crash | Processing finishes later | Lease expiry + fencing |
+| Redis down | Sign-in fails; share links keep working | Watching a link needs only PostgreSQL and storage |
+| Kafka down | Analytics gap | Buffer briefly, then drop and count; dashboard flags it |
 
-**Expiration enforcement:** Expiration is checked server-side on every share access -- not via client-side timers, CDN TTLs, or presigned URL expiry. If `expires_at < NOW()`, the server returns 404 regardless of whether the token is correct. This ensures expired links cannot be replayed even if the URL is cached in a browser, shared on Slack, or bookmarked. The check is a simple timestamp comparison -- negligible overhead.
+**What I'd watch:** Stop-to-link latency reported by clients (the SLO), part URL rate, completion outcomes (a rise in `incomplete` means clients are losing parts), uploads swept per hour, the age of the oldest queued job, dead jobs, share opens by status code, and Kafka consumer lag.
 
-**Access control matrix:**
+---
 
-| Feature | No Password | With Password | Expired | Revoked |
-|---------|-------------|---------------|---------|---------|
-| Token lookup | Found | Found | Found | Not found |
-| Password check | Skip | Verify bcrypt | N/A | N/A |
-| Expiry check | Pass | Pass | Fail (404) | N/A |
-| Result | Video + URL | Video + URL | Error | Error |
+## ⚖️ Trade-offs & Wrap-up (1 min)
 
-**Caching strategy at scale:** At 60 lookups/second, PostgreSQL handles token validation trivially. At 60,000/second (viral video with a share link), we would cache validated tokens in Redis:
+| Decision | ✅ Chosen | ❌ Alternative | Why |
+|----------|-----------|----------------|-----|
+| Upload | Multipart parts during recording, direct to storage | One upload after Stop, or a proxy | Link ready ~1 s after Stop; API scales by requests |
+| Completion | Parts listed from storage, verified | Trust the client's list | Idempotent; never marks missing bytes playable |
+| Abandoned uploads | Activity-based sweeper + lifecycle rule | Timeout from creation | Long recordings aren't killed |
+| Share access | Token row + signed grant | Signed URLs | Revocable; bcrypt once per viewer |
+| Playback credentials | 10-minute CDN cookies | Long-lived URLs | Bounds revocation for active viewers |
+| Processing | Play original, transcode later | Block on transcode | No waiting |
+| Jobs | Leases + fencing | Locks held for the job | Crash recovery without stale writes |
+| Views | View ID heartbeats in ClickHouse | Row per request in PostgreSQL | Exact and retry-safe at 16K/s |
 
-- Key: `share:validated:{token}` containing the video ID and permissions
-- TTL: `min(remaining_expiry, 5_minutes)` -- never cache longer than the share's remaining lifetime
-- Invalidation: on share deletion, explicitly delete the Redis key with `DEL share:validated:{token}`
-- Password-protected shares are NOT cached -- every access must re-verify the password
-
-This caching layer reduces database load by 99% for popular share links while maintaining correct security behavior.
-
-**The trade-off:** Every share access requires a database lookup (token + JOIN to video + JOIN to user). This is three tables joined on indexed foreign keys -- under 1ms in PostgreSQL. We pay this cost on every access to gain: individual revocation (DELETE one row), password protection (bcrypt on the same row), and expiration enforcement (timestamp comparison on the same row). The alternative (signed URLs with HMAC) saves the database lookup but loses all three of these capabilities.
-
-### Deep Dive 4: Abuse Resistance and the bcrypt Cost of Protected Shares
-
-> "The previous deep dive ended on a deliberate gap: password-protected shares can't be cached. That gap is also the system's cheapest denial-of-service target, so it's worth following through."
-
-**The problem:** A public share link is an unauthenticated endpoint that anyone with the URL can hit. For an unprotected share that's fine — the work is one indexed lookup. For a *protected* share, every single request runs bcrypt at 10 rounds, which is ~100ms of deliberately-expensive CPU. That asymmetry is the whole issue: the attacker spends a few bytes on a request, the server spends a tenth of a CPU-second answering it. Twenty requests per second against one protected share saturates two full cores doing nothing but hashing.
-
-**Why the obvious fix is wrong.** The instinct is to cache the validation result, exactly as we cache unprotected tokens. But caching "this token passed its password check" makes the check meaningless — the cache key is the token, and the token is what the attacker already has. Anyone who fetched the URL after a legitimate viewer authenticated would ride that cached entry straight through. Lowering the bcrypt cost factor is the other tempting fix, and it's worse: it speeds up the offline attack the cost factor exists to prevent, trading a real security property for a throughput problem that has a cheaper answer.
-
-**What actually works: make the *viewer* stateful, not the share.** A successful password check mints a short-lived cookie scoped to that one share token. Subsequent requests present the cookie, the server verifies it, and bcrypt runs exactly once per viewer per session rather than once per request. The security property survives because the cookie is issued only after a real password verification and is bound to a single share.
-
-| Approach | Bcrypt runs | Revocable | Safe |
-|----------|-------------|-----------|------|
-| ✅ Verify once, issue a scoped short-lived cookie | Once per viewer session | Yes — cookie TTL is short and the share row still gates issuance | Yes |
-| ❌ Cache validation by token | Once per TTL, globally | No — cache key is the public token | No: grants access to anyone holding the URL |
-| ❌ Reduce bcrypt cost factor | Every request, faster | Yes | No: weakens the offline attack it exists to resist |
-| ❌ Nothing (current implementation) | Every request | Yes | Yes, but trivially DoS-able |
-
-> "What I'd flag in review is that this reintroduces exactly the server-side session state the presigned-URL design worked so hard to avoid. I think that's the right call anyway — it's one small key with a short TTL, not video bytes — but it's a real concession and I'd rather name it than pretend the design is uniformly stateless."
-
-**Rate limiting is the layer underneath.** Two Redis-backed limiters run in front of this. A global limiter covers all `/api` traffic, and a stricter one covers uploads, where a single request costs far more than a JSON response. Redis rather than in-memory counters is the important detail: with in-memory state, every API instance keeps its own tally, so an attacker spreading requests across N instances gets N times the allowance and the limit silently means nothing behind a load balancer.
-
-The limits are deliberately per-endpoint rather than one global number. Uploads, share validation, and metadata reads have completely different costs and completely different abuse profiles — a single shared bucket would either be too loose to stop upload abuse or so tight that ordinary library browsing trips it. The cost is more configuration and more ways to misconfigure; the benefit is that the expensive endpoints get the protection they actually need.
-
-**What we give up:** rate limiting is per-IP, which is the wrong unit for both directions. It punishes legitimate users behind a shared NAT — an office of fifty people looks like one very busy client — and it barely inconveniences a distributed attacker with a pool of addresses. Doing better means per-account limits for authenticated routes and something like proof-of-work or a CAPTCHA on the anonymous share path, neither of which is worth building before there's evidence of abuse.
-
-## 9. Failure Handling
-
-> "Let me describe how the backend handles failures in each layer."
-
-**Database failures:** The PostgreSQL connection pool is configured with 20 max connections and a 5-second connection timeout. If the pool is exhausted, new requests fail fast with 503 rather than queuing indefinitely. The health check endpoint (`GET /api/health`) runs `SELECT 1` against the pool -- load balancers use this to remove unhealthy instances.
-
-**Object storage failures:** MinIO/S3 operations (presigned URL generation, object deletion, stat) are wrapped in a circuit breaker (Opossum). If 50% of operations fail within a 10-second window, the circuit opens and subsequent calls fail immediately for 30 seconds. This prevents cascading failures where slow S3 responses consume all Node.js event loop time.
-
-**Upload failure recovery:** If a client fails during upload, the video remains in "processing" status. The client can retry by requesting a new presigned URL -- the old URL may have expired (1-hour TTL). The backend updates the storage_path to the new object name.
-
-**The reconciliation gap.** I want to be precise here rather than wave at a cleanup job, because this is the sharpest unresolved edge in the design. The four upload steps are four independent operations with no transaction spanning them, and there is no distributed transaction available -- one participant is a database, the other is an object store. So two failure modes leak, in opposite directions:
-
-| Client dies after | Leaves behind | Visible to user as |
-|-------------------|---------------|--------------------|
-| Step 1–2 (row created, no PUT) | A `videos` row in `processing` with no object | A recording stuck "processing" forever |
-| Step 3 (PUT done, no complete call) | A real object with a row still in `processing` | Same, but now also paying storage |
-
-Neither self-heals, and nothing currently sweeps them. The honest design question is which side should be authoritative. Marking rows stale after N minutes is easy and wrong on its own -- a viewer on a slow connection legitimately takes longer than any threshold you'd pick for a snappy UI, so you'd fail uploads that were about to succeed. Making the object store authoritative and reconciling rows against a bucket listing is more correct but turns a cheap query into a full-prefix scan, and it's eventually consistent in exactly the window you care about.
-
-The pragmatic answer is both, at different tempos: a short-timeout sweep that only marks rows `failed` when the object genuinely isn't there (a `statObject` check, not a bare timestamp comparison), plus an infrequent, offline reconciliation that garbage-collects objects with no referencing row. What we give up is immediacy -- a user can see a stuck "processing" card for minutes before anything corrects it -- and that's the cost of not having a transaction across the two stores.
-
-**Redis failures:** Redis is used for session storage and caching. If Redis is unavailable, sessions cannot be validated -- authenticated endpoints return 401. The Redis client uses exponential backoff (50ms * attempts, max 2s) for reconnection. Critically, the share validation endpoint can still serve unauthenticated share links without Redis -- share tokens are validated against PostgreSQL directly.
-
-> "That last point is the one I'd highlight. It means a Redis outage degrades the product to read-only public viewing rather than taking it down: creators can't sign in, but every share link already in circulation keeps working. Given that shares are how the content actually reaches people, losing the authoring path while preserving the distribution path is the right way for this system to fail. It's also a direct consequence of choosing Redis-backed sessions over JWTs — with stateless tokens the authoring path would survive a Redis outage too, but we'd have given up the immediate revocation that a sharing product needs.
-
-## 10. Scalability Discussion
-
-> "Let me walk through what breaks at different scale levels."
-
-**10K DAU (current):** Single PostgreSQL instance handles everything. MinIO runs locally. Redis for sessions. No caching or CDN needed.
-
-**100K DAU:** Add PostgreSQL read replicas for video listing and analytics queries. Redis caches hot video metadata (TTL 5 minutes) to reduce database load. Rate limiting moves from in-memory to Redis-backed for consistency across API instances.
-
-**1M DAU:** CDN for video delivery becomes mandatory -- serving 50TB/day of raw video files from origin is cost-prohibitive ($4,500/day at S3 egress pricing vs. $500/day via CloudFront). PostgreSQL analytics queries become slow; migrate view events to ClickHouse. Add Elasticsearch for full-text video search. Multiple API instances behind a load balancer.
-
-**10M DAU:** Shard PostgreSQL by user_id hash for video metadata -- keeps a user's library on one shard. Partition view_events by month for efficient pruning. Move to HLS/DASH adaptive streaming with a transcoding pipeline (FFmpeg workers consuming from a job queue). Consider edge recording processing -- initial transcoding at CDN edge locations to reduce origin bandwidth.
-
-**Key bottleneck evolution:**
-1. Storage bandwidth (solved by CDN) --
-2. Analytics queries (solved by ClickHouse) --
-3. Metadata writes (solved by sharding) --
-4. Real-time features (solved by WebSocket infrastructure) --
-5. Transcoding throughput (solved by worker fleet auto-scaling)
-
-## 11. Trade-offs Summary
-
-| Approach | Pros | Cons |
-|----------|------|------|
-| Presigned URLs for upload | API stays stateless, no bandwidth bottleneck, S3 handles retries | More client logic, multi-step upload, URL expiration |
-| ❌ Proxy upload through API | Simpler client, single endpoint | API becomes memory/bandwidth bottleneck |
-| Token-based shares | Individual revocation, password support, expiry | Database lookup per access |
-| ❌ Signed URLs (HMAC) | No database lookup, fast validation | Cannot revoke individual links, no clean password model |
-| Nullable timestamp for comments | Simple schema, single table and query | No compile-time type distinction between comment variants |
-| ❌ Polymorphic comment types | Type-safe variant distinction | Two tables or discriminated union for one nullable field |
-| PostgreSQL for analytics (local) | Single database, simpler operations | Aggregation becomes slow past 100M rows |
-| ❌ ClickHouse from day one | Sub-second aggregation at any scale | Operational overhead, separate deployment, Kafka pipeline |
-| Denormalized view_count | Fast display in video grid, no JOIN needed | Can diverge from authoritative count in view_events |
-| ❌ COUNT(*) from view_events | Always accurate | O(n) query per video in grid listing |
-| WebM (browser-native) | No server-side transcoding, instant availability | Not universally supported, no adaptive bitrate |
-| ❌ HLS/DASH transcoding | Universal playback, adaptive quality | Requires FFmpeg pipeline, storage of multiple renditions |
-| Session auth (Redis) | Immediate revocation, simple implementation | Server-side state, Redis dependency |
-| ❌ JWT tokens | Stateless, scales horizontally | No revocation without blocklist, token size grows with claims |
-| Scoped short-lived cookie after password check | Bcrypt runs once per viewer, not per request | Reintroduces server-side state on the share path |
-| ❌ Cache share validation by token | Removes the bcrypt cost entirely | Cache key is the public token — grants access to anyone holding the URL |
-| Redis-backed per-endpoint rate limits | Correct behind a load balancer, tuned to each endpoint's real cost | More configuration, more ways to misconfigure |
-| ❌ In-memory global rate limit | Zero dependencies | Per-instance counters — N instances means N times the allowance |
+"With more time I'd add an IndexedDB journal so a crashed tab can resume its upload, start transcoding the first parts while the user is still recording, and generate transcripts — which would also make the library searchable."
