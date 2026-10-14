@@ -1,356 +1,302 @@
-# Microsoft Teams - Frontend System Design Answer
+# 💬 Microsoft Teams — System Design Answer (Frontend Focus)
 
-## 🏗️ Architecture Overview
+*45-minute frontend interview, structured with the [RADIO framework](https://www.greatfrontend.com/front-end-system-design-playbook/framework): Requirements → Architecture → Data model → Interface → Optimizations. This is a proposed production design; what this repository actually runs is described in [architecture.md → Implementation Notes](./architecture.md#implementation-notes).*
 
-> "I'm designing the frontend for an enterprise chat application like Microsoft Teams. The core challenge is building a responsive, real-time chat UI that handles thousands of messages per channel, threaded conversations in a side panel, and live presence indicators -- all while maintaining smooth scrolling performance and instant message delivery."
+> "The hard part of a chat client isn't drawing messages. It's that the message list is fed by two sources at once, a history request and a live stream, and they have to meet exactly, with nothing missing and nothing shown twice, even when the network drops, the user scrolls back three days, or the same message arrives as both a REST response and a stream event. Everything else (virtualization, optimistic sends, reconnects) hangs off one idea: every event in a channel carries a sequence number, and the client keeps a cursor."
 
-The frontend is a React SPA using TanStack Router for file-based routing, Zustand for state management, Server-Sent Events for real-time updates, and Tailwind CSS with a Teams-branded color system.
+| Phase | Time | What I want the interviewer to leave with |
+|-------|------|--------------------------------------------|
+| R — Requirements | 5 min | Features, performance and accessibility targets |
+| A — Architecture | 9 min | Component tree, who owns which state, the data layer, three key flows |
+| D — Data model | 5 min | The message store, the cursor, the pending outbox |
+| I — Interface | 4 min | The API and stream as the client sees them |
+| O — Optimizations & deep dives | 18 min | A fast live list, consistency at the cursor, offline and multi-tab |
+| Loading, error & empty states | 2 min | What the UI does when things go wrong |
+| Wrap-up | 2 min | Trade-offs and next steps |
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         Browser Application                            │
-│                                                                        │
-│  ┌──────────┐  ┌──────────────────────────────────────────────────────┐ │
-│  │          │  │                  Main Content                        │ │
-│  │  Sidebar │  │  ┌────────────┐  ┌─────────────────┐  ┌──────────┐ │ │
-│  │  (Orgs + │  │  │  Channel   │  │                 │  │  Thread  │ │ │
-│  │  Teams)  │  │  │   List     │  │    Chat Area    │  │  Panel   │ │ │
-│  │          │  │  │            │  │   (Messages +   │  │          │ │ │
-│  │  64px    │  │  │  240px     │  │    Input)       │  │  320px   │ │ │
-│  │          │  │  │            │  │                 │  │          │ │ │
-│  └──────────┘  │  └────────────┘  └─────────────────┘  └──────────┘ │ │
-│                └──────────────────────────────────────────────────────┘ │
-│                                                                        │
-│  ┌─────────────────────────────────────────────────────────────────────┤
-│  │  State: AuthStore (user, session) + ChatStore (messages, channels) │ │
-│  │  SSE: EventSource per channel, auto-reconnect                      │ │
-│  │  API: Fetch with credentials, proxy via Vite                       │ │
-│  └─────────────────────────────────────────────────────────────────────┘ │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+---
 
-## 🧩 Component Architecture
+## 🎯 R — Requirements (5 min)
 
-> "The UI follows a three-column layout typical of enterprise chat apps. The leftmost column is a narrow sidebar for organization and team selection. The middle column lists channels. The right area is the chat view with an optional thread panel and member list that slide in from the right."
+"Let me confirm who uses this and where, because enterprise chat runs all day in a background tab on a work laptop."
 
-### Component Hierarchy
+### Functional requirements
 
-```
-__root.tsx (auth check, loading state)
-├── /login (LoginPage)
-├── /register (RegisterPage)
-├── / (IndexPage - redirect to first org)
-└── /org (OrgLayout - sidebar + presence heartbeat)
-    └── /org/$orgId (OrgPage - load teams, channel list)
-        └── /org/$orgId/team/$teamId (TeamPage - load channels)
-            └── /org/$orgId/team/$teamId/channel/$channelId (ChannelPage)
-                ├── ChatArea
-                │   ├── ChannelHeader (name, description, member toggle)
-                │   ├── MessageList
-                │   │   └── MessageItem (avatar, content, reactions, thread count)
-                │   │       └── ReactionPicker (emoji grid)
-                │   └── MessageInput (text + file attach)
-                ├── ThreadPanel (conditional)
-                │   ├── Parent message
-                │   ├── Reply list
-                │   └── Reply input
-                └── MemberList (conditional, with PresenceIndicator)
-```
+1. **Navigate** organizations, teams and channels; every view has a shareable URL.
+2. **Read** a channel: the newest messages first, older history on scroll, one-level threads in a side panel.
+3. **Send** messages and thread replies that appear instantly and survive flaky networks; react with emoji.
+4. **Live updates:** new messages, edits, deletions and reactions appear without refreshing.
+5. **Presence and unread:** who's online in the member list, unread badges on other channels.
 
-### Key Components (~15)
+Out of scope: meetings UI, rich-text editor internals, file previews.
 
-| Component | Responsibility | Key Props/State |
-|-----------|---------------|-----------------|
-| Sidebar | Org icons + team buttons | organizations, teams, currentTeamId |
-| OrgSelector | Organization icon buttons | organizations, currentOrgId |
-| ChannelList | Channel list + create button | channels, currentChannelId |
-| ChatArea | Message feed + header + input | messages, currentChannel |
-| MessageList | Date-grouped messages | messages array |
-| MessageItem | Single message with hover actions | message object |
-| MessageInput | Text area + file button | onSend callback, channelId |
-| ThreadPanel | Side panel for replies | threadMessages, parentMessage |
-| ReactionPicker | Emoji selection grid | onSelect callback |
-| MemberList | Online/offline member sections | channelMembers |
-| PresenceIndicator | Green/gray dot | isOnline boolean |
-| TypingIndicator | "User is typing..." text | typing users array |
-| FileAttachment | File card with download | fileId, filename, size |
-| CreateChannelModal | New channel form | teamId, onClose |
-| SearchUsers | User search autocomplete | onSelect callback |
+### Non-functional requirements
 
-## 🧭 Routing Architecture
+| Requirement | Target | Why |
+|-------------|--------|-----|
+| LCP | < 2.5 s on a mid-range laptop | First load of the day |
+| Channel switch | < 100 ms to cached content, < 300 ms cold | People hop between channels constantly |
+| INP | < 200 ms while 20 events/s stream in | Typing must never stutter because messages arrive |
+| Delivery to screen | < 100 ms after the event reaches the browser | The backend already spends ~400 ms |
+| Memory | < 150 MB after 8 hours open | Runs all day in a background tab |
+| Correctness | No missing, duplicated or reordered messages, including after reconnects | Trust in the conversation |
+| Accessibility | WCAG 2.2 AA; new messages announced politely; every action keyboard-reachable | Workplace tool, legal requirement |
 
-> "The routing structure mirrors the data hierarchy. TanStack Router's file-based routing with nested layouts means each route level loads its corresponding data. Navigation between channels only re-renders the innermost component, not the entire page."
+---
 
-### Route-to-Data Mapping
+## 🏗️ A — Architecture (9 min)
+
+"A client-rendered SPA. It's an authenticated app with no SEO, and the expensive part is the live list after load, not the first paint, so server rendering would buy little. I'd keep the initial bundle small and code-split the thread panel, settings and admin screens."
 
 ```
-/org                          → OrgLayout loads orgs, starts heartbeat
-  /org/$orgId                 → OrgPage loads teams for this org
-    /org/$orgId/team/$teamId  → TeamPage loads channels for this team
-      .../channel/$channelId  → ChannelPage loads messages, connects SSE
+  ┌──────────────────────────────────────────────────────────────────────────────────────────┐
+  │ Routes (TanStack Router) · the URL owns the selection                                    │
+  │ /org/$orgId/team/$teamId/channel/$channelId                                              │
+  └─────────┬──────────────────────────────────┬────────────────────────────────┬────────────┘
+            ▼                                  ▼ (1) channel opens              ▼
+  ┌────────────────────────┐    ┌──────────────────────────────┐    ┌────────────────────────┐
+  │ Sidebar · ChannelList  │    │ ChannelPage · ChatArea       │    │ ThreadPanel            │
+  │ team, channel pickers  │    │ MessageList (virtualized)    │    │ MemberList · presence  │
+  └─────────┬──────────────┘    │ Composer                     │    └───────────┬────────────┘
+            │ read lists        └───────┬──────────────────────┘                │ read thread
+            │                           │ (2) send, load older                  │
+            ▼                           ▼                                       ▼
+  ┌────────────────────────────┐    ┌────────────────────────────────────────────────────────┐
+  │ Server-state cache         │    │ Message store (Zustand) · the open channel             │
+  │ orgs, teams, channels,     │    │ messages ordered by seq · cursor · pending sends       │
+  │ members (TanStack Query)   │    │ open thread · stream status                            │
+  └─────────┬──────────────────┘    └───┬─────────────┬──────────────────────────────────────┘
+            │ GET lists                 │             │ persist outbox              ▲ (3) apply
+            │                 GET, POST │             │                             │ if next seq
+            ▼                           │             ▼                             │
+  ┌──────────────────────────┐          │   ┌──────────────────────┐  ┌─────────────┴────────┐
+  │ API client               │          │   │ IndexedDB            │  │ Event stream (SSE)   │
+  │ fetch · AbortSignal      │◀─────────┘   │ outbox, recent pages │  │ reopen with cursors  │
+  │ typed errors             │              └──────────────────────┘  └───────────┬──────────┘
+  └─────────┬────────────────┘                                                    │
+            │ HTTPS, session cookie                       GET /events?cursors=…   │
+            ▼                                                                     ▼
+  ┌──────────────────────────────────────────────────────────────────────────────────────────┐
+  │ Chat API · Push Gateway  (backend design: system-design-answer-backend.md)               │
+  └──────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Why TanStack Router Over React Router
+1. **Open a channel (1).** The URL changes, `ChannelPage` asks the message store to open the channel, the store fetches the newest page and its `latestSeq`, and only then adds the channel's cursor to the event stream.
+2. **Send (2).** The composer hands text to the store, which inserts a pending row immediately, saves it to the IndexedDB outbox, and posts it with a client-generated `clientMessageId`.
+3. **Live update (3).** The event stream delivers an event tagged with its channel and `seq`; the store applies it only if it is exactly the next number, and the virtualized list re-renders the rows that changed.
+
+### Who owns which state
+
+| State | Owner | Why there |
+|-------|-------|-----------|
+| Selected org, team, channel, open thread | URL (router params) | Shareable, survives reload, back button works |
+| Orgs, teams, channels, members | TanStack Query cache | Plain request/response data: caching, dedupe, retries for free |
+| Messages, cursor, pending sends | Message store (Zustand) | Fed by history and the stream; ordering logic lives in one place |
+| Unsent messages | IndexedDB outbox | Must survive a tab close or crash |
+| Draft text, menus, hover state | Component state | Never shared |
+
+"The rule I'm applying: request/response data goes in a query cache, but the message list is a live, event-sourced view, so it gets its own store with explicit merge rules. Putting messages in a generic query cache invites a refetch that overwrites events the stream already applied."
+
+### Key interaction: opening a channel
+
+```
+ ChannelPage         Message store                     Chat API   Event stream
+      │                    │                               │            │
+      │ 1 openChannel(ch)  │                               │            │
+      │───────────────────▶│                               │            │
+      │                    │ 2 GET /messages?channelId=ch  │            │
+      │                    │──────────────────────────────▶│            │
+      │                    │ 3 {messages, latestSeq: 41}   │            │
+      │                    │◀──────────────────────────────│            │
+      │                    │ 4 render page; cursor = 41    │            │
+      │                    │ 5 open with after=41                       │
+      │                    │───────────────────────────────────────────▶│
+      │                    │ 6 id 42, new_message                       │
+      │                    │◀───────────────────────────────────────────│
+      │                    │ 7 42 = cursor + 1: apply      │            │
+      │                    │                               │            │
+```
+
+"History first, stream second, from the exact position the page was read at. If I opened the stream first, a message could arrive before the page and then be wiped when the page replaces the list; if I opened it after with no cursor, anything posted between the two requests would be lost. The cursor makes both orders correct."
+
+### Key interaction: sending
+
+```
+Composer           Message store                              Chat API   Event stream
+    │                    │                                        │            │
+    │ 1 send("ship it")  │                                        │            │
+    │───────────────────▶│                                        │            │
+    │                    │ 2 add pending row, key K               │            │
+    │                    │ 3 POST /messages {clientMessageId: K}  │            │
+    │                    │───────────────────────────────────────▶│            │
+    │                    │ 4 id 43: message with K                             │
+    │                    │◀────────────────────────────────────────────────────│
+    │                    │ 5 replace pending row in place         │            │
+    │                    │ 6 201 message (same id): no-op         │            │
+    │                    │◀───────────────────────────────────────│            │
+    ····················· request fails: row shows Retry ·······················
+    │                    │ 7 retry with the same K                │            │
+    │                    │───────────────────────────────────────▶│            │
+    │                    │ 8 200 original, never a duplicate      │            │
+    │                    │◀───────────────────────────────────────│            │
+    │                    │                                        │            │
+```
+
+"The pending row and the server's message are matched by `clientMessageId`, so it doesn't matter whether the stream event (step 4) or the REST response (step 6) arrives first; the second one finds the message already confirmed and does nothing. A retry reuses the same key, so a request that actually succeeded but whose response was lost can't produce a duplicate."
+
+### Key interaction: a gap and a resync
+
+```
+Event stream                  Message store                           Chat API
+      │                             │                                     │
+      │ 1 id 45 (cursor is 43)      │                                     │
+      │────────────────────────────▶│                                     │
+      │                             │ 2 gap: ignore 45                    │
+      │ 3 reopen with after=43      │                                     │
+      │◀────────────────────────────│                                     │
+      │ 4 replay 44, 45, then live  │                                     │
+      │────────────────────────────▶│                                     │
+      ·················· server answers resync instead ····················
+      │ 5 resync {latestSeq: 900}   │                                     │
+      │────────────────────────────▶│                                     │
+      │                             │ 6 reload newest page, keep pending  │
+      │                             │────────────────────────────────────▶│
+      │ 7 reopen with after=900     │                                     │
+      │◀────────────────────────────│                                     │
+      │                             │                                     │
+```
+
+"The store never applies an event out of order. A jump means something was lost in transit, so it reopens the stream from its cursor and lets the server replay. If the gap can't be replayed (the laptop slept for two days), the server says `resync` and the store reloads the newest page while keeping unsent messages."
+
+---
+
+## 💾 D — Data Model (5 min)
+
+"The message store is normalized per channel and keyed by the server's ordering, not by arrival order."
+
+| Entity | Shape | Where | Notes |
+|--------|-------|-------|-------|
+| `Message` | id, channelId, seq, author, content, parentId, replyCount, reactions, editedAt, deletedAt, clientMessageId, status | Store, by id | `status` exists only on the client: pending or failed |
+| `ChannelTimeline` | ordered seqs, cursor (last applied seq), oldest loaded seq, hasMore | Store, per channel | Up to 10 channels kept, least recently used evicted |
+| `Reaction` | emoji, set of user ids | Inside `Message` | A set, so repeating an event can't double count |
+| `Thread` | root id, reply ids | Store | Only the open thread |
+| `OutboxEntry` | clientMessageId, channelId, content, parentId, attempts | IndexedDB | Removed when the server confirms |
+| Lists | orgs, teams, channels, members | Query cache | Keys like `['channels', teamId]` |
 
-| Approach | Pros | Cons |
-|----------|------|------|
-| ✅ TanStack Router | Type-safe params, file-based, nested layouts | Newer, smaller ecosystem |
-| ❌ React Router v6 | Mature, well-documented | No file-based routing, less type safety |
+Three modeling decisions:
 
-> "TanStack Router's file-based routing with typed parameters is ideal for this app's deep hierarchy. The route `/org/$orgId/team/$teamId/channel/$channelId` has three dynamic segments -- TanStack Router validates these at compile time, preventing runtime crashes from typos in parameter names. React Router would require manual type assertions at each level."
+- **Order by `seq`, never by timestamp.** Timestamps from different senders' clocks disagree; `seq` comes from the server in commit order. Pending messages have no `seq` yet, so they render after every confirmed one until the server places them.
+- **Reactions are sets of users, not counters.** An optimistic toggle followed by its own stream event, or a replayed event, then changes nothing the second time.
+- **Deletions are tombstones.** A deleted thread root still anchors its replies, rendered as "This message was deleted."
 
-### Navigation-Driven Data Loading
+---
 
-Data loading is triggered by route transitions, not by user actions in the UI. When the user clicks a channel name:
-1. TanStack Router navigates to the new channel route
-2. The ChannelPage component's `useEffect` fires with the new channelId
-3. ChatStore calls `setCurrentChannel(channelId)` which disconnects the old SSE, clears messages, loads new messages, connects new SSE
+## 🔌 I — Interface (4 min)
 
-This approach ensures the URL is always the source of truth for application state. Users can share channel links, and browser back/forward navigation works correctly.
+### The API as the client sees it
 
-## 🔄 State Management
+```
+GET    /api/v1/channels/{id}/messages?before=<seq>&limit=50  → {messages, latestSeq, hasMore}
+POST   /api/v1/messages        {channelId, content, parentId?, clientMessageId} → 201 | 200 replayed | 422
+GET    /api/v1/messages/{id}/thread                          → root + replies in seq order
+PUT    /api/v1/messages/{id}/reactions/{emoji}               → idempotent; event only if changed
+DELETE /api/v1/messages/{id}/reactions/{emoji}
+GET    /events?cursors=ch1:41,ch2:17     SSE: events tagged {channel, seq}; resync when too old
+POST   /api/v1/channels/{id}/read?seq=<n>
+```
 
-> "I split state into two Zustand stores: AuthStore for authentication and ChatStore for everything chat-related. This separation ensures auth state doesn't trigger unnecessary re-renders in chat components."
+- `latestSeq` is the contract that matters most: the history page is everything up to it, the stream is everything after it.
+- Every stream event carries its channel and `seq`, so the client can detect duplicates and gaps per channel.
+- `404` means "doesn't exist or you can't see it". The UI shows the same "Channel not found" for both, which is also why a deep link to a private channel leaks nothing.
 
-### AuthStore
-- `user` (User or null), `loading`, `error`
-- Actions: `login`, `register`, `logout`, `checkAuth`
-- Persists session via HTTP-only cookies (server-managed)
+### Component contracts
 
-### ChatStore
+| Component / hook | Contract |
+|------------------|----------|
+| `<ChannelPage channelId>` | Opens the channel on mount and closes it on unmount; nothing else talks to the stream |
+| `<MessageList channelId>` | Virtualized; reads ordered ids from the store; owns scroll anchoring |
+| `<MessageItem id>` | Subscribes to one message by id, so a reaction re-renders one row |
+| `<Composer onSend>` | Owns the draft; hands text to `useSendMessage()` and clears |
+| `useSendMessage()`, `useToggleReaction()` | Wrap the optimistic update, the outbox and the request, so components never touch cursors or keys |
 
-The ChatStore is the largest piece of state, containing:
+---
 
-**Data**: organizations, teams, channels, messages, threadMessages, channelMembers
+## 🔧 O — Optimizations & Deep Dives (18 min)
 
-**Selection**: currentOrgId, currentTeamId, currentChannelId, threadParentId
+### Deep dive 1: a live list that stays fast (7 min)
 
-**Connection**: sseConnection (EventSource reference), showMemberList toggle
+"A busy channel holds thousands of messages of very different heights, grows at the bottom, loads history at the top, and receives events while you type. Three techniques keep it smooth."
 
-**Actions**: ~18 actions including loadOrganizations, loadTeams, loadChannels, loadMessages, loadMoreMessages, loadThread, loadChannelMembers, sendMessage, sendThreadReply, setCurrentOrg, setCurrentTeam, setCurrentChannel, openThread, closeThread, toggleMemberList, connectSSE, disconnectSSE, addMessageFromSSE, startPresenceHeartbeat
+1. **Virtualization with measured heights.** `@tanstack/react-virtual` renders only the rows in view plus a small overscan, so the DOM stays around 40 rows whether the channel holds 50 messages or 5,000. Rows have different heights (code blocks, images, reactions), so each row is measured after it renders and the estimates are corrected.
+2. **Scroll anchoring in both directions.** When older history is prepended, I adjust `scrollTop` by the height that was added above, before paint, so the message the reader is looking at doesn't move. When a new message arrives, I follow it only if the reader was already at the bottom; otherwise a "New messages" pill appears. A reaction landing on a message far up must never yank the view.
+3. **Batching stream bursts.** A reconnect can replay 300 events at once. I apply events to the store in one batch per animation frame and render inside `startTransition`, so keystrokes in the composer stay interactive while the list catches up.
 
-### Why Two Stores
+| Approach | Verdict |
+|----------|---------|
+| ✅ Virtualized list, measured heights, anchored prepends | Constant DOM size; reading position stable both ways |
+| ❌ Render everything | Thousands of rows means seconds of layout and a frozen composer |
+| ❌ Paginate with "page 2" buttons | Breaks the reading flow of a conversation |
 
-> "Auth changes (login/logout) are rare events that should trigger a full page transition. Chat state changes (new message, reaction, presence) happen constantly and should update surgically. With a single store, every message arrival would trigger Zustand's equality check against the entire state tree. Two stores isolate these concerns -- auth re-renders the root layout, chat re-renders only the affected message or presence indicator."
+"The cost is accessibility work: rows that aren't rendered don't exist for a screen reader. The list is a `role="log"` region; I announce only new messages from other people in the open channel, keep keyboard focus on a rendered row while arrow keys move it, and expose 'Load older messages' as a real button."
 
-### Selector-Based Re-rendering
+### Deep dive 2: consistency at the cursor (7 min)
 
-Zustand's selector pattern prevents unnecessary re-renders:
-- `useAuthStore(s => s.user)` only re-renders when user changes
-- `useChatStore(s => s.messages)` only re-renders when messages array changes
-- Components like PresenceIndicator use `useChatStore(s => s.channelMembers)` and won't re-render on message changes
+"Four things can deliver the same message: the history page, the stream, the REST response to my own send, and a replay after reconnect. The store must show it exactly once, in the right place."
 
-## 🔧 Deep Dive 1: Message List Performance
+**The rules the store applies to every incoming event:**
 
-> "The message list is the most performance-critical component. A busy channel might have thousands of messages. Rendering all of them would freeze the browser. The key optimization strategies are pagination, scroll anchoring, and smart re-rendering."
+1. `seq <= cursor`: already applied. Drop it.
+2. `seq = cursor + 1`: apply it and advance the cursor.
+3. `seq > cursor + 1`: something was missed. Drop it and reopen the stream from the cursor; the server replays the gap in order.
+4. `resync`: the gap is too old to replay. Reload the newest page, keep pending sends, reopen from the new `latestSeq`.
 
-### Pagination Strategy
+**Matching my own sends.** A pending row carries the `clientMessageId` I generated; the server's copy carries the same key. Whichever arrives first (the REST response or the stream event) replaces the pending row in place; the other finds a confirmed message and is a no-op.
 
-Messages are loaded newest-first from the API (`ORDER BY created_at DESC LIMIT 50`), then reversed client-side for display. Older messages are loaded when the user scrolls to the top.
+**Stale responses.** Every channel open increments a session counter, and any response that comes back for an older session is dropped, so quickly clicking through three channels can't paint the first one's history into the third. Team and channel lists use the same guard, and the URL, not the store, decides which team and channel are selected.
 
-| Approach | Pros | Cons |
-|----------|------|------|
-| ✅ Cursor-based (before timestamp) | Consistent with insertions | Slightly more complex API |
-| ❌ Offset-based | Simple | New messages shift offsets, duplicates |
-| ❌ Load all messages | Simple display logic | Memory explosion on large channels |
+| Approach | Verdict |
+|----------|---------|
+| ✅ Server `seq` + client cursor + key matching | Exactly-once display across history, stream, replies and replays |
+| ❌ Dedupe by message id only | Catches duplicates but not gaps; a lost event is invisible until reload |
+| ❌ Refetch the whole channel on every reconnect | Correct but slow, and it throws away scroll position and pending state |
 
-> "I chose cursor-based pagination using the `before` timestamp parameter because offset-based pagination breaks when new messages arrive. If 5 new messages are posted while the user loads page 2 at offset 50, they'd see 5 duplicates. Cursor pagination always returns messages older than the cursor timestamp, immune to new insertions."
+"What I give up: the store owns real logic (cursor, gap handling, key matching), and it has to be tested like a reducer. That's why the merge rules are pure functions with unit tests rather than code buried in components."
 
-### Scroll Behavior
+### Deep dive 3: offline, reconnects and many tabs (4 min)
 
-- **New message arrives**: Auto-scroll to bottom if user is already near the bottom (within 100px of the scroll end). If scrolled up reading history, show a "New messages" badge instead of disrupting their reading position.
-- **Load older messages**: When the user scrolls to the top, fetch older messages and prepend them. Preserve scroll position by measuring content height before and after insertion.
-- **Date separators**: Group messages by date and insert visual separators. This is a rendering-only concern -- the MessageList component compares each message's date to the previous message's date and inserts a separator when they differ.
+- **Outbox.** Unsent messages are written to IndexedDB before the request. On reload or reconnect the outbox is replayed with the same `clientMessageId`s, so nothing is lost and nothing is duplicated. After three failures a row shows "Not sent · Retry".
+- **Reconnect.** `EventSource` reconnects by itself; the store shows a "Reconnecting…" banner only after two seconds so brief blips don't flash. Visibility changes matter too: a tab hidden for an hour reconnects with its cursors when it becomes visible.
+- **Many tabs.** Ten open tabs shouldn't mean ten streams. One tab, elected with the Web Locks API, holds the stream and forwards events to the others over `BroadcastChannel`; if it closes, another takes the lock and reconnects with the cursors.
+- **Security.** Messages render as text; links are linkified only for `http:` and `https:`; attachments open through short-lived signed URLs on a separate domain; a strict Content-Security-Policy backs it up.
 
-### Re-Render Optimization
+---
 
-> "Each MessageItem receives a single message object. When a reaction is added via SSE, only the affected message's reactions array changes. Zustand updates the specific message in the messages array using `map()`, which creates a new reference for that message but preserves references for all other messages. React's reconciliation sees that only one MessageItem's props changed, and only re-renders that one."
+## 🧯 Loading, Error and Empty States (2 min)
 
-### Virtual Scrolling (Future Enhancement)
+| Situation | What the user sees | How |
+|-----------|--------------------|-----|
+| First load of a channel | Skeleton rows at real message height | The store is `loading` for the first page only |
+| Loading older history | A small spinner row at the top; reading position kept | Anchored prepend |
+| Stream disconnected | "Reconnecting…" banner after 2 s; history stays readable | Event stream status in the store |
+| Send fails | Dimmed row turns into "Not sent · Retry" | Outbox entry with attempts; retry reuses the key |
+| Gap too old (`resync`) | List refreshes in place; pending sends stay at the bottom | Reload the newest page |
+| Channel not found or no access | "This channel doesn't exist or you don't have access" | Same copy for `404` either way |
+| Empty channel | "No messages yet. Start the conversation!" with the composer focused | The empty state is the onboarding |
+| History fetch fails | "Couldn't load messages" with Try again | Retry reopens the channel |
 
-For channels with 10K+ messages loaded in memory, virtual scrolling with `@tanstack/react-virtual` would render only visible messages plus a small overscan buffer. The challenge with chat is variable message heights -- short text messages differ from messages with file attachments and multiple reactions. This requires `measureElement` for dynamic height measurement:
+---
 
-1. Estimate initial height (e.g., 60px for text-only messages)
-2. After render, measure actual DOM height via `getBoundingClientRect`
-3. Update virtualizer's height cache for accurate scroll position calculation
-4. Overscan 3-5 items above and below viewport for smooth scrolling
+## ⚖️ Wrap-up (2 min)
 
-## 🔧 Deep Dive 2: Real-Time Updates via SSE
+| Decision | ✅ Chosen | ❌ Alternative | Why |
+|----------|-----------|----------------|-----|
+| Rendering | SPA with code splitting | SSR | Authenticated app; the cost is after load |
+| Message state | Dedicated store with seq cursor | Generic query cache | Live, event-sourced data needs explicit merge rules |
+| List state | TanStack Query for orgs, teams, channels | Hand-written fetching in a store | Caching and retries without bespoke code |
+| Ordering | Server `seq` | Client timestamps | One order for everyone |
+| Sends | Optimistic + `clientMessageId` + IndexedDB outbox | Wait for the server | Instant feedback without duplicates |
+| Reactions | Sets of users, optimistic | Counters | Idempotent under replays |
+| Long lists | Virtualized, anchored both ways | Render all | Constant DOM, stable reading position |
+| Tabs | One stream, shared over BroadcastChannel | One stream per tab | Fewer connections, one cursor set |
 
-> "SSE (Server-Sent Events) drives all real-time updates. When the user opens a channel, the client establishes an EventSource connection to `/api/sse/:channelId`. The server pushes events for new messages, edits, and reaction changes."
-
-### Connection Lifecycle
-
-1. **Connect**: When `setCurrentChannel` is called, disconnect any existing SSE, then create a new EventSource for the channel
-2. **Receive**: Event listeners for `new_message`, `message_edited`, `reaction_added`, `reaction_removed`
-3. **Disconnect**: When navigating away from a channel or unmounting, close the EventSource
-4. **Reconnect**: EventSource handles reconnection automatically on network errors
-
-### Event Processing
-
-| Event | Client Action |
-|-------|--------------|
-| `new_message` (top-level) | Append to messages array, auto-scroll if near bottom |
-| `new_message` (thread reply) | Increment parent's reply_count, append to threadMessages if open |
-| `message_edited` | Update message content in-place by ID, set is_edited flag |
-| `reaction_added` | Find message, add/increment reaction, update users list |
-| `reaction_removed` | Find message, decrement/remove reaction, filter users list |
-
-### Deduplication
-
-> "When the sender posts a message, two things happen: the REST response returns the created message, and the SSE stream delivers the same message to all clients (including the sender). Without deduplication, the sender sees their message twice."
-
-The SSE handler checks `if (state.messages.some(m => m.id === message.id)) return state` before appending. This ID-based deduplication ensures messages are never duplicated regardless of race conditions between REST responses and SSE events.
-
-### SSE vs. WebSocket Trade-off
-
-| Aspect | SSE | WebSocket |
-|--------|-----|-----------|
-| Direction | Server-to-client only | Bidirectional |
-| Reconnection | Built into EventSource API | Must implement manually |
-| Protocol | Standard HTTP | Protocol upgrade required |
-| Proxy support | Works through HTTP proxies | May require special config |
-| Browser limit | ~6 connections per domain | ~200 connections per domain |
-| Message format | Text only (UTF-8) | Text and binary |
-
-> "For chat, the asymmetry is natural: messages are sent via REST POST (which gives us request/response semantics, error handling, and rate limiting for free), while real-time delivery is server-to-client push. SSE's built-in reconnection with EventSource means the client automatically recovers from network drops without custom retry logic. The trade-off is the 6-connection-per-domain limit in older browsers -- if a user has multiple channels open in tabs, they could exhaust this limit. Modern browsers have relaxed this to ~100 for HTTP/2, and our single-channel-per-page design avoids the issue entirely."
-
-## 🔧 Deep Dive 3: Offline and Reconnection Handling
-
-> "Enterprise users switch between WiFi and VPN, close laptop lids, and resume hours later. The client must handle these transitions gracefully without losing messages or showing stale state."
-
-### Reconnection Flow
-
-1. **Network loss detected**: EventSource fires `onerror`, begins automatic retry with increasing intervals
-2. **Reconnection succeeds**: SSE stream resumes, but messages sent during the offline period are missing
-3. **Gap fill**: On reconnection, the client should fetch messages newer than the last received message's timestamp
-4. **State reconciliation**: Merge fetched messages with existing state, deduplicating by message ID
-
-### Current Implementation vs. Production
-
-The current implementation relies on EventSource's auto-reconnect but doesn't implement gap-fill. In production, I'd track `lastEventId` via the SSE `id` field, and on reconnect, the server would replay events since that ID. Alternatively, the client compares its latest message timestamp with the server and fetches the gap.
-
-### Presence During Offline
-
-- Heartbeat interval stops when the tab is hidden (detectable via `document.visibilitychange` event)
-- Redis TTL expires after 60 seconds of no heartbeat, marking the user as offline
-- On tab focus, immediately send a heartbeat to restore online status
-- This prevents "phantom online" status for backgrounded tabs
-
-### Optimistic Updates
-
-> "When a user sends a message, they expect to see it immediately -- not after a 200ms round trip to the server. Optimistic updates display the message instantly in the UI before the server confirms."
-
-The current implementation waits for the SSE event to display sent messages. A production implementation would:
-1. Generate a client-side temporary ID
-2. Add the message to state with a "pending" visual indicator (slightly dimmed text)
-3. On server success via SSE, replace the temp ID with the real UUID, remove pending indicator
-4. On server failure, mark the message as "failed" with a retry button
-5. Track pending messages separately to avoid conflicts with SSE deduplication
-
-## 🎨 UI/UX Design
-
-### Layout Specifications
-
-- **Sidebar** (64px): Dark background (#292929), organization icons stacked vertically with first-letter avatars, team buttons below a divider
-- **Channel List** (240px): White background, team dropdown at top, channel names with # prefix, "+" button for creating channels
-- **Chat Area** (flexible): Light gray background (#F5F5F5), channel header bar (48px), scrollable message list, message input with attachment button
-- **Thread Panel** (320px): Slides in from right when user clicks "Reply in thread", parent message at top, replies below, dedicated reply input
-- **Member List** (240px): Slides in from right, toggle via member icon in header, online/offline sections with presence dots
-
-### Teams Color System
-
-| Token | Value | Usage |
-|-------|-------|-------|
-| teams-bg | #F5F5F5 | Page background |
-| teams-surface | #FFFFFF | Cards, panels, inputs |
-| teams-sidebar | #292929 | Left sidebar background |
-| teams-primary | #5B5FC7 | Buttons, links, active states |
-| teams-hover | #4F52B2 | Primary hover state |
-| teams-text | #242424 | Body text |
-| teams-secondary | #616161 | Secondary text, labels |
-| teams-border | #E0E0E0 | Dividers, input borders |
-| teams-success | #6BB700 | Online presence indicator |
-| teams-chat | #E8EBFA | Active channel highlight, own message background |
-
-### Message Hover Actions
-
-When hovering over a message, a floating action bar appears at the top-right corner with reaction (emoji face) and thread reply (speech bubble) buttons. This pattern keeps the default UI clean while providing quick access to common actions. The hover bar uses `position: absolute` relative to the message container to avoid layout shift.
-
-### Accessibility Considerations
-
-- Keyboard navigation through channels and messages
-- Screen reader labels on presence indicators ("User is online" / "User is offline")
-- High contrast ratios between text and background (WCAG AA compliant)
-- Focus indicators on all interactive elements (buttons, inputs, links)
-
-## ⚡ Performance Considerations
-
-### Bundle Optimization
-
-- Code split by route -- TanStack Router handles this automatically via dynamic imports
-- SSE connection managed at the channel level, not globally (no unnecessary connections)
-- Zustand selectors prevent cascading re-renders
-
-### Network Optimization
-
-- Vite dev server proxies `/api` to backend on port 3001, eliminating CORS preflight requests
-- Credentials included via `fetch` with `credentials: 'include'` for session cookies
-- Presence heartbeat is a lightweight POST with empty body (minimal payload)
-- File downloads use presigned MinIO URLs, offloading bandwidth from the API server
-
-### Memory Management
-
-- Messages are cleared when switching channels (`setCurrentChannel` resets the messages array)
-- Thread state is cleared when closing the thread panel
-- SSE connections are properly closed on channel switch and component unmount
-- No accumulation of messages across channel switches
-
-## 🗂️ State: Server Cache vs. UI State
-
-Two kinds of state, deliberately kept apart. Organizations, teams, channels, messages, and presence are *server* state — the client holds a copy that can go stale. Which panel is open, which thread is expanded, and draft text are *UI* state that no server ever needs to know about.
-
-Collapsing them into one store is the common mistake, and it produces a specific bug: a refetch of server data blows away the open thread panel, because both live in the same object and the refetch replaced it. Keeping them separate means the message list can refresh under an open thread panel without disturbing it.
-
-| State | Where | Why |
-|-------|-------|-----|
-| Channels, messages, presence | Zustand store, refetched and stream-updated | Shared across components; must survive navigation within an org |
-| Open thread, member list visibility, drafts | Component or store slice never touched by refetch | Purely local; a server refresh must not disturb it |
-
-The trade-off is discipline rather than machinery — nothing enforces the split, so it's a convention that has to hold as features are added. A data-fetching library with its own cache would enforce it structurally, at the cost of a second state system alongside the store.
-
-## 🧭 Routing the Hierarchy
-
-The URL is `/org/:orgId/team/:teamId/channel/:channelId`, and the route tree mirrors the containment hierarchy exactly — each segment is a layout that loads its own level and renders an outlet for the next.
-
-That structure buys real things. Every level's data loads once at the level that owns it rather than being refetched by children; the sidebar rail lives in the org layout and survives channel navigation without remounting; and any view in the app is a shareable, bookmarkable URL, which for a work chat tool is not a nicety — "here's the channel" is how people hand off context.
-
-**The trap in this shape** is the convenience redirect. Each layout wants to pick a sensible default for the level below: land on the first team, then its first channel. Written as an effect that fires when the child data arrives, it will happily rewrite a URL that already named a channel — the effect can't tell "no channel chosen yet" from "a channel was chosen, and the list just finished loading." The symptom is specific and confusing: clicking a channel works, but reloading that page or opening the link from Slack silently lands on a different channel. The fix is that the redirect must be conditional on the child param being *absent*, not merely on the data being present.
-
-| Approach | Pros | Cons |
-|----------|------|------|
-| ✅ Redirect only when the child param is absent | Deep links and reloads work; defaults still apply on entry | Every layout that picks a default needs the guard |
-| ❌ Redirect whenever the child list loads | Trivial to write | Silently clobbers deep links — the bug only appears on reload, never while clicking |
-
-> "What makes this worth calling out is that it's invisible to the person who wrote it. You build the app by clicking through it, and clicking is the one path that works. It only shows up when someone pastes a link — which is to say, the first time a real user tries to share something."
-
-## 🔌 Rendering a Stream
-
-The message list is fed by two sources that have to agree: an initial `GET` for history, and an `EventSource` pushing everything after. The subtlety is that those overlap. A message can arrive over the stream while the history fetch is still in flight, and naive append gives you either a duplicate or a message that vanishes when the fetch resolves and replaces the list.
-
-Keying by message ID and merging rather than appending is what makes this safe, and it's the same property that makes the optimistic-send path work: the optimistic message carries a temporary ID, the server's response carries the real one, and the merge reconciles them. Without ID-keyed merging you need send-order assumptions that break the moment two people post at once.
-
-The cost is that the client holds the reconciliation logic — the server just broadcasts and has no idea what any given client already has. The alternative, sequence numbers per channel so a reconnecting client can ask for the gap, moves that burden to the server and would also fix the missed-message problem SSE currently has. It's the right next step, and it's not built.
-
-## ⚖️ Trade-offs Summary
-
-| Decision | Chosen | Alternative | Rationale |
-|----------|--------|-------------|-----------|
-| ✅ Zustand | Lightweight, selector-based | ❌ Redux | Chat state is simple, no middleware needed |
-| ✅ SSE (EventSource) | Auto-reconnect, HTTP-native | ❌ WebSocket | Unidirectional push, simpler client |
-| ✅ TanStack Router | File-based, type-safe params | ❌ React Router | Nested layouts match hierarchy |
-| ✅ Cursor pagination | Stable with concurrent writes | ❌ Offset pagination | No duplicate/gap issues |
-| ✅ Two stores | Separate auth/chat concerns | ❌ Single store | Auth changes don't re-render chat |
-| ✅ Tailwind CSS | Utility-first, theme tokens | ❌ CSS Modules | Faster iteration, consistent design |
-| ✅ Route-driven loading | URL is source of truth | ❌ Store-driven loading | Shareable links, browser nav works |
-| ✅ Date separators in render | No extra state | ❌ Pre-computed grouping | Simpler, derived from message timestamps |
+"With more time I'd persist recent pages in IndexedDB so channels open instantly offline, add per-route Web Vitals reporting, and build the typing indicator as a throttled, short-lived event outside the sequenced stream."

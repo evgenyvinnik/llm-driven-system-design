@@ -1,357 +1,350 @@
-# Microsoft Teams - Backend System Design Answer
+# 💬 Microsoft Teams — System Design Answer (Backend Focus)
 
-## 🏗️ Architecture Overview
+*45-minute backend interview. This is a proposed production design; what this repository actually runs is described in [architecture.md → Implementation Notes](./architecture.md#implementation-notes).*
 
-> "I'm designing the backend for an enterprise chat platform like Microsoft Teams. The core challenge is delivering messages in real-time across a hierarchical organization structure -- organizations contain teams, teams contain channels, and channels contain threaded conversations. The system must handle millions of concurrent connections, persist every message for compliance, and track user presence across all channels."
+> "Chat looks like insert a row, push it to everyone. Two things make Teams hard. First, every message lives four levels deep (organization, team, channel, thread), and one wrong membership check shows a company's conversations to another company. Second, 30 million devices are connected to hundreds of different servers, and every one of them must see a channel's messages in the same order with no holes, including the laptop that slept through forty of them. My answer to the second problem is one number: a gapless sequence per channel."
 
-The backend follows a service-oriented architecture behind an API gateway, with PostgreSQL for persistent storage, Redis for real-time state (presence, pub/sub, sessions), and MinIO (S3-compatible) for file storage.
+| Phase | Time | What I want the interviewer to leave with |
+|-------|------|--------------------------------------------|
+| Requirements & scale | 5 min | Scope, targets, and the 4.5M pushes per second |
+| High-level architecture | 10 min | One overview and the send, deliver and resume flows |
+| Data model & API | 7 min | Shard keys, the event log, the contract |
+| Deep dive 1: ordering and resume | 8 min | Why a counter row, and how a client never misses anything |
+| Deep dive 2: fan-out and presence | 8 min | Getting one event to the right sockets on 300 gateways |
+| Deep dive 3: permissions | 4 min | Checking four levels on every request without leaking |
+| Scale, failures, wrap-up | 3 min | What breaks first; the trade-offs I made |
+
+---
+
+## 🎯 Requirements & Scale (5 min)
+
+"Let me pin down scope, because Teams is chat, meetings, files and an app platform at once."
+
+### Functional requirements
+
+1. **Hierarchy:** organizations contain teams, teams contain channels; teams and channels can be private.
+2. **Messaging:** post, reply in one-level threads, react, edit and delete your own messages, attach files.
+3. **Real time:** new messages, edits, deletions and reactions reach every member's open devices within a second.
+4. **History:** opening a channel shows the latest messages; scrolling loads older ones.
+5. **Presence and unread:** who is online, and unread badges for channels with new activity.
+
+Out of scope: calls and meetings media (a separate service with an SFU), shared channels across tenants, bots, compliance export. I'll mention search and mobile push only as consumers of the event stream.
+
+### Non-functional requirements
+
+| Requirement | Target | Why |
+|-------------|--------|-----|
+| Send acknowledgement | p99 < 300 ms | The sender is waiting on it |
+| Delivery to recipients | p99 < 500 ms in region | Conversation feels live below about half a second |
+| Open a channel | p99 < 200 ms for 50 messages | The most frequent read |
+| Availability | 99.99% for send and receive | Work stops when chat stops |
+| Durability | No acknowledged message is ever lost | Messages are business records |
+| Ordering | One order per channel; no gaps after reconnects | Replies that appear before their question break trust |
+| Isolation | Zero cross-tenant reads | The failure the product does not survive |
+
+### Capacity estimate
+
+| Quantity | Estimate | Consequence |
+|----------|----------|-------------|
+| Users | 100M daily active, 30M devices connected at peak | A dedicated connection tier |
+| Messages | 40/user/day → 4B/day → ~46K/s average, ~150K/s peak | Shard by channel |
+| Events (messages, edits, reactions) | ~1.5× messages → ~220K/s peak | An ordered log per channel |
+| Pushes | ~20 online recipients per event → ~4.5M/s peak | Fan out per gateway node, not per user |
+| Gateways | 30M streams ÷ ~150K per node ≈ 200 nodes, 300 with headroom | A routing table: user → node |
+| Storage | ~1 KB × 4B/day ≈ 4 TB/day, ~1.5 PB/year | Partitioning and storage tiers by age |
+| Presence by client heartbeat | 30M ÷ 30 s = 1M writes/s | Let the gateway own presence instead |
+
+"The two numbers I'll design around: 4.5 million pushes per second, which rules out every server subscribing to everything, and the fact that order is per channel, not global, which tells me my shard key."
+
+---
+
+## 🏗️ High-Level Architecture (10 min)
+
+"I'll draw the whole system, then walk the three journeys that matter: sending, fanning out, and reconnecting."
 
 ```
-┌─────────────┐     ┌─────────────┐     ┌─────────────────────────────────────────┐
-│   Clients   │────▶│  API Gateway│────▶│            Service Layer                │
-│  (Web/Mobile)│    │  (nginx/LB) │     │                                         │
-└──────┬──────┘     └─────────────┘     │  ┌─────────┐ ┌─────────┐ ┌──────────┐  │
-       │                                │  │  Auth   │ │ Message │ │ Presence │  │
-       │  SSE Stream                    │  │ Service │ │ Service │ │ Service  │  │
-       │◀───────────────────────────────│  └─────────┘ └────┬────┘ └────┬─────┘  │
-                                        │                   │           │         │
-                                        │  ┌─────────┐ ┌───┴─────┐ ┌──┴──────┐  │
-                                        │  │  File   │ │  Redis  │ │  Redis  │  │
-                                        │  │ Service │ │ Pub/Sub │ │ TTL Keys│  │
-                                        │  └────┬────┘ └─────────┘ └─────────┘  │
-                                        └───────┼────────────────────────────────┘
-                                                │
-                            ┌──────────┐  ┌─────┴─────┐  ┌──────────┐
-                            │PostgreSQL│  │   MinIO   │  │  Valkey  │
-                            │(Messages)│  │  (Files)  │  │ (Cache)  │
-                            └──────────┘  └───────────┘  └──────────┘
+  ┌──────────────────────────────────────────────────────────────────────────────────────────┐
+  │ Teams clients · web, desktop, mobile · one event stream per device                       │
+  └───────┬───────────────────────────────────────────────────────────────────┬──────────────┘
+          │ (1) POST /api/v1/messages              (3) GET /events?cursors=…  │
+          ▼                                                   SSE, held open  ▼
+  ┌──────────────────────────────────────────────────────────────────────────────────────────┐
+  │ Load balancer · TLS · /api/* to Chat API · /events to Push Gateway                       │
+  └───────┬───────────────────────────────────────────────────────────────────┬──────────────┘
+          ▼                                                                   ▼
+  ┌────────────────────┐                                      ┌──────────────────────────────┐
+  │ Chat API           │                                      │ Push Gateway                 │
+  │ writes · history   │                                      │ holds SSE streams            │
+  │ access checks      │                                      │ ~150K per node               │
+  └───────┬────────────┘                                      └─┬─────┬──────────────────────┘
+          │ access check, then INSERT                           │     │               ▲
+          │ message + event in 1 tx                             │     │ presence,     │ events
+          ▼                                                     │     │ registry      │ for node
+  ┌──────────────────────────────┐                              │     │               │
+  │ PostgreSQL shards            │  replay after cursor         │     │               │
+  │ messages, events: by channel │◀─────────────────────────────┘     │               │
+  │ memberships: by tenant       │                                    ▼               │
+  └───────┬──────────────────────┘                                ┌───────────────────┴──────┐
+          │                                                       │ Redis Cluster            │
+          │ (2) CDC: channel_events                               │ presence · conn registry │
+          │                                                       │ gw:{node} pub/sub        │
+          │                                                       └──────────────────────────┘
+          │                                                                   ▲
+          ▼                                                                   │ look up, publish
+  ┌──────────────────────┐                                                    │
+  │ Kafka                │    consume, in order per channel       ┌───────────┴──────────────┐
+  │ channel-events by ch │───────────────────────────────────────▶│ Fan-out workers          │
+  └───────┬──────────────┘                                        │ route events to gateways │
+          │ consume                                               └──────────────────────────┘
+          ▼
+  ┌──────────────────────┐
+  │ Search indexer       │
+  │ mobile push notifier │
+  └──────────────────────┘
 ```
 
-## 🏢 Organizational Hierarchy
+1. **Send (1).** The client posts with a `clientMessageId` it generated. The Chat API checks membership at all four levels, then in one transaction on the channel's shard takes the channel's next sequence number, inserts the message and appends an event row. It answers `201` with the message and its `seq`.
+2. **Fan out (2).** Change data capture streams the event row into Kafka, partitioned by channel. Fan-out workers look up which gateway nodes hold the channel's online members and publish one batch per node; each gateway writes the event to its local streams.
+3. **Connect and resume (3).** Every device keeps one SSE stream to a gateway, opened with the last `seq` it applied for each channel it has loaded. The gateway replays what's newer from the event log, then switches to live events, and records the user's presence and node.
 
-> "Enterprise chat differs from consumer chat in one fundamental way: the resource hierarchy. Slack has workspaces and channels. Discord has servers and channels. Teams has organizations, teams within those organizations, and channels within those teams. This three-level hierarchy mirrors how enterprises actually organize -- a company (org) has departments (teams) with topic-specific discussion spaces (channels)."
+| Component | Responsibility | Scales with | Notes |
+|-----------|----------------|-------------|-------|
+| Load balancer | TLS, routes `/api/*` and `/events` | Connections | Idle timeout above the heartbeat |
+| Chat API | Writes, history, membership checks | Requests | Stateless |
+| Push Gateway | SSE streams, replay, presence | Open connections (~150K/node) | In-memory state only |
+| PostgreSQL shards | Messages + event log by channel; memberships by tenant | Channels, tenants | Synchronous replica per shard |
+| Kafka `channel-events` | Durable ordered copy of every event | Event rate | Keyed by channel id, 48 h retention |
+| Fan-out workers | Members → gateway nodes → batches | Pushes/s | Stateless |
+| Redis Cluster | Presence, connection registry, per-node pub/sub | Connected users | Losing it delays delivery, never loses data |
+| Search indexer, notifier | Search index, mobile pushes | Event rate | Independent Kafka consumers |
 
-The hierarchy drives access control at every level:
-- A user must be an org member to see any teams in that org
-- A user must be a team member to see channels in that team (unless the channel is public)
-- A user must be a channel member to send messages (auto-joined for public channels)
+"Why separate the gateway from the Chat API? A gateway is a memory-bound process holding 150,000 mostly idle sockets that must survive deploys; the API is stateless request/response that I want to deploy hourly. Splitting them means an API deploy never drops a stream."
 
-Creating a team automatically creates a "General" channel and adds the creator to both. This is done in a database transaction to ensure atomicity. Without the transaction, a crash between team creation and channel creation would leave a team with no channels -- an invalid state that would confuse the frontend.
+### Flow 1: sending a message
 
-## 💾 Data Model
-
-> "The data model centers on a four-level hierarchy: Organization, Team, Channel, Message. Each level has a membership table for access control. Threading is modeled as a self-referencing foreign key on the messages table."
-
-### Core Tables
-
-| Table | Key Columns | Indexes | Notes |
-|-------|-------------|---------|-------|
-| users | id (UUID PK), username (unique), email (unique), password_hash | username, email | Display name, avatar URL, role |
-| organizations | id (UUID PK), name, slug (unique), created_by (FK users) | slug | Top-level container |
-| org_members | id, org_id (FK), user_id (FK), role | (org_id, user_id) unique, user_id | Roles: owner, admin, member |
-| teams | id, org_id (FK), name, is_private, created_by (FK) | org_id | Cascade delete from org |
-| team_members | id, team_id (FK), user_id (FK), role | (team_id, user_id) unique, user_id | Roles: owner, member |
-| channels | id, team_id (FK), name, is_private, created_by (FK) | team_id | Cascade delete from team |
-| channel_members | id, channel_id (FK), user_id (FK), last_read_at | (channel_id, user_id) unique, user_id | Read tracking per user |
-| messages | id, channel_id (FK), user_id (FK), parent_message_id (self FK), content, is_edited | (channel_id, created_at DESC), parent_message_id | Thread via self-reference |
-| message_reactions | id, message_id (FK), user_id (FK), emoji | message_id, (message_id, user_id, emoji) unique | One reaction per emoji per user |
-| files | id, message_id (FK), channel_id (FK), user_id (FK), filename, storage_path, size_bytes | channel_id, message_id | Cascade delete from message |
-
-### Threading Model
-
-> "I chose self-referencing messages over a separate threads table. A thread is simply a message whose parent_message_id is NULL (top-level) with replies pointing back to it. This keeps the schema simple -- one table handles both top-level messages and replies. The trade-off is that deeply nested threads aren't supported, but Teams uses flat thread replies (one level deep), making this the right fit."
-
-### UUID Primary Keys
-
-> "Every table uses UUID primary keys instead of auto-incrementing integers. UUIDs can be generated on any node without coordination, which is essential for horizontal scaling. Auto-increment requires a single source of truth, which becomes a bottleneck when you shard the database. The trade-off is larger index sizes (16 bytes vs. 4-8 bytes) and slightly slower index lookups due to non-sequential insertion, but the operational benefits outweigh this at enterprise scale."
-
-### Cascade Deletion Chain
-
-The cascade chain flows: Organization -> Team -> Channel -> Message -> Reaction/File. Deleting an organization removes everything beneath it. This simplifies cleanup but requires careful confirmation UIs. In production, I'd implement soft deletes with a `deleted_at` timestamp and a separate archival process rather than hard cascades.
-
-### Read Tracking
-
-The `last_read_at` column on channel_members tracks each user's read position. Unread count is computed as the number of messages with `created_at > last_read_at`. At scale, this query is expensive (scans the messages index per channel per user) and should be denormalized into a counter updated on each new message.
-
-## 🔄 API Design
-
-### Authentication
 ```
-POST /api/auth/register     → Create account, start session
-POST /api/auth/login        → Authenticate, start session
-POST /api/auth/logout       → Destroy session
-GET  /api/auth/me           → Current user info
+Alice's client                            Chat API                                 PostgreSQL
+       │                                      │                                         │
+       │ 1 POST /messages, clientMessageId K  │                                         │
+       │─────────────────────────────────────▶│                                         │
+       │                                      │ 2 check org, team, channel membership   │
+       │                                      │ 3 BEGIN; next_channel_seq(ch) = 42      │
+       │                                      │────────────────────────────────────────▶│
+       │                                      │ 4 INSERT message ON CONFLICT (user, K)  │
+       │                                      │────────────────────────────────────────▶│
+       │                                      │ 5 INSERT event (ch, 42); COMMIT         │
+       │                                      │────────────────────────────────────────▶│
+       │ 6 201 {message, seq: 42}             │                                         │
+       │◀─────────────────────────────────────│                                         │
+       ················· response lost; client retries with the same K ··················
+       │ 7 POST /messages, clientMessageId K  │                                         │
+       │─────────────────────────────────────▶│                                         │
+       │                                      │ 8 conflict on (user, K): ROLLBACK       │
+       │                                      │────────────────────────────────────────▶│
+       │ 9 200 original message               │                                         │
+       │◀─────────────────────────────────────│                                         │
+       │                                      │                                         │
 ```
 
-### Organization and Team Management
-```
-GET  /api/organizations             → List user's orgs
-POST /api/organizations             → Create org (auto-adds creator as owner)
-GET  /api/organizations/:id         → Get org details
-GET  /api/organizations/:id/members → List org members
-POST /api/organizations/:id/members → Add member
-GET  /api/teams?orgId=xxx           → List teams in org
-POST /api/teams                     → Create team (auto-creates General channel)
-GET  /api/teams/:id                 → Get team details
-GET  /api/teams/:id/members         → List team members
-POST /api/teams/:id/members         → Add member
-```
+"Step 3 is the heart of the design: `next_channel_seq` increments the channel's counter row and holds that row's lock until commit. Steps 7 to 9 are the retry: the response was lost, the client sends the same key, the unique index on (user, key) turns the insert into a conflict, the transaction rolls back so the sequence number goes back unused, and the client gets the original message. A reused key with different text gets `422`."
 
-### Channels and Messaging
+### Flow 2: delivering an event
+
 ```
-GET  /api/channels?teamId=xxx                 → List channels
-POST /api/channels                            → Create channel
-GET  /api/channels/:id                        → Get channel details
-GET  /api/channels/:id/members                → List channel members
-POST /api/channels/:id/members                → Add member
-POST /api/channels/:id/read                   → Mark as read
-GET  /api/messages?channelId=xxx&before=ts    → Paginated messages
-POST /api/messages                            → Send message
-PUT  /api/messages/:id                        → Edit message (owner only)
-DELETE /api/messages/:id                      → Delete message (owner only)
-GET  /api/messages/:id/thread                 → Get thread replies
+PostgreSQL           Kafka           Fan-out worker               Gateway                     Bob
+     │                 │                    │                        │                         │
+     │ 1 CDC (ch, 42)  │                    │                        │                         │
+     │────────────────▶│                    │                        │                         │
+     │                 │ 2 event, key = ch  │                        │                         │
+     │                 │───────────────────▶│                        │                         │
+     │                 │                    │ 3 Redis: gateways of members                     │
+     │                 │                    │ 4 batch for this node  │                         │
+     │                 │                    │───────────────────────▶│                         │
+     │                 │             5 drop duplicates by (ch, seq)  │                         │
+     │                 │                    │                        │ 6 id ch:42 new_message  │
+     │                 │                    │                        │────────────────────────▶│
+     │                 │                    │                        │ 7 42 = last + 1: apply  │
+     │                 │                    │                        │                         │
 ```
 
-### Real-Time, Presence, Files, and Reactions
+"Kafka keeps a channel's events in order because the key is the channel id. Delivery is at least once, so step 5 drops anything at or below the last `seq` the gateway sent, and step 7 is the client applying an event only if it's exactly the next number."
+
+### Flow 3: reconnecting
+
 ```
-GET    /api/sse/:channelId           → SSE event stream
-POST   /api/presence/heartbeat       → Presence heartbeat
-GET    /api/presence/channel/:id     → Channel member presence
-POST   /api/files                    → Upload file (multipart)
-GET    /api/files/:id/download       → Presigned download URL
-GET    /api/files?channelId=xxx      → List channel files
-POST   /api/reactions                → Add reaction
-DELETE /api/reactions                → Remove reaction
-GET    /api/users/search?q=xxx       → Search users by name
+Bob's client                              Gateway            Event log (PostgreSQL)
+      │                                      │                          │
+      │ 1 reconnect, cursors {ch: 39}        │                          │
+      │─────────────────────────────────────▶│                          │
+      │                                      │ 2 head(ch) = 42          │
+      │                                      │─────────────────────────▶│
+      │                                      │ 3 events ch, seq 40..42  │
+      │                                      │─────────────────────────▶│
+      │ 4 replay 40, 41, 42 in order         │                          │
+      │◀─────────────────────────────────────│                          │
+      │ 5 live events from 43                │                          │
+      │◀─────────────────────────────────────│                          │
+      ······ cursor older than retention, or more than 500 behind ·······
+      │ 6 resync {latestSeq}                 │                          │
+      │◀─────────────────────────────────────│                          │
+      │ 7 reconnect after reloading history  │                          │
+      │─────────────────────────────────────▶│                          │
+      │                                      │                          │
 ```
 
-### Pagination Design
+"Reconnecting is the normal case: laptops sleep, phones switch networks, gateways restart for deploys. The client sends its cursor for each channel it has in memory, and the gateway replays the gap from the log. Replay is capped at 500 events and 48 hours; past that the client reloads the newest page instead."
 
-> "Messages use cursor-based pagination with a `before` timestamp parameter rather than offset-based pagination. With offset pagination, new messages arriving between page loads shift all offsets -- page 2 at offset 50 would include messages from page 1 if 5 new messages were posted. Cursor pagination anchors to a timestamp, guaranteeing no duplicates or gaps regardless of concurrent writes."
+---
 
-## 🔒 Security and Rate Limiting
+## 💾 Data Model (4 min)
 
-Session-based authentication using Redis-backed express-session with HTTP-only, SameSite cookies. Three-tier rate limiting protects against abuse:
+"Two shard keys. Message data is sharded by **channel**, so a channel's counter, messages and events commit in one local transaction. Membership data is sharded by **tenant**, so the whole authorization chain for a request lives on one shard."
 
-| Tier | Limit | Scope | Purpose |
-|------|-------|-------|---------|
-| Auth | 50 req / 15 min | Login/register | Brute-force protection |
-| API | 1000 req / 15 min | All /api routes | General abuse prevention |
-| Messages | 120 req / 1 min | POST /messages | Spam prevention |
+| Store | Table / key | Key columns | Notes |
+|-------|-------------|-------------|-------|
+| Directory shard | `org_members`, `team_members` | (org or team, user), role | Roles: owner, admin, member |
+| Directory shard | `channels` | id, team_id, org_id, is_private | org_id denormalized for routing |
+| Directory shard | `channel_members` | (channel, user), `last_read_seq` | Index by user for "my channels" |
+| Message shard | `channel_heads` | channel_id, `last_seq` | The counter row |
+| Message shard | `messages` | PK (channel_id, seq); id; author; parent_seq; content; client_message_id; edited_at; deleted_at | Unique (author, client_message_id); partial index on top-level messages |
+| Message shard | `channel_events` | PK (channel_id, seq); type; payload | Same transaction as the change; hourly partitions dropped after 48 h |
+| Message shard | `reactions` | PK (channel, message_seq, user, emoji) | The key makes a repeat add a no-op |
+| Redis | `presence:{user}`, `gw:{node}:alive`, `conn:{user}` | status; 30 s lease; node ids | Presence and routing |
 
-> "Rate limiting at the message level is critical for chat -- without it, a single misbehaving client could flood a channel with 1000 messages per second, overwhelming both the database and every connected SSE client. The 120/minute limit still allows fast-paced conversation (2 messages per second) while preventing spam."
+"Two details matter. **Deletes are tombstones**: a deleted thread root keeps its replies, and the deletion is itself an event. **Unread badges** come from `last_read_seq`: the badge is a count of top-level messages after it, capped at 100 and shown as '99+'. That's an index range scan of at most 100 rows. The alternative, a counter per member incremented on every message, turns one message in a 10,000-person channel into 10,000 writes."
 
-## 🔧 Deep Dive 1: Real-Time Message Delivery
+"Why PostgreSQL rather than Cassandra for messages? The access pattern is partition plus range, which Cassandra handles well. But the sequence has to be gapless and commit-ordered, and in Cassandra that means a lightweight transaction (a Paxos round) per message. In a sharded PostgreSQL the counter row, the message and the event are one local transaction."
 
-> "The hardest problem in a chat system is delivering messages in real-time across multiple server instances to thousands of concurrent clients per channel."
+---
 
-### The Pipeline
+## 🔌 API Design (3 min)
 
-1. Client sends `POST /api/messages` with channel ID and content
-2. Server validates auth, membership, rate limit. Persists to PostgreSQL
-3. Server publishes to Redis pub/sub on `teams:channel:{channelId}`
-4. Every server instance subscribing to that channel receives the event
-5. Each server iterates its local SSE client map and writes the event to each response stream
+```
+POST   /api/v1/messages                      send; clientMessageId → 201 | 200 replayed | 422 | 404
+GET    /api/v1/channels/{id}/messages        ?before=<seq>&limit=50 → {messages, latestSeq, hasMore}
+GET    /api/v1/messages/{id}/thread          root and replies in seq order
+PATCH  /api/v1/messages/{id}                 edit own → event message_edited
+DELETE /api/v1/messages/{id}                 tombstone → event message_deleted
+PUT    /api/v1/messages/{id}/reactions/{e}   idempotent add; event only if it changed
+DELETE /api/v1/messages/{id}/reactions/{e}   idempotent remove
+GET    /events?cursors=ch1:41,ch2:17         SSE: replay after each cursor, then live
+POST   /api/v1/channels/{id}/read            ?seq=<n> → last_read_seq
+```
 
-### Why SSE Over WebSocket
+- **`clientMessageId` is the idempotency key.** Sending is not naturally idempotent, so the client says which requests are retries. Same key and same body returns the original; same key, different body is `422`.
+- **One number for both directions.** `before=<seq>` pages backwards through history; the stream's cursor moves forward. `latestSeq` in the history response, read in the same snapshot as the page, is where the stream starts.
+- **`404`, never `403`,** for anything the caller can't see, so nobody can probe ids to learn that a private channel exists.
+- **Errors** are `application/problem+json`; rate limits are per user, in Redis, advertised with `RateLimit` headers.
+- **REST for writes, SSE for pushes.** Writes need status codes, idempotency and rate limits, which HTTP already has; the push side carries hundreds of events for every one a user sends. WebSocket would win for meeting signaling, which lives in a different service.
 
-| Approach | Pros | Cons |
-|----------|------|------|
-| ✅ SSE (Server-Sent Events) | HTTP-native, auto-reconnect, simpler server | Unidirectional only |
-| ❌ WebSocket | Bidirectional, lower overhead per message | Connection upgrade complexity, no auto-reconnect |
+---
 
-> "I chose SSE because the communication pattern is asymmetric. Messages are sent via REST POST (client-to-server), and pushed via SSE (server-to-client). SSE gives us automatic reconnection with EventSource, works through HTTP proxies without special configuration, and doesn't require a separate protocol upgrade. The trade-off is that we can't push typing indicators as efficiently -- but typing indicators are low-priority ephemeral data that can tolerate higher latency. For typing, I'd use a separate polling endpoint at 3-second intervals rather than contaminating the SSE stream with high-frequency low-value events."
+## 🔧 Deep Dive 1: One Number per Channel (8 min)
 
-### Cross-Instance Broadcasting
+"Ordering, history pagination, duplicate detection and resume all reduce to one question: how do I number a channel's events?"
 
-> "Without Redis pub/sub, messages only reach clients connected to the same server instance that received the POST. With 10 API servers, 90% of clients would miss messages. Redis pub/sub acts as a broadcast bus -- when any server receives a message, it publishes to Redis, and all subscribing servers relay it to their local SSE clients."
+| Approach | How it works | Where it breaks |
+|----------|--------------|-----------------|
+| ❌ Timestamps | Order by `created_at` | Ties within a millisecond; clock skew between servers; "after 14:02:07.123" can skip a row |
+| ❌ `SEQUENCE` or Snowflake ids | Unique, roughly increasing ids | Can commit out of order: id 43 visible before 42, so a cursor at 43 never sees 42 |
+| ❌ Global log offset | One Kafka partition for everything | A single partition can't take 220K events/s, and order across channels is useless anyway |
+| ✅ Counter row per channel | Increment inside the write transaction; lock held to commit | Writes to one channel are serialized |
 
-### SSE Connection Management
+**Why it works.** Incrementing the channel's counter row takes its lock, and the lock lasts until commit. So number 43 cannot be issued until the transaction holding 42 has committed or rolled back. If it rolled back, the counter goes back too and the next writer gets 42. Numbers are **gapless** and become **visible in order**. That gives me four guarantees for the price of one row:
 
-Each server maintains a `Map<channelId, Set<SSEClient>>`. When a client connects:
-- Server sets SSE headers (text/event-stream, no-cache, keep-alive, X-Accel-Buffering: no)
-- Subscribes to the Redis pub/sub channel if not already subscribed
-- Adds client to the in-memory map
-- Sends periodic heartbeat comments every 30 seconds to prevent proxy timeout
-- On disconnect, removes client from the set and unsubscribes from Redis if set is empty
+1. **Order:** every device sorts by `seq`, so everyone sees the same sequence.
+2. **History:** `before=<seq>` is a keyset cursor; page 500 is as cheap as page 1, and there are no ties to skip.
+3. **Duplicates:** at-least-once delivery is safe because anything at or below the last applied `seq` is dropped.
+4. **Gaps:** a client that receives 45 when it last applied 43 knows it missed exactly one event, and asks for it.
 
-The `X-Accel-Buffering: no` header is critical for nginx reverse proxies -- without it, nginx buffers SSE events and delivers them in bursts rather than streaming immediately.
+**The event log is the stream.** Every visible change, including edits, deletions and reactions, is appended to `channel_events` in the same transaction, with its own `seq`. CDC and Kafka only carry it. If a transport loses, duplicates or reorders something, the log repairs it; pub/sub as the source of truth fails silently, because Redis pub/sub is at-most-once and an instance restarting mid-publish just never delivers that message.
 
-### Failure Modes and Recovery
+**Resume.** A client keeps a cursor per channel it has loaded. On reconnect it sends those cursors; the gateway reads the head, replays the missing range from the log (at most 500 events), then goes live. A cursor older than the log's 48-hour retention gets `resync`, and the client reloads the newest page. The first page and the stream meet exactly, because the history response returns `latestSeq` from the same snapshot as the page.
 
-- **Server crash**: SSE connections drop, clients auto-reconnect to another server via load balancer. On reconnect, the client fetches messages since its last received timestamp to fill the gap.
-- **Redis pub/sub failure**: Circuit breaker opens after 50% error rate. Messages still persist to PostgreSQL but real-time delivery degrades. Clients fall back to polling on SSE reconnect failure.
-- **Client network loss**: EventSource retries automatically with increasing intervals. The browser handles all retry logic.
-- **Redis message loss**: Redis pub/sub is fire-and-forget -- if no subscriber is listening, the message is lost. This is acceptable because the message is durably stored in PostgreSQL. SSE is a notification mechanism, not the source of truth.
+**What I give up.** Writes to a single channel are serialized on one row lock: a few hundred per second per channel at most. Real channels see a few per second, and the giant ones (company announcements) are read-heavy, not write-heavy. I also pay a second write per change for the event row, and 48 hours of log, about 35 TB at peak.
 
-## 🔧 Deep Dive 2: Thread Model at Scale
+> "The repository builds exactly this locally: a `BEFORE INSERT` trigger numbers every message, the event log is written in the same transaction, and each SSE stream resumes from `Last-Event-ID`."
 
-> "Threading seems simple -- just add a parent_message_id column. But the scaling implications of that choice ripple through queries, real-time delivery, and UI data requirements."
+---
 
-### Query Patterns
+## 🔧 Deep Dive 2: Fan-Out and Presence (8 min)
 
-Two distinct access patterns emerge:
-1. **Channel feed**: Top-level messages (`WHERE parent_message_id IS NULL`) ordered by `created_at DESC`, with reply counts via correlated subquery
-2. **Thread view**: All messages for a thread (`WHERE id = :parentId OR parent_message_id = :parentId`) ordered by `created_at ASC`
+"4.5 million pushes per second, from events produced on message shards to sockets spread over 300 gateways. The question is how an event finds its sockets."
 
-### Reply Count Optimization
+| Approach | Cost per event | Where it breaks |
+|----------|----------------|-----------------|
+| ❌ Every gateway subscribes to every channel its users are in | Free per event | 150K users × ~100 channels = millions of subscriptions per node, churning on every connect |
+| ❌ Per-user inbox (fan-out on write) | One write per recipient | 4.5M writes/s; one announcement to 50K people = 50K writes |
+| ✅ Route to gateway nodes | One batch per node with members online | Needs an accurate connection registry |
 
-| Approach | Pros | Cons |
-|----------|------|------|
-| ✅ Correlated subquery (current) | Always accurate | O(n) subqueries per page load |
-| ❌ Denormalized reply_count column | O(1) reads | Must update on every reply, counter drift risk |
-| ❌ Materialized view | Fast reads | Refresh lag, cannot be real-time |
+**How routing works.** When a device connects, its gateway records `conn:{user} → node` in Redis. A fan-out worker consuming a channel's partition resolves the channel's members (cached, invalidated by membership events), keeps the online ones, groups them by node and publishes one batch per node on that node's topic. A 20-person channel costs at most 20 batches; an announcement to 100,000 people costs one batch per gateway, about 300. The cost is bounded by the number of gateways, not the size of the audience.
 
-> "For the local implementation, I use a correlated subquery because correctness matters more than performance at small scale. At production scale, I'd add a denormalized reply_count column and update it atomically in the same transaction that inserts the reply. Counter drift is mitigated by nightly reconciliation jobs comparing stored counts against actual counts."
+**Why the alternatives fail.** Channel subscriptions put the work on connection churn: every reconnect re-subscribes to hundreds of channels, and a deploy that restarts a gateway re-subscribes 150,000 users at once. Inboxes do the work on every message for every member, including members who are offline and will never read the live copy.
 
-### Real-Time Thread Updates
+**Stale routing is harmless.** If the registry says Bob is on node 7 but he just moved to node 12, node 7 drops the batch. Bob's reconnect to node 12 sent his cursor, and node 12 replayed the gap from the log. Correctness never depends on the registry; only latency does.
 
-When a reply arrives via pub/sub, the SSE event includes the `parent_message_id`. The client must:
-1. Increment the reply count on the parent message in the channel feed
-2. If the thread panel is open for that parent, append the reply
-3. Not add the reply to the channel feed (replies only appear in threads)
+**Slow consumers.** A gateway cuts off any client with more than 1 MB of unsent output instead of buffering without limit. The client reconnects and resumes from its cursor.
 
-### Thread Pagination
+### Presence without a million heartbeats
 
-Most threads have fewer than 100 replies, so the thread view loads all replies without pagination. For outlier threads with thousands of replies, cursor-based pagination would be added when thread loading exceeds the 200ms p99 latency target.
+Client heartbeats (a POST every 30 seconds) cost 1M writes per second at 30M devices and still show people online for a minute after the lid closes. But the gateway already holds the connection, so it is the authority:
 
-## 🔧 Deep Dive 3: Presence System Design
+1. Each gateway keeps a lease, `gw:{node}:alive`, with a 30-second TTL.
+2. It writes `presence:{user}` only when state changes: first connection, last disconnection, or an explicit status like Busy.
+3. If a gateway dies, its lease expires and all its users read as offline within 30 seconds. No per-user cleanup.
+4. Clients subscribe to presence only for people on screen (a member list, a chat header), and changes are debounced to one per user per 10 seconds so a flaky network doesn't flicker everyone's status.
 
-> "Presence tracking -- showing who's online -- seems trivial until you consider 10 million concurrent users sending heartbeats every 30 seconds. That's 333K heartbeats per second."
+"What I give up: presence now depends on the gateway tier, and a crashed node's users take up to 30 seconds to go grey. I'll take that over a million writes a second."
 
-### Redis TTL Approach
+---
 
-Each user's online status is a Redis key with a TTL:
-- Key: `presence:{userId}`, Value: timestamp, TTL: 60 seconds
-- Client sends heartbeat every 30 seconds (2x safety margin over TTL)
-- If heartbeat stops, key expires automatically -- no cleanup job needed
-- Checking presence: `EXISTS presence:{userId}` returns 1 (online) or 0 (offline)
+## 🔧 Deep Dive 3: Permissions Across Four Levels (4 min)
 
-### Why Redis TTL Over Alternatives
+"The failure that ends this product is one tenant reading another's messages. So the question is where the check lives and what I'm willing to cache."
 
-| Approach | Pros | Cons |
-|----------|------|------|
-| ✅ Redis TTL keys | Auto-expiry, O(1) per heartbeat | Must batch reads for efficiency |
-| ❌ Database column + timestamp | Persistent, queryable | Polling needed, no auto-cleanup |
-| ❌ Redis SET per channel | O(1) per channel lookup | 50 SADD ops per heartbeat for user in 50 channels |
-| ❌ WebSocket connection state | Instant transitions | Requires WebSocket, no horizontal scaling |
+**The rule.** A user can read a channel if they are in its organization, and in the team if the team is private, and in the channel if the channel is private. Posting uses the same rule; adding members requires an owner or admin role.
 
-> "I chose Redis TTL keys because the set-per-channel approach has unacceptable write amplification. A user in 50 channels would need 50 SADD operations on every heartbeat. With TTL keys, each heartbeat is a single SETEX regardless of channel count. The read side uses Redis pipeline to batch N EXISTS calls into a single round trip when loading a member list."
+**Where it lives.** One indexed query walks org, team and channel for the caller, on the tenant's directory shard, on every request and every stream connect. The organization membership is an inner join, so a user from another tenant gets no row at all, exactly as if the channel didn't exist. Everything that fails answers `404`. Every channel-scoped route goes through one middleware, so a new endpoint can't forget the check.
 
-### Batch Presence Queries
+| Approach | Read cost | Failure mode |
+|----------|-----------|--------------|
+| ✅ Walk the chain per request | One indexed query, one shard | Slower reads, visible on a latency graph |
+| ❌ Materialized effective permissions | One lookup | A missed invalidation is a silent leak that lasts until a customer finds it |
 
-When loading a channel's member list, we need presence for N users. Individual EXISTS calls create N round trips. Redis pipeline batches all checks into one round trip: queue N EXISTS commands, execute, zip results with user IDs.
+**What I cache.** Only the slow-changing half: a user's organization memberships, for 60 seconds. Removal from a channel or organization also sends a "close stream" message to the gateways holding that user, so an open stream doesn't keep delivering after access ends.
 
-### Scale Considerations
+"This isn't a performance decision; it's choosing which mistakes are recoverable. A slow check I fix from a dashboard. A stale permission I learn about from a customer."
 
-At 10M concurrent users with 30-second heartbeats:
-- 333K writes/second to Redis (SETEX operations)
-- Each key is ~50 bytes, total memory: ~500MB
-- This fits on a single Redis instance but can be sharded by user ID hash for redundancy
+---
 
-### Presence Change Notifications
+## 📈 Scale, Failures & Observability (2 min)
 
-The current implementation polls presence when loading the member list. At production scale, I'd add real-time presence change events:
-- On first heartbeat after absence: publish "user_online" event to their channels
-- On key expiry: use Redis keyspace notifications to broadcast "user_offline"
-- Rate-limit presence notifications to at most once per 10 seconds per user to avoid flapping
+**What breaks first, in order:** gateway memory and connection churn during deploys (drain nodes in waves); hot message shards (split by channel id; reads move to replicas); fan-out lag during spikes (more partitions and workers); history storage (tier by age).
 
-### Why Not WebSockets
+| Failure | What users see | Mitigation |
+|---------|----------------|------------|
+| Gateway node dies | ~150K devices reconnect within seconds | Cursors replay the gap; node lease expires presence |
+| Fan-out worker crash | Short delay for its partitions | Kafka redelivers; duplicates dropped by `seq` |
+| Pub/sub drops a message | One gateway misses an event | Next event exposes the gap; periodic head check |
+| Shard primary fails | Sends fail for seconds | Promote synchronous replica; clients retry with the same key |
+| Kafka down | Live delivery pauses; sending still works | Log holds events; replay on reconnect |
+| Device offline for days | Cursor past retention | `resync` and reload the newest page |
 
-Worth stating plainly, since it's the first question this design invites:
+**What I'd watch:** commit-to-socket delivery latency, Kafka lag per partition, duplicate drops, gap fills, resyncs by reason (rising resyncs mean clients outlive the log retention), streams per gateway, idempotent replays versus creates, and `404`s from membership checks per tenant.
 
-| Approach | Pros | Cons |
-|----------|------|------|
-| ✅ REST write + SSE receive | Writes keep HTTP status codes, validation, and error semantics; `EventSource` reconnects itself; plain HTTP traverses proxies | One-way, so client-pushed signals need a separate path; ~6 connections per origin on HTTP/1.1 |
-| ❌ Bidirectional WebSocket | One connection both ways | "Send message" becomes a frame with no status code — you reinvent correlation IDs and acks to learn whether the write succeeded |
+---
 
-The traffic is deeply asymmetric: a user in a busy channel receives hundreds of messages and sends a handful, so a bidirectional socket's upstream is almost entirely idle. We're paying connection complexity for a direction we barely use. The concrete cost of choosing SSE is visible in the presence design — heartbeats are `POST` requests on a timer rather than frames on the existing connection, which is more requests than a socket would need. That's the trade: a little redundant traffic in exchange for never having to rebuild HTTP's error handling inside a message protocol.
+## ⚖️ Trade-offs & Wrap-up (1 min)
 
-## 📊 Observability
+| Decision | ✅ Chosen | ❌ Alternative | Why |
+|----------|-----------|----------------|-----|
+| Ordering | Counter row per channel | Timestamps, SEQUENCE ids | Gapless and commit-ordered: cursors never skip |
+| Delivery truth | Event log in the write transaction | Pub/sub messages | Transports lose and reorder; the log repairs them |
+| Transport | REST writes + SSE pushes | WebSocket both ways | Status codes and idempotency for writes |
+| Fan-out | Batches per gateway node | Channel subscriptions, per-user inboxes | Cost bounded by gateway count |
+| Resume | Per-channel cursors, bounded replay | Refetch on reconnect | No gaps and no full reloads |
+| Permissions | Chain walk per request, `404` | Materialized permissions | Stale permissions leak silently |
+| Presence | Gateway leases, change-only writes | Client heartbeats | Avoids 1M writes/s |
+| Shard keys | Messages by channel, directory by tenant | By user | Keeps sequences and checks local |
 
-### Metrics (Prometheus)
-
-| Metric | Type | Labels | Purpose |
-|--------|------|--------|---------|
-| http_request_duration_seconds | Histogram | method, route, status | API latency tracking |
-| http_requests_total | Counter | method, route, status | Request volume |
-| messages_total | Counter | channel_id | Message throughput per channel |
-| sse_connections_active | Gauge | - | Current SSE connection count |
-| presence_updates_total | Counter | - | Heartbeat volume |
-
-### Structured Logging
-
-JSON-formatted logs via Pino with request correlation via pino-http. Key fields: userId, channelId, operation for distributed tracing.
-
-### Health Check
-
-`GET /api/health` verifies database connectivity. Used by load balancers to route traffic away from unhealthy instances.
-
-## 🔧 Deep Dive 4: Hierarchical Authorization
-
-> "Everything so far has been about delivery. This one is about the failure that would actually end the product: a message from one company's channel appearing in another's."
-
-**The problem:** Four levels of containment — organization → team → channel → message — and each level has its own membership table. "Can Alice read this message" isn't one check; it's a question about which of those memberships she holds. The tempting shortcut is to check only the innermost level, because channel membership is what the query needs anyway. That shortcut is exactly where cross-tenant leaks come from: a stale `channel_members` row for someone who was removed from the *organization* three months ago still passes an innermost-only check.
-
-**Two ways to answer it:**
-
-| Approach | Read cost | Correctness after a membership change | Failure mode |
-|----------|-----------|----------------------------------------|--------------|
-| ✅ Walk the chain per request | Three indexed lookups, joinable into one query | Immediate — the next request sees the new state | Slower reads; the join is on every message fetch |
-| ❌ Materialize effective permissions per user per channel | One lookup | Only as correct as the invalidation | A missed invalidation is a *silent* leak that persists indefinitely |
-
-I'd walk the chain. The costs are asymmetric in a way that makes this lopsided: the price of walking is a few hundred microseconds on a query that's already hitting the database, and the price of a stale materialized permission is a customer discovering another customer's messages. A cache whose staleness is measured in "until someone notices" is not an acceptable trade for a latency improvement that no user can perceive.
-
-> "The thing I'd want to make explicit is that this isn't really a performance decision, it's a decision about which mistakes are recoverable. If the chain walk is too slow, we find out from a latency graph and fix it. If invalidation has a bug, we find out from a customer, and by then the disclosure has already happened. I'll take the recoverable failure."
-
-**Where authorization actually lives matters as much as its shape.** Membership checks belong in the query, not in application code after the fetch. A handler that loads a message and *then* checks permission has already pulled the row across a trust boundary, and every new endpoint is a fresh chance to forget the check. Expressing it as a join means the unauthorized row is never selected — the default for a new query is to return nothing rather than to return everything.
-
-**What this costs at scale:** every message read carries a membership join, so the hot path grows a dependency on tables that change rarely but are read constantly. The right escape hatch, if it ever becomes necessary, isn't to skip the check but to cache the *narrowest* part of it — an org-level membership set per user, which changes on the order of days — while still verifying channel membership per request. That keeps the fast-moving, security-critical half authoritative and caches only the half that's nearly static.
-
-**Private channels are where the model earns its keep.** `channels.is_private` means team membership is no longer sufficient — a user can be on the team and still not belong in the channel. A model that treated channel access as derived from team access would have no way to express that, and adding private channels later would require rewriting every authorization path. Carrying `channel_members` from the start costs a table and a join; retrofitting it would cost an audit of every query in the system.
-
-### Typing Indicators: The Case Against Building Them
-
-The one real-time feature deliberately left unbuilt. Typing is the highest-frequency signal in a chat product — a burst of events per keystroke run — and it is worthless the instant it's stale. Routing that through the same Postgres-write-then-publish path as messages would mean the noisiest data in the system takes the most expensive route.
-
-The right shape, if built, is a short-TTL Redis key plus an SSE event: no durable write at all, and the TTL doing the expiry that a "stopped typing" event would otherwise have to deliver reliably. That's the same reasoning as presence — for data that's only meaningful for the next few seconds, expiry beats state transitions, because the "off" signal is exactly the one most likely to be lost.
-
-It's also the strongest argument the WebSocket side has. Typing is genuinely client-pushed and high-frequency, which is the traffic shape SSE handles worst. If typing indicators shipped, `POST`-per-keystroke-burst would be the point where the asymmetry assumption stops holding and the decision deserves revisiting.
-
-## ⚡ Scalability Discussion
-
-### What Breaks First
-
-1. **SSE connection limits**: At 100K connections per server, memory (~10GB) and file descriptor limits become bottlenecks. Solution: dedicated SSE gateway servers separate from API servers.
-
-2. **Messages table**: Billions of rows slow the `(channel_id, created_at)` B-tree index. Solution: range partition by `created_at` monthly, or migrate to Cassandra for high-volume channels.
-
-3. **Redis pub/sub fan-out**: A 10K-member channel at 100 msgs/sec means 1M SSE pushes/sec. Solution: batch delivery over 100ms windows, tiered fan-out through gateway servers.
-
-### Scaling Path
-
-- **Phase 1**: Vertical scaling -- bigger database, more Redis memory
-- **Phase 2**: Read replicas for message history, separate write/read endpoints
-- **Phase 3**: Database partitioning by date range
-- **Phase 4**: CQRS -- PostgreSQL for writes, Elasticsearch for search, Cassandra for reads
-- **Phase 5**: Multi-region with per-region storage and cross-region metadata sync
-
-### The Subscription Leak
-
-One honest note on the pub/sub layer: subscribing happens on every SSE connect, and unsubscribing — though implemented — is never called on disconnect. Each instance's subscription set therefore only grows for the life of the process.
-
-At this scale nothing breaks; Redis handles thousands of subscriptions without noticing. At real scale it's a slow leak with an unpleasant shape: memory grows monotonically, a restart appears to "fix" it, and the symptom shows up as periodic unexplained instance churn rather than as anything pointing at pub/sub. The fix is to reference-count subscriptions per channel and unsubscribe when the last local client for that channel disconnects — not to unsubscribe on every disconnect, which would silently cut off the other clients on that instance still watching the same channel.
-
-## ⚖️ Trade-offs Summary
-
-| Decision | Chosen | Alternative | Rationale |
-|----------|--------|-------------|-----------|
-| ✅ SSE | Simple, HTTP-native, auto-reconnect | ❌ WebSocket | Unidirectional push sufficient, REST for sends |
-| ✅ Redis pub/sub | Low latency, simple setup | ❌ Kafka | Chat prioritizes speed over durability |
-| ✅ Self-referencing threads | One table, simple joins | ❌ Separate threads table | Flat threads match Teams UX |
-| ✅ Redis TTL for presence | Auto-expiry, no cleanup jobs | ❌ Database polling | Sub-minute accuracy, O(1) per heartbeat |
-| ✅ PostgreSQL | ACID, joins, mature | ❌ Cassandra | Sufficient until billions of messages |
-| ✅ MinIO (S3-compatible) | Presigned URLs, scalable | ❌ Database BLOBs | Offloads bandwidth |
-| ✅ Session auth | Immediate revocation | ❌ JWT | No token refresh, works with SSE |
-| ✅ Cursor pagination | Stable under concurrent writes | ❌ Offset pagination | No duplicates from new messages |
-| ✅ UUID primary keys | No coordination needed | ❌ Auto-increment | Required for database sharding |
+"With more time I'd add per-tenant search with permission filtering at query time, the meetings signaling service, and retention policies per tenant for compliance."
