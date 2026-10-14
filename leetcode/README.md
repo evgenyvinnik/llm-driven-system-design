@@ -24,7 +24,7 @@ An online coding practice and evaluation platform where users can solve programm
 - Test case validation with real-time results
 - User progress tracking and submission history
 - Admin dashboard with system statistics
-- Leaderboards
+- Admin leaderboard (SQL aggregate; contests are not implemented)
 
 ## Implementation Status
 
@@ -88,7 +88,7 @@ This creates:
 npm run dev
 ```
 
-Backend runs on http://localhost:3001
+Backend runs on http://localhost:3001. By default the API process also judges submissions (an embedded judge worker); Docker must be running for code to execute.
 
 5. **Install frontend dependencies (new terminal):**
 
@@ -139,9 +139,11 @@ leetcode/
 │   ├── src/
 │   │   ├── db/           # Database pool, redis, init.sql, seed
 │   │   ├── routes/       # API routes (auth, problems, submissions, etc.)
-│   │   ├── services/     # Code executor service
+│   │   ├── services/     # Code executor, judge, checker, submission creation
+│   │   ├── shared/       # Judge queue, status cache, rate limits, metrics, logging
+│   │   ├── worker/       # Judge worker (embedded in the API or standalone)
 │   │   ├── middleware/   # Auth middleware
-│   │   └── index.js      # Express server entry point
+│   │   └── index.ts      # Express server entry point
 │   └── package.json
 ├── frontend/
 │   ├── src/
@@ -170,10 +172,10 @@ leetcode/
 - `GET /api/v1/problems/:slug/submissions` - Get user's submissions for a problem
 
 ### Submissions
-- `POST /api/v1/submissions` - Submit code
-- `POST /api/v1/submissions/run` - Run code against sample tests
-- `GET /api/v1/submissions/:id` - Get submission details
-- `GET /api/v1/submissions/:id/status` - Poll submission status
+- `POST /api/v1/submissions` - Submit code (send an `Idempotency-Key` header to make retries safe; `422` if the key is reused with different code)
+- `POST /api/v1/submissions/run` - Run code against sample tests (`503` + `Retry-After` when the sandbox is unavailable)
+- `GET /api/v1/submissions/:id` - Get submission details (owner or admin only)
+- `GET /api/v1/submissions/:id/status` - Poll submission status (owner or admin only)
 
 ### Users
 - `GET /api/v1/users/:id/profile` - Get user profile
@@ -204,11 +206,13 @@ npm run dev:server3  # Port 3003
 
 The code execution sandbox uses Docker to safely run user-submitted code:
 
-- **Security:** Containers run with dropped capabilities, no network access, read-only filesystem
-- **Resource limits:** Memory (256MB/512MB), CPU (50%), PIDs (50), time limits
+- **Security:** Containers run as an unprivileged user (65534) with dropped capabilities, no network, a read-only root and code mount, and a 64 MB tmpfs `/tmp`
+- **Resource limits:** Memory (256MB/512MB, no swap), CPU (50%), PIDs (50), per-test time limit, 1 MiB of stdout (Output Limit Exceeded beyond that)
+- **Compile once:** C++ and Java are compiled once per submission; each test then runs in a fresh container
 - **Languages:** Python 3.11, JavaScript (Node 20), C++ (GCC 13), Java (OpenJDK 21)
+- **gVisor:** set `SANDBOX_RUNTIME=runsc` to run every container under gVisor if it is installed
 
-To enable code execution, ensure Docker is running and the user has Docker socket access.
+To enable code execution, ensure Docker is running and the user has Docker socket access. Without Docker, submissions are retried and then end as `system_error`, and sample runs return `503`.
 
 ## Technology Stack
 
@@ -224,40 +228,50 @@ See [architecture.md](./architecture.md) for detailed system design documentatio
 
 ## Development Notes
 
-See [claude.md](./claude.md) for development insights and iteration history.
+See [CLAUDE.md](./CLAUDE.md) for development insights and iteration history.
 
 ## Implemented Features
 
-- **Rate Limiting**: Protects execution resources
+- **Judge Queue**: The `submissions` table is the queue — workers claim with `FOR UPDATE SKIP LOCKED`, hold a lease, and write verdicts fenced by a lease token; failed attempts retry with backoff, then end as `system_error`
+- **Rate Limiting**: Protects execution resources (per process)
   - 10 submissions/minute per user
   - 30 code runs/minute per user
-  - Brute force protection on auth endpoints
+  - 5 failed logins per 15 minutes and 5 registrations per hour per IP
 - **Circuit Breaker**: Graceful degradation when Docker is unavailable
-- **Idempotency**: Prevents duplicate submissions on retry
+- **Idempotency**: `Idempotency-Key` replays and in-flight duplicate detection, enforced by unique indexes
 - **Metrics**: Prometheus-compatible observability
 - **Virtualized Lists**: Efficient rendering for large problem catalogs
 
-## Kafka Queue Mode (Optional)
+## Judge Workers
 
-For production scale, enable Kafka queue-based execution:
+The API process judges submissions itself by default. To scale judging separately, turn that off and run standalone workers (each needs Docker access and a distinct `WORKER_ID`):
 
-1. **Start Kafka:**
 ```bash
-docker-compose up -d zookeeper kafka
+EMBEDDED_WORKER=false npm run dev   # API only
+npm run dev:worker1                 # worker-1
+npm run dev:worker2                 # worker-2 (another terminal)
 ```
 
-2. **Enable queue mode:**
-```bash
-export USE_KAFKA_QUEUE=true
-```
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `EMBEDDED_WORKER` | `true` | Run a judge worker inside the API process |
+| `WORKER_ID` | hostname | Worker name; containers are labelled with it and cleaned up on restart |
+| `JUDGE_CONCURRENCY` | `2` | Submissions judged at once per worker |
+| `JUDGE_LEASE_MS` | `30000` | Lease length; heartbeats renew it every third of that |
+| `JUDGE_POLL_MS` | `2000` | Fallback poll interval (new submissions also wake workers via `LISTEN/NOTIFY`) |
+| `JUDGE_MAX_ATTEMPTS` | `3` | Attempts before a submission ends as `system_error` |
+| `WORKER_LANGUAGES` | all | Comma-separated languages this worker accepts (per-language pools) |
+| `SANDBOX_RUNTIME` | Docker default | OCI runtime, e.g. `runsc` for gVisor |
+| `SANDBOX_MAX_CONTAINERS` | `4` | Containers one process runs at once |
+| `SANDBOX_USER` | `65534:65534` | uid:gid that submitted code runs as |
 
-3. **Start workers:**
-```bash
-npm run dev:worker1  # Worker 1
-npm run dev:worker2  # Worker 2 (in another terminal)
-```
+## Testing
 
-Workers consume submission jobs from Kafka and execute them independently, enabling horizontal scaling.
+```bash
+cd backend
+npm test          # vitest: checker, Docker stream parsing, executor, judge, worker, submission service, auth
+npm run lint
+```
 
 ## Future Enhancements
 

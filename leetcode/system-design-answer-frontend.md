@@ -1,556 +1,291 @@
-# LeetCode (Online Judge) - System Design Answer (Frontend Focus)
+# 🧑‍💻 LeetCode (Online Judge) — System Design Answer (Frontend Focus)
 
-*45-minute system design interview format - Frontend Engineer Position*
+*45-minute frontend interview, structured with the [RADIO framework](https://www.greatfrontend.com/front-end-system-design-playbook/framework): Requirements → Architecture → Data model → Interface → Optimizations. This is a proposed production design; what this repository actually runs is described in [architecture.md → Implementation Notes](./architecture.md#implementation-notes).*
 
----
+> "The frontend of an online judge is two products in one page. The problem statement is a document — public, read far more than it's solved, and worth ranking in search. The editor is an application — heavy, stateful, and the place where a coder can lose twenty minutes of work to a refresh. Around both sits an asynchronous verdict that takes seconds to arrive. So I'll design for three things: code is never lost, a submission is never duplicated or misreported, and the page feels fast even though the editor is the heaviest thing on it."
 
-## 🎯 Problem Statement
-
-Design the frontend architecture for an online coding practice platform that allows users to:
-- Browse and filter coding problems by difficulty and tags
-- Write and edit code in a syntax-highlighted editor
-- Submit code and view real-time execution results
-- Track progress across problems
-- Participate in timed contests
-
----
-
-## 📋 Requirements Clarification
-
-### Functional Requirements
-
-1. **Problem Browser**: Filterable, sortable list of coding problems
-2. **Code Editor**: Syntax highlighting, multiple language support, auto-complete
-3. **Test Runner**: Execute code against sample test cases
-4. **Submission Results**: Real-time status updates with test case details
-5. **Progress Dashboard**: Visualize solved problems, streaks, rankings
-
-### Non-Functional Requirements
-
-1. **Responsive**: Support desktop, tablet, and mobile layouts
-2. **Performance**: Editor responsive at 60fps, instant UI feedback
-3. **Accessibility**: Keyboard navigation, screen reader support
-4. **Offline Resilience**: Cache problems for offline viewing
-
-### UI/UX Requirements
-
-- Clean, distraction-free coding environment
-- Clear visual feedback for submission status
-- Intuitive navigation between problems
-- Real-time progress updates without page refresh
+| Phase | Time | What I want the interviewer to leave with |
+|-------|------|--------------------------------------------|
+| R — Requirements | 5 min | Features, performance and accessibility targets |
+| A — Architecture | 9 min | Rendering split, component tree, who owns which state |
+| D — Data model | 5 min | Client entities, cache keys, freshness |
+| I — Interface | 5 min | The API as the client sees it; component contracts |
+| O — Optimizations & deep dives | 17 min | The editor, submit and verdict UX, the problem list |
+| Loading, error & empty states | 2 min | What the UI does when things go wrong |
+| Wrap-up | 2 min | Trade-offs and next steps |
 
 ---
 
-## 🏗️ High-Level Architecture
+## 🎯 R — Requirements (5 min)
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                            React Application                                 │
-│                                                                              │
-│  ┌────────────────────────────────────────────────────────────────────────┐ │
-│  │                        TanStack Router                                  │ │
-│  │    /                    ──▶ Problem List                               │ │
-│  │    /problems/:slug      ──▶ Problem Detail + Editor                    │ │
-│  │    /submissions         ──▶ Submission History                         │ │
-│  │    /progress            ──▶ User Dashboard                             │ │
-│  │    /contests/:id        ──▶ Contest View                               │ │
-│  └────────────────────────────────────────────────────────────────────────┘ │
-│                                                                              │
-│  ┌───────────────┐  ┌───────────────────────────────────────────────────┐  │
-│  │   Sidebar     │  │              Main Content Area                     │  │
-│  │  ┌─────────┐  │  │  ┌─────────────────────────────────────────────┐  │  │
-│  │  │ Problem │  │  │  │           Problem Description               │  │  │
-│  │  │  List   │  │  │  │  - Title, difficulty badge                  │  │  │
-│  │  │         │  │  │  │  - Description markdown                     │  │  │
-│  │  │ Filters │  │  │  │  - Examples with I/O                        │  │  │
-│  │  │ - Easy  │  │  │  └─────────────────────────────────────────────┘  │  │
-│  │  │ - Med   │  │  │  ┌─────────────────────────────────────────────┐  │  │
-│  │  │ - Hard  │  │  │  │              Code Editor                    │  │  │
-│  │  │         │  │  │  │  - Language selector                        │  │  │
-│  │  │ Tags    │  │  │  │  - CodeMirror with syntax highlighting     │  │  │
-│  │  │ Status  │  │  │  │  - Run / Submit buttons                     │  │  │
-│  │  └─────────┘  │  │  └─────────────────────────────────────────────┘  │  │
-│  └───────────────┘  │  ┌─────────────────────────────────────────────┐  │  │
-│                     │  │           Test Results Panel                │  │  │
-│                     │  │  - Status badges (Pass/Fail/TLE/MLE)       │  │  │
-│                     │  │  - Expected vs Actual output                │  │  │
-│                     │  │  - Runtime and memory stats                 │  │  │
-│                     │  └─────────────────────────────────────────────┘  │  │
-│                     └───────────────────────────────────────────────────┘  │
-│                                                                              │
-│  ┌────────────────────────────────────────────────────────────────────────┐ │
-│  │                         Zustand Store                                   │ │
-│  │  problems[] │ submissions[] │ currentCode │ language │ user            │ │
-│  └────────────────────────────────────────────────────────────────────────┘ │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+"I'll confirm who uses this and on what, because it sets the performance budget and the editor choice."
+
+### Functional requirements
+
+1. **Problem list**: ~3,000 problems with difficulty, solved status and acceptance rate; filter, search and sort.
+2. **Problem workspace**: statement with examples on one side; editor with language picker, Run and Submit on the other; resizable panes.
+3. **Run**: results per sample case — input, expected, actual, error.
+4. **Submit**: live progress ("Running test 3 of 10") and a verdict with the failing test when allowed.
+5. **History and progress**: past submissions per problem, solved counts by difficulty.
+6. **Contests**: countdown, problem set, and a scoreboard with "my rank".
+
+Out of scope: discussions, video solutions, collaborative editing.
+
+### Non-functional requirements
+
+| Requirement | Target | Why |
+|-------------|--------|-----|
+| LCP on a problem page | < 2.0 s on a mid-range laptop, < 2.5 s on mobile | The statement is what people came to read |
+| INP | < 100 ms while typing in a 500-line file | Input lag in an editor feels broken |
+| CLS | < 0.1 | The editor and verdict panel reserve their space |
+| JavaScript | < 150 KB gzipped before the editor; editor chunk loaded in parallel with the statement | Most visits to a statement come from search |
+| Durability of drafts | Survive refresh, language switches, closed tabs, expired sessions | Losing code is the worst thing this UI can do |
+| Accessibility | WCAG 2.2 AA; full keyboard use; verdicts announced | The verdict is an asynchronous result |
+| Devices | Desktop-first; mobile for reading and light edits | People solve on laptops, browse on phones |
 
 ---
 
-## 🔧 Deep Dive: Code Editor Architecture
+## 🏗️ A — Architecture (9 min)
 
-### CodeMirror 6 Component Structure
+### Rendering: the statement is a document, the editor is an app
+
+"Problem statements are public, change rarely and bring in search traffic, so I pre-render them to static HTML at the CDN and revalidate when a problem changes. The workspace — editor, Run, Submit, history — is client-rendered inside that page and loaded as its own chunk, starting while the statement paints. A pure SPA would make search engines and first-time visitors wait for JavaScript to see a statement; server-rendering the editor buys nothing, because it's useless until hydrated and depends on the user's session and drafts."
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                      CodeEditor Component                        │
-│                                                                  │
-│  ┌────────────────────────────────────────────────────────────┐ │
-│  │                    EditorState                              │ │
-│  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐  │ │
-│  │  │ basicSetup   │  │ langExtension│  │    oneDark       │  │ │
-│  │  │ (line nums,  │  │ (python/js/  │  │    theme         │  │ │
-│  │  │  folding)    │  │  java/cpp)   │  │                  │  │ │
-│  │  └──────────────┘  └──────────────┘  └──────────────────┘  │ │
-│  └────────────────────────────────────────────────────────────┘ │
-│                              │                                   │
-│                              ▼                                   │
-│  ┌────────────────────────────────────────────────────────────┐ │
-│  │                    EditorView                               │ │
-│  │  - updateListener ──▶ onChange callback                    │ │
-│  │  - lineWrapping                                             │ │
-│  │  - Recreates on language change                             │ │
-│  └────────────────────────────────────────────────────────────┘ │
-└─────────────────────────────────────────────────────────────────┘
+ ┌──────────────────────────────────────────────────────────────────────────────────────────────┐
+ │ App shell · React Router · RootLayout restores the session once                              │
+ │ URL state: /problems?difficulty=…&q=…  ·  /problems/:slug  ·  /contests/:id?page=…           │
+ └──────────────────────┬────────────────────────────────┬──────────────────┬───────────────────┘
+                        │                                │                  │
+                        │ /problems/:slug (lazy)         │ /problems?q=…    │ /contests/:id (lazy)
+                        ▼                                ▼                  ▼
+ ┌────────────────────────────────────────────┐  ┌───────────────┐  ┌───────────────────────────┐
+ │ ProblemWorkspace                           │  │ ProblemTable  │  │ StandingsPage             │
+ │ Statement · CodeEditor · RunPanel          │  │ virtualized   │  │ rank table · my rank      │
+ │ VerdictPanel (aria-live)                   │  │ <table>       │  │ contest countdown         │
+ └──┬──────────────┬─────────────────┬────────┘  └───────┬───────┘  └───────┬───────────────────┘
+    │              │                 │                   │                  │
+    │ save draft   │ (1) submit      │ (2) poll          │ catalog          │ (3) standings
+    │ (500 ms)     │ + key K         │ with backoff      │                  │ every 15 s
+    │              │                 │                   │                  │
+    ▼              ▼                 ▼                   ▼                  ▼
+ ┌──────────────┐ ┌─────────────────────────────────────────────────────────────────────────────┐
+ │ Draft store  │ │ Server-state cache · TanStack Query                                         │
+ │ Zustand +    │ │ ['problems', filters] · ['problem', slug] · ['submission', id, 'status']    │
+ │ localStorage │ │ ['standings', contestId, page] · dedupe, retries, refetchInterval           │
+ └──────────────┘ └─────────────────────┬───────────────────────────────────────────────────────┘
+                                        │
+                                        │ fetch
+                                        ▼
+                  ┌─────────────────────────────────────────────────────────────────────────────┐
+                  │ API client · fetch + AbortSignal · Idempotency-Key header                   │
+                  │ typed errors (ApiError, RateLimitError) · 401 → login · Retry-After         │
+                  └─────────────────────┬───────────────────────────────────────────────────────┘
+                                        │
+                                        │ HTTPS · session cookie
+                                        ▼
+                  ┌─────────────────────────────────────────────────────────────────────────────┐
+                  │ Backend · Submission API (/api/v1) · Contest Service                        │
+                  └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Trade-off 1: CodeMirror 6 vs Monaco Editor
+1. **Submit (1).** The workspace flushes the draft, freezes the code with a fresh idempotency key, and runs a mutation through the query cache; the API client sends the key in a header and retries network errors with the same key.
+2. **Poll (2).** The verdict panel subscribes to the submission's status query. Its refetch interval backs off from 0.5 s to 5 s and stops at the first terminal status; progress goes to an `aria-live` region.
+3. **Standings (3).** The contest page's standings query refetches every 15 s, only while the tab is visible.
 
-| Approach | Pros | Cons |
-|----------|------|------|
-| ✅ CodeMirror 6 | 150KB bundle, excellent mobile, highly customizable | Less IDE-like features |
-| ❌ Monaco Editor | Full VS Code experience, IntelliSense, multi-cursor | 2MB bundle, poor mobile support |
+### Who owns which state
 
-> "I chose CodeMirror 6 over Monaco for the code editor, and this decision significantly impacts our frontend architecture. Monaco provides the full VS Code editing experience—IntelliSense, go-to-definition, multi-cursor editing—but at 2MB it would triple our bundle size and dominate our initial load time. For a coding practice platform, Monaco's IntelliSense is actually less useful than it sounds: users implement specific function signatures against known inputs, not exploring unfamiliar APIs. CodeMirror 6's 150KB footprint means our editor loads in under 500ms even on 3G connections. The mobile experience is where CodeMirror truly wins—its touch handling, virtual keyboard interaction, and viewport management are production-ready, while Monaco is effectively unusable on mobile. The trade-off is that power users won't get VS Code muscle memory shortcuts, but we can add common keybindings as CodeMirror extensions. For users who practice during commutes or breaks, mobile support is essential—and Monaco doesn't offer it."
+| State | Owner | Why there |
+|-------|-------|-----------|
+| Problems, problem detail, history, standings, submission status | Server-state cache (TanStack Query) | Dedupe, retries, cancellation, refetch intervals and invalidation without hand-written loading flags |
+| Code drafts per problem and language, preferred language | Zustand store persisted to `localStorage` | Client-owned data that must outlive the page |
+| Pending submit's idempotency key | Component state mirrored to `sessionStorage` | A refresh mid-submit can resend the same key |
+| Filters, search, sort, contest page | URL search params | Shareable, bookmarkable, back-button friendly |
+| Pane sizes, open tab, dialogs | Local component state (pane sizes persisted) | Never shared |
+
+"The rule I'm applying: server data never gets copied into a client store, and client-owned data — drafts — never round-trips through the server on every keystroke. Each piece of state has exactly one owner."
+
+### Key interaction: submitting
+
+```
+ Coder         Workspace              Query cache          API client                Backend
+   │               │                       │                    │                       │
+   │ 1 Ctrl+Enter  │                       │                    │                       │
+   │──────────────▶│                       │                    │                       │
+   │               │ 2 flush draft, new key K, disable button   │                       │
+   │               │ 3 mutate(code, K)     │                    │                       │
+   │               │──────────────────────▶│                    │                       │
+   │               │                       │ 4 submit(code, K)  │                       │
+   │               │                       │───────────────────▶│                       │
+   │               │                       │                    │ 5 POST (key K)        │
+   │               │                       │                    │──────────────────────▶│
+   │               │                       │                    │ 6 network error       │
+   │               │                       │                    │◀──────────────────────│
+   │               │                       │                    │ 7 retry, same K       │
+   │               │                       │                    │──────────────────────▶│
+   │               │                       │                    │ 8 202 {submissionId}  │
+   │               │                       │                    │◀──────────────────────│
+   │               │ 9 start status query  │                    │                       │
+   │               │◀──────────────────────│                    │                       │
+   │               │                       │                    │                       │
+```
+
+"Submit is deliberately *not* optimistic: there's no verdict to show until the judge produces one, and pretending otherwise would lie. What I make instant is feedback — the button switches to 'Submitting…' in the same frame — and what I make safe is the retry, by reusing the key."
+
+### Key interaction: waiting for the verdict
+
+```
+VerdictPanel                  Status query                API client                   Backend
+      │                             │                          │                          │
+      │ 1 subscribe(id)             │                          │                          │
+      │────────────────────────────▶│                          │                          │
+      │                             │ 2 getStatus(id, signal)  │                          │
+      │                             │─────────────────────────▶│                          │
+      │                             │                          │ 3 GET …/status           │
+      │                             │                          │─────────────────────────▶│
+      │                             │                          │ 4 running, test 3 of 10  │
+      │                             │                          │◀─────────────────────────│
+      │ 5 progress → aria-live      │                          │                          │
+      │◀────────────────────────────│                          │                          │
+      │                             │ 6 poll again (1–5 s)     │                          │
+      │                             │─────────────────────────▶│                          │
+      │                             │                          │ 7 wrong_answer, test 4   │
+      │                             │                          │◀─────────────────────────│
+      │ 8 verdict; refresh history  │                          │                          │
+      │◀────────────────────────────│                          │                          │
+      ···························· the coder leaves the page ······························
+      │ 9 unmount → abort           │                          │                          │
+      │────────────────────────────▶│                          │                          │
+      │                             │                          │                          │
+```
+
+"Polling is just a query whose refetch interval depends on the data: half a second at first, because most runs finish in a few seconds, then backing off to five. It stops on a terminal status, aborts its in-flight request when the coder leaves the page, and keeps going through network errors. Because every status change lands in a polite live region, a screen-reader user hears 'Running test 3 of 10' and then 'Wrong Answer on test 4' without losing their place in the editor."
 
 ---
 
-## 🔧 Deep Dive: State Management
+## 💾 D — Data Model (5 min)
 
-### Zustand Store Architecture
+| Entity | Shape | Cache key | Freshness |
+|--------|-------|-----------|-----------|
+| `ProblemSummary` | `id`, `slug`, `title`, `difficulty`, `acceptance`, `myStatus` | `['problems', {difficulty, q, sort}]` | Catalog index fetched whole; `staleTime` 5 min |
+| `Problem` | statement (markdown), examples, limits, starter code per language, sample cases | `['problem', slug]` | Static per problem version; long `staleTime` |
+| `SubmissionStatus` | `status`, `currentTest`, `testCasesTotal`, `runtimeMs`, `errorMessage` | `['submission', id, 'status']` | Polled until terminal, then immutable |
+| `SubmissionSummary` | `id`, `language`, `status`, `runtimeMs`, `createdAt` | `['submissions', slug]` | Invalidated when a verdict arrives |
+| `StandingsPage` | `rows[50]`, `myRank`, `frozen`, `asOf` | `['standings', contestId, page]` | Refetch every 15 s while visible |
+| `Draft` | `code` | `drafts['two-sum:python']` in the persisted store | Saved 500 ms after typing stops |
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                     Zustand Problem Store                        │
-│                                                                  │
-│  ┌──────────────────────────────┬──────────────────────────────┐│
-│  │          State               │           Actions            ││
-│  ├──────────────────────────────┼──────────────────────────────┤│
-│  │  problems[]                  │  setFilter()                 ││
-│  │  filters {                   │  setCurrentProblem()         ││
-│  │    difficulty: all/easy/...  │  setLanguage()               ││
-│  │    status: all/solved/...    │  setCode()                   ││
-│  │    search: string            │  submitCode()                ││
-│  │  }                           │                              ││
-│  │  currentProblem              │  ┌────────────────────────┐  ││
-│  │  currentLanguage             │  │  getFilteredProblems() │  ││
-│  │  code: { [slug]: code }      │  │  (computed selector)   │  ││
-│  │  submissions[]               │  └────────────────────────┘  ││
-│  │  activeSubmission            │                              ││
-│  └──────────────────────────────┴──────────────────────────────┘│
-│                              │                                   │
-│                              ▼                                   │
-│  ┌────────────────────────────────────────────────────────────┐ │
-│  │              persist() middleware                           │ │
-│  │  Saves to localStorage:                                     │ │
-│  │  - code drafts (keyed by problem slug)                      │ │
-│  │  - currentLanguage preference                               │ │
-│  └────────────────────────────────────────────────────────────┘ │
-└─────────────────────────────────────────────────────────────────┘
-```
+Two modeling decisions:
 
-### Trade-off 2: Zustand vs Redux vs Context
-
-| Approach | Pros | Cons |
-|----------|------|------|
-| ✅ Zustand | 1KB, minimal boilerplate, built-in persist | Smaller ecosystem |
-| ❌ Redux Toolkit | Mature, large ecosystem, devtools | 7KB, more boilerplate |
-| ❌ Context API | Zero dependencies, built-in | Re-renders, no persistence |
-
-> "I chose Zustand with the persist middleware over Redux or Context for state management. The key requirement driving this decision is code draft persistence—users must never lose their work if they accidentally close the browser or navigate away. Redux could achieve this with redux-persist, but that's 3 additional packages (redux, @reduxjs/toolkit, redux-persist) totaling 15KB+ and requiring action creators, reducers, and middleware configuration. Zustand's persist middleware is built-in and configures in 5 lines. Context API would require building persistence from scratch. The trade-off is Redux's richer devtools and middleware ecosystem, but for a coding practice app where state is straightforward (problems, code drafts, submissions), Zustand's simplicity wins. The real architectural benefit is that Zustand doesn't require Provider wrapping, so our component tree stays clean and we avoid the 'provider hell' of combining multiple contexts. For computed values like filtered problem lists, Zustand's selector pattern prevents unnecessary re-renders—only components subscribing to filters re-render when filters change."
+- **Terminal statuses are immutable.** Once a status query returns `accepted` or any other final verdict, I set its `staleTime` to infinity. The server guarantees verdicts never change, so the client never needs to ask again.
+- **Drafts are keyed by problem *and* language.** Switching from Python to C++ and back must restore the Python code; one draft per problem would overwrite it with the C++ starter.
 
 ---
 
-## 🔧 Deep Dive: Submission Results UI
+## 🔌 I — Interface (5 min)
 
-### Real-time Status Polling Flow
+### The API as the client sees it
 
 ```
-┌────────────────┐         ┌────────────────┐         ┌────────────────┐
-│   Submit Code  │         │   Backend API  │         │   Job Queue    │
-└───────┬────────┘         └───────┬────────┘         └───────┬────────┘
-        │                          │                          │
-        │  POST /submissions       │                          │
-        │─────────────────────────▶│                          │
-        │                          │   Queue execution job    │
-        │                          │─────────────────────────▶│
-        │  { submissionId }        │                          │
-        │◀─────────────────────────│                          │
-        │                          │                          │
-        ├──────────────────────────── POLLING LOOP ───────────┤
-        │                          │                          │
-        │  GET /status/{id}        │                          │
-        │─────────────────────────▶│                          │
-        │  { status: "running",    │                          │
-        │    currentTest: 3 }      │                          │
-        │◀─────────────────────────│                          │
-        │                          │                          │
-        │  ...poll every 1s...     │                          │
-        │                          │                          │
-        │  { status: "accepted",   │                          │
-        │    runtimeMs: 42 }       │                          │
-        │◀─────────────────────────│                          │
-        │                          │                          │
-        │  STOP POLLING            │                          │
-        ▼                          ▼                          ▼
+GET  /api/v1/problems?difficulty&q&sort        → {problems, pagination}   (the whole index, paged at 500)
+GET  /api/v1/problems/{slug}                    → statement, samples, limits, starter code
+POST /api/v1/runs                               {slug, language, code}         → 202 {runId}
+POST /api/v1/submissions                        {slug, language, code} + Idempotency-Key → 202 {submissionId} | 200 duplicate | 422 | 429
+GET  /api/v1/submissions/{id}/status            → status, progress, verdict; Retry-After while running
+GET  /api/v1/problems/{slug}/submissions        → my history for the problem
+GET  /api/v1/contests/{id}/standings?page       → {rows, myRank, frozen, asOf}
 ```
 
-### Status Badge Configuration
+- Errors carry a status the client can act on: `401` sends the coder to log in with drafts intact; `404` on a status poll stops polling; `422` means a client bug (key reuse); `429` and `503` include `Retry-After`, which the UI turns into a countdown on the button.
+- A `200` with `duplicate: true` on submit is not an error: the same code is already being judged, so the UI attaches to that submission.
 
-| Status | Color | Icon | User Message |
-|--------|-------|------|--------------|
-| accepted | Green | CheckCircle | All tests passed |
-| wrong_answer | Red | XCircle | Output mismatch on test N |
-| time_limit_exceeded | Yellow | Clock | Solution too slow |
-| memory_limit_exceeded | Orange | HardDrive | Memory limit exceeded |
-| runtime_error | Red | AlertTriangle | Code crashed |
-| compile_error | Purple | AlertCircle | Syntax error |
-| pending | Gray | Clock | Waiting in queue |
-| running | Blue | Loader (animated) | Running test N of M |
+### Component contracts
 
-### Trade-off 3: Polling vs WebSocket for Status Updates
-
-| Approach | Pros | Cons |
-|----------|------|------|
-| ✅ HTTP Polling | Stateless, proxy-friendly, simpler error handling | 1s latency, more requests |
-| ❌ WebSocket | Real-time updates, fewer requests | Stateful, reconnection logic needed |
-
-> "I chose HTTP polling over WebSocket for submission status updates. For a code execution flow, the ~1 second polling interval is imperceptible—users expect 2-5 seconds for their code to run anyway. Polling simplifies our frontend architecture significantly: we use a simple useEffect with setInterval, handle errors with standard try/catch, and don't need reconnection logic for network interruptions. WebSocket would require connection state management, heartbeats, and graceful reconnection with exponential backoff. The real killer for WebSocket is corporate environments—many companies' proxies block or interfere with WebSocket connections, but HTTP always works. The trade-off is slightly higher server load, but the backend caches status in Valkey making each poll sub-millisecond. If we later need streaming output (showing compilation errors as they happen), we can upgrade specific flows to WebSocket while keeping the simple polling for status. For 10K concurrent contest users polling every second, that's 10K requests/second to a cached endpoint—easily handled."
+| Component / hook | Contract |
+|------------------|----------|
+| `<CodeEditor language value onChange />` | Controlled; never re-mounts on language change; exposes a keymap for Ctrl+Enter (submit) and Ctrl+' (run) |
+| `useDraft(slug, language)` | Returns the saved draft or the starter code; debounced save; flushes on language switch and before submit |
+| `useSubmit()` | Freezes code, owns the idempotency key and the retry policy; returns the submission id |
+| `useSubmissionStatus(id)` | Backoff polling, abort on unmount, stops at terminal statuses; returns `{data, stalled}` |
+| `<VerdictPanel status />` | Renders progress and verdicts inside one polite live region |
+| `<ProblemTable problems filters />` | Virtualized `<table>` with fixed 48 px rows, `aria-rowcount` and `aria-rowindex` |
 
 ---
 
-## 🔧 Deep Dive: Problem List with Virtualization
+## 🔧 O — Optimizations & Deep Dives (17 min)
 
-### TanStack Virtual Architecture
+### Deep dive 1: an editor that is fast to load and never loses code (6 min)
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    ProblemList Component                         │
-│                                                                  │
-│  ┌────────────────────────────────────────────────────────────┐ │
-│  │                 Sticky Header (always visible)              │ │
-│  │  ┌──────────┬───────────────────┬───────────┬────────────┐ │ │
-│  │  │  Status  │       Title       │ Difficulty│ Acceptance │ │ │
-│  │  └──────────┴───────────────────┴───────────┴────────────┘ │ │
-│  └────────────────────────────────────────────────────────────┘ │
-│                                                                  │
-│  ┌────────────────────────────────────────────────────────────┐ │
-│  │              useVirtualizer (TanStack Virtual)              │ │
-│  │                                                             │ │
-│  │  Total items: 3000 problems                                 │ │
-│  │  Rendered: ~15 visible + 10 overscan = 25 DOM nodes         │ │
-│  │                                                             │ │
-│  │  Viewport: [ row 45 ] [ row 46 ] [ row 47 ] [ row 48 ]     │ │
-│  │            ───────────────────────────────────────          │ │
-│  │                        visible rows                         │ │
-│  │                                                             │ │
-│  │  Config:                                                    │ │
-│  │  - estimateSize: 56px per row                              │ │
-│  │  - overscan: 10 (extra rows above/below)                   │ │
-│  │  - getScrollElement: parentRef.current                      │ │
-│  └────────────────────────────────────────────────────────────┘ │
-│                                                                  │
-│  ┌────────────────────────────────────────────────────────────┐ │
-│  │                    ProblemRow (per item)                    │ │
-│  │  - StatusIcon (solved/attempted/unsolved)                  │ │
-│  │  - Title (clickable link)                                  │ │
-│  │  - DifficultyBadge (Easy=green, Medium=yellow, Hard=red)   │ │
-│  │  - Acceptance rate percentage                              │ │
-│  └────────────────────────────────────────────────────────────┘ │
-└─────────────────────────────────────────────────────────────────┘
-```
+**Choosing the editor.**
 
-> "I use TanStack Virtual for the problem list because LeetCode has 3000+ problems. Without virtualization, rendering 3000 table rows creates 3000 DOM nodes—causing multi-second initial render, janky scrolling, and high memory usage. Virtualization renders only visible rows plus overscan buffer (~25 DOM nodes total). The trade-off is implementation complexity: we manage scroll position, calculate which items are visible, and position them with CSS transforms. But for a list that users scroll frequently while searching for problems, smooth 60fps scrolling is essential. The estimateSize of 56px allows fast initial render, and since all rows have identical height, we don't need dynamic measurement."
+| Option | Verdict |
+|--------|---------|
+| ✅ CodeMirror 6 | Modular: core plus one language pack is a fraction of Monaco; works on touch devices; language packs load on demand |
+| ❌ Monaco (VS Code's editor) | Megabytes of JavaScript and workers for IntelliSense that a single-file algorithm problem doesn't need; poor on mobile |
+| ❌ A plain `<textarea>` | Tiny, but no highlighting, bracket matching or indentation — people would paste from their IDE instead |
 
----
+"In this repository the whole workspace route — CodeMirror, two language packs, the theme and the markdown renderer — is a 235 KB gzipped chunk, and moving it behind a lazy route cut the initial bundle from 339 KB to 106 KB gzipped. I'd go further in production: start fetching the editor chunk from the statement page's `<head>` with a preload, so it downloads while the statement paints, and load language packs only when picked."
 
-## 🔧 Deep Dive: Resizable Panels
+**Never losing code.** Drafts live in a persisted client store keyed by problem and language. I save 500 ms after typing stops rather than on every keystroke, because the persist middleware serializes every draft on each write — with fifty saved drafts that's a noticeable stall in the middle of typing, which shows up directly as INP. The pending save is flushed synchronously on a language switch and before submit, so neither can lose the last half-second. Reset clears the draft and restores the starter code, behind a confirmation.
 
-### Split Pane Layout
+**What I give up.** Drafts are per device. Server-side draft sync is the next step if people move between machines, but it adds write load and conflict handling for something `localStorage` does well.
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         ProblemView (react-resizable-panels)             │
-│                                                                          │
-│  ┌─────────────────────────────┐ ║ ┌─────────────────────────────────┐  │
-│  │                             │ ║ │                                 │  │
-│  │     Problem Description     │ ║ │         PanelGroup              │  │
-│  │                             │ ║ │         (vertical)              │  │
-│  │  ┌───────────────────────┐  │ ║ │  ┌───────────────────────────┐ │  │
-│  │  │  Title + Difficulty   │  │ R │  │                           │ │  │
-│  │  └───────────────────────┘  │ E │  │      Code Editor          │ │  │
-│  │                             │ S │  │                           │ │  │
-│  │  ┌───────────────────────┐  │ I │  │  ┌─────────────────────┐  │ │  │
-│  │  │  Description HTML     │  │ Z │  │  │ Language Selector   │  │ │  │
-│  │  │  (markdown rendered)  │  │ E │  │  │ Run / Submit btns   │  │ │  │
-│  │  └───────────────────────┘  │   │  │  └─────────────────────┘  │ │  │
-│  │                             │ H │  │                           │ │  │
-│  │  ┌───────────────────────┐  │ A │  └───────────────────────────┘ │  │
-│  │  │  Examples             │  │ N │  ════════════════════════════  │  │
-│  │  │  Input → Output       │  │ D │  ┌───────────────────────────┐ │  │
-│  │  └───────────────────────┘  │ L │  │      Test Results         │ │  │
-│  │                             │ E │  │  - Status banner           │ │  │
-│  │  Panel: 40% default         │ ║ │  │  - Runtime/Memory stats    │ │  │
-│  │          25% minimum        │ ║ │  │  - Failed test details     │ │  │
-│  │                             │ ║ │  └───────────────────────────┘ │  │
-│  └─────────────────────────────┘ ║ │  Panel: 60% / 40% split       │  │
-│                                  ║ └─────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+### Deep dive 2: submit and verdict UX that tells the truth (6 min)
 
-> "I use react-resizable-panels for the split layout because users have different preferences for problem description vs code editor space. Some users want a narrow description panel to maximize coding area; others need full width for complex problem descriptions. The nested PanelGroup creates vertical split within the right panel (editor/results). Panel sizes persist to localStorage so users don't re-adjust every session. The trade-off is an additional dependency and DOM complexity, but this is a core UX pattern for IDE-style interfaces."
+"Three failure modes I'm designing out: a duplicate submission after a timeout, a coder stuck on 'Submitting…' forever, and a verdict that changes after being shown."
+
+1. **Duplicates.** One idempotency key per Submit, created after the draft is flushed and the code frozen, kept in `sessionStorage` until a response arrives. Network errors and `5xx` are retried twice with the same key; the server returns the original submission. Editing the code after a failure creates a new key on the next click — it's a different request.
+2. **Stuck states.** Every async state has an exit: polling gives up after five minutes with "still judging — your verdict will appear in Submissions"; a `401` mid-poll shows a login dialog over the workspace with the draft untouched; a `503` on Run shows "Judge busy, try again in 30 s" from `Retry-After`.
+3. **Flip-flopping verdicts.** The server only moves statuses forward and never changes a verdict, and the client treats terminal statuses as immutable. A sandbox outage arrives as `pending` with "judge temporarily unavailable, retrying" and, at worst, a final `system_error` styled as "our fault, please resubmit" — never as Wrong Answer.
+
+| Approach | Verdict |
+|----------|---------|
+| ✅ Pessimistic submit + key + backoff polling | Honest, cheap for the server, and safe to retry |
+| ❌ Optimistic "Accepted" | There is nothing to be optimistic about until the judge runs |
+| ❌ WebSocket per tab | Connection management for a result that arrives in seconds; I'd add Server-Sent Events only for contest banners |
+
+**Accessibility of the workspace.** CodeMirror captures Tab for indentation, which is a keyboard trap unless there's a documented exit: Escape, then Tab, moves focus out, and I announce that in the editor's accessible description. Run and Submit have keyboard shortcuts shown in their tooltips. The verdict panel is one `role="status"` region so updates are announced politely, and verdict colors always come with text.
+
+### Deep dive 3: a 3,000-row problem list that stays responsive (3 min)
+
+- **Load the index once.** 3,000 rows × ~100 bytes is ~300 KB of JSON, ~40 KB gzipped. I fetch it in pages of 500 and filter and sort in memory, so typing in the search box never waits on the network. Server-side search would be the answer at 300,000 rows; at 3,000 it would just add latency to every keystroke.
+- **Virtualize, but keep table semantics.** Only the ~20 visible rows plus overscan render; two spacer rows pad the rest. Because rows that aren't rendered don't exist for assistive technology, the table carries `aria-rowcount` and each row its `aria-rowindex`.
+- **Filters in the URL.** `/problems?difficulty=medium&q=tree` survives refresh and can be shared, and the back button restores the view.
+- **Prefetch on intent.** Hovering a row prefetches the problem query and the editor chunk, so the workspace usually opens from cache.
+
+### Deep dive 4: security checklist (2 min)
+
+- **Statements are markdown from trusted setters, rendered without raw HTML**, so a statement can't inject script; examples render as text in `<pre>`. A strict Content-Security-Policy (`script-src 'self'`) backs that up.
+- **Code is never executed in the browser.** Run goes to the judge, so a malicious "solution" shared in a link can't run in someone else's session.
+- **CSRF**: session cookie with `SameSite=Lax`, JSON-only mutations, and CORS restricted to the app's origin.
 
 ---
 
-## ⚡ Deep Dive: Core Web Vitals Optimization
+## 🧯 Loading, Error and Empty States (2 min)
 
-### Target Metrics
-
-| Metric | Target | LeetCode Challenge |
-|--------|--------|-------------------|
-| **LCP** (Largest Contentful Paint) | < 2.5s | Problem description + code editor |
-| **INP** (Interaction to Next Paint) | < 200ms | Submit button, test runs |
-| **CLS** (Cumulative Layout Shift) | < 0.1 | Resizable panels, async content |
-
-### Trade-off 4: LCP Optimization Strategy
-
-| Approach | Pros | Cons |
-|----------|------|------|
-| ✅ Skeleton + streaming | Fast perceived load, progressive | Implementation complexity |
-| ❌ Full SSR | Best LCP, SEO | Server complexity, hydration cost |
-| ❌ Wait for all data | Simple | Slow LCP, poor perceived perf |
-
-> "For LCP optimization, I chose skeleton screens with streaming data over full SSR or waiting for complete data. The LCP element on our problem page is the problem description panel—a large text block that users need to read before coding. With full SSR, we'd need a Node.js server rendering React, adding deployment complexity and hydration overhead. Instead, we render a skeleton instantly (LCP < 500ms), then stream the problem description from cache. The skeleton maintains the exact layout dimensions, preventing CLS when content arrives. For the code editor (150KB), we lazy-load it with a Suspense boundary showing an editor-shaped skeleton. Users perceive instant load because they see the layout immediately, even though the editor hasn't loaded. The trade-off is that we need careful skeleton design matching final layout—any mismatch causes CLS."
-
-### LCP Optimization Pipeline
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    LCP Optimization Pipeline                     │
-│                                                                  │
-│  T=0ms    Browser receives HTML                                  │
-│           ┌─────────────────────────────────────────────────────┐│
-│           │  Critical CSS inlined in <head>                     ││
-│           │  - Layout grid, skeleton styles                     ││
-│           │  - Above-the-fold components                        ││
-│           └─────────────────────────────────────────────────────┘│
-│                                                                  │
-│  T=50ms   First Paint (skeleton visible)                         │
-│           ┌───────────────────┬─────────────────────────────────┐│
-│           │  Problem Skeleton │  Editor Skeleton (lazy loading) ││
-│           │  ████████████████ │  ┌─────────────────────────────┐││
-│           │  ████████████████ │  │  Loading editor...          │││
-│           │  ████████████     │  │  ██████████████████         │││
-│           │                   │  └─────────────────────────────┘││
-│           └───────────────────┴─────────────────────────────────┘│
-│                                                                  │
-│  T=200ms  API response (problem data cached in Valkey)           │
-│           Problem description rendered ──▶ LCP COMPLETE          │
-│                                                                  │
-│  T=400ms  CodeMirror chunk loaded (150KB)                        │
-│           Editor replaces skeleton (same dimensions ──▶ no CLS)  │
-│                                                                  │
-│  T=500ms  Fully interactive                                      │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### Critical Rendering Path
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                  Resource Loading Priority                       │
-│                                                                  │
-│  Preload (in <head>):                                            │
-│  ├── Critical CSS (inline)                                       │
-│  ├── Main JS bundle (< 50KB gzipped)                            │
-│  └── Primary font (system-ui fallback)                          │
-│                                                                  │
-│  Prefetch (after LCP):                                           │
-│  ├── CodeMirror chunk (150KB)                                    │
-│  ├── Next problem (prediction based on current)                  │
-│  └── User's saved code from localStorage                         │
-│                                                                  │
-│  Lazy (on demand):                                               │
-│  ├── Submission history                                          │
-│  ├── Progress dashboard                                          │
-│  └── Admin features                                              │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### INP (Interaction to Next Paint) Optimization
-
-| Interaction | Target | Optimization |
-|-------------|--------|--------------|
-| Submit button click | < 50ms | Optimistic UI, defer network |
-| Language dropdown | < 30ms | Preloaded options, no network |
-| Panel resize | 0ms (60fps) | CSS transforms, no layout |
-| Problem filter | < 100ms | In-memory filter, virtual list |
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                  Submit Button Optimization                      │
-│                                                                  │
-│  Click ──▶ Immediate UI feedback (button disabled, spinner)     │
-│       ──▶ State update (optimistic: "Submitting...")            │
-│       ──▶ Network request (fire and forget)                     │
-│       ──▶ Transition to polling state                           │
-│                                                                  │
-│  Total time to visual feedback: < 16ms (one frame)              │
-│  User perceives instant response                                 │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-> "INP measures the delay between user interaction and visual feedback. For the submit button, we update UI state synchronously before the network request—the button shows a spinner within 16ms (one frame). The actual submission happens asynchronously. For panel resizing, we use CSS transforms instead of changing width/height properties, enabling GPU-accelerated 60fps animation without triggering layout. The filter input uses in-memory filtering over the already-loaded problem list, avoiding any network latency."
-
-### CLS Prevention
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    CLS Prevention Strategies                     │
-│                                                                  │
-│  Problem: Async content shifts layout when it loads              │
-│                                                                  │
-│  Solution 1: Reserved space with skeletons                       │
-│  ┌──────────────────────────────────────────────────────────────┐│
-│  │  .skeleton-problem-description {                              ││
-│  │    min-height: 400px;  /* matches typical problem */         ││
-│  │    animation: pulse;                                          ││
-│  │  }                                                            ││
-│  └──────────────────────────────────────────────────────────────┘│
-│                                                                  │
-│  Solution 2: Resizable panels with fixed initial size            │
-│  ┌──────────────────────────────────────────────────────────────┐│
-│  │  PanelGroup: defaultSize={[40, 60]}                          ││
-│  │  Panel: minSize={25}  /* prevents collapse */                ││
-│  │  Sizes persisted to localStorage                              ││
-│  └──────────────────────────────────────────────────────────────┘│
-│                                                                  │
-│  Solution 3: Font loading with size-adjust                       │
-│  ┌──────────────────────────────────────────────────────────────┐│
-│  │  @font-face { size-adjust: 100.5%; } /* match fallback */    ││
-│  │  font-display: swap;  /* show text immediately */            ││
-│  └──────────────────────────────────────────────────────────────┘│
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### Code Splitting Strategy
-
-```
-┌────────────────────────────────────────────────────────────┐
-│  Route-based Code Splitting                                 │
-│                                                             │
-│  Bundle                    Size      Load Strategy          │
-│  ─────────────────────────────────────────────────────────  │
-│  main.js                   45KB      Immediate              │
-│  problem-list.js           12KB      Immediate (home route) │
-│  problem-view.js           25KB      Lazy (on navigate)     │
-│  codemirror-core.js        80KB      Lazy (on problem view) │
-│  codemirror-python.js      20KB      Lazy (on lang select)  │
-│  codemirror-javascript.js  15KB      Lazy (on lang select)  │
-│  submission-history.js     18KB      Lazy (rarely visited)  │
-│  admin.js                  35KB      Lazy (admin only)      │
-│                                                             │
-│  Initial load: 57KB (main + problem-list)                   │
-│  Problem page: +105KB (view + editor core)                  │
-└────────────────────────────────────────────────────────────┘
-```
-
-### Service Worker Caching
-
-```
-┌────────────────┐     fetch /api/problems/two-sum     ┌────────────────┐
-│    Browser     │────────────────────────────────────▶│  Service Worker│
-└────────────────┘                                     └───────┬────────┘
-                                                               │
-                 ┌─────────────────────────────────────────────┤
-                 │                                             │
-                 ▼                                             ▼
-        ┌────────────────┐                           ┌────────────────┐
-        │  Cache Match?  │──── yes ─────────────────▶│ Return cached  │
-        └───────┬────────┘                           └────────────────┘
-                │ no
-                ▼
-        ┌────────────────┐     ┌─────────────────────────────────────┐
-        │  Network fetch │────▶│  cache.put() + return response      │
-        └────────────────┘     └─────────────────────────────────────┘
-
-Caching Strategy:
-├── App shell (HTML, CSS, JS): CacheFirst, 7 days
-├── Problem data: StaleWhileRevalidate, 1 hour
-├── Static assets: CacheFirst, 30 days
-└── Submissions: NetworkFirst (must be fresh)
-```
-
-### Performance Budget
-
-| Resource | Budget | Actual | Status |
-|----------|--------|--------|--------|
-| Initial JS | < 100KB | 57KB | ✅ |
-| Initial CSS | < 20KB | 12KB | ✅ |
-| LCP | < 2.5s | 1.2s | ✅ |
-| TTI | < 3.5s | 2.1s | ✅ |
-| Total problem page | < 300KB | 162KB | ✅ |
+| Situation | What the coder sees | How |
+|-----------|---------------------|-----|
+| Problem page first load | Statement from the CDN immediately; an editor-sized skeleton until the chunk loads | Fixed-size placeholder, so CLS stays near zero |
+| Submit in flight | "Submitting…" on the button; Run still available | Button disabled, key held in `sessionStorage` |
+| Waiting for a judge | "Waiting for a judge…" then "Running test 3 of 10" | Status query with backoff; polite live region |
+| Judge outage | "Judge temporarily unavailable — retrying (attempt 1 of 3)" | Server keeps the job; client keeps polling |
+| Rate limited | "Try again in 42 s" countdown on Submit | `429` with `Retry-After` |
+| Session expired mid-solve | Login dialog over the workspace; draft untouched | Drafts are local; the query cache refetches after login |
+| Offline | Banner; editing and drafts keep working; Submit waits | Mutations pause until the browser is back online |
+| No submissions yet | "No submissions yet — press Ctrl+Enter to submit" | The empty state teaches the shortcut |
+| No problems match the filter | "No problems match 'trie' in Hard" plus a clear-filters button | An empty table with headers looks broken |
 
 ---
 
-## ♿ Accessibility
+## ⚖️ Wrap-up (2 min)
 
-### Keyboard Shortcuts
+| Decision | ✅ Chosen | ❌ Alternative | Why |
+|----------|-----------|----------------|-----|
+| Rendering | Static statement + client-rendered workspace | Pure SPA; full SSR | Search traffic gets HTML; the editor needs the client anyway |
+| Editor | CodeMirror 6, lazy chunk | Monaco | A fraction of the size; works on touch |
+| Server state | Query cache with data-driven refetch | Copying responses into a global store | Polling, dedupe and invalidation for free |
+| Drafts | Persisted store, debounced, per language | Save on every keystroke; server autosave | No INP cost; survives refresh |
+| Submit | Pessimistic + idempotency key + retry | Optimistic; disabled button only | Truthful and duplicate-free |
+| Verdict delivery | Backoff polling, aria-live | WebSocket | Seconds-long jobs; no connection state |
+| Problem list | Whole index, virtualized `<table>` | Server search per keystroke | 3,000 rows filter instantly in memory |
 
-| Shortcut | Action |
-|----------|--------|
-| Ctrl/Cmd + Enter | Submit code |
-| Ctrl/Cmd + ' | Run against sample tests |
-| Tab | Navigate between UI elements |
-| Escape | Close modals/panels |
-| Ctrl/Cmd + / | Toggle line comment |
-| Ctrl/Cmd + S | Save draft (visual feedback only) |
-
-### ARIA Implementation
-
-| Element | ARIA Attributes | Purpose |
-|---------|-----------------|---------|
-| Submit button | aria-label, aria-busy, disabled | Announce state to screen readers |
-| Status updates | role="status", aria-live="polite" | Announce test progress |
-| Problem list | role="table", aria-sort | Sortable table semantics |
-| Editor | role="textbox", aria-label | Identify as code input |
-
----
-
-## ⚖️ Trade-offs Summary
-
-| Decision | Choice | Trade-off |
-|----------|--------|-----------|
-| Editor | ✅ CodeMirror 6 | Less IDE features vs 10x smaller bundle + mobile |
-| State | ✅ Zustand + persist | Smaller ecosystem vs simplicity + persistence |
-| Status | ✅ HTTP Polling | 1s latency vs stateless simplicity |
-| List | ✅ TanStack Virtual | Implementation complexity vs 60fps scrolling |
-| Layout | ✅ Resizable panels | Extra dependency vs user-customizable layout |
-| LCP | ✅ Skeleton + streaming | Implementation complexity vs fast perceived load |
-| INP | ✅ Optimistic UI | State complexity vs instant feedback |
-
----
-
-## 🔮 Future Frontend Enhancements
-
-1. **Monaco Editor Option**: Feature flag for power users who want IDE features
-2. **WebSocket Upgrade**: Real-time submission status for contests
-3. **Collaborative Editing**: Pair programming mode with CRDT
-4. **Code Playback**: Step-through execution visualization
-5. **Mobile App**: React Native version for on-the-go practice
-
----
-
-## 📝 Closing Summary
-
-> "I've designed a frontend architecture for an online judge optimized for Core Web Vitals. LCP targets < 2.5s through skeleton screens with streaming data and lazy-loaded CodeMirror (57KB initial load vs 200KB+ with Monaco). INP stays under 200ms via optimistic UI updates—the submit button shows feedback within 16ms, before network requests complete. CLS is prevented through reserved skeleton dimensions and persisted panel sizes. The architecture prioritizes perceived performance: users see a functional layout instantly, with the editor loading progressively. CodeMirror 6's 150KB bundle loads lazily while users read the problem description, making the editor ready by the time they need it. This performance-first approach means mobile users on 3G can start coding within 2 seconds."
+"With more time I'd add Server-Sent Events for contest verdicts, a diff view against the previous submission, and per-route real-user Web Vitals so the editor chunk's cost is measured, not guessed."
