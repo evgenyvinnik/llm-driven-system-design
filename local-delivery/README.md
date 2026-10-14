@@ -62,8 +62,12 @@ docker-compose ps
 # Load demo accounts and sample data.
 # The mounted init.sql only creates the schema; the seed users live in
 # backend/db-seed/seed.sql, which must be loaded explicitly (there is no npm seed script).
-PGPASSWORD=delivery_secret psql -h localhost -U delivery -d delivery -f backend/db-seed/seed.sql
+PGPASSWORD=delivery_secret psql -h localhost -U delivery -d delivery -v ON_ERROR_STOP=1 -f backend/db-seed/seed.sql
 ```
+
+Both SQL files are re-runnable. After pulling schema changes into an existing volume, apply them with
+`psql ... -v ON_ERROR_STOP=1 -f backend/src/db/init.sql` (every statement is guarded, and the new
+constraints use `NOT VALID` so old rows don't block them).
 
 ### 2. Start Backend
 
@@ -75,7 +79,21 @@ npm install
 
 # Start the server (default port 3000)
 npm run dev
+
+# Unit tests (vitest, offline: shared modules are mocked)
+npm test
 ```
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `PORT` | `3000` | HTTP + WebSocket port |
+| `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` | `localhost`, `5432`, `delivery`, `delivery`, `delivery_secret` | PostgreSQL |
+| `REDIS_HOST`, `REDIS_PORT` | `localhost`, `6379` | Redis / Valkey |
+| `LOCATION_STALE_MS` | `30000` | A driver whose last ping is older than this gets no offers |
+| `LOG_LEVEL` | `info` | Pino log level |
+
+Drivers only receive offers while they are online **and** pinging: the driver dashboard sends its
+position every 10 seconds while online, so keep that tab open when testing matching.
 
 Backend will be available at:
 - API: http://localhost:3000/api/v1
@@ -109,7 +127,7 @@ The database is seeded with test accounts:
 | Driver | driver3@test.com | password123 |
 | Admin | admin@delivery.local | password123 |
 
-All seeded accounts share the bcrypt-hashed password `password123`. Login is verified with `bcrypt.compare` in `authService.validatePassword`, so the password must match exactly — earlier notes claiming "any password works" were incorrect. (The comment in `db-seed/seed.sql` still says `admin123`; the hash is actually `password123`.)
+All seeded accounts share the bcrypt-hashed password `password123`. Login is verified with `bcrypt.compare` in `authService.validatePassword`, so the password must match exactly.
 
 ## API Endpoints
 
@@ -127,10 +145,12 @@ All seeded accounts share the bcrypt-hashed password `password123`. Login is ver
 - `GET /api/v1/merchants/search?q=...` - Search merchants
 
 ### Orders (Customer)
-- `POST /api/v1/orders` - Create order
+- `POST /api/v1/orders/quote` - Price a cart (subtotal, delivery fee, tip, total) without creating it
+- `POST /api/v1/orders` - Create order; send an `Idempotency-Key` header (one per checkout attempt): a retry with the same key returns the original order, a different body or user gets `422`
 - `GET /api/v1/orders` - Get my orders
-- `GET /api/v1/orders/:id` - Get order details
-- `POST /api/v1/orders/:id/cancel` - Cancel order
+- `GET /api/v1/orders/:id` - Get order details (includes `version`)
+- `POST /api/v1/orders/:id/cancel` - Cancel order (`409` once a driver has accepted)
+- `POST /api/v1/orders/:id/tip` - Change the tip
 - `POST /api/v1/orders/:id/rate/driver` - Rate driver
 - `POST /api/v1/orders/:id/rate/merchant` - Rate merchant
 
@@ -141,7 +161,7 @@ All seeded accounts share the bcrypt-hashed password `password123`. Login is ver
 - `POST /api/v1/driver/location` - Update location
 - `GET /api/v1/driver/orders` - Get active orders
 - `GET /api/v1/driver/offers/pending` - Get pending offer
-- `POST /api/v1/driver/offers/:id/accept` - Accept offer
+- `POST /api/v1/driver/offers/:id/accept` - Accept offer (`409` if the offer expired or the order was cancelled)
 - `POST /api/v1/driver/offers/:id/reject` - Reject offer
 - `POST /api/v1/driver/orders/:id/picked-up` - Mark picked up
 - `POST /api/v1/driver/orders/:id/in-transit` - Mark in transit
@@ -168,10 +188,13 @@ Connect to `ws://localhost:3000/ws?token=<auth_token>`
 
 ### Server -> Client
 ```json
+{ "type": "order_snapshot", "payload": { "order": {...} } }
 { "type": "location_update", "payload": { "lat": ..., "lng": ..., "eta_seconds": ... } }
-{ "type": "status_update", "payload": { "status": "...", "timestamp": "..." } }
+{ "type": "status_update", "payload": { "order_id": "...", "status": "...", "driver_id": "...", "version": 3, "timestamp": "..." } }
 { "type": "new_offer", "payload": { "offer_id": "...", "order": {...}, "expires_in": 30 } }
 ```
+
+Every `subscribe_order` is answered with an `order_snapshot`, so a client that reconnects simply resubscribes. Keep whichever copy of the order has the higher `version`.
 
 ## Running Multiple Backend Instances
 
@@ -188,6 +211,10 @@ npm run dev:server2  # Port 3002
 npm run dev:server3  # Port 3003
 ```
 
+Matching is shared through dispatch leases in PostgreSQL: if you stop the instance that is matching an
+order, another instance's sweeper picks the order up within about 45 seconds (immediately on a graceful
+shutdown, which releases its leases).
+
 ## Project Structure
 
 ```
@@ -196,8 +223,8 @@ local-delivery/
 ├── backend/
 │   ├── package.json
 │   ├── tsconfig.json
-│   ├── db/
-│   │   └── init.sql            # Database schema and seed data
+│   ├── db-seed/
+│   │   └── seed.sql            # Demo accounts and menus (re-runnable)
 │   └── src/
 │       ├── index.ts            # Entry point
 │       ├── routes/             # API routes
@@ -206,16 +233,20 @@ local-delivery/
 │       │   ├── orders.ts
 │       │   ├── driver.ts
 │       │   └── admin.ts
+│       ├── db/init.sql         # Schema (re-runnable)
 │       ├── services/           # Business logic
 │       │   ├── authService.ts
 │       │   ├── driverService.ts
 │       │   ├── merchantService.ts
-│       │   ├── orderService.ts
-│       │   └── ratingService.ts
+│       │   ├── ratingService.ts
+│       │   └── order/          # pricing, create, stateMachine, cancel,
+│       │                       # assignment, dispatch, matching, delivery, tracking
+│       ├── shared/             # idempotency, errors, schemas, circuit breaker, metrics, logger
 │       ├── middleware/
 │       │   └── auth.ts
 │       ├── websocket/
-│       │   └── handler.ts
+│       │   ├── handler.ts
+│       │   └── channelRegistry.ts
 │       ├── types/
 │       │   └── index.ts
 │       └── utils/
@@ -239,14 +270,15 @@ local-delivery/
 ## Key Design Decisions
 
 ### Real-time Location Tracking
-- Driver locations are stored in Redis using GEOADD/GEORADIUS
-- Location updates are published via Redis Pub/Sub
-- WebSocket connections subscribe to driver location channels
+- Driver locations are stored in Redis with GEOADD and searched with GEOSEARCH; a `drivers:last_seen` sorted set filters out drivers who stopped pinging
+- Location updates are published via Redis Pub/Sub; PostgreSQL gets one sample per driver per 10 seconds
+- Each API process holds one Redis subscriber and fans messages out to its WebSocket clients
 
 ### Driver Matching
 - Scoring algorithm considers: distance, rating, acceptance rate, current load
 - Offers are sent sequentially with 30-second timeout
-- Up to 5 attempts before order is cancelled
+- Accepting is one transaction (offer, order, driver); partial unique indexes allow one live offer per order and per driver
+- After 5 offers, or 5 minutes without a driver nearby, the order is cancelled
 
 ### Data Storage
 - PostgreSQL for persistent data (users, orders, merchants)
@@ -259,7 +291,7 @@ See [system-design-answer-fullstack.md](./system-design-answer-fullstack.md) for
 
 ## Development Notes
 
-See [claude.md](./claude.md) for development insights and iteration history.
+See [CLAUDE.md](./CLAUDE.md) for development insights and iteration history.
 
 ## References & Inspiration
 

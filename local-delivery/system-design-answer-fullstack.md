@@ -1,322 +1,309 @@
-# Local Delivery Service - System Design Answer (Full-Stack Focus)
+# 🛵 Local Delivery (DoorDash / Instacart) — System Design Answer (Full-Stack Focus)
 
-*45-minute system design interview format - Full-Stack Engineer Position*
+*45-minute full-stack interview. This is a proposed production design; what this repository actually runs is described in [architecture.md → Implementation Notes](./architecture.md#implementation-notes).*
 
-## 📋 Problem Statement
+> "As a full-stack engineer I want to follow one order through its whole life — the cart, the Place order tap, the search for a courier, the Accept tap, the dot on the map — and get the contracts between client and server right, because every hard problem here sits on that seam. Three contracts carry the weight: an idempotency key and a server quote that make checkout safe and honest, a claim transaction that makes Accept and Cancel race safely, and a versioned snapshot-plus-events stream that keeps the tracking screen from ever going backwards."
 
-Design a last-mile delivery platform end to end — DoorDash, Instacart, Uber Eats. Three apps (customer, driver, merchant), one backend, and a physical world in the middle that refuses to be transactional.
+| Phase | Time | What I want the interviewer to leave with |
+|-------|------|--------------------------------------------|
+| Requirements & scale | 5 min | Scope, and targets on both sides of the wire |
+| End-to-end architecture | 8 min | One diagram from both apps to the data stores, plus three flows |
+| Data model & API contract | 7 min | Server tables, client cache, the fields both sides rely on |
+| Deep dive 1: one order per tap | 8 min | Idempotency and pricing from the button to the row |
+| Deep dive 2: Accept versus Cancel | 7 min | One courier or none, and what each app shows |
+| Deep dive 3: tracking that never goes backwards | 7 min | Snapshot, versions, reconnects, presence |
+| Failures, scale, wrap-up | 3 min | What each failure looks like to each user |
 
-Since this is the full-stack framing, I'll organize around **the seams** — the places where a client requirement forces a server design, or where a server guarantee determines what the UI is even allowed to promise. Delivery is unusually rich in these, because it has three clients with *adversarial incentives* sharing one data model:
+---
 
-- The **customer** wants a live dot on a map. That's a 10,000-writes-per-second firehose the backend has to survive, and it's 800× the order volume.
-- The **driver** taps "Accept" in a parking garage on 1 bar of LTE. That single tap forces the entire exactly-once story, because two drivers arriving at one restaurant is a failure no `ROLLBACK` can undo.
-- The **merchant** starts cooking on confirmation, which means *when* we match determines whether food sits cold or a driver waits unpaid. That's a backend scheduling decision driven entirely by a physical-world constraint.
+## 🎯 Requirements & Scale (5 min)
 
-## 🎯 Requirements Clarification
+**Functional.** Customers browse nearby merchants, build a one-merchant cart, see the server's price, place an order, track it live (status, courier position, ETA), cancel before preparation, and rate afterwards. Couriers go online, receive 30-second offers, accept or decline, and step the order through pickup and delivery while their app shares GPS. Admins see orders, couriers and merchants. Out of scope: payments, batching orders onto one courier, surge pricing, the merchant tablet.
 
-- **How stale can a driver's location be?** Three seconds. That number determines the entire storage strategy for the highest-volume data in the system.
-- **Is matching optimizing for the customer, the driver, or the fleet?** They conflict. I'll pick, and say what it costs.
-- **One metro or many?** Many — but drivers never cross metros, which hands us a free shard key.
-- **Does the client ever compute money?** No. Prices, fees, and totals are server-authoritative. The cart *displays* a total; it never decides one.
+| Side | Requirement | Target |
+|------|-------------|--------|
+| Backend | Order placement | 99.99% available, p99 < 300 ms, independent of courier supply |
+| Backend | Time to assign | p50 < 30 s, p99 < 2 min |
+| Backend | Assignment | Exactly one courier; never for a cancelled order |
+| Frontend | Live updates | On screen < 1 s after the server publishes; resynced < 5 s after reconnect |
+| Frontend | Browse | LCP < 2.5 s on mid-range Android over 4G; INP < 200 ms |
+| Both | Checkout | One order per attempt, even across timeouts, double taps and reloads |
+| Both | Tracking | The screen never shows an older state than it already showed |
 
-### Functional Requirements
+**Scale.** 1M orders a day is ~12 a second, ~35 at the dinner peak — small. 30,000 online couriers pinging every 3 seconds is ~10,000 location writes a second — the firehose. Around 50,000 customers watching a map at peak means ~17,000 pushed updates a second.
 
-- Customer: browse merchants, build a cart, place an order, watch it arrive
-- Driver: go online, receive offers, accept/reject, mark picked up and delivered
-- Merchant: confirm orders, set prep time
-- Real-time tracking with live location and ETA
-- Two-way ratings
+"The client's 3-second GPS interval, multiplied by 30,000 couriers, *is* the backend's biggest write load. And the client's tracking screen, multiplied by 50,000, *is* the socket fleet. On this system the frontend's timers are the backend's capacity plan."
 
-### Non-Functional Requirements
+---
 
-| Requirement | Target | Consequence across the stack |
-|-------------|--------|------------------------------|
-| Match latency | Driver assigned < 30s | Matching cannot be inside the order POST |
-| Location freshness | 3s | Volatile geo-index; conflated WebSocket delivery |
-| Order placement availability | 99.99% | Order commit must not depend on driver supply |
-| ETA accuracy | ±3 min, 90% | The trust metric; drives the biggest support cost |
-| Zero lost orders | Absolute | Idempotency keys in durable storage, not cache |
-
-### Scale Estimates
-
-The numbers that force the design:
-
-- **1M orders/day ≈ 12/sec average, ~35/sec at the dinner peak.** Order volume is *tiny*. This is not a throughput problem.
-- **30K concurrent drivers × 1 update / 3s = 10,000 writes/second.** Location is ~800× the order volume.
-- Naively persisting that is **86 GB/day** of data with a **3-second useful life.**
-- Tens of thousands of customers watching a map simultaneously at peak.
-
-**The asymmetry is the whole story: orders are low-volume and must be perfect; locations are high-volume and are allowed to be lossy.** Every seam below follows from that single sentence.
-
-## 🏗️ High-Level Architecture
+## 🏗️ End-to-End Architecture (8 min)
 
 ```
-┌──────────────┐   ┌──────────────┐   ┌──────────────┐
-│  Customer    │   │   Driver     │   │  Merchant    │
-│  React SPA   │   │   React SPA  │   │  React SPA   │
-│  • cart      │   │  • offer     │   │  • confirm   │
-│  • tracking  │   │    modal     │   │  • prep time │
-│    map       │   │  • location  │   │              │
-└──┬────────┬──┘   └──┬────────┬──┘   └──────┬───────┘
-   │ REST   │ WSS     │ REST   │ WSS         │ REST
-   ▼        ▼         ▼        ▼             ▼
-┌──────────────────────────────────────────────────────┐
-│  API Gateway — authn, role checks, rate limits        │
-└──┬───────────┬──────────────┬─────────────┬──────────┘
-   ▼           ▼              ▼             ▼
-┌───────┐ ┌──────────┐ ┌───────────┐ ┌──────────────┐
-│ Order │ │ Location │ │ Tracking  │ │ Notification │
-│ Svc   │ │ Svc      │ │ Svc (WS)  │ │ Svc          │
-└───┬───┘ └────┬─────┘ └─────▲─────┘ └──────────────┘
-    │          │             │
-    ▼          │ GEORADIUS   │ pub/sub
-┌──────────┐   │             │
-│ Matching │◀──┘             │
-│ Svc      │                 │
-│ 1 leader │                 │
-│ per metro│                 │
-└────┬─────┘                 │
-     ▼                       │
-┌──────────────┐  ┌──────────┴─────┐  ┌──────────────┐
-│  PostgreSQL  │  │ Redis / Valkey │  │    Kafka     │
-│ orders TRUTH │  │ • geo index    │  │ • loc events │
-│ idempotency  │  │ • sessions     │  │ • order evts │
-│ offers       │  │ • pub/sub      │  │ (durable tail│
-│ last-known   │  │ • order event  │  │  for ETA ML) │
-│   location   │  │   stream       │  └──────────────┘
-└──────────────┘  └────────────────┘
+  ┌──────────────────────────┐                          ┌────────────────────────────┐
+  │ Customer SPA             │                          │ Courier SPA                │
+  │ Idempotency-Key, version │                          │ offers · GPS heartbeat     │
+  └───┬──────────────────────┘                          └───────────────────┬────────┘
+      │                  ▲                                  ▲               │
+      │ (1) POST /orders │ WSS: status,                     │ WSS: offers   │ (3) POST /location
+      │ Idempotency-Key  │ location, ETA                    │               │ POST …/accept
+      ▼                  ▼                                  ▼               ▼
+  ┌───────────────────────────────────────────────────────────────────────────────────────────┐
+  │ Load balancer · TLS · session auth · rate limits · routes /api/* and /ws                  │
+  └────────┬───────────────────────┬───────────────────────────────────────────────┬──────────┘
+           │                       │                       ▲                       │
+           │ /orders               │ /offers               │ /ws                   │ /location
+           ▼                       ▼                       ▼                       ▼
+  ┌───────────────────┐   ┌───────────────────┐   ┌───────────────────┐   ┌───────────────────┐
+  │ Order Service     │   │ Dispatch Service  │   │ Tracking Gateway  │   │ Location Service  │
+  │ pricing · states  │   │ matching · offers │   │ WebSocket fan-out │   │ ping ingest       │
+  └────────┬──────────┘   └───┬───────────┬───┘   └───────────┬───────┘   └───┬─────────┬─────┘
+           │                  │           │                   ▲               │         │
+           │ INSERT order,    │ offer,    │ (2) GEOSEARCH     │ SUBSCRIBE     │ GEOADD  │
+           │ key, lease       │ claim     │                   │               │ PUBLISH │
+           ▼                  ▼           ▼                   │               │         │ sample
+  ┌────────────────────────────────┐    ┌─────────────────────┴──────┐        │         │
+  │ PostgreSQL · source of truth   │    │ Redis · one per metro      │◀───────┘         │
+  │ orders, offers, couriers, keys │    │ geo, last-seen, pub/sub    │                  │
+  └────────────────────────────────┘    └────────────────────────────┘                  │
+                                                                                        ▼
+                                                                          ┌────────────────────┐
+                                                                          │ Kafka · locations  │
+                                                                          │ → history, ETA ML  │
+                                                                          └────────────────────┘
 ```
 
-The structural rule: **the location path and the order path share nothing on the hot path.** Locations go to Redis and Kafka and never touch PostgreSQL per-update. Orders go to PostgreSQL and are never eventually consistent. Merging them is how you build a checkout that goes down because too many drivers are driving.
+1. **Place (1).** The customer SPA posts the cart with the attempt's idempotency key. The Order Service prices it from the menu and commits the order, its items, the key and a dispatch lease in one transaction, then returns `201`. The SPA navigates to the tracking page; nobody waits for a courier inside a request.
+2. **Dispatch (2).** The Dispatch Service instance holding the lease finds fresh couriers near the merchant in Redis, writes a 30-second offer, and the gateway pushes it to the courier SPA. Accept is one transaction that claims the offer and the order.
+3. **Track (3).** The courier SPA posts its position every 3 seconds (10 when parked). The Location Service writes Redis and publishes; gateway nodes push position, ETA and status changes to the customer SPA's socket.
 
-## 💾 Data Model
+| Layer | Choice | Why |
+|-------|--------|-----|
+| Customer and courier SPAs | React, TanStack Query for server state, a small store for cart and session | Live, authenticated screens; one cache with one merge rule |
+| Order Service | Stateless; PostgreSQL transactions | Pricing, creation, guarded transitions |
+| Dispatch Service | Leases + `SKIP LOCKED` sweeper | Matching survives crashes and deploys |
+| Location Service + Redis per metro | Geo index, last-seen, pub/sub | 10K writes/s kept off the order database |
+| Tracking Gateway | WebSocket, one Redis subscriber per node | Push to both apps; Redis connections scale with nodes |
+| PostgreSQL | Orders, offers, couriers, idempotency keys | The source of truth for anything that must be correct |
 
-| Table | Key Columns | Notes |
-|-------|-------------|-------|
-| users | id, email, password_hash, **role** (customer/driver/merchant/admin) | One identity, four roles — and three of them are adversarial |
-| drivers | id (= users.id), status (offline/available/busy), rating, **acceptance_rate**, current_lat/lng | Partial index on location **where status='available'** — we only ever search the 30% that can work |
-| merchants | id, name, lat, lng, **avg_prep_time_minutes**, is_open | `avg_prep_time` isn't decoration — it's the input that decides *when* to match |
-| menu_items | id, merchant_id, name, price, is_available | |
-| orders | id, customer_id, merchant_id, driver_id, **status**, delivery lat/lng, subtotal, delivery_fee, tip, total, per-state timestamps | The state machine is the `status` column |
-| order_items | order_id, menu_item_id, **name, unit_price (denormalized)** | An order is a contract about a past moment. It must not re-price itself when the merchant raises prices tomorrow |
-| driver_offers | order_id, driver_id, status, offered_at, **expires_at** | This table *is* the matching protocol, and the audit trail for "why did two drivers show up" |
-| idempotency_keys | key (PK), user_id, response (JSONB), status | **In PostgreSQL, not Redis** — a lost key is a double charge |
-| ratings | order_id, rater_id, rated_user_id, rating | |
-
-Two decisions worth defending, both of which look like the "wrong" choice at first glance:
-
-**Idempotency keys go in PostgreSQL even though Redis is faster.** Losing one means a customer's retry places a second real order with a second real charge. Meanwhile **driver locations go in volatile Redis** even though losing them sounds catastrophic. The rule isn't "Redis for speed, Postgres for safety" — it's **match the durability of the store to the lifetime and consequence of the data.** Location lives 3 seconds and self-heals. An idempotency key must outlive a retry storm.
-
-**Order items denormalize name and price.** A foreign key would be cleaner and would also mean historical receipts silently change when a menu changes. Same reasoning as any receipt anywhere.
-
-## 🔧 Seam 1: The Order Placement Flow — Where the Request Returns
-
-This is the most important line in the whole design, and it's a decision the frontend and backend have to make *together*.
-
-**The naive full-stack flow:** the customer taps Place Order; the server creates the order, finds a driver, and returns the assigned driver in the response. The UI shows a spinner until it has a driver. Clean, simple, and catastrophically wrong.
-
-**How it concretely breaks.** Matching takes 30 seconds in the good case and, with sequential offers, can take *minutes* if drivers decline. So this design holds an HTTP request open for minutes, and:
-
-- Every mobile network, load balancer, and proxy between the phone and the server will time out first. The customer gets an error for an order that *succeeded* — and now they tap again.
-- Order placement's 99.99% availability target is now bounded by the availability of the geo-index, the Kafka cluster, **and whether enough human beings feel like working right now.** You cannot hit four nines on a number that depends on driver supply at 7pm on a Friday.
-- The retry storm that follows is exactly what the idempotency key exists to survive — but we've engineered a system that generates them constantly.
-
-**The correct seam: the request returns the moment the order is durably committed.**
+### Flow: checkout across the wire
 
 ```
- POST /orders  (X-Idempotency-Key)
-      │
-      ▼
- ┌────────────────────────────┐
- │ 1. Insert idempotency key  │  PK constraint = the guard.
- │ 2. Price the order         │  Server-authoritative. Always.
- │ 3. Authorize payment       │  Circuit-breakered external call
- │ 4. INSERT order (pending)  │  ← durable. It cannot be lost now.
- │ 5. Emit order.created      │
- └─────────────┬──────────────┘
-               ▼
-        201 Created  ────────────▶  the customer is DONE waiting
-               │
-               │  everything below is ASYNC and reaches the client
-               │  over WebSocket, not over this response
-               ▼
-   merchant confirms → matching runs → driver accepts
-   → picked_up → in_transit → delivered
+Customer SPA                         Order Service                            PostgreSQL
+      │                                    │                                       │
+      │ 1 POST /orders/quote               │                                       │
+      │───────────────────────────────────▶│                                       │
+      │ 2 subtotal, fee, total             │                                       │
+      │◀───────────────────────────────────│                                       │
+      │ 3 tap Place order: key K           │                                       │
+      │ 4 POST /orders, Idempotency-Key K  │                                       │
+      │───────────────────────────────────▶│                                       │
+      │                                    │ 5 one tx: key K, order, items, lease  │
+      │                                    │──────────────────────────────────────▶│
+      │ 6 201 lost in a tunnel             │                                       │
+      │◀───────────────────────────────────│                                       │
+      │ 7 retry with the same K            │                                       │
+      │───────────────────────────────────▶│                                       │
+      │                                    │ 8 INSERT key K: conflict              │
+      │                                    │──────────────────────────────────────▶│
+      │ 9 stored 201, Idempotent-Replayed  │                                       │
+      │◀───────────────────────────────────│                                       │
+      │                                    │                                       │
 ```
 
-**What that forces on the client.** The UI can no longer say "here's your driver." It has to model an order as a **live subscription, not a request/response**. The customer navigates immediately to a tracking screen showing "Finding your driver…", and the driver appears when a `driver_assigned` event arrives over the socket. That is a strictly better UX *and* it's the only version that can be four-nines available — which is the nicest kind of trade-off, where the honest architecture and the good product point the same direction.
+"Steps 3 and 8 are two halves of one contract. The browser promises to send the same key for the same attempt — even after a reload, because the attempt lives in `sessionStorage` — and the server promises that a repeated key returns the stored response instead of doing the work again. Step 2 is the other contract: the number on the button comes from the same pricing function that step 5 uses, so the customer pays what they saw."
 
-**When to match is itself a seam.** Matching at `ready_for_pickup` means the driver arrives late and the food sits. Matching at `confirmed` means the driver waits, unpaid, and starts hating the platform. The right answer is to schedule matching at `confirmed + (prep_time − estimated_travel_time)` — which is why `avg_prep_time_minutes` lives on the merchant table, and why the merchant app's "prep time" field is load-bearing infrastructure rather than a settings screen.
-
-## 🔧 Seam 2: The Location Firehose — Client Behavior Dictates Server Storage
-
-The driver's phone sends its position every 3 seconds. That client-side interval, multiplied by 30,000 drivers, *is* the 10K writes/second requirement. The frontend's timer is the backend's capacity plan.
-
-**Three data paths, because the data has three different consumers with three different needs:**
-
-| Path | Destination | Consumer | Durability |
-|------|-------------|----------|------------|
-| **Hot** | Redis geo-index | Matching (`GEORADIUS`) | ❌ Volatile — and that's *correct* |
-| **Push** | Redis Pub/Sub → WebSocket | The customer's map | ❌ Lossy, conflated |
-| **Durable tail** | Kafka | ETA model training, dispute resolution | ✅ Replayable |
-
-**Why volatile is the right answer for the geo-index.** Redis losing it sounds catastrophic: every driver appears offline. But every online driver sends a position within 3 seconds, so the index **self-heals in one update cycle.** The data was going to be overwritten anyway. We're not tolerating volatility — we're exploiting the fact that the data expires faster than any recovery process could run.
-
-**Why PostGIS in the main database would break this.** It's ~5–10ms per query versus sub-millisecond, which hurts on the match path. But the deeper problem is the *write* side: the 10K/sec firehose would now share a WAL, a buffer cache, and a connection pool with order placement. The 800×-larger stream would be competing with the revenue path. The isolation matters more than the speed.
-
-**The client seam: what the map is allowed to do.**
-
-- **Conflate.** A position is *state*, not an event — the newest strictly supersedes the older. If the customer's connection stalls, drop the queued positions and send only the latest. Nobody needs to know where the driver *was* four seconds ago.
-- **Interpolate.** Updates arrive every 3s, but a dot that teleports every 3 seconds looks broken. The client animates between known positions — which means the *perceived* smoothness is a frontend concern, and the backend can send *less* data because of it. Solving a rendering problem on the client bought us real backend headroom.
-- **Show staleness honestly.** If no update arrives for 10 seconds, the UI must say so. A frozen dot that looks live is worse than a dot labeled "last seen 30s ago," because the customer makes decisions ("should I go downstairs?") on it.
-
-**And the opposite discipline for status events.** "Picked up" and "delivered" are **events**, not state. They are never conflated, and they ride a bounded, replayable per-order Redis Stream. A customer whose phone goes through a tunnel reconnects and *replays what they missed*, rather than silently skipping a state and staring at a map forever wondering if the food arrived.
-
-> "Same transport, opposite delivery guarantees, decided by the semantics of the payload. Positions are state — droppable, conflatable, interpolatable. Status changes are events — each one is a fact, and losing one strands a human being. Knowing which of your streams is which is the single most useful lens I have for real-time systems, and it's a decision the client and the server have to agree on explicitly, or one of them will get it wrong."
-
-## 🔧 Seam 3: The Accept Button — Exactly-Once Against a Physical World
-
-The driver taps Accept in a parking garage. This one interaction contains the hardest correctness problem in the system, and it cannot be solved on either side alone.
-
-**Two races, failing in opposite directions:**
-
-**Race A — duplicate orders (client-caused).** The customer taps Place Order, the network hangs, the app retries. Without protection: two orders, two charges. The client generates an idempotency key; the server inserts it *before* doing the work, and the primary-key constraint kills the duplicate at the door. A completed key returns the cached response byte-for-byte — **including the original order ID**, so the client's retry lands on the same tracking screen rather than a second one.
-
-**Race B — double assignment (server-caused).** Two drivers accept the same order, because an offer was retried or a stale request replayed. The guard is a conditional update: assign the driver **only where `driver_id IS NULL`**. Zero rows updated means someone else won; the losing driver is told instantly and re-queued. **The database row is the lock**, and nothing at the application layer is trustworthy under retry.
-
-**The failure with no clean answer: the driver accepted and we never heard it.** The tap lands, the row updates, the response dies in the garage. The driver's app shows nothing. Ours shows them assigned. This is the state that produces "two drivers showed up" and "nobody showed up," and it's the one that actually happens.
-
-There's no transaction that fixes it, because one of the participants is a human in a car. So the fix is a protocol spanning both sides:
-
-1. **The driver app never trusts its own last-known state.** On reconnect it *asks the server* what it's assigned to. The server is the truth, always. This is a client-side rule with no server-side enforcement — which means it has to be a rule, and it has to be in the code review checklist.
-2. **Assignment carries a liveness lease.** If an assigned driver stops sending location updates for N minutes, the order returns to the matching pool and is re-offered. That covers the dead battery, the driver who quit for the day, and the accidental tap. Note that this is only possible *because* location updates already exist — the firehose we built for the map turns out to be the heartbeat we need for correctness.
-3. **Every offer and outcome is recorded**, so "why did two drivers arrive at the taco truck" has an answer at 2am, and so `acceptance_rate` is a fact rather than a guess.
-
-> "The general principle: you cannot make the physical world atomic, so make the *record* atomic and give the world a way to reconcile against it. Every irreversible physical action — driving to a restaurant, handing over food — must be preceded by a state transition the database has committed **and the actor's device has confirmed reading.** The state machine isn't bookkeeping. It's the only thing standing between us and two drivers at one restaurant."
-
-## 🔌 The API Contract: Three Clients, One Model
-
-Three apps consuming one backend creates a specific temptation and a specific failure.
+### Flow: a cancel and an accept collide
 
 ```
-# Customer
-GET    /api/v1/merchants?lat=&lng=       Browse nearby
-GET    /api/v1/merchants/:id/menu
-POST   /api/v1/orders                    X-Idempotency-Key REQUIRED
-GET    /api/v1/orders/:id
-WSS    /ws  → subscribe(order:{id})      Tracking + status events
-
-# Driver
-POST   /api/v1/driver/go-online | go-offline
-POST   /api/v1/driver/location           The firehose
-POST   /api/v1/driver/offers/:id/accept  The race
-POST   /api/v1/driver/orders/:id/picked-up | delivered
-WSS    /ws  → subscribe(driver:{id})     Incoming offers
-
-# Merchant
-POST   /api/v1/merchant/orders/:id/confirm   Sets prep time
+Customer SPA                     API                              PostgreSQL    Courier SPA
+      │                           │                                    │             │
+      │ 1 POST /orders/42/cancel  │                                    │             │
+      │──────────────────────────▶│                                    │             │
+      │                           │ 2 cancel if pending; expire offer  │             │
+      │                           │───────────────────────────────────▶│             │
+      │ 3 200 cancelled, v2       │                                    │             │
+      │◀──────────────────────────│                                    │             │
+      │                           │ 4 POST /offers/7/accept                          │
+      │                           │◀─────────────────────────────────────────────────│
+      │                           │ 5 claim: offer still pending? no   │             │
+      │                           │───────────────────────────────────▶│             │
+      │                           │ 6 409 OFFER_UNAVAILABLE                          │
+      │                           │─────────────────────────────────────────────────▶│
+      │                           │                          7 close modal, explain  │
+      │                           │                                    │             │
 ```
 
-**The temptation is one `/orders/:id` that returns everything and lets each client pick what it needs.** It's DRY, it's one endpoint, and it's a data leak: the customer's payload would carry the driver's phone number and exact position, the driver's payload would carry the customer's payment details, and the merchant's would carry both. Role-based *field projection* is not optional here, and it must happen server-side. The three roles in this marketplace have adversarial incentives; "the client just won't render that field" is not an access-control strategy, it's a press release waiting to happen.
+"Both requests are compare-and-set updates on the same order row, so PostgreSQL serializes them. Here the cancel wins and also withdraws the live offer, so the claim in step 5 finds no pending offer and the courier gets `409`. Had the accept arrived first, the order would be `driver_assigned` and the cancel would get `409` instead. Each app has copy for its `409`."
 
-**Shared types, separate views.** The three frontends and the backend share one TypeScript definition of `Order`, `Driver`, `Merchant` — which means a field rename is a compile error rather than a runtime `undefined` in production. But each role gets a *projection* of that type, generated server-side, and the client's type reflects what it's actually allowed to see. That's the seam working: one source of truth for the shape, enforced boundaries on the content.
-
-## 🔄 The Order State Machine — the Contract Every Client Renders
+### Flow: from the courier's phone to the customer's map
 
 ```
-  pending ──▶ confirmed ──▶ preparing ──▶ ready_for_pickup
-     │            │                              │
-     │            │              (matching is scheduled here:
-     │            │               confirmed + prep − travel)
-     │            │                              ▼
-     │            │                       driver_assigned
-     │            │                              ▼
-     │            │                          picked_up
-     │            │                              ▼
-     │            │                         in_transit
-     │            │                              ▼
-     ▼            ▼                          delivered
-  cancelled ◀────────────────────────────────────┘
-                            (only before pickup)
+ Courier          Location Svc                   Redis                Gateway             Customer
+    │                   │                          │                     │                    │
+    │ 1 POST /location  │                          │                     │                    │
+    │──────────────────▶│                          │                     │                    │
+    │                   │ 2 GEOADD, ZADD, PUBLISH  │                     │                    │
+    │                   │─────────────────────────▶│                     │                    │
+    │                   │ 3 SET gate NX PX 10s     │                     │                    │
+    │                   │─────────────────────────▶│                     │                    │
+    │                   │                          │ 4 location message  │                    │
+    │                   │                          │────────────────────▶│                    │
+    │                   │                          │                     │ 5 stage-aware ETA  │
+    │                   │                          │                     │ 6 lat, lng, eta    │
+    │                   │                          │                     │───────────────────▶│
+    ·································· customer reconnects ····································
+    │                   │                          │                     │ 7 subscribe_order  │
+    │                   │                          │                     │◀───────────────────│
+    │                   │                          │                     │ 8 snapshot v4      │
+    │                   │                          │                     │───────────────────▶│
+    │                   │                          │                     │                    │
 ```
 
-This diagram is a **shared contract**, not an implementation detail — all three apps render a view of it, and each transition is a conditional update on the server (`WHERE status = <expected>`), not a read-then-write.
+"Step 3 is the server side of the courier app's heartbeat: one ping per 10-second window is persisted, the rest exist only in Redis. Steps 7 and 8 are the reconnect contract: the socket keeps no history, so every subscription starts with a snapshot."
 
-The client-side consequence is subtle and important: **no client may optimistically advance a state.** It's tempting — the driver taps "Picked Up," why not show it immediately? Because unlike a kanban card, this transition has a *physical* meaning: it tells the customer their food has left the restaurant, and it starts the delivery ETA clock. If the update fails and we've already told the customer, we've lied about the physical world. Optimism is affordable when the client can predict the result *and* the consequence of being wrong is cosmetic. Here it's neither.
+---
 
-Contrast that with the tip amount or a rating — safe to render optimistically, because being wrong for 200ms harms nobody. **The rule isn't "optimistic UI good"; it's "optimism is priced by the cost of being wrong."**
+## 💾 Data Model & API Contract (7 min)
 
-## 🧭 Consistency Model
+### Server side
 
-| Data | Guarantee | Client implication |
-|------|-----------|--------------------|
-| Orders, state transitions | Strong, ACID, conditional updates | The client must treat the server as the sole authority — never optimistically advance a state |
-| Driver assignment | Strong, single-writer | The offer modal must handle "too late" gracefully; it *will* happen |
-| Idempotency keys | Durable (PostgreSQL) | The client must generate a key per *intent*, not per *request*, or retries won't dedupe |
-| Driver location | Eventual, ≤ 3s, lossy | Client conflates and interpolates; shows staleness after 10s |
-| Order status push | At-least-once, replayable | Client must be idempotent on receipt — the same "delivered" may arrive twice |
-| Ratings | Eventual, async | Safe to render optimistically |
+| Store | Table / key | Key columns | Notes |
+|-------|-------------|-------------|-------|
+| PostgreSQL | `orders` | `id`, `status`, `version`, `driver_id`, amounts in cents, `dispatch_owner`, `dispatch_lease_until` | Every transition is a guarded `UPDATE` that bumps `version` |
+| PostgreSQL | `driver_offers` | `order_id`, `driver_id`, `status`, `expires_at` | Unique: one pending per order, one pending per courier, one accepted per order |
+| PostgreSQL | `idempotency_keys` | `key`, `user_id`, `request_hash`, `response` | Same transaction as the order; 24 h |
+| Redis | `drivers:locations`, `drivers:last_seen` | Geo set; sorted set of ping times | Search ignores couriers silent > 30 s |
+| Redis | `order:{id}:status`, `driver:{id}:location`, `driver:{id}:offers` | Pub/sub channels | Fan-out to gateway nodes |
 
-The row people get wrong is the last-but-one. At-least-once delivery means **the client must tolerate duplicates.** A UI that appends a status to a timeline on every event will show "Delivered" twice after a reconnect replay. Applying events by ID into a keyed map, rather than appending to a list, makes duplicate delivery harmless — a small client-side decision that only makes sense if you know what the server's delivery guarantee actually is.
+### Client side
 
-## 🛠️ Failure Handling Across the Stack
+| Cache key | Holds | Updated by |
+|-----------|-------|------------|
+| `['order', id]` | Order with `version` | Snapshot, status events, refetch — whichever has the higher version |
+| `['order', id, 'position']` | `lat`, `lng`, `eta`, `receivedAt` | Location events |
+| `['quote', cart, tip, location]` | Server price | Refetched on change; stale requests aborted |
+| `['offer', 'pending']` | Offer with `expiresAt` | Offer push; re-read on every reconnect |
+| Store: cart, session | Ids, quantities, user | Local; cart persisted |
+| `sessionStorage`: checkout attempt | Idempotency key | Cleared on success; replaced when the cart changes |
 
-| Failure | Server behavior | What each client shows |
-|---------|-----------------|------------------------|
-| Redis down | Geo-index gone → matching **pauses**; orders queue in `confirmed` | Customer: "Finding your driver" (honest, and true). Driver: no offers. Nothing lies |
-| PostgreSQL down | New orders rejected (503); active tracking continues from Redis | Customer: checkout disabled with a clear message. **Never** a silent failure at the payment moment |
-| Kafka down | Locations still flow to Redis; matching and tracking unaffected | Nothing user-visible. Analytics and ETA training lag. This is the whole point of it being a separate path |
-| Matching circuit opens | Orders hold; admin paged | Customer still sees an honest "searching" state |
-| WebSocket drops | — | Client reconnects with jittered backoff and **replays missed order events** from the stream. Locations need no replay — a fresh one arrives in 3s |
-| Driver goes dark | Liveness lease expires → re-offer | Customer notified of the reassignment. Silence here is what generates support tickets |
+### The contract
 
-The rule: **degrade matching before orders, and tracking before either.** Accepting an order you can't yet fulfill is recoverable — you can always find a driver later. Losing the order isn't.
+```
+POST /api/v1/orders/quote                → subtotal, delivery_fee, tip, total (decimal strings)
+POST /api/v1/orders + Idempotency-Key    → 201 order | 409 in flight | 422 reused or invalid
+POST /api/v1/orders/{id}/cancel          → 200 | 409 a courier already accepted
+POST /api/v1/driver/offers/{id}/accept   → 200 order | 409 OFFER_UNAVAILABLE | ORDER_UNAVAILABLE
+GET  /api/v1/driver/offers/pending       → offer + expires_in_seconds | null
+POST /api/v1/driver/location             {lat, lng} every 3 s moving, 10 s parked
+WSS  /ws                                 order_snapshot · status_update {status, version} · location_update {eta}
+```
 
-## 🔐 Security in a Three-Sided Marketplace
+| Contract element | The server guarantees | The client relies on it to |
+|------------------|----------------------|----------------------------|
+| `Idempotency-Key` | Same key + same body → same `201` for 24 h; another user or body → `422` | Retry after timeouts, double taps and reloads without a second order |
+| Quote = create pricing | One function prices both | Show a total that is the total charged |
+| `version` on order, events, snapshots | Incremented on every transition | Keep the newest copy whatever the arrival order |
+| Snapshot on subscribe | Every subscription starts with the full order | Recover anything missed while disconnected |
+| `409` + `code` on Accept, Cancel and courier steps | The move was not applied; the current state is unchanged | Show a specific message and refetch, never assume success |
+| `expires_in` seconds on offers | Measured on the server's clock | Count down correctly on a phone with a skewed clock |
+| Liveness window 30 s | Couriers silent longer get no offers | Send a heartbeat every 10 s while parked |
 
-- **Session tokens in Redis, not JWTs.** A compromised *driver* account steals real food and real money. Revocation must be one operation, not a fifteen-minute wait.
-- **Role checks on every endpoint.** These three roles have genuinely adversarial incentives — a customer hitting the driver-location endpoint is an attack, not a curiosity.
-- **Location spoofing is the interesting one.** A driver reporting a fake position near a busy merchant harvests more offers. The defense is statistical, not cryptographic: flag physically implausible movement (a 400 km/h "bicycle"), and cross-check reported positions against the actual delivery timeline. Note this is only possible because we kept the durable Kafka tail — a fraud control that falls out of a decision made for ETA training.
-- **Money is never computed on the client.** The cart *displays* a total; the server *decides* one. A client-computed total is a client-editable total.
+---
 
-## 📊 What I'd Measure
+## 🔧 Deep Dive 1: One Order per Tap, at the Right Price (8 min)
 
-| Signal | Layer | Why it's the right one here |
-|--------|-------|------------------------------|
-| Time-to-match p99 | Server | The core SLO. The tail is where the sequential-offer trade-off actually hurts |
-| **Offer rejection rate by zone** | Server | A *supply* problem wearing an engineering costume. No matcher tuning fixes it — it's a pricing signal |
-| Location ingest rate vs. drivers-online | Both | These must track exactly. A gap means driver apps are silently failing to report and the geo-index is going stale |
-| **ETA error distribution** | Both | The trust metric, and the biggest driver of support volume |
-| WebSocket reconnect rate | Client | Spikes mean the tracking experience is broken for people who will never file a bug |
-| Orders stuck in a state past threshold | Server | The catch-all. An order sitting in `confirmed` for 10 minutes is now a human problem |
+"The scenario: a customer on a train taps Place order, the request times out, and they tap again. Without care we create two orders, charge twice and dispatch two couriers. Each layer has a job."
 
-## 📈 Scalability: What Breaks First
+**Browser.** On tap, the SPA creates a key with `crypto.randomUUID()` for this checkout attempt and keeps it in `sessionStorage`. Automatic retries, the Retry button and a reload that finds the attempt pending all reuse it. Editing the cart, tip or address resets it, because that is a different request. The button is disabled while pending, but correctness doesn't depend on that.
 
-1. **The Redis geo-index on writes.** The fix is *free*, and it's the nicest property in the system: **shard by metro.** Drivers do not deliver from San Francisco to Chicago. Each metro gets its own geo-index and its own matching leader, with **zero cross-shard queries** — the physical world already partitioned the data for us. Most sharding decisions are agonizing; this one is a gift.
-2. **WebSocket connections** for tracking. Horizontal gateways with Redis Pub/Sub so any gateway serves any customer. Bursty in exactly the same way orders are — everyone tracks at dinner.
-3. **PostgreSQL order writes** — 35/sec at peak is genuinely small. This is *not* the bottleneck people expect. What grows is the `orders` table; partition by month, archive after 30 days.
-4. **The matching leader per metro** must be single-writer to keep the offer protocol coherent. That's a vertical ceiling per metro — but a metro is a bounded amount of demand, and if one outgrows a process, split it into zones. Geography keeps handing us shard keys.
-5. **ETA quality**, which is not a throughput problem and is the first thing to actually fail the user. Haversine ignores roads, traffic, and the fifteen minutes it takes to park downtown — and it's *systematically optimistic exactly where orders are densest*. The upgrade is a routing engine, then a model trained on the Kafka history we've been quietly collecting.
+**API.** The Order Service opens a transaction and inserts the key. If the insert succeeds, it prices the cart, inserts the order and items, stores the `201` body under the key and commits — all or nothing, so a crash mid-request leaves no half-made order and no orphaned key. If the key already exists, a concurrent first attempt is still running, and the insert waits on the unique index until it commits, then returns the stored `201`. A different user or a different body with the same key gets `422`, without seeing the other request's data.
 
-## ⚖️ Trade-offs Summary
+**Database.** The key's primary key prevents a duplicate attempt; the `CHECK` constraints on quantities and amounts are the last line of defense against a malformed cart.
 
-| Decision | Chosen | Alternative | Rationale |
-|----------|--------|-------------|-----------|
-| Order POST returns | ✅ On durable commit, before matching | ❌ After a driver is assigned | Matching takes minutes; 99.99% can't depend on driver supply |
-| Order UX model | ✅ Live subscription (WebSocket) | ❌ Request/response | Follows directly from the above — and it's a better product anyway |
-| Geo-index | ✅ Redis, volatile | ❌ PostGIS in the main DB | Self-heals in 3s; isolates a 10K/sec firehose from the revenue path |
-| Location durability | ✅ Volatile hot + durable Kafka tail | ❌ Persist every point | 86 GB/day of data with a 3-second lifetime |
-| Location delivery | ✅ Conflated + client interpolation | ❌ Buffer every point | Position is state; newest supersedes. Interpolation buys backend headroom |
-| Status delivery | ✅ At-least-once, replayable stream | ❌ Conflated like locations | Each status is a fact; losing one strands a human |
-| Client on duplicate events | ✅ Apply by ID into a keyed map | ❌ Append to a list | At-least-once means duplicates *will* arrive |
-| Idempotency store | ✅ PostgreSQL | ❌ Redis | A lost key is a double charge |
-| Driver assignment | ✅ Conditional update on `driver_id IS NULL` | ❌ App-level lock | The row is the lock |
-| Driver app state | ✅ Ask the server on reconnect | ❌ Trust local state | The phone was in a garage; the server was not |
-| Money | ✅ Server-authoritative | ❌ Client-computed total | A client-computed total is a client-editable total |
-| Sharding | ✅ By metro | ❌ By hash | Geography already partitioned the data |
+**Price.** The cart sends item ids and quantities. The quote endpoint and the create endpoint call the same pricing function — menu prices, a distance-based delivery fee, integer cents — so the total the customer saw is the total they pay.
 
-## 🚀 Closing
+| Approach | Verdict |
+|----------|---------|
+| ✅ Client key per attempt + key in the order's transaction | Correct across timeouts, reloads and concurrent duplicates |
+| ❌ Key stored in Redis next to an order in PostgreSQL | Two commits can disagree: a key without an order, or an order without a key |
+| ❌ Dedupe by request body | Merges intentional repeats (the same lunch two days running) |
+| ❌ Client-computed total | Wrong as soon as the fee depends on distance |
 
-Every seam in this design comes from one sentence: **orders are rare and must be perfect; locations are constant and are allowed to be lossy.** That asymmetry is why they get different databases, different durability, different delivery guarantees, and different client-side handling — and why the single worst thing you could do to this system is build one uniform "real-time data path" that treats them the same.
+"What I give up: a few hundred milliseconds of 'Placing order…' instead of optimism, an extra row per order for 24 hours, and a held connection while a duplicate waits behind the first request — capped at 5 seconds, after which it gets `409` and retries."
 
-What I'd build next, in the order the business would feel it: **a real ETA** (Haversine is a placeholder wearing a lab coat, and every trust metric traces back to it — the Kafka stream already holds the ground truth); **batched multi-stop assignment** (two orders on the same block should ride together — that's where the margin is); and honest instrumentation of **supply**, because when there are no drivers near the merchant at 7pm, no scoring function saves you, and the correct response is pricing rather than engineering. Knowing which of your problems your architecture *can't* solve is part of designing it.
+---
+
+## 🔧 Deep Dive 2: Accept versus Cancel — One Courier or None (7 min)
+
+"Two couriers driving to one restaurant, or a courier driving for an order the customer cancelled, can't be rolled back. This deep dive is about making those outcomes impossible and making the losing side's screen honest."
+
+**Server.** Accepting is one transaction of three compare-and-set updates: the offer from `pending` to `accepted` if unexpired and owned by this courier, the order from unassigned to `driver_assigned` if still dispatchable, the courier to `busy` if still online. Any zero-row update rolls back all three. Partial unique indexes allow one pending offer per order, one per courier, and one accepted offer per order, so the guarantee holds even if two dispatchers briefly overlap. Cancel is a compare-and-set too (`WHERE status IN ('pending','confirmed') AND customer_id = $me`) and withdraws the live offer in the same transaction.
+
+**Courier app.** Accept is pessimistic: the modal disables its buttons and waits. `200` adds the delivery; `409 ORDER_UNAVAILABLE` closes the modal with "This order is no longer available". The countdown uses the server's remaining seconds, and after any reconnect the app re-reads its pending offer, because a push can be missed.
+
+**Customer app.** Cancel is pessimistic too. A `409` means a courier won the race: the page refetches and says "A courier already accepted — the order can't be cancelled now", and the timeline shows the assignment.
+
+**The lifecycle is a shared contract.** Both apps render the same states, and the server decides every move. No client advances a state optimistically: "picked up" tells the customer their food left the restaurant and starts the delivery ETA, so showing it before the server agrees is a lie about the physical world. Optimism is fine for things that are cheap to be wrong about — a rating, a tip — and wrong for things that send people driving.
+
+| Approach | Verdict |
+|----------|---------|
+| ✅ Claim transaction + unique indexes; pessimistic buttons with `409` copy | One courier or none; each side sees the truth |
+| ❌ Broadcast offers, first accept wins | A herd on one row; 49 couriers see failures |
+| ❌ Read-check-write in each route | Cancel and accept both succeed |
+| ❌ Optimistic Accept in the courier app | A courier starts driving for an order they don't have |
+
+**The last-instant accept.** When an offer's window closes, the matcher expires it with a compare-and-set. If that matches nothing, the courier accepted at the last moment, and the acceptance stands rather than the order going to a second courier.
+
+"What I give up is speed: sequential offers can take minutes when couriers decline, and both apps show a spinner on their critical button. I'd rather show 'finding your courier' for longer than send two cars."
+
+---
+
+## 🔧 Deep Dive 3: Tracking That Never Goes Backwards (7 min)
+
+"A WebSocket will drop — tunnels, elevators, a deploy. The contract has to say what happens to the missed messages, because pub/sub won't remember them."
+
+**Server.** Each gateway node holds one Redis subscriber and a reference-counted map from channels to its sockets. Subscribing to an order subscribes the socket to the order's status channel and, once there is a courier, to that courier's location channel, then sends a full snapshot. Status events are absolute and carry the order's `version`. When a courier is assigned, the gateway moves the socket to the new courier's location channel itself. Each position goes out with a stage-aware ETA: before pickup, courier to merchant plus any wait for the food plus merchant to customer; after pickup, only the last leg. A 30-second ping/pong drops dead sockets.
+
+**Client.** On close, the SPA reconnects after 1, 2, 4… up to 30 seconds, each randomized, so a deploy that drops every socket doesn't bring them back in lockstep. On open it resubscribes and receives a snapshot. The cache keeps whichever copy of the order has the higher version, so a late event never undoes a snapshot. After each status event the SPA refetches the order to pick up the courier's name and timestamps, through the same version check. While reconnecting it shows a banner, and the map says how old the last position is instead of pretending to be live.
+
+**Presence is a contract too.** The server stops offering orders to a courier who hasn't pinged for 30 seconds — otherwise a dead phone would hold every nearby order for a 30-second timeout. Browsers report GPS only on movement, so the courier app re-sends its last position every 10 seconds while online. Each ping goes over the socket when it's open and over HTTP otherwise, never both, so customers don't get duplicate positions.
+
+| Approach | Verdict |
+|----------|---------|
+| ✅ Snapshot on subscribe + versioned absolute events | Reconnects recover; duplicates and reordering are harmless |
+| ❌ Event replay from a per-order stream | Works, but every node must track offsets; the snapshot is simpler and the state is small |
+| ❌ Client applies events in arrival order | A late event moves the timeline backwards |
+| ❌ Polling every 3 s | ~17K requests/s at peak, and still half a second of average lag |
+
+"What I give up: a persistent connection per tracking customer and a snapshot per reconnect. Both are cheap next to a customer who saw 'delivered' and then 'picked up'."
+
+---
+
+## 📈 Failures & Scale (2 min)
+
+| Failure | Customer sees | Courier sees | Mitigation |
+|---------|---------------|--------------|------------|
+| Response lost at checkout | "Retry is safe"; the retry returns the same order | — | Idempotency key in the order's transaction |
+| Dispatch instance crashes | "Finding your courier" a little longer | Offers resume | Lease expiry + sweeper on another instance |
+| Metro Redis down | Map freezes; search takes longer | No new offers | Matching pauses rather than guessing; index rebuilds from pings |
+| Socket drops | "Reconnecting…" banner, last position aged | Offer re-read on reconnect | Backoff with jitter; snapshot on resubscribe |
+| Cancel races Accept | `409`: "a courier already accepted" — or a clean cancel | `409`: "no longer available" — or the order | One compare-and-set wins |
+| PostgreSQL primary down | Checkout disabled with a message | Accept fails with retry | `503`; replica promotion |
+
+**What breaks first as we grow:** courier efficiency at peak (greedy matching; batched assignment is the fix), then one metro's Redis on writes (split into zones — couriers never cross metros, so geography is a free shard key), then gateway connections (horizontal), then the size of the orders table (monthly partitions).
+
+---
+
+## ⚖️ Trade-offs & Wrap-up (1 min)
+
+| Decision | ✅ Chosen | ❌ Alternative | Why |
+|----------|-----------|----------------|-----|
+| Checkout safety | Client key + key in the order's transaction | Body dedupe or a disabled button | Retries can't duplicate; intentional repeats still work |
+| Price | Server quote, same function as create | Client total | The customer pays what they saw |
+| One courier per order | Claim transaction + unique indexes | Read-check-write | Database-enforced on every path |
+| Critical buttons | Pessimistic with specific `409` copy | Optimistic | Physical-world states can't be undone |
+| Tracking | Snapshot + versioned events over WebSocket | Polling or arrival-order events | Push latency; never backwards |
+| Courier presence | 10 s heartbeat vs 30 s server window | Movement-only pings | Parked couriers stay matchable, dead phones don't |
+| Placement | Return on commit; track asynchronously | Wait for a courier | Availability independent of supply |
+
+"With more time: schedule dispatch at confirmation plus prep time minus travel time so couriers arrive as food is ready, reassign when an assigned courier goes silent, Web Push for backgrounded tabs, and a routing-engine ETA trained on the location history."
