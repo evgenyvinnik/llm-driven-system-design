@@ -1,10 +1,15 @@
 /**
- * @fileoverview WebSocket client for real-time collaboration features.
- * Handles connection management, page subscriptions, presence updates,
- * and operation broadcasting with automatic reconnection logic.
+ * @fileoverview WebSocket client for real-time collaboration.
+ *
+ * The socket only RECEIVES committed changes; edits are saved over REST. The
+ * client remembers which page it is subscribed to and, after every
+ * (re)connect, subscribes again with the last operation seq the editor applied,
+ * so the server replays exactly what was missed while the connection was down.
+ * Reconnects never give up (capped exponential backoff with jitter), and a
+ * watchdog reconnects when the server's 30-second heartbeat stops arriving.
  */
 
-import type { WSMessage, Operation } from '@/types';
+import type { WSMessage } from '@/types';
 
 /** Handler function for incoming WebSocket messages */
 type MessageHandler = (message: WSMessage) => void;
@@ -12,161 +17,175 @@ type MessageHandler = (message: WSMessage) => void;
 /** Handler function for connection state changes */
 type ConnectionHandler = () => void;
 
+/** No message (not even a heartbeat) for this long means the link is dead. */
+const SILENCE_TIMEOUT_MS = 75_000;
+const MAX_BACKOFF_MS = 30_000;
+
 /**
  * WebSocket service for real-time communication with the server.
- * Provides methods for subscribing to pages, sending operations,
- * and updating presence. Automatically reconnects on disconnection.
  */
 class WebSocketService {
   private ws: WebSocket | null = null;
   private token: string | null = null;
+  private shouldReconnect = false;
   private reconnectAttempts = 0;
-  private maxReconnectAttempts = 5;
-  private reconnectTimeout: number | null = null;
+  private reconnectTimer: number | null = null;
+  private watchdogTimer: number | null = null;
+  private lastMessageAt = 0;
+  private subscription: { pageId: string; sinceSeq: () => number } | null = null;
   private messageHandlers: Set<MessageHandler> = new Set();
   private connectionHandlers: Set<ConnectionHandler> = new Set();
   private disconnectionHandlers: Set<ConnectionHandler> = new Set();
-  private pendingMessages: WSMessage[] = [];
   private clientId: string | null = null;
+
+  constructor() {
+    if (typeof window !== 'undefined') {
+      // Coming back online: reconnect now instead of waiting out the backoff.
+      window.addEventListener('online', () => {
+        if (this.shouldReconnect && !this.ws && this.token) {
+          this.reconnectAttempts = 0;
+          this.connect(this.token);
+        }
+      });
+    }
+  }
 
   /**
    * Establishes a WebSocket connection with the server.
-   * Uses the authentication token for session verification.
    *
    * @param token - Session token for authentication
    */
   connect(token: string): void {
-    if (this.ws?.readyState === WebSocket.OPEN) {
+    this.token = token;
+    this.shouldReconnect = true;
+    if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
       return;
     }
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
 
-    this.token = token;
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const host = window.location.host;
-    const url = `${protocol}//${host}/ws?token=${token}`;
+    const ws = new WebSocket(`${protocol}//${window.location.host}/ws?token=${encodeURIComponent(token)}`);
+    this.ws = ws;
 
-    this.ws = new WebSocket(url);
-
-    this.ws.onopen = () => {
-      console.log('WebSocket connected');
+    ws.onopen = () => {
       this.reconnectAttempts = 0;
-      this.connectionHandlers.forEach((handler) => handler());
-
-      // Send pending messages
-      while (this.pendingMessages.length > 0) {
-        const message = this.pendingMessages.shift()!;
-        this.send(message);
+      this.lastMessageAt = Date.now();
+      this.startWatchdog();
+      // Resume the page subscription from the last seq the editor applied.
+      if (this.subscription) {
+        this.sendNow({
+          type: 'subscribe',
+          payload: { pageId: this.subscription.pageId, sinceSeq: this.subscription.sinceSeq() },
+        });
       }
+      this.connectionHandlers.forEach((handler) => handler());
     };
 
-    this.ws.onmessage = (event) => {
+    ws.onmessage = (event) => {
+      this.lastMessageAt = Date.now();
       try {
         const message: WSMessage = JSON.parse(event.data);
-
-        // Handle connected message
         if (message.type === 'connected') {
-          const payload = message.payload as { clientId: string };
-          this.clientId = payload.clientId;
+          this.clientId = (message.payload as { clientId: string }).clientId;
         }
-
         this.messageHandlers.forEach((handler) => handler(message));
       } catch (error) {
         console.error('Failed to parse WebSocket message:', error);
       }
     };
 
-    this.ws.onclose = () => {
-      console.log('WebSocket disconnected');
+    ws.onclose = () => {
+      if (this.ws !== ws) return;
+      this.ws = null;
+      this.clientId = null;
+      this.stopWatchdog();
       this.disconnectionHandlers.forEach((handler) => handler());
-      this.attemptReconnect();
+      if (this.shouldReconnect) this.scheduleReconnect();
     };
 
-    this.ws.onerror = (error) => {
-      console.error('WebSocket error:', error);
+    ws.onerror = () => {
+      // onclose follows and schedules the reconnect.
     };
   }
 
   /**
-   * Closes the WebSocket connection and prevents automatic reconnection.
-   * Called on logout or when leaving the application.
+   * Closes the connection and stops reconnecting (logout).
    */
   disconnect(): void {
-    if (this.reconnectTimeout) {
-      clearTimeout(this.reconnectTimeout);
-      this.reconnectTimeout = null;
+    this.shouldReconnect = false;
+    this.subscription = null;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
     }
-    this.reconnectAttempts = this.maxReconnectAttempts; // Prevent reconnection
-    this.ws?.close();
+    this.stopWatchdog();
+    const ws = this.ws;
     this.ws = null;
     this.clientId = null;
+    ws?.close();
   }
 
-  private attemptReconnect(): void {
-    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-      console.log('Max reconnection attempts reached');
-      return;
-    }
-
-    const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 30000);
+  private scheduleReconnect(): void {
+    const base = Math.min(1000 * 2 ** this.reconnectAttempts, MAX_BACKOFF_MS);
+    const delay = base / 2 + Math.random() * (base / 2);
     this.reconnectAttempts++;
-
-    console.log(`Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts})`);
-
-    this.reconnectTimeout = window.setTimeout(() => {
-      if (this.token) {
-        this.connect(this.token);
-      }
+    this.reconnectTimer = window.setTimeout(() => {
+      this.reconnectTimer = null;
+      if (this.shouldReconnect && this.token) this.connect(this.token);
     }, delay);
   }
 
-  /**
-   * Sends a message through the WebSocket connection.
-   * If not connected, queues the message to be sent when connection opens.
-   *
-   * @param message - The message to send
-   */
-  send(message: WSMessage): void {
+  private startWatchdog(): void {
+    this.stopWatchdog();
+    this.watchdogTimer = window.setInterval(() => {
+      if (this.ws?.readyState === WebSocket.OPEN && Date.now() - this.lastMessageAt > SILENCE_TIMEOUT_MS) {
+        this.ws.close(); // onclose schedules the reconnect
+      }
+    }, 10_000);
+  }
+
+  private stopWatchdog(): void {
+    if (this.watchdogTimer) {
+      clearInterval(this.watchdogTimer);
+      this.watchdogTimer = null;
+    }
+  }
+
+  /** Sends now if connected; otherwise drops the message (state is resent on reconnect). */
+  private sendNow(message: WSMessage): void {
     if (this.ws?.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(message));
-    } else {
-      this.pendingMessages.push(message);
     }
   }
 
   /**
-   * Subscribes to real-time updates for a specific page.
-   * Receives presence updates and operations from other users.
+   * Subscribes to a page. `sinceSeq` is read at send time, so a reconnect
+   * resumes from whatever the editor has applied by then.
    *
    * @param pageId - The page to subscribe to
+   * @param sinceSeq - Returns the last operation seq the editor applied
    */
-  subscribePage(pageId: string): void {
-    this.send({
-      type: 'subscribe',
-      payload: { pageId },
-    });
+  subscribePage(pageId: string, sinceSeq: () => number): void {
+    this.subscription = { pageId, sinceSeq };
+    this.sendNow({ type: 'subscribe', payload: { pageId, sinceSeq: sinceSeq() } });
   }
 
   /**
-   * Unsubscribes from the currently subscribed page.
-   * Removes presence and stops receiving updates.
+   * Unsubscribes from the current page.
    */
   unsubscribePage(): void {
-    this.send({
-      type: 'unsubscribe',
-      payload: {},
-    });
+    this.subscription = null;
+    this.sendNow({ type: 'unsubscribe', payload: {} });
   }
 
   /**
-   * Sends an editing operation to be broadcast to other users.
-   *
-   * @param operation - The operation to send (timestamp and author added by server)
+   * Asks the server to replay operations after `sinceSeq` (gap detected).
    */
-  sendOperation(operation: Omit<Operation, 'timestamp' | 'author_id'>): void {
-    this.send({
-      type: 'operation',
-      payload: operation,
-    });
+  requestSync(pageId: string, sinceSeq: number): void {
+    this.sendNow({ type: 'sync', payload: { pageId, sinceSeq } });
   }
 
   /**
@@ -175,29 +194,12 @@ class WebSocketService {
    * @param cursorPosition - The current cursor location (block and offset)
    */
   updatePresence(cursorPosition?: { block_id: string; offset: number }): void {
-    this.send({
-      type: 'presence',
-      payload: { cursor_position: cursorPosition },
-    });
-  }
-
-  /**
-   * Requests operations that occurred since a given timestamp.
-   * Used to sync after reconnection or when returning to a page.
-   *
-   * @param since - Timestamp to sync from (operations after this time)
-   */
-  requestSync(since: number): void {
-    this.send({
-      type: 'sync',
-      payload: { since },
-    });
+    this.sendNow({ type: 'presence', payload: { cursor_position: cursorPosition } });
   }
 
   /**
    * Registers a handler for incoming WebSocket messages.
    *
-   * @param handler - Function to call when a message is received
    * @returns Unsubscribe function to remove the handler
    */
   onMessage(handler: MessageHandler): () => void {
@@ -208,7 +210,6 @@ class WebSocketService {
   /**
    * Registers a handler for successful connection events.
    *
-   * @param handler - Function to call when connected
    * @returns Unsubscribe function to remove the handler
    */
   onConnect(handler: ConnectionHandler): () => void {
@@ -219,7 +220,6 @@ class WebSocketService {
   /**
    * Registers a handler for disconnection events.
    *
-   * @param handler - Function to call when disconnected
    * @returns Unsubscribe function to remove the handler
    */
   onDisconnect(handler: ConnectionHandler): () => void {

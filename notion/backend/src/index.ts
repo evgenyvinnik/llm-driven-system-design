@@ -14,7 +14,7 @@ import workspacesRoutes from './routes/workspaces.js';
 import pagesRoutes from './routes/pages.js';
 import blocksRoutes from './routes/blocks.js';
 import databasesRoutes from './routes/databases.js';
-import { setupWebSocket } from './services/websocket.js';
+import { setupWebSocket, closeWebSocket } from './services/websocket.js';
 
 // Import shared modules
 import { logger, requestLogger } from './shared/logger.js';
@@ -117,8 +117,8 @@ app.get('/health', async (_, res) => {
  */
 app.get('/ready', async (_, res) => {
   try {
-    // Verify database is accessible
-    await pool.query('SELECT 1');
+    // Sessions and real-time fan-out need Redis as much as data needs PostgreSQL
+    await Promise.all([pool.query('SELECT 1'), redis.ping()]);
     res.status(200).json({ status: 'ready' });
   } catch {
     res.status(503).json({ status: 'not ready' });
@@ -156,6 +156,9 @@ setupWebSocket(server);
 // Graceful shutdown handler
 async function shutdown(signal: string): Promise<void> {
   logger.info({ signal }, 'Shutdown signal received, closing connections...');
+
+  // Close WebSockets first: open upgraded sockets keep server.close() from finishing
+  closeWebSocket().catch((error) => logger.error({ error }, 'Error closing WebSocket server'));
 
   // Stop accepting new connections
   server.close(async () => {

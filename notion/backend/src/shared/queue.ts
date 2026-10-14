@@ -136,9 +136,15 @@ class QueueManager {
       return this.connecting;
     }
 
+    // Clear the in-flight promise whether it succeeds or fails: leaving a
+    // rejected promise here made every later connect() (including the
+    // scheduled reconnect) fail forever if RabbitMQ was down at startup.
     this.connecting = this.doConnect();
-    await this.connecting;
-    this.connecting = null;
+    try {
+      await this.connecting;
+    } finally {
+      this.connecting = null;
+    }
   }
 
   private async doConnect(): Promise<void> {
@@ -294,7 +300,9 @@ class QueueManager {
         } else {
           // Max retries exceeded, send to DLQ or discard
           logger.error({ error, queueName, retryCount }, 'Message processing failed, max retries exceeded');
-          this.channel.ack(msg); // Ack to remove from main queue (already in DLQ via RabbitMQ)
+          // Reject without requeue so RabbitMQ dead-letters it into the DLQ
+          // (an ack silently dropped it; queues without a DLQ still drop it).
+          this.channel.nack(msg, false, false);
         }
 
         queueMessagesProcessed.inc({ queue_name: queueName, status: 'failure' });

@@ -84,6 +84,8 @@ export interface Page {
   properties_schema: PropertySchema[];
   position: string;
   is_archived: boolean;
+  /** Seq of the last committed block operation on this page (BIGINT, so a string from pg). */
+  last_op_seq?: string | number;
   created_by: string | null;
   created_at: Date;
   updated_at: Date;
@@ -247,7 +249,10 @@ export interface Operation {
   block_id: string;
   type: OperationType;
   data: Record<string, unknown>;
-  timestamp: number;
+  /** Position in the page's operation log (null for rows written before seqs existed). */
+  seq: number | null;
+  /** Packed hybrid logical clock (see utils/hlc.ts encodeHLC). */
+  timestamp: string;
   author_id: string | null;
   created_at: Date;
 }
@@ -257,7 +262,9 @@ export interface Operation {
  * All WebSocket messages follow this structure with type-specific payloads.
  */
 export interface WSMessage {
-  type: 'subscribe' | 'unsubscribe' | 'operation' | 'presence' | 'ack' | 'error' | 'sync';
+  type:
+    | 'subscribe' | 'unsubscribe' | 'operation' | 'presence' | 'error' | 'sync'
+    | 'connected' | 'subscribed' | 'unsubscribed' | 'heartbeat' | 'sync_hint' | 'resync_required';
   payload: unknown;
 }
 

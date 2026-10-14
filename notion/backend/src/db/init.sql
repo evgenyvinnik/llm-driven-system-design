@@ -111,7 +111,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
--- Operations log for CRDT sync
+-- Operation log: one row per committed block change, ordered per page by seq
 CREATE TABLE IF NOT EXISTS operations (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     page_id UUID REFERENCES pages(id) ON DELETE CASCADE,
@@ -153,6 +153,18 @@ CREATE INDEX IF NOT EXISTS idx_audit_log_user ON audit_log(user_id, timestamp DE
 CREATE INDEX IF NOT EXISTS idx_audit_log_resource ON audit_log(resource_type, resource_id, timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_log_timestamp ON audit_log(timestamp DESC);
 
+-- Per-page position in the operation log. It is incremented in the same
+-- transaction as each block write, so seqs have no gaps and a client that sees
+-- seq N+2 after N knows it missed exactly one operation.
+ALTER TABLE pages ADD COLUMN IF NOT EXISTS last_op_seq BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE operations ADD COLUMN IF NOT EXISTS seq BIGINT;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_operations_page_seq ON operations(page_id, seq);
+
+-- Permission lookups by user, sibling scans for positions
+CREATE INDEX IF NOT EXISTS idx_page_permissions_user ON page_permissions(user_id);
+CREATE INDEX IF NOT EXISTS idx_blocks_siblings ON blocks(page_id, parent_block_id, position);
+CREATE INDEX IF NOT EXISTS idx_pages_parent_position ON pages(parent_id, position);
+
 -- Function to update updated_at timestamp
 CREATE OR REPLACE FUNCTION update_updated_at_column()
 RETURNS TRIGGER AS $$
@@ -163,22 +175,22 @@ END;
 $$ language 'plpgsql';
 
 -- Triggers for updated_at
-CREATE TRIGGER update_users_updated_at BEFORE UPDATE ON users
+CREATE OR REPLACE TRIGGER update_users_updated_at BEFORE UPDATE ON users
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
-CREATE TRIGGER update_workspaces_updated_at BEFORE UPDATE ON workspaces
+CREATE OR REPLACE TRIGGER update_workspaces_updated_at BEFORE UPDATE ON workspaces
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
-CREATE TRIGGER update_pages_updated_at BEFORE UPDATE ON pages
+CREATE OR REPLACE TRIGGER update_pages_updated_at BEFORE UPDATE ON pages
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
-CREATE TRIGGER update_blocks_updated_at BEFORE UPDATE ON blocks
+CREATE OR REPLACE TRIGGER update_blocks_updated_at BEFORE UPDATE ON blocks
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
-CREATE TRIGGER update_database_views_updated_at BEFORE UPDATE ON database_views
+CREATE OR REPLACE TRIGGER update_database_views_updated_at BEFORE UPDATE ON database_views
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
-CREATE TRIGGER update_database_rows_updated_at BEFORE UPDATE ON database_rows
+CREATE OR REPLACE TRIGGER update_database_rows_updated_at BEFORE UPDATE ON database_rows
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
 -- Seed data is in db-seed/seed.sql

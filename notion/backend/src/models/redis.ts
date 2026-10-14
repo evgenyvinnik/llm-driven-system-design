@@ -14,13 +14,9 @@ const redis = new Redis({
   host: process.env.REDIS_HOST || 'localhost',
   port: parseInt(process.env.REDIS_PORT || '6379'),
   maxRetriesPerRequest: 3,
-  retryStrategy: (times) => {
-    if (times > 3) {
-      console.error('Redis connection failed after 3 retries');
-      return null;
-    }
-    return Math.min(times * 200, 2000);
-  },
+  // Keep reconnecting with capped backoff. Returning null after three tries
+  // left the API without sessions or pub/sub until it was restarted.
+  retryStrategy: (times) => Math.min(times * 200, 2000),
 });
 
 redis.on('connect', () => {

@@ -7,7 +7,7 @@ import { wsService } from '@/services/websocket';
 import Sidebar from '@/components/sidebar/Sidebar';
 import BlockEditor from '@/components/editor/BlockEditor';
 import DatabaseView from '@/components/database/DatabaseView';
-import type { Page, DatabaseView as DBView, Presence, WSMessage } from '@/types';
+import type { Page, DatabaseView as DBView, Operation, Presence, WSMessage } from '@/types';
 
 function PageView() {
   const { pageId } = Route.useParams();
@@ -17,8 +17,13 @@ function PageView() {
   const {
     blocks,
     presence,
-    setBlocks,
-    applyRemoteOperation,
+    permission,
+    saveState,
+    loadSnapshot,
+    receiveOperation,
+    receiveSync,
+    requestCatchUp,
+    resync,
     setPresence,
     addPresence,
     removePresence,
@@ -31,17 +36,22 @@ function PageView() {
   const [isLoading, setIsLoading] = useState(true);
   const [activeViewId, setActiveViewId] = useState<string | null>(null);
 
-  // Fetch page data
+  // Load the snapshot, then subscribe from the seq it reflects: the server
+  // replays anything committed in between, so no edit falls through the gap.
   useEffect(() => {
+    let cancelled = false;
+
     async function fetchPage() {
       setIsLoading(true);
       try {
         const data = await pagesApi.get(pageId);
+        if (cancelled) return;
         setPage(data.page);
-        setBlocks(data.blocks);
         setChildPages(data.children);
         setViews(data.views);
         setCurrentPage(data.page);
+        loadSnapshot(pageId, data.blocks, data.seq, data.permission);
+        wsService.subscribePage(pageId, () => useEditorStore.getState().lastSeq);
 
         if (data.views.length > 0) {
           setActiveViewId(data.views[0].id);
@@ -50,39 +60,40 @@ function PageView() {
         console.error('Failed to fetch page:', error);
         navigate({ to: '/' });
       } finally {
-        setIsLoading(false);
+        if (!cancelled) setIsLoading(false);
       }
     }
 
     fetchPage();
-  }, [pageId, navigate, setBlocks, setCurrentPage]);
+    return () => {
+      cancelled = true;
+      wsService.unsubscribePage();
+    };
+  }, [pageId, navigate, loadSnapshot, setCurrentPage]);
 
-  // Subscribe to real-time updates
+  // Real-time messages for the open page
   useEffect(() => {
-    if (!pageId) return;
-
-    wsService.subscribePage(pageId);
-
-    const unsubscribe = wsService.onMessage((message: WSMessage) => {
+    return wsService.onMessage((message: WSMessage) => {
       switch (message.type) {
         case 'subscribed': {
-          const payload = message.payload as { presence: Presence[] };
-          setPresence(payload.presence);
+          const payload = message.payload as { pageId: string; presence: Presence[] };
+          if (payload.pageId === pageId) setPresence(payload.presence);
           break;
         }
-        case 'operation': {
-          const operation = message.payload as {
-            id: string;
-            page_id: string;
-            block_id: string;
-            type: 'insert' | 'update' | 'delete' | 'move';
-            data: Record<string, unknown>;
-            timestamp: number;
-            author_id: string;
-          };
-          applyRemoteOperation(operation);
+        case 'operation':
+          receiveOperation(message.payload as Operation);
+          break;
+        case 'sync': {
+          const payload = message.payload as { pageId: string; operations: Operation[]; headSeq: number };
+          if (payload.pageId === pageId) receiveSync(payload.operations, payload.headSeq);
           break;
         }
+        case 'resync_required':
+          void resync();
+          break;
+        case 'sync_hint':
+          requestCatchUp();
+          break;
         case 'presence': {
           const payload = message.payload as {
             action: 'join' | 'leave' | 'update';
@@ -106,12 +117,7 @@ function PageView() {
         }
       }
     });
-
-    return () => {
-      wsService.unsubscribePage();
-      unsubscribe();
-    };
-  }, [pageId, setPresence, addPresence, removePresence, updatePresencePosition, applyRemoteOperation]);
+  }, [pageId, receiveOperation, receiveSync, requestCatchUp, resync, setPresence, addPresence, removePresence, updatePresencePosition]);
 
   // Fetch workspaces if not loaded
   useEffect(() => {
@@ -166,6 +172,16 @@ function PageView() {
               <h1 className="text-4xl font-bold">{page.title || 'Untitled'}</h1>
             </div>
 
+            {/* Access level and save status */}
+            <div className="flex items-center gap-3 mb-2 text-sm text-notion-text-secondary" aria-live="polite">
+              {permission === 'view' && (
+                <span className="px-2 py-0.5 rounded bg-notion-background-secondary">View only</span>
+              )}
+              {saveState === 'saving' && <span>Saving...</span>}
+              {saveState === 'offline' && <span>Offline - changes will be saved when the connection returns</span>}
+              {saveState === 'error' && <span>Some changes could not be saved</span>}
+            </div>
+
             {/* Presence indicators */}
             {presence.length > 0 && (
               <div className="flex items-center gap-2 mb-4">
@@ -197,6 +213,7 @@ function PageView() {
               pageId={page.id}
               blocks={blocks}
               childPages={childPages}
+              readOnly={permission === 'view'}
             />
           )}
         </div>

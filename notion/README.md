@@ -96,7 +96,8 @@ export REDIS_PORT=6379
 # Create database and run init.sql
 psql -U postgres -c "CREATE USER notion WITH PASSWORD 'notion_password';"
 psql -U postgres -c "CREATE DATABASE notion_db OWNER notion;"
-psql -U notion -d notion_db -f backend/init.sql
+psql -U notion -d notion_db -f backend/src/db/init.sql   # re-runnable
+psql -U notion -d notion_db -f backend/db-seed/seed.sql
 
 # Install and run
 cd backend && npm install && npm run dev
@@ -113,6 +114,7 @@ cd frontend && npm install && npm run dev
 
 - **Email:** admin@notion.local
 - **Password:** password123
+- **Guest:** guest@notion.local / password123 (a workspace guest with view access to "Getting Started" only, to see permission inheritance)
 
 ## Project Structure
 
@@ -120,7 +122,7 @@ cd frontend && npm install && npm run dev
 notion/
 ├── docker-compose.yml       # PostgreSQL + Redis containers
 ├── backend/
-│   ├── init.sql             # Database schema and seed data
+│   ├── db-seed/seed.sql     # Sample data (admin, guest, pages, blocks, Tasks database)
 │   ├── src/
 │   │   ├── index.ts         # Express + WebSocket server
 │   │   ├── routes/          # API endpoints
@@ -129,8 +131,12 @@ notion/
 │   │   │   ├── pages.ts
 │   │   │   ├── blocks.ts
 │   │   │   └── databases.ts
+│   │   ├── db/init.sql      # Database schema (re-runnable)
 │   │   ├── services/
-│   │   │   └── websocket.ts # Real-time sync
+│   │   │   ├── pageOperations.ts # Block write path: page lock, version check, op log with seq
+│   │   │   ├── permissions.ts    # Permission inheritance down the page tree, sharing
+│   │   │   ├── realtime.ts       # Redis pub/sub fan-out across instances
+│   │   │   └── websocket.ts      # Subscribe with sinceSeq, replay, presence, heartbeats
 │   │   ├── middleware/
 │   │   │   └── auth.ts
 │   │   ├── models/
@@ -203,7 +209,16 @@ notion/
 - `PATCH /api/blocks/:id` - Update block
 - `DELETE /api/blocks/:id` - Delete block
 - `POST /api/blocks/:id/move` - Move block
-- `POST /api/blocks/batch` - Batch operations
+- `POST /api/blocks/batch` - Several operations on one page in one transaction
+
+Block writes accept `expected_version` (or `If-Match`) and answer `409` with the current block
+when someone else saved first. `POST /api/blocks` accepts a client-chosen `id`; retrying the
+same create returns the existing block with `200`.
+
+### Sharing
+- `GET /api/pages/:id/permissions` - Grants that apply to the page (direct or inherited)
+- `PUT /api/pages/:id/permissions` - `{email, permission: view | edit | full_access}`; adds unknown users as workspace guests
+- `DELETE /api/pages/:id/permissions/:userId` - Remove a direct grant
 
 ### Databases
 - `GET /api/databases/:id` - Get database with rows
@@ -237,19 +252,24 @@ notion/
 
 ## WebSocket Events
 
+Edits are saved over REST; the socket only delivers committed operations. Every block
+operation on a page gets the next per-page sequence number (`seq`), so a client can detect a
+missed message and ask for a replay.
+
 ### Client to Server
-- `subscribe` - Subscribe to page updates
-- `unsubscribe` - Unsubscribe from page
-- `operation` - Send block operation
-- `presence` - Update cursor position
-- `sync` - Request sync from timestamp
+- `subscribe {pageId, sinceSeq}` - Subscribe to a page and replay operations after `sinceSeq`
+- `unsubscribe` - Unsubscribe from the page
+- `sync {pageId, sinceSeq}` - Replay operations after `sinceSeq` (sent when a gap is detected)
+- `presence {cursor_position}` - Update cursor position
 
 ### Server to Client
 - `connected` - Connection established
-- `subscribed` - Subscribed to page with presence
-- `operation` - Broadcast block operation
-- `presence` - User presence update
-- `ack` - Operation acknowledged
+- `subscribed {headSeq, permission, presence}` - Subscribed to the page
+- `operation {seq, op_id, type, block_id, block}` - A committed block operation
+- `sync {operations, headSeq}` / `resync_required` - Replay, or "reload the page snapshot"
+- `sync_hint` - The server's Redis subscriber reconnected; check for missed operations
+- `presence` - User joined, left or moved their cursor
+- `heartbeat` - Sent every 30 seconds (the server also pings; dead sockets are dropped)
 
 ## Development
 
@@ -266,12 +286,24 @@ npm run dev:server2  # Port 3002
 npm run dev:server3  # Port 3003
 ```
 
+Instances share edits and presence through Redis pub/sub (`page:{id}` channels), so two
+browsers connected to different instances see each other's changes.
+
+### Tests
+
+```bash
+cd backend
+npm test   # vitest: fractional keys, HLC packing, permission resolution (offline, no services needed)
+```
+
 ### Environment Variables
 
 Backend:
 - `PORT` - Server port (default: 3001)
 - `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, `DB_NAME` - PostgreSQL config
-- `REDIS_HOST`, `REDIS_PORT` - Redis config
+- `REDIS_HOST`, `REDIS_PORT` - Redis config (sessions, presence, and pub/sub fan-out between instances)
+- `RABBITMQ_URL` - RabbitMQ connection (default `amqp://notion:notion_local@localhost:5672`); the API runs without it
+- `LOG_LEVEL` - Pino log level (default `info`)
 - `FRONTEND_URL` - CORS origin (default: http://localhost:5173)
 
 ## Architecture

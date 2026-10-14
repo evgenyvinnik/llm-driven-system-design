@@ -123,31 +123,36 @@ export function compareHLC(a: HLC, b: HLC): number {
   return a.nodeId.localeCompare(b.nodeId);
 }
 
+/** Bits reserved for the logical counter when an HLC is packed into a BIGINT. */
+const COUNTER_BITS = 16n;
+const COUNTER_MASK = (1n << COUNTER_BITS) - 1n;
+
 /**
- * Converts an HLC to a single sortable number for database storage.
- * Combines timestamp and counter; works as long as counter < 999999.
+ * Packs an HLC into a sortable BIGINT: physical milliseconds in the high bits,
+ * the logical counter in the low 16 bits. Returned as a decimal string because
+ * milliseconds * 2^16 is far beyond Number.MAX_SAFE_INTEGER; the previous
+ * `timestamp * 1e6 + counter` encoding silently rounded the counter away.
  *
- * @param hlc - The HLC timestamp to convert
- * @returns A sortable numeric representation
+ * @param hlc - The HLC timestamp to encode
+ * @returns Decimal string suitable for a BIGINT column
  */
-export function hlcToNumber(hlc: HLC): number {
-  // Combine timestamp and counter into a single number
-  // This works as long as counter doesn't exceed 999999
-  return hlc.timestamp * 1000000 + Math.min(hlc.counter, 999999);
+export function encodeHLC(hlc: HLC): string {
+  const counter = BigInt(Math.min(Math.max(hlc.counter, 0), Number(COUNTER_MASK)));
+  return ((BigInt(hlc.timestamp) << COUNTER_BITS) | counter).toString();
 }
 
 /**
- * Reconstructs an HLC from a numeric representation.
- * Note: The nodeId is lost during numeric conversion.
+ * Reverses encodeHLC. The nodeId is not stored in the packed form.
  *
- * @param num - The numeric HLC representation
- * @param nodeId - Optional nodeId to assign (defaults to empty string)
- * @returns An HLC timestamp (approximate, without original nodeId)
+ * @param value - Packed HLC as returned by encodeHLC (or read from PostgreSQL)
+ * @param nodeId - Optional nodeId to assign
+ * @returns The decoded HLC
  */
-export function numberToHLC(num: number, nodeId: string = ''): HLC {
+export function decodeHLC(value: string | number | bigint, nodeId: string = ''): HLC {
+  const packed = BigInt(value);
   return {
-    timestamp: Math.floor(num / 1000000),
-    counter: num % 1000000,
+    timestamp: Number(packed >> COUNTER_BITS),
+    counter: Number(packed & COUNTER_MASK),
     nodeId,
   };
 }

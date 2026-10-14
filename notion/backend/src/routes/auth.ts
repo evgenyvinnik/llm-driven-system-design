@@ -30,53 +30,53 @@ router.post('/register', async (req: Request, res: Response) => {
       return;
     }
 
-    // Check if email already exists
-    const existingUser = await pool.query(
-      'SELECT id FROM users WHERE email = $1',
-      [email]
-    );
-
-    if (existingUser.rows.length > 0) {
-      res.status(409).json({ error: 'Email already registered' });
-      return;
-    }
-
     // Hash password
     const passwordHash = await bcrypt.hash(password, SALT_ROUNDS);
 
-    // Create user
-    const result = await pool.query<User>(
-      `INSERT INTO users (email, password_hash, name)
-       VALUES ($1, $2, $3)
-       RETURNING id, email, name, avatar_url, role, created_at`,
-      [email, passwordHash, name]
-    );
+    // The user, their workspace, membership and welcome page commit together
+    // (a failure halfway used to leave a user without a workspace). The unique
+    // index on email, not a prior SELECT, decides concurrent registrations.
+    const client = await pool.connect();
+    let user: User;
+    try {
+      await client.query('BEGIN');
+      const result = await client.query<User>(
+        `INSERT INTO users (email, password_hash, name)
+         VALUES ($1, $2, $3)
+         RETURNING id, email, name, avatar_url, role, created_at`,
+        [email, passwordHash, name]
+      );
+      user = result.rows[0];
 
-    const user = result.rows[0];
+      const workspaceResult = await client.query(
+        `INSERT INTO workspaces (name, icon, owner_id)
+         VALUES ($1, $2, $3)
+         RETURNING id`,
+        [`${name}'s Workspace`, '📝', user.id]
+      );
+      const workspaceId = workspaceResult.rows[0].id;
 
-    // Create default workspace for new user
-    const workspaceResult = await pool.query(
-      `INSERT INTO workspaces (name, icon, owner_id)
-       VALUES ($1, $2, $3)
-       RETURNING id`,
-      [`${name}'s Workspace`, '📝', user.id]
-    );
-
-    const workspaceId = workspaceResult.rows[0].id;
-
-    // Add user to workspace
-    await pool.query(
-      `INSERT INTO workspace_members (workspace_id, user_id, role)
-       VALUES ($1, $2, $3)`,
-      [workspaceId, user.id, 'admin']
-    );
-
-    // Create a welcome page
-    await pool.query(
-      `INSERT INTO pages (workspace_id, title, icon, created_by)
-       VALUES ($1, $2, $3, $4)`,
-      [workspaceId, 'Welcome', '👋', user.id]
-    );
+      await client.query(
+        `INSERT INTO workspace_members (workspace_id, user_id, role)
+         VALUES ($1, $2, 'admin')`,
+        [workspaceId, user.id]
+      );
+      await client.query(
+        `INSERT INTO pages (workspace_id, title, icon, position, created_by)
+         VALUES ($1, $2, $3, 'n', $4)`,
+        [workspaceId, 'Welcome', '👋', user.id]
+      );
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      if ((error as { code?: string }).code === '23505') {
+        res.status(409).json({ error: 'Email already registered' });
+        return;
+      }
+      throw error;
+    } finally {
+      client.release();
+    }
 
     // Create session token
     const token = uuidv4();

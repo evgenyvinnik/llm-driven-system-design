@@ -1,156 +1,140 @@
 /**
- * @fileoverview Fractional indexing for ordering blocks and list items.
+ * @fileoverview Fractional indexing for ordering blocks, pages and database rows.
  * Based on: https://www.figma.com/blog/realtime-editing-of-ordered-sequences/
+ * and the midpoint algorithm popularized by rocicorp/fractional-indexing.
  *
- * Fractional indexing allows inserting items between any two existing items
- * without reindexing other elements. This is crucial for real-time collaboration
- * where multiple users may be inserting items simultaneously.
+ * A position is a string over the digits a-z read as a base-26 fraction
+ * ("n" is 0.5, "an" is 0.019...). Byte-wise string order equals numeric order,
+ * so inserting between two siblings is a single-row write that touches nothing
+ * else. Only lowercase ASCII is used, so PostgreSQL collations and JavaScript
+ * string comparison agree on the order.
  *
- * Position strings use lowercase letters (a-z) and are lexicographically sortable.
- * The algorithm generates midpoint positions between existing positions.
+ * Invariant: a generated key never ends in the zero digit "a". "b" and "ba" are
+ * the same fraction but different strings and nothing sorts between them, so a
+ * trailing zero creates a gap that can never be split. Keys written by older
+ * code (and old seed data) may still end in "a"; they are accepted as bounds by
+ * stripping the trailing zeros first. When no key fits (duplicate positions, or
+ * a bound that is all zeros) generateKeyBetween throws PositionError and the
+ * caller rebalances the sibling list.
  */
 
-const ALPHABET = 'abcdefghijklmnopqrstuvwxyz';
-const BASE = ALPHABET.length;
+const DIGITS = 'abcdefghijklmnopqrstuvwxyz';
+const ZERO = DIGITS[0];
+
+/** Keys longer than this make the server rebalance the sibling list. */
+export const MAX_POSITION_LENGTH = 48;
+
+/** Thrown when no key exists between the given bounds. */
+export class PositionError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'PositionError';
+  }
+}
+
+function assertValidKey(key: string): void {
+  if (!/^[a-z]+$/.test(key)) {
+    throw new PositionError(`Invalid position "${key}"`);
+  }
+}
+
+function stripTrailingZeros(key: string): string {
+  let end = key.length;
+  while (end > 0 && key[end - 1] === ZERO) end--;
+  return key.slice(0, end);
+}
 
 /**
- * Generate a position string between two existing positions
- * @param before - The position before (or empty string for start)
- * @param after - The position after (or empty string for end)
- * @returns A new position string that sorts between before and after
+ * Midpoint of two fractions written as digit strings. `a` may be '' (zero) and
+ * `b` null (one). Neither ends in the zero digit, and a < b.
+ */
+function midpoint(a: string, b: string | null): string {
+  if (b !== null) {
+    // Copy the shared prefix ("a" pads the shorter lower bound) and recurse.
+    let n = 0;
+    while ((a[n] ?? ZERO) === b[n]) n++;
+    if (n > 0) return b.slice(0, n) + midpoint(a.slice(n), b.slice(n));
+  }
+
+  const digitA = a ? DIGITS.indexOf(a[0]) : 0;
+  const digitB = b !== null ? DIGITS.indexOf(b[0]) : DIGITS.length;
+
+  if (digitB - digitA > 1) {
+    return DIGITS[Math.round((digitA + digitB) / 2)];
+  }
+
+  // Consecutive first digits: either a shorter key fits ("bz" < "c" < "cn"),
+  // or keep a's first digit and find a midpoint above the rest of a.
+  if (b !== null && b.length > 1) {
+    return b.slice(0, 1);
+  }
+  return DIGITS[digitA] + midpoint(a.slice(1), null);
+}
+
+/**
+ * Returns a key that sorts strictly between `before` and `after`.
+ * A missing bound means "start of list" / "end of list".
+ *
+ * @throws PositionError when no such key exists
+ */
+export function generateKeyBetween(
+  before: string | null | undefined,
+  after: string | null | undefined
+): string {
+  if (before) assertValidKey(before);
+  if (after) assertValidKey(after);
+
+  const lower = before ? stripTrailingZeros(before) : '';
+  if (!after) {
+    return midpoint(lower, null);
+  }
+
+  const upper = stripTrailingZeros(after);
+  if (upper === '') {
+    throw new PositionError(`No position sorts before "${after}"`);
+  }
+  if (lower >= upper) {
+    throw new PositionError(`No position fits between "${before}" and "${after}"`);
+  }
+  return midpoint(lower, upper);
+}
+
+/**
+ * Backwards-compatible wrapper: empty strings mean an open bound.
  */
 export function generatePosition(before: string = '', after: string = ''): string {
-  // Handle edge cases
-  if (!before && !after) {
-    return 'n'; // Middle of alphabet
-  }
-
-  if (!before) {
-    // Insert at the beginning
-    return decrementPosition(after);
-  }
-
-  if (!after) {
-    // Insert at the end
-    return incrementPosition(before);
-  }
-
-  // Insert between two positions
-  return midpoint(before, after);
+  return generateKeyBetween(before || null, after || null);
 }
 
 /**
- * Calculate midpoint between two position strings
+ * Returns `count` evenly spread keys between two bounds, in order. Used to
+ * rebalance a sibling list: halving the interval recursively keeps every key
+ * about log26(count) characters long.
  */
-function midpoint(a: string, b: string): string {
-  // Ensure a < b
-  if (a >= b) {
-    throw new Error(`Cannot find midpoint: ${a} >= ${b}`);
-  }
+export function generateNKeysBetween(
+  before: string | null,
+  after: string | null,
+  count: number
+): string[] {
+  if (count <= 0) return [];
+  const middleIndex = Math.floor(count / 2);
+  const middle = generateKeyBetween(before, after);
+  return [
+    ...generateNKeysBetween(before, middle, middleIndex),
+    middle,
+    ...generateNKeysBetween(middle, after, count - middleIndex - 1),
+  ];
+}
 
-  // Pad to same length
-  const maxLen = Math.max(a.length, b.length);
-  const paddedA = a.padEnd(maxLen, 'a');
-  const paddedB = b.padEnd(maxLen, 'z');
-
-  // Find midpoint character by character
-  let result = '';
-  let carry = 0;
-
-  for (let i = 0; i < maxLen; i++) {
-    const charA = ALPHABET.indexOf(paddedA[i]) + carry;
-    const charB = ALPHABET.indexOf(paddedB[i]);
-
-    if (charA < charB) {
-      const mid = Math.floor((charA + charB) / 2);
-      result += ALPHABET[mid];
-
-      if (result > a && result < b) {
-        return result;
-      }
-
-      // Need more precision
-      carry = (charA + charB) % 2 * BASE;
-    } else {
-      result += paddedA[i];
-    }
-  }
-
-  // If we get here, we need to append a character
-  result += 'n';
-  return result;
+/** True when a key has grown long enough that its siblings should be rebalanced. */
+export function isPositionTooLong(key: string): boolean {
+  return key.length > MAX_POSITION_LENGTH;
 }
 
 /**
- * Increment a position (for inserting after)
- */
-function incrementPosition(pos: string): string {
-  if (!pos) return 'n';
-
-  const chars = pos.split('');
-  let i = chars.length - 1;
-
-  while (i >= 0) {
-    const charIndex = ALPHABET.indexOf(chars[i]);
-    if (charIndex < BASE - 1) {
-      chars[i] = ALPHABET[charIndex + 1];
-      return chars.join('');
-    }
-    chars[i] = 'a';
-    i--;
-  }
-
-  // All characters were 'z', prepend 'a' and append
-  return pos + 'n';
-}
-
-/**
- * Decrement a position (for inserting before)
- */
-function decrementPosition(pos: string): string {
-  if (!pos) return 'n';
-
-  const chars = pos.split('');
-  let i = chars.length - 1;
-
-  while (i >= 0) {
-    const charIndex = ALPHABET.indexOf(chars[i]);
-    if (charIndex > 0) {
-      chars[i] = ALPHABET[charIndex - 1];
-      return chars.join('');
-    }
-    chars[i] = 'z';
-    i--;
-  }
-
-  // All characters were 'a', this shouldn't happen often
-  return 'a' + pos.slice(0, -1) + 'n';
-}
-
-/**
- * Generate multiple positions for bulk insert
- * @param before - Position before first item
- * @param after - Position after last item
- * @param count - Number of positions to generate
- */
-export function generatePositions(before: string, after: string, count: number): string[] {
-  const positions: string[] = [];
-  let current = before;
-
-  for (let i = 0; i < count; i++) {
-    const isLast = i === count - 1;
-    const next = isLast ? after : '';
-    current = generatePosition(current, next);
-    positions.push(current);
-  }
-
-  return positions;
-}
-
-/**
- * Compare two position strings
+ * Byte-wise comparison (not localeCompare), matching ORDER BY position.
  * @returns negative if a < b, 0 if equal, positive if a > b
  */
 export function comparePositions(a: string, b: string): number {
-  return a.localeCompare(b);
+  return a < b ? -1 : a > b ? 1 : 0;
 }

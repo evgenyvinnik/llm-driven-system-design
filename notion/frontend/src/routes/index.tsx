@@ -36,7 +36,7 @@ function IndexPage() {
             Select a page from the sidebar to get started, or create a new page.
           </p>
 
-          {pages.filter((p) => !p.parent_id).length === 0 ? (
+          {pages.filter((p) => !p.parent_id || !pages.some((q) => q.id === p.parent_id)).length === 0 ? (
             <div className="text-center py-12 bg-notion-background-secondary rounded-lg">
               <p className="text-notion-text-secondary mb-4">No pages yet</p>
               <p className="text-sm text-notion-text-secondary">
@@ -46,7 +46,7 @@ function IndexPage() {
           ) : (
             <div className="grid gap-4">
               {pages
-                .filter((p) => !p.parent_id)
+                .filter((p) => !p.parent_id || !pages.some((q) => q.id === p.parent_id))
                 .map((page) => (
                   <a
                     key={page.id}

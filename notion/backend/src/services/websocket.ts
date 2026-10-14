@@ -1,258 +1,302 @@
 /**
  * @fileoverview WebSocket server for real-time collaboration.
- * Handles page subscriptions, operation broadcasting, and presence tracking.
- * Uses Hybrid Logical Clocks (HLC) for causal ordering of operations.
+ *
+ * The socket delivers committed changes; it is not a write path. Edits go
+ * through the REST API, which applies them, assigns a per-page sequence number
+ * and publishes them on Redis (services/pageOperations.ts). This module:
+ *  - authenticates the socket and checks view permission on subscribe,
+ *  - forwards page events from Redis pub/sub to its local subscribers, so
+ *    clients on different API instances see each other,
+ *  - replays missed operations from the log when a client (re)subscribes or
+ *    asks to sync from the last seq it applied,
+ *  - tracks presence (who is viewing, cursor block) in Redis, and
+ *  - pings every 30 seconds and drops sockets that stop answering, instead of
+ *    disconnecting readers who simply have not typed for a minute.
  */
 
 import { WebSocketServer, WebSocket } from 'ws';
-import { Server } from 'http';
+import type { Server, IncomingMessage } from 'http';
 import { v4 as uuidv4 } from 'uuid';
 import { getSession, setPresence, getPresence, removePresence } from '../models/redis.js';
 import pool from '../models/db.js';
-import type { WSMessage, Presence, Operation } from '../types/index.js';
-import { generateHLC, hlcToNumber, initHLC } from '../utils/hlc.js';
+import type { WSMessage, Presence } from '../types/index.js';
+import { getPageAccess, hasPermission, isUuid } from './permissions.js';
+import { readOperationsSince } from './pageOperations.js';
+import {
+  startRealtime,
+  stopRealtime,
+  subscribePage,
+  unsubscribePage,
+  publishPageEvent,
+  type PageEvent,
+} from './realtime.js';
+import { wsConnectionsGauge, wsMessagesCounter } from '../shared/metrics.js';
+import { logger } from '../shared/logger.js';
 
-/** Unique identifier for this server instance (used in HLC) */
-const serverId = uuidv4().slice(0, 8);
-initHLC(serverId);
+const SERVER_ID = process.env.SERVER_ID || `server-${process.env.PORT || 3000}`;
 
-/**
- * Represents an authenticated WebSocket connection.
- * Tracks user identity, current page subscription, and activity timestamp.
- */
+/** Ping interval; a socket that misses one full interval is terminated. */
+const HEARTBEAT_INTERVAL_MS = 30_000;
+
+/** Largest gap replayed from the log; beyond it the client reloads the page. */
+const MAX_REPLAY_OPERATIONS = 1000;
+
+/** An authenticated WebSocket connection and the page it is viewing. */
 interface ClientConnection {
   ws: WebSocket;
   userId: string;
   userName: string;
   pageId: string | null;
-  lastSeen: number;
+  isAlive: boolean;
 }
 
-/** Map of client ID to connection data */
+/** Map of client ID to connection data (this instance only) */
 const clients = new Map<string, ClientConnection>();
 
-/** Map of page ID to set of subscribed client IDs */
+/** Map of page ID to the local client IDs subscribed to it */
 const pageSubscriptions = new Map<string, Set<string>>();
+
+let wss: WebSocketServer | null = null;
+let heartbeatTimer: NodeJS.Timeout | null = null;
+
+function send(conn: ClientConnection, message: WSMessage): void {
+  if (conn.ws.readyState === WebSocket.OPEN) {
+    conn.ws.send(JSON.stringify(message));
+    wsMessagesCounter.inc({ direction: 'outbound', type: message.type });
+  }
+}
+
+/**
+ * Sends a message to the subscribers of a page connected to THIS instance.
+ * Cross-instance delivery happens one level up, through Redis pub/sub.
+ */
+function broadcastLocal(pageId: string, message: WSMessage, excludeClientId?: string): void {
+  const subscribers = pageSubscriptions.get(pageId);
+  if (!subscribers) return;
+  for (const clientId of subscribers) {
+    if (clientId === excludeClientId) continue;
+    const conn = clients.get(clientId);
+    if (conn) send(conn, message);
+  }
+}
+
+/** Delivers an event received from Redis to the local subscribers of its page. */
+function deliverPageEvent(event: PageEvent): void {
+  broadcastLocal(event.pageId, { type: event.type, payload: event.payload }, event.originClientId);
+}
+
+/**
+ * Resolves the session token from the upgrade request into a user.
+ */
+async function authenticate(req: IncomingMessage): Promise<{ id: string; name: string } | null> {
+  const url = new URL(req.url || '', `http://${req.headers.host}`);
+  const token = url.searchParams.get('token');
+  if (!token) return null;
+  const userId = await getSession(token);
+  if (!userId) return null;
+  const result = await pool.query<{ id: string; name: string }>(
+    'SELECT id, name FROM users WHERE id = $1',
+    [userId]
+  );
+  return result.rows[0] ?? null;
+}
 
 /**
  * Sets up the WebSocket server on an existing HTTP server.
- * Handles authentication, message routing, and connection lifecycle.
  *
  * @param server - The HTTP server to attach WebSocket to
  * @returns The configured WebSocketServer instance
  */
 export function setupWebSocket(server: Server): WebSocketServer {
-  const wss = new WebSocketServer({ server, path: '/ws' });
+  wss = new WebSocketServer({ server, path: '/ws' });
 
-  wss.on('connection', async (ws, req) => {
+  // After the Redis subscriber reconnects, events may have been missed:
+  // tell every local client to sync from its last applied seq.
+  startRealtime(deliverPageEvent, () => {
+    for (const pageId of pageSubscriptions.keys()) {
+      broadcastLocal(pageId, { type: 'sync_hint', payload: { pageId } });
+    }
+  });
+
+  wss.on('connection', (ws, req) => {
     const clientId = uuidv4();
-    let connection: ClientConnection | null = null;
 
-    console.log(`WebSocket client connected: ${clientId}`);
+    // Handlers are attached before authentication finishes so a 'subscribe'
+    // sent right after the socket opens is queued rather than lost. Messages
+    // are processed strictly one at a time per connection.
+    const ready = authenticate(req)
+      .then((user) => {
+        if (!user) {
+          ws.send(JSON.stringify({ type: 'error', payload: { message: 'Invalid session' } }));
+          ws.close(4401, 'Unauthorized');
+          return null;
+        }
+        const conn: ClientConnection = {
+          ws,
+          userId: user.id,
+          userName: user.name,
+          pageId: null,
+          isAlive: true,
+        };
+        clients.set(clientId, conn);
+        wsConnectionsGauge.inc({ server_id: SERVER_ID });
+        send(conn, { type: 'connected', payload: { clientId, userId: user.id, userName: user.name } });
+        return conn;
+      })
+      .catch((error) => {
+        logger.error({ error }, 'WebSocket authentication failed');
+        ws.close(1011, 'Authentication error');
+        return null;
+      });
 
-    // Authenticate from query params or cookies
-    const url = new URL(req.url || '', `http://${req.headers.host}`);
-    const token = url.searchParams.get('token');
-
-    if (!token) {
-      ws.send(JSON.stringify({ type: 'error', payload: { message: 'Authentication required' } }));
-      ws.close();
-      return;
-    }
-
-    // Validate session
-    const userId = await getSession(token);
-    if (!userId) {
-      ws.send(JSON.stringify({ type: 'error', payload: { message: 'Invalid session' } }));
-      ws.close();
-      return;
-    }
-
-    // Get user info
-    const userResult = await pool.query(
-      'SELECT id, name FROM users WHERE id = $1',
-      [userId]
-    );
-
-    if (userResult.rows.length === 0) {
-      ws.send(JSON.stringify({ type: 'error', payload: { message: 'User not found' } }));
-      ws.close();
-      return;
-    }
-
-    const user = userResult.rows[0];
-
-    connection = {
-      ws,
-      userId: user.id,
-      userName: user.name,
-      pageId: null,
-      lastSeen: Date.now(),
-    };
-
-    clients.set(clientId, connection);
-
-    // Send welcome message
-    ws.send(JSON.stringify({
-      type: 'connected',
-      payload: {
-        clientId,
-        userId: user.id,
-        userName: user.name,
-      },
-    }));
-
-    // Handle incoming messages
-    ws.on('message', async (data) => {
-      try {
-        const message: WSMessage = JSON.parse(data.toString());
-        await handleMessage(clientId, message);
-      } catch (error) {
-        console.error('WebSocket message error:', error);
-        ws.send(JSON.stringify({ type: 'error', payload: { message: 'Invalid message format' } }));
-      }
+    let queue: Promise<void> = Promise.resolve();
+    ws.on('message', (data) => {
+      queue = queue
+        .then(async () => {
+          const conn = await ready;
+          if (!conn || !clients.has(clientId)) return;
+          conn.isAlive = true;
+          let message: WSMessage;
+          try {
+            message = JSON.parse(data.toString()) as WSMessage;
+          } catch {
+            send(conn, { type: 'error', payload: { message: 'Invalid message format' } });
+            return;
+          }
+          wsMessagesCounter.inc({ direction: 'inbound', type: String(message.type) });
+          await handleMessage(clientId, conn, message);
+        })
+        .catch((error) => {
+          logger.error({ error, clientId }, 'WebSocket message handling failed');
+        });
     });
 
-    // Handle disconnect
-    ws.on('close', async () => {
-      console.log(`WebSocket client disconnected: ${clientId}`);
-
+    ws.on('pong', () => {
       const conn = clients.get(clientId);
-      if (conn?.pageId) {
-        // Remove from page subscription
-        const subscribers = pageSubscriptions.get(conn.pageId);
-        if (subscribers) {
-          subscribers.delete(clientId);
-          if (subscribers.size === 0) {
-            pageSubscriptions.delete(conn.pageId);
-          }
-        }
+      if (conn) conn.isAlive = true;
+    });
 
-        // Remove presence
-        await removePresence(conn.pageId, conn.userId);
-
-        // Notify others
-        broadcastToPage(conn.pageId, {
-          type: 'presence',
-          payload: {
-            action: 'leave',
-            userId: conn.userId,
-            userName: conn.userName,
-          },
-        }, clientId);
-      }
-
-      clients.delete(clientId);
+    ws.on('close', () => {
+      void cleanupConnection(clientId);
     });
 
     ws.on('error', (error) => {
-      console.error(`WebSocket error for ${clientId}:`, error);
+      logger.warn({ error: error.message, clientId }, 'WebSocket error');
     });
   });
 
-  // Periodic cleanup of stale connections
-  setInterval(() => {
-    const now = Date.now();
+  heartbeatTimer = setInterval(() => {
     for (const [clientId, conn] of clients) {
-      if (now - conn.lastSeen > 60000) { // 1 minute timeout
-        console.log(`Cleaning up stale connection: ${clientId}`);
-        conn.ws.close();
-        clients.delete(clientId);
+      if (!conn.isAlive) {
+        logger.info({ clientId }, 'Terminating unresponsive WebSocket');
+        conn.ws.terminate();
+        void cleanupConnection(clientId);
+        continue;
       }
+      conn.isAlive = false;
+      conn.ws.ping();
+      // An application-level heartbeat lets the browser detect a dead server.
+      send(conn, { type: 'heartbeat', payload: { at: Date.now() } });
     }
-  }, 30000);
+  }, HEARTBEAT_INTERVAL_MS);
 
   return wss;
 }
 
 /**
- * Routes incoming WebSocket messages to appropriate handlers.
- * Updates the connection's lastSeen timestamp for timeout tracking.
- *
- * @param clientId - The unique client connection ID
- * @param message - The parsed WebSocket message
+ * Closes every socket with "going away" so clients reconnect elsewhere, stops
+ * the heartbeat and the Redis subscriber. Called during graceful shutdown.
  */
-async function handleMessage(clientId: string, message: WSMessage): Promise<void> {
+export async function closeWebSocket(): Promise<void> {
+  if (heartbeatTimer) clearInterval(heartbeatTimer);
+  heartbeatTimer = null;
+  for (const conn of clients.values()) {
+    conn.ws.close(1001, 'Server shutting down');
+  }
+  await new Promise<void>((resolve) => (wss ? wss.close(() => resolve()) : resolve()));
+  await stopRealtime();
+}
+
+/** Removes a connection exactly once, whichever of close/heartbeat sees it first. */
+async function cleanupConnection(clientId: string): Promise<void> {
   const conn = clients.get(clientId);
   if (!conn) return;
+  clients.delete(clientId);
+  wsConnectionsGauge.dec({ server_id: SERVER_ID });
+  if (conn.pageId) {
+    await leavePage(clientId, conn).catch((error) =>
+      logger.warn({ error, clientId }, 'Failed to clean up page subscription')
+    );
+  }
+}
 
-  conn.lastSeen = Date.now();
-
+async function handleMessage(clientId: string, conn: ClientConnection, message: WSMessage): Promise<void> {
   switch (message.type) {
     case 'subscribe':
-      await handleSubscribe(clientId, message.payload as { pageId: string });
+      await handleSubscribe(clientId, conn, message.payload as { pageId?: unknown; sinceSeq?: unknown });
       break;
-
     case 'unsubscribe':
-      await handleUnsubscribe(clientId);
+      if (conn.pageId) {
+        const pageId = conn.pageId;
+        await leavePage(clientId, conn);
+        send(conn, { type: 'unsubscribed', payload: { pageId } });
+      }
       break;
-
-    case 'operation':
-      await handleOperation(clientId, message.payload as Operation);
-      break;
-
-    case 'presence':
-      await handlePresenceUpdate(clientId, message.payload as Partial<Presence>);
-      break;
-
     case 'sync':
-      await handleSync(clientId, message.payload as { since: number });
+      await handleSync(conn, message.payload as { pageId?: unknown; sinceSeq?: unknown });
       break;
-
+    case 'presence':
+      await handlePresenceUpdate(clientId, conn, message.payload as Partial<Presence>);
+      break;
+    case 'operation':
+      send(conn, {
+        type: 'error',
+        payload: { message: 'Edits are saved through the REST API; this socket only delivers committed operations' },
+      });
+      break;
     default:
-      conn.ws.send(JSON.stringify({ type: 'error', payload: { message: 'Unknown message type' } }));
+      send(conn, { type: 'error', payload: { message: 'Unknown message type' } });
   }
 }
 
 /**
- * Subscribes a client to real-time updates for a page.
- * Verifies access permissions and broadcasts presence to other viewers.
- *
- * @param clientId - The client connection ID
- * @param payload - Contains the pageId to subscribe to
+ * Subscribes the connection to a page. When `sinceSeq` is given (the seq of
+ * the snapshot the client loaded, or the last operation it applied), the
+ * missed operations are replayed from the log right after subscribing.
  */
-async function handleSubscribe(clientId: string, payload: { pageId: string }): Promise<void> {
-  const conn = clients.get(clientId);
-  if (!conn) return;
-
-  const { pageId } = payload;
-
-  // Verify page access
-  const pageResult = await pool.query(
-    'SELECT workspace_id FROM pages WHERE id = $1',
-    [pageId]
-  );
-
-  if (pageResult.rows.length === 0) {
-    conn.ws.send(JSON.stringify({ type: 'error', payload: { message: 'Page not found' } }));
+async function handleSubscribe(
+  clientId: string,
+  conn: ClientConnection,
+  payload: { pageId?: unknown; sinceSeq?: unknown }
+): Promise<void> {
+  const pageId = payload?.pageId;
+  if (!isUuid(pageId)) {
+    send(conn, { type: 'error', payload: { message: 'Page not found' } });
     return;
   }
 
-  const memberCheck = await pool.query(
-    `SELECT role FROM workspace_members
-     WHERE workspace_id = $1 AND user_id = $2`,
-    [pageResult.rows[0].workspace_id, conn.userId]
-  );
-
-  if (memberCheck.rows.length === 0) {
-    conn.ws.send(JSON.stringify({ type: 'error', payload: { message: 'Access denied' } }));
+  const access = await getPageAccess(conn.userId, pageId);
+  if (!access || !hasPermission(access.permission, 'view')) {
+    send(conn, { type: 'error', payload: { message: 'Access denied', pageId } });
     return;
   }
 
-  // Unsubscribe from previous page
-  if (conn.pageId) {
-    await handleUnsubscribe(clientId);
+  if (conn.pageId && conn.pageId !== pageId) {
+    await leavePage(clientId, conn);
   }
-
-  // Subscribe to new page
   conn.pageId = pageId;
 
-  if (!pageSubscriptions.has(pageId)) {
-    pageSubscriptions.set(pageId, new Set());
+  let subscribers = pageSubscriptions.get(pageId);
+  if (!subscribers) {
+    subscribers = new Set();
+    pageSubscriptions.set(pageId, subscribers);
   }
-  pageSubscriptions.get(pageId)!.add(clientId);
+  subscribers.add(clientId);
+  // Subscribe to Redis BEFORE reading the replay: anything committed after the
+  // replay query arrives live, anything before it is in the replay, and the
+  // client drops duplicates by seq.
+  await subscribePage(pageId);
 
-  // Update presence in Redis
   const presenceData: Presence = {
     user_id: conn.userId,
     user_name: conn.userName,
@@ -260,216 +304,99 @@ async function handleSubscribe(clientId: string, payload: { pageId: string }): P
     last_seen: Date.now(),
   };
   await setPresence(pageId, conn.userId, JSON.stringify(presenceData));
+  const presence = Object.values(await getPresence(pageId)).map((p) => JSON.parse(p) as Presence);
 
-  // Get current presence on page
-  const presence = await getPresence(pageId);
-  const activeUsers = Object.values(presence).map((p) => JSON.parse(p) as Presence);
-
-  // Send subscription confirmation with presence
-  conn.ws.send(JSON.stringify({
+  send(conn, {
     type: 'subscribed',
     payload: {
       pageId,
-      presence: activeUsers,
+      presence,
+      permission: access.permission,
+      headSeq: Number((access.page as { last_op_seq?: string | number }).last_op_seq ?? 0),
     },
-  }));
+  });
 
-  // Notify others of new presence
-  broadcastToPage(pageId, {
+  await publishPageEvent({
     type: 'presence',
-    payload: {
-      action: 'join',
-      userId: conn.userId,
-      userName: conn.userName,
-    },
-  }, clientId);
+    pageId,
+    originClientId: clientId,
+    payload: { action: 'join', userId: conn.userId, userName: conn.userName },
+  });
+
+  if (typeof payload.sinceSeq === 'number' && Number.isFinite(payload.sinceSeq)) {
+    await sendReplay(conn, pageId, payload.sinceSeq);
+  }
 }
 
-/**
- * Unsubscribes a client from the current page.
- * Removes presence data and notifies other viewers.
- *
- * @param clientId - The client connection ID
- */
-async function handleUnsubscribe(clientId: string): Promise<void> {
-  const conn = clients.get(clientId);
-  if (!conn || !conn.pageId) return;
+/** Client noticed a gap (or got a sync_hint) and asks for operations after sinceSeq. */
+async function handleSync(conn: ClientConnection, payload: { pageId?: unknown; sinceSeq?: unknown }): Promise<void> {
+  if (!conn.pageId || payload?.pageId !== conn.pageId) {
+    send(conn, { type: 'error', payload: { message: 'Not subscribed to that page' } });
+    return;
+  }
+  const sinceSeq = typeof payload.sinceSeq === 'number' ? payload.sinceSeq : 0;
+  await sendReplay(conn, conn.pageId, sinceSeq);
+}
 
+async function sendReplay(conn: ClientConnection, pageId: string, sinceSeq: number): Promise<void> {
+  const { ops, headSeq, complete } = await readOperationsSince(pageId, sinceSeq, MAX_REPLAY_OPERATIONS);
+  if (!complete) {
+    send(conn, { type: 'resync_required', payload: { pageId, headSeq } });
+    return;
+  }
+  send(conn, { type: 'sync', payload: { pageId, operations: ops, headSeq } });
+}
+
+async function leavePage(clientId: string, conn: ClientConnection): Promise<void> {
   const pageId = conn.pageId;
+  if (!pageId) return;
+  conn.pageId = null;
 
-  // Remove from subscription
   const subscribers = pageSubscriptions.get(pageId);
   if (subscribers) {
     subscribers.delete(clientId);
     if (subscribers.size === 0) {
       pageSubscriptions.delete(pageId);
+      await unsubscribePage(pageId);
     }
   }
 
-  // Remove presence
   await removePresence(pageId, conn.userId);
-
-  // Notify others
-  broadcastToPage(pageId, {
+  await publishPageEvent({
     type: 'presence',
-    payload: {
-      action: 'leave',
-      userId: conn.userId,
-      userName: conn.userName,
-    },
-  }, clientId);
-
-  conn.pageId = null;
-
-  conn.ws.send(JSON.stringify({
-    type: 'unsubscribed',
-    payload: { pageId },
-  }));
+    pageId,
+    originClientId: clientId,
+    payload: { action: 'leave', userId: conn.userId, userName: conn.userName },
+  });
 }
 
 /**
- * Handles an editing operation from a client.
- * Persists to database with HLC timestamp and broadcasts to other subscribers.
- *
- * @param clientId - The client connection ID
- * @param operation - The block operation (insert, update, delete, move)
+ * Updates a client's cursor position and broadcasts it to the page's viewers
+ * on every instance.
  */
-async function handleOperation(clientId: string, operation: Operation): Promise<void> {
-  const conn = clients.get(clientId);
-  if (!conn || !conn.pageId) {
-    conn?.ws.send(JSON.stringify({ type: 'error', payload: { message: 'Not subscribed to a page' } }));
-    return;
-  }
-
-  // Generate HLC timestamp
-  const hlc = generateHLC();
-  const timestamp = hlcToNumber(hlc);
-
-  // Persist operation
-  try {
-    await pool.query(
-      `INSERT INTO operations (id, page_id, block_id, type, data, timestamp, author_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-      [
-        operation.id || uuidv4(),
-        conn.pageId,
-        operation.block_id,
-        operation.type,
-        JSON.stringify(operation.data),
-        timestamp,
-        conn.userId,
-      ]
-    );
-
-    // Acknowledge to sender
-    conn.ws.send(JSON.stringify({
-      type: 'ack',
-      payload: {
-        operationId: operation.id,
-        timestamp,
-      },
-    }));
-
-    // Broadcast to other subscribers
-    broadcastToPage(conn.pageId, {
-      type: 'operation',
-      payload: {
-        ...operation,
-        timestamp,
-        author_id: conn.userId,
-        author_name: conn.userName,
-      },
-    }, clientId);
-  } catch (error) {
-    console.error('Operation persistence error:', error);
-    conn.ws.send(JSON.stringify({ type: 'error', payload: { message: 'Failed to persist operation' } }));
-  }
-}
-
-/**
- * Updates a client's cursor position and broadcasts to other viewers.
- * Used for showing collaborative cursors in the editor.
- *
- * @param clientId - The client connection ID
- * @param payload - Contains optional cursor position (block_id, offset)
- */
-async function handlePresenceUpdate(clientId: string, payload: Partial<Presence>): Promise<void> {
-  const conn = clients.get(clientId);
-  if (!conn || !conn.pageId) return;
-
-  // Update presence in Redis
+async function handlePresenceUpdate(
+  clientId: string,
+  conn: ClientConnection,
+  payload: Partial<Presence>
+): Promise<void> {
+  if (!conn.pageId) return;
   const presenceData: Presence = {
     user_id: conn.userId,
     user_name: conn.userName,
     page_id: conn.pageId,
-    cursor_position: payload.cursor_position,
+    cursor_position: payload?.cursor_position,
     last_seen: Date.now(),
   };
   await setPresence(conn.pageId, conn.userId, JSON.stringify(presenceData));
-
-  // Broadcast cursor position to others
-  broadcastToPage(conn.pageId, {
+  await publishPageEvent({
     type: 'presence',
+    pageId: conn.pageId,
+    originClientId: clientId,
     payload: {
       action: 'update',
       userId: conn.userId,
       userName: conn.userName,
-      cursor_position: payload.cursor_position,
+      cursor_position: payload?.cursor_position,
     },
-  }, clientId);
-}
-
-/**
- * Handles a sync request from a client returning to a page.
- * Returns all operations since the given timestamp for catching up.
- *
- * @param clientId - The client connection ID
- * @param payload - Contains the timestamp to sync from
- */
-async function handleSync(clientId: string, payload: { since: number }): Promise<void> {
-  const conn = clients.get(clientId);
-  if (!conn || !conn.pageId) {
-    conn?.ws.send(JSON.stringify({ type: 'error', payload: { message: 'Not subscribed to a page' } }));
-    return;
-  }
-
-  // Get operations since timestamp
-  const result = await pool.query(
-    `SELECT * FROM operations
-     WHERE page_id = $1 AND timestamp > $2
-     ORDER BY timestamp`,
-    [conn.pageId, payload.since]
-  );
-
-  conn.ws.send(JSON.stringify({
-    type: 'sync',
-    payload: {
-      operations: result.rows,
-      timestamp: Date.now(),
-    },
-  }));
-}
-
-/**
- * Broadcasts a message to all clients subscribed to a page.
- * Optionally excludes a specific client (e.g., the sender).
- *
- * @param pageId - The page to broadcast to
- * @param message - The message object to send
- * @param excludeClientId - Optional client ID to exclude from broadcast
- */
-function broadcastToPage(pageId: string, message: WSMessage, excludeClientId?: string): void {
-  const subscribers = pageSubscriptions.get(pageId);
-  if (!subscribers) return;
-
-  const messageStr = JSON.stringify(message);
-
-  for (const clientId of subscribers) {
-    if (clientId === excludeClientId) continue;
-
-    const conn = clients.get(clientId);
-    if (conn && conn.ws.readyState === WebSocket.OPEN) {
-      conn.ws.send(messageStr);
-    }
-  }
+  });
 }

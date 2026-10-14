@@ -71,6 +71,9 @@ export interface Block {
  * A page within a workspace.
  * Can contain blocks or act as a database with structured data.
  */
+/** Effective permission on a page (nearest grant, else workspace role). */
+export type PermissionLevel = 'none' | 'view' | 'edit' | 'full_access';
+
 export interface Page {
   id: string;
   workspace_id: string;
@@ -82,6 +85,8 @@ export interface Page {
   properties_schema: PropertySchema[];
   position: string;
   is_archived: boolean;
+  /** Present on list responses: the caller's effective permission. */
+  permission?: PermissionLevel;
   created_by: string | null;
   created_at: string;
   updated_at: string;
@@ -229,11 +234,16 @@ export interface WSMessage {
  * A single editing operation for real-time sync.
  */
 export interface Operation {
-  id: string;
+  op_id: string;
   page_id: string;
+  /** Position in the page's operation log; consecutive, no gaps. */
+  seq: number;
   block_id: string;
   type: 'insert' | 'update' | 'delete' | 'move';
-  data: Record<string, unknown>;
-  timestamp: number;
+  /** Block row after the change; null for a delete. */
+  block: Block | null;
   author_id: string | null;
+  /** Packed hybrid logical clock, as a decimal string. */
+  timestamp: string;
+  created_at: string;
 }

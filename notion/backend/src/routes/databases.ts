@@ -2,18 +2,41 @@
  * @fileoverview Database feature routes for structured data management.
  * Databases are special pages with a properties schema and multiple views
  * (table, board, list). This module handles rows, views, and schema updates.
+ * Access follows the database page's effective permission: view to read,
+ * edit to change rows, views or the schema.
  */
 
 import { Router, Request, Response } from 'express';
 import pool from '../models/db.js';
 import { authMiddleware } from '../middleware/auth.js';
-import { generatePosition } from '../utils/fractionalIndex.js';
-import type { DatabaseView, DatabaseRow, Page, PropertySchema } from '../types/index.js';
+import { generateKeyBetween, PositionError } from '../utils/fractionalIndex.js';
+import type { DatabaseView, DatabaseRow, PropertySchema } from '../types/index.js';
+import { invalidatePageCache } from '../shared/cache.js';
+import { isUuid, requirePageAccess, type GrantLevel, type PageAccess } from '../services/permissions.js';
+import { sendError } from '../utils/httpError.js';
 
 const router = Router();
 
 // Apply authentication to all database routes
 router.use(authMiddleware);
+
+/**
+ * Checks permission on the database page and that it really is a database.
+ * Sends the error response itself and returns null on failure.
+ */
+async function requireDatabase(
+  req: Request,
+  res: Response,
+  needed: GrantLevel
+): Promise<PageAccess | null> {
+  const access = await requirePageAccess(req, res, req.params.id, needed);
+  if (!access) return null;
+  if (!access.page.is_database) {
+    res.status(404).json({ error: 'Database not found' });
+    return null;
+  }
+  return access;
+}
 
 /**
  * GET /api/databases/:id
@@ -22,60 +45,26 @@ router.use(authMiddleware);
  */
 router.get('/:id', async (req: Request, res: Response) => {
   try {
+    const access = await requireDatabase(req, res, 'view');
+    if (!access) return;
     const { id } = req.params;
     const { view_id } = req.query;
 
-    // Get database page
-    const pageResult = await pool.query<Page>(
-      'SELECT * FROM pages WHERE id = $1 AND is_database = true',
-      [id]
-    );
-
-    if (pageResult.rows.length === 0) {
-      res.status(404).json({ error: 'Database not found' });
-      return;
-    }
-
-    const database = pageResult.rows[0];
-
-    // Check workspace membership
-    const memberCheck = await pool.query(
-      `SELECT role FROM workspace_members
-       WHERE workspace_id = $1 AND user_id = $2`,
-      [database.workspace_id, req.user!.id]
-    );
-
-    if (memberCheck.rows.length === 0) {
-      res.status(403).json({ error: 'Not a member of this workspace' });
-      return;
-    }
-
-    // Get views
     const viewsResult = await pool.query<DatabaseView>(
-      'SELECT * FROM database_views WHERE page_id = $1 ORDER BY position',
+      'SELECT * FROM database_views WHERE page_id = $1 ORDER BY position, id',
       [id]
     );
 
-    // Get rows
-    let rowsQuery = `
-      SELECT * FROM database_rows
-      WHERE database_id = $1 AND is_archived = false
-    `;
-    const rowsParams: unknown[] = [id];
+    const rowsResult = await pool.query<DatabaseRow>(
+      `SELECT * FROM database_rows
+       WHERE database_id = $1 AND is_archived = false
+       ORDER BY position, id`,
+      [id]
+    );
 
-    // Apply view filters and sorts if specified
     const activeView = view_id
       ? viewsResult.rows.find((v) => v.id === view_id)
       : viewsResult.rows[0];
-
-    if (activeView?.sort && activeView.sort.length > 0) {
-      // For now, we'll sort in memory since JSONB sorting is complex
-      // In production, you'd use proper JSONB operators
-    }
-
-    rowsQuery += ' ORDER BY position';
-
-    const rowsResult = await pool.query<DatabaseRow>(rowsQuery, rowsParams);
 
     // Apply filters in memory (in production, use database-level filtering)
     let rows = rowsResult.rows;
@@ -117,106 +106,59 @@ router.get('/:id', async (req: Request, res: Response) => {
     }
 
     res.json({
-      database,
+      database: access.page,
       views: viewsResult.rows,
       rows,
       activeViewId: activeView?.id,
+      permission: access.permission,
     });
   } catch (error) {
-    console.error('Get database error:', error);
-    res.status(500).json({ error: 'Failed to get database' });
+    sendError(res, error, 'Failed to get database');
   }
 });
 
 /**
  * POST /api/databases/:id/rows
- * Creates a new row in the database with default property values.
- * Position is calculated using fractional indexing.
+ * Creates a new row with default property values, after `after_row_id` or at
+ * the end.
  */
 router.post('/:id/rows', async (req: Request, res: Response) => {
   try {
+    const access = await requireDatabase(req, res, 'edit');
+    if (!access) return;
     const { id } = req.params;
-    const { properties, after_row_id } = req.body;
+    const { properties, after_row_id } = req.body ?? {};
 
-    // Get database page
-    const pageResult = await pool.query<Page>(
-      'SELECT * FROM pages WHERE id = $1 AND is_database = true',
+    const siblings = await pool.query<{ id: string; position: string }>(
+      'SELECT id, position FROM database_rows WHERE database_id = $1 ORDER BY position, id',
       [id]
     );
-
-    if (pageResult.rows.length === 0) {
-      res.status(404).json({ error: 'Database not found' });
-      return;
-    }
-
-    const database = pageResult.rows[0];
-
-    // Check workspace membership
-    const memberCheck = await pool.query(
-      `SELECT role FROM workspace_members
-       WHERE workspace_id = $1 AND user_id = $2`,
-      [database.workspace_id, req.user!.id]
-    );
-
-    if (memberCheck.rows.length === 0) {
-      res.status(403).json({ error: 'Not a member of this workspace' });
-      return;
-    }
-
-    // Calculate position
-    let position = 'n';
-    if (after_row_id) {
-      const afterRow = await pool.query<DatabaseRow>(
-        'SELECT position FROM database_rows WHERE id = $1',
-        [after_row_id]
-      );
-
-      if (afterRow.rows.length > 0) {
-        const nextRow = await pool.query<DatabaseRow>(
-          `SELECT position FROM database_rows
-           WHERE database_id = $1 AND position > $2
-           ORDER BY position LIMIT 1`,
-          [id, afterRow.rows[0].position]
-        );
-
-        position = generatePosition(
-          afterRow.rows[0].position,
-          nextRow.rows[0]?.position || ''
-        );
-      }
-    } else {
-      const lastRow = await pool.query<DatabaseRow>(
-        `SELECT position FROM database_rows
-         WHERE database_id = $1
-         ORDER BY position DESC LIMIT 1`,
-        [id]
-      );
-
-      position = generatePosition(lastRow.rows[0]?.position || '', '');
+    const rowsInOrder = siblings.rows;
+    const last = rowsInOrder[rowsInOrder.length - 1]?.position ?? null;
+    const index = isUuid(after_row_id) ? rowsInOrder.findIndex((r) => r.id === after_row_id) : -1;
+    let position: string;
+    try {
+      position =
+        index === -1
+          ? generateKeyBetween(last, null)
+          : generateKeyBetween(rowsInOrder[index].position, rowsInOrder[index + 1]?.position ?? null);
+    } catch (error) {
+      if (!(error instanceof PositionError)) throw error;
+      position = generateKeyBetween(last, null);
     }
 
     // Set default values based on schema
-    const schema = database.properties_schema as PropertySchema[];
+    const schema = (access.page.properties_schema ?? []) as PropertySchema[];
     const rowProperties: Record<string, unknown> = {};
-
     for (const prop of schema) {
       if (properties && properties[prop.id] !== undefined) {
         rowProperties[prop.id] = properties[prop.id];
+      } else if (prop.type === 'title') {
+        rowProperties[prop.id] = 'Untitled';
+      } else if (prop.type === 'checkbox') {
+        rowProperties[prop.id] = false;
       } else {
-        // Default values
-        switch (prop.type) {
-          case 'title':
-            rowProperties[prop.id] = 'Untitled';
-            break;
-          case 'checkbox':
-            rowProperties[prop.id] = false;
-            break;
-          case 'number':
-            rowProperties[prop.id] = null;
-            break;
-          default:
-            rowProperties[prop.id] = null;
-        }
+        rowProperties[prop.id] = null;
       }
     }
 
@@ -229,84 +171,67 @@ router.post('/:id/rows', async (req: Request, res: Response) => {
 
     res.status(201).json({ row: result.rows[0] });
   } catch (error) {
-    console.error('Create row error:', error);
-    res.status(500).json({ error: 'Failed to create row' });
+    sendError(res, error, 'Failed to create row');
   }
 });
 
 /**
  * PATCH /api/databases/:id/rows/:rowId
- * Updates property values for a database row.
- * Merges provided properties with existing values.
+ * Merges the given property values into the row. The merge happens inside
+ * PostgreSQL (`properties || $1::jsonb`), so two people editing different
+ * cells of the same row at the same time both keep their change; the old
+ * read-merge-write in Node lost one of them.
  */
 router.patch('/:id/rows/:rowId', async (req: Request, res: Response) => {
   try {
+    const access = await requireDatabase(req, res, 'edit');
+    if (!access) return;
     const { id, rowId } = req.params;
-    const { properties, position } = req.body;
+    const { properties, position } = req.body ?? {};
 
-    // Get row
-    const rowResult = await pool.query<DatabaseRow>(
-      'SELECT * FROM database_rows WHERE id = $1 AND database_id = $2',
-      [rowId, id]
-    );
-
-    if (rowResult.rows.length === 0) {
+    if (!isUuid(rowId)) {
       res.status(404).json({ error: 'Row not found' });
-      return;
-    }
-
-    // Get database
-    const pageResult = await pool.query<Page>(
-      'SELECT workspace_id FROM pages WHERE id = $1',
-      [id]
-    );
-
-    // Check workspace membership
-    const memberCheck = await pool.query(
-      `SELECT role FROM workspace_members
-       WHERE workspace_id = $1 AND user_id = $2`,
-      [pageResult.rows[0].workspace_id, req.user!.id]
-    );
-
-    if (memberCheck.rows.length === 0) {
-      res.status(403).json({ error: 'Not a member of this workspace' });
       return;
     }
 
     const updates: string[] = [];
     const values: unknown[] = [];
-    let paramIndex = 1;
-
     if (properties !== undefined) {
-      // Merge with existing properties
-      const currentProperties = rowResult.rows[0].properties as Record<string, unknown>;
-      const mergedProperties = { ...currentProperties, ...properties };
-      updates.push(`properties = $${paramIndex++}`);
-      values.push(JSON.stringify(mergedProperties));
+      if (typeof properties !== 'object' || properties === null || Array.isArray(properties)) {
+        res.status(400).json({ error: 'properties must be an object' });
+        return;
+      }
+      values.push(JSON.stringify(properties));
+      updates.push(`properties = properties || $${values.length}::jsonb`);
     }
-
     if (position !== undefined) {
-      updates.push(`position = $${paramIndex++}`);
+      if (typeof position !== 'string' || !/^[a-z]{1,100}$/.test(position)) {
+        res.status(400).json({ error: 'position must be 1-100 lowercase letters' });
+        return;
+      }
       values.push(position);
+      updates.push(`position = $${values.length}`);
     }
-
     if (updates.length === 0) {
       res.status(400).json({ error: 'No updates provided' });
       return;
     }
 
-    values.push(rowId);
+    values.push(rowId, id);
     const result = await pool.query<DatabaseRow>(
       `UPDATE database_rows SET ${updates.join(', ')}
-       WHERE id = $${paramIndex}
+       WHERE id = $${values.length - 1} AND database_id = $${values.length}
        RETURNING *`,
       values
     );
+    if (result.rows.length === 0) {
+      res.status(404).json({ error: 'Row not found' });
+      return;
+    }
 
     res.json({ row: result.rows[0] });
   } catch (error) {
-    console.error('Update row error:', error);
-    res.status(500).json({ error: 'Failed to update row' });
+    sendError(res, error, 'Failed to update row');
   }
 });
 
@@ -316,50 +241,29 @@ router.patch('/:id/rows/:rowId', async (req: Request, res: Response) => {
  */
 router.delete('/:id/rows/:rowId', async (req: Request, res: Response) => {
   try {
+    const access = await requireDatabase(req, res, 'edit');
+    if (!access) return;
     const { id, rowId } = req.params;
-    const { permanent } = req.query;
-
-    const rowResult = await pool.query<DatabaseRow>(
-      'SELECT * FROM database_rows WHERE id = $1 AND database_id = $2',
-      [rowId, id]
-    );
-
-    if (rowResult.rows.length === 0) {
+    if (!isUuid(rowId)) {
       res.status(404).json({ error: 'Row not found' });
       return;
     }
 
-    // Get database
-    const pageResult = await pool.query<Page>(
-      'SELECT workspace_id FROM pages WHERE id = $1',
-      [id]
-    );
-
-    // Check workspace membership
-    const memberCheck = await pool.query(
-      `SELECT role FROM workspace_members
-       WHERE workspace_id = $1 AND user_id = $2`,
-      [pageResult.rows[0].workspace_id, req.user!.id]
-    );
-
-    if (memberCheck.rows.length === 0) {
-      res.status(403).json({ error: 'Not a member of this workspace' });
+    const result =
+      req.query.permanent === 'true'
+        ? await pool.query('DELETE FROM database_rows WHERE id = $1 AND database_id = $2', [rowId, id])
+        : await pool.query(
+            'UPDATE database_rows SET is_archived = true WHERE id = $1 AND database_id = $2',
+            [rowId, id]
+          );
+    if (result.rowCount === 0) {
+      res.status(404).json({ error: 'Row not found' });
       return;
     }
 
-    if (permanent === 'true') {
-      await pool.query('DELETE FROM database_rows WHERE id = $1', [rowId]);
-      res.json({ message: 'Row permanently deleted' });
-    } else {
-      await pool.query(
-        'UPDATE database_rows SET is_archived = true WHERE id = $1',
-        [rowId]
-      );
-      res.json({ message: 'Row archived' });
-    }
+    res.json({ message: req.query.permanent === 'true' ? 'Row permanently deleted' : 'Row archived' });
   } catch (error) {
-    console.error('Delete row error:', error);
-    res.status(500).json({ error: 'Failed to delete row' });
+    sendError(res, error, 'Failed to delete row');
   }
 });
 
@@ -370,41 +274,16 @@ router.delete('/:id/rows/:rowId', async (req: Request, res: Response) => {
  */
 router.post('/:id/views', async (req: Request, res: Response) => {
   try {
+    const access = await requireDatabase(req, res, 'edit');
+    if (!access) return;
     const { id } = req.params;
-    const { name, type, filter, sort, group_by, properties_visibility } = req.body;
+    const { name, type, filter, sort, group_by, properties_visibility } = req.body ?? {};
 
-    // Get database
-    const pageResult = await pool.query<Page>(
-      'SELECT * FROM pages WHERE id = $1 AND is_database = true',
-      [id]
-    );
-
-    if (pageResult.rows.length === 0) {
-      res.status(404).json({ error: 'Database not found' });
-      return;
-    }
-
-    // Check workspace membership
-    const memberCheck = await pool.query(
-      `SELECT role FROM workspace_members
-       WHERE workspace_id = $1 AND user_id = $2`,
-      [pageResult.rows[0].workspace_id, req.user!.id]
-    );
-
-    if (memberCheck.rows.length === 0) {
-      res.status(403).json({ error: 'Not a member of this workspace' });
-      return;
-    }
-
-    // Get position for new view
     const lastView = await pool.query<DatabaseView>(
-      `SELECT position FROM database_views
-       WHERE page_id = $1
-       ORDER BY position DESC LIMIT 1`,
+      'SELECT position FROM database_views WHERE page_id = $1 ORDER BY position DESC, id DESC LIMIT 1',
       [id]
     );
-
-    const position = generatePosition(lastView.rows[0]?.position || '', '');
+    const position = generateKeyBetween(lastView.rows[0]?.position ?? null, null);
 
     const result = await pool.query<DatabaseView>(
       `INSERT INTO database_views (page_id, name, type, filter, sort, group_by, properties_visibility, position)
@@ -422,10 +301,11 @@ router.post('/:id/views', async (req: Request, res: Response) => {
       ]
     );
 
+    // Views are part of the cached page snapshot.
+    await invalidatePageCache(access.page.id);
     res.status(201).json({ view: result.rows[0] });
   } catch (error) {
-    console.error('Create view error:', error);
-    res.status(500).json({ error: 'Failed to create view' });
+    sendError(res, error, 'Failed to create view');
   }
 });
 
@@ -435,185 +315,115 @@ router.post('/:id/views', async (req: Request, res: Response) => {
  */
 router.patch('/:id/views/:viewId', async (req: Request, res: Response) => {
   try {
+    const access = await requireDatabase(req, res, 'edit');
+    if (!access) return;
     const { id, viewId } = req.params;
-    const { name, type, filter, sort, group_by, properties_visibility, position } = req.body;
+    const { name, type, filter, sort, group_by, properties_visibility, position } = req.body ?? {};
 
-    const viewResult = await pool.query<DatabaseView>(
-      'SELECT * FROM database_views WHERE id = $1 AND page_id = $2',
-      [viewId, id]
-    );
-
-    if (viewResult.rows.length === 0) {
+    if (!isUuid(viewId)) {
       res.status(404).json({ error: 'View not found' });
-      return;
-    }
-
-    // Get database
-    const pageResult = await pool.query<Page>(
-      'SELECT workspace_id FROM pages WHERE id = $1',
-      [id]
-    );
-
-    // Check workspace membership
-    const memberCheck = await pool.query(
-      `SELECT role FROM workspace_members
-       WHERE workspace_id = $1 AND user_id = $2`,
-      [pageResult.rows[0].workspace_id, req.user!.id]
-    );
-
-    if (memberCheck.rows.length === 0) {
-      res.status(403).json({ error: 'Not a member of this workspace' });
       return;
     }
 
     const updates: string[] = [];
     const values: unknown[] = [];
-    let paramIndex = 1;
+    const push = (column: string, value: unknown) => {
+      values.push(value);
+      updates.push(`${column} = $${values.length}`);
+    };
 
-    if (name !== undefined) {
-      updates.push(`name = $${paramIndex++}`);
-      values.push(name);
-    }
-    if (type !== undefined) {
-      updates.push(`type = $${paramIndex++}`);
-      values.push(type);
-    }
-    if (filter !== undefined) {
-      updates.push(`filter = $${paramIndex++}`);
-      values.push(JSON.stringify(filter));
-    }
-    if (sort !== undefined) {
-      updates.push(`sort = $${paramIndex++}`);
-      values.push(JSON.stringify(sort));
-    }
-    if (group_by !== undefined) {
-      updates.push(`group_by = $${paramIndex++}`);
-      values.push(group_by);
-    }
-    if (properties_visibility !== undefined) {
-      updates.push(`properties_visibility = $${paramIndex++}`);
-      values.push(JSON.stringify(properties_visibility));
-    }
-    if (position !== undefined) {
-      updates.push(`position = $${paramIndex++}`);
-      values.push(position);
-    }
+    if (name !== undefined) push('name', name);
+    if (type !== undefined) push('type', type);
+    if (filter !== undefined) push('filter', JSON.stringify(filter));
+    if (sort !== undefined) push('sort', JSON.stringify(sort));
+    if (group_by !== undefined) push('group_by', group_by);
+    if (properties_visibility !== undefined) push('properties_visibility', JSON.stringify(properties_visibility));
+    if (position !== undefined) push('position', position);
 
     if (updates.length === 0) {
       res.status(400).json({ error: 'No updates provided' });
       return;
     }
 
-    values.push(viewId);
+    values.push(viewId, id);
     const result = await pool.query<DatabaseView>(
       `UPDATE database_views SET ${updates.join(', ')}
-       WHERE id = $${paramIndex}
+       WHERE id = $${values.length - 1} AND page_id = $${values.length}
        RETURNING *`,
       values
     );
+    if (result.rows.length === 0) {
+      res.status(404).json({ error: 'View not found' });
+      return;
+    }
 
+    await invalidatePageCache(access.page.id);
     res.json({ view: result.rows[0] });
   } catch (error) {
-    console.error('Update view error:', error);
-    res.status(500).json({ error: 'Failed to update view' });
+    sendError(res, error, 'Failed to update view');
   }
 });
 
 /**
  * DELETE /api/databases/:id/views/:viewId
- * Deletes a database view. Cannot delete the last remaining view.
+ * Deletes a view of THIS database (the id pair is checked together, so a view
+ * of another workspace's database cannot be deleted through your own database).
+ * The last remaining view cannot be deleted.
  */
 router.delete('/:id/views/:viewId', async (req: Request, res: Response) => {
   try {
+    const access = await requireDatabase(req, res, 'edit');
+    if (!access) return;
     const { id, viewId } = req.params;
-
-    // Check if it's the last view
-    const viewCount = await pool.query(
-      'SELECT COUNT(*) FROM database_views WHERE page_id = $1',
-      [id]
-    );
-
-    if (parseInt(viewCount.rows[0].count) <= 1) {
-      res.status(400).json({ error: 'Cannot delete the last view' });
+    if (!isUuid(viewId)) {
+      res.status(404).json({ error: 'View not found' });
       return;
     }
 
-    // Get database
-    const pageResult = await pool.query<Page>(
-      'SELECT workspace_id FROM pages WHERE id = $1',
-      [id]
+    const result = await pool.query(
+      `DELETE FROM database_views
+       WHERE id = $1 AND page_id = $2
+         AND (SELECT COUNT(*) FROM database_views WHERE page_id = $2) > 1`,
+      [viewId, id]
     );
-
-    // Check workspace membership
-    const memberCheck = await pool.query(
-      `SELECT role FROM workspace_members
-       WHERE workspace_id = $1 AND user_id = $2`,
-      [pageResult.rows[0].workspace_id, req.user!.id]
-    );
-
-    if (memberCheck.rows.length === 0) {
-      res.status(403).json({ error: 'Not a member of this workspace' });
+    if (result.rowCount === 0) {
+      const exists = await pool.query('SELECT 1 FROM database_views WHERE id = $1 AND page_id = $2', [viewId, id]);
+      res
+        .status(exists.rows.length > 0 ? 400 : 404)
+        .json({ error: exists.rows.length > 0 ? 'Cannot delete the last view' : 'View not found' });
       return;
     }
 
-    await pool.query('DELETE FROM database_views WHERE id = $1', [viewId]);
-
+    await invalidatePageCache(access.page.id);
     res.json({ message: 'View deleted' });
   } catch (error) {
-    console.error('Delete view error:', error);
-    res.status(500).json({ error: 'Failed to delete view' });
+    sendError(res, error, 'Failed to delete view');
   }
 });
 
 /**
  * PATCH /api/databases/:id/schema
  * Updates the database properties schema (column definitions).
- * Used when adding, removing, or modifying database columns.
  */
 router.patch('/:id/schema', async (req: Request, res: Response) => {
   try {
-    const { id } = req.params;
-    const { properties_schema } = req.body;
-
-    if (!properties_schema) {
-      res.status(400).json({ error: 'properties_schema is required' });
+    const access = await requireDatabase(req, res, 'edit');
+    if (!access) return;
+    const { properties_schema } = req.body ?? {};
+    if (!Array.isArray(properties_schema)) {
+      res.status(400).json({ error: 'properties_schema must be an array' });
       return;
     }
 
-    // Get database
-    const pageResult = await pool.query<Page>(
-      'SELECT * FROM pages WHERE id = $1 AND is_database = true',
-      [id]
+    const result = await pool.query(
+      'UPDATE pages SET properties_schema = $1 WHERE id = $2 RETURNING *',
+      [JSON.stringify(properties_schema), req.params.id]
     );
 
-    if (pageResult.rows.length === 0) {
-      res.status(404).json({ error: 'Database not found' });
-      return;
-    }
-
-    // Check workspace membership
-    const memberCheck = await pool.query(
-      `SELECT role FROM workspace_members
-       WHERE workspace_id = $1 AND user_id = $2`,
-      [pageResult.rows[0].workspace_id, req.user!.id]
-    );
-
-    if (memberCheck.rows.length === 0) {
-      res.status(403).json({ error: 'Not a member of this workspace' });
-      return;
-    }
-
-    const result = await pool.query<Page>(
-      `UPDATE pages SET properties_schema = $1
-       WHERE id = $2
-       RETURNING *`,
-      [JSON.stringify(properties_schema), id]
-    );
-
+    await invalidatePageCache(access.page.id);
     res.json({ database: result.rows[0] });
   } catch (error) {
-    console.error('Update schema error:', error);
-    res.status(500).json({ error: 'Failed to update schema' });
+    sendError(res, error, 'Failed to update schema');
   }
 });
 

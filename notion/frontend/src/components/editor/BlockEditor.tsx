@@ -20,6 +20,8 @@ interface BlockEditorProps {
   blocks: Block[];
   /** Child pages to display at the bottom */
   childPages: Page[];
+  /** View-only access: render blocks without editing affordances */
+  readOnly?: boolean;
 }
 
 /**
@@ -29,7 +31,7 @@ interface BlockEditorProps {
  * @param props - Component props
  * @returns The rendered block editor
  */
-export default function BlockEditor({ pageId, blocks, childPages }: BlockEditorProps) {
+export default function BlockEditor({ pageId, blocks, childPages, readOnly = false }: BlockEditorProps) {
   const {
     addBlock,
     updateBlock,
@@ -127,7 +129,9 @@ export default function BlockEditor({ pageId, blocks, childPages }: BlockEditorP
   return (
     <div className="pb-32">
       {/* Render blocks */}
-      {rootBlocks.length === 0 ? (
+      {rootBlocks.length === 0 && readOnly ? (
+        <div className="notion-block text-notion-text-secondary">This page is empty.</div>
+      ) : rootBlocks.length === 0 ? (
         <div
           className="notion-block cursor-text"
           onClick={() => handleAddBlock()}
@@ -143,6 +147,7 @@ export default function BlockEditor({ pageId, blocks, childPages }: BlockEditorP
             block={block}
             childBlocks={getChildBlocks(block.id)}
             allBlocks={blocks}
+            readOnly={readOnly}
             isFocused={focusedBlockId === block.id}
             onFocus={() => setFocusedBlock(block.id)}
             onUpdate={(content) => handleUpdateBlock(block.id, content)}
@@ -156,7 +161,7 @@ export default function BlockEditor({ pageId, blocks, childPages }: BlockEditorP
       )}
 
       {/* Add block button */}
-      <div className="mt-4">
+      <div className={readOnly ? 'hidden' : 'mt-4'}>
         <button
           className="flex items-center gap-2 text-notion-text-secondary hover:text-notion-text transition-colors px-2 py-1"
           onClick={() => handleAddBlock(rootBlocks[rootBlocks.length - 1]?.id)}

@@ -47,6 +47,8 @@ interface BlockComponentProps {
   onKeyDown: (e: React.KeyboardEvent) => void;
   /** Called when a slash command is detected */
   onSlashCommand: (command: string) => void;
+  /** View-only access: no editing, no handles or menus */
+  readOnly?: boolean;
 }
 
 /**
@@ -87,11 +89,19 @@ export default function BlockComponent({
   onAddBlock,
   onKeyDown,
   onSlashCommand,
+  readOnly = false,
 }: BlockComponentProps) {
   const contentRef = useRef<HTMLDivElement>(null);
   const [showMenu, setShowMenu] = useState(false);
   const [isExpanded, setIsExpanded] = useState(!block.is_collapsed);
   const { updateBlock } = useEditorStore();
+
+  // Renderers mark their element contentEditable; turn that off for viewers.
+  useEffect(() => {
+    if (contentRef.current) {
+      contentRef.current.contentEditable = readOnly ? 'false' : 'true';
+    }
+  });
 
   // Manage focus when this block becomes focused
   useEffect(() => {
@@ -238,17 +248,19 @@ export default function BlockComponent({
   return (
     <div className={`notion-block group ${isFocused ? 'notion-block-focused' : ''}`}>
       {/* Block handle with add button and grip */}
-      <BlockHandle
-        onAdd={() => onAddBlock()}
-        onMenuToggle={() => setShowMenu(!showMenu)}
-      />
+      {!readOnly && (
+        <BlockHandle
+          onAdd={() => onAddBlock()}
+          onMenuToggle={() => setShowMenu(!showMenu)}
+        />
+      )}
 
       {/* Block content delegated to type-specific component */}
       {renderBlockContent()}
 
       {/* Block type conversion menu */}
       <BlockTypeMenu
-        isOpen={showMenu}
+        isOpen={showMenu && !readOnly}
         onClose={() => setShowMenu(false)}
         onSelectType={handleTypeChange}
       />

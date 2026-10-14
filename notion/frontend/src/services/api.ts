@@ -8,6 +8,21 @@
 const API_BASE = '/api';
 
 /**
+ * Error thrown for non-2xx responses. Keeps the status and the parsed body so
+ * callers can react to specific cases (409 carries the current block).
+ */
+export class ApiError extends Error {
+  constructor(
+    public readonly status: number,
+    message: string,
+    public readonly body: Record<string, unknown>
+  ) {
+    super(message);
+    this.name = 'ApiError';
+  }
+}
+
+/**
  * Generic fetch wrapper with error handling and JSON parsing.
  * Automatically includes credentials and Content-Type headers.
  *
@@ -30,8 +45,8 @@ async function request<T>(
   });
 
   if (!response.ok) {
-    const error = await response.json().catch(() => ({ error: 'Request failed' }));
-    throw new Error(error.error || 'Request failed');
+    const body = await response.json().catch(() => ({ error: 'Request failed' }));
+    throw new ApiError(response.status, body.error || 'Request failed', body);
   }
 
   return response.json();
@@ -107,6 +122,9 @@ export const pagesApi = {
       blocks: import('@/types').Block[];
       children: import('@/types').Page[];
       views: import('@/types').DatabaseView[];
+      /** Operation-log position this snapshot reflects; subscribe with it. */
+      seq: number;
+      permission: import('@/types').PermissionLevel;
     }>(`/pages/${id}`),
 
   create: (data: {
@@ -152,6 +170,8 @@ export const blocksApi = {
   },
 
   create: (data: {
+    /** Client-chosen id: retrying the same create returns the same block. */
+    id?: string;
     page_id: string;
     parent_block_id?: string | null;
     type?: import('@/types').BlockType;
@@ -164,7 +184,7 @@ export const blocksApi = {
       body: JSON.stringify(data),
     }),
 
-  update: (id: string, data: Partial<import('@/types').Block>) =>
+  update: (id: string, data: Partial<import('@/types').Block> & { expected_version?: number }) =>
     request<{ block: import('@/types').Block }>(`/blocks/${id}`, {
       method: 'PATCH',
       body: JSON.stringify(data),

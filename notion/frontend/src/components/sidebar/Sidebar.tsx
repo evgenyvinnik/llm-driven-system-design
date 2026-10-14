@@ -78,7 +78,9 @@ export default function Sidebar() {
   };
 
   // Build page tree
-  const rootPages = pages.filter((p) => !p.parent_id);
+  // A guest can see a shared subpage without its parent; show it as a root.
+  const visibleIds = new Set(pages.map((p) => p.id));
+  const rootPages = pages.filter((p) => !p.parent_id || !visibleIds.has(p.parent_id));
 
   const renderPageItem = (page: Page, level = 0) => {
     const children = pages.filter((p) => p.parent_id === page.id);

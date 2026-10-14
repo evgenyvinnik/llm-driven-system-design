@@ -1,7 +1,7 @@
 -- Seed data for development/testing
 -- Notion Clone Sample Data
 
--- Insert default admin user (password: admin123)
+-- Insert default admin user (password: password123)
 INSERT INTO users (id, email, password_hash, name, role) VALUES
     ('00000000-0000-0000-0000-000000000001', 'admin@notion.local', '$2b$10$H7vKWTFB.lP5/btyuA8ttO8eqqU2bXcc5vlcdanvOmPL4t4/vK3UW', 'Admin User', 'admin')
 ON CONFLICT (email) DO NOTHING;
@@ -82,3 +82,17 @@ INSERT INTO database_rows (id, database_id, properties, position, created_by) VA
      '{"title": "Write documentation", "status": "todo", "priority": "low", "due_date": "2025-02-01"}'::jsonb,
      'e', '00000000-0000-0000-0000-000000000001')
 ON CONFLICT DO NOTHING;
+
+-- A guest who sees only what was shared with them: "Getting Started" with view
+-- permission (and, by inheritance, any page created under it). password123.
+INSERT INTO users (id, email, password_hash, name, role) VALUES
+    ('00000000-0000-0000-0000-000000000002', 'guest@notion.local', '$2b$10$H7vKWTFB.lP5/btyuA8ttO8eqqU2bXcc5vlcdanvOmPL4t4/vK3UW', 'Guest User', 'user')
+ON CONFLICT (email) DO NOTHING;
+
+INSERT INTO workspace_members (workspace_id, user_id, role) VALUES
+    ('00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000002', 'guest')
+ON CONFLICT DO NOTHING;
+
+INSERT INTO page_permissions (page_id, user_id, permission) VALUES
+    ('00000000-0000-0000-0000-000000000002', '00000000-0000-0000-0000-000000000002', 'view')
+ON CONFLICT (page_id, user_id) DO NOTHING;
