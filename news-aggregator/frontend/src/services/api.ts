@@ -108,7 +108,9 @@ export const feedApi = {
     if (options?.dateFrom) params.set('date_from', options.dateFrom);
     if (options?.dateTo) params.set('date_to', options.dateTo);
     if (options?.limit) params.set('limit', String(options.limit));
-    return fetchApi<{ articles: import('../types').Article[] }>(`/search?${params}`);
+    return fetchApi<{ articles: import('../types').Article[]; engine?: 'elasticsearch' | 'postgres' }>(
+      `/search?${params}`
+    );
   },
 
   /**
@@ -191,6 +193,8 @@ export const userApi = {
   recordRead: (articleId: string, dwellTimeSeconds: number) =>
     fetchApi<{ message: string }>('/user/reading-history', {
       method: 'POST',
+      // keepalive lets the request finish even if the page navigates away
+      keepalive: true,
       body: JSON.stringify({ article_id: articleId, dwell_time_seconds: dwellTimeSeconds }),
     }),
 

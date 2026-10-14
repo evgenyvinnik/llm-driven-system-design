@@ -199,12 +199,17 @@ export const useFeedStore = create<FeedState>((set) => ({
     set({ stories, cursor, hasMore, error: null }),
 
   appendStories: (newStories, cursor, hasMore) =>
-    set((state) => ({
-      stories: [...state.stories, ...newStories],
-      cursor,
-      hasMore,
-      error: null,
-    })),
+    set((state) => {
+      // A cursor whose snapshot expired restarts ranking at the same offset,
+      // so a page can repeat a story we already show; keep the first copy.
+      const seen = new Set(state.stories.map((story) => story.id));
+      return {
+        stories: [...state.stories, ...newStories.filter((story) => !seen.has(story.id))],
+        cursor,
+        hasMore,
+        error: null,
+      };
+    }),
 
   setLoading: (isLoading) => set({ isLoading }),
   setError: (error) => set({ error, isLoading: false }),

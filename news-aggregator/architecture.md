@@ -1,838 +1,541 @@
-# News Aggregator - Architecture Design
+# News Aggregator — Architecture
 
 ## System Overview
 
-A content aggregation and curation platform that crawls RSS/Atom feeds from multiple sources, deduplicates articles, clusters related stories, extracts topics, and delivers personalized news feeds to users. Core challenges involve content deduplication at scale, real-time ranking, and balancing freshness with relevance.
+A Google News–style aggregator. It polls tens of thousands of publisher RSS and Atom feeds, groups the incoming articles into **stories** (one story is all the coverage of one event), ranks stories for each reader, flags breaking news when coverage spikes, and offers full-text search. The product is the story list, not the article list: when twenty outlets cover the same event, the reader should see one entry that says "20 sources", not twenty near-identical headlines.
 
-**Learning Goals:**
-- Build content deduplication with SimHash fingerprinting
-- Design multi-signal ranking algorithms for personalized feeds
-- Implement scheduled crawling with circuit breakers
-- Handle full-text search with Elasticsearch
+Three problems make this a real design exercise:
 
----
+1. **Polite polling at scale.** Fifty thousand feeds every 15 minutes is ~56 fetches a second against servers we don't own. The crawler must avoid re-downloading unchanged feeds (conditional GETs), back off from feeds that are failing, space out requests to the same domain, and never fetch one feed twice when several crawler instances run at once.
+2. **Near-duplicate clustering.** Each new article must find its story among about a million open stories in a few milliseconds. Exact hashes miss rewrites, and embeddings are expensive. SimHash fingerprints plus a banded index lookup make "is this the same story?" an indexed equality query and a popcount.
+3. **Ranking a moving target.** Scores change every minute as stories age and new coverage arrives. The feed has to stay personal without becoming a filter bubble, and pagination has to stay consistent while the ranking underneath it moves.
+
+**Learning goals:** conditional GETs, per-source backoff and lease-based scheduling with `FOR UPDATE SKIP LOCKED`; SimHash fingerprints, banding and the pigeonhole argument; transactional ingestion with advisory locks; multi-signal ranking with a diversity penalty; snapshot (cursor) pagination over a ranked list; Elasticsearch as a derived index with a PostgreSQL fallback.
 
 ## Requirements
 
-### Functional Requirements
+### Functional requirements
 
-- **Source Crawling**: Fetch RSS/Atom feeds on configurable schedules (5-60 minute intervals)
-- **Deduplication**: Identify and group near-duplicate articles using SimHash fingerprinting
-- **Story Clustering**: Group articles covering the same story from multiple sources
-- **Categorization**: Extract topics using keyword matching (politics, tech, sports, etc.)
-- **Personalization**: Rank feed items based on user interests, freshness, source quality, and trending signals
-- **Search**: Full-text search across articles with filters (source, date, topic)
-- **User Management**: Registration, login, preferences, reading history
-- **Admin Dashboard**: Manage sources, view crawl status, monitor system health
+1. **Crawl** RSS/Atom feeds on a per-source interval (5–60 minutes), using conditional GETs and backing off from failing sources.
+2. **Deduplicate and cluster**: one row per article URL; near-duplicate articles join the same story, which keeps coverage counts and a velocity (articles per minute).
+3. **Breaking news**: flag a story when at least three distinct sources cover it within 30 minutes, and show it in a banner for six hours.
+4. **Personalized feed**: rank by topic interest (explicit and learned from reading), preferred and blocked sources, freshness, coverage and velocity, with a diversity penalty. Logged-out readers get a shared, non-personalized ranking.
+5. **Browse**: topic pages, trending, story detail with all coverage, full-text search with topic and date filters.
+6. **Accounts**: register, log in, preferences, reading history.
+7. **Admin**: add, edit and remove sources, trigger crawls, see crawl health (failures, last status, whether conditional GETs work), flag or unflag breaking stories.
 
-### Non-Functional Requirements
+Out of scope: scraping full article pages (we use what feeds provide), paywall handling, push-notification delivery, comments and ads.
 
-- **Throughput**: 10K feed requests/second at peak, 1K crawls/minute
-- **Latency**: p95 < 200ms for feed retrieval, p95 < 500ms for search
-- **Availability**: 99.9% uptime (< 8.7 hours downtime/month)
-- **Consistency**: Eventual consistency acceptable (1-2 second delay for new articles)
-- **Durability**: No data loss for user preferences and reading history
+### Non-functional requirements
 
----
+| Requirement | Target | Why |
+|-------------|--------|-----|
+| Freshness | New article in feeds within one polling interval + 1 min (p95 ≤ 16 min; ≤ 3 min for priority sources) | News loses value by the minute |
+| Breaking detection | Flagged within 2 min of the third independent source | The banner is only useful early |
+| Feed latency | p99 < 200 ms for a cold first page, < 60 ms for later pages | Feed opens are the main interaction |
+| Search latency | p95 < 500 ms | Interactive, but less frequent |
+| Availability | 99.9% for reading; crawling may lag without a user-visible outage | Reading must survive publisher and pipeline trouble |
+| Politeness | ≤ 1 fetch per feed per interval, ≤ 1 request/s per domain, honor `Retry-After` | Publishers block crawlers that ignore this |
+| Dedup recall | Every pair of fingerprints within 3 bits is compared | Missed duplicates show up as repeated stories |
+| Consistency | One article per URL; one story per event per window; feeds may lag ingestion by ≤ 60 s | Duplicates are visible; small lag is not |
 
 ## Capacity Estimation
 
-### Production Scale
-
-| Metric | Value | Rationale |
-|--------|-------|-----------|
-| Daily Active Users (DAU) | 5M | News aggregator user base |
-| News Sources | 50K RSS feeds | Major outlets + niche blogs globally |
-| Articles/Day | 2M | ~40 articles per active source |
-| Average Article Size | 5 KB | Title, URL, summary, metadata, fingerprint |
-| Feed requests/second | 10K peak | 5M users x 10 refreshes/day, concentrated in peak hours |
-| Search queries/second | 2K peak | 20% of users search daily |
-
-### Storage Growth
-
-| Component | Size/Day | 30-Day Total | Retention |
-|-----------|----------|--------------|-----------|
-| PostgreSQL (articles) | 10 GB | 300 GB | 90 days, then archive |
-| PostgreSQL (users/prefs) | 50 MB | 1.5 GB | Indefinite |
-| Elasticsearch (search index) | 6 GB | 180 GB | 90 days, then prune |
-| Redis (sessions + cache) | 500 MB | 2 GB (steady state) | TTL-based eviction |
+| Quantity | Estimate | Consequence |
+|----------|----------|-------------|
+| Sources | 50K feeds, median interval 15 min | 50,000 / 900 s ≈ **56 fetches/s** |
+| Unchanged feeds | ~75% of polls answered `304` | ~14 bodies/s to parse instead of 56, and most of the bandwidth saved |
+| New articles | 2M/day ≈ 23/s average, ~70/s peak | One clustering transaction each |
+| Open stories | ~600K new stories/day × 48 h window ≈ 1.2M | A linear scan would be 1.2M Hamming checks per article, ~28M/s |
+| Band lookup | 1.2M / 65,536 ≈ 18 stories per band value × 4 bands | **~70 candidates per article**, about 17,000× less work |
+| Feed traffic | 5M DAU × 10 opens ≈ 50M/day; ~10K requests/s at peak including later pages | Ranking must be cached and pages served from snapshots |
+| Feed snapshots | ~3K new snapshots/s at peak × 900 s TTL × ~5 KB ≈ 13 GB | A Redis cluster; 8-byte ids would halve it |
+| Storage | Articles ~5 KB → 10 GB/day; search index ~6 GB/day; 90-day retention | ~900 GB in PostgreSQL (partitioned by month), ~540 GB in Elasticsearch |
+| Search | ~2K queries/s at peak | Elasticsearch sized for search; PostgreSQL only as a fallback |
 
 ### Local Development Scale
 
-| Metric | Value | Rationale |
-|--------|-------|-----------|
-| Daily Active Users | 10-50 | Local testing |
-| News Sources | 50-200 RSS feeds | Mix of major outlets and niche blogs |
-| Articles/Day | 2,000-10,000 | ~50-100 articles per active source |
-| Total API RPS | ~20 | With 3x headroom = 60 RPS capacity |
-
----
+The local stack has 10 seeded sources pointing at real publisher feeds, 6 seeded stories with 15 articles, a handful of users and well under 10 requests per second. One Express process serves the API and runs the crawler. PostgreSQL and Redis are required; Elasticsearch is optional.
 
 ## High-Level Architecture
 
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│                         CDN / Edge Cache                             │
-│                  (Static assets, trending feed cache)                │
-└──────────────────────────────────────────────────────────────────────┘
-                                │
-                                ▼
-┌──────────────────────────────────────────────────────────────────────┐
-│                       API Gateway / Load Balancer                    │
-│              (Rate limiting, auth, request routing)                   │
-└──────────────────────────────────────────────────────────────────────┘
-                                │
-              ┌─────────────────┼─────────────────┐
-              ▼                 ▼                  ▼
-     ┌──────────────┐  ┌──────────────┐   ┌──────────────┐
-     │  API Server  │  │  API Server  │   │  API Server  │
-     │  Instance 1  │  │  Instance 2  │   │  Instance N  │
-     └──────┬───────┘  └──────┬───────┘   └──────┬───────┘
-            │                 │                   │
-            └─────────────────┼───────────────────┘
-                              │
-        ┌─────────────────────┼─────────────────────┐
-        ▼                     ▼                      ▼
-┌──────────────┐     ┌──────────────┐      ┌──────────────┐
-│  PostgreSQL  │     │    Redis     │      │Elasticsearch │
-│  (Primary)   │     │  (Cache +   │      │  (Search)    │
-│  + Replicas  │     │   Sessions) │      │              │
-└──────────────┘     └──────────────┘      └──────────────┘
-                              │
-                              │ Index queue
-                              ▼
-                     ┌──────────────┐
-                     │ Index Worker │──────▶ Elasticsearch
-                     └──────────────┘
-
-┌──────────────────────────────────────────────────────────────────────┐
-│                       Crawler Service Cluster                        │
-│                                                                      │
-│  ┌────────────┐  ┌────────────┐  ┌────────────┐                    │
-│  │ Crawler 1  │  │ Crawler 2  │  │ Crawler N  │                    │
-│  │ (feeds     │  │ (feeds     │  │ (feeds     │                    │
-│  │  a-h hash) │  │  i-p hash) │  │  q-z hash) │                    │
-│  └────────────┘  └────────────┘  └────────────┘                    │
-│                                                                      │
-│  Each crawler: RSS fetch ──▶ SimHash dedup ──▶ Topic extract         │
-│                ──▶ Story cluster ──▶ PostgreSQL write ──▶ Index queue │
-└──────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────┐                                             ┌─────────────────────────┐
+│ Reader web / mobile app │                                             │ Publisher feeds         │
+│ admin console, same API │                                             │ ~50K RSS / Atom URLs    │
+└────────────┬────────────┘                                             └─────────────────────────┘
+             │                                                                       ▲
+             │ (2) GET /api/v1/feed?cursor                     (1) conditional GET   │
+             │ (3) GET /api/v1/search?q                             200 | 304        │
+             ▼                                                                       │
+┌─────────────────────────┐                                             ┌────────────┴────────────┐
+│ CDN + load balancer     │                          lease, reschedule  │ Fetch workers           │
+│ anon feed cached 30 s   │                       ┌─────────────────────┤ lease · per-domain pace │
+└────────────┬────────────┘                       │                     └────────────┬────────────┘
+             │                                    │                        raw items │
+             │                                    │                                  │
+             ▼                                    ▼                                  ▼
+┌─────────────────────────┐             ┌────────────────────┐          ┌─────────────────────────┐
+│ Feed API (stateless)    │  page rows  │ PostgreSQL         │          │ Kafka articles.raw      │
+│ rank · diversify        ├────────────▶│ sources · schedule │          └────────────┬────────────┘
+│ snapshot cursor         │             │ articles · stories │                       ▼
+│ story pages · search    │             │ users · prefs      │ articles ┌─────────────────────────┐
+│                         │             │ band index 4 x 16  │◀─────────┤ Cluster workers         │
+│                         │             └────────────────────┘          │ SimHash band lookup     │
+│                         │                                             │ story + counters        │
+│                         │  search     ┌────────────────────┐  index   │ breaking detection      │
+│                         ├────────────▶│ Elasticsearch      │◀─────────┤                         │
+│                         │             │ articles index     │          │                         │
+│                         │             └────────────────────┘          │                         │
+└────────────┬────────────┘                                             └─────────────────────────┘
+             │ snapshot, profile, session
+             ▼
+┌─────────────────────────┐
+│ Redis · sessions, feeds │
+└─────────────────────────┘
 ```
 
-### Request Flow: Fetching Personalized Feed
+1. **Crawl (1).** Fetch workers claim due feeds from `crawl_schedule` under a lease, wait for the domain's next request slot, and send a conditional GET. A `304` ends the visit. On a `200` the worker publishes each item to Kafka, then stores the new ETag and the next crawl time. Cluster workers store each article and its story assignment in one PostgreSQL transaction, then index the article into Elasticsearch.
+2. **Feed (2).** The CDN serves the anonymous feed from cache; personalized requests reach the Feed API. It ranks about 200 recent stories once, freezes that order as a snapshot in Redis, and returns one page plus a cursor. Later pages read the snapshot.
+3. **Search (3).** The Feed API queries Elasticsearch and hydrates the hits from PostgreSQL. If Elasticsearch is unavailable, it answers from PostgreSQL full-text search instead.
+
+| Component | Responsibility | Scales with | Notes |
+|-----------|----------------|-------------|-------|
+| CDN + load balancer | TLS, static assets, anonymous feed cache (30 s) | Readers | Personalized responses are `Cache-Control: private` |
+| Feed API | Ranking, snapshots, story pages, search, accounts, admin | Feed requests | Stateless; profiles and snapshots live in Redis |
+| Fetch workers | Lease due feeds, conditional GET, backoff, per-domain pacing | Feed count (~56 fetches/s) | Network-bound; hundreds of requests in flight per worker |
+| Kafka `articles.raw` | Buffer between fetching and clustering, replay | Article rate | Keyed by source id |
+| Cluster workers | Store article, band lookup, assign story, counters, breaking flag, indexing | Article rate (~70/s peak) | Database-bound; one transaction per article |
+| PostgreSQL | Source of truth: sources, schedule, articles, stories, users | Articles (~10 GB/day) | Articles partitioned by month; band columns indexed |
+| Redis | Sessions, ranking profiles, feed snapshots | Daily active readers | Losing it logs readers out and restarts scrolls; no data is lost |
+| Elasticsearch | Derived article index for search | Articles, search QPS | Rebuildable from PostgreSQL at any time |
+
+Fetching and clustering are separate pools because they fail differently. Fetchers wait on publishers' networks; cluster workers wait on PostgreSQL. With Kafka between them, fetchers keep polling through a database incident, and a clustering bug can be fixed and the last day of articles replayed.
+
+## Core Components / Request Flows
+
+### Crawling one feed
 
 ```
-1. User requests GET /api/v1/feed
-2. API Server checks Redis cache for user:{id}:feed (TTL 60s)
-3. If cache HIT:
-   - Return cached feed immediately (< 20ms)
-4. If cache MISS:
-   a. Query PostgreSQL for recent articles (last 24h)
-   b. Load user preferences from Redis cache (or PostgreSQL)
-   c. Apply ranking algorithm:
-      - Relevance score (35%): topic match with user interests
-      - Freshness score (25%): exponential decay, 6-hour half-life
-      - Quality score (20%): source diversity, multi-source stories
-      - Trending score (10%): velocity of new articles in cluster
-      - Breaking boost (+30%): if breaking_news flag set
-   d. Return top 50 articles, cache in Redis (TTL 60s)
-5. Return JSON response
+Fetch worker                         PostgreSQL   Publisher feed    Kafka
+      │                                   │              │            │
+      │ 1 claim due sources, SKIP LOCKED  │              │            │
+      │──────────────────────────────────▶│              │            │
+      │ 2 sources, ETags, lease token     │              │            │
+      │◀──────────────────────────────────│              │            │
+      │ 3 wait for the domain's slot      │              │            │
+      │ 4 GET, If-None-Match: "a1"                       │            │
+      │─────────────────────────────────────────────────▶│            │
+      │ 5 304, or 200 + body + new ETag                  │            │
+      │◀─────────────────────────────────────────────────│            │
+      ··························· 200 only ····························
+      │ 6 one message per item                                        │
+      │──────────────────────────────────────────────────────────────▶│
+      ···························· always ·····························
+      │ 7 next_crawl, ETag WHERE token    │              │            │
+      │──────────────────────────────────▶│              │            │
+      │                                   │              │            │
 ```
 
-### Request Flow: Search Query
+- **Claiming is the lease.** One statement selects due rows with `FOR UPDATE SKIP LOCKED`, pushes their `next_crawl` ten minutes ahead and stamps a fresh `lease_token`. Concurrent workers skip rows another worker is claiming instead of queueing behind it. If a worker dies mid-fetch, nothing needs cleaning up: the source becomes due again when the ten minutes pass.
+- **Completion is fenced.** Step 7 updates the row only `WHERE lease_token = $token`. A worker that outlived its lease (a long GC pause, a hung connection) finds its token replaced and its update matches nothing, so it cannot overwrite the newer crawler's validators or schedule.
+- **Validators advance last.** The new ETag is stored only after every item is durable (acknowledged by Kafka; committed locally). Storing it first would turn the next poll into a `304` and silently skip the items we failed to store.
+- **Backoff is durable and per source.** A failure schedules the next attempt `interval × 2^failures` ahead, capped at 24 hours, with ±10% jitter, and never sooner than `Retry-After`. For a 15-minute feed that is 30 minutes after one failure, 2 hours after three, and once a day after seven. The state lives in `crawl_schedule`, so it survives restarts and every worker sees it.
+- **Breakers are per source.** Within a process, `429`, `5xx` and timeouts count against that source's circuit breaker only. One publisher's bad afternoon never opens a breaker shared with nineteen healthy feeds.
+
+### Ingesting and clustering one article
 
 ```
-1. User submits GET /api/v1/search?q=election&topic=politics
-2. API Server builds Elasticsearch query:
-   - Full-text match on title + summary (English analyzer)
-   - Filter by topic if specified
-   - Sort by relevance + recency boost
-3. Elasticsearch returns document IDs + highlights
-4. API Server hydrates results with PostgreSQL data if needed
-5. Return JSON with highlighted snippets
+Cluster worker                           PostgreSQL    Elasticsearch
+       │                                      │              │
+       │ 1 BEGIN; INSERT ON CONFLICT (url)    │              │
+       │─────────────────────────────────────▶│              │
+       │ 2 new id (none: duplicate, stop)     │              │
+       │◀─────────────────────────────────────│              │
+       │ 3 lock the 4 band buckets            │              │
+       │─────────────────────────────────────▶│              │
+       │ 4 stories sharing a band, 48 h       │              │
+       │─────────────────────────────────────▶│              │
+       │ 5 ~70 candidates                     │              │
+       │◀─────────────────────────────────────│              │
+       │ 6 Hamming < 3? closest wins          │              │
+       │ 7 lock story, link, recount, COMMIT  │              │
+       │─────────────────────────────────────▶│              │
+       │ 8 index (after commit)                              │
+       │────────────────────────────────────────────────────▶│
+       │                                      │              │
 ```
 
-### Request Flow: Crawl Cycle
+- **Fingerprint.** SimHash tokenizes title and body, uses unigrams and word trigrams as features, hashes each to 64 bits (FNV-1a), adds +1/−1 per bit position and keeps the sign. Similar text gives fingerprints that differ in a few bits; two articles join when fewer than 3 of 64 bits differ.
+- **Bands.** The fingerprint is split into four 16-bit bands, stored as generated columns with an index each. Three differing bits can touch at most three bands, so any fingerprint within distance 3 shares at least one band exactly (the pigeonhole principle). Step 4 is therefore four indexed equality probes, and the exact Hamming check runs on ~70 candidates instead of a million stories.
+- **Locks.** Two workers can ingest near-duplicates at the same moment. Each first takes transaction-scoped advisory locks on its four `(band, value)` buckets, in ascending order. Near-duplicates share a bucket, so the second waits, then sees the first one's committed story and joins it instead of creating a twin. Ascending order rules out deadlocks.
+- **Counters and breaking.** After locking the story row, the worker recounts articles, distinct sources and the 30-minute velocity from the story's articles, so concurrent joins are never lost. A story becomes breaking when three or more distinct sources covered it in the window. Article time is the earlier of publication and arrival, so a newly added source's backlog doesn't look like a burst.
+
+### Serving a feed page
 
 ```
-1. Crawler Service runs on schedule (cron: every 15 minutes)
-2. Fetch list of due sources from PostgreSQL
-3. For each source (parallel, max 10 concurrent):
-   a. Check circuit breaker state for source domain
-   b. Fetch RSS/Atom feed with timeout (10s)
-   c. Parse feed, extract articles
-   d. For each article:
-      - Generate SimHash fingerprint (64-bit)
-      - Check PostgreSQL for existing fingerprint (Hamming distance <= 3)
-      - If duplicate: link to existing story cluster
-      - If new: insert article, create/update story cluster
-   e. Push article IDs to Redis queue for Elasticsearch indexing
-4. Index Worker:
-   - Pop article IDs from Redis queue (BLPOP)
-   - Bulk index to Elasticsearch
-   - Update story cluster aggregations
+Reader                          Feed API                         Redis   PostgreSQL
+   │                                │                              │          │
+   │ 1 GET /api/v1/feed?limit=20    │                              │          │
+   │───────────────────────────────▶│                              │          │
+   │                                │ 2 200 candidate stories, 48 h           │
+   │                                │────────────────────────────────────────▶│
+   │                                │ 3 score, sort, diversity penalty        │
+   │                                │ 4 SET feed:snap:{id} EX 900  │          │
+   │                                │─────────────────────────────▶│          │
+   │                                │ 5 hydrate ids 1-20                      │
+   │                                │────────────────────────────────────────▶│
+   │ 6 page + cursor {snap, 20}     │                              │          │
+   │◀───────────────────────────────│                              │          │
+   ····························· reader scrolls ·······························
+   │ 7 GET /api/v1/feed?cursor=...  │                              │          │
+   │───────────────────────────────▶│                              │          │
+   │                                │ 8 GET feed:snap:{id}         │          │
+   │                                │─────────────────────────────▶│          │
+   │                                │ 9 hydrate ids 21-40                     │
+   │                                │────────────────────────────────────────▶│
+   │ 10 next page, same ordering    │                              │          │
+   │◀───────────────────────────────│                              │          │
+   │                                │                              │          │
 ```
 
----
-
-## Core Components
-
-### 1. API Server (Node.js + Express)
-
-Serves the REST API for the frontend. Handles session-based authentication, rate limiting (100 req/min per IP, 20 for search), request validation, and response caching via Redis.
-
-### 2. Crawler Service
-
-Scheduled feed fetching with per-domain rate limiting (1 req/sec), circuit breakers per source, and retry with exponential backoff (1s, 5s, 30s). Crawl results are stored in PostgreSQL and pushed to an indexing queue.
-
-### 3. SimHash Deduplication Engine
-
-Generates 64-bit fingerprints from article content. Two articles with Hamming distance <= 3 are considered near-duplicates. O(1) comparison, 8 bytes per article, no ML dependencies.
-
-### 4. Multi-Signal Ranking Engine
-
-Combines weighted signals for personalized feed scoring:
+Each candidate gets a score from five signals, then a diversity pass:
 
 | Signal | Weight | Computation |
 |--------|--------|-------------|
-| Relevance | 35% | Topic match with user interests (cosine similarity) |
-| Freshness | 25% | Exponential decay with 6-hour half-life |
-| Quality | 20% | Source diversity, multi-source story coverage |
-| Trending | 10% | Velocity (articles/hour) in story cluster |
-| Breaking | +30% boost | Binary flag on story cluster |
+| Relevance | 0.35 | 0.3 base + learned topic weights (preferred topics count as at least 0.8) + 0.2 if a preferred source covers it; capped at 1 |
+| Freshness | 0.25 | `0.5 ^ (age_hours / 6)`, so it halves every six hours |
+| Quality | 0.20 | `min(source_count / 5, 1)`: independent coverage as a proxy for importance |
+| Trending | 0.10 | Velocity (articles/min over 30 min), decaying linearly to zero 30 minutes after the newest article |
+| Breaking | +0.30 | Flat bonus while flagged |
 
-### 5. PostgreSQL (Primary Data Store)
+After sorting, each story is multiplied by `0.8^n`, where `n` is the number of stories with the same primary topic already ranked above it. Stories covered only by sources the reader blocked are dropped before scoring.
 
-Articles, sources, users, preferences, story clusters, reading history. Transactional integrity for user operations. Indexes optimized for time-range queries and fingerprint lookups.
+**Snapshots.** The ranked id list (≤ 200 ids with scores) is stored as `feed:snap:{id}` for 15 minutes. `feed:current:{user}` points page-1 requests at the viewer's newest snapshot for 60 seconds, which is the feed cache. The cursor is an opaque base64url encoding of `{snapshot id, offset}`. A snapshot is only served to the viewer who created it, since another reader's ranking would reveal their interests. When a snapshot expires mid-scroll, the API ranks again and continues at the same offset, and the client drops any story it already shows. Hydration fetches the page's story rows and their three newest articles in two queries, so counts on the cards are current even though the order is frozen.
 
-### 6. Redis (Cache + Queue)
+### Search
 
-Session storage (TTL 24h), feed cache (TTL 60s), user preference cache (TTL 5min), global trending feed cache (TTL 30s), and article indexing queue (RPUSH/BLPOP pattern).
-
-### 7. Elasticsearch (Search Index)
-
-Full-text search with English analyzer, relevance scoring, topic aggregations. Search is a degradable feature: if Elasticsearch is down, feeds still work.
-
----
+Elasticsearch runs a `multi_match` over title (×3), summary (×2) and body with topic and date filters; hits are hydrated from PostgreSQL in rank order. If the Elasticsearch call fails, the same request runs against a generated `tsvector` column (title weight A, summary B, body C) with `websearch_to_tsquery` and `ts_rank_cd`. The response carries `engine: "elasticsearch" | "postgres"` so the UI can say results are basic matches.
 
 ## Database Schema
 
+### Production schema
+
 ```sql
-CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
-
--- Users
-CREATE TABLE users (
-  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  username VARCHAR(50) UNIQUE NOT NULL,
-  email VARCHAR(255) UNIQUE NOT NULL,
-  password_hash VARCHAR(255) NOT NULL,
-  role VARCHAR(20) DEFAULT 'user' CHECK (role IN ('user', 'admin')),
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
--- News sources
 CREATE TABLE sources (
-  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  name VARCHAR(255) NOT NULL,
-  domain VARCHAR(255) UNIQUE,
-  feed_url VARCHAR(500) NOT NULL,
-  category VARCHAR(50),
-  credibility_score DECIMAL(3, 2) DEFAULT 0.80,
-  crawl_frequency_minutes INTEGER DEFAULT 15,
-  is_active BOOLEAN DEFAULT true,
-  last_crawled_at TIMESTAMP,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  id            UUID PRIMARY KEY,
+  name          TEXT NOT NULL,
+  feed_url      TEXT NOT NULL UNIQUE,
+  domain        TEXT NOT NULL,                 -- politeness is per domain, not per feed
+  category      TEXT,
+  crawl_frequency_minutes INT NOT NULL DEFAULT 15,
+  priority      INT NOT NULL DEFAULT 5,
+  is_active     BOOLEAN NOT NULL DEFAULT true
 );
 
--- Story clusters (groups of related articles)
-CREATE TABLE stories (
-  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  title VARCHAR(500) NOT NULL,
-  summary TEXT,
-  primary_topic VARCHAR(50),
-  topics TEXT[] DEFAULT '{}',
-  entities JSONB DEFAULT '[]',
-  fingerprint BIGINT,
-  article_count INTEGER DEFAULT 1,
-  source_count INTEGER DEFAULT 1,
-  velocity DECIMAL(10, 4) DEFAULT 0,
-  is_breaking BOOLEAN DEFAULT FALSE,
-  breaking_started_at TIMESTAMP,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
--- Articles
-CREATE TABLE articles (
-  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  source_id UUID REFERENCES sources(id) ON DELETE CASCADE,
-  story_id UUID REFERENCES stories(id) ON DELETE SET NULL,
-  url VARCHAR(1000) UNIQUE NOT NULL,
-  title VARCHAR(500) NOT NULL,
-  summary TEXT,
-  body TEXT,
-  author VARCHAR(255),
-  image_url VARCHAR(500),
-  published_at TIMESTAMP,
-  crawled_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  fingerprint BIGINT,
-  topics TEXT[] DEFAULT '{}',
-  entities JSONB DEFAULT '[]',
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
--- User preferences
-CREATE TABLE user_preferences (
-  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  user_id UUID REFERENCES users(id) ON DELETE CASCADE UNIQUE,
-  preferred_topics TEXT[] DEFAULT '{}',
-  preferred_sources UUID[] DEFAULT '{}',
-  blocked_sources UUID[] DEFAULT '{}',
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
--- User reading history
-CREATE TABLE user_reading_history (
-  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  user_id UUID REFERENCES users(id) ON DELETE CASCADE,
-  article_id UUID REFERENCES articles(id) ON DELETE CASCADE,
-  story_id UUID REFERENCES stories(id) ON DELETE SET NULL,
-  read_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  dwell_time_seconds INTEGER DEFAULT 0,
-  UNIQUE(user_id, article_id)
-);
-
--- Topic weights (learned from behavior)
-CREATE TABLE user_topic_weights (
-  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  user_id UUID REFERENCES users(id) ON DELETE CASCADE,
-  topic VARCHAR(50) NOT NULL,
-  weight DECIMAL(5, 4) DEFAULT 0.1,
-  UNIQUE(user_id, topic)
-);
-
--- Crawl schedule
 CREATE TABLE crawl_schedule (
-  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  source_id UUID REFERENCES sources(id) ON DELETE CASCADE UNIQUE,
-  next_crawl TIMESTAMP NOT NULL,
-  priority INTEGER DEFAULT 5,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  source_id     UUID PRIMARY KEY REFERENCES sources(id) ON DELETE CASCADE,
+  next_crawl    TIMESTAMPTZ NOT NULL,          -- claiming pushes it ahead: that is the lease
+  lease_token   UUID,                          -- fencing token for completion
+  etag          TEXT,                          -- validators from the last fully stored 200
+  last_modified TEXT,
+  consecutive_failures INT NOT NULL DEFAULT 0, -- drives interval x 2^failures
+  last_status   INT,
+  last_error    TEXT
+);
+CREATE INDEX ON crawl_schedule (next_crawl);
+
+-- A unique index on a partitioned table must include the partition key, so URL
+-- uniqueness lives in a small unpartitioned table keyed by a hash of the URL.
+CREATE TABLE article_urls (
+  url_hash   BYTEA PRIMARY KEY,
+  article_id UUID NOT NULL
 );
 
--- Performance indexes
-CREATE INDEX idx_articles_story ON articles(story_id);
-CREATE INDEX idx_articles_source ON articles(source_id);
-CREATE INDEX idx_articles_published ON articles(published_at DESC);
-CREATE INDEX idx_articles_fingerprint ON articles(fingerprint);
-CREATE INDEX idx_stories_topics ON stories USING GIN(topics);
-CREATE INDEX idx_stories_velocity ON stories(velocity DESC) WHERE velocity > 0;
-CREATE INDEX idx_stories_breaking ON stories(is_breaking) WHERE is_breaking = true;
-CREATE INDEX idx_stories_created ON stories(created_at DESC);
-CREATE INDEX idx_reading_history_user ON user_reading_history(user_id);
-CREATE INDEX idx_crawl_schedule_next ON crawl_schedule(next_crawl);
+CREATE TABLE articles (
+  id           UUID NOT NULL,
+  source_id    UUID NOT NULL REFERENCES sources(id),
+  story_id     UUID,
+  url          TEXT NOT NULL,
+  title        TEXT NOT NULL,
+  summary      TEXT,
+  body         TEXT,
+  published_at TIMESTAMPTZ,
+  crawled_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  fingerprint  NUMERIC(20, 0) NOT NULL,        -- unsigned 64-bit SimHash
+  topics       TEXT[] NOT NULL DEFAULT '{}',
+  PRIMARY KEY (id, crawled_at)
+) PARTITION BY RANGE (crawled_at);             -- monthly partitions, dropped after 90 days
+CREATE INDEX ON articles (story_id, published_at DESC);
+
+CREATE TABLE stories (
+  id                  UUID PRIMARY KEY,
+  title               TEXT NOT NULL,
+  summary             TEXT,
+  primary_topic       TEXT,
+  topics              TEXT[] NOT NULL DEFAULT '{}',
+  fingerprint         NUMERIC(20, 0) NOT NULL, -- the first article's fingerprint
+  fp_band0 INT GENERATED ALWAYS AS (mod(fingerprint, 65536)::int) STORED,
+  fp_band1 INT GENERATED ALWAYS AS (mod(div(fingerprint, 65536), 65536)::int) STORED,
+  fp_band2 INT GENERATED ALWAYS AS (mod(div(fingerprint, 4294967296), 65536)::int) STORED,
+  fp_band3 INT GENERATED ALWAYS AS (div(fingerprint, 281474976710656)::int) STORED,
+  article_count       INT NOT NULL DEFAULT 1,
+  source_count        INT NOT NULL DEFAULT 1,
+  velocity            NUMERIC(10, 4) NOT NULL DEFAULT 0,
+  is_breaking         BOOLEAN NOT NULL DEFAULT false,
+  breaking_started_at TIMESTAMPTZ,
+  last_article_at     TIMESTAMPTZ NOT NULL,
+  created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+-- Band + window in one index, so the 48-hour filter is served by the index too.
+CREATE INDEX ON stories (fp_band0, last_article_at);
+CREATE INDEX ON stories (fp_band1, last_article_at);
+CREATE INDEX ON stories (fp_band2, last_article_at);
+CREATE INDEX ON stories (fp_band3, last_article_at);
+CREATE INDEX ON stories (breaking_started_at DESC) WHERE is_breaking;
+
+-- users, user_preferences (preferred_topics, preferred_sources, blocked_sources),
+-- user_reading_history UNIQUE (user_id, article_id), user_topic_weights UNIQUE (user_id, topic)
 ```
 
-### Elasticsearch Mapping
+Redis keys: `session:{id}` (24 h), `user:{id}:prefs` (ranking profile, 5 min), `feed:snap:{id}` (15 min), `feed:current:{user|anon}` (60 s), `feed:topic:{topic}:{cursor}:{limit}` (60 s), `feed:breaking` (30 s), `story:{id}` (2 min).
 
-```json
-{
-  "mappings": {
-    "properties": {
-      "article_id": { "type": "keyword" },
-      "title": { "type": "text", "analyzer": "english", "fields": { "exact": { "type": "keyword" } } },
-      "summary": { "type": "text", "analyzer": "english" },
-      "source_name": { "type": "keyword" },
-      "source_id": { "type": "keyword" },
-      "topics": { "type": "keyword" },
-      "published_at": { "type": "date" },
-      "crawled_at": { "type": "date" },
-      "story_cluster_id": { "type": "keyword" }
-    }
-  },
-  "settings": {
-    "number_of_shards": 1,
-    "number_of_replicas": 0,
-    "refresh_interval": "5s"
-  }
-}
+### Local schema
+
+The schema that actually runs is [`backend/src/db/init.sql`](./backend/src/db/init.sql). Every statement is guarded (`IF NOT EXISTS`, `ADD COLUMN IF NOT EXISTS`), so it can be loaded twice or over an older volume. Differences from the production design:
+
+- `articles` is not partitioned and has `url VARCHAR(1000) UNIQUE` directly; there is no `article_urls` table.
+- `sources.domain` is `UNIQUE`, so the local build allows one feed per domain (adding a second returns `409`).
+- Timestamps are `TIMESTAMP` without time zone; band indexes are single-column.
+- `articles.search_vector` is a generated `tsvector` with a GIN index, used only by the search fallback.
+
+The banding columns are generated by PostgreSQL itself, so no application code or seed has to keep them in sync:
+
+```sql
+ALTER TABLE stories ADD COLUMN IF NOT EXISTS fp_band0 INTEGER
+  GENERATED ALWAYS AS (mod(fingerprint, 65536)::integer) STORED;
+ALTER TABLE stories ADD COLUMN IF NOT EXISTS fp_band1 INTEGER
+  GENERATED ALWAYS AS (mod(div(fingerprint, 65536), 65536)::integer) STORED;
+ALTER TABLE stories ADD COLUMN IF NOT EXISTS fp_band2 INTEGER
+  GENERATED ALWAYS AS (mod(div(fingerprint, 4294967296), 65536)::integer) STORED;
+ALTER TABLE stories ADD COLUMN IF NOT EXISTS fp_band3 INTEGER
+  GENERATED ALWAYS AS (div(fingerprint, 281474976710656)::integer) STORED;
 ```
 
-### Redis Key Patterns
-
-| Pattern | Type | TTL | Purpose |
-|---------|------|-----|---------|
-| `session:{sessionId}` | Hash | 24h | User session data |
-| `user:{userId}:feed` | String (JSON) | 60s | Cached personalized feed |
-| `user:{userId}:prefs` | String (JSON) | 5m | Cached user preferences |
-| `feed:global` | String (JSON) | 30s | Cached global trending feed |
-| `index:queue` | List | None | Article IDs pending ES indexing |
-| `rate:{ip}` | String (count) | 60s | Rate limiting counter |
-| `crawl:lock:{sourceId}` | String | 5m | Distributed crawl lock |
-
----
+Fingerprints are stored as `NUMERIC(20, 0)`: SimHash is an unsigned 64-bit value, and a signed `BIGINT` rejects every fingerprint at or above 2⁶³.
 
 ## API Design
 
-### Core Endpoints
+### Production API
 
 ```
-# Feed
-GET  /api/v1/feed                 → Personalized feed (or trending for anonymous)
-GET  /api/v1/stories/:id          → Story detail with all source articles
-GET  /api/v1/search               → Full-text search with topic/date filters
-GET  /api/v1/topics               → List topics with article counts
-GET  /api/v1/trending             → Trending stories by velocity
-
-# User
-POST /api/v1/user/login           → Login (session-based)
-POST /api/v1/user/register        → Registration
-GET  /api/v1/user/preferences     → Get preferences
-PUT  /api/v1/user/preferences     → Update preferences (invalidates cache)
-
-# Admin
-GET  /api/v1/admin/sources        → List all sources with crawl status
-POST /api/v1/admin/sources        → Add new source
-PUT  /api/v1/admin/sources/:id    → Update source
-GET  /api/v1/admin/stats          → System stats (crawl rates, article counts)
-POST /api/v1/admin/crawl          → Trigger immediate crawl
+GET    /api/v1/feed?cursor&limit            ranked page + opaque next_cursor (snapshot-backed)
+GET    /api/v1/feed/topic/{topic}?cursor    stories with that topic, newest coverage first
+GET    /api/v1/breaking                     stories flagged in the last 6 h
+GET    /api/v1/trending                     most-covered stories of the last 24 h
+GET    /api/v1/stories/{id}                 story + up to 20 articles (all coverage)
+GET    /api/v1/search?q&topics&date_from&date_to   → {articles, engine}
+POST   /api/v1/user/login | /register | /logout
+GET    /api/v1/user/preferences             PUT replaces topics / preferred / blocked sources
+POST   /api/v1/user/reading-history         {article_id, dwell_time_seconds}; safe to retry
+POST   /api/v1/admin/sources                400 non-http(s) URL | 409 duplicate
+POST   /api/v1/admin/sources/{id}/crawl     crawl now under a lease → 200 | 409 already running
+POST   /api/v1/admin/stories/{id}/breaking  {is_breaking}
 ```
 
----
+- **Cursors are opaque.** Clients never compute offsets; a cursor names a snapshot and a position. Malformed or old numeric cursors restart from the top instead of erroring.
+- **Errors**: `400` for invalid input (non-UUID ids, unparseable dates, non-http(s) feed URLs), `401`/`403` for auth, `404` for unknown resources, `409` for a crawl already in progress or a duplicate source. Production would return them as `application/problem+json`; the local API returns `{error}`.
+- **The read signal is idempotent.** Only the first read of an article changes learned weights, and dwell time is a maximum, not a sum, so the client can retry freely.
+
+### Local routes
+
+| Route | Handler | Notes |
+|-------|---------|-------|
+| `GET /api/v1/feed`, `/feed/topic/:topic`, `/breaking`, `/trending`, `/stories/:id`, `/stories/:id/articles`, `/search`, `/topics` | [routes/feed.ts](./backend/src/routes/feed.ts) | Topic feed still paginates with numeric offsets |
+| `/api/v1/user/*` | [routes/user.ts](./backend/src/routes/user.ts) | Session cookie `session_id` or `X-Session-Id` header |
+| `/api/v1/admin/*` | [routes/admin.ts](./backend/src/routes/admin.ts) | `GET /sources` includes `consecutive_failures`, `last_status`, `last_error`, `conditional_get` |
+| `/health`, `/health/live`, `/health/ready`, `/health/detailed`, `/metrics` | [index.ts](./backend/src/index.ts) | Readiness requires PostgreSQL and Redis; Elasticsearch only degrades |
 
 ## Key Design Decisions
 
-### SimHash vs Semantic Embeddings for Deduplication
+### 1. Poll with conditional GETs and durable per-source backoff
 
-**Chosen: SimHash (64-bit fingerprint).**
+RSS has no reliable push: WebSub exists but few publishers support it, so polling is the baseline and WebSub is an optimization to add later. What makes polling affordable is the conditional GET. With the ETag and Last-Modified from the last good response, an unchanged feed costs a `304` with no body, and about three polls in four are unchanged. A naive crawler that re-downloads everything spends four times the bandwidth and parse CPU, and publishers notice.
 
-At 2M articles/day, computing semantic embeddings for every article would require GPU inference at ~100ms per article, adding 55 GPU-hours of daily compute. SimHash generates a 64-bit fingerprint from word frequencies in O(n) time with zero dependencies. Two fingerprints are compared via Hamming distance in O(1), and a threshold of <= 3 bits identifies near-duplicates with high precision for news content where duplicates are literal copies or minor rewrites.
+Backoff has to be durable and per source. The original design retried failed feeds on every 15-minute cycle, and when a feed's circuit breaker opened it fell back to a shared "global" breaker with immediate retries. That sent *more* requests to a failing publisher, and let one publisher's errors open a breaker other feeds depended on. Exponential backoff stored in `crawl_schedule` survives restarts, is shared by all workers, and honors `Retry-After`. The cost is staleness for flaky-but-important sources: after a bad hour, a feed may wait a few hours for its next attempt. A `priority` column and a lower cap for priority sources address that.
 
-The trade-off is accuracy on paraphrased content. If Reuters and AP write completely different articles about the same event, SimHash will not detect them as duplicates. Story clustering handles this partially: articles with overlapping keywords and entities are clustered together even if their fingerprints differ. For a news aggregator, this is acceptable: showing two genuinely different takes on the same story adds value rather than being noise.
+### 2. Leases with `SKIP LOCKED` and fencing tokens for scheduling
 
-### Elasticsearch vs PostgreSQL Full-Text Search
+Three alternatives fail in specific ways. A cron per instance crawls every due feed once per instance. A single scheduler with a global lock is a bottleneck and a single point of failure. A Redis lock per feed needs expiry and fencing anyway, and lives apart from the schedule it protects. Claiming rows with `FOR UPDATE SKIP LOCKED` keeps the queue and the lease in one table: workers never block each other, a crash releases work by itself, and the fencing token stops a worker that outlived its lease from overwriting newer state. At about 56 claims per second PostgreSQL is far from its limit. Beyond a few million feeds I would partition the schedule by hash of source id.
 
-**Chosen: Elasticsearch for search, PostgreSQL for primary data.**
+### 3. SimHash with four 16-bit bands, not a scan, MinHash or embeddings
 
-PostgreSQL's `tsvector`/`tsquery` works well for simple keyword search, but news search demands relevance scoring with field boosting (title matches worth more than body), phrase matching, and faceted results (counts per topic, per source). Elasticsearch's BM25 scoring, built-in analyzers, and aggregation framework handle this natively. The English analyzer also handles stemming and stop words.
+| Approach | Where it breaks |
+|----------|-----------------|
+| ❌ Exact hash of the text | Any change in wording, punctuation or a byline produces a different hash; catches only verbatim reposts |
+| ❌ Linear scan of recent fingerprints | 1.2M comparisons per article at production scale; cost grows with exactly the busy news days that matter |
+| ⚠️ MinHash + LSH | Better Jaccard estimates, but ~100 hashes per document and tunable band/row trade-offs to store and reason about |
+| ⚠️ Sentence embeddings | Catch paraphrases SimHash misses, but need model inference per article, a vector index and a fuzzier threshold |
+| ✅ SimHash + 4×16-bit bands | 8 bytes per document, four indexed equality probes, and guaranteed recall for distance ≤ 3 |
 
-The cost is an additional service to operate and an eventual consistency gap: articles are searchable ~5 seconds after crawling (ES refresh interval). This is acceptable for a news aggregator where users search for topics, not breaking-second updates. Elasticsearch is also a degradable dependency: if it fails, feeds continue working from PostgreSQL and search returns a "temporarily unavailable" message.
+What we give up is paraphrase blindness. Two outlets that write the same news in different words get different fingerprints and become two stories. That is acceptable because the main win is collapsing wire-service copies, which SimHash catches. An embedding pass over *candidate pairs* (same entities, same hour) is the natural next step, and it is cheap because it only runs on pairs SimHash didn't merge.
 
-### Redis Lists vs RabbitMQ for Index Queue
+### 4. A story is its first fingerprint plus a 48-hour activity window
 
-**Chosen: Redis Lists (RPUSH/BLPOP).**
+A story keeps the fingerprint of its first article and accepts articles while its newest article is less than 48 hours old. That window slides, so a developing story stays open while coverage keeps arriving, and coincidental matches against old stories are ruled out. The alternative, a running centroid of all member fingerprints, drifts as the story evolves and makes the band index churn on every update. The cost is non-transitivity: B can match A, and C can match B but not A, so C starts its own story. Advisory locks on band buckets make concurrent ingestion produce the same result as serial ingestion. They don't make clustering transitive.
 
-The article indexing queue is a simple FIFO: crawlers produce article IDs, the index worker consumes them. Redis Lists provide this with zero additional infrastructure since Redis is already running for caching and sessions. BLPOP blocks efficiently when the queue is empty (no polling). Idempotent Elasticsearch upserts make at-least-once delivery safe.
+### 5. Snapshot pagination over a ranked list
 
-RabbitMQ would add routing, acknowledgments, and dead letter exchange capabilities, but these are unnecessary for an indexing pipeline where reprocessing an article is cheap and harmless. The memory overhead of a RabbitMQ instance (256 MB+) is not justified for this use case.
+Offset pagination over a live ranking produces duplicates and gaps. Between page 1 and page 2, freshness decays, new stories arrive and the breaking flag changes, so items shift across page boundaries. Keyset pagination doesn't apply either, because there is no stable sort key: the score itself moves. Freezing the ranked id list for the length of a scroll (15 minutes) makes pages disjoint and complete. Precomputing feeds per user (fan-out on write) would also be consistent, but at 5M readers and ~70 new articles per second it would rewrite millions of lists per minute for feeds that are mostly never opened. Snapshots are computed only for readers who show up. The cost is Redis memory (~13 GB at peak) and slightly stale ordering within one scroll. Card contents are hydrated live, so counts are current.
 
----
+### 6. Breaking news from distinct-source velocity
 
-## Caching Strategy
+Raw article velocity is easy to fake by accident: one prolific source, or a new source's backlog, produces a burst of articles about nothing. Counting *distinct* sources within 30 minutes, by publication time capped at arrival time, measures independent confirmation, which is what "breaking" means. The flag expires from the banner after six hours. The threshold (3 sources) is a global constant, which is wrong for niche topics where three outlets is a lot. Per-topic thresholds are an open refinement.
 
-### Cache-Aside Pattern
+### 7. Elasticsearch as a derived index, PostgreSQL full-text as the fallback
 
-All caching uses cache-aside (lazy loading): check cache first, on miss fetch from source, store in cache with TTL, return result.
+PostgreSQL is the source of truth; Elasticsearch is rebuilt from it. Search needs BM25 relevance across weighted fields, fuzzy matching and highlighting, which `ts_rank` does only coarsely. So Elasticsearch serves search while it is healthy, and a GIN-indexed `tsvector` keeps search working, with worse ranking, when it isn't. Indexing happens after the article commits. Production feeds the indexer from an event stream with retries, and a reindex job repairs drift.
 
-| Cache Type | TTL | Invalidation Strategy |
-|------------|-----|----------------------|
-| User session | 24 hours | Explicit logout or expiry |
-| Personalized feed | 60 seconds | TTL expiry only |
-| Global trending | 30 seconds | TTL expiry only |
-| User preferences | 5 minutes | Invalidate on PUT /preferences |
-| Source list | 10 minutes | Invalidate on admin changes |
+## Consistency and Idempotency
 
-### Why Feed Caching Matters
+- **One article per URL.** `INSERT … ON CONFLICT (url) DO NOTHING RETURNING id`. Re-crawls, overlapping crawls and replayed Kafka messages are no-ops. (The previous check-then-insert raced between instances.)
+- **One transaction per article.** Insert, band locks, story lookup, story link and counter refresh commit together. A crash can't leave an article without a story, which matters because the URL constraint would then stop it from ever being processed again.
+- **One crawler per feed.** Leases plus fencing tokens, as above. Two admins pressing "crawl now" at once get one `200` and one `409`.
+- **Validators after durability.** The ETag advances only when every item from that response is stored.
+- **Read signals are idempotent.** `RETURNING (xmax = 0) AS inserted` tells a fresh history row from an upsert; weights change only for the fresh one, and dwell time is `GREATEST(old, new)`.
+- **Feeds are consistent within a scroll** (snapshot) and eventually consistent across scrolls (60-second page-1 reuse).
 
-Without caching, every feed request requires: PostgreSQL queries for candidate stories (200+ rows), user preference lookups, ranking algorithm execution, and article enrichment. With 10K requests/second at peak, this would require massive database capacity. A 60-second cache reduces database load by ~99.8%, returning cached responses in < 20ms vs 100-200ms for computed feeds. The staleness is invisible to users: news content changes on a 15-minute crawl cycle, so a 60-second cache never misses an article.
+| Write | Invalidates |
+|-------|-------------|
+| Crawl stored new articles | Anonymous `feed:current:anon`, topic pages, breaking, trending |
+| Preferences saved | `user:{id}:prefs` and `feed:current:{id}`, so the next page 1 uses the new preferences |
+| First read of an article | `user:{id}:prefs` only; the scroll in progress keeps its snapshot |
+| Admin breaking toggle | `feed:breaking` and `story:{id}` |
 
----
+## Security / Auth
 
-## Security
-
-### Authentication
-
-Session-based authentication with Redis store. Passwords hashed with bcrypt (cost factor 12). Session cookies set with HttpOnly, Secure (in production), SameSite=Lax, 24-hour expiry.
-
-### Authorization (RBAC)
-
-| Role | Permissions |
-|------|-------------|
-| `user` | Read feeds, search, update own preferences, reading history |
-| `admin` | All user permissions + manage sources, view stats, trigger crawls |
-
-### Rate Limiting
-
-| Endpoint | Limit | Rationale |
-|----------|-------|-----------|
-| General API | 100 req/min per IP | Standard abuse prevention |
-| Search | 20 req/min per IP | Search is expensive (Elasticsearch) |
-| Login | 5 attempts/min per IP | Brute force protection |
-
-### Input Validation
-
-All queries use parameterized statements for SQL injection prevention. Search queries are trimmed, length-limited (200 chars), and escaped. Topic filters validated against alphanumeric pattern.
-
----
+- **Passwords** are hashed with scrypt (N=2¹⁴, r=8, p=1, 16-byte random salt per hash) and compared in constant time. The hash string records its parameters, so the cost can be raised later. Hashes from the old salted-SHA-256 scheme still verify once and are replaced at that login.
+- **Sessions** are random ids in Redis (24 h) in an `HttpOnly`, `SameSite=Lax` cookie, `Secure` in production. Logout deletes the session. Admin routes check the role stored in the session.
+- **Third-party content.** Article links are accepted only as absolute `http:`/`https:` URLs at ingestion, so a hostile feed can't plant a `javascript:` link. React escapes all text, and links open with `rel="noopener noreferrer"`.
+- **SSRF.** Feed URLs are fetched server-side. Production must resolve each host and refuse private, loopback and link-local addresses (or fetch through an egress proxy), or an admin-added "feed" can probe internal services.
+- **Rate limits** (production): login 5/min per IP and account, search 20/min per IP, and a per-domain fetch budget enforced by the fetchers themselves.
 
 ## Observability
 
-### Prometheus Metrics
+| Metric | Type | Why |
+|--------|------|-----|
+| `crawler_fetch_total{status}` (`success`, `not_modified`, `error`, `timeout`, `circuit_open`) | Counter | The `not_modified` share shows whether conditional GETs work; a drop means validators are being lost |
+| `crawler_fetch_duration_seconds{source_id}` | Histogram | Slow publishers |
+| `story_assignments_total{result}` (`joined`, `created`) | Counter | Clustering health: a shift in the joined share signals a tokenizer or threshold regression |
+| `articles_stored_total`, `articles_fetched_total` | Counter | Ingestion rate vs. feed volume (duplicate rate) |
+| `feed_generation_duration_seconds{type,cached}` | Histogram | Snapshot reuse vs. fresh ranking latency |
+| `cache_hits_total`, `cache_misses_total{cache_type}` | Counter | Profile and snapshot hit ratios |
+| `circuit_breaker_state{name}` | Gauge | Per-source breaker states |
 
-| Metric | Type | Purpose |
-|--------|------|---------|
-| `http_request_duration_seconds` | Histogram | Track API latency against SLOs |
-| `feed_generations_total` | Counter | Monitor feed request volume |
-| `cache_hits_total` / `cache_misses_total` | Counter | Calculate cache hit rate |
-| `crawler_fetch_total` | Counter | Track crawl success/failure rates |
-| `circuit_breaker_state` | Gauge | Monitor source health (0=closed, 1=open, 2=half-open) |
-| `articles_stored_total` | Counter | Track content ingestion rate |
-| `index_queue_depth` | Gauge | Number of articles pending indexing |
-
-### Key Alerting Thresholds
-
-| Metric | Warning | Critical | Action |
-|--------|---------|----------|--------|
-| API p95 latency | > 300ms | > 1s | Check DB queries, cache hit rate |
-| Error rate | > 1% | > 5% | Check logs, investigate errors |
-| Cache hit rate | < 70% | < 50% | Review cache TTLs, warm cache |
-| Index queue depth | > 500 | > 2000 | Scale index workers |
-| Crawl failure rate | > 10% | > 30% | Check network, source health |
-
-### Structured Logging
-
-Pino-based JSON logging with consistent fields: timestamp, level, service name, source ID, trace ID. Request logging middleware records method, path, status, duration, user ID. Pretty-printed in development, raw JSON in production.
-
-### Health Checks
-
-| Endpoint | Purpose | Checks |
-|----------|---------|--------|
-| `/health` | Liveness probe | Process running |
-| `/health/live` | K8s liveness | Simple OK |
-| `/health/ready` | Readiness probe | PostgreSQL + Redis + Elasticsearch (ES degraded OK) |
-| `/health/detailed` | Debugging | All above + connection pool stats, circuit breaker states, cache stats |
-
----
+Alerts I'd set: `not_modified` share below 50% for an hour; more than 5% of active sources with `consecutive_failures ≥ 3`; repeated "lease expired" warnings, meaning crawls are outliving their lease; p99 feed latency above 200 ms; Elasticsearch fallback in use for more than 5 minutes. Logs are structured JSON (Pino) with `sourceId`, outcome, status and next-crawl delay on every crawl.
 
 ## Failure Handling
 
-### Circuit Breakers for RSS Sources
-
-Each RSS source gets its own circuit breaker (Opossum library). A single slow or unresponsive source cannot block the crawler thread, exhaust connection pool slots, or delay crawling of healthy sources.
-
-**Configuration:**
-- Timeout: 10 seconds
-- Error threshold: 50% of requests
-- Reset timeout: 30 seconds (half-open test)
-- Volume threshold: 5 requests before tripping
-
-### Retry Strategy
-
-Exponential backoff with jitter for RSS fetch failures:
-- Retry 1: ~1 second
-- Retry 2: ~5 seconds
-- Retry 3: ~30 seconds
-- Total worst-case: ~36 seconds per source
-
-Only transient failures are retried. Permanent failures (404, 410 Gone) update the source's `last_error` field.
-
-### Idempotent Operations
-
-Article insertion uses `ON CONFLICT (url) DO NOTHING` for safe replay. Elasticsearch indexing uses upsert by article UUID. Duplicate processing has no side effects.
-
-### Graceful Degradation
-
-| Component Failure | Degraded Behavior |
-|-------------------|-------------------|
-| Redis unavailable | Sessions fail (re-login required), feeds uncached but functional |
-| Elasticsearch unavailable | Search returns "temporarily unavailable", feeds still work |
-| PostgreSQL unavailable | Full outage (primary data store) |
-| Individual source down | Circuit opens, other sources continue, retry on next cycle |
-
----
+| Failure | Behavior |
+|---------|----------|
+| A feed is down or rate-limits us | Backoff `interval × 2^n` (≤ 24 h), at least `Retry-After`; other feeds unaffected |
+| Fetcher crashes mid-crawl | Lease expires after 10 min, source becomes due again; inserts are idempotent |
+| Fetcher outlives its lease | Its completion update matches nothing (fencing token); a warning is logged |
+| Item fails to store | Validators are not advanced; the next poll refetches the full body |
+| Elasticsearch down | Search answers from PostgreSQL full-text search (`engine: postgres`); the API starts and stays ready without it |
+| Redis down | Readers are treated as logged out; feeds still compute, more slowly and without snapshot reuse (a later page may repeat a story, which the client drops) |
+| PostgreSQL down | Reading fails (readiness turns `503`); fetchers keep polling into Kafka in production |
+| Kafka down (production) | Fetchers stop claiming; feeds keep serving what is stored |
 
 ## Scalability Considerations
 
-### Horizontal Scaling Path
+What breaks first as the system grows, in order:
 
-1. **API Servers**: Stateless, scale behind load balancer
-2. **Crawlers**: Partition sources by domain hash, run multiple crawler instances
-3. **PostgreSQL**: Read replicas for feed queries, partition articles by month
-4. **Redis**: Redis Cluster for cache sharding at > 1GB
-5. **Elasticsearch**: Add nodes, increase shard count for search scaling
-
-### What Breaks First
-
-At 100x scale (500M articles/month):
-- **Fingerprint lookups**: Hamming distance scan becomes expensive. Solution: locality-sensitive hashing index or bit-manipulation tricks.
-- **Feed computation**: Even with caching, cache misses at 10K RPS require fast ranking. Solution: pre-compute feeds in background workers.
-- **Elasticsearch index size**: 18 TB/year at full text. Solution: rolling indices with lifecycle management.
-
----
+1. **Ranking CPU and candidate queries.** Every fresh snapshot scores 200 candidates. Cache the candidate pool per region for 30 seconds and personalize only the scoring, and keep snapshots small (ids only).
+2. **Hot story rows.** A huge story gets dozens of articles a minute, and each recount scans all its articles under the row lock. At scale I'd keep counters incrementally (a per-story source set in Redis or a `story_sources` table) instead of recounting.
+3. **The schedule table.** Fine to a few million feeds; beyond that, partition by hash of source id and give each worker pool a partition range.
+4. **Article storage and indexing.** Monthly partitions with 90-day retention; Elasticsearch rolling indices with lifecycle management.
+5. **Per-domain politeness across workers.** In-process pacing stops working once one domain's feeds land on many workers. Route feeds to workers by hash of domain, or keep a token bucket per domain in Redis.
 
 ## Trade-offs Summary
 
 | Decision | Chosen | Alternative | Rationale |
 |----------|--------|-------------|-----------|
-| Deduplication | SimHash (64-bit) | Semantic embeddings | O(1) comparison, no ML dependencies, sufficient for news |
-| Search engine | Elasticsearch | PostgreSQL full-text | Better relevance scoring, facets, gracefully degradable |
-| Index queue | Redis Lists | RabbitMQ | Already running, simpler, idempotent consumers |
-| Database | PostgreSQL + JSONB | MongoDB | SQL joins for stories+articles, JSONB for flexible fields |
-| Feed caching | 60s TTL | Real-time computation | 99.8% DB load reduction, invisible staleness |
-| Auth | Session + Redis | JWT | Immediate revocation, simpler for learning |
-| Crawl scheduling | node-cron in-process | Dedicated scheduler service | Simpler for single-process deployment |
-
----
-
-## Frontend Architecture
-
-This section documents the React frontend implementation, covering component hierarchy, state management, routing, data fetching, and key UI patterns.
-
-### Component Hierarchy
-
-```
-__root.tsx (Root Layout)
-├── Header (components/Header.tsx)
-│   ├── Logo + brand "NewsAgg"
-│   ├── Navigation links (Feed, Trending, Topics, Search)
-│   ├── Auth state display (login/register or user menu)
-│   └── Admin link (conditional on role)
-├── index.tsx (Feed Page)
-│   └── StoryCard list with topic badges, source counts, breaking indicators
-├── trending.tsx (Trending Stories)
-│   └── StoryCard list sorted by velocity
-├── topics.index.tsx (Topics Overview)
-│   └── Topic grid with article counts
-├── topics.$topic.tsx (Topic Feed)
-│   └── StoryCard list filtered by selected topic
-├── story.$storyId.tsx (Story Detail)
-│   └── Story metadata + list of source articles with links
-├── search.tsx (Search Page)
-│   └── Search input, topic/date filters, article result list
-├── settings.tsx (User Settings)
-│   └── Preferred topics selector, blocked sources
-├── admin.tsx (Admin Dashboard)
-│   └── Source list, add/edit/delete sources, crawl triggers, system stats
-├── login.tsx / register.tsx (Auth Pages)
-```
-
-### Shared Components
-
-- **`Header`** (`components/Header.tsx`) -- Top navigation bar with route links, auth state, and responsive layout. Extracted as a shared component used by the root layout.
-- **`StoryCard`** (`components/StoryCard.tsx`) -- Reusable card displaying a story's title, summary, topics (as badges), source count, article count, and relative timestamp. Used on the feed, trending, and topic pages.
-- **`TopicBadges`** (`components/TopicBadges.tsx`) -- Renders an array of topic names as colored pill badges. Used inside StoryCard and on the story detail page.
-
-### Zustand Stores
-
-The frontend uses two Zustand stores:
-
-**`useAuthStore`** (`stores/index.ts`) -- Manages user authentication and preferences. Uses `zustand/middleware/persist` to save the user object to `localStorage` for session restoration. On login, it automatically fetches user preferences (preferred topics, blocked sources) to enable personalized feed ranking. The `updatePreferences` action sends a PUT request and updates the local state in one step.
-
-**`useFeedStore`** (`stores/index.ts`) -- Manages news feed state including the story list, pagination cursor, loading/error states, and selected topic filter. Supports two operations: `setStories` (replaces the list, used for initial load and refresh) and `appendStories` (appends to the list, used for infinite scroll "load more"). Changing the `selectedTopic` resets the story list and cursor to start a fresh filtered fetch. This store does not persist to storage -- the feed always starts fresh on page load.
-
-### Routing
-
-The frontend uses TanStack Router with file-based routing. The route structure mirrors the content hierarchy:
-
-- `/` -- personalized feed (or global trending for anonymous users)
-- `/trending` -- stories sorted by velocity (article count growth rate)
-- `/topics` -- overview of all topics with story counts
-- `/topics/$topic` -- feed filtered by a specific topic (dynamic route segment)
-- `/story/$storyId` -- story detail page with all source articles (dynamic route segment)
-- `/search` -- full-text search with topic and date filters
-- `/settings` -- user preference management (preferred topics, blocked sources)
-- `/admin` -- source management and system stats (admin role required)
-- `/login`, `/register` -- authentication pages
-
-The root layout calls `Header` and wraps child routes in a centered content area via `Outlet`.
-
-### Data Fetching
-
-API communication is organized into three client modules (`services/api.ts`):
-
-- **`feedApi`** -- Feed retrieval (`getFeed`, `getTopicFeed`, `getTrending`, `getBreaking`), story details, story articles, search, and topics listing. Uses cursor-based pagination for feed endpoints.
-- **`userApi`** -- Authentication (login, register, logout, session check), preference management, reading history recording, and available topics.
-- **`adminApi`** -- Source CRUD, manual crawl triggers, article listing, breaking news management, and system stats.
-
-All API methods use a shared `fetchApi` wrapper that includes `credentials: 'include'` for session cookie-based authentication, sets JSON content type, and extracts error messages from response bodies. Data fetching is triggered from route components via `useEffect` hooks or from store actions.
-
-### Key UI Patterns
-
-- **Cursor-based pagination**: The feed uses cursor-based pagination rather than offset-based. Each API response includes a `next_cursor` and `has_more` flag. The feed store's `appendStories` action appends new stories without re-fetching previous pages, enabling efficient infinite scroll.
-- **Topic filtering with state reset**: When the user selects a topic in the feed store, the stories array, cursor, and hasMore flag are all reset to initial values, triggering a fresh fetch from the first page of the filtered feed.
-- **Reading history tracking**: When a user views a story detail page, the frontend can record the read event via `userApi.recordRead`, including dwell time. This implicit signal feeds back into the ranking algorithm's relevance scoring.
-- **Conditional personalization**: The feed endpoint returns personalized results for authenticated users (weighted by topic preferences and reading history) and falls back to global trending for anonymous visitors, with no UI change required.
-- **Session restoration**: The auth store persists only the user object (not preferences) to localStorage. On page load, the stored user enables immediate rendering of the authenticated UI while preferences are re-fetched from the API.
-
----
-
-## Deep Pattern Explanations
-
-This section explains each production-grade pattern implemented in the backend, written for readers who may be encountering these concepts for the first time.
-
-### RBAC (Role-Based Access Control)
-
-RBAC is an authorization model where permissions are assigned to roles rather than individual users, and users are assigned one or more roles. Instead of checking "can user X manage sources?" the system checks "does user X have a role that includes the manage-sources permission?"
-
-In this project, there are two roles: `user` and `admin`. Regular users can read feeds, search, and manage their own preferences and reading history. Admins get all user permissions plus the ability to manage sources, view system stats, and trigger crawls. When a request arrives, the auth middleware extracts the user's role from their session and checks whether that role permits the requested operation.
-
-The key advantage over per-user permission lists is simplicity: with 5M users, you manage 2 role definitions instead of 5M permission sets. The trade-off is granularity -- you cannot give one specific user elevated crawl permissions without promoting them to full admin. For a news aggregator, this coarse-grained model is appropriate because the admin operations (source management) are infrequent and high-trust.
-
-### Redis Cache-Aside
-
-Cache-aside (also called "lazy loading") is a caching strategy where the application code is responsible for managing the cache. On every read, the application first checks the cache. If the data is there (a "cache hit"), it returns immediately. If not (a "cache miss"), the application fetches from the database, stores the result in the cache with a TTL (time-to-live), and then returns it.
-
-In this project, cache-aside is used at multiple levels: personalized feeds (60-second TTL), global trending feed (30-second TTL), user preferences (5-minute TTL), and source lists (10-minute TTL). At 10K feed requests/second at peak, a 60-second cache reduces database load by 99.8% -- only the first request in each 60-second window actually hits PostgreSQL and runs the ranking algorithm. Subsequent requests get the cached JSON in under 20ms.
-
-Cache-aside differs from "write-through" caching (where every write updates both the cache and the database simultaneously). Cache-aside is simpler because it does not require the cache to participate in write operations. The trade-off is staleness: after an article is crawled and inserted into PostgreSQL, it will not appear in cached feeds until the feed cache TTL expires. For a news aggregator with a 15-minute crawl cycle, a 60-second cache staleness window is invisible.
-
-### Circuit Breaker
-
-A circuit breaker is a stability pattern that prevents a failing service from being called repeatedly, giving it time to recover. It works like an electrical circuit breaker: when failures exceed a threshold, the breaker "opens" and immediately rejects all requests for a cooldown period, rather than letting them pile up and make the problem worse.
-
-The circuit breaker has three states. In the **closed** state (normal operation), requests flow through to the downstream service. If failures exceed a configured threshold (50% of requests in this project), the breaker transitions to the **open** state. In the open state, all requests are immediately rejected without contacting the downstream service. After a configured timeout (30 seconds), the breaker enters the **half-open** state, where it allows a small number of test requests through. If those succeed, the breaker closes again; if they fail, it reopens.
-
-In this project, each RSS source gets its own circuit breaker (via the Opossum library). This is critical because the crawler fetches from hundreds of different sources. If one source's server is down or responding slowly (10+ second timeouts), its circuit breaker opens, and the crawler skips it on subsequent cycles without wasting time or connection pool slots. Other sources continue to be crawled normally. Without per-source circuit breakers, a single slow source could exhaust the crawler's concurrency limit and delay all other sources.
-
-### Structured Logging
-
-Structured logging means emitting log entries as machine-parseable data (typically JSON objects) rather than free-form text strings. Instead of `console.log('Crawled source Reuters, found 15 articles')`, structured logging produces `{"level":"info","sourceId":"abc","sourceName":"Reuters","articlesFound":15,"crawlDuration":1234,"timestamp":"..."}`.
-
-This project uses Pino, a high-performance JSON logger for Node.js. Every log entry includes a consistent set of fields: timestamp, log level, and service name. The request logging middleware (pino-http) automatically adds method, path, status code, duration, and user ID to every HTTP request log. In development, logs are pretty-printed for readability; in production, raw JSON is emitted for ingestion by log aggregation tools.
-
-The primary advantage is queryability. When investigating why a specific source's crawl failed, you can filter logs by `sourceId` and `level=error` to find the exact failure. With unstructured text logs, you would need to write fragile regex patterns to extract the same information.
-
-### Prometheus Metrics
-
-Prometheus is a time-series monitoring system that collects numerical metrics from applications by periodically "scraping" an HTTP endpoint (typically `/metrics`). The application exposes counters, histograms, and gauges in a text format that Prometheus understands, and Prometheus stores and queries this data over time.
-
-The three main metric types used in this project are:
-- **Counters**: Values that only go up (e.g., `crawler_fetch_total`, `cache_hits_total`). Useful for computing rates (crawls per minute, cache hit ratio).
-- **Histograms**: Track the distribution of values (e.g., `http_request_duration_seconds`). Prometheus computes percentiles (p50, p95, p99) from histogram buckets, enabling latency SLO monitoring like "API p95 < 200ms."
-- **Gauges**: Values that go up or down (e.g., `circuit_breaker_state`, `index_queue_depth`). Useful for tracking current state -- for example, knowing how many articles are waiting for Elasticsearch indexing.
-
-Each metric has labels that add dimensions. For example, `crawler_fetch_total{source="reuters",status="success"}` lets you independently track crawl outcomes per source. The alerting thresholds defined in the Observability section (e.g., "cache hit rate < 50% = critical") are implemented as Prometheus alerting rules that evaluate against these metrics.
-
-### Rate Limiting
-
-Rate limiting restricts how many requests a client can make within a time window. It protects the system from abuse, prevents any single client from monopolizing resources, and ensures fair access for all users.
-
-This project implements per-IP rate limiting with different thresholds per endpoint:
-- General API: 100 requests/minute (standard abuse prevention)
-- Search: 20 requests/minute (search is expensive because it hits Elasticsearch)
-- Login: 5 attempts/minute (brute force protection)
-
-The implementation uses Redis counters keyed by IP address with a 60-second TTL. When a request arrives, the counter is atomically incremented. If it exceeds the limit, the server returns HTTP 429 (Too Many Requests) with a `Retry-After` header. The rate limit key includes the IP and the current minute, so the counter automatically resets each minute without cleanup.
-
-The search endpoint gets a tighter limit because each search query involves an Elasticsearch query with text analysis, scoring, and aggregation -- significantly more expensive than a feed request that might be served from Redis cache. Without search rate limiting, a single client could degrade search performance for all users.
-
-### Idempotency
-
-Idempotency means that performing the same operation multiple times produces the same result as performing it once. In a news aggregator, this prevents duplicate articles when the crawler processes the same RSS feed entry twice.
-
-This project achieves idempotency through database constraints: article insertion uses `ON CONFLICT (url) DO NOTHING`. If the crawler encounters the same article URL during a re-crawl (which happens every 15 minutes), the insert is silently skipped. Similarly, Elasticsearch indexing uses upsert by article UUID -- re-indexing the same article overwrites the existing document rather than creating a duplicate.
-
-Reading history recording uses a composite unique constraint `(user_id, article_id)`. If a user opens the same article twice, only one reading history entry is created. These constraint-based approaches are simpler than explicit idempotency key management (as used in the notification system) because the operations are naturally idempotent -- there is no side effect beyond data storage.
-
-### Health Checks
-
-Health checks are HTTP endpoints that report whether a service is alive and ready to handle traffic. They are consumed by load balancers, container orchestrators (Kubernetes), and monitoring systems to make automated decisions about routing and restarts.
-
-This project implements four health check tiers:
-- **`/health`** (liveness): Returns 200 if the process is running. No dependency checks.
-- **`/health/live`** (K8s liveness probe): Simple OK response. If this fails, the orchestrator restarts the container.
-- **`/health/ready`** (readiness probe): Checks PostgreSQL and Redis connectivity. Elasticsearch failure is treated as "degraded" rather than "not ready" because search is a degradable feature -- feeds still work without it.
-- **`/health/detailed`** (debugging): Returns all dependency statuses plus connection pool statistics and circuit breaker states for each RSS source. This endpoint is used for monitoring dashboards and incident investigation, not for automated routing.
-
-The distinction between readiness and liveness is important: if PostgreSQL is temporarily unreachable, the service is alive (do not restart it) but not ready (do not route traffic to it). If Elasticsearch is down, the service is still ready because feeds work without search -- only the `/health/detailed` endpoint shows the degradation.
-
----
+| Feed freshness | Polling + conditional GET | Full re-download each poll | ~75% of polls become 304s; publishers stay friendly |
+| Failure policy | Durable per-source exponential backoff | Retry every cycle / global breaker | Isolates failures; honors Retry-After; survives restarts |
+| Scheduling | `SKIP LOCKED` lease + fencing token | Cron per instance, global lock | No double crawls, no coordinator, crash-safe |
+| Near-duplicates | SimHash + 4×16 bands | Linear scan, MinHash, embeddings | Indexed lookup, guaranteed recall ≤ 3 bits, 8 bytes/doc |
+| Story identity | First fingerprint + 48 h activity window | Running centroid | Stable index; window bounds false matches |
+| Concurrent clustering | Advisory locks on band buckets | Unique constraint / serialize all ingestion | Serializes only near-duplicates |
+| Pagination | Ranked snapshot + opaque cursor | Offset over live ranking, per-user fan-out | Disjoint pages; compute only for active readers |
+| Breaking news | ≥ 3 distinct sources in 30 min | Raw article velocity, manual only | Measures independent confirmation |
+| Search | Elasticsearch + PostgreSQL fallback | PostgreSQL only / Elasticsearch only | Good relevance, and search survives an ES outage |
+| Passwords | scrypt with per-hash salt | SHA-256 with a fixed salt | Slow, salted hashes; legacy hashes upgraded at login |
 
 ## Implementation Notes
 
-This section maps the production architecture to the actual local implementation running on Docker + Node.js + Express.
+The local project runs the whole pipeline in one Node.js process: Express API, in-process crawler, PostgreSQL 16, Valkey/Redis 7, and optionally Elasticsearch 8 from [`docker-compose.yml`](./docker-compose.yml). The frontend is React 19 + TanStack Router + Zustand. This section maps the design above to the code as of the 2026-10-10 review.
 
-### Local Architecture
+### Production design → local implementation
 
+| Production design | Local implementation | Where |
+|-------------------|----------------------|-------|
+| Fetch workers + Kafka + cluster workers | One process: `node-cron` every 15 min (plus a startup crawl) claims sources and ingests inline; `CRAWLER_ENABLED=false` turns the schedule off on extra instances | [index.ts](./backend/src/index.ts), [crawler.ts](./backend/src/services/crawler.ts) |
+| Lease + fencing token | Implemented as designed (`CRAWLER_LEASE_SECONDS`, default 600) | [crawler.ts](./backend/src/services/crawler.ts) |
+| Conditional GET + durable backoff | Implemented; policy is pure functions with tests | [crawl-policy.ts](./backend/src/services/crawl-policy.ts) |
+| Per-domain politeness | In-process slots per domain (`CRAWLER_DOMAIN_DELAY_MS`, default 1 s); not shared across instances | [crawler.ts](./backend/src/services/crawler.ts) |
+| SimHash + bands + advisory locks | Implemented; generated band columns, single-column indexes | [simhash.ts](./backend/src/utils/simhash.ts), [init.sql](./backend/src/db/init.sql) |
+| Snapshot pagination | Implemented for the main feed; topic pages still use numeric offsets | [feed.ts](./backend/src/services/feed.ts) |
+| Breaking detection | Automatic (≥ `BREAKING_MIN_SOURCES` in `VELOCITY_WINDOW_MINUTES`), shown for `BREAKING_TTL_HOURS`; admins can also toggle it | [crawler.ts](./backend/src/services/crawler.ts), [feed.ts](./backend/src/services/feed.ts) |
+| Elasticsearch + fallback | ES optional at startup (retried in the background); PostgreSQL full-text fallback per request | [search.ts](./backend/src/services/search.ts), [elasticsearch.ts](./backend/src/db/elasticsearch.ts) |
+| scrypt passwords | Implemented with legacy upgrade | [password.ts](./backend/src/shared/password.ts), [user.ts](./backend/src/services/user.ts) |
+
+### Crawling
+
+A pass claims up to 50 due sources in one statement and crawls ten at a time:
+
+```typescript
+// backend/src/services/crawler.ts — claimDueSources()
+`WITH due AS (
+   SELECT cs.source_id
+   FROM crawl_schedule cs
+   JOIN sources s ON s.id = cs.source_id
+   WHERE s.is_active = true AND cs.next_crawl <= NOW()
+   ORDER BY cs.priority DESC, cs.next_crawl ASC
+   LIMIT $1
+   FOR UPDATE OF cs SKIP LOCKED
+ )
+ UPDATE crawl_schedule cs
+ SET next_crawl = NOW() + make_interval(secs => $2::int), lease_token = $3
+ FROM due, sources s
+ WHERE cs.source_id = due.source_id AND s.id = cs.source_id
+ RETURNING ${CLAIMED_SOURCE_COLUMNS}`
 ```
-┌──────────────────────────────────────────────────────────┐
-│                    Frontend (Vite)                        │
-│                  localhost:5173                           │
-│  Routes: / (feed), /search, /trending, /topics,          │
-│          /story/:id, /settings, /admin, /login           │
-└───────────────────────────┬──────────────────────────────┘
-                            │ HTTP
-                            ▼
-┌──────────────────────────────────────────────────────────┐
-│              API Server (Express)                         │
-│           localhost:3001 / 3002 / 3003                    │
-│                                                          │
-│  /api/v1/feed, /stories, /search, /topics, /trending     │
-│  /api/v1/user/login, /register, /preferences             │
-│  /api/v1/admin/sources, /stats, /crawl                   │
-│  /health, /health/live, /health/ready, /health/detailed  │
-│  /metrics (Prometheus)                                   │
-│                                                          │
-│  Built-in: Crawler (node-cron every 15 min)              │
-│            Index worker (BLPOP from Redis queue)          │
-└─────┬──────────┬──────────┬──────────────────────────────┘
-      │          │          │
-      ▼          ▼          ▼
-┌──────────┐ ┌──────────┐ ┌───────────────┐
-│PostgreSQL│ │  Valkey   │ │ Elasticsearch │
-│  :5432   │ │  :6379   │ │  :9200        │
-│          │ │          │ │               │
-│  newsagg │ │ Sessions │ │ Articles      │
-│  newsagg │ │ Feeds    │ │ index         │
-│  _dev    │ │ Queue    │ │               │
-└──────────┘ └──────────┘ └───────────────┘
-```
 
-### Production-Grade Patterns Actually Implemented
+`fetchFeed()` sends `If-None-Match`/`If-Modified-Since` through the source's Opossum breaker (10 s timeout). `429` and `5xx` throw inside the breaker so they count against it; `304` and `4xx` don't. It never throws: every outcome comes back as `fetched`, `not_modified` or `failed`, because the scheduler needs it. `crawlSource()` parses and ingests a `200` and computes the next delay with `nextCrawlDelaySeconds()`. `completeCrawl()` then writes validators, failure count, status and `next_crawl` only `WHERE lease_token = $token`. The admin "crawl now" button uses `claimSource()`, the same lease, so it returns `409` while a crawl is running. The old fallback that retried open-circuit sources through a shared global breaker is gone.
 
-| Pattern | File | Description |
-|---------|------|-------------|
-| Structured logging | `backend/src/shared/logger.ts` | Pino JSON logging, request correlation, pretty-print in dev |
-| Prometheus metrics | `backend/src/shared/metrics.ts` | HTTP latency histograms, crawl counters, cache hit/miss counters, queue depth gauge |
-| Circuit breakers | `backend/src/shared/circuit-breaker.ts` | Per-source circuit breakers via Opossum, state exposed to `/health/detailed` |
-| Retry with backoff | `backend/src/shared/retry.ts` | Exponential backoff with jitter for RSS fetches |
-| Feed caching | `backend/src/shared/cache.ts` | Redis cache-aside with configurable TTL, cache stats for monitoring |
-| Health checks | `backend/src/index.ts` | Four-tier: `/health`, `/health/live`, `/health/ready`, `/health/detailed` with pool stats + circuit state |
-| SimHash dedup | `backend/src/utils/simhash.ts` | 64-bit fingerprinting, Hamming distance comparison |
-| Topic extraction | `backend/src/utils/topics.ts` | Keyword-based topic classification |
-| RSS parsing | `backend/src/utils/rss.ts` | RSS/Atom feed parsing via fast-xml-parser |
-| Scheduled crawling | `backend/src/services/crawler.ts` | node-cron scheduling, parallel crawls with concurrency limit |
-| Config management | `backend/src/shared/config.ts` | Centralized config with validation and environment variable support |
-| Graceful shutdown | `backend/src/index.ts` | SIGTERM/SIGINT handlers, connection draining |
+### Ingestion and clustering
 
-### Simplifications for Local Development
+`processArticle()` keeps only absolute http(s) links (`normalizeArticleUrl()`), truncates over-long fields, computes the fingerprint, topics and entities, and runs `INSERT … ON CONFLICT (url) DO NOTHING` and `assignToStory()` in one `withTransaction()`. `assignToStory()` skips matching for an all-zero fingerprint (text with no usable tokens). Otherwise it takes `pg_advisory_xact_lock(20817, band * 65536 + value)` for the four bands, selects candidates sharing a band whose `last_article_at` is within 48 hours, picks the closest under distance 3 (`closestStory()`), locks the story row, links the article and runs one aggregate `UPDATE` for counts, velocity and the breaking flag. Indexing into Elasticsearch happens after the commit, with two quick retries, and is logged and skipped on failure.
 
-| Production Design | Local Substitute | Why |
-|-------------------|------------------|-----|
-| CDN + edge cache | Direct Vite dev server | No CDN needed locally |
-| API Gateway + LB | Direct connection to Express on port 3001-3003 | No nginx needed |
-| Crawler service cluster | In-process node-cron scheduler | Simpler, single process |
-| Dedicated index workers | In-process BLPOP consumer | No separate worker process |
-| PostgreSQL read replicas | Single PostgreSQL instance | Low query volume |
-| Redis Cluster | Single Valkey instance | < 100 MB cache |
-| Elasticsearch cluster | Single ES node (512 MB heap) | Sufficient for ~10K articles |
-| Partitioned articles table | Single unpartitioned table | No partition management needed |
-| ML-based topic extraction | Keyword matching | No model training/deployment |
+### Feed, personalization and reading signals
 
-### What Was Omitted
+`getPersonalizedFeed()` decodes the cursor, loads the snapshot (or the viewer's current one for page 1), and otherwise ranks with `rankStories()` and stores a new snapshot. `hydrateStories()` loads the page's rows and up to three newest articles per story (minus blocked sources) in two queries; the old code issued one query per story. Freshness is now a true six-hour half-life (`0.5^(age/6)`; the code previously used `e^(-age/6)`, which keeps only 37% at six hours). Trending uses `effectiveVelocity()`, which decays stored velocity to zero 30 minutes after the newest article; before, a burst of coverage stayed "trending" forever. Saving preferences validates the payload (source ids must be UUIDs) and invalidates the profile and the current snapshot. `recordArticleRead()` runs in one transaction and learns only from the first read. The story page now sends that signal when a signed-in reader opens an article, using `fetch(…, {keepalive: true})`; before, nothing in the UI called it.
 
-- CDN for static assets and feed caching
-- Multi-region deployment
-- Kubernetes orchestration
-- OAuth/OIDC (uses session auth)
-- ML-based topic extraction and semantic embeddings
-- Breaking news detection via velocity thresholds
-- Push notifications for breaking news
-- Source credibility scoring with feedback loops
-- A/B testing for ranking algorithm weights
-- Collaborative filtering for recommendations
-- Multi-language support
-- GraphQL API
+### Frontend
+
+File-based TanStack Router routes (`/`, `/topics/$topic`, `/story/$storyId`, `/search`, `/trending`, `/settings`, `/admin`, `/login`) load data in route loaders. A Zustand store holds the persisted user and the feed list. `appendStories` drops ids already shown, which matters when an expired snapshot is re-ranked. The search page shows a notice when results came from the PostgreSQL fallback. There is no server-state cache library, no list virtualization, no SSE (the breaking banner is fetched by the home loader), and no UI for preferred or blocked sources (the API supports both).
+
+### Operations
+
+`/health/ready` requires PostgreSQL and Redis and reports Elasticsearch as `degraded` without failing. Elasticsearch initialization is retried in the background, so the API starts without it. Shutdown on `SIGTERM` stops the cron task, closes the HTTP server, waits up to 10 s for an in-flight crawl, then closes PostgreSQL and Redis, with a forced exit after 15 s. An unfinished crawl is safe because its lease simply expires. The session middleware treats a Redis error as "not logged in" instead of leaving the request hanging. `npm run db:seed` applies [`db-seed/base.sql`](./backend/db-seed/base.sql) and writes six clustered stories with real fingerprints.
+
+### Verification (2026-10-10)
+
+- `cd backend && npm test`: 35 offline vitest tests (crawl policy, `fetchFeed` and `crawlSource` against a stubbed `fetch` and mocked database, SimHash banding including a 2,000-case pigeonhole property test, ranking and snapshot pagination against an in-memory Redis, password hashing). Backend `tsc --noEmit` and lint clean; frontend `tsc`, lint and `vite build` clean.
+- Against real PostgreSQL 16 and Redis with Elasticsearch absent and a local mock RSS origin: `init.sql` loads twice, and again over seeded data. The API starts and is ready without Elasticsearch. The legacy admin hash logs in and is rewritten as scrypt. Three feed pages stay disjoint while a new breaking story is inserted mid-scroll. A 200 stores the ETag and the re-crawl is a `304` with `If-None-Match`. A `503` with `Retry-After: 120` schedules the next attempt at least 120 s out. The same article from two sources crawled concurrently ends up as one story with two sources. Two simultaneous "crawl now" requests return `200` and `409`. Search falls back to PostgreSQL. Blocking a story's sources hides it immediately. Two identical read signals bump the topic weight once. `SIGTERM` exits cleanly.
+
+### Simplified or omitted
+
+- **Remaining limitations.** Topic pages paginate by offset over stored velocity, so pages can shift. Elasticsearch drift (an article whose indexing failed after retries) has no repair job; the fallback only covers Elasticsearch being *down*. Per-domain pacing is per process. `sources.domain` is unique (one feed per domain). Feed URLs are not checked against private addresses (SSRF). No rate limiting. The session caches the role at login. The breaking flag is sticky, and detection can re-flag a story an admin cleared. Story counters are recomputed with `COUNT(DISTINCT)` per new article.
+- **Omitted:** Kafka and separate worker pools, CDN, multi-region, partitioned tables, WebSub push, embeddings or entity-based clustering, ML topic classification (topics are keyword lists in [topics.ts](./backend/src/utils/topics.ts)), source credibility scoring, notifications, and A/B testing of ranking weights.

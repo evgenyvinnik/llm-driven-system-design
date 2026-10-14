@@ -74,9 +74,15 @@ app.use((req, _res, next) => {
 app.use(async (req, _res, next) => {
   const sessionId = req.cookies?.session_id || req.headers['x-session-id'];
   if (sessionId) {
-    const session = await sessionStore.get(sessionId as string);
-    if (session) {
-      (req as express.Request & { session: unknown }).session = session;
+    try {
+      const session = await sessionStore.get(sessionId as string);
+      if (session) {
+        (req as express.Request & { session: unknown }).session = session;
+      }
+    } catch (err) {
+      // Express 4 does not catch rejected async middleware: without this the
+      // request would hang during a Redis outage. Continue as anonymous.
+      logger.warn({ error: (err as Error).message }, 'Session lookup failed; continuing unauthenticated');
     }
   }
   next();
@@ -238,78 +244,101 @@ app.use((err: Error, req: express.Request, res: express.Response, _next: express
   res.status(500).json({ error: 'Internal server error' });
 });
 
+/** The scheduled crawl currently running in this process, if any. */
+let crawlInFlight: Promise<unknown> | null = null;
+
 /**
- * Initialize and start the server.
- * Sets up Elasticsearch indexes, starts HTTP server, and schedules crawl jobs.
+ * Run one scheduled crawl pass unless one is already running here.
+ * (Across instances, the leases in crawl_schedule prevent double crawling.)
+ * @param label - 'scheduled' or 'initial', for logs
  */
-async function start() {
+function runScheduledCrawl(label: string): void {
+  if (crawlInFlight) {
+    logger.info({ label }, 'Previous crawl still running; skipping this tick');
+    return;
+  }
+  crawlInFlight = crawlAllDueSources()
+    .then(results => {
+      logger.info({
+        label,
+        sourcesCount: results.length,
+        newArticles: results.reduce((sum, r) => sum + r.articles_new, 0),
+      }, 'Crawl pass completed');
+    })
+    .catch(err => logger.error({ label, error: (err as Error).message }, 'Crawl pass failed'))
+    .finally(() => { crawlInFlight = null; });
+}
+
+/**
+ * Create the Elasticsearch indexes, retrying in the background.
+ * Search is a degradable feature (PostgreSQL full-text search answers while
+ * Elasticsearch is away), so its absence must not stop the API from starting.
+ * @param attempt - Attempt number, for backoff
+ */
+async function initSearchIndex(attempt = 1): Promise<void> {
   try {
-    // Initialize Elasticsearch indexes
     await initElasticsearch();
     logger.info('Elasticsearch initialized');
-
-    // Start the server
-    app.listen(PORT, () => {
-      logger.info({ port: PORT }, 'News Aggregator server started');
-    });
-
-    // Schedule crawling every 15 minutes
-    cron.schedule('*/15 * * * *', async () => {
-      logger.info('Running scheduled crawl...');
-      try {
-        const results = await crawlAllDueSources();
-        const totalNew = results.reduce((sum, r) => sum + r.articles_new, 0);
-        logger.info({
-          sourcesCount: results.length,
-          newArticles: totalNew,
-        }, 'Scheduled crawl completed');
-      } catch (err) {
-        logger.error({ error: err }, 'Scheduled crawl failed');
-      }
-    });
-
-    logger.info('Scheduled crawl every 15 minutes');
-
-    // Run initial crawl on startup (after 10 seconds delay)
-    setTimeout(async () => {
-      logger.info('Running initial crawl...');
-      try {
-        const results = await crawlAllDueSources();
-        const totalNew = results.reduce((sum, r) => sum + r.articles_new, 0);
-        logger.info({
-          sourcesCount: results.length,
-          newArticles: totalNew,
-        }, 'Initial crawl completed');
-      } catch (err) {
-        logger.error({ error: err }, 'Initial crawl failed');
-      }
-    }, 10000);
-
-    // Log startup configuration
-    logger.info({
-      retention: config.retention,
-      features: config.features,
-    }, 'Server configuration');
-
   } catch (err) {
-    logger.error({ error: err }, 'Failed to start server');
-    process.exit(1);
+    const delayMs = Math.min(30000, 2000 * attempt);
+    logger.warn({ attempt, retryInMs: delayMs, error: (err as Error).message },
+      'Elasticsearch unavailable; search will use PostgreSQL until it is reachable');
+    setTimeout(() => { void initSearchIndex(attempt + 1); }, delayMs).unref();
   }
 }
 
-// Handle graceful shutdown
-process.on('SIGTERM', async () => {
-  logger.info('SIGTERM received, shutting down gracefully');
-  await pool.end();
-  redis.disconnect();
-  process.exit(0);
-});
+let server: ReturnType<typeof app.listen> | null = null;
+let crawlTask: ReturnType<typeof cron.schedule> | null = null;
 
-process.on('SIGINT', async () => {
-  logger.info('SIGINT received, shutting down gracefully');
+/**
+ * Initialize and start the server.
+ * Starts HTTP immediately; Elasticsearch setup and crawling run alongside.
+ */
+async function start() {
+  server = app.listen(PORT, () => {
+    logger.info({ port: PORT }, 'News Aggregator server started');
+  });
+
+  void initSearchIndex();
+
+  if (config.crawler.enabled) {
+    // Every instance may run the schedule: claiming sources under a lease
+    // means each due source is crawled by exactly one of them.
+    crawlTask = cron.schedule('*/15 * * * *', () => runScheduledCrawl('scheduled'));
+    setTimeout(() => runScheduledCrawl('initial'), 10000).unref();
+    logger.info('Scheduled crawl every 15 minutes');
+  } else {
+    logger.info('CRAWLER_ENABLED=false: scheduled crawling disabled in this process');
+  }
+
+  logger.info({
+    retention: config.retention,
+    features: config.features,
+  }, 'Server configuration');
+}
+
+/**
+ * Graceful shutdown: stop accepting requests and scheduling crawls, give an
+ * in-flight crawl up to 10 seconds to finish (an unfinished one is safe: its
+ * lease simply expires), then close PostgreSQL and Redis.
+ * @param signal - The signal received
+ */
+async function shutdown(signal: string): Promise<void> {
+  logger.info({ signal }, 'Shutting down gracefully');
+  crawlTask?.stop();
+  const forceExit = setTimeout(() => process.exit(1), 15000);
+  forceExit.unref();
+
+  await new Promise<void>(resolve => (server ? server.close(() => resolve()) : resolve()));
+  if (crawlInFlight) {
+    await Promise.race([crawlInFlight, new Promise(resolve => setTimeout(resolve, 10000))]);
+  }
   await pool.end();
   redis.disconnect();
   process.exit(0);
-});
+}
+
+process.on('SIGTERM', () => { void shutdown('SIGTERM'); });
+process.on('SIGINT', () => { void shutdown('SIGINT'); });
 
 start();

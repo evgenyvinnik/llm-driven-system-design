@@ -21,10 +21,10 @@ export const Route = createFileRoute('/search')({
   loaderDeps: ({ search: { q } }) => ({ q }),
   loader: async ({ deps: { q } }) => {
     if (!q || q.length < 2) {
-      return { articles: [], query: q };
+      return { articles: [], query: q, engine: undefined };
     }
     const response = await feedApi.search(q);
-    return { articles: response.articles, query: q };
+    return { articles: response.articles, query: q, engine: response.engine };
   },
   component: SearchPage,
 });
@@ -49,7 +49,7 @@ function formatDate(dateString: string): string {
  * @returns Search page with input form and result list
  */
 function SearchPage() {
-  const { articles, query } = Route.useLoaderData();
+  const { articles, query, engine } = Route.useLoaderData();
   const navigate = useNavigate();
   const [searchInput, setSearchInput] = useState(query);
 
@@ -87,6 +87,12 @@ function SearchPage() {
       {query && (
         <p className="text-gray-600">
           {articles.length} result{articles.length !== 1 ? 's' : ''} for "{query}"
+        </p>
+      )}
+
+      {engine === 'postgres' && (
+        <p role="status" className="text-sm text-amber-700 mb-4">
+          The search index is unavailable, so these are basic keyword matches.
         </p>
       )}
 

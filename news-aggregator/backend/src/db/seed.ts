@@ -317,11 +317,12 @@ async function seedStories(): Promise<void> {
       `INSERT INTO stories
          (title, summary, primary_topic, topics, entities, fingerprint,
           article_count, source_count, velocity, is_breaking, breaking_started_at,
-          created_at, updated_at)
+          created_at, updated_at, last_article_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
                CASE WHEN $10 THEN NOW() - ($11 || ' hours')::interval ELSE NULL END,
                NOW() - ($11 || ' hours')::interval,
-               NOW() - ($11 || ' hours')::interval)
+               NOW() - ($11 || ' hours')::interval,
+               NOW() - ($12 || ' minutes')::interval)
        RETURNING id`,
       [
         story.title,
@@ -338,6 +339,8 @@ async function seedStories(): Promise<void> {
         story.velocity,
         story.isBreaking,
         story.hoursAgo,
+        // Newest article's age: velocity decays from here (see feed.ts)
+        Math.min(...story.articles.map((a) => a.minutesAgo)),
       ],
     );
     const storyId = rows[0].id;

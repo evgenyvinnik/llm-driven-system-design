@@ -1,471 +1,276 @@
-# News Aggregator - Full-Stack System Design Interview Answer
+# 📰 News Aggregator — System Design Answer (Full-Stack Focus)
 
-*A 45-minute system design interview answer with balanced coverage of frontend, backend, and their integration points.*
+*45-minute full-stack interview. This is a proposed production design; what this repository actually runs is described in [architecture.md → Implementation Notes](./architecture.md#implementation-notes).*
 
----
+> "I want to follow one news event end to end: a publisher posts it, our crawler finds it politely, it merges with nineteen other outlets' versions into one story, and it lands in a reader's feed, maybe with a breaking banner. The hard part is the contracts between the layers. The backend's ranking changes every minute, so the cursor the client holds has to mean something stable. The reader's clicks feed the ranking, so that signal has to survive retries. And freshness has to be honest on screen, not just in the database."
 
-## Opening Statement
-
-"Today I'll design a news aggregator like Google News or Flipboard, covering both the backend content pipeline and frontend user experience. The core challenges span both layers: on the backend, crawling RSS feeds with rate limiting, deduplicating articles using SimHash, and ranking content with multiple signals; on the frontend, displaying clustered stories with source diversity indicators, implementing breaking news alerts, and tracking reading progress for personalization. I'll focus on how these systems integrate through shared types, real-time updates, and optimistic UI patterns."
-
----
-
-## Step 1: Requirements Clarification (3-5 minutes)
-
-### Functional Requirements
-
-| Feature | Backend Responsibility | Frontend Responsibility |
-|---------|------------------------|------------------------|
-| Content Crawling | Fetch RSS feeds, parse articles | Display crawl status in admin |
-| Deduplication | SimHash fingerprinting, clustering | Show "X sources" indicator |
-| Personalization | Ranking algorithm, user preferences | Topic selector, preference UI |
-| Feed Display | API with pagination, caching | Virtualized infinite scroll |
-| Search | Elasticsearch query, filtering | Search bar, filters, results |
-| Breaking News | Velocity detection, notifications | Alert banner, real-time updates |
-| Reading Progress | Store dwell time, history | Track reads, sync periodically |
-
-### Non-Functional Requirements
-
-| Requirement | Target | Implementation |
-|-------------|--------|----------------|
-| Freshness | Breaking news < 5 min | Priority crawling + push updates |
-| Feed Latency | p95 < 200ms | Redis cache + optimistic UI |
-| Initial Load | < 2s | Code splitting, skeleton states |
-| Offline Support | Read cached articles | Service worker, IndexedDB |
+| Phase | Time | What I want the interviewer to leave with |
+|-------|------|--------------------------------------------|
+| Requirements & scale | 5 min | Targets on both sides of the wire |
+| End-to-end architecture | 8 min | One diagram from publisher to screen, plus the flows that cross the seam |
+| Data model & API contract | 7 min | Server tables, client cache, and the fields both sides rely on |
+| Deep dive 1: an infinite feed over a moving ranking | 8 min | Snapshot cursor + client dedupe |
+| Deep dive 2: the personalization loop | 7 min | Preferences, read signals, invalidation, diversity |
+| Deep dive 3: from crawl to breaking banner | 7 min | Polite crawling, clustering, live and honest UI |
+| Failures, scale, wrap-up | 3 min | What each failure looks like to a reader |
 
 ---
 
-## Step 2: High-Level Architecture (5 minutes)
+## 🎯 Requirements & Scale (5 min)
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              FRONTEND                                        │
-│  ┌───────────┐  ┌───────────┐  ┌───────────┐  ┌───────────┐  ┌───────────┐ │
-│  │ Feed View │  │ Story     │  │ Search    │  │ Prefs     │  │ Admin     │ │
-│  │           │  │ Detail    │  │ View      │  │ Panel     │  │ Dashboard │ │
-│  └─────┬─────┘  └─────┬─────┘  └─────┬─────┘  └─────┬─────┘  └─────┬─────┘ │
-│        │              │              │              │              │        │
-│  ┌─────▼──────────────▼──────────────▼──────────────▼──────────────▼─────┐  │
-│  │                        Zustand Stores                                  │  │
-│  │   feedStore  │  preferencesStore  │  readingProgressStore  │  authStore│  │
-│  └─────────────────────────────────────┬─────────────────────────────────┘  │
-│                                        │                                     │
-│  ┌─────────────────────────────────────▼─────────────────────────────────┐  │
-│  │                         API Client Layer                               │  │
-│  │   Axios instance │ Request interceptors │ Response transformers        │  │
-│  └─────────────────────────────────────┬─────────────────────────────────┘  │
-└────────────────────────────────────────┼─────────────────────────────────────┘
-                                         │ HTTP/WebSocket
-                                         │
-┌────────────────────────────────────────┼─────────────────────────────────────┐
-│                              BACKEND   │                                      │
-│  ┌─────────────────────────────────────▼─────────────────────────────────┐  │
-│  │                           API Gateway                                  │  │
-│  │     Rate Limiting │ Authentication │ Request Validation                │  │
-│  └───────────┬───────────────┬───────────────┬───────────────┬───────────┘  │
-│              │               │               │               │               │
-│  ┌───────────▼───┐  ┌───────▼───────┐  ┌───▼───────────┐  ┌▼───────────┐   │
-│  │ Feed Service  │  │ Search Service│  │ User Service  │  │ Admin API  │   │
-│  └───────┬───────┘  └───────┬───────┘  └───────┬───────┘  └──────┬─────┘   │
-│          │                  │                  │                 │          │
-│  ┌───────▼──────────────────▼──────────────────▼─────────────────▼───────┐  │
-│  │                         Data Layer                                     │  │
-│  │   PostgreSQL │ Redis │ Elasticsearch                                   │  │
-│  └───────────────────────────────────────────────────────────────────────┘  │
-│                                                                              │
-│  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │                    Background Services                               │    │
-│  │   Crawler │ Deduplicator │ Indexer │ Breaking News Detector         │    │
-│  └─────────────────────────────────────────────────────────────────────┘    │
-└──────────────────────────────────────────────────────────────────────────────┘
-```
+**Functional.** We crawl publisher RSS/Atom feeds and cluster articles into stories. Readers get a personalized ranked feed (or an anonymous one), topic pages, story pages with all coverage, a breaking-news banner, and full-text search. Signed-in readers set preferred topics and preferred or blocked sources, and their reading teaches the ranking. Admins manage sources and see crawl health. Out of scope: full-page scraping, paywalls, push notifications, comments.
+
+| Side | Requirement | Target |
+|------|-------------|--------|
+| Backend | Freshness | New article in feeds within one polling interval + 1 min (p95 ≤ 16 min) |
+| Backend | Breaking detection | Within 2 min of the third independent source |
+| Backend | Feed API latency | p99 < 200 ms cold page 1, < 60 ms later pages |
+| Backend | Politeness | ≤ 1 fetch per feed per interval, ≤ 1 req/s per domain, honor `Retry-After` |
+| Frontend | Front page | LCP < 2.5 s on mid-range mobile over 4G; CLS < 0.1 |
+| Frontend | Scrolling | INP < 200 ms; no duplicate or missing stories while paging |
+| Both | Correctness | One story per event; reading the same article twice teaches the ranking once |
+
+**Scale.** 50K feeds at a 15-minute median interval is ~56 fetches/s, about three-quarters of them answered `304 Not Modified`. 2M articles/day (~70/s peak) cluster against ~1.2M open stories. 5M daily readers open the feed ~10 times a day, so ~10K requests/s at peak.
+
+"For the full stack, the scale numbers translate into two contract decisions. Ranking is expensive and moves every minute, so the server ranks once per scroll and hands the client an opaque cursor. And 1.2M open stories means clustering needs an index, which I'll show is a banded SimHash."
 
 ---
 
-## Step 3: Shared Type Definitions (5 minutes)
+## 🏗️ End-to-End Architecture (8 min)
 
-Shared types ensure frontend and backend stay in sync:
+```
+┌─────────────────────────┐                                             ┌─────────────────────────┐
+│ Reader web / mobile app │                                             │ Publisher feeds         │
+│ admin console, same API │                                             │ ~50K RSS / Atom URLs    │
+└────────────┬────────────┘                                             └─────────────────────────┘
+             │                                                                       ▲
+             │ (2) GET /api/v1/feed?cursor                     (1) conditional GET   │
+             │ (3) GET /api/v1/search?q                             200 | 304        │
+             ▼                                                                       │
+┌─────────────────────────┐                                             ┌────────────┴────────────┐
+│ CDN + load balancer     │                          lease, reschedule  │ Fetch workers           │
+│ anon feed cached 30 s   │                       ┌─────────────────────┤ lease · per-domain pace │
+└────────────┬────────────┘                       │                     └────────────┬────────────┘
+             │                                    │                        raw items │
+             │                                    │                                  │
+             ▼                                    ▼                                  ▼
+┌─────────────────────────┐             ┌────────────────────┐          ┌─────────────────────────┐
+│ Feed API (stateless)    │  page rows  │ PostgreSQL         │          │ Kafka articles.raw      │
+│ rank · diversify        ├────────────▶│ sources · schedule │          └────────────┬────────────┘
+│ snapshot cursor         │             │ articles · stories │                       ▼
+│ story pages · search    │             │ users · prefs      │ articles ┌─────────────────────────┐
+│                         │             │ band index 4 x 16  │◀─────────┤ Cluster workers         │
+│                         │             └────────────────────┘          │ SimHash band lookup     │
+│                         │                                             │ story + counters        │
+│                         │  search     ┌────────────────────┐  index   │ breaking detection      │
+│                         ├────────────▶│ Elasticsearch      │◀─────────┤                         │
+│                         │             │ articles index     │          │                         │
+│                         │             └────────────────────┘          │                         │
+└────────────┬────────────┘                                             └─────────────────────────┘
+             │ snapshot, profile, session
+             ▼
+┌─────────────────────────┐
+│ Redis · sessions, feeds │
+└─────────────────────────┘
+```
 
-**Core Domain Types:**
-- `Source`: id, name, homepage, favicon, category (mainstream/tech/local/opinion), credibilityScore (0.0-1.0)
-- `Article`: id, sourceId, storyClusterId, url, title, summary, author, imageUrl, publishedAt, topics[]
-- `StoryCluster`: id, title, summary, primaryImageUrl, primaryTopic, topics[], articleCount, sourceCount, sources[], velocity, isBreaking, firstSeenAt, lastUpdatedAt
-- `Topic`: id, displayName, keywords[], articleCount
+1. **Crawl (1).** Fetch workers lease due feeds and send conditional GETs. New items go through Kafka to cluster workers, which store each article and its story in one transaction, update counters and the breaking flag, and index the article for search.
+2. **Feed (2).** The SPA requests a page. The Feed API ranks ~200 candidates once, stores the ranked ids as a snapshot in Redis, and returns a page with an opaque cursor; next pages read the same snapshot. Anonymous feeds are cached at the CDN for 30 s.
+3. **Search (3).** Elasticsearch answers when healthy; PostgreSQL full-text search answers when it isn't, and the response says which one did.
 
-**User Types:**
-- `User`: id, email, displayName, role (user/admin), createdAt
-- `UserPreferences`: topics[], preferredSources[], excludedSources[]
-- `ReadingHistoryEntry`: storyClusterId, readAt, dwellTimeSeconds
+| Layer | Choice | Why |
+|-------|--------|-----|
+| Reader app | SPA with server-rendered anonymous pages; TanStack Query for server state; URL holds topic and query | Public pages need fast first paint and SEO; signed-in pages are dynamic |
+| Feed API | Stateless; ranking, snapshots, story pages, search, accounts | Scales horizontally behind the CDN |
+| Fetch / cluster workers | Separate pools, Kafka between them | Network-bound vs database-bound; replayable |
+| PostgreSQL | Source of truth, SimHash band index | One transaction per article |
+| Redis | Sessions, ranking profiles, snapshots | Losing it costs logins and scroll positions, not data |
+| Elasticsearch | Search index | Derived; PostgreSQL full-text is the fallback |
 
-**API Request/Response Types:**
-- `FeedRequest`: cursor?, limit?, topic?
-- `FeedResponse`: stories[], nextCursor, hasMore
-- `SearchRequest`: query, topic?, source?, dateFrom?, dateTo?, limit?
-- `SearchResponse`: hits[], total (with article, highlights, score)
+### Flow: scrolling past an expired snapshot
 
-**WebSocket Event Types:**
-- `WSBreakingNewsEvent`: type='breaking_news', story
-- `WSFeedUpdateEvent`: type='feed_update', newStories count
+```
+ Feed page            Query cache               Feed API                  Redis
+     │                     │                        │                       │
+     │ 1 fetchNextPage()   │                        │                       │
+     │────────────────────▶│                        │                       │
+     │                     │ 2 GET /feed?cursor=c2  │                       │
+     │                     │───────────────────────▶│                       │
+     │                     │                        │ 3 GET feed:snap:{id}  │
+     │                     │                        │──────────────────────▶│
+     │                     │                        │ 4 miss: expired       │
+     │                     │                        │◀──────────────────────│
+     │                   5 re-rank, keep offset 40  │                       │
+     │                     │ 6 page + new cursor    │                       │
+     │                     │◀───────────────────────│                       │
+     │                     │ 7 drop ids already shown                       │
+     │ 8 append, announce  │                        │                       │
+     │◀────────────────────│                        │                       │
+     │                     │                        │                       │
+```
+
+"This is the seam working as designed. The server promises that a cursor's pages never overlap *while its snapshot lives*. When the snapshot is gone, it re-ranks and continues at the same offset. The client promises to drop ids it already shows. Neither side has to be perfect alone."
+
+### Flow: a read teaches the ranking, once
+
+```
+Story page                     Feed API                      PostgreSQL    Redis
+     │                             │                              │          │
+     │ 1 POST /reading-history     │                              │          │
+     │────────────────────────────▶│                              │          │
+     │                             │ 2 upsert history, inserted?  │          │
+     │                             │─────────────────────────────▶│          │
+     │                             │ 3 first read only: +weights  │          │
+     │                             │─────────────────────────────▶│          │
+     │                             │ 4 DEL user:{id}:prefs                   │
+     │                             │────────────────────────────────────────▶│
+     │ 5 200 (a retry is a no-op)  │                              │          │
+     │◀────────────────────────────│                              │          │
+     ··························· next fresh feed ·····························
+     │                             │ 6 profile miss: reload                  │
+     │                             │────────────────────────────────────────▶│
+     │                             │                              │          │
+```
+
+"The client fires the read with `keepalive`, so it survives the reader leaving the page, and may retry it. The server makes retries harmless: `RETURNING (xmax = 0)` tells a new history row from an upsert, and only a new row changes topic weights. The current scroll keeps its snapshot, so the feed doesn't reshuffle under the reader's thumb. The *next* fresh feed picks up the new weights."
 
 ---
 
-## Step 4: Deep Dive - Content Pipeline (8 minutes)
+## 💾 Data Model & API Contract (7 min)
 
-### Backend: Crawl and Deduplication Flow
+### Server side
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                          CRAWL PIPELINE                                      │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐                   │
-│  │ Rate Limiter │───►│ RSS Fetcher  │───►│ XML Parser   │                   │
-│  │ (per domain) │    │              │    │              │                   │
-│  └──────────────┘    └──────────────┘    └──────┬───────┘                   │
-│                                                  │                           │
-│                                                  ▼                           │
-│  ┌──────────────────────────────────────────────────────────────────────┐   │
-│  │                     FOR EACH ARTICLE                                  │   │
-│  │  ┌────────────────┐                                                   │   │
-│  │  │ Check Exists   │──► If exists by source_id + external_id: SKIP    │   │
-│  │  └───────┬────────┘                                                   │   │
-│  │          │ New article                                                │   │
-│  │          ▼                                                            │   │
-│  │  ┌────────────────┐                                                   │   │
-│  │  │ SimHash        │──► Compute 64-bit fingerprint from title+summary │   │
-│  │  │ Fingerprint    │                                                   │   │
-│  │  └───────┬────────┘                                                   │   │
-│  │          │                                                            │   │
-│  │          ▼                                                            │   │
-│  │  ┌────────────────┐    ┌─────────────────────────────────────────┐   │   │
-│  │  │ Find Cluster   │───►│ Query: Hamming distance <= 3            │   │   │
-│  │  │                │    │ Within 48 hours, ORDER BY last_updated  │   │   │
-│  │  └───────┬────────┘    └─────────────────────────────────────────┘   │   │
-│  │          │                                                            │   │
-│  │          ├──► Match found: UPDATE cluster stats (article_count++)    │   │
-│  │          │                                                            │   │
-│  │          └──► No match: CREATE new story_cluster                     │   │
-│  │                                                                       │   │
-│  │  ┌────────────────┐                                                   │   │
-│  │  │ Insert Article │──► Store with fingerprint, topics, cluster_id    │   │
-│  │  └───────┬────────┘                                                   │   │
-│  │          │                                                            │   │
-│  │          ▼                                                            │   │
-│  │  ┌────────────────┐                                                   │   │
-│  │  │ Queue Indexing │──► Redis RPUSH to index:queue for Elasticsearch  │   │
-│  │  └────────────────┘                                                   │   │
-│  └──────────────────────────────────────────────────────────────────────┘   │
-│                                                                              │
-│  ┌────────────────┐                                                         │
-│  │ Check Breaking │──► Evaluate velocity for affected clusters              │
-│  └────────────────┘                                                         │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+| Store | Table / key | Key columns | Notes |
+|-------|-------------|-------------|-------|
+| PostgreSQL | `crawl_schedule` | `source_id`, `next_crawl`, `lease_token`, `etag`, `last_modified`, `consecutive_failures` | The schedule, the lease and the backoff state in one row |
+| PostgreSQL | `articles` | `id`, `source_id`, `story_id`, `url` (unique), `title`, `fingerprint`, `published_at`, `topics` | Monthly partitions in production |
+| PostgreSQL | `stories` | `id`, `fingerprint`, `fp_band0..3` (generated), `source_count`, `velocity`, `is_breaking`, `breaking_started_at`, `last_article_at` | Four band indexes for candidate lookup |
+| PostgreSQL | `user_preferences`, `user_topic_weights`, `user_reading_history` | Unique `(user_id, article_id)` | Explicit and learned interests |
+| Redis | `feed:snap:{id}` / `feed:current:{user}` | Ranked ids + scores + owner / newest snapshot id | 15 min / 60 s |
+| Redis | `user:{id}:prefs` | Ranking profile | Dropped on preference save and on a first read |
 
-### Frontend: Displaying Source Diversity
+### Client side
 
-**StoryCard Component Structure:**
+| Cache key / store | Holds | Invalidated by |
+|-------------------|-------|----------------|
+| `['feed', topic]` (infinite query) | Pages of stories + `next_cursor` | Pull-to-refresh, preference save, topic change (new key) |
+| `['story', id]` | Story + all coverage | 2-minute stale time |
+| `['search', q, filters]` | Results + `engine` | Query change (keyed by the URL) |
+| `['prefs']` | Topics, preferred and blocked sources | Save, then invalidate `['feed']` |
+| Zustand `session` | User and role | Login, logout, any `401` |
+
+### The contract
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│ [Breaking Badge - if story.isBreaking]                       │
-├─────────────────────────────────────────────────────────────┤
-│  ┌──────────┐  ┌────────────────────────────────────────┐   │
-│  │          │  │ [TopicBadges - first 2 topics]          │   │
-│  │  Image   │  │ Story Title (linked to /story/:id)      │   │
-│  │  (lazy)  │  │ Summary (line-clamp-2)                  │   │
-│  └──────────┘  └────────────────────────────────────────┘   │
-├─────────────────────────────────────────────────────────────┤
-│ Source Diversity Section (expandable)                        │
-│  ┌────────────────────────────────────────────────────────┐ │
-│  │ [SourceStack: favicon icons -space-x-1]  X sources ▼   │ │
-│  └────────────────────────────────────────────────────────┘ │
-│                                                              │
-│  [Expanded: AnimatePresence]                                │
-│  ├─ Source 1: [favicon] Name [CredibilityBadge]             │
-│  ├─ Source 2: [favicon] Name [CredibilityBadge]             │
-│  └─ Source N: [favicon] Name [CredibilityBadge]             │
-└─────────────────────────────────────────────────────────────┘
+GET  /api/v1/feed?cursor&limit          → {stories[], next_cursor, has_more}
+GET  /api/v1/breaking                   → {stories[]}  flagged in the last 6 h
+GET  /api/v1/stories/{id}               → story + articles[]
+GET  /api/v1/search?q&topics&date_from  → {articles[], engine}
+PUT  /api/v1/user/preferences           → 200 | 400 (source ids must be UUIDs)
+POST /api/v1/user/reading-history       → 200 | 404 unknown article; retry-safe
 ```
 
-**SourceStack Visual:** Overlapping favicon circles with +N remaining indicator
+| Contract element | The server guarantees | The client relies on it to |
+|------------------|-----------------------|----------------------------|
+| Opaque `next_cursor` | Pages from one snapshot never overlap or skip; an expired snapshot continues at the same offset | Append pages blindly; only dedupe by id as a backstop |
+| `has_more` | False only at the end of the snapshot | Stop the infinite scroll and show "You're all caught up" |
+| Snapshot owner check | A cursor works only for the reader who created it | Share URLs freely; cursors stay out of URLs |
+| Idempotent read signal | First read only changes weights; dwell is a maximum | Fire with `keepalive`, retry on failure, never track "already sent" |
+| `engine` on search | Says whether results came from the fallback | Show "basic results" instead of pretending nothing is wrong |
+| Breaking TTL | Stories leave `/breaking` 6 h after being flagged | Render the banner as-is, no client-side expiry logic |
+| Validated input | `400` for bad ids, dates, URLs | Map field errors to form fields |
 
 ---
 
-## Step 5: Deep Dive - Feed Ranking and Display (8 minutes)
+## 🔧 Deep Dive 1: An Infinite Feed over a Moving Ranking (8 min)
 
-### Backend: Multi-Signal Ranking
+"The failure I'm designing against: a reader scrolls to page 3 and sees a story they saw on page 1. Or worse, the story that moved up while they were reading never appears at all."
 
-**Ranking Weights:**
-| Signal | Weight | Description |
-|--------|--------|-------------|
-| Relevance | 35% | Topic match with user interests |
-| Freshness | 25% | Exponential decay, 6-hour half-life |
-| Quality | 20% | Source diversity + avg credibility |
-| Diversity | 10% | Penalize repeated topics in feed |
-| Trending | 10% | Story velocity (capped at 1.0) |
+**Why it happens.** The score includes freshness, which halves every six hours, plus velocity and a breaking bonus. All of these change between two page requests. A new breaking story enters at the top and pushes everything down one position. With offset pagination, the last story of page 1 shows up again as the first of page 2. Worse, a story that moved *up* past the page boundary is never shown at all. The client can hide duplicates, but it can't recover a gap.
 
-**Additional Modifiers:**
-- Breaking news: +30% boost
-- Already read: 90% penalty
+**Server side.** Page 1 ranks ~200 candidates and stores the ranked ids under a snapshot id for 15 minutes. The cursor is base64url of `{snapshot, offset}`, so pages 2..n are slices of the same frozen list. Hydration reads live rows, so a card's "12 sources" is current even though its position is frozen. A snapshot is only served to its owner. When it expires mid-scroll, the server re-ranks and keeps the offset.
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                         FEED GENERATION FLOW                                 │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  1. CHECK CACHE                                                              │
-│     └─► Key: feed:user:{userId}:{cursor}:{limit}                            │
-│     └─► If hit: return cached response                                       │
-│                                                                              │
-│  2. LOAD USER CONTEXT (parallel)                                             │
-│     ├─► UserPreferences: topics[], preferredSources[], excludedSources[]    │
-│     └─► ReadHistory: Set<storyClusterId> (last 100)                         │
-│                                                                              │
-│  3. GET CANDIDATES                                                           │
-│     └─► Query story_clusters WHERE last_updated_at > NOW() - 48h            │
-│     └─► LIMIT 500, ORDER BY last_updated_at DESC                            │
-│                                                                              │
-│  4. SCORE EACH STORY                                                         │
-│     ┌──────────────────────────────────────────────────────────────────┐    │
-│     │ score = relevance * 0.35 + freshness * 0.25 + quality * 0.20     │    │
-│     │       + diversity * 0.10 + trending * 0.10                        │    │
-│     │ if (isBreaking) score *= 1.3                                      │    │
-│     │ Update context.topicsInFeed for diversity tracking                │    │
-│     └──────────────────────────────────────────────────────────────────┘    │
-│                                                                              │
-│  5. SORT BY SCORE, PAGINATE                                                  │
-│     └─► Slice [cursor, cursor+limit]                                        │
-│                                                                              │
-│  6. CACHE RESULT                                                             │
-│     └─► Redis SETEX with 60s TTL                                            │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+**Client side.** The feed is one infinite query keyed by topic. A sentinel near the bottom calls `fetchNextPage` with the last cursor, and the merge step drops ids already on screen, a backstop for the expired-snapshot case. The list is virtualized, so a reader 300 stories deep still has ~25 cards in the DOM. Scroll position and loaded pages survive navigating to a story and back, because the query cache keeps them.
 
-**Signal Computation Details:**
-- `relevance`: +0.3 per matching topic, +0.2 for preferred source, *0.1 if already read
-- `freshness`: exp(-ageHours * ln(2) / 6) - exponential decay
-- `quality`: 0.6 * min(sourceCount/5, 1) + 0.4 * avgCredibility
-- `diversity`: max(0, 1 - topicCountInFeed * 0.2)
+| Approach | Verdict |
+|----------|---------|
+| ✅ Server snapshot + opaque cursor + client dedupe | Disjoint pages within a scroll; graceful past expiry |
+| ❌ Offset over the live ranking | Duplicates *and* gaps; the client can only fix the duplicates |
+| ❌ Client fetches 200 ranked items at once | ~400 KB of JSON before first paint on a phone |
+| ❌ Per-user precomputed feed (fan-out) | Millions of rewrites a minute for feeds that are mostly never opened |
 
-### Frontend: Virtualized Feed with Skeleton States
-
-**FeedPage Structure:**
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              FEED PAGE                                       │
-├─────────────────────────────────────────────────────────────────────────────┤
-│  ┌───────────────────────────────────────────────────────────────────────┐  │
-│  │ BreakingNewsBanner (if breakingStory && !dismissed)                   │  │
-│  │   [Pulsing dot] BREAKING: {title}  [SourceStack] [X dismiss]          │  │
-│  └───────────────────────────────────────────────────────────────────────┘  │
-│                                                                              │
-│  ┌───────────────────────────────────────────────────────────────────────┐  │
-│  │ TopicNav - horizontal scroll topic filters                            │  │
-│  └───────────────────────────────────────────────────────────────────────┘  │
-│                                                                              │
-│  ┌───────────────────────────────────────────────────────────────────────┐  │
-│  │ PullToRefresh (mobile)                                                │  │
-│  │   ┌─────────────────────────────────────────────────────────────────┐ │  │
-│  │   │ VirtualizedStoryList                                            │ │  │
-│  │   │   ├─ StoryCard (visible)                                        │ │  │
-│  │   │   ├─ StoryCard (visible)                                        │ │  │
-│  │   │   ├─ StoryCard (visible)                                        │ │  │
-│  │   │   └─ [Load more trigger - onLoadMore when in view]              │ │  │
-│  │   └─────────────────────────────────────────────────────────────────┘ │  │
-│  │                                                                       │  │
-│  │   OR if loading && empty:                                             │  │
-│  │   ┌─────────────────────────────────────────────────────────────────┐ │  │
-│  │   │ FeedSkeleton (count=5) - animated placeholders                  │ │  │
-│  │   └─────────────────────────────────────────────────────────────────┘ │  │
-│  └───────────────────────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
-
-**Zustand Feed Store State:**
-- `stories[]`, `cursor`, `hasMore`, `isLoading`
-- `loadFeed(reset?)`: Fetches from API, appends or replaces
-- `loadMore()`: Calls loadFeed(false)
-- `refresh()`: Calls loadFeed(true)
+"What I give up: the order within one scroll is up to 15 minutes old. That's fine because pull-to-refresh starts a new snapshot, and the breaking banner, not the list, is where urgency lives."
 
 ---
 
-## Step 6: Deep Dive - Breaking News System (8 minutes)
+## 🔧 Deep Dive 2: The Personalization Loop (7 min)
 
-### Backend: Velocity Detection and Notifications
+"Personalization has two inputs: what the reader tells us and what the reader does. Both must reach the ranking quickly and safely, without turning the feed into a monoculture."
 
-**Detection Thresholds:**
-| Metric | Threshold | Window |
-|--------|-----------|--------|
-| Velocity | > 2 articles/minute | 30 minutes |
-| Sources | >= 5 unique sources | 30 minutes |
+**Explicit preferences.** The settings form saves topics and preferred or blocked sources with a `PUT`. The server validates the payload (source ids must be UUIDs), stores it, and invalidates the reader's ranking profile and current snapshot in the same request. The client then invalidates `['feed']`, so the next feed visit ranks with the new preferences right away instead of after a cache TTL. Blocking a source hides stories covered *only* by that source. Stories with other coverage stay, and the blocked outlet just disappears from their source list.
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                     BREAKING NEWS DETECTION FLOW                             │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  ┌────────────────────┐                                                      │
-│  │ checkCluster(id)   │ ◄── Called after new article added to cluster       │
-│  └─────────┬──────────┘                                                      │
-│            │                                                                 │
-│            ▼                                                                 │
-│  ┌────────────────────────────────────────────────────────────────────────┐ │
-│  │ Query: COUNT articles, COUNT DISTINCT sources WHERE cluster_id = ?     │ │
-│  │        AND created_at > NOW() - 30 minutes                             │ │
-│  └─────────┬──────────────────────────────────────────────────────────────┘ │
-│            │                                                                 │
-│            ▼                                                                 │
-│  ┌────────────────────┐                                                      │
-│  │ velocity = count/30│                                                      │
-│  │ UPDATE velocity    │                                                      │
-│  └─────────┬──────────┘                                                      │
-│            │                                                                 │
-│            ▼                                                                 │
-│  ┌────────────────────────────────────────────────────────────────────────┐ │
-│  │ IF velocity > 2 AND sources >= 5:                                      │ │
-│  │   ┌──────────────────────────────────────────────────────────────────┐ │ │
-│  │   │ UPDATE story_clusters SET is_breaking=true, breaking_started_at  │ │ │
-│  │   │ WHERE id = ? AND is_breaking = false  -- Idempotent               │ │ │
-│  │   └──────────────────────────────────────────────────────────────────┘ │ │
-│  │                                                                        │ │
-│  │   IF row updated (newly breaking):                                     │ │
-│  │     ├─► Redis PUBLISH 'breaking-news' channel (for all API servers)   │ │
-│  │     └─► Queue push notifications for interested users                  │ │
-│  └────────────────────────────────────────────────────────────────────────┘ │
-│                                                                              │
-│  Push Notification Query:                                                    │
-│  SELECT users WHERE push_enabled = true AND preferences.topics ?| story.topics│
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+**Implicit signals.** When a signed-in reader opens an article from a story page, the client sends `POST /reading-history` with dwell time, using `keepalive` so a fast tab switch doesn't drop it. The first read of an article adds 0.05 to each of its topics (0.1 if they spent more than a minute), capped at 1. Re-reads and retries change nothing. Without that rule, a flaky network that retries three times would teach the ranking three times as much.
 
-### Frontend: Real-time Breaking News UI
+**Keeping it from becoming a filter bubble.** Relevance is only 35% of the score. Freshness (25%), coverage (20%) and velocity (10%) keep major news visible to everyone. After sorting, each story is multiplied by `0.8^n` for the `n` stories of its primary topic above it. It's a penalty, not a quota, so a dominant topic can still lead on a day it deserves to.
 
-**useBreakingNews Hook:**
-- WebSocket connection to receive `breaking_news` events
-- Tracks `dismissedIds` to avoid re-showing dismissed stories
-- Falls back to polling /api/v1/breaking every 30s when WS disconnected
-- Triggers browser Notification API (if permitted)
-- Plays notification sound on new breaking story
+| Approach | Verdict |
+|----------|---------|
+| ✅ Weighted signals + diversity penalty + idempotent learning | Personal, but news still gets through; retries are harmless |
+| ❌ Relevance-only ranking | Three tech reads in, the feed converges to one topic within days |
+| ❌ Hard per-topic quota | Drops legitimately dominant coverage on a big news day |
+| ❌ Counting every read event | Retries and re-opens inflate interests |
 
-**BreakingNewsBanner Component:**
-- Fixed position at top (z-50)
-- Red background with pulsing dot indicator
-- Displays story title (clickable to navigate)
-- Shows SourceStack (max 3 favicons)
-- X button to dismiss (adds to dismissedIds)
-- Role="alert" with aria-live="assertive" for accessibility
+"What I give up: learned weights only grow, up to a cap of 1. A reader whose interests change keeps the old ones until I add decay. A nightly `weight × 0.95` is the obvious next step, and so is a 'show me less of this' control that writes a negative weight."
 
 ---
 
-## Step 7: Deep Dive - Reading Progress Sync (5 minutes)
+## 🔧 Deep Dive 3: From Crawl to Breaking Banner (7 min)
 
-### Backend: Reading History API
+"Freshness is a pipeline. Every stage can add minutes, and the screen should tell the truth about what it knows."
 
-**Batch Upsert Strategy:**
-- POST /api/v1/reading-history with array of entries
-- ON CONFLICT: accumulate dwell_time, keep latest read_at
-- After upsert: invalidate user's feed cache (redis.del feed:user:*:*)
+**Crawl.** Fetch workers claim due feeds with `FOR UPDATE SKIP LOCKED`, which pushes `next_crawl` ahead by a lease and stamps a token. A crashed worker's feeds come back on their own, and a stalled worker's late write is fenced off. Conditional GETs make most polls cheap `304`s. Failing feeds back off exponentially, up to a day and never sooner than `Retry-After`, in state that every worker shares. That is how we stay welcome on 50K servers at 56 fetches a second.
 
-### Frontend: Dwell Time Tracking and Sync
+**Cluster.** Each article's SimHash fingerprint is split into four 16-bit bands. Any fingerprint within 3 bits shares at least one band, so four indexed lookups find all candidates (~70 instead of 1.2M). Advisory locks on those band buckets make two workers that ingest the AP and Reuters versions at the same moment take turns, so they produce one story, not two.
 
-**readingProgressStore (Zustand + persist):**
+**Detect.** A story is flagged breaking when three *distinct* sources cover it within 30 minutes, counting by publication time capped at arrival. One chatty outlet, or a new source's backlog, can't trigger it. The flag stays in the breaking feed for six hours.
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                    READING PROGRESS ARCHITECTURE                             │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  State:                                                                      │
-│  ├─ readStories: Set<storyId>                                               │
-│  └─ pendingEntries: Array<{storyClusterId, readAt, dwellTimeSeconds}>       │
-│                                                                              │
-│  Actions:                                                                    │
-│  ├─ markAsRead(storyId) → Add to readStories, create pending entry          │
-│  ├─ trackDwellTime(storyId, seconds) → Update/create pending entry          │
-│  └─ syncToServer() → POST entries to API, clear pendingEntries on success   │
-│                                                                              │
-│  Persistence: localStorage via zustand/middleware/persist                   │
-│                                                                              │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  useReadingHistorySync Hook:                                                 │
-│  ├─ setInterval(syncToServer, 30000) - sync every 30s                       │
-│  └─ addEventListener('beforeunload', syncToServer) - sync on page leave     │
-│                                                                              │
-│  useDwellTimeTracker(storyId) Hook:                                          │
-│  ├─ startTime ref = Date.now()                                               │
-│  ├─ setInterval every 10s: trackDwellTime(storyId, elapsed)                 │
-│  └─ On unmount: track remaining time                                         │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+**Show.** The banner is part of the app shell. Production pushes `story.breaking` events over SSE, which reconnects on its own and resumes with `Last-Event-ID`, so a reader who walks through a tunnel still gets the events they missed. If SSE isn't available, the shell polls `/breaking` every 60 s while the tab is visible. The banner announces new items through a polite live region, not an assertive one, and new stories never jump into the list being read. A "3 new stories" pill appears instead, so nothing shifts under the reader's thumb.
+
+| Approach | Verdict |
+|----------|---------|
+| ✅ Distinct-source threshold + SSE banner + "new stories" pill | Early, honest, no layout shift |
+| ❌ Raw article velocity | One prolific source or a backlog fakes a breaking event |
+| ❌ Insert new stories into the visible list | Content jumps; readers lose their place; CLS spikes |
+| ❌ WebSocket per reader | A bidirectional channel for a one-way, low-rate stream |
 
 ---
 
-## Step 8: Error Handling Strategy (3 minutes)
+## 📈 Failures & Scale (2 min)
 
-### Backend: Centralized Error Handling
+| Failure | What the reader sees | What happens |
+|---------|----------------------|--------------|
+| A publisher is down | Nothing; that outlet's coverage arrives later | Backoff with `Retry-After`; other feeds unaffected |
+| Elasticsearch down | Search works with a "basic results" note | PostgreSQL full-text fallback (`engine: postgres`) |
+| Redis down | Logged out; a page may repeat a story, which the client hides | Feeds compute without snapshots |
+| Snapshot expired mid-scroll | Nothing | Server re-ranks and keeps the offset; client dedupes |
+| Read signal lost or retried | Nothing | `keepalive`; the server counts first reads only |
+| PostgreSQL down | Error state with retry; cached pages still visible | Replica promotion; crawling buffers in Kafka |
 
-**Error Classes:**
-- `AppError(message, statusCode, code)` - base class
-- `NotFoundError(resource)` - 404
-- `ValidationError(message)` - 400
-
-**Error Middleware:**
-- Logs error with path, method, stack
-- If AppError: return structured { error: { code, message } }
-- Unknown errors: return 500 with generic message
-
-### Frontend: Error Boundary and Toast
-
-**ErrorBoundary Component:**
-- Catches React rendering errors
-- Displays "Something went wrong" with error message
-- Provides "Refresh page" button
-
-**API Interceptor:**
-- Response error handler extracts message from response.data.error.message
-- Shows toast.error(message)
-- 401 errors trigger useAuthStore.logout()
+**What breaks first as we grow:** ranking CPU on cold page-1 loads (cache the candidate pool per region and personalize only the scoring), hot story rows during huge events (incremental counters instead of recounts), and snapshot memory in Redis (store 8-byte ids, shorten the TTL).
 
 ---
 
-## Trade-offs Summary
+## ⚖️ Trade-offs & Wrap-up (1 min)
 
-| Decision | Chosen Approach | Alternative | Trade-off |
-|----------|-----------------|-------------|-----------|
-| Breaking news delivery | WebSocket + polling fallback | Server-Sent Events | Bi-directional capability vs simpler protocol |
-| Feed caching | 60s Redis TTL | Real-time generation | Fast response vs always-fresh |
-| Reading history sync | Periodic batch (30s) | Real-time per-read | Lower API calls vs immediate personalization |
-| Deduplication | SimHash 64-bit | Semantic embeddings | Fast O(1) compare vs better paraphrase detection |
-| State management | Zustand | React Query | Simpler model vs built-in caching |
-| Source diversity UI | Expandable list | Always visible grid | Cleaner initial view vs immediate visibility |
+| Decision | ✅ Chosen | ❌ Alternative | Why |
+|----------|-----------|----------------|-----|
+| Feed pagination | Snapshot + opaque cursor + client dedupe | Offset over live ranking | No duplicates or gaps |
+| Learning from reads | First read only, `keepalive`, retry-safe | Count every event | Retries can't inflate interests |
+| Preference changes | Server and client invalidate together | Wait for TTLs | The next feed reflects the change |
+| Diversity | Multiplicative topic penalty | Quotas or none | Variety without hiding big news |
+| Crawling | Conditional GET, durable backoff, leases | Re-download, cron per instance | Polite and crash-safe |
+| Clustering | SimHash + band index + advisory locks | Linear scan, embeddings | Indexed, cheap, race-free |
+| Breaking UI | SSE banner + "new stories" pill | Polling only, inserting into the list | Early and stable |
+| Search | Elasticsearch + labeled fallback | ES only | Search survives an outage, honestly |
 
----
-
-## Future Enhancements
-
-1. **Collaborative Filtering** - "Users like you read..." recommendations
-2. **ML Topic Extraction** - Replace keyword matching with trained classifier
-3. **Semantic Search** - Vector similarity for concept-based queries
-4. **Offline Mode PWA** - Service worker for cached article reading
-5. **Source Credibility ML** - Automated scoring based on accuracy history
-6. **A/B Testing Framework** - Compare ranking algorithm variants
-
----
-
-## Closing Summary
-
-"I've designed a full-stack news aggregator with:
-
-1. **Content Pipeline** - RSS crawling with rate limiting, SimHash deduplication, and story clustering
-2. **Multi-signal Ranking** - Combining relevance, freshness, quality, diversity, and trending signals
-3. **Breaking News System** - Velocity detection on backend, WebSocket push to frontend
-4. **Source Diversity UI** - Showing multiple perspectives with credibility indicators
-5. **Reading Progress Sync** - Frontend dwell time tracking with periodic backend sync
-
-The key integration points are: shared TypeScript types for API contracts, WebSocket for real-time breaking news, and periodic sync for reading history. The backend focuses on data processing and caching, while the frontend handles virtualized rendering and optimistic updates. Happy to dive deeper into any layer."
+"With more time I'd add weight decay and a 'less like this' control, embeddings for paraphrased duplicates, and offline reading: cache the last feed and the opened stories in IndexedDB, and queue read signals for when the reader is back online."

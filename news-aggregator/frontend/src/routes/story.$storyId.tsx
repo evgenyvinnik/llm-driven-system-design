@@ -5,7 +5,9 @@
  */
 
 import { createFileRoute, Link } from '@tanstack/react-router';
-import { feedApi } from '../services/api';
+import { useRef } from 'react';
+import { feedApi, userApi } from '../services/api';
+import { useAuthStore } from '../stores';
 import { Clock, ExternalLink, Newspaper, TrendingUp, Zap, ArrowLeft } from 'lucide-react';
 
 /**
@@ -44,6 +46,19 @@ function formatDate(dateString: string): string {
  */
 function StoryPage() {
   const { story } = Route.useLoaderData();
+  const user = useAuthStore((state) => state.user);
+  const openedAt = useRef(Date.now());
+
+  /**
+   * Record a read when a signed-in user opens an article. This is the implicit
+   * signal behind learned topic weights; the server only learns from the first
+   * read of an article, so repeated clicks are harmless.
+   */
+  const recordRead = (articleId: string) => {
+    if (!user) return;
+    const dwellSeconds = Math.round((Date.now() - openedAt.current) / 1000);
+    userApi.recordRead(articleId, dwellSeconds).catch(() => undefined);
+  };
 
   return (
     <div className="max-w-4xl mx-auto">
@@ -106,6 +121,7 @@ function StoryPage() {
             href={article.url}
             target="_blank"
             rel="noopener noreferrer"
+            onClick={() => recordRead(article.id)}
             className="card block hover:border-primary-300"
           >
             <div className="flex items-start justify-between gap-4">

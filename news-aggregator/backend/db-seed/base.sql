@@ -1,7 +1,8 @@
 -- Seed data for development/testing
 -- News Aggregator Sample Data
 
--- Insert default admin user (password: admin123)
+-- Insert default admin user (password: password123). The hash is the legacy
+-- sha256(password + 'salt') form; the first login replaces it with scrypt.
 INSERT INTO users (username, email, password_hash, role)
 VALUES ('admin', 'admin@newsagg.local', 'f3ab6d7f779ddc29da66448ff3711af1df1289c9de16f5d76c918d9f3ef63b2e', 'admin');
 

@@ -100,7 +100,6 @@ export async function initElasticsearch(): Promise<void> {
  * @param article.published_at - Publication timestamp
  * @param article.source_id - ID of the news source
  * @param article.story_id - ID of the story cluster (if assigned)
- * @param article.fingerprint - SimHash fingerprint for deduplication
  */
 export async function indexArticle(article: {
   id: string;
@@ -112,15 +111,14 @@ export async function indexArticle(article: {
   published_at?: Date;
   source_id: string;
   story_id?: string;
-  fingerprint?: bigint;
 }): Promise<void> {
+  // The SimHash fingerprint is deliberately not indexed: it is an unsigned
+  // 64-bit value, and the mapping's signed `long` rejects every fingerprint
+  // at or above 2^63 (about half of them), which failed those documents.
   await esClient.index({
     index: 'articles',
     id: article.id,
-    body: {
-      ...article,
-      fingerprint: article.fingerprint ? Number(article.fingerprint) : null,
-    },
+    body: article,
   });
 }
 

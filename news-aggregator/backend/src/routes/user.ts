@@ -15,11 +15,28 @@ import {
   recordArticleRead,
   getReadingHistory,
   getAvailableTopics,
+  ArticleNotFoundError,
 } from '../services/user.js';
 import { v4 as uuid } from 'uuid';
 import { sessionStore } from '../db/redis.js';
 
 const router = Router();
+
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** True for undefined or an array of strings (optionally all UUIDs). */
+function isStringList(value: unknown, uuids = false): boolean {
+  if (value === undefined) return true;
+  return Array.isArray(value) && value.every(v => typeof v === 'string' && (!uuids || UUID_PATTERN.test(v)));
+}
+
+/** Session cookie settings: not readable by scripts, not sent on cross-site POSTs. */
+const SESSION_COOKIE = {
+  httpOnly: true,
+  sameSite: 'lax' as const,
+  secure: process.env.NODE_ENV === 'production',
+  maxAge: 86400000, // 24 hours
+};
 
 /**
  * POST /register - Register a new user
@@ -30,7 +47,8 @@ router.post('/register', async (req: Request, res: Response) => {
   try {
     const { username, email, password } = req.body;
 
-    if (!username || !email || !password) {
+    if (typeof username !== 'string' || typeof email !== 'string' || typeof password !== 'string'
+        || !username || !email || !password) {
       return res.status(400).json({ error: 'Missing required fields' });
     }
 
@@ -44,11 +62,7 @@ router.post('/register', async (req: Request, res: Response) => {
     const sessionId = uuid();
     await sessionStore.set(sessionId, { userId: user.id, role: user.role });
 
-    res.cookie('session_id', sessionId, {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
-      maxAge: 86400000, // 24 hours
-    });
+    res.cookie('session_id', sessionId, SESSION_COOKIE);
 
     res.status(201).json({
       id: user.id,
@@ -74,7 +88,7 @@ router.post('/login', async (req: Request, res: Response) => {
   try {
     const { email, password } = req.body;
 
-    if (!email || !password) {
+    if (typeof email !== 'string' || typeof password !== 'string' || !email || !password) {
       return res.status(400).json({ error: 'Missing email or password' });
     }
 
@@ -88,11 +102,7 @@ router.post('/login', async (req: Request, res: Response) => {
     const sessionId = uuid();
     await sessionStore.set(sessionId, { userId: user.id, role: user.role });
 
-    res.cookie('session_id', sessionId, {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
-      maxAge: 86400000,
-    });
+    res.cookie('session_id', sessionId, SESSION_COOKIE);
 
     res.json({
       id: user.id,
@@ -186,6 +196,10 @@ router.put('/preferences', async (req: Request, res: Response) => {
     }
 
     const { preferred_topics, preferred_sources, blocked_sources } = req.body;
+    if (!isStringList(preferred_topics) || !isStringList(preferred_sources, true)
+        || !isStringList(blocked_sources, true)) {
+      return res.status(400).json({ error: 'Topics must be strings; sources must be source UUIDs' });
+    }
 
     const preferences = await updateUserPreferences(session.userId, {
       preferred_topics,
@@ -215,13 +229,17 @@ router.post('/reading-history', async (req: Request, res: Response) => {
 
     const { article_id, dwell_time_seconds } = req.body;
 
-    if (!article_id) {
-      return res.status(400).json({ error: 'Missing article_id' });
+    if (typeof article_id !== 'string' || !UUID_PATTERN.test(article_id)) {
+      return res.status(400).json({ error: 'article_id must be a UUID' });
     }
+    const dwell = Number.isFinite(dwell_time_seconds) ? Math.max(0, Math.min(Math.round(dwell_time_seconds), 86400)) : 0;
 
-    await recordArticleRead(session.userId, article_id, dwell_time_seconds || 0);
+    await recordArticleRead(session.userId, article_id, dwell);
     res.json({ message: 'Reading recorded' });
   } catch (error) {
+    if (error instanceof ArticleNotFoundError) {
+      return res.status(404).json({ error: 'Article not found' });
+    }
     console.error('Error recording read:', error);
     res.status(500).json({ error: 'Failed to record reading' });
   }

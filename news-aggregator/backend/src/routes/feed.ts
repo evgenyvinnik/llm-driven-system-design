@@ -14,7 +14,7 @@ import {
   getStory,
 } from '../services/feed.js';
 import { query } from '../db/postgres.js';
-import { searchArticles } from '../db/elasticsearch.js';
+import { search } from '../services/search.js';
 
 const router = Router();
 
@@ -151,22 +151,24 @@ router.get('/search', async (req: Request, res: Response) => {
     const dateTo = req.query.date_to
       ? new Date(req.query.date_to as string)
       : undefined;
-    const limit = parseInt(req.query.limit as string) || 20;
+    if ((dateFrom && isNaN(dateFrom.getTime())) || (dateTo && isNaN(dateTo.getTime()))) {
+      return res.status(400).json({ error: 'date_from and date_to must be ISO dates' });
+    }
+    const limit = Math.min(parseInt(req.query.limit as string) || 20, 100);
 
-    // Search in Elasticsearch
-    const searchResults = await searchArticles(q, {
+    // Elasticsearch first; PostgreSQL full-text search if it is unavailable
+    const { ids: articleIds, engine } = await search(q, {
       topics,
       dateFrom,
       dateTo,
       limit,
     });
 
-    if (searchResults.length === 0) {
-      return res.json({ articles: [] });
+    if (articleIds.length === 0) {
+      return res.json({ articles: [], engine });
     }
 
     // Get full article details from PostgreSQL
-    const articleIds = searchResults.map(r => r.id);
     const articles = await query(
       `SELECT a.id, a.source_id, s.name as source_name, a.title, a.summary, a.url,
               a.author, a.published_at, a.topics, a.story_id
@@ -182,7 +184,7 @@ router.get('/search', async (req: Request, res: Response) => {
       .map(id => articleMap.get(id))
       .filter(Boolean);
 
-    res.json({ articles: orderedArticles });
+    res.json({ articles: orderedArticles, engine });
   } catch (error) {
     console.error('Error searching articles:', error);
     res.status(500).json({ error: 'Failed to search articles' });

@@ -4,9 +4,11 @@
  * Reading behavior is used to learn implicit topic preferences for personalization.
  */
 
-import crypto from 'node:crypto';
-import { query, queryOne, execute } from '../db/postgres.js';
+import { query, queryOne, execute, withTransaction } from '../db/postgres.js';
 import { v4 as uuid } from 'uuid';
+import { hashPassword, verifyPassword } from '../shared/password.js';
+import { deleteFromCache, CacheKeys, invalidateUserFeedCache } from '../shared/cache.js';
+import { logger } from '../shared/logger.js';
 
 /** Represents a user account */
 interface User {
@@ -33,26 +35,11 @@ interface ReadingHistoryEntry {
   dwell_time_seconds: number;
 }
 
-/**
- * Hash a password for storage.
- * Note: Uses simple SHA-256 for learning purposes.
- * In production, use bcrypt or argon2.
- * @param password - Plain text password
- * @returns Hashed password string
- */
-function hashPassword(password: string): string {
-  // In production, use bcrypt.hash()
-  return crypto.createHash('sha256').update(password + 'salt').digest('hex');
-}
-
-/**
- * Verify a password against its hash.
- * @param password - Plain text password to verify
- * @param hash - Stored password hash
- * @returns True if password matches
- */
-function verifyPassword(password: string, hash: string): boolean {
-  return hashPassword(password) === hash;
+/** Thrown when an operation references an article that does not exist. */
+export class ArticleNotFoundError extends Error {
+  constructor() {
+    super('Article not found');
+  }
 }
 
 /**
@@ -69,20 +56,17 @@ export async function createUser(
   password: string
 ): Promise<User> {
   const id = uuid();
-  const passwordHash = hashPassword(password);
+  const passwordHash = await hashPassword(password);
 
-  await execute(
-    `INSERT INTO users (id, username, email, password_hash)
-     VALUES ($1, $2, $3, $4)`,
-    [id, username, email, passwordHash]
-  );
-
-  // Initialize preferences
-  await execute(
-    `INSERT INTO user_preferences (user_id)
-     VALUES ($1)`,
-    [id]
-  );
+  // The user and their preferences row succeed or fail together.
+  await withTransaction(async (client) => {
+    await client.query(
+      `INSERT INTO users (id, username, email, password_hash)
+       VALUES ($1, $2, $3, $4)`,
+      [id, username, email, passwordHash]
+    );
+    await client.query('INSERT INTO user_preferences (user_id) VALUES ($1)', [id]);
+  });
 
   return {
     id,
@@ -108,8 +92,25 @@ export async function authenticateUser(
     [email]
   );
 
-  if (!user || !verifyPassword(password, user.password_hash)) {
+  if (!user) {
     return null;
+  }
+
+  const check = await verifyPassword(password, user.password_hash);
+  if (!check.valid) {
+    return null;
+  }
+
+  // Transparently upgrade legacy hashes now that we know the password.
+  if (check.needsRehash) {
+    try {
+      await execute(
+        'UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2 AND password_hash = $3',
+        [await hashPassword(password), user.id, user.password_hash]
+      );
+    } catch (err) {
+      logger.warn({ userId: user.id, error: (err as Error).message }, 'Password rehash failed');
+    }
   }
 
   return {
@@ -181,6 +182,10 @@ export async function updateUserPreferences(
     [userId, newPrefs.preferred_topics, newPrefs.preferred_sources, newPrefs.blocked_sources]
   );
 
+  // The cached ranking profile and the current feed snapshot were built from
+  // the old preferences; drop both so the next feed load reflects the change.
+  await invalidateUserFeedCache(userId);
+
   return newPrefs;
 }
 
@@ -198,38 +203,50 @@ export async function recordArticleRead(
   articleId: string,
   dwellTimeSeconds: number = 0
 ): Promise<void> {
-  // Get article's story ID
-  const article = await queryOne<{ story_id: string | null; topics: string[] }>(
-    'SELECT story_id, topics FROM articles WHERE id = $1',
-    [articleId]
-  );
-
-  if (!article) {
-    throw new Error('Article not found');
-  }
-
-  // Record reading history
-  await execute(
-    `INSERT INTO user_reading_history (user_id, article_id, story_id, dwell_time_seconds)
-     VALUES ($1, $2, $3, $4)
-     ON CONFLICT (user_id, article_id) DO UPDATE SET
-       dwell_time_seconds = user_reading_history.dwell_time_seconds + $4,
-       read_at = NOW()`,
-    [userId, articleId, article.story_id, dwellTimeSeconds]
-  );
-
-  // Update topic weights based on reading behavior
-  for (const topic of article.topics) {
-    // Increase weight based on dwell time
-    const weightIncrease = dwellTimeSeconds > 60 ? 0.1 : 0.05;
-
-    await execute(
-      `INSERT INTO user_topic_weights (user_id, topic, weight)
-       VALUES ($1, $2, $3)
-       ON CONFLICT (user_id, topic) DO UPDATE SET
-         weight = LEAST(user_topic_weights.weight + $3, 1.0)`,
-      [userId, topic, weightIncrease]
+  const weightsChanged = await withTransaction(async (client) => {
+    const article = await client.query<{ story_id: string | null; topics: string[] }>(
+      'SELECT story_id, topics FROM articles WHERE id = $1',
+      [articleId]
     );
+    if (article.rowCount === 0) {
+      throw new ArticleNotFoundError();
+    }
+    const { story_id: storyId, topics } = article.rows[0];
+
+    // GREATEST, not +=: a retried request must not inflate dwell time.
+    // xmax = 0 is true only for a freshly inserted row (not the upsert path).
+    const history = await client.query<{ inserted: boolean }>(
+      `INSERT INTO user_reading_history (user_id, article_id, story_id, dwell_time_seconds)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (user_id, article_id) DO UPDATE SET
+         dwell_time_seconds = GREATEST(user_reading_history.dwell_time_seconds, EXCLUDED.dwell_time_seconds),
+         read_at = NOW()
+       RETURNING (xmax = 0) AS inserted`,
+      [userId, articleId, storyId, dwellTimeSeconds]
+    );
+
+    // Learn from the first read only, so retries and re-opens of the same
+    // article do not keep pushing the user's topic weights up.
+    if (!history.rows[0].inserted) {
+      return false;
+    }
+    const weightIncrease = dwellTimeSeconds > 60 ? 0.1 : 0.05;
+    for (const topic of topics) {
+      await client.query(
+        `INSERT INTO user_topic_weights (user_id, topic, weight)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (user_id, topic) DO UPDATE SET
+           weight = LEAST(user_topic_weights.weight + $3, 1.0)`,
+        [userId, topic, weightIncrease]
+      );
+    }
+    return topics.length > 0;
+  });
+
+  // The next feed snapshot should rank with the new weights; the snapshot the
+  // user is scrolling right now is left alone.
+  if (weightsChanged) {
+    await deleteFromCache(CacheKeys.userPrefs(userId));
   }
 }
 

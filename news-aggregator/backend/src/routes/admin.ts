@@ -8,7 +8,8 @@
 
 import { Router, Request, Response } from 'express';
 import { query, execute } from '../db/postgres.js';
-import { crawlAllDueSources, getAllSources as _getAllSources, addSource, crawlSource } from '../services/crawler.js';
+import { crawlAllDueSources, addSource, crawlSource, claimSource, normalizeArticleUrl } from '../services/crawler.js';
+import { deleteFromCache, CacheKeys } from '../shared/cache.js';
 
 const router = Router();
 
@@ -67,7 +68,8 @@ router.get('/stats', requireAdmin, async (_req: Request, res: Response) => {
 router.get('/sources', requireAdmin, async (_req: Request, res: Response) => {
   try {
     const sources = await query(
-      `SELECT s.*, cs.next_crawl, cs.priority
+      `SELECT s.*, cs.next_crawl, cs.priority, cs.consecutive_failures, cs.last_status,
+              cs.last_error, (cs.etag IS NOT NULL OR cs.last_modified IS NOT NULL) AS conditional_get
        FROM sources s
        LEFT JOIN crawl_schedule cs ON s.id = cs.source_id
        ORDER BY s.name`,
@@ -91,10 +93,16 @@ router.post('/sources', requireAdmin, async (req: Request, res: Response) => {
     if (!name || !feed_url) {
       return res.status(400).json({ error: 'Missing name or feed_url' });
     }
+    if (typeof feed_url !== 'string' || !normalizeArticleUrl(feed_url)) {
+      return res.status(400).json({ error: 'feed_url must be an absolute http(s) URL' });
+    }
 
     const source = await addSource(name, feed_url, category || 'general');
     res.status(201).json(source);
   } catch (error) {
+    if ((error as { code?: string }).code === '23505') {
+      return res.status(409).json({ error: 'A source for this domain already exists' });
+    }
     console.error('Error adding source:', error);
     res.status(500).json({ error: 'Failed to add source' });
   }
@@ -108,6 +116,9 @@ router.put('/sources/:id', requireAdmin, async (req: Request, res: Response) => 
   try {
     const { id } = req.params;
     const { name, feed_url, category, is_active, crawl_frequency_minutes } = req.body;
+    if (feed_url !== undefined && (typeof feed_url !== 'string' || !normalizeArticleUrl(feed_url))) {
+      return res.status(400).json({ error: 'feed_url must be an absolute http(s) URL' });
+    }
 
     await execute(
       `UPDATE sources SET
@@ -120,6 +131,16 @@ router.put('/sources/:id', requireAdmin, async (req: Request, res: Response) => 
        WHERE id = $6`,
       [name, feed_url, category, is_active, crawl_frequency_minutes, id]
     );
+
+    // Validators and backoff belong to the old URL; a new feed starts clean.
+    if (feed_url !== undefined) {
+      await execute(
+        `UPDATE crawl_schedule SET etag = NULL, last_modified = NULL, consecutive_failures = 0,
+           last_status = NULL, last_error = NULL, next_crawl = NOW()
+         WHERE source_id = $1 AND lease_token IS NULL`,
+        [id]
+      );
+    }
 
     res.json({ message: 'Source updated' });
   } catch (error) {
@@ -145,29 +166,20 @@ router.delete('/sources/:id', requireAdmin, async (req: Request, res: Response) 
 
 /**
  * POST /sources/:id/crawl - Manually trigger crawl for a source
- * Immediately crawls the specified source and returns results.
+ * Claims the source under the same lease the scheduler uses (409 while another
+ * crawler holds it), crawls it immediately, and returns the outcome.
  */
 router.post('/sources/:id/crawl', requireAdmin, async (req: Request, res: Response) => {
   try {
-    const { id } = req.params;
-
-    const sources = await query<{
-      id: string;
-      name: string;
-      domain: string;
-      feed_url: string;
-      category: string;
-      crawl_frequency_minutes: number;
-    }>(
-      'SELECT id, name, domain, feed_url, category, crawl_frequency_minutes FROM sources WHERE id = $1',
-      [id]
-    );
-
-    if (sources.length === 0) {
+    const claim = await claimSource(req.params.id);
+    if (claim.status === 'not_found') {
       return res.status(404).json({ error: 'Source not found' });
     }
+    if (claim.status === 'busy') {
+      return res.status(409).json({ error: 'This source is being crawled right now' });
+    }
 
-    const result = await crawlSource(sources[0]);
+    const result = await crawlSource(claim.source);
     res.json(result);
   } catch (error) {
     console.error('Error crawling source:', error);
@@ -261,6 +273,10 @@ router.post('/stories/:id/breaking', requireAdmin, async (req: Request, res: Res
        WHERE id = $2`,
       [is_breaking, id]
     );
+    await Promise.all([
+      deleteFromCache(CacheKeys.breakingNews()),
+      deleteFromCache(CacheKeys.story(id)),
+    ]);
 
     res.json({ message: 'Story updated' });
   } catch (error) {

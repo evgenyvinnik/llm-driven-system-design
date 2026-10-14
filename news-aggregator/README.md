@@ -26,17 +26,19 @@ A content aggregation and curation platform that crawls RSS feeds, deduplicates 
 ## Architecture
 
 ```
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│    Frontend     │────▶│     Backend     │────▶│   PostgreSQL    │
-│  (React + TS)   │     │   (Express)     │     │   (Articles)    │
-└─────────────────┘     └─────────────────┘     └─────────────────┘
-                              │                        │
-                              ▼                        ▼
-                        ┌───────────┐           ┌───────────┐
-                        │   Redis   │           │Elasticsearch│
-                        │  (Cache)  │           │  (Search)  │
-                        └───────────┘           └───────────┘
+┌─────────────────┐     ┌──────────────────────────┐     ┌─────────────────┐
+│ Frontend        │────▶│ Backend (Express)        │────▶│ PostgreSQL      │
+│ React + Vite    │     │ API + in-process crawler │     │ articles,       │
+└─────────────────┘     └──┬────────────────────┬──┘     │ stories, users  │
+                           │                    │        └─────────────────┘
+                           ▼                    ▼
+                 ┌──────────────────┐  ┌──────────────────┐
+                 │ Redis            │  │ Elasticsearch    │
+                 │ sessions, feeds  │  │ search; optional │
+                 └──────────────────┘  └──────────────────┘
 ```
+
+The crawler claims due feeds under a lease, fetches them with conditional GETs (ETag / Last-Modified), backs off from failing feeds, and clusters articles into stories with SimHash. Elasticsearch is optional: without it, search falls back to PostgreSQL full-text search. See [architecture.md](./architecture.md) for the design.
 
 ## Getting Started
 
@@ -63,10 +65,11 @@ A content aggregation and curation platform that crawls RSS feeds, deduplicates 
    docker-compose ps
    ```
 
-4. Install backend dependencies and start the server:
+4. Install backend dependencies, seed demo stories, and start the server:
    ```bash
    cd backend
    npm install
+   npm run db:seed   # users, sources and six clustered stories (first run only)
    npm run dev
    ```
 
@@ -91,6 +94,8 @@ npm run dev:server1  # Port 3001
 npm run dev:server2  # Port 3002
 npm run dev:server3  # Port 3003
 ```
+
+Every instance may run the crawl schedule: sources are claimed under a lease (`FOR UPDATE SKIP LOCKED`), so each due feed is crawled by exactly one instance. Set `CRAWLER_ENABLED=false` to run an instance that only serves the API.
 
 ## API Endpoints
 
@@ -126,7 +131,7 @@ GET  /api/v1/admin/sources          # List all sources
 POST /api/v1/admin/sources          # Add new source
 PUT  /api/v1/admin/sources/:id      # Update source
 DELETE /api/v1/admin/sources/:id    # Delete source
-POST /api/v1/admin/sources/:id/crawl # Crawl single source
+POST /api/v1/admin/sources/:id/crawl # Crawl single source now (409 while it is being crawled)
 POST /api/v1/admin/crawl            # Trigger full crawl
 ```
 
@@ -182,7 +187,7 @@ news-aggregator/
 │   │   ├── routes/         # API routes
 │   │   ├── services/       # Business logic
 │   │   └── utils/          # SimHash, RSS parsing, topics
-│   └── db/init.sql         # Schema and seed data
+│   └── src/db/init.sql     # Schema (re-runnable)
 └── frontend/
     └── src/
         ├── routes/         # Tanstack Router pages
@@ -203,8 +208,24 @@ DB_PASSWORD=newsagg_dev
 DB_NAME=news_aggregator
 REDIS_HOST=localhost
 REDIS_PORT=6379
-ELASTICSEARCH_URL=http://localhost:9200
+ELASTICSEARCH_URL=http://localhost:9200   # optional; search falls back to PostgreSQL
 FRONTEND_URL=http://localhost:5173
+
+# Crawler (defaults shown)
+CRAWLER_ENABLED=true              # run the 15-minute schedule in this process
+CRAWLER_LEASE_SECONDS=600         # lease length when a source is claimed
+CRAWLER_MAX_BACKOFF_MINUTES=1440  # cap for per-source failure backoff and Retry-After
+CRAWLER_DOMAIN_DELAY_MS=1000      # minimum gap between requests to one domain
+
+# Clustering and breaking news
+CLUSTER_WINDOW_HOURS=48           # a story accepts articles while its newest one is this recent
+BREAKING_MIN_SOURCES=3            # distinct sources within the window that flag breaking news
+VELOCITY_WINDOW_MINUTES=30
+BREAKING_TTL_HOURS=6              # how long a story stays in the breaking banner
+
+# Feed
+CACHE_FEED_TTL=60                 # page 1 reuses the viewer's snapshot this long
+CACHE_FEED_SNAPSHOT_TTL=900       # how long a feed cursor stays valid
 ```
 
 ## Testing
@@ -212,6 +233,7 @@ FRONTEND_URL=http://localhost:5173
 ```bash
 # Backend
 cd backend
+npm test        # vitest: crawl policy, crawler, SimHash banding, feed ranking/snapshots, passwords
 npm run build   # TypeScript compilation
 
 # Frontend
@@ -227,7 +249,7 @@ See [architecture.md](./architecture.md) for detailed system design documentatio
 
 ## Development Notes
 
-See [claude.md](./claude.md) for development insights and iteration history.
+See [CLAUDE.md](./CLAUDE.md) for development insights and iteration history.
 
 ## Future Enhancements
 

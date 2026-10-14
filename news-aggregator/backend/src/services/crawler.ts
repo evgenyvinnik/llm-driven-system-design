@@ -302,8 +302,12 @@ export async function crawlSource(source: ClaimedSource): Promise<CrawlResult> {
             childLogger.warn({ article: item.title, error: (err as Error).message }, 'Failed to process article');
           }
         }
-        etag = fetched.etag;
-        lastModified = fetched.lastModified;
+        // Advance the validators only if every item was stored: otherwise the
+        // next conditional GET would get a 304 and never retry the failed ones.
+        if (result.errors.length === 0) {
+          etag = fetched.etag;
+          lastModified = fetched.lastModified;
+        }
       } catch (err) {
         outcome = 'failed';
         lastError = `Parse error: ${(err as Error).message}`;

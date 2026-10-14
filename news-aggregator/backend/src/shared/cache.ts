@@ -12,12 +12,10 @@ import { cacheHitsTotal, cacheMissesTotal } from './metrics.js';
  * Cache key prefixes for different data types.
  */
 export const CacheKeys = {
-  /** Personalized user feed cache */
-  userFeed: (userId: string, cursor: string, limit: number) =>
-    `feed:user:${userId}:${cursor}:${limit}`,
-  /** Anonymous/global feed cache */
-  globalFeed: (cursor: string, limit: number) =>
-    `feed:global:${cursor}:${limit}`,
+  /** Ranked feed snapshot (story ids in rank order) that a cursor points into */
+  feedSnapshot: (snapshotId: string) => `feed:snap:${snapshotId}`,
+  /** A viewer's newest snapshot id ('anon' for logged-out viewers); reused for page 1 */
+  currentFeed: (owner: string) => `feed:current:${owner}`,
   /** Topic-specific feed cache */
   topicFeed: (topic: string, cursor: string, limit: number) =>
     `feed:topic:${topic}:${cursor}:${limit}`,
@@ -123,17 +121,22 @@ export async function deleteFromCache(key: string): Promise<void> {
 
 /**
  * Delete multiple keys matching a pattern.
- * Useful for invalidating all feed caches for a user.
+ * Iterates with SCAN rather than KEYS: KEYS walks the whole keyspace in one
+ * blocking call, which stalls every other Redis client while it runs.
  *
- * @param pattern - Redis glob pattern (e.g., 'feed:user:123:*')
+ * @param pattern - Redis glob pattern (e.g., 'feed:topic:*')
  */
 export async function deleteByPattern(pattern: string): Promise<void> {
   try {
-    const keys = await redis.keys(pattern);
-    if (keys.length > 0) {
-      await redis.del(...keys);
-      logger.debug({ pattern, count: keys.length }, 'Cache pattern delete');
+    let count = 0;
+    const stream = redis.scanStream({ match: pattern, count: 200 });
+    for await (const keys of stream as AsyncIterable<string[]>) {
+      if (keys.length > 0) {
+        await redis.del(...keys);
+        count += keys.length;
+      }
     }
+    logger.debug({ pattern, count }, 'Cache pattern delete');
   } catch (error) {
     logger.error({ pattern, error }, 'Cache pattern delete error');
   }
@@ -173,14 +176,17 @@ export async function getOrSet<T>(
 }
 
 /**
- * Invalidate all feed caches for a user.
- * Called when user preferences change.
+ * Invalidate a user's ranking profile and current feed snapshot.
+ * Called when preferences change, so the next page 1 is ranked with them.
+ * Snapshots already handed out stay valid for scrolling until they expire.
  *
  * @param userId - The user's ID
  */
 export async function invalidateUserFeedCache(userId: string): Promise<void> {
-  await deleteByPattern(`feed:user:${userId}:*`);
-  await deleteFromCache(CacheKeys.userPrefs(userId));
+  await Promise.all([
+    deleteFromCache(CacheKeys.currentFeed(userId)),
+    deleteFromCache(CacheKeys.userPrefs(userId)),
+  ]);
   logger.info({ userId }, 'User feed cache invalidated');
 }
 
@@ -190,7 +196,7 @@ export async function invalidateUserFeedCache(userId: string): Promise<void> {
  */
 export async function invalidateGlobalCaches(): Promise<void> {
   await Promise.all([
-    deleteByPattern('feed:global:*'),
+    deleteFromCache(CacheKeys.currentFeed('anon')),
     deleteByPattern('feed:topic:*'),
     deleteFromCache(CacheKeys.breakingNews()),
     deleteFromCache(CacheKeys.trending()),

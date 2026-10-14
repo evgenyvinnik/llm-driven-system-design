@@ -8,20 +8,20 @@ That decision can't be exact string matching — no two outlets write the same h
 
 The second problem is that ranking a feed has no ground truth. Relevance, freshness, source diversity, and velocity all pull in different directions, and a feed optimizing purely for personal relevance turns into a filter bubble where a user who reads three tech stories never sees anything else again.
 
-**Learning goals:** SimHash fingerprinting and Hamming-distance clustering, multi-signal ranking with an explicit diversity penalty, per-source circuit breakers for crawling flaky third-party feeds, and using Elasticsearch alongside PostgreSQL for the query shapes SQL is bad at.
+**Learning goals:** polite crawling (conditional GETs, durable per-source backoff, `SKIP LOCKED` leases with fencing tokens), SimHash fingerprinting with a banded index and Hamming-distance clustering, multi-signal ranking with an explicit diversity penalty and snapshot (cursor) pagination, and Elasticsearch as a derived index with a PostgreSQL full-text fallback.
 
 ## Architecture at a Glance (what actually runs)
 
 | Component | Port / detail | Why this one |
 |-----------|--------------|--------------|
-| **API + in-process crawler** (`backend/src/index.ts`) | **3000** (`npm run dev` → `tsx watch`; `dev:server1/2/3` on 3001–3003) | Express plus a `node-cron` job every 15 minutes calling `crawlAllDueSources()` |
-| **PostgreSQL 16** | 5432 (`newsagg`/`newsagg_dev`, db `news_aggregator`) | `users`, `sources`, `stories`, `articles`, `user_preferences`, `user_reading_history`, `user_topic_weights`, `crawl_schedule` |
-| **Valkey 7** | 6379 | Sessions and cached user ranking profiles (topic weights) |
-| **Elasticsearch 8.11** | 9200 (single-node, security disabled) | Two indices, `articles` and `stories`, for full-text search with relevance scoring |
+| **API + in-process crawler** (`backend/src/index.ts`) | **3000** (`npm run dev` → `tsx watch`; `dev:server1/2/3` on 3001–3003) | Express plus a `node-cron` job every 15 minutes calling `crawlAllDueSources()`, which claims due sources under a lease, so every instance can run it; `CRAWLER_ENABLED=false` turns it off |
+| **PostgreSQL 16** | 5432 (`newsagg`/`newsagg_dev`, db `news_aggregator`) | `users`, `sources`, `stories` (with generated SimHash band columns), `articles` (with a generated `tsvector`), `user_preferences`, `user_reading_history`, `user_topic_weights`, `crawl_schedule` (lease token, ETag/Last-Modified, failure count) |
+| **Valkey 7** | 6379 | Sessions, cached ranking profiles, ranked feed snapshots behind the feed cursor, topic/breaking/trending caches |
+| **Elasticsearch 8.11** | 9200 (single-node, security disabled) | Optional. `articles` index for search; when it is unreachable the API still starts and `/search` answers from PostgreSQL full-text search |
 
 This is the one project in the batch whose backend port is **3000, not 3001** — `dev` is plain `tsx watch src/index.ts`, `shared/config.ts` defaults `PORT` to 3000, and `frontend/vite.config.ts` proxies `/api` there. Don't "fix" that to 3001 without changing all three.
 
-The ideas live in `backend/src/utils/simhash.ts` (fingerprinting), `backend/src/utils/topics.ts` (keyword classifier), and `backend/src/services/feed.ts` (`calculateStoryScore` and `applyDiversityPenalty`). Crawling and clustering are `backend/src/services/crawler.ts`. Cross-cutting helpers sit in `backend/src/shared/` — `circuit-breaker.ts`, `retry.ts`, `cache.ts`, `metrics.ts`, `logger.ts`, `config.ts`. Frontend is React 19 + TanStack Router (file-based: feed, trending, search, `topics.$topic`, `story.$storyId`, settings, admin) + Zustand + Tailwind.
+The ideas live in `backend/src/utils/simhash.ts` (fingerprinting and bands), `backend/src/services/crawl-policy.ts` (conditional headers, `Retry-After`, backoff), `backend/src/services/crawler.ts` (leases, fetching, transactional ingestion and clustering), `backend/src/services/feed.ts` (ranking, diversity, snapshots), `backend/src/services/search.ts` (Elasticsearch with PostgreSQL fallback), `backend/src/shared/password.ts` (scrypt) and `backend/src/utils/topics.ts` (keyword classifier). Cross-cutting helpers sit in `backend/src/shared/` — `circuit-breaker.ts`, `retry.ts`, `cache.ts`, `metrics.ts`, `logger.ts`, `config.ts`. Frontend is React 19 + TanStack Router (file-based: feed, trending, search, `topics.$topic`, `story.$storyId`, settings, admin) + Zustand + Tailwind.
 
 ## Key Design Decisions
 
@@ -35,15 +35,13 @@ Including trigrams alongside unigrams is what makes the fingerprint sensitive to
 
 What we give up: paraphrase blindness (the failure mode above) and threshold brittleness. The distance-3 cutoff was tuned by eye for news-length text; it will be wrong for very short items, where a handful of words dominates the fingerprint and unrelated stubs collide.
 
-### 2. Clustering is a linear scan over a 48-hour window
+### 2. Clustering uses a banded SimHash index, not a scan
 
-`assignToStory` selects every story from the last 48 hours with a non-null fingerprint and compares in JavaScript until it finds one under the threshold.
+Until 2026-10, `assignToStory` selected every story from the last 48 hours and compared fingerprints in JavaScript: O(N) per article, and most expensive on the busiest news days. Now `stories` carries four generated columns `fp_band0..3` (the fingerprint's 16-bit slices), each indexed. Two fingerprints within distance 3 must agree on at least one band (pigeonhole), so four equality probes return every possible match and the exact Hamming check runs only on those candidates. Generated columns mean PostgreSQL keeps the bands in sync, so no writer or seed can forget them.
 
-The obvious objection is that this is O(N) per article, and it is. The reason it's the right call *at this scale* is that the correct alternative is genuinely expensive: Hamming-distance search has no index in Postgres, so doing it properly means the SimHash banding trick — split the 64-bit fingerprint into 4 bands of 16 bits, index each band separately, and use the pigeonhole principle (two fingerprints within distance 3 must match exactly on at least one band) to turn the scan into an equality lookup. That's four extra indexed columns, four lookups, and a candidate-merge step, to avoid scanning a few hundred rows.
+Concurrency was the other half. Two crawlers could ingest near-duplicates at the same moment, both find no candidate, and create twin stories. Each ingest transaction now takes `pg_advisory_xact_lock(20817, band * 65536 + value)` on its four buckets in ascending order, so near-duplicates serialize and unrelated articles never wait.
 
-The 48-hour window is the actual scaling mechanism, and it's a domain bound rather than a technical one: news clusters form within hours, so an article matching a three-day-old story is more likely a coincidence than a continuation. It caps the scan regardless of how large `stories` grows.
-
-What we give up: the window is a hard cut with no notion of a slowly developing story, and the scan cost grows linearly with *news volume* even though it's bounded in time — a busy news day with many sources is exactly when it's most expensive.
+The window is now "newest article within 48 hours" (`last_article_at`) instead of "created within 48 hours", so a developing story stays open while coverage arrives. What we give up: banding only guarantees recall up to distance 3 with 4 bands; raising the threshold means more, narrower bands.
 
 ### 3. Ranking is five weighted signals plus a multiplicative diversity penalty
 
@@ -55,17 +53,13 @@ The freshness half-life of 6 hours is the load-bearing constant: after 12 hours 
 
 What we give up: every weight here is a guess with no feedback loop. Nothing measures whether the ranked feed produces more reading than a chronological one.
 
-### 4. Per-source circuit breakers, not one crawler breaker
+### 4. Per-source failure isolation: breakers, durable backoff, leases
 
-`crawler.ts` keeps a `Map` of Opossum breakers keyed by source ID, so each RSS feed gets its own.
-
-A single shared breaker is actively harmful for this workload. Third-party feeds fail constantly and independently — one outlet's CDN has a bad afternoon, another rotates a URL, a third times out under load. With one breaker, that one bad source drives up the aggregate error rate and trips the breaker for *every* source, so a single flaky publisher stops the entire crawl. Per-source breakers make failure isolation match the failure boundary: the broken feed is skipped and retried later, and the other nineteen crawl normally.
-
-Combined with `crawl_schedule` (each source has its own `next_crawl` and interval) and a per-domain delay map, this is also what keeps the crawler polite — it won't hammer a domain that's already struggling.
+`crawler.ts` keeps one Opossum breaker per source; `429`/`5xx` count against it, `304`/`4xx` don't. A single shared breaker lets one publisher's bad afternoon stop every feed. The breaker only matters within a process, though. The real politeness mechanism is `crawl_schedule`: a failure schedules the next attempt `interval × 2^failures` ahead (capped at 24 h, ±10% jitter, never sooner than `Retry-After`), and that state survives restarts and is shared by all instances. Conditional GETs (stored ETag/Last-Modified) turn unchanged feeds into `304`s. Claiming due rows with `FOR UPDATE SKIP LOCKED`, which pushes `next_crawl` ahead by the lease and stamps a fencing token, means several instances never crawl the same source, and a crashed crawl releases itself.
 
 ### 5. Postgres and Elasticsearch, each for what it's good at
 
-Articles are written to Postgres and then indexed into Elasticsearch (`indexArticle`, wrapped in `withRetry`). Feed assembly, clustering, and all the relational joins run against Postgres; only `GET /api/search` hits Elasticsearch.
+Articles are written to Postgres and, after the commit, indexed into Elasticsearch (`indexArticle`, wrapped in `withRetry`). Feed assembly, clustering, and all the relational joins run against Postgres; only `GET /api/v1/search` uses Elasticsearch, and since 2026-10 it falls back to a GIN-indexed `tsvector` in Postgres when Elasticsearch fails.
 
 Postgres full-text search would remove a service, and for simple keyword lookup it would be fine. It fails on the thing search is actually for: relevance ranking across title, summary, and body with different field weights, fuzzy matching for misspellings, and highlighted snippets. `tsvector` gives you `ts_rank`, which is coarse, and building multi-field weighted scoring on top of it means reimplementing a chunk of BM25 in SQL.
 
@@ -73,11 +67,13 @@ The cost is a genuine dual-write with no transaction across it. Postgres is the 
 
 ## Current State
 
-Runs end to end: RSS/Atom crawling via `fast-xml-parser` with per-source circuit breakers, per-domain rate limiting, and a `crawl_schedule` table driving a 15-minute cron; article dedup by URL then SimHash clustering into stories with `article_count`, `source_count`, and 30-minute `velocity` maintained on each assignment; keyword topic classification across technology/politics/business/sports and more; entity extraction; Elasticsearch indexing with retry; personalized feed ranking with the diversity penalty; topic browsing, trending, breaking, story detail with its constituent articles, and full-text search; user registration/login, preferences, reading history, and learned `user_topic_weights`; and an admin dashboard for source CRUD, manual crawl triggering, stats, and manually flagging a story as breaking. Health checks report Postgres/Redis/Elasticsearch status plus circuit-breaker state; Prometheus metrics and Pino structured logging throughout.
+Runs end to end with PostgreSQL and Redis; Elasticsearch is optional. RSS/Atom crawling via `fast-xml-parser` with lease-based claiming, conditional GETs, durable per-source backoff, per-source circuit breakers and per-domain pacing; transactional ingestion (`ON CONFLICT (url)`, article + story assignment + counters in one transaction) with banded SimHash clustering and advisory locks; automatic breaking detection (≥ 3 distinct sources in 30 min, shown for 6 h) plus manual admin flags; keyword topics and entity extraction; Elasticsearch indexing with a PostgreSQL full-text fallback; personalized ranking with blocked/preferred sources, decaying velocity and the diversity penalty, paged through ranked snapshots; registration/login with scrypt hashes; preferences and an idempotent reading-history signal that the story page sends; an admin dashboard for sources, crawl health, manual crawls and breaking flags. Health checks, Prometheus metrics, Pino logs, graceful shutdown.
 
-Seeded from `backend/db-seed/seed.sql`: **`admin@newsagg.local`** / **`password123`** (role `admin`), plus sample sources. (The comment above the hash still says `admin123` and is wrong.)
+**Tests:** `cd backend && npm test` runs 35 offline vitest tests.
 
-Simplified or omitted: **auth hashing is demo-grade** — `services/user.ts` uses `sha256(password + 'salt')` with a hardcoded literal salt, and says so in its own comment; this is not acceptable outside a learning project. The crawler runs in-process rather than as a separate worker or a queue-distributed fleet. Breaking-news detection is manual (an admin endpoint) rather than derived from velocity. No source credibility scoring, no semantic dedup, no reindex-from-Postgres repair job, and no tests.
+Seeded by `npm run db:seed` (applies `db-seed/base.sql`, then six clustered stories): **`admin@newsagg.local`** / **`password123`** (role `admin`). Its hash is the legacy salted SHA-256 form and is replaced by scrypt at the first login.
+
+Not built: Kafka and separate worker pools (crawling runs in the API process), a reindex-from-Postgres job for Elasticsearch drift, semantic or entity-based dedup, source credibility scoring, rate limiting, SSRF protection for admin-added feed URLs, cursor pagination on topic pages, and frontend server-state caching, virtualization or a settings UI for sources.
 
 ## Iteration & Repair Log
 
@@ -90,13 +86,22 @@ Simplified or omitted: **auth hashing is demo-grade** — `services/user.ts` use
 - **Featured story card reserved space for an image that doesn't exist:** `StoryCard` applied `col-span-2 row-span-2` to the first story, but nothing in the frontend renders `image_url`, so the extra row was a tall empty void. Now `md:col-span-2` — wider, not taller.
 - **Elasticsearch startup is slow:** the Compose health check uses a 30s interval and accepts yellow cluster status, because a single-node cluster never reaches green and the API otherwise raced ES to readiness.
 - **CI:** the repo-wide smoke-test workflow was removed (a CI runner can't provide the Docker services these tests need).
+- **2026-10-10 (implementation review + docs rewrite):**
+  - *Polite crawling made real.* Before: no conditional GETs; a failing source was retried every cycle; and an open per-source breaker fell back to a shared "global" breaker with immediate retries, which sent *more* traffic to a failing publisher. Every instance's cron crawled every due source. Now `crawl_schedule` stores ETag/Last-Modified, failure count, last status/error and a lease token; `claimDueSources()` claims with `FOR UPDATE SKIP LOCKED` and a 10-minute lease; `completeCrawl()` is fenced by the token; backoff is `interval × 2^failures` (≤ 24 h, ±10% jitter, ≥ `Retry-After`); validators advance only when every item of a `200` was stored. Domain pacing reserves slots before sleeping, and crawls run ten at a time. Admin "crawl now" uses the same lease (`409` while busy).
+  - *Ingestion races fixed.* Check-then-insert by URL became `INSERT … ON CONFLICT (url) DO NOTHING`. Insert, story assignment and counters share one transaction, where before a crash could leave an article without a story forever. Clustering uses the band index plus advisory locks (see decision 2). Velocity and breaking use `LEAST(published_at, created_at)` so a new source's backlog isn't a burst; non-http(s) article links are dropped at ingestion.
+  - *Feed correctness.* The personalized feed paginated by offset into a list re-ranked on every request (duplicates and gaps). It is now served from a ranked snapshot (`feed:snap:{id}`, 15 min) behind an opaque base64url cursor, owner-checked, and hydrated in two queries instead of one per story. Blocked sources were loaded and ignored; they now drop stories covered only by them, and preferred sources add 0.2 relevance. Preference saves didn't invalidate anything (up to 5 minutes stale); they now drop the profile and current snapshot. Freshness used `e^(-age/6)` while every doc said "6-hour half-life"; it is now `0.5^(age/6)`. Stored velocity never decayed (a burst stayed "trending" forever); it now decays to zero 30 minutes after the newest article. The breaking list was `is_breaking OR velocity > 0.5` with no time bound; it is now flags from the last 6 hours. Reading history bumped topic weights on every retry; now only the first read counts and dwell is `GREATEST`. The UI never sent read signals; the story page now does (`keepalive`).
+  - *Security and degradation.* `sha256(password + 'salt')` became scrypt with per-hash salts; legacy hashes verify once and are upgraded. The session cookie is `SameSite=Lax`, and the session middleware no longer hangs requests when Redis errors. The API exited at startup if Elasticsearch was down; ES init now retries in the background, and `/search` falls back to Postgres full-text search, reporting `engine`. Indexing sent the unsigned fingerprint into a signed `long` field, failing about half of all documents; the fingerprint is no longer indexed. `init.sql` is re-runnable. The `crawl` npm script pointed at a missing file and was removed.
+  - *Tests and verification.* vitest added (35 tests). Verified against PostgreSQL 16 and Redis with a mock RSS origin and no Elasticsearch: schema loads twice, ETag then `304`, `503` + `Retry-After` backoff, concurrent near-duplicates → one story, concurrent manual crawls → `200`/`409`, disjoint pages while a story is inserted mid-scroll, PG search fallback, blocked sources hidden immediately, read signal counted once, legacy hash upgraded, clean `SIGTERM`.
+  - *Docs.* `architecture.md` and the three interview answers rewritten around one layered overview (read path left, crawl pipeline right, stores in the middle) and generated sequence diagrams.
 
 ## Open Questions
 
-1. `Number(fingerprint)` truncates exactly the bits clustering depends on. Once fixed, does the distance-3 threshold still hold — or has clustering quality been silently measured against corrupted fingerprints all along?
-2. The 48-hour clustering scan is linear in news volume. Is SimHash banding (4×16-bit indexed columns + pigeonhole) worth its complexity, or is the honest answer that the window should shrink instead?
-3. The diversity penalty is `0.8^n` on primary topic only, so two stories about the same *event* with different primary topics both survive. Should the penalty key on entity overlap rather than topic label?
-4. Elasticsearch is a derived index with no repair path. Should indexing move behind a queue with a DLQ (making failures replayable), or should a periodic reindex-from-Postgres job be the safety net?
+1. Fingerprints are now exact (`NUMERIC(20,0)`, no `Number()`), but nobody has measured whether "fewer than 3 differing bits" is the right threshold for news-length text. Short items collide easily. Should very short texts skip clustering, or use a title-only fingerprint?
+2. The diversity penalty is `0.8^n` on primary topic only, so two stories about the same *event* with different primary topics both survive. Should the penalty key on entity overlap rather than topic label?
+3. Elasticsearch still has no repair path for documents whose indexing failed after retries; the Postgres fallback only helps when ES is *down*. Outbox + replayable indexer, or a periodic reindex-from-Postgres job?
+4. Per-domain pacing is per process. With several instances crawling, one domain can get one request per second *per instance*. Is routing sources to instances by domain hash worth it at this scale, or a Redis token bucket per domain?
+5. Breaking detection re-flags a story an admin cleared as soon as another source arrives. Should a manual "not breaking" be sticky for the story's lifetime?
+6. Admin-added feed URLs are fetched server-side with no check against private or link-local addresses (SSRF). Fine for a local learning project; what's the minimal correct guard (resolve-then-check, or an egress proxy)?
 
 ## Resources
 
