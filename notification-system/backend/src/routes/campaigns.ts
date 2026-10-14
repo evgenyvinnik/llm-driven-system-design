@@ -200,28 +200,26 @@ interface TargetAudience {
 // Start campaign (admin only)
 router.post('/:id/start', adminMiddleware, async (req: Request, res: Response): Promise<void> => {
   try {
-    const campaignResult = await query<CampaignRow>(
-      `SELECT * FROM campaigns WHERE id = $1`,
+    // Claim the campaign atomically. The old SELECT-then-UPDATE let two
+    // concurrent starts both pass the status check and both fan out.
+    const claimed = await query<CampaignRow>(
+      `UPDATE campaigns SET status = 'running', started_at = NOW(), updated_at = NOW()
+       WHERE id = $1 AND status IN ('draft', 'scheduled')
+       RETURNING *`,
       [req.params.id]
     );
 
-    if (campaignResult.rows.length === 0) {
-      res.status(404).json({ error: 'Campaign not found' });
+    if (claimed.rows.length === 0) {
+      const exists = await query<{ id: string }>(`SELECT id FROM campaigns WHERE id = $1`, [req.params.id]);
+      if (exists.rows.length === 0) {
+        res.status(404).json({ error: 'Campaign not found' });
+      } else {
+        res.status(409).json({ error: 'Campaign cannot be started (already running, completed or cancelled)' });
+      }
       return;
     }
 
-    const campaign = campaignResult.rows[0];
-
-    if (!['draft', 'scheduled'].includes(campaign.status)) {
-      res.status(400).json({ error: 'Campaign cannot be started' });
-      return;
-    }
-
-    // Update status to running
-    await query(
-      `UPDATE campaigns SET status = 'running', started_at = NOW() WHERE id = $1`,
-      [req.params.id]
-    );
+    const campaign = claimed.rows[0];
 
     // Get target users based on audience filters
     let usersQuery = `SELECT id FROM users WHERE role = 'user'`;
@@ -243,14 +241,18 @@ router.post('/:id/start', adminMiddleware, async (req: Request, res: Response): 
     let sentCount = 0;
     for (const user of usersResult.rows) {
       try {
-        await notificationService.sendNotification({
+        // One durable key per recipient: re-running the fan-out cannot notify anyone twice.
+        const result = await notificationService.sendNotification({
           userId: user.id,
           templateId: campaign.template_id || undefined,
           channels: campaign.channels,
           priority: campaign.priority as 'critical' | 'high' | 'normal' | 'low',
           data: targetAudience?.data || {},
+          dedupeKey: `campaign:${campaign.id}:${user.id}`,
         });
-        sentCount++;
+        if (result.status === 'queued' || result.status === 'scheduled') {
+          sentCount++;
+        }
       } catch (e) {
         console.error(`Failed to send to user ${user.id}:`, e);
       }

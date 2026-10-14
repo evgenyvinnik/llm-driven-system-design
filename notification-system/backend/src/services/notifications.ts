@@ -1,12 +1,12 @@
 import { v4 as uuidv4 } from 'uuid';
-import { query } from '../utils/database.js';
-import { publishToQueue, getQueueName } from '../utils/rabbitmq.js';
-import { preferencesService, UserPreferences } from './preferences.js';
+import { query, withTransaction } from '../utils/database.js';
+import { preferencesService } from './preferences.js';
 import { rateLimiter } from './rateLimiter.js';
 import { templateService } from './templates.js';
 import { deduplicationService, deliveryTracker } from './delivery.js';
+import { enqueueDeliveries } from './outbox.js';
+import { deliveryTimeAfterQuietHours } from './quietHours.js';
 import { createLogger } from '../utils/logger.js';
-import { idempotencyService, IdempotencyConflictError } from '../utils/idempotency.js';
 import {
   notificationsSentCounter,
   rateLimitedCounter,
@@ -17,7 +17,6 @@ import { Logger } from 'pino';
 const log: Logger = createLogger('notification-service');
 
 export interface NotificationRequest {
-  idempotencyKey?: string;
   userId: string;
   templateId?: string;
   data?: Record<string, unknown>;
@@ -25,16 +24,29 @@ export interface NotificationRequest {
   priority?: 'critical' | 'high' | 'normal' | 'low';
   scheduledAt?: Date | null;
   deduplicationWindow?: number;
+  /** Durable per-recipient key, e.g. campaign:{id}:{user}; a repeat creates nothing. */
+  dedupeKey?: string;
 }
 
 export interface NotificationResult {
   notificationId: string | null;
-  status: string;
+  status: 'queued' | 'scheduled' | 'deduplicated' | 'suppressed' | 'rate_limited' | 'duplicate';
   reason?: string;
   retryAfter?: number;
   channels?: string[];
   channel?: string;
   scheduledFor?: Date;
+}
+
+/** Thrown for requests that can never succeed as sent (HTTP 4xx). */
+export class NotificationRequestError extends Error {
+  public statusCode: number;
+
+  constructor(message: string, statusCode: number = 400) {
+    super(message);
+    this.name = 'NotificationRequestError';
+    this.statusCode = statusCode;
+  }
 }
 
 interface GetNotificationsOptions {
@@ -57,96 +69,47 @@ interface NotificationRow {
   delivery_statuses: unknown[];
 }
 
-interface LogContext {
-  userId: string;
-  templateId?: string;
-  priority: string;
-  channels: string[];
-  notificationId?: string;
-}
+const VALID_CHANNELS = ['push', 'email', 'sms'];
+const VALID_PRIORITIES = ['critical', 'high', 'normal', 'low'];
 
-/** Orchestrates notification creation, validation, deduplication, rate limiting, and channel routing. */
+/** Orchestrates validation, preferences, dedup, rate limiting and the outbox write. */
 export class NotificationService {
   /**
-   * Send a notification to a user with idempotency support.
+   * Accepts a notification for delivery. Nothing is published to RabbitMQ
+   * here: the notification, one delivery row per channel and one outbox row
+   * per channel are committed in a single transaction, and the relay in the
+   * worker publishes them when they are due. Either all of it exists or none.
    *
-   * If an idempotency key is provided, the request will be deduplicated:
-   * - Same key with completed request: returns cached result
-   * - Same key with in-progress request: returns 409 Conflict
+   * HTTP-level idempotency (Idempotency-Key) is handled by the route.
    */
   async sendNotification(request: NotificationRequest): Promise<NotificationResult> {
-    const {
-      idempotencyKey,
-      userId,
-      templateId,
-      priority = 'normal',
-      channels = ['push', 'email'],
-    } = request;
-
-    const logContext: LogContext = { userId, templateId, priority, channels };
-
-    // If idempotency key provided, use idempotency service
-    if (idempotencyKey) {
-      log.debug({ ...logContext, idempotencyKey }, 'Processing request with idempotency key');
-
-      try {
-        const { result, cached } = await idempotencyService.executeWithIdempotency<NotificationResult>(
-          idempotencyKey,
-          () => this.processNotification(request)
-        );
-
-        if (cached) {
-          log.info({ ...logContext, idempotencyKey }, 'Returning cached result for idempotent request');
-        }
-
-        return result;
-      } catch (error) {
-        if (error instanceof IdempotencyConflictError) {
-          log.warn({ ...logContext, idempotencyKey }, 'Idempotency conflict - request already processing');
-          return {
-            notificationId: null,
-            status: 'conflict',
-            reason: 'Request with this idempotency key is already being processed',
-            retryAfter: 5, // Suggest client retry after 5 seconds
-          };
-        }
-        throw error;
-      }
-    }
-
-    // No idempotency key - process normally
-    return this.processNotification(request);
-  }
-
-  /**
-   * Internal method to process the notification.
-   * Separated from sendNotification to support idempotency wrapping.
-   */
-  async processNotification(request: NotificationRequest): Promise<NotificationResult> {
     const {
       userId,
       templateId,
       data = {},
-      channels = ['push', 'email'],
       priority = 'normal',
       scheduledAt,
       deduplicationWindow = 60,
+      dedupeKey,
     } = request;
+    const channels = [...new Set(request.channels ?? ['push', 'email'])];
 
-    const logContext: LogContext = { userId, templateId, priority, channels };
+    await this.validate({ ...request, channels });
+    const logContext = { userId, templateId, priority, channels };
 
-    // Validate request
-    await this.validate(request);
+    // 1. Preferences first (cached), so a suppressed send spends no dedup or rate budget.
+    const preferences = await preferencesService.getPreferences(userId);
+    const allowedChannels = preferencesService.filterChannels(channels, preferences);
+    if (allowedChannels.length === 0) {
+      log.info(logContext, 'Notification suppressed by user preferences');
+      return { notificationId: null, status: 'suppressed', reason: 'user_preferences' };
+    }
 
-    // Generate notification ID for tracking
-    const notificationId = uuidv4();
-    logContext.notificationId = notificationId;
-
-    // Check for duplicates using content-based deduplication
-    if (await deduplicationService.checkDuplicate(userId, templateId, data, deduplicationWindow)) {
+    // 2. Content dedup: atomic claim, released below if nothing gets created.
+    const dedupKey = deduplicationService.generateKey(userId, templateId, data);
+    if (!(await deduplicationService.claim(dedupKey, deduplicationWindow))) {
       log.info(logContext, 'Notification deduplicated');
       deduplicatedCounter.inc();
-
       return {
         notificationId: null,
         status: 'deduplicated',
@@ -154,172 +117,116 @@ export class NotificationService {
       };
     }
 
-    // Check rate limits
-    const rateLimitResult = await rateLimiter.checkLimit(userId, channels);
-    if (rateLimitResult.limited) {
-      log.warn({
-        ...logContext,
-        reason: rateLimitResult.reason,
-        channel: rateLimitResult.channel,
-      }, 'Notification rate limited');
-
-      rateLimitedCounter.labels(rateLimitResult.reason || '', rateLimitResult.channel || '').inc();
-
-      return {
-        notificationId: null,
-        status: 'rate_limited',
-        reason: rateLimitResult.reason,
-        channel: rateLimitResult.channel,
-        retryAfter: rateLimitResult.retryAfter,
-      };
-    }
-
-    // Get user preferences
-    const preferences = await preferencesService.getPreferences(userId);
-
-    // Filter channels based on preferences
-    const allowedChannels = preferencesService.filterChannels(channels, preferences);
-
-    if (allowedChannels.length === 0) {
-      log.info(logContext, 'Notification suppressed by user preferences');
-
-      return {
-        notificationId,
-        status: 'suppressed',
-        reason: 'user_preferences',
-      };
-    }
-
-    // Check quiet hours (skip for critical notifications)
-    if (preferencesService.isQuietHours(preferences) && priority !== 'critical') {
-      // For now, just mark as scheduled for later
-      const endOfQuietHours = this.calculateEndOfQuietHours(preferences);
-
-      await query(
-        `INSERT INTO notifications
-           (id, user_id, template_id, content, channels, priority, status, scheduled_at)
-         VALUES ($1, $2, $3, $4, $5, $6, 'scheduled', $7)`,
-        [
-          notificationId,
-          userId,
-          templateId,
-          JSON.stringify({ templateData: data }),
-          allowedChannels,
-          priority,
-          endOfQuietHours,
-        ]
-      );
-
-      log.info({
-        ...logContext,
-        scheduledFor: endOfQuietHours,
-      }, 'Notification scheduled for after quiet hours');
-
-      return {
-        notificationId,
-        status: 'scheduled',
-        reason: 'quiet_hours',
-        scheduledFor: endOfQuietHours,
-      };
-    }
-
-    // Render content for each channel
-    let content: Record<string, unknown> = {};
-    if (templateId) {
-      const template = await templateService.getTemplate(templateId);
-      if (template) {
-        for (const channel of allowedChannels) {
-          try {
-            content[channel] = templateService.renderTemplate(template, channel, data);
-          } catch (_e) {
-            log.debug({ channel, templateId }, 'Channel not supported by template');
-          }
-        }
+    try {
+      // 3. Rate limits: all channels admitted together, or none.
+      const rateLimitResult = await rateLimiter.checkLimit(userId, allowedChannels);
+      if (rateLimitResult.limited) {
+        await deduplicationService.release(dedupKey);
+        log.warn({ ...logContext, reason: rateLimitResult.reason, channel: rateLimitResult.channel }, 'Notification rate limited');
+        rateLimitedCounter.labels(rateLimitResult.reason || '', rateLimitResult.channel || '').inc();
+        return {
+          notificationId: null,
+          status: 'rate_limited',
+          reason: rateLimitResult.reason,
+          channel: rateLimitResult.channel,
+          retryAfter: rateLimitResult.retryAfter,
+        };
       }
-    }
 
-    // If no template, use provided content directly
-    if (Object.keys(content).length === 0) {
-      content = (data.content as Record<string, unknown>) || { title: data.title, body: data.body };
-    }
+      // 4. When may it go out? Requested time, pushed past quiet hours
+      //    (evaluated in the user's time zone) unless it is critical.
+      const now = new Date();
+      const requestedAt = scheduledAt && scheduledAt.getTime() > now.getTime() ? scheduledAt : now;
+      const { deliverAt, deferred } = deliveryTimeAfterQuietHours(preferences, requestedAt, priority);
+      const isScheduled = deliverAt.getTime() > now.getTime() + 1000;
 
-    // Create notification record
-    await query(
-      `INSERT INTO notifications
-         (id, user_id, template_id, content, channels, priority, status, scheduled_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-      [
-        notificationId,
-        userId,
-        templateId,
-        JSON.stringify(content),
-        allowedChannels,
-        priority,
-        scheduledAt ? 'scheduled' : 'pending',
-        scheduledAt || null,
-      ]
-    );
+      // 5. Render per channel now, so the stored content is exactly what is sent.
+      const content = await this.renderContent(templateId, allowedChannels, data);
 
-    // Route to channel queues
-    if (!scheduledAt) {
-      for (const channel of allowedChannels) {
-        await this.routeToChannel(
+      // 6. One transaction: notification + delivery rows + outbox rows.
+      const notificationId = uuidv4();
+      const created = await withTransaction(async (client) => {
+        const inserted = await client.query(
+          `INSERT INTO notifications
+             (id, user_id, template_id, content, channels, priority, status, scheduled_at, dedupe_key)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+           ON CONFLICT (dedupe_key) WHERE dedupe_key IS NOT NULL DO NOTHING
+           RETURNING id`,
+          [
+            notificationId,
+            userId,
+            templateId || null,
+            JSON.stringify(content),
+            allowedChannels,
+            priority,
+            isScheduled ? 'scheduled' : 'pending',
+            isScheduled ? deliverAt : null,
+            dedupeKey || null,
+          ]
+        );
+        if (inserted.rowCount === 0) return false;
+
+        await deliveryTracker.createDeliveries(client, notificationId, allowedChannels, isScheduled ? deliverAt : null);
+        await enqueueDeliveries(client, allowedChannels.map((channel) => ({
           notificationId,
           userId,
           channel,
           priority,
-          (content[channel] as Record<string, unknown>) || content
-        );
+          availableAt: deliverAt,
+        })));
+        return true;
+      });
+
+      if (!created) {
+        await deduplicationService.release(dedupKey);
+        log.info({ ...logContext, dedupeKey }, 'Recipient already has this notification');
+        return { notificationId: null, status: 'duplicate', reason: 'dedupe_key_exists' };
       }
+
+      notificationsSentCounter.labels('all', priority, isScheduled ? 'scheduled' : 'queued').inc();
+      log.info({ ...logContext, notificationId, channels: allowedChannels, deliverAt, deferred }, 'Notification accepted');
+
+      if (isScheduled) {
+        return {
+          notificationId,
+          status: 'scheduled',
+          reason: deferred ? 'quiet_hours' : 'scheduled',
+          channels: allowedChannels,
+          scheduledFor: deliverAt,
+        };
+      }
+      return { notificationId, status: 'queued', channels: allowedChannels };
+    } catch (error) {
+      await deduplicationService.release(dedupKey);
+      throw error;
     }
-
-    log.info({
-      ...logContext,
-      channels: allowedChannels,
-      scheduled: !!scheduledAt,
-    }, 'Notification queued successfully');
-
-    notificationsSentCounter.labels('all', priority, 'queued').inc();
-
-    return {
-      notificationId,
-      status: scheduledAt ? 'scheduled' : 'queued',
-      channels: allowedChannels,
-    };
   }
 
-  async routeToChannel(
-    notificationId: string,
-    userId: string,
-    channel: string,
-    priority: string,
-    content: Record<string, unknown>
-  ): Promise<void> {
-    const queueName = getQueueName(channel, priority);
-
-    await publishToQueue(queueName, {
-      notificationId,
-      userId,
-      channel,
-      content,
-      priority,
-      queuedAt: Date.now(),
-    });
-
-    // Create delivery status record
-    await deliveryTracker.updateStatus(notificationId, channel, 'pending');
-
-    log.debug({
-      notificationId,
-      channel,
-      priority,
-      queueName,
-    }, 'Notification routed to channel queue');
+  /** Per-channel content from the template, or the caller's title/body. */
+  private async renderContent(
+    templateId: string | undefined,
+    channels: string[],
+    data: Record<string, unknown>
+  ): Promise<Record<string, unknown>> {
+    if (templateId) {
+      const template = await templateService.getTemplate(templateId);
+      if (!template) {
+        throw new NotificationRequestError(`Template not found: ${templateId}`);
+      }
+      const content: Record<string, unknown> = {};
+      for (const channel of channels) {
+        if (template.channels[channel]) {
+          content[channel] = templateService.renderTemplate(template, channel, data);
+        }
+      }
+      if (Object.keys(content).length > 0) return content;
+    }
+    return (data.content as Record<string, unknown>) || { title: data.title, body: data.body };
   }
 
   async validate(request: NotificationRequest): Promise<void> {
     if (!request.userId) {
-      throw new Error('userId is required');
+      throw new NotificationRequestError('userId is required');
     }
 
     // Check if user exists
@@ -329,40 +236,27 @@ export class NotificationService {
     );
 
     if (userResult.rows.length === 0) {
-      throw new Error('User not found');
+      throw new NotificationRequestError('User not found', 404);
     }
 
     // Validate channels
-    const validChannels = ['push', 'email', 'sms'];
+    if (request.channels && request.channels.length === 0) {
+      throw new NotificationRequestError('At least one channel is required');
+    }
     for (const channel of request.channels || []) {
-      if (!validChannels.includes(channel)) {
-        throw new Error(`Invalid channel: ${channel}`);
+      if (!VALID_CHANNELS.includes(channel)) {
+        throw new NotificationRequestError(`Invalid channel: ${channel}`);
       }
     }
 
     // Validate priority
-    const validPriorities = ['critical', 'high', 'normal', 'low'];
-    if (request.priority && !validPriorities.includes(request.priority)) {
-      throw new Error(`Invalid priority: ${request.priority}`);
-    }
-  }
-
-  calculateEndOfQuietHours(preferences: UserPreferences): Date {
-    const now = new Date();
-    const endMinutes = preferences.quietHoursEnd || 0;
-
-    const endTime = new Date(now);
-    endTime.setHours(Math.floor(endMinutes / 60));
-    endTime.setMinutes(endMinutes % 60);
-    endTime.setSeconds(0);
-    endTime.setMilliseconds(0);
-
-    // If end time is before current time, it's tomorrow
-    if (endTime <= now) {
-      endTime.setDate(endTime.getDate() + 1);
+    if (request.priority && !VALID_PRIORITIES.includes(request.priority)) {
+      throw new NotificationRequestError(`Invalid priority: ${request.priority}`);
     }
 
-    return endTime;
+    if (request.scheduledAt && Number.isNaN(request.scheduledAt.getTime())) {
+      throw new NotificationRequestError('scheduledAt must be an ISO-8601 timestamp');
+    }
   }
 
   async getUserNotifications(
@@ -396,19 +290,11 @@ export class NotificationService {
   }
 
   async cancelNotification(notificationId: string, userId: string): Promise<boolean> {
-    const result = await query<{ id: string }>(
-      `UPDATE notifications
-       SET status = 'cancelled'
-       WHERE id = $1 AND user_id = $2 AND status IN ('pending', 'scheduled')
-       RETURNING id`,
-      [notificationId, userId]
-    );
-
-    if (result.rows.length > 0) {
+    const cancelled = await deliveryTracker.cancel(notificationId, userId);
+    if (cancelled) {
       log.info({ notificationId, userId }, 'Notification cancelled');
     }
-
-    return result.rows.length > 0;
+    return cancelled;
   }
 }
 

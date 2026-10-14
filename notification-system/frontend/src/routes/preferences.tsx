@@ -48,8 +48,17 @@ function PreferencesPage() {
     });
   };
 
+  // Quiet hours are evaluated in this zone on the server, so save the
+  // browser's zone along with the window.
+  const browserTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+
   const handleQuietHoursSave = async () => {
-    await setQuietHours(quietHoursEnabled ? quietStart : null, quietHoursEnabled ? quietEnd : null, quietHoursEnabled);
+    await setQuietHours(
+      quietHoursEnabled ? quietStart : null,
+      quietHoursEnabled ? quietEnd : null,
+      quietHoursEnabled,
+      browserTimeZone
+    );
   };
 
   if (isLoading && !preferences) {
@@ -159,7 +168,7 @@ function PreferencesPage() {
           Current timezone: <strong>{preferences?.timezone || 'UTC'}</strong>
         </p>
         <p className="text-xs text-gray-400">
-          Timezone is automatically detected based on your browser settings.
+          Saving quiet hours stores your browser&apos;s timezone ({browserTimeZone}); quiet hours are applied in that zone.
         </p>
       </div>
     </div>

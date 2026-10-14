@@ -2,7 +2,7 @@ import express, { Express, Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import { pool, initDatabase } from './utils/database.js';
 import { redis } from './utils/redis.js';
-import { initRabbitMQ, getChannel } from './utils/rabbitmq.js';
+import { getOutboxLagSeconds } from './services/outbox.js';
 import { createLogger, requestLogger } from './utils/logger.js';
 import { metricsMiddleware, getMetrics, activeConnections } from './utils/metrics.js';
 import { getAllCircuitBreakerStates, initializeCircuitBreakers } from './utils/circuitBreaker.js';
@@ -106,25 +106,18 @@ app.get('/health', async (_req: Request, res: Response): Promise<void> => {
     overallStatus = 'unhealthy';
   }
 
-  // Check RabbitMQ
+  // Delivery pipeline: the API never talks to RabbitMQ (it writes the outbox);
+  // what matters here is whether the worker's relay is keeping up.
   try {
-    const channel = getChannel();
-    if (channel) {
-      components.rabbitmq = { status: 'healthy' };
-    } else {
-      components.rabbitmq = {
-        status: 'degraded',
-        error: 'Channel not initialized',
-      };
-      if (overallStatus === 'healthy') {
-        overallStatus = 'degraded';
-      }
+    const lagSeconds = await getOutboxLagSeconds();
+    components.outbox = lagSeconds > 30
+      ? { status: 'degraded', error: `oldest due outbox row waiting ${lagSeconds}s (relay down or broker unreachable)` }
+      : { status: 'healthy', latencyMs: lagSeconds * 1000 };
+    if (lagSeconds > 30 && overallStatus === 'healthy') {
+      overallStatus = 'degraded';
     }
   } catch (error) {
-    components.rabbitmq = {
-      status: 'unhealthy',
-      error: (error as Error).message,
-    };
+    components.outbox = { status: 'unhealthy', error: (error as Error).message };
     overallStatus = 'unhealthy';
   }
 
@@ -232,16 +225,11 @@ async function start(): Promise<void> {
     initializeCircuitBreakers();
     log.info('Circuit breakers initialized');
 
-    // Bind the port FIRST so the API (login, reads) is reachable immediately.
-    // RabbitMQ (async notification delivery) is initialized in the background —
-    // it's slow to start and NOT required for auth, so it must not delay the server.
+    // The API only needs PostgreSQL and Redis. Notifications are written to the
+    // transactional outbox; the worker process relays them to RabbitMQ.
     const server: Server = app.listen(PORT, () => {
       log.info({ port: PORT }, `Notification API server running on port ${PORT}`);
     });
-
-    initRabbitMQ()
-      .then(() => log.info('RabbitMQ connected'))
-      .catch((e) => log.warn({ error: (e as Error).message }, 'RabbitMQ init failed; delivery degraded'));
 
     // Track connections for graceful shutdown
     server.on('connection', (socket: Socket) => {

@@ -1,3 +1,4 @@
+import { createHash, randomUUID } from 'node:crypto';
 import { redis } from './redis.js';
 import { createLogger } from './logger.js';
 import { idempotencyCacheHits } from './metrics.js';
@@ -5,278 +6,133 @@ import { Logger } from 'pino';
 
 const log: Logger = createLogger('idempotency');
 
-// Default TTL for idempotency keys: 24 hours
-const DEFAULT_TTL_SECONDS = 86400;
+/** How long a completed response is replayed for. */
+const COMPLETED_TTL_SECONDS = 86400;
+/** How long a claim may stay 'processing' before another request may take over. */
+const PROCESSING_TTL_SECONDS = 60;
 
-export interface IdempotencyOptions {
-  ttlSeconds?: number;
-  keyPrefix?: string;
+interface IdempotencyRecord {
+  state: 'processing' | 'completed';
+  fingerprint: string;
+  token: string;
+  status?: number;
+  body?: unknown;
 }
 
-interface IdempotencyCheckResult {
-  found: boolean;
-  result: unknown;
-  status: string | null;
-}
+export type IdempotencyBegin =
+  | { kind: 'new'; token: string }
+  | { kind: 'replay'; status: number; body: unknown }
+  | { kind: 'in_progress' }
+  | { kind: 'mismatch' }
+  | { kind: 'unavailable' };
 
-interface IdempotencyExecuteResult<T> {
-  result: T;
-  cached: boolean;
-}
+// Both scripts act only while the stored record still carries our claim token,
+// so a request whose claim expired cannot overwrite or delete a newer claim.
+const COMPLETE_IF_OWNER = `
+local current = redis.call('GET', KEYS[1])
+if not current then return 0 end
+local ok, record = pcall(cjson.decode, current)
+if not ok or record.token ~= ARGV[1] then return 0 end
+redis.call('SET', KEYS[1], ARGV[2], 'EX', tonumber(ARGV[3]))
+return 1
+`;
 
-interface CachedEntry {
-  status: string;
-  result?: unknown;
-  startedAt?: number;
-  completedAt?: number;
-}
+const RELEASE_IF_OWNER = `
+local current = redis.call('GET', KEYS[1])
+if not current then return 0 end
+local ok, record = pcall(cjson.decode, current)
+if ok and record.token == ARGV[1] then
+  redis.call('DEL', KEYS[1])
+  return 1
+end
+return 0
+`;
 
-interface RetryableError extends Error {
-  retryable?: boolean;
-  code?: string;
+/** JSON with object keys sorted, so equal payloads always hash the same. */
+export function stableStringify(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => stableStringify(item)).join(',')}]`;
+  }
+  if (value && typeof value === 'object') {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .filter(([, item]) => item !== undefined)
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+    return `{${entries.map(([key, item]) => `${JSON.stringify(key)}:${stableStringify(item)}`).join(',')}}`;
+  }
+  return JSON.stringify(value ?? null);
 }
 
 /**
- * Idempotency service for ensuring exactly-once processing of notifications.
+ * HTTP idempotency for POST /notifications (Idempotency-Key header).
  *
- * Uses Redis to store idempotency keys with the following pattern:
- * - Key: idempotency:{key}
- * - Value: JSON containing the result and metadata
- * - TTL: 24 hours (configurable)
- *
- * This prevents duplicate notification sends when:
- * - Client retries due to network timeout
- * - Service restarts mid-processing
- * - Load balancer routes same request to different instances
+ * Keys are scoped by the caller, so one user's key can never return another
+ * user's response, and they are bound to a fingerprint of the request body:
+ * the same key with a different body is a client bug and gets 422 instead of
+ * someone else's cached result. Only successful (2xx) responses are stored;
+ * anything else releases the claim so the client can retry with the same key.
  */
 export class IdempotencyService {
-  private ttlSeconds: number;
-  private keyPrefix: string;
-
-  constructor(options: IdempotencyOptions = {}) {
-    this.ttlSeconds = options.ttlSeconds || DEFAULT_TTL_SECONDS;
-    this.keyPrefix = options.keyPrefix || 'idempotency';
+  buildKey(scope: string, key: string): string {
+    return `idempotency:${scope}:${key}`;
   }
 
-  /**
-   * Build the Redis key for an idempotency key
-   */
-  buildKey(key: string): string {
-    return `${this.keyPrefix}:${key}`;
+  fingerprint(payload: unknown): string {
+    return createHash('sha256').update(stableStringify(payload)).digest('hex');
   }
 
-  /**
-   * Check if a request with the given idempotency key was already processed.
-   * If so, return the cached result. Otherwise, return null.
-   */
-  async check(idempotencyKey: string | undefined): Promise<IdempotencyCheckResult> {
-    if (!idempotencyKey) {
-      return { found: false, result: null, status: null };
-    }
-
-    const redisKey = this.buildKey(idempotencyKey);
+  /** Claims the key with SET NX, or explains why this request must not run. */
+  async begin(scope: string, key: string, fingerprint: string): Promise<IdempotencyBegin> {
+    const redisKey = this.buildKey(scope, key);
+    const token = randomUUID();
+    const claim: IdempotencyRecord = { state: 'processing', fingerprint, token };
 
     try {
-      const cached = await redis.get(redisKey);
-
-      if (cached) {
-        const parsed = JSON.parse(cached) as CachedEntry;
-
-        // Check if the request is still in progress
-        if (parsed.status === 'processing') {
-          log.info({ idempotencyKey }, 'Request is still being processed');
-          return { found: true, result: null, status: 'processing' };
-        }
-
-        // Request completed - return cached result
-        log.info({ idempotencyKey }, 'Returning cached result for idempotent request');
-        idempotencyCacheHits.inc();
-
-        return { found: true, result: parsed.result, status: 'completed' };
+      const claimed = await redis.set(redisKey, JSON.stringify(claim), 'EX', PROCESSING_TTL_SECONDS, 'NX');
+      if (claimed === 'OK') {
+        return { kind: 'new', token };
       }
 
-      return { found: false, result: null, status: null };
-    } catch (error) {
-      log.error({ err: error, idempotencyKey }, 'Error checking idempotency key');
-      // On error, proceed with processing to avoid blocking
-      return { found: false, result: null, status: null };
-    }
-  }
-
-  /**
-   * Mark a request as in-progress. This is used to detect concurrent duplicate requests.
-   *
-   * Uses SET NX to ensure only one instance can claim the key.
-   */
-  async markProcessing(idempotencyKey: string | undefined): Promise<boolean> {
-    if (!idempotencyKey) {
-      return true; // No idempotency key means we always process
-    }
-
-    const redisKey = this.buildKey(idempotencyKey);
-
-    try {
-      // Use NX to only set if not exists, with a short TTL for processing state
-      // This prevents race conditions between concurrent requests
-      const processingTtl = 300; // 5 minutes max processing time
-      const value = JSON.stringify({
-        status: 'processing',
-        startedAt: Date.now(),
-      });
-
-      const result = await redis.set(redisKey, value, 'EX', processingTtl, 'NX');
-
-      if (result === 'OK') {
-        log.debug({ idempotencyKey }, 'Claimed idempotency key for processing');
-        return true;
+      const existing = await redis.get(redisKey);
+      if (!existing) {
+        // The other claim expired between our SET and GET; let the client retry.
+        return { kind: 'in_progress' };
       }
-
-      log.info({ idempotencyKey }, 'Idempotency key already claimed by another request');
-      return false;
-    } catch (error) {
-      log.error({ err: error, idempotencyKey }, 'Error marking idempotency key as processing');
-      // On error, proceed with processing
-      return true;
-    }
-  }
-
-  /**
-   * Store the result for an idempotency key after successful processing.
-   */
-  async complete(idempotencyKey: string | undefined, result: unknown, ttlSeconds?: number): Promise<void> {
-    if (!idempotencyKey) {
-      return;
-    }
-
-    const redisKey = this.buildKey(idempotencyKey);
-    const ttl = ttlSeconds || this.ttlSeconds;
-
-    try {
-      const value = JSON.stringify({
-        status: 'completed',
-        result,
-        completedAt: Date.now(),
-      });
-
-      await redis.setex(redisKey, ttl, value);
-
-      log.debug({ idempotencyKey, ttl }, 'Stored idempotency result');
-    } catch (error) {
-      log.error({ err: error, idempotencyKey }, 'Error storing idempotency result');
-      // Non-fatal - worst case is the request might be reprocessed
-    }
-  }
-
-  /**
-   * Remove the idempotency key (e.g., on processing failure that should be retried)
-   */
-  async clear(idempotencyKey: string | undefined): Promise<void> {
-    if (!idempotencyKey) {
-      return;
-    }
-
-    const redisKey = this.buildKey(idempotencyKey);
-
-    try {
-      await redis.del(redisKey);
-      log.debug({ idempotencyKey }, 'Cleared idempotency key');
-    } catch (error) {
-      log.error({ err: error, idempotencyKey }, 'Error clearing idempotency key');
-    }
-  }
-
-  /**
-   * Execute an operation with idempotency protection.
-   *
-   * Workflow:
-   * 1. Check if already processed -> return cached result
-   * 2. Mark as processing (with NX lock)
-   * 3. Execute operation
-   * 4. Store result on success, clear on retryable failure
-   */
-  async executeWithIdempotency<T>(
-    idempotencyKey: string,
-    operation: () => Promise<T>
-  ): Promise<IdempotencyExecuteResult<T>> {
-    // Step 1: Check for existing result
-    const existing = await this.check(idempotencyKey);
-
-    if (existing.found && existing.status === 'completed') {
-      return { result: existing.result as T, cached: true };
-    }
-
-    if (existing.found && existing.status === 'processing') {
-      // Another request is processing - return a conflict response
-      throw new IdempotencyConflictError(idempotencyKey);
-    }
-
-    // Step 2: Try to claim the key
-    const claimed = await this.markProcessing(idempotencyKey);
-
-    if (!claimed) {
-      throw new IdempotencyConflictError(idempotencyKey);
-    }
-
-    try {
-      // Step 3: Execute the operation
-      const result = await operation();
-
-      // Step 4: Store the result
-      await this.complete(idempotencyKey, result);
-
-      return { result, cached: false };
-    } catch (error) {
-      const retryableError = error as RetryableError;
-      // On retryable errors, clear the key so the request can be retried
-      if (retryableError.retryable) {
-        await this.clear(idempotencyKey);
-      } else {
-        // For non-retryable errors, store the error as the result
-        await this.complete(idempotencyKey, {
-          error: true,
-          message: retryableError.message,
-          code: retryableError.code,
-        });
+      const record = JSON.parse(existing) as IdempotencyRecord;
+      if (record.fingerprint !== fingerprint) {
+        return { kind: 'mismatch' };
       }
-      throw error;
+      if (record.state === 'processing') {
+        return { kind: 'in_progress' };
+      }
+      idempotencyCacheHits.inc();
+      return { kind: 'replay', status: record.status ?? 200, body: record.body };
+    } catch (error) {
+      // Fail open: a Redis outage should not stop notifications being accepted.
+      log.error({ err: error, key: redisKey }, 'Idempotency store unavailable; proceeding without it');
+      return { kind: 'unavailable' };
     }
   }
 
-  /**
-   * Generate an idempotency key from request parameters.
-   * Useful when clients don't provide their own idempotency key.
-   */
-  generateKey(params: Record<string, unknown>): string {
-    const data = JSON.stringify(params);
-    // Simple hash for deduplication
-    let hash = 0;
-    for (let i = 0; i < data.length; i++) {
-      const char = data.charCodeAt(i);
-      hash = (hash << 5) - hash + char;
-      hash = hash & hash;
+  /** Stores the response for replay, if this request still owns the claim. */
+  async complete(scope: string, key: string, token: string, fingerprint: string, status: number, body: unknown): Promise<void> {
+    const record: IdempotencyRecord = { state: 'completed', fingerprint, token, status, body };
+    try {
+      await redis.eval(COMPLETE_IF_OWNER, 1, this.buildKey(scope, key), token, JSON.stringify(record), String(COMPLETED_TTL_SECONDS));
+    } catch (error) {
+      log.error({ err: error, scope, key }, 'Could not store idempotent response');
     }
-    return `generated:${Math.abs(hash).toString(16)}`;
+  }
+
+  /** Gives the key back so the client can retry (non-2xx outcomes). */
+  async release(scope: string, key: string, token: string): Promise<void> {
+    try {
+      await redis.eval(RELEASE_IF_OWNER, 1, this.buildKey(scope, key), token);
+    } catch (error) {
+      log.error({ err: error, scope, key }, 'Could not release idempotency claim');
+    }
   }
 }
 
-/**
- * Error thrown when a duplicate request is detected while processing
- */
-export class IdempotencyConflictError extends Error {
-  public idempotencyKey: string;
-  public statusCode: number;
-  public retryable: boolean;
-
-  constructor(idempotencyKey: string) {
-    super(`Request with idempotency key ${idempotencyKey} is already being processed`);
-    this.name = 'IdempotencyConflictError';
-    this.idempotencyKey = idempotencyKey;
-    this.statusCode = 409; // Conflict
-    this.retryable = true;
-  }
-}
-
-// Singleton instance
 export const idempotencyService = new IdempotencyService();
 
 export default idempotencyService;

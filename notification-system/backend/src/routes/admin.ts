@@ -4,6 +4,7 @@ import { redis } from '../utils/redis.js';
 import { adminMiddleware } from '../middleware/auth.js';
 import { deliveryTracker } from '../services/delivery.js';
 import { rateLimiter } from '../services/rateLimiter.js';
+import { getOutboxLagSeconds } from '../services/outbox.js';
 
 const router: Router = Router();
 
@@ -58,8 +59,6 @@ interface FailedNotificationRow {
   [key: string]: unknown;
 }
 
-type QueueDepth = Record<string, Record<string, number>>;
-
 // All admin routes require admin role
 router.use(adminMiddleware);
 
@@ -99,15 +98,17 @@ router.get('/stats', async (req: Request, res: Response): Promise<void> => {
         [timeRange]
       ),
 
-      // Queue depth from Redis
-      getQueueDepth(),
+      // Deliveries waiting or in flight, by channel and priority
+      deliveryTracker.getBacklog(),
     ]);
+    const outboxLagSeconds = await getOutboxLagSeconds();
 
     res.json({
       notifications: notificationStats.rows[0],
       deliveryByChannel: deliveryStats,
       users: userStats.rows[0],
       queueDepth,
+      outboxLagSeconds,
       timeRange,
     });
   } catch (error) {
@@ -198,6 +199,17 @@ router.patch('/users/:id/role', async (req: Request, res: Response): Promise<voi
       return;
     }
 
+    // Sessions cache the role in Redis for up to 24 hours. Evict them so a
+    // demotion takes effect on the next request instead of a day later; the
+    // auth middleware then reloads the role from PostgreSQL.
+    const sessions = await query<{ token: string }>(
+      `SELECT token FROM sessions WHERE user_id = $1`,
+      [req.params.id]
+    );
+    if (sessions.rows.length > 0) {
+      await redis.del(...sessions.rows.map((row) => `session:${row.token}`));
+    }
+
     res.json(result.rows[0]);
   } catch (error) {
     console.error('Update user role error:', error);
@@ -284,23 +296,5 @@ router.get('/failed-notifications', async (_req: Request, res: Response): Promis
     res.status(500).json({ error: 'Failed to get failed notifications' });
   }
 });
-
-// Helper function to get queue depth
-async function getQueueDepth(): Promise<QueueDepth> {
-  const channels = ['push', 'email', 'sms'];
-  const priorities = ['critical', 'high', 'normal', 'low'];
-  const depth: QueueDepth = {};
-
-  for (const channel of channels) {
-    depth[channel] = {};
-    for (const priority of priorities) {
-      const key = `queue:${channel}:${priority}`;
-      const count = await redis.llen(key);
-      depth[channel][priority] = count;
-    }
-  }
-
-  return depth;
-}
 
 export default router;

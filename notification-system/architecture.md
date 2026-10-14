@@ -1,825 +1,525 @@
-# Design Notification System - Architecture
+# Notification System — Architecture
 
 ## System Overview
 
-A high-throughput notification system delivering messages across multiple channels (push, email, SMS, in-app) with reliability guarantees and user preference handling. Core challenges involve message routing, delivery guarantees, and scale.
+A notification system takes "tell this user about this event" from many product services and turns it into a push, an email, an SMS or an in-app message — or into nothing, when the user opted out, is asleep, or already got the same message a minute ago. Calling a provider is the easy part. The hard parts are deciding **whether and when** to send (preferences, quiet hours in the user's own time zone, duplicates, rate limits), keeping **one marketing campaign of a million messages from delaying one password-reset email**, and making retries safe: a provider can accept a message and the acknowledgement can still be lost, so the system has to be built so that **retries never double-send and accepted notifications are never lost**.
 
-**Learning Goals:**
-- Build multi-channel message routing
-- Design priority-based queue processing
-- Implement delivery tracking and retries
-- Handle user preferences at scale
+This document describes the production design first. [Implementation Notes](#implementation-notes) describes what the local Express + PostgreSQL + Redis + RabbitMQ + React project actually runs.
 
----
+**Learning goals**
+
+- Transactional outbox instead of writing to the database and the queue separately.
+- At-least-once delivery made safe with an idempotent, leased, fenced claim per (notification, channel).
+- Priority isolation with separate queues, and retries with a budget and a dead-letter queue.
+- Preferences and quiet hours evaluated in the recipient's time zone, without a database read per send.
+- Idempotency keys on the accept API.
 
 ## Requirements
 
-### Functional Requirements
+### Functional requirements
 
-1. **Send**: Deliver notifications across channels (push, email, SMS, in-app)
-2. **Priority**: Process critical messages before normal/low priority
-3. **Preferences**: Respect user notification settings and quiet hours
-4. **Track**: Monitor delivery status per channel with event history
-5. **Template**: Support dynamic content templates with variable substitution
-6. **Campaign**: Admin-initiated bulk notifications with audience targeting
+1. **Accept** a notification for a user from an internal service: a template and its data (or raw content), the channels to try, and a priority (`critical`, `high`, `normal`, `low`), optionally scheduled for later.
+2. **Decide** per channel: honor channel and category opt-outs, defer non-critical messages until the end of the user's quiet hours, drop duplicates, enforce per-user and per-provider rate limits.
+3. **Deliver** through push (APNs, FCM), email and SMS providers, with retries, provider failover and a dead-letter queue.
+4. **Track** status per channel — queued, sent, delivered, bounced, failed — including provider delivery receipts, and let callers cancel anything that has not started.
+5. **Campaigns**: an operator sends one template to an audience of millions.
+6. **Preference center** for users; template, campaign and delivery tooling for operators.
 
-### Non-Functional Requirements
+Out of scope: building our own push or SMS transport, A/B testing content, ML send-time optimization.
 
-- **Throughput**: 1M+ notifications per minute at peak
-- **Latency**: < 100ms for critical notifications end-to-end
-- **Reliability**: 99.99% delivery rate with at-least-once semantics
-- **Availability**: 99.95% uptime (< 26 minutes downtime/month)
-- **Ordering**: Best-effort ordering within priority tier
+### Non-functional requirements
 
----
+| Requirement | Target |
+|-------------|--------|
+| Accept latency | p99 < 100 ms for `POST /v1/notifications` |
+| Durability | A `202 Accepted` notification is never lost |
+| Duplicates | At most one provider call per (notification, channel), except when a worker dies between the provider's accept and recording it |
+| Critical latency | Accepted → handed to the provider, p99 < 2 s, even during a campaign |
+| Normal latency | p99 < 30 s; campaign and digest traffic is throughput-bound, minutes are fine |
+| Opt-out freshness | A preference change applies to the next send, everywhere within 5 s |
+| Availability | Accept path 99.95%; one provider's outage never blocks other channels |
 
 ## Capacity Estimation
 
-### Production Scale
+| Quantity | Estimate | Design consequence |
+|----------|----------|--------------------|
+| Notifications | 500M/day → ~5,800/s average; campaign peaks of 1M/min ≈ 17K/s | Accept path scales horizontally; writes are sharded |
+| Deliveries | ~1.5 channels each → 750M/day, ~25K/s at peak | Channel workers scale per channel |
+| Channel mix | ~70% push, ~25% email, ~5% SMS | SMS is ~5% of volume and most of the cost (~$0.008 each) |
+| Preference reads | One per notification → ~17K/s peak | Cache in Redis; a database read per send would be the ceiling |
+| Notification rows | ~500 B × 500M/day ≈ 250 GB/day; 30-day history ≈ 7.5 TB | Shard by recipient; age out to cold storage |
+| Delivery rows | ~200 B × 750M/day ≈ 150 GB/day | Same shard as their notification |
+| Outbox rows | Transient: written and published within seconds, deleted after a day | Small and hot; partial index on unpublished rows |
+| Redis | Preferences for ~100M users × ~200 B ≈ 20 GB, plus short-lived keys | Redis Cluster |
 
-| Metric | Value | Rationale |
-|--------|-------|-----------|
-| Daily notifications | 500M | 1M/min peak x 60% duty cycle |
-| Unique users | 100M | Active user base |
-| Average channels per notification | 1.5 | Most go to push + email |
-| Daily delivery attempts | 750M | 500M x 1.5 channels |
-| Template renders/second | 17K | 1M/min / 60 |
-| Preference lookups/second | 17K | One per notification |
+"A campaign burst is 17,000 messages a second. If priority were only a sort key in one queue, a password reset arriving behind a million campaign messages would wait about a minute. That number is why critical traffic gets its own queues and its own consumers."
 
-### Storage Growth
+### Local Development Scale
 
-| Component | Size/Day | 30-Day Total | Retention |
-|-----------|----------|--------------|-----------|
-| Notifications table | 10 GB | 300 GB | 90 days, then archive |
-| Delivery status | 5 GB | 150 GB | 90 days |
-| Events (opens/clicks) | 2 GB | 60 GB | 30 days |
-| Templates + preferences | Negligible | ~1 GB | Indefinite |
-
----
+One API process, one worker process, PostgreSQL, Redis (Valkey) and RabbitMQ from Docker Compose, plus the Vite dev server: a handful of users and tens of notifications per minute. `dev:server1..3` run extra API instances to show that nothing is held in process memory. Ports and setup are in the [README](./README.md).
 
 ## High-Level Architecture
 
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│                          API Gateway / LB                            │
-│              (Rate limiting, auth, request routing)                   │
-└──────────────────────────────────────────────────────────────────────┘
-                                │
-                                ▼
-┌──────────────────────────────────────────────────────────────────────┐
-│                       Notification Service                           │
-│  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐     │
-│  │   Validation    │  │   Preferences   │  │    Routing      │     │
-│  │                 │  │                 │  │                 │     │
-│  │ - Schema check  │  │ - User prefs    │  │ - Channel split │     │
-│  │ - Rate limit    │  │ - Quiet hours   │  │ - Priority sort │     │
-│  │ - Idempotency   │  │ - Category opt  │  │ - Template      │     │
-│  └─────────────────┘  └─────────────────┘  └─────────────────┘     │
-└──────────────────────────────────────────────────────────────────────┘
-                                │
-           ┌────────────────────┼────────────────────┐
-           ▼                    ▼                    ▼
-┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│  RabbitMQ Queue  │    │  RabbitMQ Queue  │    │  RabbitMQ Queue  │
-│  push.critical   │    │  email.critical  │    │  sms.critical    │
-│  push.normal     │    │  email.normal    │    │  sms.normal      │
-│  push.low        │    │  email.low       │    │  sms.low         │
-└─────────────────┘    └─────────────────┘    └─────────────────┘
-           │                    │                    │
-           ▼                    ▼                    ▼
-┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│  Push Workers    │    │  Email Workers   │    │  SMS Workers     │
-│  (N instances)   │    │  (N instances)   │    │  (N instances)   │
-│                  │    │                  │    │                  │
-│  - APNs / FCM    │    │  - SMTP/SES      │    │  - Twilio        │
-│  - Circuit break │    │  - SendGrid      │    │  - Rate limit    │
-│  - Retry logic   │    │  - Retry logic   │    │  - Retry logic   │
-└─────────────────┘    └─────────────────┘    └─────────────────┘
-           │                    │                    │
-           └────────────────────┼────────────────────┘
-                                ▼
-┌──────────────────────────────────────────────────────────────────────┐
-│                      Delivery Tracking Service                       │
-│         (Status updates, receipts, analytics, DLQ monitoring)        │
-└──────────────────────────────────────────────────────────────────────┘
-                                │
-              ┌─────────────────┼─────────────────┐
-              ▼                 ▼                  ▼
-     ┌──────────────┐  ┌──────────────┐   ┌──────────────┐
-     │  PostgreSQL   │  │    Redis     │   │  Prometheus  │
-     │  (Primary DB) │  │  (Cache +   │   │  + Grafana   │
-     │               │  │   Sessions) │   │              │
-     └──────────────┘  └──────────────┘   └──────────────┘
+  ┌─────────────────────────────┐                         ┌────────────────────────────┐
+  │ Product services            │                         │ Admin console              │
+  │ auth · orders · social      │                         │ campaigns · templates      │
+  └──────────────┬──────────────┘                         └─────────────┬──────────────┘
+                 │ (1) POST /v1/notifications                           │ start campaign
+                 ▼                                                      ▼
+  ┌──────────────┴──────────────────────────────────────────────────────┴──────────────┐
+  │ API gateway · service auth · per-caller quotas · TLS                               │
+  └──────────────┬─────────────────────────────────────────────────────────────────────┘
+                 ▼
+  ┌─────────────────────────────┐                         ┌────────────────────────────┐
+  │ Notification API            │  GET prefs, SET NX,     │ Redis                      │
+  │ prefs · quiet hours · dedup │────────────────────────▶│ prefs cache · idempotency  │
+  │ rate limits · render        │  rate-limit script      │ dedup keys · rate counters │
+  └──────────────┬──────────────┘                         └────────────────────────────┘
+                 │ 1 tx: notification + deliveries + outbox
+                 ▼
+  ┌─────────────────────────────┐  (2) SELECT due rows    ┌────────────────────────────┐
+  │ PostgreSQL · by recipient   │◀────────────────────────│ Outbox relay               │
+  │ notifications · deliveries  │  FOR UPDATE SKIP LOCKED │ due rows, critical first   │
+  │ outbox · preferences        │                         └─────────────┬──────────────┘
+  └─────────────────────────────┘                                       │ publish + confirm
+          ▲             ▲                                               ▼
+          │             │                                 ┌────────────────────────────┐
+          │ delivered,  │                                 │ RabbitMQ                   │
+          │ bounced     │                                 │ 12 queues + dead-letter    │
+          │             │                                 └─────────────┬──────────────┘
+          │             │                                               │ consume
+          │             │ claim · mark sent                             ▼
+          │             │ retry via outbox                ┌────────────────────────────┐
+          │             └─────────────────────────────────┤ Channel workers            │
+          │                                               │ push · email · sms pools   │
+          │                                               └─────────────┬──────────────┘
+          │                                                             │ send
+          │                                                             ▼
+  ┌───────┴─────────────────────┐  (3) POST /webhooks/ses ┌────────────────────────────┐
+  │ Webhook receiver            │◀────────────────────────┤ APNs · FCM · SES · Twilio  │
+  │ verify · dedupe · advance   │                         │ external providers         │
+  └─────────────────────────────┘                         └────────────────────────────┘
 ```
 
-### Request Flow: Send Notification
+1. **Accept (1).** A product service posts a notification with an `Idempotency-Key`. The Notification API reads the user's preferences from Redis, drops opted-out channels, pushes a non-critical send past the user's quiet hours, claims a dedup key and the rate-limit budget, renders the template, and commits the notification, one delivery row per channel and one outbox row per channel in a single PostgreSQL transaction. It answers `202 Accepted`; nothing has been published yet.
+2. **Deliver (2).** The outbox relay selects due outbox rows, most urgent first, publishes each to its `{channel}.{priority}` RabbitMQ queue and marks it published once the broker confirms. A channel worker claims the delivery row, calls the provider, records the result and acks the message. Failures become a new outbox row due later; exhausted retries go to the dead-letter queue.
+3. **Receipts (3).** Providers call back with delivered, bounced, complained or unregistered-token events. The webhook receiver verifies the signature, ignores events it has already seen and moves the delivery row forward — never backward.
+
+| Component | Responsibility | Scales with | Notes |
+|-----------|----------------|-------------|-------|
+| API gateway | TLS, service authentication, per-caller quotas | Requests | A misbehaving caller is throttled before it reaches us |
+| Notification API | Validate, preferences, quiet hours, dedup, rate limits, render, one transaction; serves SSE streams | Accept rate, open streams | Stateless; never talks to RabbitMQ |
+| Redis Cluster | Preference cache, idempotency records, dedup keys, rate-limit counters | Users, request rate | Losing it slows accepts; preferences fall back to PostgreSQL |
+| PostgreSQL (sharded) | Notifications, deliveries, outbox, preferences | Recipients | Sharded by `user_id`, so the accept transaction is single-shard |
+| Outbox relay | Publish due rows in priority order, with confirms | Accept rate | One relay per shard; `SKIP LOCKED` lets replicas share a shard |
+| RabbitMQ | 12 queues (3 channels × 4 priorities) plus a dead-letter queue | Deliveries | Quorum queues; per-message ack and redelivery |
+| Channel workers | Claim, call provider, record, ack | Deliveries per channel | Separate pools per channel; breakers and token buckets per provider |
+| Webhook receiver | Provider receipts → delivery status | Receipt rate | Idempotent by provider event ID |
+
+The Notification API and the workers are separate deployments because their failure modes are different: the API must keep accepting while a provider is down, and a slow provider must back up only its own channel's workers. The relay is what lets the API not care whether RabbitMQ is up at all.
+
+## Core Components / Request Flows
+
+### Accepting a notification
 
 ```
-1. Client sends POST /api/v1/notifications with idempotency key
-2. API checks idempotency key in Redis → if exists, return cached result
-3. Validate request schema, check rate limits (per-user + global)
-4. Load user preferences from Redis cache (5-min TTL) or PostgreSQL
-5. Filter channels based on preferences, check quiet hours
-6. Render notification template with dynamic variables
-7. Store notification record in PostgreSQL (status: pending)
-8. For each allowed channel:
-   a. Publish to RabbitMQ priority queue (e.g., push.critical)
-   b. Create delivery_status record (status: queued)
-9. Cache idempotency result in Redis (24h TTL)
-10. Return notification ID + queued channels to client
+Caller                       Notification API                           Redis   PostgreSQL
+   │                                 │                                    │          │
+   │ 1 POST, Idempotency-Key K       │                                    │          │
+   │────────────────────────────────▶│                                    │          │
+   │                                 │ 2 SET idem:{caller}:K NX EX 60     │          │
+   │                                 │───────────────────────────────────▶│          │
+   │                                 │ 3 GET prefs:{user}                 │          │
+   │                                 │───────────────────────────────────▶│          │
+   │                                 │ 4 deliver_at after quiet hours     │          │
+   │                                 │ 5 dedup SET NX; rate-limit script  │          │
+   │                                 │───────────────────────────────────▶│          │
+   │                                 │ 6 1 tx: notification, deliveries, outbox      │
+   │                                 │──────────────────────────────────────────────▶│
+   │                                 │ 7 store 202 under K (24 h)         │          │
+   │                                 │───────────────────────────────────▶│          │
+   │ 8 202 {id, queued | scheduled}  │                                    │          │
+   │◀────────────────────────────────│                                    │          │
+   │                                 │                                    │          │
 ```
 
-### Request Flow: Worker Processing
+- The idempotency key is scoped by caller and bound to a SHA-256 fingerprint of the request body. A repeat with the same body replays the stored `202`; a repeat while the first is still running gets `409` with `Retry-After`; the same key with a different body is a client bug and gets `422`.
+- Preferences come from Redis (cache-aside, invalidated on every preference write, 5-minute TTL as a backstop). Opted-out channels are removed first, so a suppressed send spends no dedup or rate-limit budget.
+- Quiet hours are minutes from local midnight plus an IANA zone. "22:00–07:00 Asia/Tokyo" defers a `normal` send made at 23:10 Tokyo time to 07:00 Tokyo time, correct across DST changes. `critical` sends ignore quiet hours.
+- The content dedup key is `SET NX` on a hash of user, template and data, so two identical concurrent requests cannot both pass. Rate limits for all requested channels are checked and taken in one Lua script — all or nothing.
+- The transaction is the commitment point. If it rolls back, there is no notification and no message; if it commits, the relay will publish it. There is no window in which one exists without the other.
+
+### Relaying and delivering
 
 ```
-1. Worker consumes from RabbitMQ (critical queue first, then normal, then low)
-2. Check circuit breaker state for channel provider
-   - If OPEN: reject immediately, requeue with delay
-3. Attempt delivery via provider (APNs, SendGrid, Twilio)
-4. On success:
-   a. ACK message in RabbitMQ
-   b. Update delivery_status to 'sent'
-   c. Increment Prometheus counter
-5. On transient failure:
-   a. NACK with requeue, increment retry counter
-   b. After max retries: route to dead letter exchange
-6. On permanent failure (invalid token, bounced email):
-   a. ACK message, update status to 'failed'
-   b. Deregister invalid device tokens
+Outbox relay                   PostgreSQL   RabbitMQ         Email worker                Provider
+      │                             │           │                  │                         │
+      │ 1 SELECT due … SKIP LOCKED  │           │                  │                         │
+      │────────────────────────────▶│           │                  │                         │
+      │ 2 publish to email.high                 │                  │                         │
+      │────────────────────────────────────────▶│                  │                         │
+      │ 3 publisher confirm                     │                  │                         │
+      │◀────────────────────────────────────────│                  │                         │
+      │ 4 SET published_at; COMMIT  │           │                  │                         │
+      │────────────────────────────▶│           │                  │                         │
+      │                             │           │ 5 {id, channel}  │                         │
+      │                             │           │─────────────────▶│                         │
+      │                             │ 6 claim: pending → sending   │                         │
+      │                             │◀─────────────────────────────│                         │
+      │                             │           │                  │ 7 send, key = id:email  │
+      │                             │           │                  │────────────────────────▶│
+      │                             │           │                  │ 8 202 accepted          │
+      │                             │           │                  │◀────────────────────────│
+      │                             │ 9 mark sent (fenced)         │                         │
+      │                             │◀─────────────────────────────│                         │
+      │                             │           │ 10 ack           │                         │
+      │                             │           │◀─────────────────│                         │
+      │                             │           │                  │                         │
 ```
 
----
+- The relay query is `WHERE published_at IS NULL AND available_at <= now() ORDER BY priority, available_at FOR UPDATE SKIP LOCKED LIMIT 100`. Scheduled sends, quiet-hours deferrals and retries are all just rows with a later `available_at`; no separate scheduler exists.
+- Publishing waits for the broker's confirm before the row is marked published. A relay that crashes mid-batch rolls back and those rows are published again — so consumers must be idempotent, and they are.
+- The claim is one `UPDATE … SET status = 'sending', attempts = attempts + 1, lease_expires_at = now() + 60 s WHERE status IN ('pending', 'retrying') OR (status = 'sending' AND lease_expires_at < now())`. A duplicate or redelivered message finds nothing to claim and is acked. `attempts` is the fencing token: the final write includes `WHERE attempts = mine`, so a worker whose lease expired cannot overwrite the result of the worker that took over.
+- The provider gets `{notification_id}:{channel}` as its idempotency or collapse key where it supports one (email APIs, APNs `apns-collapse-id`), which shrinks the duplicate window that remains when a worker dies after the provider accepted.
+- Recording a result locks the notification row, updates the delivery row and recomputes the aggregate status in one transaction, so two channels finishing at once cannot leave the notification stuck at `partial`.
 
-## Core Components
+### Failure, retry and dead-lettering
 
-### 1. Notification Service
+```
+RabbitMQ                    Email worker         Provider           PostgreSQL   Outbox relay
+    │                             │                  │                   │             │
+    │ 1 message (attempt 2 of 5)  │                  │                   │             │
+    │────────────────────────────▶│                  │                   │             │
+    │                             │ 2 claim, attempts = 2                │             │
+    │                             │─────────────────────────────────────▶│             │
+    │                             │ 3 send           │                   │             │
+    │                             │─────────────────▶│                   │             │
+    │                             │ 4 503 / timeout  │                   │             │
+    │                             │◀─────────────────│                   │             │
+    │                             │ 5 retrying + outbox row due in 10 s  │             │
+    │                             │─────────────────────────────────────▶│             │
+    │ 6 ack                       │                  │                   │             │
+    │◀────────────────────────────│                  │                   │             │
+    ··································· 10 s later ·····································
+    │ 7 republish (attempt 3)                                                          │
+    │◀─────────────────────────────────────────────────────────────────────────────────│
+    ······························ attempt 5 also fails ································
+    │                             │ 8 failed, exhausted                  │             │
+    │                             │─────────────────────────────────────▶│             │
+    │ 9 nack → dead-letter queue  │                  │                   │             │
+    │◀────────────────────────────│                  │                   │             │
+    │                             │                  │                   │             │
+```
 
-Orchestrates the notification lifecycle: validation, preference filtering, template rendering, and routing to channel-specific queues.
+- A transient failure (timeout, 5xx, throttling) puts the row back to `retrying` and inserts the retry as an outbox row due after exponential backoff with jitter (~5 s, 10 s, 20 s, 40 s), in the same transaction. The retry survives a worker crash because it is a database row, not a timer.
+- When the provider's circuit breaker is open the delivery is deferred by the breaker's half-open delay and the attempt is handed back: a provider outage should not burn every message's retry budget.
+- Permanent failures (unregistered device token, hard bounce, unverified address) fail immediately and feed suppression lists. After the fifth transient failure the delivery is marked failed and the message is rejected into the dead-letter queue for inspection and replay. A message that cannot be parsed goes straight there.
+- A sweeper re-enqueues deliveries whose lease expired more than 30 s ago — the case where a worker died and its redelivered message was skipped because the lease still looked alive.
 
-**Key responsibilities:**
-- Idempotency key checking and caching
-- Rate limit enforcement (per-user and global)
-- User preference loading with Redis cache-aside
-- Template rendering with variable substitution
-- Multi-channel routing with priority assignment
+### Delivery receipts
 
-### 2. Priority Queue System
+"Sent" means a provider accepted the message, not that a person saw it. Providers report what happened later: SES and SendGrid post delivered, bounced and complained events; APNs and FCM answer with `Unregistered`/`410` for dead tokens; Twilio posts status callbacks. The webhook receiver verifies each callback's signature, inserts `(provider, event_id)` into `provider_events` (a duplicate insert means "already applied"), looks the delivery up by `provider_message_id`, and advances it only forward (`sent → delivered`, `sent → bounced`). Bounces and complaints add the address to a suppression list; unregistered tokens deactivate the device. Receipts that arrive before the worker recorded `sent` are kept and applied when it does.
 
-Separate RabbitMQ queues per channel and priority level. Workers consume from critical queues first, ensuring time-sensitive notifications (2FA codes, payment confirmations) are processed before marketing messages.
+### Live updates to browsers
 
-**Queue naming convention:** `notifications.{channel}.{priority}`
-
-**Priority levels:**
-- `critical`: 2FA, security alerts, payment confirmations
-- `high`: Direct messages, order updates
-- `normal`: Social notifications, recommendations
-- `low`: Marketing, digests, newsletters
-
-### 3. Channel Workers
-
-Dedicated worker pools per channel, each with its own circuit breaker and retry logic. Workers are stateless and horizontally scalable.
-
-**Push worker**: Sends to APNs (iOS) and FCM (Android), handles device token lifecycle (deregistration on invalid tokens).
-
-**Email worker**: Renders HTML/text templates, sends via SMTP provider (SendGrid/SES), includes unsubscribe headers and tracking pixels.
-
-**SMS worker**: Sends via Twilio/carrier APIs with aggressive rate limiting to respect carrier throughput limits.
-
-### 4. Delivery Tracking
-
-Tracks per-channel delivery status and aggregates to overall notification status. Records events (opens, clicks) for analytics. Monitors dead letter queue depth and alerts on growth.
-
-### 5. Preference Service
-
-Manages user notification preferences (enabled channels, category opt-outs, quiet hours) with Redis caching (5-minute TTL). Invalidates cache on preference updates.
-
-### 6. Rate Limiter
-
-Multi-level rate limiting using Redis atomic counters:
-
-| Level | Push | Email | SMS |
-|-------|------|-------|-----|
-| Per user | 50/hour | 10/hour | 5/hour |
-| Per service | 10K/min | 1K/min | 100/min |
-| Global | 100K/min | 10K/min | 1K/min |
-
----
+The in-app inbox and the operator console are live. Every change a person can see — a new inbox item, a delivery moving to `sent`, `delivered` or `bounced` — also writes a `user_events` row with a per-user sequence number in the same transaction as the change. The relay publishes those rows to the Redis pub/sub channel `user:{id}`; the Notification API instance holding that user's server-sent events stream is subscribed and forwards them, using the sequence number as the SSE `id`. A reconnecting browser sends `Last-Event-ID`, and the API replays newer rows from PostgreSQL before going live, so nothing is lost across a dropped connection. Browsers keep one stream per user agent by electing a leader tab.
 
 ## Database Schema
 
+### Production schema
+
 ```sql
-CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
-
--- Users
-CREATE TABLE IF NOT EXISTS users (
-  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  email VARCHAR(255) UNIQUE NOT NULL,
-  phone VARCHAR(20),
-  name VARCHAR(255) NOT NULL,
-  email_verified BOOLEAN DEFAULT false,
-  phone_verified BOOLEAN DEFAULT false,
-  role VARCHAR(20) DEFAULT 'user',
-  created_at TIMESTAMP DEFAULT NOW(),
-  updated_at TIMESTAMP DEFAULT NOW()
+-- Sharded by user_id: a notification, its deliveries and its outbox rows live on
+-- the same shard, so accepting one is a local transaction.
+CREATE TABLE notifications (
+  id            UUID PRIMARY KEY,
+  user_id       UUID NOT NULL,
+  category      TEXT NOT NULL,              -- security | orders | social | marketing
+  template_id   TEXT,
+  template_ver  INT,
+  content       JSONB NOT NULL,             -- rendered per channel at accept time
+  priority      SMALLINT NOT NULL,          -- 0 critical .. 3 low
+  status        TEXT NOT NULL,              -- pending | scheduled | partial | delivered | failed | cancelled
+  deliver_at    TIMESTAMPTZ NOT NULL,
+  dedupe_key    TEXT,                       -- e.g. campaign:{id}:{user_id}
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+CREATE UNIQUE INDEX ON notifications (user_id, dedupe_key) WHERE dedupe_key IS NOT NULL;
+CREATE INDEX ON notifications (user_id, created_at DESC, id);       -- history and inbox
 
--- Notifications
-CREATE TABLE IF NOT EXISTS notifications (
-  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  template_id VARCHAR(100),
-  content JSONB NOT NULL,
-  channels TEXT[] NOT NULL,
-  priority VARCHAR(20) DEFAULT 'normal',
-  status VARCHAR(20) DEFAULT 'pending',
-  scheduled_at TIMESTAMP,
-  created_at TIMESTAMP DEFAULT NOW(),
-  delivered_at TIMESTAMP
-);
-
-CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_notifications_status ON notifications(status) WHERE status = 'pending';
-CREATE INDEX IF NOT EXISTS idx_notifications_scheduled ON notifications(scheduled_at) WHERE status = 'scheduled';
-
--- Delivery status per channel
-CREATE TABLE IF NOT EXISTS delivery_status (
-  notification_id UUID REFERENCES notifications(id) ON DELETE CASCADE,
-  channel VARCHAR(20) NOT NULL,
-  status VARCHAR(20) NOT NULL,
-  details JSONB DEFAULT '{}',
-  attempts INTEGER DEFAULT 1,
-  next_retry_at TIMESTAMP,
-  updated_at TIMESTAMP DEFAULT NOW(),
+CREATE TABLE deliveries (
+  notification_id      UUID NOT NULL REFERENCES notifications (id),
+  channel              TEXT NOT NULL,       -- push | email | sms | in_app
+  status               TEXT NOT NULL,       -- pending | sending | retrying | sent | delivered | bounced | failed | cancelled
+  attempts             INT NOT NULL DEFAULT 0,   -- also the fencing token
+  lease_expires_at     TIMESTAMPTZ,
+  next_attempt_at      TIMESTAMPTZ,
+  provider             TEXT,
+  provider_message_id  TEXT,
+  updated_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY (notification_id, channel)
 );
+CREATE UNIQUE INDEX ON deliveries (provider, provider_message_id) WHERE provider_message_id IS NOT NULL;
 
-CREATE INDEX IF NOT EXISTS idx_delivery_status ON delivery_status(status, updated_at);
-CREATE INDEX IF NOT EXISTS idx_delivery_retry ON delivery_status(next_retry_at) WHERE status = 'pending';
+CREATE TABLE delivery_outbox (
+  id               BIGSERIAL PRIMARY KEY,
+  notification_id  UUID NOT NULL,
+  channel          TEXT NOT NULL,
+  priority         SMALLINT NOT NULL,
+  available_at     TIMESTAMPTZ NOT NULL,
+  published_at     TIMESTAMPTZ
+);
+CREATE INDEX ON delivery_outbox (priority, available_at) WHERE published_at IS NULL;
 
--- User preferences
-CREATE TABLE IF NOT EXISTS notification_preferences (
-  user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-  channels JSONB DEFAULT '{"push": {"enabled": true}, "email": {"enabled": true}, "sms": {"enabled": false}}',
-  categories JSONB DEFAULT '{}',
-  quiet_hours_start INTEGER, -- minutes from midnight
-  quiet_hours_end INTEGER,
-  timezone VARCHAR(50) DEFAULT 'UTC',
-  updated_at TIMESTAMP DEFAULT NOW()
+CREATE TABLE preferences (
+  user_id      UUID PRIMARY KEY,
+  channels     JSONB NOT NULL,              -- {"sms": {"enabled": false}}
+  categories   JSONB NOT NULL,              -- {"marketing": {"email": false}}
+  quiet_start  SMALLINT,                    -- minutes from local midnight
+  quiet_end    SMALLINT,
+  time_zone    TEXT NOT NULL DEFAULT 'UTC', -- IANA name
+  version      INT NOT NULL DEFAULT 1,      -- If-Match on updates
+  updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- Device tokens
-CREATE TABLE IF NOT EXISTS device_tokens (
-  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  platform VARCHAR(20) NOT NULL, -- ios, android, web
-  token TEXT NOT NULL,
-  active BOOLEAN DEFAULT true,
-  created_at TIMESTAMP DEFAULT NOW(),
-  last_used TIMESTAMP
+CREATE TABLE user_events (                 -- what the SSE stream replays after Last-Event-ID
+  user_id     UUID NOT NULL,
+  seq         BIGINT NOT NULL,                -- per-user, strictly increasing
+  type        TEXT NOT NULL,                  -- inbox.created | inbox.read | delivery.updated
+  payload     JSONB NOT NULL,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (user_id, seq)
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS idx_device_token ON device_tokens(token);
-CREATE INDEX IF NOT EXISTS idx_device_user ON device_tokens(user_id) WHERE active = true;
-
--- Notification events (opens, clicks)
-CREATE TABLE IF NOT EXISTS notification_events (
-  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  notification_id UUID REFERENCES notifications(id) ON DELETE CASCADE,
-  channel VARCHAR(20),
-  event_type VARCHAR(20),
-  metadata JSONB,
-  occurred_at TIMESTAMP DEFAULT NOW()
+CREATE TABLE provider_events (
+  provider             TEXT NOT NULL,
+  event_id             TEXT NOT NULL,
+  provider_message_id  TEXT NOT NULL,
+  type                 TEXT NOT NULL,       -- delivered | bounced | complained | unregistered
+  received_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (provider, event_id)
 );
-
-CREATE INDEX IF NOT EXISTS idx_events_notification ON notification_events(notification_id);
-CREATE INDEX IF NOT EXISTS idx_events_time ON notification_events(occurred_at);
-
--- Templates
-CREATE TABLE IF NOT EXISTS notification_templates (
-  id VARCHAR(100) PRIMARY KEY,
-  name VARCHAR(200),
-  description TEXT,
-  channels JSONB NOT NULL,
-  variables TEXT[],
-  created_by UUID REFERENCES users(id),
-  created_at TIMESTAMP DEFAULT NOW(),
-  updated_at TIMESTAMP DEFAULT NOW()
-);
-
--- Campaigns
-CREATE TABLE IF NOT EXISTS campaigns (
-  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  name VARCHAR(255) NOT NULL,
-  description TEXT,
-  template_id VARCHAR(100) REFERENCES notification_templates(id),
-  target_audience JSONB,
-  channels TEXT[],
-  priority VARCHAR(20) DEFAULT 'normal',
-  status VARCHAR(20) DEFAULT 'draft',
-  scheduled_at TIMESTAMP,
-  started_at TIMESTAMP,
-  completed_at TIMESTAMP,
-  created_by UUID REFERENCES users(id),
-  created_at TIMESTAMP DEFAULT NOW(),
-  updated_at TIMESTAMP DEFAULT NOW()
-);
-
-CREATE INDEX IF NOT EXISTS idx_campaigns_status ON campaigns(status);
-
--- Campaign statistics
-CREATE TABLE IF NOT EXISTS campaign_stats (
-  campaign_id UUID PRIMARY KEY REFERENCES campaigns(id) ON DELETE CASCADE,
-  total_sent INTEGER DEFAULT 0,
-  total_delivered INTEGER DEFAULT 0,
-  total_opened INTEGER DEFAULT 0,
-  total_clicked INTEGER DEFAULT 0,
-  total_failed INTEGER DEFAULT 0,
-  updated_at TIMESTAMP DEFAULT NOW()
-);
-
--- Sessions
-CREATE TABLE IF NOT EXISTS sessions (
-  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  token VARCHAR(255) UNIQUE NOT NULL,
-  expires_at TIMESTAMP NOT NULL,
-  created_at TIMESTAMP DEFAULT NOW()
-);
-
-CREATE INDEX IF NOT EXISTS idx_sessions_token ON sessions(token);
-CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
 ```
 
----
+Device tokens (`user_id`, platform, token, active), templates (versioned, one variant per channel and locale), campaigns and an email suppression list complete the relational model. Redis holds `prefs:{user}` (5-minute TTL), `idempotency:{caller}:{key}` (60 s while processing, 24 h once completed), `dedup:{user}:{sha256}` (the dedup window, 60 s by default) and `ratelimit:{scope}:{id}:{channel}` counters.
+
+### Local schema
+
+The local schema is [`backend/src/db/init.sql`](./backend/src/db/init.sql); every statement is re-runnable, and Docker Compose loads it into fresh volumes. It maps to the production design like this:
+
+| Production | Local | Difference |
+|------------|-------|------------|
+| `notifications` | `notifications` | `channels TEXT[]` instead of a category; `scheduled_at` holds the deferred delivery time; `dedupe_key` unique when set; not sharded |
+| `deliveries` | `delivery_status` | Same state machine and lease columns (`attempts`, `lease_expires_at`, `next_retry_at`); success is `sent`, receipts never move it to `delivered` |
+| `delivery_outbox` | `delivery_outbox` | Adds `priority_rank`, the JSON `payload`, `publish_attempts` and `last_error` |
+| `preferences` | `notification_preferences` | No `version` column; `categories` stored but not enforced |
+| `provider_events`, `user_events` | — | No webhooks or live stream locally; `notification_events` stores opens, clicks and dead letters |
+| — | `users`, `sessions`, `device_tokens`, `notification_templates`, `campaigns`, `campaign_stats` | Session auth lives in the same database |
 
 ## API Design
 
-### Core Endpoints
+### Production API
 
 ```
-# Authentication
-POST   /api/v1/auth/register        → Create user account
-POST   /api/v1/auth/login           → Login, returns session token
-POST   /api/v1/auth/logout          → Invalidate session
-
-# Notifications
-POST   /api/v1/notifications        → Send notification (with idempotency key)
-GET    /api/v1/notifications        → List user's notifications
-GET    /api/v1/notifications/:id    → Get notification status + delivery details
-
-# Preferences
-GET    /api/v1/preferences          → Get user notification preferences
-PUT    /api/v1/preferences          → Update preferences (invalidates cache)
-
-# Templates (admin)
-GET    /api/v1/templates            → List notification templates
-POST   /api/v1/templates            → Create template
-PUT    /api/v1/templates/:id        → Update template
-
-# Campaigns (admin)
-GET    /api/v1/campaigns            → List campaigns
-POST   /api/v1/campaigns            → Create campaign
-POST   /api/v1/campaigns/:id/launch → Launch campaign
-
-# Admin
-GET    /api/v1/admin/stats          → Delivery statistics
-GET    /api/v1/admin/queues         → Queue depth per channel/priority
+POST   /v1/notifications                 accept; Idempotency-Key → 202 {id, status, deliver_at} | 409 | 422 | 429
+GET    /v1/notifications/{id}            status with per-channel deliveries (caller or recipient)
+DELETE /v1/notifications/{id}            cancel what has not started → 200 | 409 already sending
+GET    /v1/me/notifications?cursor=…     in-app inbox and history, newest first, keyset pagination
+POST   /v1/me/notifications/{id}/read    mark read (in-app) and record the open
+GET    /v1/me/preferences                preferences with version
+PATCH  /v1/me/preferences                If-Match: version → 200 | 412
+GET    /v1/me/stream                     SSE: inbox items and delivery updates, Last-Event-ID resume
+POST   /v1/campaigns/{id}/start          operator; starts the fan-out job → 202
+POST   /v1/webhooks/{provider}           signed provider receipts → 200, idempotent by event ID
 ```
 
----
+- `202 Accepted`, not `201`: the resource exists, but delivery happens later. The body says `queued` or `scheduled` with `deliver_at`, or why nothing will be sent (`suppressed`, `deduplicated`).
+- Rate-limited requests get `429` with `Retry-After`; errors are `application/problem+json`.
+- Callers are services authenticated at the gateway; a user token may only target its own user.
+
+### Local routes
+
+All under `/api/v1`, bearer session token; details in [Implementation Notes](#implementation-notes).
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| POST | `/auth/login`, `/auth/register`, `/auth/logout`; GET `/auth/me` | Demo session auth |
+| POST | `/notifications` | Accept; optional `Idempotency-Key`; `202` queued or scheduled, `200` deduplicated, suppressed or duplicate, `429`, `403` when a non-admin targets another user |
+| GET | `/notifications`, `/notifications/:id` | Own history (`limit`/`offset`), one notification with per-channel rows |
+| DELETE | `/notifications/:id` | Cancel a pending or scheduled notification |
+| POST | `/notifications/:id/events` | Record opened, clicked or dismissed — recipient or admin only |
+| GET | `/notifications/rate-limit/usage` | Per-channel hourly usage |
+| GET, PATCH, PUT | `/preferences`, `/preferences/channels/:channel`, `/preferences/quiet-hours` | Channel toggles, quiet hours and time zone |
+| GET, POST, PATCH, DELETE | `/templates…`, `/campaigns…` | Templates and campaigns (writes are admin-only) |
+| GET, PATCH, POST | `/admin/…` | Stats with delivery backlog and outbox lag, users, roles, rate-limit resets, failures |
+| GET | `/health`, `/health/live`, `/health/ready`, `/metrics` | Operations (outside `/api/v1`) |
 
 ## Key Design Decisions
 
-### Priority Queues: Separate Queues vs Sorted Sets
+### 1. A transactional outbox, not "insert, then publish"
 
-**Chosen: Separate RabbitMQ queues per channel and priority level.**
+The obvious accept path inserts the notification and then publishes to the queue. Those are two systems, and any crash or broker error between them leaves a notification that exists but will never be sent — or, if the order is flipped, a message for a notification that was never committed. Writing the outbox row in the same transaction as the notification makes them one fact, and the relay turns that fact into a message at least once. Two more things fall out for free: the API's availability no longer depends on RabbitMQ, and scheduling becomes a column (`available_at`) rather than a separate service — quiet-hours deferrals, scheduled sends and retry backoff are all the same relay query. The cost is extra write volume (one outbox row per delivery, deleted a day later), a relay to operate, and up to one polling interval of extra latency; the relay is woken with `LISTEN/NOTIFY` so critical messages don't wait for the next poll.
 
-At 1M notifications/minute, a single sorted set per channel becomes a bottleneck. Redis ZPOPMIN is O(log N) per pop, and with 100K+ items in the set, contention on a single key creates hot-spot issues. Separate queues allow workers to consume from the critical queue first and fall through to normal/low queues only when higher-priority queues are empty. Each queue can be independently monitored, and RabbitMQ provides built-in dead letter exchange support, durable persistence, and consumer acknowledgment.
+### 2. One queue per channel and priority, not a priority field
 
-The trade-off is operational complexity: 9 queues (3 channels x 3 priorities) instead of 3 sorted sets. But RabbitMQ's management UI makes monitoring straightforward, and the isolation prevents a flood of low-priority marketing notifications from delaying critical 2FA messages.
+Priority as a field inside one queue does not survive a campaign: the million campaign messages already in the queue are ahead of the password reset, whatever its priority says. RabbitMQ's own priority queues reorder only what is waiting, and with prefetch the consumer already holds low-priority messages in memory. Separate queues let critical consumers sit idle and react immediately, and let push, email and SMS scale and fail independently — SMS is slow, throttled and expensive; push is cheap and huge. The outbox relay applies the same rule one step earlier: it drains critical rows first, so a campaign backlog in the outbox cannot delay them either. What we give up is queue count: 3 channels × 4 priorities is 12 queues to declare, monitor and alarm on, and a new channel adds four.
 
-### At-Least-Once vs Exactly-Once Delivery
+### 3. At-least-once delivery with an idempotent claim
 
-**Chosen: At-least-once delivery with client-side idempotency.**
+Exactly-once delivery to an external provider does not exist: the provider can accept the message and our acknowledgement can be lost, and no transaction spans RabbitMQ, PostgreSQL and APNs. So messages are delivered at least once, and the consumer makes repeats harmless by claiming the (notification, channel) row before it calls the provider. A redelivered or replayed message finds the row already `sending` or `sent` and is acked without a send. The claim carries a 60-second lease so a dead worker's delivery is picked up again, and the attempt counter fences the dead worker's late write. The remaining duplicate window is "worker dies after the provider accepted but before it recorded `sent`" — narrowed further by provider idempotency keys and collapse IDs. We accept that window because the alternative failure, a lost password-reset email, is worse than a rare duplicate push.
 
-Exactly-once delivery across distributed systems requires distributed transactions or two-phase commit between the message queue and the downstream provider (APNs, SendGrid, Twilio). This adds significant latency and complexity, and downstream providers do not support transactional semantics anyway. At-least-once is achieved simply by ACK-after-delivery: the worker only acknowledges the RabbitMQ message after the provider confirms delivery.
+### 4. Retries are outbox rows with a budget
 
-The cost is potential duplicates. We mitigate this with idempotency keys at the API layer (preventing duplicate sends from clients) and provider-level deduplication (APNs collapse IDs, SendGrid message IDs). For the rare case where a duplicate reaches the user, push notifications overwrite previous ones and email duplicates are a minor annoyance. Users strongly prefer receiving a duplicate over missing a critical notification.
+Retrying in process (sleep, then try again) holds a worker slot and dies with the process; requeueing with `nack` retries immediately and forever. Writing the retry as an outbox row due later is durable, needs no broker plugin for delays, and lets the relay keep priority ordering for retries too. Five attempts with exponential backoff cover about a minute and a half of provider trouble; longer outages are absorbed by the circuit breaker, whose deferrals don't spend attempts. Only after the budget is spent does a message go to the dead-letter queue — not on every failed attempt.
 
-### Preference Caching: 5-Minute TTL
+### 5. Decide at accept time, re-check opt-outs at send time
 
-**Chosen: Redis cache-aside with 5-minute TTL, explicit invalidation on update.**
+Preferences, quiet hours and dedup are applied once, at accept time, from Redis: that keeps the database off the hot path and means suppressed messages never enter the pipeline. Quiet hours are stored as local minutes plus an IANA time zone and evaluated with the zone's rules — server-local time would wake Tokyo users at 3 a.m. — and the deferral target is computed across DST. But a message deferred for eight hours can outlive the user's consent, so workers re-check the cached opt-out (channel and category) just before sending. Preference writes invalidate the cache, so both checks see a change within seconds; the 5-minute TTL is only a backstop. Legal unsubscribes (one-click `List-Unsubscribe`) write through to PostgreSQL before they return.
 
-At 17K preference lookups/second, hitting PostgreSQL for every notification would require a large connection pool and aggressive read replicas. A 5-minute cache reduces database load by 99.7% (only ~3 misses per user per 15-minute window). The staleness risk is acceptable: if a user disables email notifications, the worst case is receiving 1-2 more emails before the cache expires. Cache invalidation on preference update (via `DEL prefs:{userId}`) handles the common case of immediate effect after a settings change.
+### 6. RabbitMQ rather than Kafka for delivery jobs
 
-The alternative of longer TTLs (1 hour) would further reduce load but create user-visible lag when toggling preferences. The alternative of no caching is not viable at production scale.
-
----
+Delivery jobs are individually acknowledged, individually retried and individually dead-lettered, and one slow provider call must not block the messages behind it. That is a work queue. In Kafka, a partition is consumed in order, so one stuck message delays everything behind it in that partition, and retries need retry topics. Kafka is the right tool for the event stream around the system — the product events that trigger notifications, and opens and clicks flowing to analytics — where replay matters. RabbitMQ with quorum queues handles 25K messages per second across 12 queues, and per-message acks, redelivery and dead-lettering are built in.
 
 ## Consistency and Idempotency
 
-### Idempotency Keys
+| Operation | Guarantee | Mechanism |
+|-----------|-----------|-----------|
+| Accept | Notification, deliveries and outbox rows exist together or not at all | One transaction on the recipient's shard |
+| Client retry | One notification per `Idempotency-Key` | Caller-scoped key, `SET NX` claim, body fingerprint (`422` on mismatch), stored `202` for 24 h |
+| Campaign fan-out | At most one notification per recipient per campaign | Unique `dedupe_key = campaign:{id}:{user}`; a rerun inserts nothing |
+| Same content twice | Sent once within the dedup window | `SET NX` on `dedup:{user}:{sha256}`, released if nothing was created |
+| Publish | Every committed delivery is published at least once | Outbox, relay, publisher confirms |
+| Consume | One provider call per (notification, channel), except when a worker dies mid-send | Claim with lease; `attempts` as fencing token |
+| Status | Never regresses; concurrent channels can't lose an update | Row lock on the notification while recomputing; receipts only move forward |
+| Cancel | Nothing that hasn't started will be sent | Deliveries → `cancelled` and unpublished outbox rows deleted in one transaction; the claim skips cancelled notifications |
 
-All notification sends accept a client-provided idempotency key via the `Idempotency-Key` header. The key is stored in Redis with a 24-hour TTL. On duplicate requests, the cached response is returned immediately.
+## Security / Auth
 
-**Key format:** `{service-name}:{entity-id}:{action}:{timestamp}`
-
-**Processing states:**
-1. Key not found → process notification, store result
-2. Key found, status "processing" → return 409 Conflict (concurrent duplicate)
-3. Key found, status "completed" → return cached result
-
-### Delivery Status Consistency
-
-Delivery status uses INSERT ... ON CONFLICT DO UPDATE for idempotent status writes. The aggregate notification status is computed from individual channel statuses:
-
-- All channels sent → `delivered`
-- All channels failed → `failed`
-- Any channel pending → `partial`
-- Mix of sent and failed → `partial_success`
-
----
-
-## Security
-
-### Authentication
-
-Session-based authentication with Redis backing. Sessions are stored with 24-hour TTL. Passwords hashed with bcrypt (cost factor 12).
-
-### Role-Based Access Control (RBAC)
-
-| Role | Permissions |
-|------|-------------|
-| `user` | Send notifications to self, manage own preferences, view own delivery status |
-| `service` | Send notifications to any user, access bulk endpoints, view aggregate stats |
-| `admin` | All permissions plus: manage templates, configure rate limits, manage campaigns |
-
-### Rate Limiting
-
-Redis-backed sliding window counters with per-user and global limits. Different thresholds per role (users get conservative limits, services get higher throughput, admins bypass per-user limits).
-
----
+- **Callers:** internal services authenticate at the gateway (mTLS or signed service tokens) and get per-caller quotas. A user session may only notify its own user; sending to others is an operator or service permission.
+- **Recipients:** inbox, preferences, status and open/click events are scoped to the authenticated user; events are accepted only for the recipient's own notifications and channels.
+- **Sessions:** server-side sessions in Redis; role changes and logouts evict cached sessions immediately.
+- **Webhooks:** every provider callback is signature-verified (SES SNS signatures, Twilio `X-Twilio-Signature`, SendGrid signed events) and deduplicated by event ID.
+- **Content:** template variables are HTML-escaped for email; links are rewritten for click tracking only to an allow-listed domain; previews render in a sandboxed iframe.
+- **Abuse and cost:** per-user hourly caps per channel, SMS off by default, and per-provider token buckets so we never exceed contracted throughput.
 
 ## Observability
 
-### Prometheus Metrics
-
-| Metric | Type | Labels | Purpose |
-|--------|------|--------|---------|
-| `notifications_sent_total` | Counter | channel, priority, status | Throughput monitoring |
-| `delivery_attempts_total` | Counter | channel, success/failure | Provider reliability |
-| `processing_duration_seconds` | Histogram | channel | Latency percentiles |
-| `http_request_duration_seconds` | Histogram | method, route, status | API latency |
-| `queue_depth` | Gauge | queue, priority | Backpressure detection |
-| `circuit_breaker_state` | Gauge | channel | Provider health (0=closed, 1=open, 2=half-open) |
-| `rate_limited_total` | Counter | level | Rate limit effectiveness |
-| `active_connections` | Gauge | type | Connection tracking |
-
-### Structured Logging
-
-JSON-formatted logs via Pino with consistent fields: timestamp, level, service name, request ID, user ID. Child loggers per component for tracing. Sensitive field redaction (authorization headers, tokens).
-
-### Health Checks
-
-| Endpoint | Purpose | Checks | Response Time |
-|----------|---------|--------|---------------|
-| `/health/live` | Liveness probe | Process running | < 1ms |
-| `/health/ready` | Readiness probe | PostgreSQL, Redis connectivity | < 100ms |
-| `/health` | Full health | All above + RabbitMQ + circuit breaker states | < 500ms |
-
----
+- **Accept path:** latency, outcomes (`queued`, `scheduled`, `suppressed`, `deduplicated`, `rate_limited`), idempotent replays and conflicts.
+- **Pipeline:** outbox lag (age of the oldest due, unpublished row — the single best "is delivery working" signal), queue depth per channel and priority, consumer utilization.
+- **Delivery:** outcomes per channel (`sent`, `retry_scheduled`, `deferred`, `failed`, `dead_lettered`, `skipped`), provider latency and error rate, breaker state, attempts per delivery.
+- **Receipts:** delivered and bounce rates per provider; a rising bounce or complaint rate pauses campaigns.
+- **SLO alerts:** critical accepted-to-sent p99 above 2 s, outbox lag above 30 s, dead-letter growth, bounce rate above 2%.
+- Structured logs carry the notification ID, channel and attempt; traces span API → relay → worker → provider.
 
 ## Failure Handling
 
-### Circuit Breaker Pattern
-
-Per-channel circuit breakers protect against provider outages. Each delivery channel (push, email, SMS) gets its own breaker to prevent a single provider failure from affecting other channels.
-
-**States:**
-- **Closed** (normal): Requests flow through
-- **Open** (after threshold failures): Requests rejected immediately for 30-60s
-- **Half-open** (testing): Allow a few requests to test recovery
-
-**Configuration per channel:**
-
-| Channel | Failure Threshold | Reset Timeout | Rationale |
-|---------|-------------------|---------------|-----------|
-| Push | 5 consecutive | 30s | APNs/FCM are reliable, brief outages |
-| Email | 3 consecutive | 60s | SMTP more sensitive to load |
-| SMS | 3 consecutive | 60s | Carrier APIs rate-limit aggressively |
-
-### Retry Strategy
-
-Exponential backoff with jitter prevents thundering herd on provider recovery:
-
-| Attempt | Base Delay | With Jitter | Cumulative |
-|---------|------------|-------------|------------|
-| 1 | 1s | 1.0-1.1s | ~1s |
-| 2 | 2s | 2.0-2.2s | ~3s |
-| 3 | 4s | 4.0-4.4s | ~7s |
-| 4 | 8s | 8.0-8.8s | ~15s |
-| 5 | 16s | 16.0-17.6s | ~32s |
-
-Only transient errors are retried (429, 5xx, ECONNRESET, ETIMEDOUT). Permanent failures (invalid tokens, hard bounces) go directly to failed status.
-
-### Dead Letter Queue
-
-After max retries, messages route to the dead letter exchange. DLQ is monitored with alerts on depth > 100. Manual reprocessing is available via admin API.
-
-### Graceful Degradation
-
-| Component Failure | Degraded Behavior |
-|-------------------|-------------------|
-| Redis unavailable | Sessions fail (require re-login), preferences fetched from DB, no rate limiting |
-| RabbitMQ unavailable | API returns 503, notifications queued in-memory (bounded buffer) |
-| PostgreSQL unavailable | Full outage (primary data store) |
-| Push provider down | Circuit opens, push notifications queued for retry |
-| Email provider down | Circuit opens, emails queued for retry |
-
-### Graceful Shutdown
-
-SIGTERM/SIGINT handlers stop accepting new connections, wait for in-flight requests to complete, close database and Redis connections cleanly, with a 30-second timeout for forced shutdown.
-
----
+| Failure | Behavior | Mitigation |
+|---------|----------|------------|
+| RabbitMQ down | Accepts keep working; deliveries wait in the outbox | Relay retries with backoff; outbox lag alerts |
+| Provider down | That channel's deliveries defer and retry; others unaffected | Per-provider circuit breaker, failover to a secondary provider, retry budget, DLQ |
+| Worker dies mid-send | Message redelivered; claim waits out the lease | Lease sweeper re-enqueues; fencing ignores the dead worker's late write |
+| Relay dies mid-batch | Batch rolls back and is republished | Idempotent claims make the duplicates harmless |
+| Redis down | Preferences read from PostgreSQL; idempotency, dedup and rate limits fail open | Circuit breaker on the cache; alert, since duplicates become possible |
+| PostgreSQL shard down | Accepts for that shard's users fail with `503` | Replica promotion; callers retry with the same key |
+| Campaign floods the pipeline | Low-priority queues back up | Separate queues and consumers; critical traffic is unaffected |
+| Poison message | Dead-lettered on first read | Parse and validate before the claim |
 
 ## Scalability Considerations
 
-### Horizontal Scaling Path
-
-1. **API servers**: Stateless, scale behind load balancer. Session data in Redis, no local state.
-2. **Workers**: Add more consumer instances per channel. RabbitMQ distributes messages across consumers.
-3. **PostgreSQL**: Read replicas for notification status queries. Partition notifications table by month for write throughput.
-4. **Redis**: Redis Cluster for cache sharding when exceeding single-node memory.
-5. **RabbitMQ**: Cluster with quorum queues for high availability.
-
-### Database Partitioning
-
-Notifications table partitioned by `created_at` (monthly). Old partitions archived or dropped based on retention policy (90 days active, then archive).
-
-### What Breaks First
-
-At 10x current scale (10M notifications/min):
-- **Queue depth**: Workers must scale proportionally. Auto-scaling based on queue depth metrics.
-- **Database writes**: Batch inserts and partition pruning become critical. Consider moving delivery events to a time-series database.
-- **Redis memory**: Preference cache grows linearly with user count. Cluster sharding at ~10GB.
-
----
+1. **Accept path:** stateless API instances; Redis Cluster for preferences and keys; PostgreSQL sharded by `user_id` so every accept is a single-shard transaction.
+2. **Relay:** one relay per shard, scaled out with `SKIP LOCKED`; outbox rows are deleted after a day, so the table stays small.
+3. **Delivery:** worker pools per channel scale on queue depth; prefetch per queue gives critical queues more in-flight capacity; per-provider token buckets cap throughput at what each provider contract allows.
+4. **Campaigns:** fan-out runs as a resumable job that pages through the audience by user ID and enqueues in batches at `low` priority; the per-recipient dedupe key makes a resumed job safe.
+5. **What breaks first:** SMS provider throughput (~100 messages/s per short code), then email reputation (warm-up and bounce rates), then the history tables' storage — aged out to object storage after 30 days.
 
 ## Trade-offs Summary
 
 | Decision | Chosen | Alternative | Rationale |
 |----------|--------|-------------|-----------|
-| Message queue | RabbitMQ | Kafka | Built-in DLX, simpler consumer model |
-| Delivery semantics | At-least-once | Exactly-once | Reliability over deduplication complexity |
-| Rate limiting | Per-user + global | Per-user only | Protects downstream providers |
-| Preference cache | 5-min TTL | Real-time lookup | 99.7% DB load reduction |
-| Auth | Session + RBAC | JWT tokens | Immediate revocation, simpler for learning |
-| Retry strategy | Exponential backoff | Fixed interval | Prevents thundering herd |
-| Circuit breaker | Per-channel | Global | Isolates provider failures |
-| Idempotency store | Redis (24h TTL) | PostgreSQL | Low latency, automatic cleanup |
-| Logging | Pino structured JSON | Console.log | Machine-parseable, queryable |
-| Metrics | Prometheus | Custom tracking | Industry standard, Grafana-compatible |
-
----
-
-## Frontend Architecture
-
-This section documents the React frontend implementation, covering component hierarchy, state management, routing, data fetching, and key UI patterns.
-
-### Component Hierarchy
-
-```
-__root.tsx (RootComponent)
-├── NavBar (inline in root)
-│   ├── Logo + brand "NotifyHub"
-│   ├── Navigation links (Dashboard, Notifications, Preferences, Admin)
-│   └── User info + Logout button
-├── index.tsx (Dashboard)
-│   ├── Rate Limit Usage cards (per-channel progress bars)
-│   ├── Quick Stats grid (delivered / pending / failed counters)
-│   └── Recent Notifications list (last 5, with status badges)
-├── notifications.tsx (Notification List)
-│   └── Full notification history with status filtering
-├── preferences.tsx (Preferences Page)
-│   └── Channel toggles (push/email/SMS), quiet hours, timezone
-├── login.tsx / register.tsx (Auth Pages)
-├── admin.tsx (Admin Layout)
-│   ├── admin/index.tsx (Admin Dashboard)
-│   │   └── Delivery stats, queue depth, channel breakdown charts
-│   ├── admin/campaigns.tsx (Campaign Management)
-│   │   └── Campaign list, create/start/cancel actions
-│   ├── admin/templates.tsx (Template Management)
-│   │   └── Template list, create/delete with variable definitions
-│   └── admin/users.tsx (User Management)
-│       └── User list, role editing, rate limit reset
-```
-
-### Zustand Stores
-
-The frontend uses three Zustand stores, each responsible for a distinct domain:
-
-**`useAuthStore`** (`stores/authStore.ts`) -- Manages authentication state including the session token, current user object, and login/register/logout actions. Uses `zustand/middleware/persist` to save the token to `localStorage` under the key `auth-storage`, enabling session restoration across page reloads. The `checkAuth` action validates the persisted token against the backend on app startup and clears it if invalid.
-
-**`useNotificationStore`** (`stores/notificationStore.ts`) -- Manages the end-user notification experience: the notification list, user preferences (channel toggles, quiet hours), rate limit usage counters, and actions for sending and cancelling notifications. After a send or cancel action, it automatically re-fetches the notification list to keep the UI in sync.
-
-**`useAdminStore`** (`stores/adminStore.ts`) -- Manages all admin dashboard state: delivery statistics, user list, campaigns, templates, and failed notifications. Each CRUD action (create campaign, delete template, update user role) triggers a re-fetch of the relevant list to ensure consistency without manual cache invalidation.
-
-### Routing
-
-The frontend uses TanStack Router with file-based routing. Routes are organized into two layers:
-
-- **User routes** (`/`, `/notifications`, `/preferences`, `/login`, `/register`) -- accessible to all authenticated users
-- **Admin routes** (`/admin`, `/admin/campaigns`, `/admin/templates`, `/admin/users`) -- guarded by role check in the navigation (admin link only appears for users with `role === 'admin'`). The `/admin` route uses a nested layout via `admin.tsx` that wraps its child routes.
-
-The root layout (`__root.tsx`) calls `checkAuth()` on mount to restore the session. Navigation links conditionally render based on `isAuthenticated` and `user.role`.
-
-### Data Fetching
-
-All API communication goes through a centralized `ApiClient` class (`services/api.ts`) that wraps `fetch` with:
-
-- Automatic `Authorization: Bearer {token}` header injection
-- JSON content type headers
-- Consistent error extraction from response bodies
-- Typed return values for every endpoint
-
-Data fetching is triggered imperatively from Zustand store actions or from `useEffect` hooks in route components. There is no query caching layer on the client -- freshness is ensured by re-fetching on navigation and after mutations. The dashboard page fetches both notifications and rate limit usage on mount when authenticated.
-
-### Key UI Patterns
-
-- **Role-based navigation**: The admin link in the top nav only renders when `user.role === 'admin'`, preventing non-admin users from seeing administrative features
-- **Status badges**: Notifications display color-coded status badges (green for delivered, yellow for pending, red for failed) using Tailwind utility classes
-- **Rate limit visualization**: The dashboard renders per-channel rate limit usage as progress bars that shift from green to yellow to red as usage approaches the limit threshold
-- **Conditional rendering on auth state**: The index page shows a welcome/CTA page for unauthenticated visitors and the full dashboard for logged-in users
-- **Token persistence**: The auth store uses Zustand's `persist` middleware with `partialize` to save only the token (not the full user object), re-validating against the backend on reload
-
----
-
-## Deep Pattern Explanations
-
-This section explains each production-grade pattern implemented in the backend, written for readers who may be encountering these concepts for the first time.
-
-### RBAC (Role-Based Access Control)
-
-RBAC is an authorization model where permissions are assigned to roles rather than individual users, and users are assigned one or more roles. Instead of checking "can user X create a template?" the system checks "does user X have a role that includes the create-template permission?"
-
-In this project, there are three roles: `user`, `service`, and `admin`. Each role has a fixed set of permissions. When a request arrives, the auth middleware extracts the user's role from their session and checks whether that role permits the requested operation. For example, only `admin` can manage templates and campaigns, while `user` can only send notifications to themselves and manage their own preferences. This approach scales well because adding a new user never requires updating permission tables -- you just assign them the appropriate role.
-
-The key advantage over per-user permission lists is simplicity: with 100K users, you manage 3 role definitions instead of 100K permission sets. The trade-off is granularity -- you cannot give one specific user a custom set of permissions without creating a new role.
-
-### Redis Cache-Aside
-
-Cache-aside (also called "lazy loading") is a caching strategy where the application code is responsible for managing the cache. On every read, the application first checks the cache. If the data is there (a "cache hit"), it returns immediately. If not (a "cache miss"), the application fetches from the database, stores the result in the cache with a TTL (time-to-live), and then returns it.
-
-In this project, user notification preferences use cache-aside with a 5-minute TTL. At 17K preference lookups/second, hitting PostgreSQL for every notification would be unsustainable. The cache absorbs 99.7% of reads. When a user updates their preferences, the cache key is explicitly deleted (`DEL prefs:{userId}`), forcing the next lookup to fetch fresh data from the database.
-
-Cache-aside differs from "write-through" caching (where every write updates both the cache and the database simultaneously) and "write-behind" caching (where writes go to the cache first and are asynchronously flushed to the database). Cache-aside is simpler because it does not require the cache to participate in write operations, but it means that immediately after a database write, the cache may serve stale data until the TTL expires or the key is explicitly invalidated.
-
-### Circuit Breaker
-
-A circuit breaker is a stability pattern that prevents a failing service from being called repeatedly, giving it time to recover. It works like an electrical circuit breaker: when failures exceed a threshold, the breaker "opens" and immediately rejects all requests for a cooldown period, rather than letting them pile up and make the problem worse.
-
-The circuit breaker has three states. In the **closed** state (normal operation), requests flow through to the downstream service. If the number of consecutive failures exceeds a configured threshold (e.g., 5 for push notifications), the breaker transitions to the **open** state. In the open state, all requests are immediately rejected without contacting the downstream service, returning an error or fallback response. After a configured timeout (e.g., 30 seconds), the breaker enters the **half-open** state, where it allows a small number of test requests through. If those succeed, the breaker closes again; if they fail, it reopens.
-
-In this project, each notification channel (push, email, SMS) has its own circuit breaker. This isolation means that if the SMS provider (Twilio) is down, push and email delivery continue unaffected. Without circuit breakers, a down provider would cause request timeouts to accumulate, exhausting worker threads and eventually blocking all notification delivery across all channels.
-
-### Structured Logging
-
-Structured logging means emitting log entries as machine-parseable data (typically JSON objects) rather than free-form text strings. Instead of `console.log('User 123 sent notification abc')`, structured logging produces `{"level":"info","userId":"123","notificationId":"abc","action":"send","timestamp":"..."}`.
-
-This project uses Pino, a high-performance JSON logger for Node.js. Every log entry includes a consistent set of fields: timestamp, log level, service name, and request ID. Child loggers add component-specific context (e.g., channel worker name, queue name) without losing the parent fields. Sensitive data like authorization headers and tokens are automatically redacted from log output.
-
-The primary advantage is queryability. When investigating a production incident, you can filter logs by `userId`, `notificationId`, or `requestId` using tools like Elasticsearch/Kibana or CloudWatch Logs Insights. With unstructured text logs, you would need to write fragile regex patterns to extract the same information. The trade-off is that JSON logs are less human-readable in a terminal during development -- Pino addresses this with a pretty-print mode for local use.
-
-### Prometheus Metrics
-
-Prometheus is a time-series monitoring system that collects numerical metrics from applications by periodically "scraping" an HTTP endpoint (typically `/metrics`). The application exposes counters, histograms, and gauges in a text format that Prometheus understands, and Prometheus stores and queries this data over time.
-
-The three main metric types used in this project are:
-- **Counters**: Values that only go up (e.g., `notifications_sent_total`). Useful for tracking throughput and computing rates (notifications per second).
-- **Histograms**: Track the distribution of values (e.g., `processing_duration_seconds`). Prometheus computes percentiles (p50, p95, p99) from histogram buckets, enabling latency SLO monitoring.
-- **Gauges**: Values that go up or down (e.g., `queue_depth`, `circuit_breaker_state`). Useful for tracking current state.
-
-Each metric has labels (key-value pairs) that add dimensions. For example, `notifications_sent_total{channel="push",priority="critical",status="success"}` lets you independently track throughput per channel, per priority, and per outcome. The combination of metric name and labels creates a unique time series. Prometheus data is visualized in Grafana dashboards where you can set up alerting rules for SLO violations.
-
-### Rate Limiting
-
-Rate limiting restricts how many requests a client can make within a time window. It protects the system from abuse, prevents any single client from monopolizing resources, and shields downstream services (like SMS providers) that have their own throughput limits.
-
-This project implements multi-level rate limiting using Redis atomic counters. Each level serves a different purpose:
-- **Per-user limits** (e.g., 50 push/hour, 10 email/hour) prevent individual users from flooding channels
-- **Per-service limits** (e.g., 10K push/min) prevent any single integrated service from overwhelming the system
-- **Global limits** (e.g., 100K push/min) protect downstream providers from exceeding their contracted throughput
-
-The sliding window counter implementation uses Redis `INCR` and `EXPIRE` commands atomically. When a request arrives, the counter for the current window is incremented. If the counter exceeds the limit, the request is rejected with HTTP 429 (Too Many Requests). The counter key includes the window timestamp, so it automatically resets when the window expires.
-
-### Idempotency
-
-Idempotency means that performing the same operation multiple times produces the same result as performing it once. In a notification system, this prevents duplicate notifications when a client retries a failed request (due to a network timeout, for example).
-
-This project implements idempotency through client-provided idempotency keys sent in the `Idempotency-Key` HTTP header. The key is stored in Redis with a 24-hour TTL. When a request arrives, the system checks Redis for the key:
-1. If the key is not found, the notification is processed normally, and the result is stored in Redis under that key.
-2. If the key is found with status "processing," a 409 Conflict is returned (a concurrent duplicate is in flight).
-3. If the key is found with status "completed," the cached result is returned immediately without re-processing.
-
-Without idempotency, a network timeout on a "send 2FA code" request could lead to the user receiving the same code twice -- confusing and potentially a security concern. The 24-hour TTL ensures Redis does not grow unbounded, while still covering retry windows for any reasonable client implementation.
-
-### Health Checks
-
-Health checks are HTTP endpoints that report whether a service is alive and ready to handle traffic. They are consumed by load balancers, container orchestrators (Kubernetes), and monitoring systems to make automated decisions about routing and restarts.
-
-This project implements three tiers of health checks:
-- **`/health/live`** (liveness probe): Returns 200 if the process is running. If this fails, the orchestrator should restart the container. It performs no dependency checks -- a process that is alive but cannot reach the database is still "live."
-- **`/health/ready`** (readiness probe): Returns 200 if the service can handle requests. It checks PostgreSQL and Redis connectivity. If this fails, the load balancer should stop routing traffic to this instance, but the orchestrator should not restart it (the database might be temporarily unreachable).
-- **`/health`** (full health): Returns detailed status of all dependencies including PostgreSQL, Redis, RabbitMQ, and circuit breaker states. This is used for debugging and monitoring dashboards, not for automated routing decisions.
-
-The separation between liveness and readiness is critical: a service that has lost its database connection should not be killed (the database will recover), but it also should not receive new requests (they will all fail).
-
----
+| Accept → queue | Transactional outbox | Insert, then publish | No lost or phantom notifications; API independent of the broker |
+| Priority | Queue per channel and priority | Priority field or priority queue | A campaign backlog can't delay critical messages |
+| Delivery semantics | At-least-once + idempotent claim | Exactly-once | Not achievable with external providers; duplicates bounded |
+| Retries | Outbox rows with backoff and a budget | In-process retry or `nack` requeue | Durable, bounded, priority-ordered |
+| Preferences | Redis cache-aside, invalidated on write | Database read per send | 17K reads/s off PostgreSQL; changes apply within seconds |
+| Quiet hours | Recipient's IANA zone | Server time | Correct local time, DST included |
+| Queue technology | RabbitMQ quorum queues | Kafka | Per-message ack, retry and DLQ; no head-of-line blocking |
+| Client retries | Idempotency-Key + fingerprint | Content hash only | Distinguishes a retry from an intentional repeat |
 
 ## Implementation Notes
 
-This section maps the production architecture to the actual local implementation running on Docker + Node.js + Express.
+The local project runs the accept path, the outbox relay, the delivery workers and the operator dashboard on one machine: an Express API ([`backend/src/index.ts`](./backend/src/index.ts)), a worker process ([`backend/src/workers/index.ts`](./backend/src/workers/index.ts)), PostgreSQL 16, Valkey 7 and RabbitMQ 3 from [`docker-compose.yml`](./docker-compose.yml), and a React 19 + TanStack Router + Zustand dashboard. Providers are simulated. This section describes the code as of the 2026-10 review.
 
-### Local Architecture
+### Production design → local implementation
 
-```
-┌──────────────────────────────────────────────────────────┐
-│                    Frontend (Vite)                        │
-│                  localhost:5173                           │
-│  Routes: / (inbox), /preferences, /admin, /login         │
-└───────────────────────────┬──────────────────────────────┘
-                            │ HTTP
-                            ▼
-┌──────────────────────────────────────────────────────────┐
-│              API Server (Express)                         │
-│           localhost:3001 / 3002 / 3003                    │
-│                                                          │
-│  /api/v1/auth/*          Auth routes                     │
-│  /api/v1/notifications/* Notification CRUD               │
-│  /api/v1/preferences/*   User preferences                │
-│  /api/v1/templates/*     Template management             │
-│  /api/v1/campaigns/*     Campaign management             │
-│  /api/v1/admin/*         Admin dashboard stats           │
-│  /health, /health/live, /health/ready                    │
-│  /metrics                Prometheus endpoint             │
-└─────┬──────────┬──────────┬──────────────────────────────┘
-      │          │          │
-      ▼          ▼          ▼
-┌──────────┐ ┌──────────┐ ┌──────────────────────┐
-│PostgreSQL│ │  Valkey   │ │     RabbitMQ          │
-│  :5432   │ │  :6379   │ │  :5672 (AMQP)         │
-│          │ │          │ │  :15672 (Management)   │
-└──────────┘ └──────────┘ └──────────┬────────────┘
-                                     │
-                                     ▼
-                          ┌──────────────────────┐
-                          │   Channel Workers     │
-                          │  (tsx watch)          │
-                          │                      │
-                          │  Push  (simulated)   │
-                          │  Email (simulated)   │
-                          │  SMS   (simulated)   │
-                          └──────────────────────┘
+| Production design | Local implementation | Where |
+|-------------------|----------------------|-------|
+| Accept in one transaction with an outbox | Implemented as described; the API needs only PostgreSQL and Redis | [notifications.ts](./backend/src/services/notifications.ts), [outbox.ts](./backend/src/services/outbox.ts) |
+| Outbox relay with confirms, priority order | Polls every 200 ms (back-to-back while batches are full), batches of 100, confirm channel with a 5 s timeout; no `LISTEN/NOTIFY` | [outbox.ts](./backend/src/services/outbox.ts), [rabbitmq.ts](./backend/src/utils/rabbitmq.ts) |
+| Queue per channel and priority + DLQ | The same 12 queues and `notifications.dead_letter`, arguments unchanged | [rabbitmq.ts](./backend/src/utils/rabbitmq.ts) |
+| Leased, fenced claim; outbox retries; DLQ | Implemented; lease sweeper every 15 s | [deliveryHandler.ts](./backend/src/workers/deliveryHandler.ts), [delivery.ts](./backend/src/services/delivery.ts) |
+| Idempotency-Key with fingerprint | Implemented on `POST /notifications`; fails open without Redis | [idempotency.ts](./backend/src/utils/idempotency.ts), [routes/notifications.ts](./backend/src/routes/notifications.ts) |
+| Preferences cache, quiet hours in the user's zone | Implemented at accept time; no re-check at send time | [preferences.ts](./backend/src/services/preferences.ts), [quietHours.ts](./backend/src/services/quietHours.ts) |
+| Rate limits and provider token buckets | Per-user hourly and global per-minute fixed windows, taken atomically at accept time; no worker-side token buckets | [rateLimiter.ts](./backend/src/services/rateLimiter.ts) |
+| Provider failover | One simulated provider per channel behind a Cockatiel circuit breaker | [workers/index.ts](./backend/src/workers/index.ts), [circuitBreaker.ts](./backend/src/utils/circuitBreaker.ts) |
+| Webhook receipts, live SSE stream, in-app channel, digests | Not implemented | — |
+
+### Accepting a notification
+
+`POST /api/v1/notifications` runs: authorization (a non-admin may only target itself, `403` otherwise) → optional `Idempotency-Key` → validation → cached preferences → content dedup → rate limits → quiet hours → render → one transaction.
+
+- **Idempotency.** The key is stored as `idempotency:{callerId}:{key}` with a SHA-256 fingerprint of the request body (keys sorted). The claim is `SET … NX EX 60`; only `2xx` responses are stored, for 24 hours, and replayed with `Idempotent-Replayed: true`. Completion and release are Lua compare-and-set scripts on a per-claim token, so a request that lost its claim cannot overwrite a newer one. A Redis error lets the request through.
+- **Dedup and rate limits.** `dedup:{userId}:{sha256(templateId, data)}` is claimed with `SET NX EX window` (60 s by default, `deduplicationWindow` in the body) and released whenever no notification ends up created. Rate limits check every counter for the allowed channels — per user per hour (push 50, email 10, SMS 5) and global per minute (100,000, 10,000, 1,000) — and increment them only if all fit, in one Lua script that also sets the TTL atomically.
+- **Quiet hours.** Windows are minutes from local midnight in the stored IANA zone, evaluated with `Intl.DateTimeFormat`; `start == end` means no quiet hours; `critical` bypasses them. The preferences page saves the browser's zone with the window, and an explicit `null` now clears it.
+- **The transaction** inserts the notification (`pending`, or `scheduled` with `scheduled_at`), one `delivery_status` row per channel and one `delivery_outbox` row per channel with `available_at` = now, the requested time or the end of quiet hours. Campaign fan-out passes `dedupeKey = campaign:{id}:{userId}`; `ON CONFLICT (dedupe_key) … DO NOTHING` makes a repeated recipient a no-op.
+- **Responses:** `202` for `queued` and `scheduled` (with `scheduledFor`), `200` for `deduplicated`, `suppressed` and `duplicate`, `429` with `Retry-After`, `400`/`404` for invalid requests, `500` otherwise. The dashboard's send form generates one key per submitted draft, reuses it when the same draft is resubmitted, and announces the outcome in an `aria-live` region.
+
+### Relay and delivery
+
+The worker process registers consumers for the 12 queues and the dead-letter queue, connects (retrying with backoff until RabbitMQ is up), starts the relay and a lease sweeper.
+
+```sql
+-- backend/src/services/delivery.ts: the claim that makes duplicates harmless
+UPDATE delivery_status ds SET status = 'sending', attempts = ds.attempts + 1,
+       lease_expires_at = NOW() + make_interval(secs => $3), ...
+FROM notifications n
+WHERE ds.notification_id = $1 AND ds.channel = $2 AND n.id = ds.notification_id
+  AND n.status <> 'cancelled'
+  AND (ds.status IN ('pending', 'retrying')
+       OR (ds.status = 'sending' AND ds.lease_expires_at < NOW()))
+RETURNING ds.attempts, n.user_id, n.priority, n.content
 ```
 
-### Production-Grade Patterns Actually Implemented
+- [`processDelivery()`](./backend/src/workers/deliveryHandler.ts) returns `ack` or `dead-letter`: no claim → ack; success → `sent`; breaker open → retry in 30 s without spending the attempt; transient failure → `retrying` plus an outbox row due after ~5 s × 2ⁿ (20% jitter, capped at 5 minutes; `DELIVERY_RETRY_BASE_MS`); permanent failure (no device, no or unverified address) → `failed` and ack; fifth failure (`DELIVERY_MAX_ATTEMPTS`) → `failed` and `nack`, which the existing dead-letter arguments route to `notifications.dead_letter`.
+- `complete()` and `scheduleRetry()` lock the notification row, update the delivery row only `WHERE status = 'sending' AND attempts = <claim>`, and recompute the aggregate (`pending`, `partial`, `delivered`, `failed`, `partial_success`, `cancelled`) in one transaction.
+- `consumeQueue()` dead-letters unparseable messages, requeues after 2 s when the handler throws before claiming (for example PostgreSQL is down), and re-attaches every consumer after a reconnect (1 s → 30 s backoff). The dead-letter consumer writes a `dead_letter` row to `notification_events`.
+- `reapExpiredLeases()` turns `sending` rows whose lease expired more than 30 s ago back into `retrying` with a fresh outbox row.
+- Cancel (`DELETE /notifications/:id`) moves the notification and its unstarted deliveries to `cancelled` and deletes unpublished outbox rows in one transaction.
+- The admin dashboard's "queue depth" is the real backlog (`delivery_status` rows pending, sending or retrying, by channel and priority) plus `outboxLagSeconds`; `/health` reports the outbox as degraded when the oldest due row has waited more than 30 s.
 
-| Pattern | File | Description |
-|---------|------|-------------|
-| Structured logging | `backend/src/utils/logger.ts` | Pino-based JSON logging, child loggers per component, request correlation IDs, sensitive field redaction |
-| Prometheus metrics | `backend/src/utils/metrics.ts` | Counters, histograms, gauges for notifications sent, delivery attempts, queue depth, circuit breaker state |
-| Circuit breakers | `backend/src/utils/circuitBreaker.ts` | Per-channel circuit breakers via Cockatiel library, state exposed via Prometheus gauge |
-| Idempotency | `backend/src/utils/idempotency.ts` | Redis-backed idempotency keys with 24h TTL, concurrent duplicate detection (409 Conflict) |
-| Retry with backoff | `backend/src/utils/retry.ts` | Exponential backoff with jitter, configurable presets (fast/standard/slow/aggressive) |
-| Health checks | `backend/src/index.ts` | Three-tier: `/health/live`, `/health/ready`, `/health` with component status + circuit breaker states |
-| Graceful shutdown | `backend/src/index.ts` | SIGTERM/SIGINT handlers, drain connections, 30s forced timeout |
-| Rate limiting | `backend/src/services/rateLimiter.ts` | Redis atomic counters, per-user and global limits |
-| Preference caching | `backend/src/services/preferences.ts` | Redis cache-aside with 5-min TTL, invalidation on update |
-| RBAC auth | `backend/src/middleware/auth.ts` | Session-based auth, role checking middleware |
+### Authorization and other fixes in this review
 
-### Simplifications for Local Development
+- Any logged-in user could send email and SMS to any other user by passing `userId`; now only admins can.
+- `POST /notifications/:id/events` accepted events for anyone's notification; it now requires the recipient (or an admin) and one of the notification's channels.
+- Role changes evict the user's cached sessions, so a demotion applies on the next request instead of up to 24 hours later.
+- Campaign start claims the campaign with a conditional `UPDATE … WHERE status IN ('draft', 'scheduled')`, so two concurrent starts can't both fan out; the second gets `409`.
+- Malformed IDs return `404` instead of a PostgreSQL cast error.
 
-| Production Design | Local Substitute | Why |
-|-------------------|------------------|-----|
-| APNs / FCM push delivery | Simulated provider (random success/failure) | No Apple/Google developer accounts needed |
-| SendGrid / SES email | Simulated provider with random delays | No email provider API keys needed |
-| Twilio SMS | Simulated provider | No SMS provider account needed |
-| API Gateway + LB | Direct connection to Express on port 3001-3003 | No nginx/HAProxy needed |
-| Dedicated worker hosts | Single process with `tsx watch` | All workers share one process |
-| Redis Cluster | Single Valkey instance | Sufficient for local data volume |
-| PostgreSQL read replicas | Single PostgreSQL instance | Low query volume |
-| Partitioned notifications table | Single unpartitioned table | No partition management overhead |
+### Operations
 
-### What Was Omitted
+Prometheus metrics ([metrics.ts](./backend/src/utils/metrics.ts)) include accept outcomes, `outbox_published_total`, `delivery_outcomes_total{channel, outcome}`, delivery attempts, processing time and breaker state. Pino writes JSON logs with request IDs, and the request serializer omits headers. `/health/live` and `/health/ready` are separate probes. The API's shutdown closes the HTTP server, PostgreSQL and Redis; the worker stops the sweeper and relay, closes RabbitMQ, then the stores.
 
-- CDN and static asset serving
-- Multi-region deployment and geo-routing
-- Kubernetes orchestration and auto-scaling
-- OAuth/OIDC integration (uses session auth instead)
-- Real push notification delivery (APNs/FCM)
-- Real email delivery (SendGrid/SES)
-- Real SMS delivery (Twilio)
-- Webhook-based delivery receipts from providers
-- In-app notification channel (WebSocket)
-- A/B testing for notification content
-- ML-based send-time optimization
+### Verification (2026-10-10)
+
+- `npm test` in `backend/` runs 25 offline vitest tests: quiet hours (zones, midnight-spanning windows, both DST transitions), the aggregate status, dedup keys, idempotency (claim, replay, `422`, caller scoping, owner-only release), the relay (priority order, stop on an unconfirmed publish) and every branch of the delivery handler. Backend and frontend `tsc`, ESLint and the frontend build are clean.
+- Against real PostgreSQL 16 and Redis, without RabbitMQ: `init.sql` and the seed both load twice; a non-admin sending to another user gets `403`; replay, `422`, and five concurrent requests with one key (one `202`, four `409`, one row); dedup; a sixth SMS gets `429` and leaves the push counter untouched; quiet hours in `Asia/Tokyo` schedule the outbox row for the local end time while `critical` goes out now; cancel removes the outbox rows; event ownership; promotion and demotion take effect immediately; two concurrent campaign starts give `200` and `409`.
+- The relay and the delivery handler were driven against the same PostgreSQL with an in-memory publisher: priority-ordered batches, scheduled rows held back, a redelivered message skipped, a transient failure retried through the outbox and then delivered, three failures ending in `dead-letter`, an expired lease re-enqueued and the dead worker's late write fenced off. The RabbitMQ consumer, publisher confirms and reconnects were not exercised against a live broker.
+
+### Simplified or omitted
+
+- **Auth is demo-grade:** login accepts any password for an existing email (sessions in PostgreSQL, cached in Redis).
+- **Preferences are applied only at accept time;** a deferred notification is sent even if the user turns the channel off in the meantime. Category preferences are stored but not enforced.
+- **Campaign fan-out runs inside the HTTP request,** one recipient at a time, targeting all users with the `user` role.
+- **No delivery receipts, in-app channel, digests, provider failover or worker-side token buckets;** `sent` means the simulated provider accepted the message (push 95%, email 98%, SMS 90% success).
+- **Template output is not HTML-escaped;** lists use `OFFSET` pagination; idempotency, dedup and rate limits fail open when Redis is down.
+- No sharding, read replicas, CDN, multi-region deployment or Kubernetes. Five Playwright smoke tests (`npm run test:smoke notification-system` from the repository root) check page rendering only.

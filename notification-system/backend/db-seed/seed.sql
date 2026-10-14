@@ -115,3 +115,26 @@ INSERT INTO delivery_status (notification_id, channel, status, details, attempts
   ('a0000000-0000-4000-8000-000000000009', 'sms',   'delivered', '{"provider": "simulated-sms", "latency_ms": 640}', 1, NULL, NOW() - INTERVAL '1 day'),
   ('a0000000-0000-4000-8000-00000000000a', 'push',  'failed',    '{"error": "unregistered_token", "dead_lettered": true}', 3, NULL, NOW() - INTERVAL '6 hours')
 ON CONFLICT (notification_id, channel) DO NOTHING;
+
+-- The seeded pending and scheduled notifications get delivery rows and outbox
+-- rows, exactly as if the API had accepted them, so a running worker relays and
+-- delivers them (the scheduled one when its time comes). Guarded for re-runs.
+INSERT INTO delivery_status (notification_id, channel, status, details, attempts, next_retry_at, updated_at)
+SELECT n.id, c.channel, 'pending', '{}', 0, n.scheduled_at, NOW()
+FROM notifications n CROSS JOIN LATERAL unnest(n.channels) AS c(channel)
+WHERE n.id = 'a0000000-0000-4000-8000-000000000007'
+ON CONFLICT (notification_id, channel) DO NOTHING;
+
+INSERT INTO delivery_outbox (notification_id, channel, priority, priority_rank, payload, available_at)
+SELECT n.id, ds.channel, n.priority,
+       CASE n.priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'low' THEN 3 ELSE 2 END,
+       jsonb_build_object('notificationId', n.id, 'userId', n.user_id, 'channel', ds.channel,
+                          'priority', n.priority, 'queuedAt', (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint),
+       COALESCE(ds.next_retry_at, NOW())
+FROM notifications n
+JOIN delivery_status ds ON ds.notification_id = n.id
+WHERE n.id IN ('a0000000-0000-4000-8000-000000000006', 'a0000000-0000-4000-8000-000000000007')
+  AND ds.status = 'pending'
+  AND NOT EXISTS (
+    SELECT 1 FROM delivery_outbox o WHERE o.notification_id = n.id AND o.channel = ds.channel
+  );

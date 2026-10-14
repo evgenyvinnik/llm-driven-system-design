@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import { api } from '../services/api';
+import { api, SendResult } from '../services/api';
 import type { Notification, Preferences, RateLimitUsage } from '../types';
 
 interface NotificationState {
@@ -11,7 +11,7 @@ interface NotificationState {
   fetchNotifications: (options?: { limit?: number; offset?: number; status?: string }) => Promise<void>;
   fetchPreferences: () => Promise<void>;
   updatePreferences: (updates: Partial<Preferences>) => Promise<void>;
-  setQuietHours: (start: string | null, end: string | null, enabled: boolean) => Promise<void>;
+  setQuietHours: (start: string | null, end: string | null, enabled: boolean, timezone?: string) => Promise<void>;
   fetchRateLimitUsage: () => Promise<void>;
   sendNotification: (data: {
     userId?: string;
@@ -19,7 +19,7 @@ interface NotificationState {
     data?: Record<string, unknown>;
     channels?: string[];
     priority?: string;
-  }) => Promise<{ notificationId: string; status: string }>;
+  }, idempotencyKey?: string) => Promise<SendResult>;
   cancelNotification: (id: string) => Promise<void>;
   clearError: () => void;
 }
@@ -72,10 +72,10 @@ export const useNotificationStore = create<NotificationState>((set, get) => ({
     }
   },
 
-  setQuietHours: async (start, end, enabled) => {
+  setQuietHours: async (start, end, enabled, timezone) => {
     set({ isLoading: true, error: null });
     try {
-      const preferences = await api.setQuietHours(start, end, enabled);
+      const preferences = await api.setQuietHours(start, end, enabled, timezone);
       set({ preferences: preferences as Preferences, isLoading: false });
     } catch (error) {
       set({
@@ -95,10 +95,10 @@ export const useNotificationStore = create<NotificationState>((set, get) => ({
     }
   },
 
-  sendNotification: async (data) => {
+  sendNotification: async (data, idempotencyKey) => {
     set({ isLoading: true, error: null });
     try {
-      const result = await api.sendNotification(data);
+      const result = await api.sendNotification(data, idempotencyKey);
       set({ isLoading: false });
       // Refresh notifications list
       get().fetchNotifications();

@@ -93,6 +93,8 @@ cd backend
 npm run dev:worker
 ```
 
+The API only needs PostgreSQL and Redis: it commits each notification together with its outbox rows. The worker runs the outbox relay (publishing due rows to RabbitMQ), the channel consumers and the dead-letter consumer — without it, notifications are accepted (`202`) but never delivered.
+
 4. **Install dependencies and start frontend:**
 
 ```bash
@@ -122,7 +124,8 @@ brew services start postgresql@16
 createdb notification_db
 createuser -s notification_user
 psql -d notification_db -c "ALTER USER notification_user WITH PASSWORD 'notification_password';"
-psql -d notification_db -f backend/init.sql
+psql -d notification_db -f backend/src/db/init.sql
+psql -d notification_db -f backend/db-seed/seed.sql
 ```
 
 2. **Install and start Redis:**
@@ -147,6 +150,24 @@ rabbitmqctl set_user_tags notification_user administrator
 ```
 
 4. **Start the application as described above.**
+
+## Environment Variables
+
+| Variable | Default | Used by |
+|----------|---------|---------|
+| `PORT` | `3000` (`npm run dev` sets `3001`) | API |
+| `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB` | `localhost`, `5432`, `notification_user`, `notification_password`, `notification_db` | API, worker |
+| `REDIS_HOST`, `REDIS_PORT` | `localhost`, `6379` | API, worker |
+| `RABBITMQ_URL` | `amqp://notification_user:notification_password@localhost:5672` | Worker |
+| `DELIVERY_MAX_ATTEMPTS` | `5` | Worker: provider attempts before a delivery is failed and dead-lettered |
+| `DELIVERY_RETRY_BASE_MS` | `5000` | Worker: first retry delay (doubles per attempt, capped at 5 minutes) |
+
+## Testing
+
+```bash
+cd backend
+npm test        # 25 offline vitest tests: quiet hours, idempotency, outbox relay, delivery handler
+```
 
 ## Running Multiple Server Instances
 
@@ -188,12 +209,12 @@ The system comes with pre-seeded demo accounts:
 - `GET /api/v1/auth/me` - Get current user
 
 ### Notifications
-- `POST /api/v1/notifications` - Send notification
+- `POST /api/v1/notifications` - Send notification (optional `Idempotency-Key` header; `202` when queued or scheduled, `200` when suppressed or deduplicated, `429` when rate limited; only admins may target another user)
 - `GET /api/v1/notifications` - Get user's notifications
 - `GET /api/v1/notifications/:id` - Get notification by ID
 - `DELETE /api/v1/notifications/:id` - Cancel notification
 - `GET /api/v1/notifications/rate-limit/usage` - Get rate limit usage
-- `POST /api/v1/notifications/:id/events` - Track notification event
+- `POST /api/v1/notifications/:id/events` - Track notification event (recipient or admin only)
 
 ### Preferences
 - `GET /api/v1/preferences` - Get user preferences
@@ -250,7 +271,7 @@ See [architecture.md](./architecture.md) for detailed system design documentatio
 
 ## Development Notes
 
-See [claude.md](./claude.md) for development insights and design decisions.
+See [CLAUDE.md](./CLAUDE.md) for development insights and design decisions.
 
 ## References & Inspiration
 

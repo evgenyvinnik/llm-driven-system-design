@@ -1,16 +1,20 @@
-import { initRabbitMQ, consumeQueue, QUEUES, QueueMessage } from '../utils/rabbitmq.js';
+import {
+  initRabbitMQ,
+  closeRabbitMQ,
+  consumeQueue,
+  publishToQueue,
+  QUEUES,
+  QueueMessage,
+} from '../utils/rabbitmq.js';
 import { pool, initDatabase, query } from '../utils/database.js';
 import { redis } from '../utils/redis.js';
 import { deliveryTracker } from '../services/delivery.js';
+import { startOutboxRelay } from '../services/outbox.js';
 import { createLogger } from '../utils/logger.js';
 import { withCircuitBreaker, initializeCircuitBreakers, CircuitBreakerOpenError } from '../utils/circuitBreaker.js';
-import { withRetry, isRetryableError, RetryPresets, RetryableError } from '../utils/retry.js';
-import {
-  notificationsSentCounter,
-  deliveryAttemptsCounter,
-  processingDurationHistogram,
-  queueDepthGauge,
-} from '../utils/metrics.js';
+import { isRetryableError, RetryableError } from '../utils/retry.js';
+import { queueDepthGauge } from '../utils/metrics.js';
+import { processDelivery, Provider, ProviderResult } from './deliveryHandler.js';
 import { Logger } from 'pino';
 
 const log: Logger = createLogger('notification-worker');
@@ -32,11 +36,12 @@ interface UserRow {
   phone_verified?: boolean;
 }
 
-interface DeliveryResult {
+interface DeliveryResult extends ProviderResult {
   success: boolean;
   reason?: string;
   error?: string;
   retryable?: boolean;
+  circuitOpen?: boolean;
   results?: Array<{
     deviceId: string;
     platform: string;
@@ -54,10 +59,6 @@ interface NotificationPayload {
   userId: string;
   content: Record<string, unknown>;
   notificationId: string;
-}
-
-interface RetryableDeliveryError extends RetryableError {
-  deliveryResult?: DeliveryResult;
 }
 
 // Simulated channel providers with circuit breaker and retry support
@@ -139,7 +140,10 @@ const providers = {
     return {
       success: anySuccess,
       results,
-      retryable: allCircuitOpen, // Retry if all failures were due to circuit breaker
+      // Every device failed: retry later; if the breaker rejected all of them,
+      // the handler defers without spending an attempt.
+      retryable: true,
+      circuitOpen: allCircuitOpen,
     };
   },
 
@@ -201,6 +205,7 @@ const providers = {
         success: false,
         email: user.rows[0].email,
         error: (error as Error).message,
+        circuitOpen: isCircuitOpen,
         retryable: isCircuitOpen || isRetryableError(error as RetryableError),
       };
     }
@@ -255,163 +260,18 @@ const providers = {
         success: false,
         phone: user.rows[0].phone,
         error: (error as Error).message,
+        circuitOpen: isCircuitOpen,
         retryable: isCircuitOpen || isRetryableError(error as RetryableError),
       };
     }
   },
 };
 
-// Non-retryable error reasons
-const NON_RETRYABLE_REASONS = ['no_devices', 'no_email', 'no_phone', 'email_not_verified'];
-
-function isRetryableResult(result: DeliveryResult): boolean {
-  if (result.retryable === false) {
-    return false;
-  }
-  if (result.retryable === true) {
-    return true;
-  }
-  return !NON_RETRYABLE_REASONS.includes(result.reason || '');
-}
-
-// Process a notification from the queue
-async function processNotification(message: QueueMessage): Promise<void> {
-  const {
-    notificationId,
-    userId,
-    channel,
-    content,
-    priority,
-    queuedAt,
-    retryCount = 0,
-  } = message;
-
-  const logContext = { notificationId, userId, channel, priority, retryCount };
-
-  log.info(logContext, `Processing ${channel} notification (attempt ${retryCount + 1})`);
-
-  const startTime = Date.now();
-  const timer = processingDurationHistogram.labels(channel, priority).startTimer();
-
-  try {
-    // Execute the delivery with retry wrapper
-    const result = await withRetry<DeliveryResult>(
-      async () => {
-        let deliveryResult: DeliveryResult;
-
-        switch (channel) {
-          case 'push':
-            deliveryResult = await providers.sendPush({ userId, content, notificationId });
-            break;
-          case 'email':
-            deliveryResult = await providers.sendEmail({ userId, content, notificationId });
-            break;
-          case 'sms':
-            deliveryResult = await providers.sendSMS({ userId, content, notificationId });
-            break;
-          default:
-            throw new Error(`Unknown channel: ${channel}`);
-        }
-
-        // If delivery failed but is retryable, throw to trigger retry
-        if (!deliveryResult.success && isRetryableResult(deliveryResult)) {
-          const error = new Error(deliveryResult.error || deliveryResult.reason) as RetryableDeliveryError;
-          error.retryable = true;
-          error.deliveryResult = deliveryResult;
-          throw error;
-        }
-
-        return deliveryResult;
-      },
-      {
-        ...RetryPresets.fast,
-        maxRetries: 2, // Quick retries within the worker, main retry via queue
-        context: { channel, notificationId },
-      }
-    );
-
-    const processingTime = Date.now() - startTime;
-    timer();
-
-    // Update delivery status based on result
-    if (result.success) {
-      await deliveryTracker.updateStatus(notificationId, channel, 'sent', {
-        ...result,
-        processingTime,
-        queuedAt,
-        deliveredAt: Date.now(),
-      });
-
-      // Update metrics
-      notificationsSentCounter.labels(channel, priority, 'sent').inc();
-      deliveryAttemptsCounter.labels(channel, 'true').inc();
-
-      log.info({
-        ...logContext,
-        processingTime,
-      }, `Notification delivered successfully`);
-    } else {
-      // Non-retryable failure
-      await deliveryTracker.updateStatus(notificationId, channel, 'failed', {
-        ...result,
-        retryCount,
-        error: result.error || result.reason,
-        processingTime,
-      });
-
-      // Update metrics
-      notificationsSentCounter.labels(channel, priority, 'failed').inc();
-      deliveryAttemptsCounter.labels(channel, 'false').inc();
-
-      log.warn({
-        ...logContext,
-        reason: result.reason,
-        processingTime,
-      }, `Notification failed (non-retryable)`);
-    }
-  } catch (error) {
-    const processingTime = Date.now() - startTime;
-    timer();
-
-    // Error during processing - check if we should trigger queue-level retry
-    const shouldRetry = retryCount < 3 && isRetryableError(error as RetryableError);
-
-    if (shouldRetry) {
-      await deliveryTracker.updateStatus(notificationId, channel, 'pending', {
-        retryCount: retryCount + 1,
-        error: (error as Error).message,
-        processingTime,
-      });
-
-      log.info({
-        ...logContext,
-        error: (error as Error).message,
-        nextRetryCount: retryCount + 1,
-      }, 'Notification will be retried via queue');
-
-      // Re-throw to trigger queue-level retry
-      throw error;
-    } else {
-      // Max retries exceeded or non-retryable error
-      await deliveryTracker.updateStatus(notificationId, channel, 'failed', {
-        retryCount,
-        error: (error as Error).message,
-        processingTime,
-        exhaustedRetries: retryCount >= 3,
-      });
-
-      // Update metrics
-      notificationsSentCounter.labels(channel, priority, 'failed').inc();
-      deliveryAttemptsCounter.labels(channel, 'false').inc();
-
-      log.error({
-        ...logContext,
-        err: error,
-        processingTime,
-      }, 'Notification failed after all retries');
-    }
-  }
-}
+const channelProviders: Record<string, Provider> = {
+  push: (delivery) => providers.sendPush(delivery),
+  email: (delivery) => providers.sendEmail(delivery),
+  sms: (delivery) => providers.sendSMS(delivery),
+};
 
 interface QueueConfig {
   queue: string;
@@ -420,6 +280,9 @@ interface QueueConfig {
   priority: string;
 }
 
+let relay: { stop: () => Promise<void> } | null = null;
+let reaper: NodeJS.Timeout | null = null;
+
 // Start workers for all queues
 async function startWorkers(): Promise<void> {
   log.info('Starting notification workers...');
@@ -427,69 +290,74 @@ async function startWorkers(): Promise<void> {
   await initDatabase();
   log.info('Database connected');
 
-  await initRabbitMQ();
-  log.info('RabbitMQ connected');
-
-  // Initialize circuit breakers
   initializeCircuitBreakers();
   log.info('Circuit breakers initialized');
 
-  // Start consumers for each queue
+  // Prefetch per queue: critical consumers get the most in-flight capacity, and
+  // SMS the least because carriers throttle hardest.
   const queues: QueueConfig[] = [
-    // Push queues (higher concurrency)
     { queue: QUEUES.PUSH_CRITICAL, prefetch: 50, channel: 'push', priority: 'critical' },
     { queue: QUEUES.PUSH_HIGH, prefetch: 30, channel: 'push', priority: 'high' },
     { queue: QUEUES.PUSH_NORMAL, prefetch: 20, channel: 'push', priority: 'normal' },
     { queue: QUEUES.PUSH_LOW, prefetch: 10, channel: 'push', priority: 'low' },
-
-    // Email queues (medium concurrency)
     { queue: QUEUES.EMAIL_CRITICAL, prefetch: 20, channel: 'email', priority: 'critical' },
     { queue: QUEUES.EMAIL_HIGH, prefetch: 15, channel: 'email', priority: 'high' },
     { queue: QUEUES.EMAIL_NORMAL, prefetch: 10, channel: 'email', priority: 'normal' },
     { queue: QUEUES.EMAIL_LOW, prefetch: 5, channel: 'email', priority: 'low' },
-
-    // SMS queues (lower concurrency due to rate limits)
     { queue: QUEUES.SMS_CRITICAL, prefetch: 10, channel: 'sms', priority: 'critical' },
     { queue: QUEUES.SMS_HIGH, prefetch: 5, channel: 'sms', priority: 'high' },
     { queue: QUEUES.SMS_NORMAL, prefetch: 3, channel: 'sms', priority: 'normal' },
     { queue: QUEUES.SMS_LOW, prefetch: 2, channel: 'sms', priority: 'low' },
   ];
 
+  // Registered before connecting so the first connect and every reconnect attach them.
   for (const { queue, prefetch, priority } of queues) {
-    await consumeQueue(queue, processNotification, { prefetch });
-
-    // Initialize queue depth gauge
+    await consumeQueue(queue, (message: QueueMessage) => processDelivery(message, channelProviders), { prefetch });
     queueDepthGauge.labels(queue, priority).set(0);
-
-    log.info({ queue, prefetch }, `Worker started for queue`);
   }
 
-  // Dead letter queue processor
+  // Dead letters are recorded as events; anything malformed is acked after logging.
   await consumeQueue(QUEUES.DEAD_LETTER, async (message: QueueMessage) => {
-    log.warn({ message }, 'Dead letter received');
+    log.warn({ notificationId: message.notificationId, channel: message.channel }, 'Dead letter received');
+    try {
+      await query(
+        `INSERT INTO notification_events (notification_id, channel, event_type, metadata)
+         VALUES ($1, $2, 'dead_letter', $3)`,
+        [message.notificationId, message.channel, JSON.stringify(message)]
+      );
+    } catch (error) {
+      log.error({ err: error }, 'Could not record dead letter');
+    }
+    return 'ack';
+  }, { prefetch: 1, onMalformed: 'ack' });
 
-    // Log to database for analysis
-    await query(
-      `INSERT INTO notification_events (notification_id, channel, event_type, metadata)
-       VALUES ($1, $2, 'dead_letter', $3)`,
-      [message.notificationId, message.channel, JSON.stringify(message)]
-    );
-  }, { prefetch: 1 });
+  await initRabbitMQ({ retry: true });
+  log.info('RabbitMQ connected; consumers attached');
+
+  // The relay publishes due outbox rows: new sends, scheduled and quiet-hours
+  // deliveries, and retries. Several worker processes can run it at once.
+  relay = startOutboxRelay({ publish: publishToQueue });
+
+  // Recover deliveries whose worker died mid-send.
+  reaper = setInterval(() => {
+    deliveryTracker.reapExpiredLeases()
+      .then((count) => { if (count > 0) log.warn({ count }, 'Re-enqueued deliveries with expired leases'); })
+      .catch((error: Error) => log.error({ err: error }, 'Lease reaper failed'));
+  }, 15000);
 
   log.info('All workers started. Waiting for messages...');
 }
 
-// Graceful shutdown
+// Graceful shutdown: stop publishing, stop consuming, then close stores.
 const shutdown = async (signal: string): Promise<void> => {
   log.info({ signal }, 'Received shutdown signal, shutting down workers...');
 
   try {
+    if (reaper) clearInterval(reaper);
+    await relay?.stop();
+    await closeRabbitMQ();
     await pool.end();
-    log.info('Database pool closed');
-
     await redis.quit();
-    log.info('Redis connection closed');
-
     log.info('Worker shutdown complete');
     process.exit(0);
   } catch (error) {

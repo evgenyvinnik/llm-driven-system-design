@@ -1,5 +1,14 @@
 const API_BASE = '/api/v1';
 
+/** What POST /notifications reports: queued, scheduled, or why nothing was sent. */
+export interface SendResult {
+  notificationId: string | null;
+  status: 'queued' | 'scheduled' | 'deduplicated' | 'suppressed' | 'rate_limited' | 'duplicate';
+  reason?: string;
+  channels?: string[];
+  scheduledFor?: string;
+}
+
 /** API client for the notification system with token-based authentication and request helpers. */
 class ApiClient {
   private token: string | null = null;
@@ -27,8 +36,12 @@ class ApiClient {
     });
 
     if (!response.ok) {
-      const error = await response.json().catch(() => ({ error: 'Request failed' }));
-      throw new Error(error.error || 'Request failed');
+      const body = await response.json().catch(() => ({}));
+      if (response.status === 429) {
+        const retryAfter = body.retryAfter ?? response.headers.get('Retry-After');
+        throw new Error(`Rate limit reached for ${body.channel ?? 'this channel'}. Try again in ${retryAfter ?? 'a few'} seconds.`);
+      }
+      throw new Error(body.error || 'Request failed');
     }
 
     return response.json();
@@ -58,16 +71,24 @@ class ApiClient {
   }
 
   // Notifications
+  /**
+   * `idempotencyKey` identifies one submitted draft: resending the same draft
+   * (after a timeout, say) returns the original result instead of a second send.
+   */
   async sendNotification(data: {
     userId?: string;
     templateId?: string;
     data?: Record<string, unknown>;
     channels?: string[];
     priority?: string;
-  }) {
-    return this.request<{ notificationId: string; status: string; channels?: string[] }>(
+  }, idempotencyKey?: string) {
+    return this.request<SendResult>(
       '/notifications',
-      { method: 'POST', body: JSON.stringify(data) }
+      {
+        method: 'POST',
+        body: JSON.stringify(data),
+        headers: idempotencyKey ? { 'Idempotency-Key': idempotencyKey } : undefined,
+      }
     );
   }
 
@@ -115,10 +136,10 @@ class ApiClient {
     return this.request<unknown>('/preferences', { method: 'PATCH', body: JSON.stringify(updates) });
   }
 
-  async setQuietHours(start: string | null, end: string | null, enabled: boolean) {
+  async setQuietHours(start: string | null, end: string | null, enabled: boolean, timezone?: string) {
     return this.request<unknown>(
       '/preferences/quiet-hours',
-      { method: 'PUT', body: JSON.stringify({ start, end, enabled }) }
+      { method: 'PUT', body: JSON.stringify({ start, end, enabled, timezone }) }
     );
   }
 

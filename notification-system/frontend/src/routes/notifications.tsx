@@ -7,7 +7,7 @@ import type { Notification, Template } from '../types';
 
 function NotificationsPage() {
   const { isAuthenticated, hasCheckedAuth } = useAuthStore();
-  const { notifications, isLoading, fetchNotifications, sendNotification, cancelNotification } =
+  const { notifications, isLoading, error, fetchNotifications, sendNotification, cancelNotification } =
     useNotificationStore();
   const { templates, fetchTemplates } = useAdminStore();
   const navigate = useNavigate();
@@ -20,6 +20,16 @@ function NotificationsPage() {
     body: '',
   });
   const [statusFilter, setStatusFilter] = useState('');
+  // One Idempotency-Key per submitted draft. Resubmitting the same draft after
+  // a failure reuses it, so a timeout followed by a retry cannot send twice;
+  // editing the draft makes it a new request with a new key.
+  const [draftKey, setDraftKey] = useState<string | null>(null);
+  const [sendOutcome, setSendOutcome] = useState('');
+
+  const updateDraft = (update: (prev: typeof formData) => typeof formData) => {
+    setDraftKey(null);
+    setFormData(update);
+  };
 
   useEffect(() => {
     // Wait for the session check to finish before deciding the user is logged
@@ -35,19 +45,24 @@ function NotificationsPage() {
 
   const handleSend = async (e: React.FormEvent) => {
     e.preventDefault();
+    const key = draftKey ?? crypto.randomUUID();
+    setDraftKey(key);
+    setSendOutcome('');
     try {
-      await sendNotification({
+      const result = await sendNotification({
         templateId: formData.templateId || undefined,
         channels: formData.channels,
         priority: formData.priority,
         data: formData.templateId
           ? {}
           : { title: formData.title, body: formData.body, content: { title: formData.title, body: formData.body } },
-      });
+      }, key);
+      setSendOutcome(describeOutcome(result.status, result.scheduledFor));
       setShowSendForm(false);
+      setDraftKey(null);
       setFormData({ templateId: '', channels: ['email'], priority: 'normal', title: '', body: '' });
     } catch {
-      // Error handled by store
+      // Error shown from the store; the key is kept so "Send" retries this draft.
     }
   };
 
@@ -58,7 +73,7 @@ function NotificationsPage() {
   };
 
   const toggleChannel = (channel: string) => {
-    setFormData((prev) => ({
+    updateDraft((prev) => ({
       ...prev,
       channels: prev.channels.includes(channel)
         ? prev.channels.filter((c) => c !== channel)
@@ -104,7 +119,7 @@ function NotificationsPage() {
               <label className="block text-sm font-medium text-gray-700 mb-1">Template (optional)</label>
               <select
                 value={formData.templateId}
-                onChange={(e) => setFormData((prev) => ({ ...prev, templateId: e.target.value }))}
+                onChange={(e) => updateDraft((prev) => ({ ...prev, templateId: e.target.value }))}
                 className="w-full px-3 py-2 border border-gray-300 rounded-md"
               >
                 <option value="">No template (custom message)</option>
@@ -123,7 +138,7 @@ function NotificationsPage() {
                   <input
                     type="text"
                     value={formData.title}
-                    onChange={(e) => setFormData((prev) => ({ ...prev, title: e.target.value }))}
+                    onChange={(e) => updateDraft((prev) => ({ ...prev, title: e.target.value }))}
                     className="w-full px-3 py-2 border border-gray-300 rounded-md"
                     required
                   />
@@ -132,7 +147,7 @@ function NotificationsPage() {
                   <label className="block text-sm font-medium text-gray-700 mb-1">Body</label>
                   <textarea
                     value={formData.body}
-                    onChange={(e) => setFormData((prev) => ({ ...prev, body: e.target.value }))}
+                    onChange={(e) => updateDraft((prev) => ({ ...prev, body: e.target.value }))}
                     className="w-full px-3 py-2 border border-gray-300 rounded-md"
                     rows={3}
                     required
@@ -162,7 +177,7 @@ function NotificationsPage() {
               <label className="block text-sm font-medium text-gray-700 mb-1">Priority</label>
               <select
                 value={formData.priority}
-                onChange={(e) => setFormData((prev) => ({ ...prev, priority: e.target.value }))}
+                onChange={(e) => updateDraft((prev) => ({ ...prev, priority: e.target.value }))}
                 className="w-full px-3 py-2 border border-gray-300 rounded-md"
               >
                 <option value="low">Low</option>
@@ -180,6 +195,16 @@ function NotificationsPage() {
               {isLoading ? 'Sending...' : 'Send Notification'}
             </button>
           </form>
+        </div>
+      )}
+
+      {/* Outcome of the last send, announced to screen readers */}
+      <div aria-live="polite" className="text-sm text-gray-700">
+        {sendOutcome}
+      </div>
+      {error && (
+        <div role="alert" className="px-4 py-3 rounded-md bg-red-50 text-sm text-red-700">
+          {error}
         </div>
       )}
 
@@ -258,6 +283,21 @@ function NotificationsPage() {
       </div>
     </div>
   );
+}
+
+function describeOutcome(status: string, scheduledFor?: string): string {
+  switch (status) {
+    case 'queued':
+      return 'Notification queued for delivery.';
+    case 'scheduled':
+      return `Notification scheduled for ${scheduledFor ? new Date(scheduledFor).toLocaleString() : 'later'} (quiet hours or a requested time).`;
+    case 'deduplicated':
+      return 'Not sent: an identical notification was sent moments ago.';
+    case 'suppressed':
+      return 'Not sent: every selected channel is turned off in your preferences.';
+    default:
+      return `Not sent (${status}).`;
+  }
 }
 
 export const Route = createFileRoute('/notifications')({
