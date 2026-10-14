@@ -47,6 +47,7 @@ Each folder contains an independent implementation of a system design problem.
 | [LinkedIn](./linkedin/) | Professional networking platform | ✅ Implemented |
 | [TikTok](./tiktok/) | Short-form video platform | ✅ Implemented |
 | [Kindle Highlights](./kindle-highlights/) | Social reading platform with real-time sync | ✅ Implemented |
+| [Pinterest](./pinterest/) | Visual discovery with pins, boards, and masonry feed | ✅ Implemented |
 
 ### Messaging & Communication
 
@@ -57,6 +58,9 @@ Each folder contains an independent implementation of a system design problem.
 | [Slack](./slack/) | Team communication and collaboration | ✅ Implemented |
 | [iMessage](./imessage/) | Cross-device messaging with offline sync | ✅ Implemented |
 | [FaceTime](./facetime/) | Real-time video calling | ✅ Implemented |
+| [Gmail](./gmail/) | Email with threaded conversations and search | ✅ Implemented |
+| [Microsoft Teams](./microsoft-teams/) | Enterprise chat with teams, channels, and presence | ✅ Implemented |
+| [Zoom](./zoom/) | Video conferencing with SFU media routing | ✅ Implemented |
 
 ### Video & Streaming
 
@@ -117,6 +121,11 @@ Each folder contains an independent implementation of a system design problem.
 | [Collaborative Editor](./collaborative-editor/) | Real-time document editing | ✅ Implemented |
 | [AI Code Assistant](./ai-code-assistant/) | CLI coding assistant like Claude Code/Cursor | ✅ Implemented |
 | [Plugin Platform](./plugin-platform/) | VS Code-like extension system with sandboxing | ✅ Implemented |
+| [Confluence](./confluence/) | Team wiki with spaces and page hierarchies | ✅ Implemented |
+| [Excalidraw](./excalidraw/) | Collaborative infinite whiteboard canvas | ✅ Implemented |
+| [Loom](./loom/) | Async screen and camera video messaging | ✅ Implemented |
+| [Retool](./retool/) | No-code internal tool builder | ✅ Implemented |
+| [Supabase Dashboard](./supabase-dashboard/) | Database management dashboard for Backend-as-a-Service | ✅ Implemented |
 
 ### Financial Services & Payments
 
@@ -128,12 +137,15 @@ Each folder contains an independent implementation of a system design problem.
 | [Venmo](./venmo/) | P2P payment platform | ✅ Implemented |
 | [Splitwise](./splitwise/) | Shared-expense tracking with debt simplification | ✅ Implemented |
 | [Apple Pay](./apple-pay/) | Secure mobile payments | ✅ Implemented |
+| [Coinbase](./coinbase/) | Cryptocurrency exchange with order matching | ✅ Implemented |
+| [PayPal](./paypal/) | P2P payments with double-entry ledger | ✅ Implemented |
 
 ### Business Services
 
 | Project | Description | Status |
 |---------|-------------|--------|
 | [DocuSign](./docusign/) | Electronic signature platform | ✅ Implemented |
+| [Salesforce](./salesforce/) | CRM with sales pipeline and lead conversion | ✅ Implemented |
 
 ### Search & Discovery
 
