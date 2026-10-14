@@ -4,48 +4,39 @@
  */
 
 import { v4 as uuidv4 } from 'uuid';
-import { query, withTransaction } from '../../db/connection.js';
+import { query } from '../../db/connection.js';
 import {
   logger,
   publishFraudCheck,
 } from '../../shared/index.js';
-import type {
-  Transaction,
-  TransactionStatus,
-  CreatePaymentRequest,
-  PoolClient,
-} from './types.js';
+import type { Transaction, CreatePaymentRequest } from './types.js';
+
+/** Result of claiming a payment record for an idempotency key. */
+export interface PaymentClaim {
+  /** True if this request inserted the row and therefore owns processing. */
+  claimed: boolean;
+  /** The inserted row, or the existing row created by an earlier request. */
+  transaction: Transaction;
+}
 
 /**
- * Creates a new transaction record in pending status.
+ * Inserts the payment in 'pending' status, using the row itself as the
+ * idempotency record.
  *
- * @description Inserts a new transaction into the database with 'pending' status.
- * The transaction is created within a database transaction for atomicity.
- * Payment method and metadata are stored as JSONB columns.
- *
- * @param transactionId - Pre-generated UUID for the transaction
- * @param merchantId - UUID of the merchant creating the payment
- * @param request - Payment request containing amount, currency, payment method, etc.
- * @param feeAmount - Calculated platform fee in cents
- * @param netAmount - Net amount for merchant after fees in cents
- * @returns The newly created Transaction object
- *
- * @example
- * const transaction = await createTransactionRecord(
- *   uuidv4(),
- *   'merchant_123',
- *   { amount: 10000, currency: 'USD', payment_method: {...}, idempotency_key: 'key123' },
- *   320,
- *   9680
- * );
+ * `INSERT ... ON CONFLICT (merchant_id, idempotency_key) DO NOTHING` is the
+ * claim: of N concurrent requests with the same key exactly one inserts and
+ * goes on to call the processor; the others read the existing row. Because the
+ * claim lives in the same database as the money movement, it cannot be lost
+ * the way a cache entry can, and it never expires.
  */
-export async function createTransactionRecord(
+export async function claimPaymentRecord(
   transactionId: string,
   merchantId: string,
   request: CreatePaymentRequest,
+  requestHash: string | null,
   feeAmount: number,
   netAmount: number
-): Promise<Transaction> {
+): Promise<PaymentClaim> {
   const {
     amount,
     currency,
@@ -54,78 +45,42 @@ export async function createTransactionRecord(
     customer_email,
     idempotency_key,
     metadata = {},
+    capture = true,
   } = request;
 
-  const transaction = await withTransaction(async (client: PoolClient) => {
-    const result = await client.query<Transaction>(
-      `INSERT INTO transactions (
-        id, idempotency_key, merchant_id, amount, currency, status,
-        payment_method, description, customer_email, fee_amount, net_amount, metadata
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-      RETURNING *`,
-      [
-        transactionId,
-        idempotency_key,
-        merchantId,
-        amount,
-        currency,
-        'pending',
-        JSON.stringify(payment_method),
-        description,
-        customer_email,
-        feeAmount,
-        netAmount,
-        JSON.stringify(metadata),
-      ]
-    );
-    return result.rows[0];
-  });
+  const inserted = await query<Transaction>(
+    `INSERT INTO transactions (
+      id, idempotency_key, request_hash, merchant_id, amount, currency, status,
+      payment_method, description, customer_email, fee_amount, net_amount, metadata, auto_capture
+    ) VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7, $8, $9, $10, $11, $12, $13)
+    ON CONFLICT (merchant_id, idempotency_key) DO NOTHING
+    RETURNING *`,
+    [
+      transactionId,
+      idempotency_key ?? null,
+      requestHash,
+      merchantId,
+      amount,
+      currency,
+      JSON.stringify(payment_method),
+      description,
+      customer_email,
+      feeAmount,
+      netAmount,
+      JSON.stringify(metadata),
+      capture,
+    ]
+  );
 
-  return transaction;
-}
-
-/**
- * Updates a transaction's status and any additional fields atomically.
- *
- * @description Updates the transaction status and increments the version number
- * for optimistic locking. Additional fields can be updated in the same query
- * (e.g., risk_score, processor_ref). The updated_at timestamp is automatically set.
- *
- * @param id - UUID of the transaction to update
- * @param status - New status to set (pending, authorized, captured, failed, voided, refunded)
- * @param additionalFields - Optional key-value pairs for additional columns to update
- * @returns Promise that resolves when update is complete
- *
- * @example
- * // Update status only
- * await updateTransactionStatus('txn_abc123', 'authorized');
- *
- * @example
- * // Update status with additional fields
- * await updateTransactionStatus('txn_abc123', 'authorized', {
- *   risk_score: 25,
- *   processor_ref: 'proc_xyz789'
- * });
- */
-export async function updateTransactionStatus(
-  id: string,
-  status: TransactionStatus,
-  additionalFields: Record<string, unknown> = {}
-): Promise<void> {
-  const updates = ['status = $2', 'updated_at = NOW()', 'version = version + 1'];
-  const params: unknown[] = [id, status];
-  let paramIndex = 3;
-
-  for (const [key, value] of Object.entries(additionalFields)) {
-    updates.push(`${key} = $${paramIndex}`);
-    params.push(value);
-    paramIndex++;
+  if (inserted[0]) {
+    return { claimed: true, transaction: inserted[0] };
   }
 
-  await query(
-    `UPDATE transactions SET ${updates.join(', ')} WHERE id = $1`,
-    params
+  const existing = await query<Transaction>(
+    'SELECT * FROM transactions WHERE merchant_id = $1 AND idempotency_key = $2',
+    [merchantId, idempotency_key]
   );
+  return { claimed: false, transaction: existing[0] };
 }
 
 /**

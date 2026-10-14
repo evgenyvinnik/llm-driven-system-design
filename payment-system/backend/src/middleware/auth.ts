@@ -125,8 +125,15 @@ export function extractIdempotencyKey(
 ): void {
   const idempotencyKey = req.headers['idempotency-key'] as string | undefined;
 
-  if (idempotencyKey) {
+  if (idempotencyKey !== undefined) {
     req.body.idempotency_key = idempotencyKey;
+  }
+
+  // Keys are stored in VARCHAR(64) columns and scoped per merchant
+  const key = req.body?.idempotency_key;
+  if (key !== undefined && (typeof key !== 'string' || key.length === 0 || key.length > 64)) {
+    res.status(400).json({ error: 'Idempotency-Key must be a string of 1-64 characters' });
+    return;
   }
 
   next();

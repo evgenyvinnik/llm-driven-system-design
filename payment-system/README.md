@@ -40,7 +40,8 @@ This project implements a payment processing system similar to Stripe, featuring
 - [x] Database/Storage layer (PostgreSQL + Redis)
 - [x] API endpoints
 - [x] Frontend dashboard
-- [ ] Comprehensive testing
+- [x] Unit tests for the ledger, state machine, idempotency fingerprints and reconciler (`cd backend && npm test`)
+- [ ] Integration test suite
 - [ ] Performance optimization
 - [ ] Full documentation
 
@@ -130,6 +131,9 @@ cd backend && npm run dev
 
 # Terminal 3: Start frontend
 cd frontend && npm run dev
+
+# Terminal 4 (optional): resolve payments whose processor outcome was unknown
+cd backend && npm run dev:reconciler    # or: npm run reconcile:once
 ```
 
 ### Running Multiple Backend Instances
@@ -190,7 +194,15 @@ curl -H "Authorization: Bearer pk_your_api_key_here" \
 
 ### Idempotency
 
-For payment creation and refunds, include an idempotency key:
+For payment creation and refunds, include an idempotency key (1-64 characters, scoped to your merchant account). The key is stored with the payment or refund itself, so it never expires:
+
+| Retry with the same key | Response |
+|-------------------------|----------|
+| Same body, payment finished | `200` with the payment's current state and `Idempotent-Replayed: true` |
+| Same body, payment still `pending` | `409` with `Retry-After: 2` |
+| Different body | `422 idempotency_key_reused` |
+
+A `202` response means the processor did not answer in time: the payment stays `pending` until the reconciler confirms the outcome with the processor. Retrying with the same key is always safe.
 
 ```bash
 curl -X POST \
@@ -236,9 +248,36 @@ curl -X POST \
      http://localhost:3000/api/v1/payments
 ```
 
-### Test Decline
+### Test Cards
 
-Use last_four: "0000" to simulate a declined payment.
+The processor is simulated (its records live in Redis under `psp-sim:*`). Choose behavior with `payment_method.last_four`:
+
+| `last_four` | Behavior |
+|-------------|----------|
+| `0000` | Declined |
+| `0001` | Approved, but the response is lost: `202 pending`, then the reconciler captures it |
+| `0002` | The first attempt never reaches the processor: `202 pending`, then the reconciler resubmits under the same reference |
+| anything else | Approved, except random declines at `PSP_DECLINE_RATE` (default 5%) |
+
+Run `npm run reconcile:once` in `backend/` (with `RECONCILE_AFTER_SECONDS=0` to skip the 30-second grace period) to resolve pending payments immediately, then check `GET /api/v1/ledger/verify` — it reports unbalanced journals and account drift.
+
+### Unit Tests
+
+```bash
+cd backend
+npm test        # vitest, offline (database and Redis are mocked)
+```
+
+### Environment Variables
+
+Besides the connection strings in `backend/.env.example`:
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `PSP_DECLINE_RATE` | `0.05` | Random decline rate of the simulated processor |
+| `PSP_TIMEOUT_MS` | `5000` | Processor call timeout; a timeout leaves the payment `pending` |
+| `RECONCILE_INTERVAL_MS` | `15000` | How often the reconciler runs |
+| `RECONCILE_AFTER_SECONDS` | `30` | How long a payment must be pending before the reconciler touches it |
 
 ## Architecture
 
@@ -246,7 +285,7 @@ See [architecture.md](./architecture.md) for detailed system design documentatio
 
 ## Development Notes
 
-See [claude.md](./claude.md) for development insights and iteration history.
+See [CLAUDE.md](./CLAUDE.md) for development insights and iteration history.
 
 ## Project Structure
 
@@ -271,9 +310,9 @@ payment-system/
 │   │   └── utils/        # Helper functions
 │   ├── package.json
 │   └── vite.config.ts
-├── docker-compose.yml    # PostgreSQL + Redis
+├── docker-compose.yml    # PostgreSQL, Valkey, RabbitMQ
 ├── architecture.md       # System design documentation
-├── claude.md            # Development notes
+├── CLAUDE.md            # Development notes
 └── README.md            # This file
 ```
 

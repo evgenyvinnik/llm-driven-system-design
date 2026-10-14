@@ -1,277 +1,221 @@
 /**
  * Payment authorization module.
  * Handles the creation and authorization of new payment transactions.
+ *
+ * Flow for POST /payments:
+ * 1. Claim: insert the payment as 'pending' keyed by (merchant, Idempotency-Key).
+ *    A duplicate request reads the existing row instead: same body -> replay,
+ *    different body -> 422, still pending -> 409.
+ * 2. Fraud score; a score above 90 fails the payment without calling out.
+ * 3. Authorize with the processor using the payment id as its idempotency key.
+ * 4. Apply the outcome with a guarded transition: approved -> authorized (and
+ *    captured, with its ledger journal, in the same database transaction when
+ *    auto-capture is on); declined or not attempted -> failed; unknown -> stays
+ *    'pending' and the API answers 202 until the reconciler resolves it.
  */
 
+import { pool, query, queryOne, withTransaction } from '../../db/connection.js';
 import {
   logger,
-  withIdempotency,
   paymentTransactionsTotal,
   paymentProcessingDuration,
   paymentAmountHistogram,
   fraudScoreHistogram,
   fraudDecisionsTotal,
+  idempotencyRequestsTotal,
   auditPaymentCreated,
   auditPaymentAuthorized,
   auditPaymentFailed,
 } from '../../shared/index.js';
 import { FraudService } from '../fraud.service.js';
-import { calculateFee } from './validation.js';
+import { calculateFee, requestFingerprint } from './validation.js';
 import { authorizeWithProcessor } from './processor.js';
-import {
-  createTransactionRecord,
-  updateTransactionStatus,
-  publishAsyncFraudCheck,
-  generateTransactionId,
-} from './transaction.js';
-import type {
-  Transaction,
-  CreatePaymentRequest,
-  CreatePaymentResponse,
-  ClientInfo,
-} from './types.js';
+import { claimPaymentRecord, publishAsyncFraudCheck, generateTransactionId } from './transaction.js';
+import { transitionStatus } from './state-machine.js';
+import { captureInTransaction, afterCapture } from './capture.js';
+import { idempotencyKeyReused, requestInProgress } from './errors.js';
+import type { Transaction, CreatePaymentRequest, CreatePaymentResponse, ClientInfo } from './types.js';
 
 const fraudService = new FraudService();
 
+/** What the route sends back: status code, body, and whether it was a replay. */
+export interface CreatePaymentResult {
+  httpStatus: 200 | 201 | 202;
+  replayed: boolean;
+  body: CreatePaymentResponse;
+}
+
 /**
- * Creates a new payment with idempotency support.
- *
- * @description Entry point for creating a new payment transaction. Wraps the core
- * payment processing logic with idempotency protection to prevent duplicate charges
- * when clients retry failed network requests. Cached responses are returned for
- * duplicate idempotency keys.
- *
- * @param merchantId - UUID of the merchant creating the payment
- * @param merchantAccountId - UUID of the merchant's ledger account for settlements
- * @param request - Payment request containing amount, currency, payment method, etc.
- * @param clientInfo - Optional client info for audit logging (IP, user agent)
- * @param capturePaymentFn - Function to capture the payment if capture=true
- * @returns Payment response with transaction ID, status, amounts, and timestamps
- *
- * @example
- * const response = await createPayment(
- *   'merchant_123',
- *   'acct_xyz789',
- *   {
- *     amount: 10000,
- *     currency: 'USD',
- *     payment_method: { type: 'card', last_four: '4242', card_brand: 'visa' },
- *     idempotency_key: 'order-12345',
- *     capture: true
- *   },
- *   { ipAddress: '192.168.1.1' },
- *   capturePaymentFn
- * );
+ * Creates a new payment, exactly once per (merchant, Idempotency-Key).
  */
 export async function createPayment(
   merchantId: string,
-  merchantAccountId: string,
   request: CreatePaymentRequest,
-  clientInfo: ClientInfo | undefined,
-  capturePaymentFn: (id: string, acctId: string, info?: ClientInfo) => Promise<Transaction>
-): Promise<CreatePaymentResponse> {
+  clientInfo?: ClientInfo
+): Promise<CreatePaymentResult> {
   const startTime = Date.now();
+  const { feeAmount, netAmount } = calculateFee(request.amount);
+  const requestHash = request.idempotency_key
+    ? requestFingerprint(request as unknown as Record<string, unknown>)
+    : null;
 
-  const { result, fromCache } = await withIdempotency<CreatePaymentResponse>(
-    'payment',
-    merchantId,
-    request.idempotency_key,
-    () => processPayment(merchantId, merchantAccountId, request, clientInfo, capturePaymentFn)
+  const { claimed, transaction } = await claimPaymentRecord(
+    generateTransactionId(), merchantId, request, requestHash, feeAmount, netAmount
   );
 
-  const duration = (Date.now() - startTime) / 1000;
-  paymentProcessingDuration.labels('create', result.status).observe(duration);
-
-  if (fromCache) {
-    logger.info(
-      { merchantId, idempotencyKey: request.idempotency_key, transactionId: result.id },
-      'Returned cached payment response'
-    );
+  if (!claimed) {
+    return replayExisting(transaction, requestHash);
+  }
+  if (request.idempotency_key) {
+    idempotencyRequestsTotal.labels('new').inc();
   }
 
+  await auditPaymentCreated(
+    transaction.id, merchantId, request.amount, request.currency,
+    clientInfo?.ipAddress, clientInfo?.userAgent
+  );
+
+  const result = await processClaimedPayment(transaction, request, clientInfo);
+  paymentProcessingDuration.labels('create', result.body.status).observe((Date.now() - startTime) / 1000);
   return result;
 }
 
 /**
- * Core payment processing logic.
- *
- * @description Executes the full payment flow:
- * 1. Calculates fees and generates transaction ID
- * 2. Creates transaction record in database
- * 3. Runs synchronous fraud scoring
- * 4. Authorizes with payment processor
- * 5. Optionally captures if capture=true
- * 6. Publishes async fraud check for deep analysis
- *
- * @param merchantId - UUID of the merchant
- * @param merchantAccountId - UUID of merchant's ledger account
- * @param request - Payment request details
- * @param clientInfo - Optional client info for audit
- * @param capturePaymentFn - Function to capture if auto-capture enabled
- * @returns Payment response with final status
+ * A second request with a key that already has a payment. Replays return the
+ * payment the key created, in its current state; they never run anything.
  */
-async function processPayment(
-  merchantId: string,
-  merchantAccountId: string,
-  request: CreatePaymentRequest,
-  clientInfo: ClientInfo | undefined,
-  capturePaymentFn: (id: string, acctId: string, info?: ClientInfo) => Promise<Transaction>
-): Promise<CreatePaymentResponse> {
-  const { amount, currency, payment_method, customer_email, capture = true } = request;
-  const { feeAmount, netAmount } = calculateFee(amount);
-  const transactionId = generateTransactionId();
+function replayExisting(existing: Transaction, requestHash: string | null): CreatePaymentResult {
+  if (existing.request_hash && existing.request_hash !== requestHash) {
+    idempotencyRequestsTotal.labels('mismatch').inc();
+    throw idempotencyKeyReused();
+  }
+  if (existing.status === 'pending') {
+    idempotencyRequestsTotal.labels('in_progress').inc();
+    throw requestInProgress(existing.id);
+  }
+  idempotencyRequestsTotal.labels('replay').inc();
+  logger.info(
+    { merchantId: existing.merchant_id, transactionId: existing.id },
+    'Idempotent replay of payment creation'
+  );
+  return { httpStatus: 200, replayed: true, body: buildResponse(existing) };
+}
 
+/** Fraud check, processor call, and outcome handling for a freshly claimed payment. */
+async function processClaimedPayment(
+  transaction: Transaction,
+  request: CreatePaymentRequest,
+  clientInfo?: ClientInfo
+): Promise<CreatePaymentResult> {
+  const { amount, currency, payment_method, customer_email } = request;
   paymentAmountHistogram.labels(currency).observe(amount);
 
-  const transaction = await createTransactionRecord(
-    transactionId, merchantId, request, feeAmount, netAmount
-  );
-
-  await auditPaymentCreated(
-    transactionId, merchantId, amount, currency,
-    clientInfo?.ipAddress, clientInfo?.userAgent
-  );
-
-  // Fraud check
   const riskScore = await fraudService.evaluate({
-    amount, currency, payment_method, merchantId, customerEmail: customer_email,
+    amount, currency, payment_method, merchantId: transaction.merchant_id, customerEmail: customer_email,
   });
-
   fraudScoreHistogram.labels(riskScore > 90 ? 'decline' : 'approve').observe(riskScore);
 
-  // High fraud score - decline
   if (riskScore > 90) {
-    return handleFraudDecline(transactionId, merchantId, transaction, riskScore, clientInfo);
+    fraudDecisionsTotal.labels('decline').inc();
+    const failed = await applyProcessorDecline(transaction.id, 'High fraud risk score', clientInfo, riskScore);
+    return { httpStatus: 201, replayed: false, body: buildResponse(failed) };
   }
-
   fraudDecisionsTotal.labels('approve').inc();
 
-  // Processor authorization
-  const authResult = await authorizeWithProcessor(amount, payment_method);
+  // Persist the score before calling out: if the outcome is unknown, the
+  // reconciler finishes this payment without re-running the fraud check.
+  await query('UPDATE transactions SET risk_score = $2 WHERE id = $1', [transaction.id, riskScore]);
 
-  if (!authResult.success) {
-    return handleProcessorDecline(
-      transactionId, merchantId, transaction, riskScore,
-      authResult.declineReason || 'Processor declined', clientInfo
-    );
+  const outcome = await authorizeWithProcessor(transaction.id, amount, payment_method);
+
+  switch (outcome.kind) {
+    case 'approved': {
+      const final = await applyProcessorApproval(transaction.id, outcome.processorRef, clientInfo);
+      publishAsyncFraudCheck(
+        transaction.id, transaction.merchant_id, amount, currency, payment_method,
+        customer_email, clientInfo?.ipAddress
+      );
+      return { httpStatus: 201, replayed: false, body: buildResponse(final) };
+    }
+    case 'declined':
+    case 'not_attempted': {
+      const final = await applyProcessorDecline(transaction.id, outcome.reason, clientInfo);
+      return { httpStatus: 201, replayed: false, body: buildResponse(final) };
+    }
+    case 'unknown': {
+      paymentTransactionsTotal.labels('pending', currency).inc();
+      logger.warn(
+        { transactionId: transaction.id, reason: outcome.reason },
+        'Authorization outcome unknown; returning 202 and leaving the payment to the reconciler'
+      );
+      return { httpStatus: 202, replayed: false, body: buildResponse(transaction) };
+    }
   }
+}
 
-  // Success - update to authorized
-  await updateTransactionStatus(transactionId, 'authorized', {
-    risk_score: riskScore,
-    processor_ref: authResult.processorRef,
+/**
+ * Applies a processor approval: pending -> authorized, plus the capture and its
+ * ledger journal in the same database transaction when auto-capture is on.
+ * Used by the live request and by the reconciler; if the other one got there
+ * first, the guarded transition matches nothing and the current row is returned.
+ */
+export async function applyProcessorApproval(
+  transactionId: string,
+  processorRef: string,
+  clientInfo?: ClientInfo
+): Promise<Transaction> {
+  const applied = await withTransaction(async (client) => {
+    const authorized = await transitionStatus(client, transactionId, ['pending'], 'authorized', {
+      processor_ref: processorRef,
+    });
+    if (!authorized) return null;
+    const captured = authorized.auto_capture ? await captureInTransaction(client, transactionId) : null;
+    return { authorized, captured };
   });
 
-  await auditPaymentAuthorized(
-    transactionId, merchantId, authResult.processorRef!,
-    clientInfo?.ipAddress, clientInfo?.userAgent
-  );
-
-  paymentTransactionsTotal.labels('authorized', currency).inc();
-
-  // Async fraud check for deep analysis
-  publishAsyncFraudCheck(
-    transactionId, merchantId, amount, currency, payment_method,
-    customer_email, clientInfo?.ipAddress
-  );
-
-  // Capture if requested
-  if (capture) {
-    await capturePaymentFn(transactionId, merchantAccountId, clientInfo);
-    return buildResponse(transactionId, 'captured', transaction, feeAmount, netAmount);
+  if (!applied) {
+    return (await queryOne<Transaction>('SELECT * FROM transactions WHERE id = $1', [transactionId]))!;
   }
 
-  return buildResponse(transactionId, 'authorized', transaction, feeAmount, netAmount);
-}
-
-/**
- * Handles payment decline due to high fraud risk score.
- *
- * @description Updates transaction to 'failed' status, records audit log,
- * and increments fraud decline metrics.
- *
- * @param transactionId - UUID of the transaction
- * @param merchantId - UUID of the merchant
- * @param transaction - Transaction object
- * @param riskScore - Fraud risk score (0-100)
- * @param clientInfo - Optional client info for audit
- * @returns Failed payment response
- */
-async function handleFraudDecline(
-  transactionId: string,
-  merchantId: string,
-  transaction: Transaction,
-  riskScore: number,
-  clientInfo?: ClientInfo
-): Promise<CreatePaymentResponse> {
-  fraudDecisionsTotal.labels('decline').inc();
-  await updateTransactionStatus(transactionId, 'failed', { risk_score: riskScore });
-  await auditPaymentFailed(
-    transactionId, merchantId, 'High fraud risk score',
-    clientInfo?.ipAddress, clientInfo?.userAgent
+  const { authorized, captured } = applied;
+  await auditPaymentAuthorized(
+    authorized.id, authorized.merchant_id, processorRef, clientInfo?.ipAddress, clientInfo?.userAgent
   );
-  paymentTransactionsTotal.labels('failed', transaction.currency).inc();
-  return buildResponse(transactionId, 'failed', transaction, transaction.fee_amount, transaction.net_amount);
+  paymentTransactionsTotal.labels('authorized', authorized.currency).inc();
+  if (captured) {
+    await afterCapture(captured, clientInfo);
+    return captured;
+  }
+  return authorized;
 }
 
-/**
- * Handles payment decline from the payment processor.
- *
- * @description Updates transaction to 'failed' status with the processor's
- * decline reason, records audit log, and increments failure metrics.
- *
- * @param transactionId - UUID of the transaction
- * @param merchantId - UUID of the merchant
- * @param transaction - Transaction object
- * @param riskScore - Fraud risk score (for record keeping)
- * @param reason - Decline reason from processor
- * @param clientInfo - Optional client info for audit
- * @returns Failed payment response
- */
-async function handleProcessorDecline(
+/** Applies a decline (or a call that was never attempted): pending -> failed. */
+export async function applyProcessorDecline(
   transactionId: string,
-  merchantId: string,
-  transaction: Transaction,
-  riskScore: number,
   reason: string,
-  clientInfo?: ClientInfo
-): Promise<CreatePaymentResponse> {
-  await updateTransactionStatus(transactionId, 'failed', { risk_score: riskScore });
-  await auditPaymentFailed(transactionId, merchantId, reason, clientInfo?.ipAddress, clientInfo?.userAgent);
-  paymentTransactionsTotal.labels('failed', transaction.currency).inc();
-  return buildResponse(transactionId, 'failed', transaction, transaction.fee_amount, transaction.net_amount);
+  clientInfo?: ClientInfo,
+  riskScore?: number
+): Promise<Transaction> {
+  const failed = await transitionStatus(
+    pool, transactionId, ['pending'], 'failed', riskScore === undefined ? {} : { risk_score: riskScore }
+  );
+  if (!failed) {
+    return (await queryOne<Transaction>('SELECT * FROM transactions WHERE id = $1', [transactionId]))!;
+  }
+  await auditPaymentFailed(failed.id, failed.merchant_id, reason, clientInfo?.ipAddress, clientInfo?.userAgent);
+  paymentTransactionsTotal.labels('failed', failed.currency).inc();
+  return failed;
 }
 
-/**
- * Builds a standardized payment response object.
- *
- * @description Constructs the CreatePaymentResponse object returned to clients.
- * Extracts relevant fields from the transaction and includes calculated amounts.
- *
- * @param id - Transaction UUID
- * @param status - Final transaction status
- * @param transaction - Transaction object for amount/currency
- * @param fee_amount - Calculated fee amount in cents
- * @param net_amount - Net amount for merchant in cents
- * @returns Standardized payment response
- */
-function buildResponse(
-  id: string,
-  status: CreatePaymentResponse['status'],
-  transaction: Transaction,
-  fee_amount: number,
-  net_amount: number
-): CreatePaymentResponse {
+/** Builds the public representation returned by POST /payments. */
+function buildResponse(transaction: Transaction): CreatePaymentResponse {
   return {
-    id,
-    status,
-    amount: transaction.amount,
+    id: transaction.id,
+    status: transaction.status,
+    amount: Number(transaction.amount),
     currency: transaction.currency,
-    fee_amount,
-    net_amount,
+    fee_amount: Number(transaction.fee_amount),
+    net_amount: Number(transaction.net_amount),
     created_at: transaction.created_at,
   };
 }
-
-// Re-export for other modules
-export { updateTransactionStatus } from './transaction.js';

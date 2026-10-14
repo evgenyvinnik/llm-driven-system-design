@@ -1,6 +1,6 @@
 import { createFileRoute, Navigate, useNavigate } from '@tanstack/react-router';
 import { useAuthStore } from '../stores/authStore';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { getPayment, capturePayment, voidPayment, refundPayment } from '../services/api';
 import type { Transaction } from '../types';
 import { formatCurrency, formatDate, getStatusColor } from '../utils/format';
@@ -16,6 +16,8 @@ function TransactionDetail() {
   const [refundAmount, setRefundAmount] = useState('');
   const [refundReason, setRefundReason] = useState('');
   const [showRefundForm, setShowRefundForm] = useState(false);
+  // One Idempotency-Key per refund draft, reused if the same draft is retried
+  const refundDraftKey = useRef<{ signature: string; key: string } | null>(null);
 
   useEffect(() => {
     async function loadData() {
@@ -66,8 +68,14 @@ function TransactionDetail() {
   async function handleRefund() {
     setActionLoading(true);
     try {
-      const amount = refundAmount ? parseInt(refundAmount) * 100 : undefined;
-      await refundPayment(id, amount, refundReason || undefined);
+      const amount = refundAmount ? Math.round(parseFloat(refundAmount) * 100) : undefined;
+      const reason = refundReason || undefined;
+      const signature = JSON.stringify({ amount, reason });
+      if (refundDraftKey.current?.signature !== signature) {
+        refundDraftKey.current = { signature, key: crypto.randomUUID() };
+      }
+      await refundPayment(id, refundDraftKey.current.key, amount, reason);
+      refundDraftKey.current = null;
       const updated = await getPayment(id);
       setTransaction(updated);
       setShowRefundForm(false);

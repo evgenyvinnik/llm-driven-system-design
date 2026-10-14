@@ -15,7 +15,7 @@ const merchantService = new MerchantService();
  * Returns the API key only once on creation - merchant must store it securely.
  * POST /api/v1/merchants
  */
-router.post('/', async (req: Request, res: Response) => {
+export async function createMerchantHandler(req: Request, res: Response): Promise<void> {
   try {
     const { name, email, default_currency } = req.body;
 
@@ -50,7 +50,9 @@ router.post('/', async (req: Request, res: Response) => {
     console.error('Create merchant error:', error);
     res.status(500).json({ error: 'Failed to create merchant' });
   }
-});
+}
+
+router.post('/', createMerchantHandler);
 
 /**
  * Retrieves the authenticated merchant's profile including current balance.

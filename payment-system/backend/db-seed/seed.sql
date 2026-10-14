@@ -14,12 +14,17 @@
 -- debits AR for the gross and credits the *merchant account* for the net, so
 -- sharing one account means debiting and crediting the same row and the
 -- merchant's payable balance is never actually tracked.
+--
+-- Balances are credit-positive (a credit adds, a debit subtracts) and equal
+-- the signed sum of each account's ledger entries below, so
+-- GET /api/v1/ledger/verify reports no drift. Receivables is an asset and
+-- therefore negative; all four balances sum to zero.
 -- ---------------------------------------------------------------------------
 INSERT INTO accounts (id, name, account_type, currency, balance) VALUES
-    ('00000000-0000-0000-0000-000000000001', 'accounts_receivable',  'asset',     'USD', 3822350),
-    ('00000000-0000-0000-0000-000000000002', 'platform_revenue',     'revenue',   'USD', 115530),
-    ('00000000-0000-0000-0000-000000000003', 'pending_settlements',  'liability', 'USD', 0),
-    ('00000000-0000-0000-0000-000000000004', 'merchant:acme',        'merchant',  'USD', 3706820)
+    ('00000000-0000-0000-0000-000000000001', 'accounts_receivable',  'asset',     'USD', -432499),
+    ('00000000-0000-0000-0000-000000000002', 'platform_revenue',     'revenue',   'USD',   19961),
+    ('00000000-0000-0000-0000-000000000003', 'pending_settlements',  'liability', 'USD',       0),
+    ('00000000-0000-0000-0000-000000000004', 'merchant:acme',        'merchant',  'USD',  412538)
 ON CONFLICT (id) DO NOTHING;
 
 INSERT INTO merchants (id, account_id, name, email, api_key_hash, webhook_url, webhook_secret, default_currency, status) VALUES
@@ -74,10 +79,10 @@ INSERT INTO transactions (id, idempotency_key, merchant_id, amount, currency, st
  'Order #14790 — returned', 'm.ferrara@example.com', 6, 'proc_9e14b7a2', 288, 8612,
  NOW() - INTERVAL '3 days', NOW() - INTERVAL '3 days 1 hour'),
 
--- Partially refunded: still `captured`, because a partial refund does not take
--- the whole transaction out of the captured state.
+-- Partially refunded: 160.00 of 640.00 went back to the customer, which the
+-- refund service records as `partially_refunded`.
 ('a1000000-0000-4000-8000-000000000007', 'seed-idem-0007', '00000000-0000-0000-0000-0000000000a1',
- 64000, 'USD', 'captured', '{"type":"card","brand":"visa","last_four":"3155","exp_month":12,"exp_year":2028}',
+ 64000, 'USD', 'partially_refunded', '{"type":"card","brand":"visa","last_four":"3155","exp_month":12,"exp_year":2028}',
  'Order #14812 — one line item returned', 'j.abara@example.com', 15, 'proc_1d77e0f9', 1886, 62114,
  NOW() - INTERVAL '4 days', NOW() - INTERVAL '4 days'),
 
@@ -97,45 +102,56 @@ ON CONFLICT (id) DO NOTHING;
 -- ---------------------------------------------------------------------------
 -- Ledger entries
 --
--- Three balanced rows per captured payment: debit Accounts Receivable for the
--- gross, credit the merchant account for the net, credit Platform Revenue for
--- the fee. Debits equal credits for every transaction id, which is exactly what
--- `verifyLedgerBalance()` reconciles.
+-- Entries posted together form a journal (journal_id) and every journal
+-- balances: debits = credits. init.sql enforces that with a deferred
+-- constraint trigger, so an unbalanced seed row would fail this INSERT.
 --
--- Only captured payments appear here. Authorized, failed and voided
--- transactions have no accounting impact — that distinction between the
--- business event and its accounting consequence is the point of the ledger.
+--   capture     debit AR gross, credit merchant net, credit revenue fee
+--   refund      credit AR, debit merchant net share, debit revenue fee share
+--   chargeback  credit AR, debit merchant amount + 15.00 fee, credit revenue fee
+--
+-- Authorized, failed and voided payments have no entries: an authorization
+-- moves no money, and that distinction between the business event and its
+-- accounting consequence is the point of the ledger. balance_after is the
+-- running credit-positive balance, in chronological order.
 -- ---------------------------------------------------------------------------
-INSERT INTO ledger_entries (id, transaction_id, account_id, entry_type, amount, currency, balance_after, description, created_at) VALUES
--- 1299.00 subscription
-('b1000000-0000-4000-8000-000000000001', 'a1000000-0000-4000-8000-000000000001', '00000000-0000-0000-0000-000000000001', 'debit',  129900, 'USD', 3822350, 'Payment received from processor', NOW() - INTERVAL '2 hours'),
-('b1000000-0000-4000-8000-000000000002', 'a1000000-0000-4000-8000-000000000001', '00000000-0000-0000-0000-000000000004', 'credit', 125833, 'USD', 3706820, 'Payment to merchant (net of fees)', NOW() - INTERVAL '2 hours'),
-('b1000000-0000-4000-8000-000000000003', 'a1000000-0000-4000-8000-000000000001', '00000000-0000-0000-0000-000000000002', 'credit',   4067, 'USD',  115530, 'Processing fee', NOW() - INTERVAL '2 hours'),
--- 45.99 order
-('b1000000-0000-4000-8000-000000000004', 'a1000000-0000-4000-8000-000000000002', '00000000-0000-0000-0000-000000000001', 'debit',    4599, 'USD', 3692450, 'Payment received from processor', NOW() - INTERVAL '5 hours'),
-('b1000000-0000-4000-8000-000000000005', 'a1000000-0000-4000-8000-000000000002', '00000000-0000-0000-0000-000000000004', 'credit',   4436, 'USD', 3580987, 'Payment to merchant (net of fees)', NOW() - INTERVAL '5 hours'),
-('b1000000-0000-4000-8000-000000000006', 'a1000000-0000-4000-8000-000000000002', '00000000-0000-0000-0000-000000000002', 'credit',    163, 'USD',  111463, 'Processing fee', NOW() - INTERVAL '5 hours'),
--- 2500.00 enterprise setup
-('b1000000-0000-4000-8000-000000000007', 'a1000000-0000-4000-8000-000000000003', '00000000-0000-0000-0000-000000000001', 'debit',  250000, 'USD', 3687851, 'Payment received from processor', NOW() - INTERVAL '1 day 4 hours'),
-('b1000000-0000-4000-8000-000000000008', 'a1000000-0000-4000-8000-000000000003', '00000000-0000-0000-0000-000000000004', 'credit', 242720, 'USD', 3576551, 'Payment to merchant (net of fees)', NOW() - INTERVAL '1 day 4 hours'),
-('b1000000-0000-4000-8000-000000000009', 'a1000000-0000-4000-8000-000000000003', '00000000-0000-0000-0000-000000000002', 'credit',   7280, 'USD',  111300, 'Processing fee', NOW() - INTERVAL '1 day 4 hours'),
--- 89.00 order, later fully refunded (capture entries; reversal below)
-('b1000000-0000-4000-8000-00000000000a', 'a1000000-0000-4000-8000-000000000006', '00000000-0000-0000-0000-000000000001', 'debit',    8900, 'USD', 3437851, 'Payment received from processor', NOW() - INTERVAL '3 days'),
-('b1000000-0000-4000-8000-00000000000b', 'a1000000-0000-4000-8000-000000000006', '00000000-0000-0000-0000-000000000004', 'credit',   8612, 'USD', 3333831, 'Payment to merchant (net of fees)', NOW() - INTERVAL '3 days'),
-('b1000000-0000-4000-8000-00000000000c', 'a1000000-0000-4000-8000-000000000006', '00000000-0000-0000-0000-000000000002', 'credit',    288, 'USD',  104020, 'Processing fee', NOW() - INTERVAL '3 days'),
--- Refund reversal for the above: the mirror image, including the proportional
--- fee giveback.
-('b1000000-0000-4000-8000-00000000000d', 'a1000000-0000-4000-8000-000000000006', '00000000-0000-0000-0000-000000000004', 'debit',    8612, 'USD', 3325219, 'Refund to customer (net reversal)', NOW() - INTERVAL '2 days 20 hours'),
-('b1000000-0000-4000-8000-00000000000e', 'a1000000-0000-4000-8000-000000000006', '00000000-0000-0000-0000-000000000002', 'debit',     288, 'USD',  103732, 'Fee reversal on refund', NOW() - INTERVAL '2 days 20 hours'),
-('b1000000-0000-4000-8000-00000000000f', 'a1000000-0000-4000-8000-000000000006', '00000000-0000-0000-0000-000000000001', 'credit',   8900, 'USD', 3428951, 'Refund paid out', NOW() - INTERVAL '2 days 20 hours'),
--- 640.00 order
-('b1000000-0000-4000-8000-000000000010', 'a1000000-0000-4000-8000-000000000007', '00000000-0000-0000-0000-000000000001', 'debit',   64000, 'USD', 3492951, 'Payment received from processor', NOW() - INTERVAL '4 days'),
-('b1000000-0000-4000-8000-000000000011', 'a1000000-0000-4000-8000-000000000007', '00000000-0000-0000-0000-000000000004', 'credit',  62114, 'USD', 3387333, 'Payment to merchant (net of fees)', NOW() - INTERVAL '4 days'),
-('b1000000-0000-4000-8000-000000000012', 'a1000000-0000-4000-8000-000000000007', '00000000-0000-0000-0000-000000000002', 'credit',   1886, 'USD',  105618, 'Processing fee', NOW() - INTERVAL '4 days'),
--- 1899.00 order, later charged back
-('b1000000-0000-4000-8000-000000000013', 'a1000000-0000-4000-8000-000000000009', '00000000-0000-0000-0000-000000000001', 'debit',  189900, 'USD', 3682851, 'Payment received from processor', NOW() - INTERVAL '11 days'),
-('b1000000-0000-4000-8000-000000000014', 'a1000000-0000-4000-8000-000000000009', '00000000-0000-0000-0000-000000000004', 'credit', 184363, 'USD', 3571751, 'Payment to merchant (net of fees)', NOW() - INTERVAL '11 days'),
-('b1000000-0000-4000-8000-000000000015', 'a1000000-0000-4000-8000-000000000009', '00000000-0000-0000-0000-000000000002', 'credit',   5537, 'USD',  111155, 'Processing fee', NOW() - INTERVAL '11 days')
+INSERT INTO ledger_entries (id, journal_id, transaction_id, account_id, entry_type, amount, currency, balance_after, description, created_at) VALUES
+-- 1899.00 order (11 days ago), later charged back
+('b1000000-0000-4000-8000-000000000013', 'f1000000-0000-4000-8000-000000000007', 'a1000000-0000-4000-8000-000000000009', '00000000-0000-0000-0000-000000000001', 'debit',  189900, 'USD', -189900, 'Payment received from processor', NOW() - INTERVAL '11 days'),
+('b1000000-0000-4000-8000-000000000014', 'f1000000-0000-4000-8000-000000000007', 'a1000000-0000-4000-8000-000000000009', '00000000-0000-0000-0000-000000000004', 'credit', 184363, 'USD',  184363, 'Payment to merchant (net of fees)', NOW() - INTERVAL '11 days'),
+('b1000000-0000-4000-8000-000000000015', 'f1000000-0000-4000-8000-000000000007', 'a1000000-0000-4000-8000-000000000009', '00000000-0000-0000-0000-000000000002', 'credit',   5537, 'USD',    5537, 'Platform transaction fee', NOW() - INTERVAL '11 days'),
+-- 640.00 order (4 days ago), later partially refunded
+('b1000000-0000-4000-8000-000000000010', 'f1000000-0000-4000-8000-000000000006', 'a1000000-0000-4000-8000-000000000007', '00000000-0000-0000-0000-000000000001', 'debit',   64000, 'USD', -253900, 'Payment received from processor', NOW() - INTERVAL '4 days'),
+('b1000000-0000-4000-8000-000000000011', 'f1000000-0000-4000-8000-000000000006', 'a1000000-0000-4000-8000-000000000007', '00000000-0000-0000-0000-000000000004', 'credit',  62114, 'USD',  246477, 'Payment to merchant (net of fees)', NOW() - INTERVAL '4 days'),
+('b1000000-0000-4000-8000-000000000012', 'f1000000-0000-4000-8000-000000000006', 'a1000000-0000-4000-8000-000000000007', '00000000-0000-0000-0000-000000000002', 'credit',   1886, 'USD',    7423, 'Platform transaction fee', NOW() - INTERVAL '4 days'),
+-- 89.00 order (3 days ago), later fully refunded
+('b1000000-0000-4000-8000-00000000000a', 'f1000000-0000-4000-8000-000000000004', 'a1000000-0000-4000-8000-000000000006', '00000000-0000-0000-0000-000000000001', 'debit',    8900, 'USD', -262800, 'Payment received from processor', NOW() - INTERVAL '3 days'),
+('b1000000-0000-4000-8000-00000000000b', 'f1000000-0000-4000-8000-000000000004', 'a1000000-0000-4000-8000-000000000006', '00000000-0000-0000-0000-000000000004', 'credit',   8612, 'USD',  255089, 'Payment to merchant (net of fees)', NOW() - INTERVAL '3 days'),
+('b1000000-0000-4000-8000-00000000000c', 'f1000000-0000-4000-8000-000000000004', 'a1000000-0000-4000-8000-000000000006', '00000000-0000-0000-0000-000000000002', 'credit',    288, 'USD',    7711, 'Platform transaction fee', NOW() - INTERVAL '3 days'),
+-- Chargeback on the 1899.00 order: the disputed amount plus a 15.00 fee
+('b1000000-0000-4000-8000-000000000019', 'f1000000-0000-4000-8000-000000000009', 'a1000000-0000-4000-8000-000000000009', '00000000-0000-0000-0000-000000000001', 'credit', 189900, 'USD',  -72900, 'Chargeback for transaction a1000000-0000-4000-8000-000000000009', NOW() - INTERVAL '3 days'),
+('b1000000-0000-4000-8000-00000000001a', 'f1000000-0000-4000-8000-000000000009', 'a1000000-0000-4000-8000-000000000009', '00000000-0000-0000-0000-000000000004', 'debit',  191400, 'USD',   63689, 'Chargeback deduction for transaction a1000000-0000-4000-8000-000000000009', NOW() - INTERVAL '3 days'),
+('b1000000-0000-4000-8000-00000000001b', 'f1000000-0000-4000-8000-000000000009', 'a1000000-0000-4000-8000-000000000009', '00000000-0000-0000-0000-000000000002', 'credit',   1500, 'USD',    9211, 'Chargeback processing fee', NOW() - INTERVAL '3 days'),
+-- Full refund of the 89.00 order: the mirror image, including the fee
+('b1000000-0000-4000-8000-00000000000d', 'f1000000-0000-4000-8000-000000000005', 'a1000000-0000-4000-8000-000000000006', '00000000-0000-0000-0000-000000000004', 'debit',    8612, 'USD',   55077, 'Refund deduction for transaction a1000000-0000-4000-8000-000000000006', NOW() - INTERVAL '2 days 20 hours'),
+('b1000000-0000-4000-8000-00000000000e', 'f1000000-0000-4000-8000-000000000005', 'a1000000-0000-4000-8000-000000000006', '00000000-0000-0000-0000-000000000002', 'debit',     288, 'USD',    8923, 'Fee refund for transaction a1000000-0000-4000-8000-000000000006', NOW() - INTERVAL '2 days 20 hours'),
+('b1000000-0000-4000-8000-00000000000f', 'f1000000-0000-4000-8000-000000000005', 'a1000000-0000-4000-8000-000000000006', '00000000-0000-0000-0000-000000000001', 'credit',   8900, 'USD',  -64000, 'Refund for transaction a1000000-0000-4000-8000-000000000006', NOW() - INTERVAL '2 days 20 hours'),
+-- Partial refund of 160.00 on the 640.00 order: fee share round(160/640 x 18.86) = 4.72
+('b1000000-0000-4000-8000-000000000016', 'f1000000-0000-4000-8000-000000000008', 'a1000000-0000-4000-8000-000000000007', '00000000-0000-0000-0000-000000000004', 'debit',   15528, 'USD',   39549, 'Refund deduction for transaction a1000000-0000-4000-8000-000000000007', NOW() - INTERVAL '2 days'),
+('b1000000-0000-4000-8000-000000000017', 'f1000000-0000-4000-8000-000000000008', 'a1000000-0000-4000-8000-000000000007', '00000000-0000-0000-0000-000000000002', 'debit',     472, 'USD',    8451, 'Fee refund for transaction a1000000-0000-4000-8000-000000000007', NOW() - INTERVAL '2 days'),
+('b1000000-0000-4000-8000-000000000018', 'f1000000-0000-4000-8000-000000000008', 'a1000000-0000-4000-8000-000000000007', '00000000-0000-0000-0000-000000000001', 'credit',  16000, 'USD',  -48000, 'Refund for transaction a1000000-0000-4000-8000-000000000007', NOW() - INTERVAL '2 days'),
+-- 2500.00 enterprise setup (1 day 4 hours ago)
+('b1000000-0000-4000-8000-000000000007', 'f1000000-0000-4000-8000-000000000003', 'a1000000-0000-4000-8000-000000000003', '00000000-0000-0000-0000-000000000001', 'debit',  250000, 'USD', -298000, 'Payment received from processor', NOW() - INTERVAL '1 day 4 hours'),
+('b1000000-0000-4000-8000-000000000008', 'f1000000-0000-4000-8000-000000000003', 'a1000000-0000-4000-8000-000000000003', '00000000-0000-0000-0000-000000000004', 'credit', 242720, 'USD',  282269, 'Payment to merchant (net of fees)', NOW() - INTERVAL '1 day 4 hours'),
+('b1000000-0000-4000-8000-000000000009', 'f1000000-0000-4000-8000-000000000003', 'a1000000-0000-4000-8000-000000000003', '00000000-0000-0000-0000-000000000002', 'credit',   7280, 'USD',   15731, 'Platform transaction fee', NOW() - INTERVAL '1 day 4 hours'),
+-- 45.99 order (5 hours ago)
+('b1000000-0000-4000-8000-000000000004', 'f1000000-0000-4000-8000-000000000002', 'a1000000-0000-4000-8000-000000000002', '00000000-0000-0000-0000-000000000001', 'debit',    4599, 'USD', -302599, 'Payment received from processor', NOW() - INTERVAL '5 hours'),
+('b1000000-0000-4000-8000-000000000005', 'f1000000-0000-4000-8000-000000000002', 'a1000000-0000-4000-8000-000000000002', '00000000-0000-0000-0000-000000000004', 'credit',   4436, 'USD',  286705, 'Payment to merchant (net of fees)', NOW() - INTERVAL '5 hours'),
+('b1000000-0000-4000-8000-000000000006', 'f1000000-0000-4000-8000-000000000002', 'a1000000-0000-4000-8000-000000000002', '00000000-0000-0000-0000-000000000002', 'credit',    163, 'USD',   15894, 'Platform transaction fee', NOW() - INTERVAL '5 hours'),
+-- 1299.00 subscription (2 hours ago)
+('b1000000-0000-4000-8000-000000000001', 'f1000000-0000-4000-8000-000000000001', 'a1000000-0000-4000-8000-000000000001', '00000000-0000-0000-0000-000000000001', 'debit',  129900, 'USD', -432499, 'Payment received from processor', NOW() - INTERVAL '2 hours'),
+('b1000000-0000-4000-8000-000000000002', 'f1000000-0000-4000-8000-000000000001', 'a1000000-0000-4000-8000-000000000001', '00000000-0000-0000-0000-000000000004', 'credit', 125833, 'USD',  412538, 'Payment to merchant (net of fees)', NOW() - INTERVAL '2 hours'),
+('b1000000-0000-4000-8000-000000000003', 'f1000000-0000-4000-8000-000000000001', 'a1000000-0000-4000-8000-000000000001', '00000000-0000-0000-0000-000000000002', 'credit',   4067, 'USD',   19961, 'Platform transaction fee', NOW() - INTERVAL '2 hours')
 ON CONFLICT (id) DO NOTHING;
 
 -- ---------------------------------------------------------------------------

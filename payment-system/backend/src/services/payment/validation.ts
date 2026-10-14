@@ -1,11 +1,10 @@
 /**
  * Payment validation module.
- * Handles fee calculation, idempotency checking, and input validation.
+ * Handles fee calculation, request fingerprints for idempotency, and state validation.
  */
 
-import { redis } from '../../db/connection.js';
-import { queryOne } from '../../db/connection.js';
-import type { Transaction, FeeConfig, FeeCalculation } from './types.js';
+import { createHash } from 'node:crypto';
+import type { FeeConfig, FeeCalculation } from './types.js';
 
 /** Default fee configuration */
 const DEFAULT_FEE_CONFIG: FeeConfig = {
@@ -44,114 +43,30 @@ export function calculateFee(
 }
 
 /**
- * Checks if a payment request has already been processed using its idempotency key.
- * Prevents duplicate charges when clients retry failed network requests.
- *
- * @description Implements a two-tier idempotency check: first checks Redis cache for
- * fast lookups, then falls back to database if not in cache. Found transactions are
- * cached in Redis for 24 hours to speed up future retries.
- *
- * @param key - Unique idempotency key provided by the client (typically a UUID)
- * @returns Existing transaction if found, null if this is a new request
- *
- * @deprecated Use withIdempotency from shared/idempotency.ts instead for new code.
- * This function is maintained for backward compatibility.
- *
- * @example
- * const existing = await checkIdempotency('payment-12345');
- * if (existing) {
- *   return existing; // Return cached response, don't process again
- * }
+ * Stable JSON serialization: object keys sorted at every level, so the same
+ * request body always produces the same string regardless of key order.
  */
-export async function checkIdempotency(key: string): Promise<Transaction | null> {
-  // First check Redis cache
-  const cached = await redis.get(`idempotency:${key}`);
-  if (cached) {
-    return JSON.parse(cached) as Transaction;
+export function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalJson).join(',')}]`;
   }
-
-  // Fall back to database
-  const existing = await queryOne<Transaction>(
-    'SELECT * FROM transactions WHERE idempotency_key = $1',
-    [key]
-  );
-
-  if (existing) {
-    // Cache for future requests (24 hour TTL)
-    await redis.setex(`idempotency:${key}`, 86400, JSON.stringify(existing));
+  if (value !== null && typeof value === 'object') {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .filter(([, v]) => v !== undefined)
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+    return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonicalJson(v)}`).join(',')}}`;
   }
-
-  return existing;
+  return JSON.stringify(value) ?? 'null';
 }
 
 /**
- * Validates that a transaction can be captured.
- *
- * @description Checks if a transaction is in a valid state for capture.
- * Only transactions in 'authorized' status can be captured.
- * Returns isValid: true for already-captured transactions (idempotent behavior).
- *
- * @param transaction - Transaction object to validate (can be null if not found)
- * @returns Object with isValid flag and optional error message
- *
- * @example
- * const { isValid, error } = validateForCapture(transaction);
- * if (!isValid) {
- *   throw new Error(error);
- * }
+ * Fingerprint of a request body, stored next to the idempotency key. A retry
+ * with the same key must carry the same body; a different body is rejected
+ * with 422 instead of silently replaying the first request's result.
  */
-export function validateForCapture(
-  transaction: Transaction | null
-): { isValid: boolean; error?: string } {
-  if (!transaction) {
-    return { isValid: false, error: 'Transaction not found' };
-  }
-
-  // Idempotent: already captured is valid
-  if (transaction.status === 'captured') {
-    return { isValid: true };
-  }
-
-  if (transaction.status !== 'authorized') {
-    return { isValid: false, error: `Cannot capture transaction in status: ${transaction.status}` };
-  }
-
-  return { isValid: true };
-}
-
-/**
- * Validates that a transaction can be voided.
- *
- * @description Checks if a transaction is in a valid state for voiding.
- * Only transactions in 'authorized' status can be voided (before capture).
- * Returns isValid: true for already-voided transactions (idempotent behavior).
- *
- * @param transaction - Transaction object to validate (can be null if not found)
- * @returns Object with isValid flag and optional error message
- *
- * @example
- * const { isValid, error } = validateForVoid(transaction);
- * if (!isValid) {
- *   throw new Error(error);
- * }
- */
-export function validateForVoid(
-  transaction: Transaction | null
-): { isValid: boolean; error?: string } {
-  if (!transaction) {
-    return { isValid: false, error: 'Transaction not found' };
-  }
-
-  // Idempotent: already voided is valid
-  if (transaction.status === 'voided') {
-    return { isValid: true };
-  }
-
-  if (transaction.status !== 'authorized') {
-    return { isValid: false, error: `Cannot void transaction in status: ${transaction.status}` };
-  }
-
-  return { isValid: true };
+export function requestFingerprint(body: Record<string, unknown>): string {
+  const { idempotency_key: _ignored, ...rest } = body;
+  return createHash('sha256').update(canonicalJson(rest)).digest('hex');
 }
 
 /**

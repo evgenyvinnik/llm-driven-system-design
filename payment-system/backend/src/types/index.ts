@@ -94,6 +94,12 @@ export interface Transaction {
   created_at: Date;
   updated_at: Date;
   version: number;
+  /** SHA-256 of the creating request body; a reused key with another body is rejected */
+  request_hash?: string | null;
+  /** Capture immediately after authorization (POST /payments `capture`, default true) */
+  auto_capture: boolean;
+  /** How many times the reconciler has tried to resolve this payment */
+  reconcile_attempts: number;
 }
 
 /**
@@ -103,6 +109,8 @@ export interface Transaction {
  */
 export interface LedgerEntry {
   id: string;
+  /** Entries posted together (one capture, refund or chargeback) share a journal */
+  journal_id: string;
   transaction_id: string;
   account_id: string;
   entry_type: EntryType;
@@ -126,6 +134,7 @@ export interface Refund {
   reason?: string;
   status: RefundStatus;
   processor_ref?: string;
+  request_hash?: string | null;
   created_at: Date;
   updated_at: Date;
 }

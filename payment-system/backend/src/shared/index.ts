@@ -5,7 +5,6 @@
  * - Logger: Structured JSON logging with Pino
  * - Metrics: Prometheus metrics collection
  * - Circuit Breaker: Resilience for external service calls
- * - Idempotency: Duplicate request prevention
  * - Audit: Compliance logging for financial operations
  * - Queue: RabbitMQ integration for async processing
  */
@@ -29,7 +28,8 @@ export {
   dbQueryDuration,
   dbActiveConnections,
   redisOperationsTotal,
-  idempotencyCacheTotal,
+  idempotencyRequestsTotal,
+  paymentReconcileTotal,
   getMetrics,
   getMetricsContentType,
 } from './metrics.js';
@@ -44,17 +44,6 @@ export {
   withResilience,
   withRetry,
 } from './circuit-breaker.js';
-
-// Idempotency
-export {
-  checkIdempotency,
-  storeIdempotencyResult,
-  releaseIdempotencyLock,
-  withIdempotency,
-  IdempotencyConflictError,
-  type IdempotencyOperation,
-  type IdempotencyResult,
-} from './idempotency.js';
 
 // Audit Logging
 export {

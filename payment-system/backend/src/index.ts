@@ -16,7 +16,7 @@ import dotenv from 'dotenv';
  */
 
 import paymentsRouter from './routes/payments.js';
-import merchantsRouter from './routes/merchants.js';
+import merchantsRouter, { createMerchantHandler } from './routes/merchants.js';
 import refundsRouter from './routes/refunds.js';
 import chargebacksRouter from './routes/chargebacks.js';
 import ledgerRouter from './routes/ledger.js';
@@ -209,8 +209,11 @@ app.get('/metrics', async (req, res) => {
 // Routes
 // ============================================================================
 
-// Public endpoints - merchant signup doesn't require auth
-app.post('/api/v1/merchants', merchantsRouter);
+// Public endpoint - merchant signup doesn't require auth. It used to be
+// `app.post('/api/v1/merchants', merchantsRouter)`, which hands the router the
+// unstripped path, matches nothing, and falls through to the authenticated
+// mount below (401). Register the handler itself instead.
+app.post('/api/v1/merchants', createMerchantHandler);
 
 // Protected endpoints - all require API key authentication
 app.use('/api/v1/payments', extractIdempotencyKey, authenticateApiKey, paymentsRouter);

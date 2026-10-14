@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import type { Request, Response } from 'express';
-import { PaymentService } from '../services/payment/index.js';
+import { PaymentService, sendError } from '../services/payment/index.js';
 import { RefundService, ChargebackService } from '../services/refund.service.js';
 import { LedgerService } from '../services/ledger.service.js';
 import type { CreatePaymentRequest, RefundRequest, TransactionListParams } from '../types/index.js';
@@ -17,6 +17,10 @@ import { logger } from '../shared/index.js';
  * - Prometheus metrics collection
  */
 const router = Router();
+
+/** Smallest and largest accepted payment, in cents. */
+const MIN_AMOUNT = 50;
+const MAX_AMOUNT = 99_999_999;
 const paymentService = new PaymentService();
 const refundService = new RefundService();
 const _chargebackService = new ChargebackService();
@@ -47,7 +51,7 @@ router.post('/', async (req: Request, res: Response) => {
 
     const paymentRequest: CreatePaymentRequest = {
       amount: req.body.amount,
-      currency: req.body.currency || 'USD',
+      currency: (req.body.currency || 'USD').toUpperCase(),
       payment_method: req.body.payment_method,
       description: req.body.description,
       customer_email: req.body.customer_email,
@@ -56,31 +60,35 @@ router.post('/', async (req: Request, res: Response) => {
       capture: req.body.capture !== false, // Default to true
     };
 
-    // Validate required fields
-    if (!paymentRequest.amount || paymentRequest.amount <= 0) {
-      res.status(400).json({ error: 'Amount must be a positive integer (in cents)' });
+    // Validate at the boundary: amounts are integer cents, at least 50 so the
+    // fee (2.9% + 30c) can never exceed the payment.
+    if (!Number.isSafeInteger(paymentRequest.amount) || paymentRequest.amount < MIN_AMOUNT || paymentRequest.amount > MAX_AMOUNT) {
+      res.status(400).json({ error: `Amount must be an integer number of cents between ${MIN_AMOUNT} and ${MAX_AMOUNT}` });
       return;
     }
 
-    if (!paymentRequest.payment_method) {
+    if (!/^[A-Z]{3}$/.test(paymentRequest.currency)) {
+      res.status(400).json({ error: 'Currency must be a three-letter ISO code' });
+      return;
+    }
+
+    if (!paymentRequest.payment_method || typeof paymentRequest.payment_method !== 'object') {
       res.status(400).json({ error: 'Payment method is required' });
       return;
     }
 
     const result = await paymentService.createPayment(
       req.merchant.id,
-      req.merchant.account_id,
       paymentRequest,
       getClientInfo(req)
     );
 
-    res.status(201).json(result);
+    if (result.replayed) {
+      res.setHeader('Idempotent-Replayed', 'true');
+    }
+    res.status(result.httpStatus).json(result.body);
   } catch (error) {
-    logger.error({ error, merchantId: req.merchant?.id }, 'Create payment error');
-    res.status(500).json({
-      error: 'Failed to create payment',
-      message: error instanceof Error ? error.message : 'Unknown error',
-    });
+    sendError(res, error, 'Failed to create payment');
   }
 });
 
@@ -177,19 +185,14 @@ router.post('/:id/capture', async (req: Request, res: Response) => {
       return;
     }
 
-    const result = await paymentService.capturePayment(
+    const { transaction: captured } = await paymentService.capturePayment(
       req.params.id,
-      req.merchant.account_id,
       getClientInfo(req)
     );
 
-    res.json(result);
+    res.json(captured);
   } catch (error) {
-    logger.error({ error, paymentId: req.params.id }, 'Capture payment error');
-    res.status(400).json({
-      error: 'Failed to capture payment',
-      message: error instanceof Error ? error.message : 'Unknown error',
-    });
+    sendError(res, error, 'Failed to capture payment');
   }
 });
 
@@ -220,18 +223,14 @@ router.post('/:id/void', async (req: Request, res: Response) => {
       return;
     }
 
-    const result = await paymentService.voidPayment(
+    const { transaction: voided } = await paymentService.voidPayment(
       req.params.id,
       getClientInfo(req)
     );
 
-    res.json(result);
+    res.json(voided);
   } catch (error) {
-    logger.error({ error, paymentId: req.params.id }, 'Void payment error');
-    res.status(400).json({
-      error: 'Failed to void payment',
-      message: error instanceof Error ? error.message : 'Unknown error',
-    });
+    sendError(res, error, 'Failed to void payment');
   }
 });
 
@@ -263,27 +262,30 @@ router.post('/:id/refund', async (req: Request, res: Response) => {
       return;
     }
 
+    if (req.body.amount !== undefined && (!Number.isSafeInteger(req.body.amount) || req.body.amount <= 0)) {
+      res.status(400).json({ error: 'Refund amount must be a positive integer (in cents)' });
+      return;
+    }
+
     const refundRequest: RefundRequest = {
       amount: req.body.amount,
       reason: req.body.reason,
       idempotency_key: req.body.idempotency_key,
     };
 
-    const result = await refundService.createRefund(
+    const { refund, replayed } = await refundService.createRefund(
       req.params.id,
       req.merchant.id,
-      req.merchant.account_id,
       refundRequest,
       getClientInfo(req)
     );
 
-    res.status(201).json(result);
+    if (replayed) {
+      res.setHeader('Idempotent-Replayed', 'true');
+    }
+    res.status(replayed ? 200 : 201).json(refund);
   } catch (error) {
-    logger.error({ error, paymentId: req.params.id }, 'Create refund error');
-    res.status(400).json({
-      error: 'Failed to create refund',
-      message: error instanceof Error ? error.message : 'Unknown error',
-    });
+    sendError(res, error, 'Failed to create refund');
   }
 });
 

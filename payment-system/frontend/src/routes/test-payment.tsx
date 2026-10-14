@@ -1,6 +1,6 @@
 import { createFileRoute, Navigate, useNavigate } from '@tanstack/react-router';
 import { useAuthStore } from '../stores/authStore';
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { createPayment } from '../services/api';
 import { formatCurrency } from '../utils/format';
 
@@ -25,6 +25,11 @@ function TestPayment() {
     currency: string;
   } | null>(null);
 
+  // One Idempotency-Key per draft: resubmitting the same values after an error
+  // or timeout reuses it (the server replays instead of charging again); any
+  // edit, or a successful submit, starts a new draft with a new key.
+  const draftKey = useRef<{ signature: string; key: string } | null>(null);
+
   if (!isAuthenticated) {
     return <Navigate to="/login" />;
   }
@@ -38,11 +43,11 @@ function TestPayment() {
     try {
       const amountInCents = Math.round(parseFloat(amount) * 100);
 
-      const payment = await createPayment({
+      const request = {
         amount: amountInCents,
         currency,
         payment_method: {
-          type: 'card',
+          type: 'card' as const,
           card_brand: cardBrand,
           last_four: lastFour,
           exp_month: parseInt(expMonth),
@@ -51,7 +56,14 @@ function TestPayment() {
         description,
         customer_email: customerEmail,
         capture,
-      });
+      };
+      const signature = JSON.stringify(request);
+      if (draftKey.current?.signature !== signature) {
+        draftKey.current = { signature, key: crypto.randomUUID() };
+      }
+
+      const payment = await createPayment(request, draftKey.current.key);
+      draftKey.current = null;
 
       setResult({
         id: payment.id,
@@ -97,6 +109,12 @@ function TestPayment() {
               <dt className="text-green-700 w-24">Status:</dt>
               <dd className="text-green-900">{result.status}</dd>
             </div>
+            {result.status === 'pending' && (
+              <p className="text-green-800" role="status">
+                The processor did not answer in time. The payment stays pending until the
+                reconciler confirms the outcome with the processor; it will not be charged twice.
+              </p>
+            )}
             <div className="flex">
               <dt className="text-green-700 w-24">Amount:</dt>
               <dd className="text-green-900">

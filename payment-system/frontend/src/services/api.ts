@@ -138,14 +138,15 @@ export async function getVolumeData(
 
 /**
  * Creates a new payment transaction.
- * Automatically generates an idempotency key to prevent duplicates.
+ * The caller passes one idempotency key per draft and reuses it when retrying
+ * the same draft, so a retry after a timeout can never create a second payment.
  * @param request - Payment details including amount and payment method
  * @returns Created transaction record
  */
 export async function createPayment(
-  request: CreatePaymentRequest
+  request: CreatePaymentRequest,
+  idempotencyKey: string
 ): Promise<Transaction> {
-  const idempotencyKey = `pay_${Date.now()}_${Math.random().toString(36).slice(2)}`;
   return fetchApi('/payments', {
     method: 'POST',
     headers: {
@@ -210,10 +211,10 @@ export async function voidPayment(id: string): Promise<Transaction> {
  */
 export async function refundPayment(
   id: string,
+  idempotencyKey: string,
   amount?: number,
   reason?: string
 ): Promise<Refund> {
-  const idempotencyKey = `ref_${Date.now()}_${Math.random().toString(36).slice(2)}`;
   return fetchApi(`/payments/${id}/refund`, {
     method: 'POST',
     headers: {

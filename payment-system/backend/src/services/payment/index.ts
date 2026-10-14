@@ -20,8 +20,8 @@ import type {
   LedgerEntry,
   ClientInfo,
 } from './types.js';
-import { calculateFee, checkIdempotency, getDefaultFeeConfig } from './validation.js';
-import { createPayment as createPaymentInternal } from './authorize.js';
+import { calculateFee, getDefaultFeeConfig } from './validation.js';
+import { createPayment as createPaymentInternal, type CreatePaymentResult } from './authorize.js';
 import { capturePayment as capturePaymentInternal } from './capture.js';
 import { voidPayment as voidPaymentInternal } from './refund.js';
 
@@ -48,12 +48,11 @@ import { voidPayment as voidPaymentInternal } from './refund.js';
  * // Create a payment
  * const response = await paymentService.createPayment(
  *   'merchant_123',
- *   'acct_xyz',
  *   { amount: 10000, currency: 'USD', payment_method: {...}, idempotency_key: 'order-1' }
  * );
  *
  * // Capture an authorized payment
- * const captured = await paymentService.capturePayment('txn_abc', 'acct_xyz');
+ * const captured = await paymentService.capturePayment('txn_abc');
  */
 export class PaymentService {
   private feeConfig = getDefaultFeeConfig();
@@ -74,27 +73,12 @@ export class PaymentService {
   }
 
   /**
-   * Checks if a payment was already processed using its idempotency key.
-   *
-   * @description Looks up existing transaction by idempotency key in cache and database.
-   *
-   * @param key - Idempotency key to check
-   * @returns Existing transaction if found, null otherwise
-   *
-   * @deprecated Use withIdempotency from shared/idempotency.ts instead for new code.
-   */
-  async checkIdempotency(key: string): Promise<Transaction | null> {
-    return checkIdempotency(key);
-  }
-
-  /**
    * Creates a new payment transaction with fraud detection and optional capture.
    *
    * @description Processes a new payment through fraud scoring, processor authorization,
    * and optional capture. Supports idempotency to prevent duplicate charges.
    *
    * @param merchantId - UUID of the merchant creating the payment
-   * @param merchantAccountId - UUID of the merchant's ledger account
    * @param request - Payment request with amount, currency, payment method, etc.
    * @param clientInfo - Optional client info for audit logging (IP, user agent)
    * @returns Payment response with transaction ID, status, and amounts
@@ -103,8 +87,7 @@ export class PaymentService {
    * @example
    * const response = await paymentService.createPayment(
    *   'merchant_123',
-   *   'acct_xyz',
-   *   {
+     *   {
    *     amount: 10000,
    *     currency: 'USD',
    *     payment_method: { type: 'card', last_four: '4242', card_brand: 'visa' },
@@ -115,14 +98,10 @@ export class PaymentService {
    */
   async createPayment(
     merchantId: string,
-    merchantAccountId: string,
     request: CreatePaymentRequest,
     clientInfo?: ClientInfo
-  ): Promise<CreatePaymentResponse> {
-    return createPaymentInternal(
-      merchantId, merchantAccountId, request, clientInfo,
-      (txId, acctId, info) => this.capturePayment(txId, acctId, info)
-    );
+  ): Promise<CreatePaymentResult> {
+    return createPaymentInternal(merchantId, request, clientInfo);
   }
 
   /**
@@ -132,25 +111,18 @@ export class PaymentService {
    * account. Creates double-entry ledger entries and publishes webhook notification.
    *
    * @param transactionId - UUID of the authorized transaction to capture
-   * @param merchantAccountId - UUID of the merchant's ledger account
    * @param clientInfo - Optional client info for audit logging
    * @returns Updated transaction with 'captured' status
    * @throws Error if transaction not found or not in 'authorized' status
    *
    * @example
-   * const captured = await paymentService.capturePayment('txn_abc123', 'acct_xyz789');
+   * const captured = await paymentService.capturePayment('txn_abc123');
    */
   async capturePayment(
     transactionId: string,
-    merchantAccountId: string,
     clientInfo?: ClientInfo
-  ): Promise<Transaction> {
-    const transaction = await this.getTransaction(transactionId);
-    if (!transaction) throw new Error('Transaction not found');
-    return capturePaymentInternal(
-      transactionId, merchantAccountId, transaction,
-      (id) => this.getTransaction(id), clientInfo
-    );
+  ): Promise<{ transaction: Transaction; changed: boolean }> {
+    return capturePaymentInternal(transactionId, clientInfo);
   }
 
   /**
@@ -167,12 +139,11 @@ export class PaymentService {
    * @example
    * const voided = await paymentService.voidPayment('txn_abc123');
    */
-  async voidPayment(transactionId: string, clientInfo?: ClientInfo): Promise<Transaction> {
-    const transaction = await this.getTransaction(transactionId);
-    if (!transaction) throw new Error('Transaction not found');
-    return voidPaymentInternal(
-      transactionId, transaction, (id) => this.getTransaction(id), clientInfo
-    );
+  async voidPayment(
+    transactionId: string,
+    clientInfo?: ClientInfo
+  ): Promise<{ transaction: Transaction; changed: boolean }> {
+    return voidPaymentInternal(transactionId, clientInfo);
   }
 
   /**
@@ -277,5 +248,8 @@ export type {
 };
 
 // Export submodule functions
-export { calculateFee, checkIdempotency } from './validation.js';
-export { authorizeWithProcessor } from './processor.js';
+export type { CreatePaymentResult } from './authorize.js';
+export { calculateFee, requestFingerprint } from './validation.js';
+export { authorizeWithProcessor, lookupProcessorPayment } from './processor.js';
+export { reconcilePendingPayments } from './reconcile.js';
+export { PaymentError, sendError } from './errors.js';

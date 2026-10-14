@@ -1,546 +1,340 @@
-# Payment System - System Design Answer (Frontend Focus)
+# 💳 Payment System — System Design Answer (Frontend Focus)
 
-*45-minute system design interview format - Frontend Engineer Position*
+*45-minute frontend interview, structured with the [RADIO framework](https://www.greatfrontend.com/front-end-system-design-playbook/framework): Requirements → Architecture → Data model → Interface → Optimizations. This is a proposed production design; what this repository actually runs is described in [architecture.md → Implementation Notes](./architecture.md#implementation-notes).*
 
-## Problem Statement
+> "A payment platform has two front ends with opposite problems. The checkout, where a customer types a card number into a merchant's page, is about safety: the card number must never touch the merchant's code, and a double click or a flaky train connection must never charge twice. The merchant dashboard is about honesty: 'processing', 'partially refunded' and 'refund pending' are real states with money behind them, and the UI must show what the server knows — never what it hopes."
 
-Design the frontend architecture for a payment system dashboard that allows:
-- Merchants to view transactions, settlements, and analytics
-- Real-time transaction monitoring with filters and search
-- Secure payment form integration (Stripe-style)
-- Webhook configuration and delivery monitoring
+| Phase | Time | What I want the interviewer to leave with |
+|-------|------|--------------------------------------------|
+| R — Requirements | 5 min | Two surfaces, their performance, accessibility and security targets |
+| A — Architecture | 8 min | Two apps, who owns which state, the data layer, three key interactions |
+| D — Data model | 5 min | Client entities, money as integers, cache keys |
+| I — Interface | 5 min | The API as the client sees it, component contracts |
+| O — Optimizations & deep dives | 18 min | Safe checkout, honest money states, live updates, big tables, security |
+| Loading, error & empty states | 2 min | What the UI does when things go wrong |
+| Wrap-up | 2 min | Trade-offs and next steps |
 
-## Requirements Clarification
+---
 
-### Functional Requirements
-1. **Transaction Dashboard**: Filterable, searchable transaction list with pagination
-2. **Transaction Details**: Detailed view with timeline, refund actions, and audit log
-3. **Analytics Dashboard**: Charts for revenue, refund rates, and fraud metrics
-4. **Webhook Management**: Configure endpoints, view delivery status and payloads
-5. **Embedded Payment Form**: Secure, PCI-compliant card input component
+## 🎯 R — Requirements (5 min)
 
-### Non-Functional Requirements
-1. **Responsive**: Desktop-first, tablet support for dashboard
-2. **Performance**: Dashboard loads in < 2 seconds, real-time updates
-3. **Security**: No sensitive data in frontend state, secure iframe for card input
-4. **Accessibility**: WCAG 2.1 AA compliance for all dashboard features
+"I'll confirm who uses each surface and what 'fast' means for them, because the checkout and the dashboard have very different budgets."
 
-### UI/UX Requirements
-- Clean, professional design suitable for financial data
-- Visual status indicators (success/pending/failed)
-- Optimistic updates for refund actions
-- Real-time transaction feed updates
+### Functional requirements
 
-## High-Level Architecture
+1. **Checkout element** — embedded in the merchant's checkout page: card number, expiry and CVC fields, a Pay button, a 3-D Secure challenge when the bank asks for one, and clear success, decline and "processing" outcomes.
+2. **Payments list** — a merchant searches and filters payments (status, date range, amount, card last four) across hundreds of thousands of rows.
+3. **Payment detail** — status timeline, card summary, fee and net amount, refunds, and the ledger entries behind them; capture or void for manually captured payments.
+4. **Refunds** — full or partial, with the refundable amount always visible.
+5. **Live updates** — a payment that is processing, or a refund that is pending, updates on its own.
+6. **Balance and disputes** — the merchant's balance from the ledger, and open chargebacks with their deadlines.
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                         React Application                                    │
-│                                                                              │
-│  ┌────────────────────────────────────────────────────────────────────────┐ │
-│  │                        TanStack Router                                  │ │
-│  │    /login            ──▶ Login Page                                     │ │
-│  │    /dashboard        ──▶ Overview Analytics                             │ │
-│  │    /transactions     ──▶ Transaction List                               │ │
-│  │    /transactions/:id ──▶ Transaction Details                            │ │
-│  │    /webhooks         ──▶ Webhook Configuration                          │ │
-│  │    /settings         ──▶ Merchant Settings                              │ │
-│  └────────────────────────────────────────────────────────────────────────┘ │
-│                                                                              │
-│  ┌────────────────────────────────────────────────────────────────────────┐ │
-│  │                         Zustand Stores                                  │ │
-│  │  ┌─────────────────┐  ┌──────────────────┐  ┌─────────────────┐       │ │
-│  │  │   authStore     │  │ transactionStore │  │  webhookStore   │       │ │
-│  │  ├─────────────────┤  ├──────────────────┤  ├─────────────────┤       │ │
-│  │  │ - merchant      │  │ - transactions   │  │ - endpoints     │       │ │
-│  │  │ - isAuthed      │  │ - filters        │  │ - deliveries    │       │ │
-│  │  │ - permissions   │  │ - pagination     │  │ - testResults   │       │ │
-│  │  └─────────────────┘  └──────────────────┘  └─────────────────┘       │ │
-│  └────────────────────────────────────────────────────────────────────────┘ │
-│                                                                              │
-│  ┌────────────────────────────────────────────────────────────────────────┐ │
-│  │                         API Service Layer                               │ │
-│  │  api.ts: fetch wrapper with auth, error handling, retry logic          │ │
-│  └────────────────────────────────────────────────────────────────────────┘ │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+Out of scope: merchant onboarding and identity verification, payout scheduling, and the BI-style analytics product.
 
-## Deep Dive: State Management with Zustand
+### Non-functional requirements
 
-### Transaction Store Design
+| Requirement | Target | Why |
+|-------------|--------|-----|
+| Checkout bundle | < 40 KB gzipped, loaded async | It runs on someone else's page; it must not hurt their LCP |
+| Checkout responsiveness | INP < 100 ms on Pay; the button reacts on the same frame | A slow-looking Pay button gets clicked twice |
+| Dashboard load | LCP < 2.5 s on a mid-range laptop over 4G; initial JS < 200 KB gzipped | Merchants open it many times a day |
+| Dashboard responsiveness | INP < 200 ms with 100,000+ payments loaded | Filtering and scrolling must stay smooth |
+| Accessibility | WCAG 2.2 AA; full keyboard use; async results announced | Checkout accessibility is a legal requirement in many markets |
+| Security | Card numbers never in the merchant's DOM or our dashboard; no secret API keys in any browser | PCI scope and account takeover |
+| Correctness | One Pay or Refund click causes at most one charge or refund, across retries, refreshes and double clicks | The single most expensive bug a payments UI can have |
+
+---
+
+## 🏗️ A — Architecture (8 min)
+
+"These are two separate apps on purpose. The **checkout element** is a small framework-free bundle — I'll call it Checkout.js — that the merchant includes; it mounts an iframe served from our domain for the card fields. It must be tiny and must not care which framework the merchant uses. The **dashboard** is an authenticated React SPA with no SEO needs, so I'd render it on the client with route-level code splitting. Server rendering would buy a faster first paint for pages nobody crawls, at the cost of a rendering tier to run; I'd manage the cold start with a small initial bundle and hashed, immutable assets."
 
 ```
-┌──────────────────────────────────────────────────────────────────────────┐
-│                     Transaction Store (Zustand + Immer)                   │
-├──────────────────────────────────────────────────────────────────────────┤
-│  DATA                                                                     │
-│  ├── transactions: Transaction[]                                          │
-│  ├── selectedTransaction: Transaction | null                              │
-│  └── totalCount: number                                                   │
-├──────────────────────────────────────────────────────────────────────────┤
-│  PAGINATION                                                               │
-│  ├── page: number (default: 1)                                            │
-│  └── pageSize: number (default: 25)                                       │
-├──────────────────────────────────────────────────────────────────────────┤
-│  FILTERS                                                                  │
-│  ├── status?: 'authorized' | 'captured' | 'refunded' | 'failed'           │
-│  ├── currency?: string                                                    │
-│  ├── dateRange?: { start: Date; end: Date }                               │
-│  ├── amountRange?: { min: number; max: number }                           │
-│  └── search?: string                                                      │
-├──────────────────────────────────────────────────────────────────────────┤
-│  LOADING STATES                                                           │
-│  ├── isLoading: boolean                                                   │
-│  └── isLoadingDetails: boolean                                            │
-├──────────────────────────────────────────────────────────────────────────┤
-│  ACTIONS                                                                  │
-│  ├── setFilters(filters) ──▶ resets page to 1, triggers fetchTransactions │
-│  ├── setPage(page) ──▶ triggers fetchTransactions                         │
-│  ├── fetchTransactions() ──▶ API call with page, pageSize, filters        │
-│  ├── fetchTransactionDetails(id) ──▶ load single transaction              │
-│  └── refundTransaction(id, amount?) ──▶ optimistic update with rollback   │
-└──────────────────────────────────────────────────────────────────────────┘
+ ┌──────────────────────────────────────────────────────────────────────────────────────────┐
+ │ Dashboard shell · TanStack Router · route guard reads the session (Zustand)              │
+ │ URL state: /payments?status=…&cursor=…    /payments/$id    /balance                      │
+ └────────────┬────────────────────────────┬────────────────────────────────┬───────────────┘
+              │                            │                                │
+              ▼                            ▼                                ▼
+ ┌─────────────────────────┐    ┌──────────────────────┐    ┌───────────────────────────────┐
+ │ /payments               │    │ /balance, /disputes  │    │ /payments/$id                 │
+ │ PaymentsTable           │    │ lazy-loaded chunks   │    │ StatusTimeline, LedgerPanel   │
+ │ (virtualized rows)      │    └──────────┬───────────┘    │ RefundDialog                  │
+ └────────────┬────────────┘               │                └───┬───────────────────┬───────┘
+              │ (1) list + filters         │ balance            │ (2) refund        │ draft
+              │                            │                    │                   │
+              ▼                            ▼                    ▼                   ▼
+ ┌────────────────────────────────────────────────────────────────────┐    ┌────────────────┐
+ │ TanStack Query cache (server state)                                │    │ sessionStorage │
+ │ ['payments', filters] · ['payment', id] · ['balance']              │    │ draft + key    │
+ │ dedupe · retry · invalidate after mutations                        │    └────────────────┘
+ └──────────────────────────┬─────────────────────────────────────────┘
+                            │ fetch / mutate                    ▲
+                            │                                   │ (3) setQueryData(event)
+                            ▼                                   │
+ ┌──────────────────────────────────────────────────┐    ┌──────────────────────────────────┐
+ │ API client: fetch + AbortSignal                  │    │ EventSource /v1/events           │
+ │ Idempotency-Key · problem+json → typed errors    │    │ resume with Last-Event-ID        │
+ └──────────────────────────┬───────────────────────┘    └──────────────────────────────────┘
+                            │ HTTPS · session cookie                        ▲
+                            │                                               │ payment.* (SSE)
+                            ▼                                               │
+ ┌──────────────────────────────────────────────────────────────────────────────────────────┐
+ │ Payment API via gateway · /v1/payments · /v1/refunds · /v1/events                        │
+ └──────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Optimistic Refund Flow
+1. **Browse (1).** `/payments` reads `['payments', filters]` as an infinite query. Status, date range and cursor live in the URL, so back, forward, refresh and shared links all restore the same view.
+2. **Refund (2).** `RefundDialog` freezes the draft with an idempotency key in `sessionStorage`, then runs a mutation through the query cache; on success it invalidates the payment and the balance.
+3. **Live status (3).** One `EventSource` per tab receives `payment.*` events for the merchant and writes them into the matching cached payment with `setQueryData`, so a payment that was "Processing" flips to "Succeeded" without a reload.
+
+### Who owns which state
+
+| State | Owner | Why there |
+|-------|-------|-----------|
+| Payments, refunds, balance, ledger entries | TanStack Query | Caching, deduplication, retries, cancellation and invalidation without hand-written loading flags |
+| Filters, sort, cursor, selected payment | URL search params | Shareable, bookmarkable, survives reload |
+| Session: user, role, merchant | Zustand, filled from `/me` | Every route guard reads it; tiny |
+| Refund draft and its idempotency key | Component state mirrored to `sessionStorage` | Must survive a refresh while a refund is in flight |
+| Live-connection status | A small Zustand slice | Drives the "Reconnecting…" banner |
+| Dialogs, menus, toasts | Local component state | Never shared |
+
+"The rule I'm applying: server data never gets copied into Zustand. Once you copy a payment into a client store you own its staleness and invalidation by hand — and in a payments UI, a stale 'captured' badge on a refunded payment is how a merchant ends up refunding twice."
+
+### Key interaction: paying in the checkout
 
 ```
-┌────────────────┐     ┌─────────────────────┐     ┌──────────────────────┐
-│ User clicks    │     │ Optimistic Update   │     │ API Response         │
-│ "Refund"       │────▶│ status = 'refunding'│────▶│                      │
-└────────────────┘     └─────────────────────┘     │  Success:            │
-                                                    │  ├── Update with     │
-                                                    │  │   server data     │
-                                                    │  │                   │
-                                                    │  Failure:            │
-                                                    │  └── Rollback to     │
-                                                    │      original state  │
-                                                    └──────────────────────┘
+Customer                         Checkout.js                Card iframe                 Payment API
+    │                                 │                          │                           │
+    │ 1 Pay (button locks)            │                          │                           │
+    │────────────────────────────────▶│                          │                           │
+    │                                 │ 2 postMessage: tokenize  │                           │
+    │                                 │─────────────────────────▶│                           │
+    │                                 │                          │ 3 POST /v1/tokens (PAN)   │
+    │                                 │                          │──────────────────────────▶│
+    │                                 │                          │ 4 tok_… (PAN stays here)  │
+    │                                 │                          │◀──────────────────────────│
+    │                                 │ 5 postMessage: tok_…     │                           │
+    │                                 │◀─────────────────────────│                           │
+    │                                 │ 6 POST confirm, key = session                        │
+    │                                 │─────────────────────────────────────────────────────▶│
+    │                                 │ 7 succeeded | requires_action | 202                  │
+    │                                 │◀─────────────────────────────────────────────────────│
+    │ 8 receipt, 3DS or "processing"  │                          │                           │
+    │◀────────────────────────────────│                          │                           │
+    │                                 │                          │                           │
 ```
 
-### Why Zustand with Immer?
+"The card number goes from the iframe straight to our tokenization endpoint (step 3); the merchant's page only ever sees a token. The confirm call (step 6) carries an idempotency key tied to the checkout session, so a retry after a network error, or a second click that slips past the locked button, confirms the same payment instead of a new one. Step 7 has three outcomes the UI must design for: success, a 3-D Secure challenge, and `202` — the processor didn't answer and the payment is still processing."
 
-| Factor | Zustand + Immer | Redux Toolkit | React Query |
-|--------|-----------------|---------------|-------------|
-| Boilerplate | Minimal | Moderate | Minimal |
-| Immutable updates | Immer syntax | Built-in | N/A |
-| Devtools | Yes | Yes | Yes |
-| Server state | Manual | Manual | Excellent |
-| Bundle size | ~3KB | ~12KB | ~12KB |
-
-> "Zustand with Immer for complex dashboard state (filters, pagination, optimistic updates). Could add React Query for server state caching if needed."
-
-## Deep Dive: Transaction Dashboard Components
-
-### Transaction List with Virtualization
+### Key interaction: refunding from the dashboard
 
 ```
-┌───────────────────────────────────────────────────────────────────────────┐
-│                          TransactionList Component                         │
-├───────────────────────────────────────────────────────────────────────────┤
-│  ┌─────────────────────────────────────────────────────────────────────┐  │
-│  │  HEADER (grid-cols-12)                                               │  │
-│  │  ├── Transaction ID (col-span-3)                                     │  │
-│  │  ├── Amount (col-span-2)                                             │  │
-│  │  ├── Status (col-span-2)                                             │  │
-│  │  ├── Customer (col-span-2)                                           │  │
-│  │  └── Date (col-span-3)                                               │  │
-│  └─────────────────────────────────────────────────────────────────────┘  │
-│                                                                            │
-│  ┌─────────────────────────────────────────────────────────────────────┐  │
-│  │  VIRTUALIZED ROWS (@tanstack/react-virtual)                          │  │
-│  │  ├── estimateSize: 72px (row height)                                 │  │
-│  │  ├── overscan: 5 (extra rows rendered)                               │  │
-│  │  └── absolute positioning with translateY for visible rows           │  │
-│  │                                                                       │  │
-│  │  ┌────────────────────────────────────────────────────────────────┐  │  │
-│  │  │  TransactionRow                                                 │  │  │
-│  │  │  ├── ID: truncated (first 8 chars)                              │  │  │
-│  │  │  ├── Amount: <AmountDisplay> with currency                      │  │  │
-│  │  │  ├── Status: <StatusBadge> with colored indicator               │  │  │
-│  │  │  ├── Customer: email or "Guest"                                 │  │  │
-│  │  │  ├── Date: relative time (formatDistanceToNow)                  │  │  │
-│  │  │  ├── onClick ──▶ navigate to /transactions/:id                  │  │  │
-│  │  │  └── onKeyDown (Enter) ──▶ navigate (accessibility)             │  │  │
-│  │  └────────────────────────────────────────────────────────────────┘  │  │
-│  └─────────────────────────────────────────────────────────────────────┘  │
-│                                                                            │
-│  ┌─────────────────────────────────────────────────────────────────────┐  │
-│  │  PAGINATION                                                          │  │
-│  │  page, pageSize, total, onPageChange                                 │  │
-│  └─────────────────────────────────────────────────────────────────────┘  │
-└───────────────────────────────────────────────────────────────────────────┘
+Merchant             RefundDialog             Query cache               Payment API
+    │                      │                       │                         │
+    │ 1 Refund 40.00       │                       │                         │
+    │─────────────────────▶│                       │                         │
+    │                      │ 2 freeze draft + key R                          │
+    │                      │ 3 mutate(draft, R)    │                         │
+    │                      │──────────────────────▶│                         │
+    │                      │                       │ 4 POST /refunds, key R  │
+    │                      │                       │────────────────────────▶│
+    │                      │                       │ 5 timeout               │
+    │                      │                       │◀────────────────────────│
+    │                      │                       │ 6 retry, same key R     │
+    │                      │                       │────────────────────────▶│
+    │                      │                       │ 7 201 (or 200 replay)   │
+    │                      │                       │◀────────────────────────│
+    │                      │ 8 invalidate queries  │                         │
+    │                      │◀──────────────────────│                         │
+    │ 9 aria-live: result  │                       │                         │
+    │◀─────────────────────│                       │                         │
+    │                      │                       │                         │
 ```
 
-### Status Badge Component
+"Refunds are deliberately *not* optimistic. The money isn't returned until the server says so, and a refund can be rejected — another refund may have used up the refundable amount a second earlier. The key `R` is what makes the automatic retry in step 6 safe: the server returns the refund it already created rather than refunding twice."
+
+### Key interaction: a processing payment resolving itself
 
 ```
-┌───────────────────────────────────────────────────────────────────────────┐
-│                            StatusBadge Styles                              │
-├───────────────────────────────────────────────────────────────────────────┤
-│  pending    ──▶  bg-yellow-100  text-yellow-800                           │
-│  authorized ──▶  bg-blue-100    text-blue-800                             │
-│  captured   ──▶  bg-green-100   text-green-800                            │
-│  refunded   ──▶  bg-purple-100  text-purple-800                           │
-│  failed     ──▶  bg-red-100     text-red-800                              │
-│  voided     ──▶  bg-gray-100    text-gray-800                             │
-└───────────────────────────────────────────────────────────────────────────┘
+ PaymentDetail                   Query cache       EventSource                  Payment API
+       │                              │                 │                            │
+       │ 1 useQuery(['payment', id])  │                 │                            │
+       │─────────────────────────────▶│                 │                            │
+       │ 2 status: pending            │                 │                            │
+       │◀─────────────────────────────│                 │                            │
+       │                              │                 │ 3 GET /events, last id 41  │
+       │                              │                 │───────────────────────────▶│
+       │                              │                 │ 4 42: payment.captured     │
+       │                              │                 │◀───────────────────────────│
+       │                              │ 5 setQueryData  │                            │
+       │                              │◀────────────────│                            │
+       │ 6 re-render: captured        │                 │                            │
+       │◀─────────────────────────────│                 │                            │
+       ···················· connection drops, browser reconnects ·····················
+       │                              │                 │ 7 GET /events, last id 42  │
+       │                              │                 │───────────────────────────▶│
+       │                              │                 │ 8 43… or gap: refetch      │
+       │                              │                 │◀───────────────────────────│
+       │                              │                 │                            │
 ```
 
-## Deep Dive: Transaction Filters
+"Server-Sent Events fit this exactly: one-way, low volume, and the browser reconnects on its own and sends `Last-Event-ID`, so the server can replay what I missed. If the gap is too old to replay, the server says so and I invalidate the payment queries instead."
 
-### Filter Panel Component
+---
 
-```
-┌───────────────────────────────────────────────────────────────────────────┐
-│                       TransactionFilters Panel                             │
-├───────────────────────────────────────────────────────────────────────────┤
-│  ┌────────────────────────────────────────────────────────────────────┐   │
-│  │  SEARCH INPUT                                                       │   │
-│  │  ├── Icon: Search (left positioned)                                 │   │
-│  │  ├── Placeholder: "Search by ID, email, or amount..."              │   │
-│  │  └── onChange ──▶ useDebouncedCallback(300ms) ──▶ setFilters        │   │
-│  └────────────────────────────────────────────────────────────────────┘   │
-│                                                                            │
-│  ┌───────────────┐  ┌───────────────┐  ┌───────────────────────────────┐  │
-│  │ STATUS SELECT │  │ DATE RANGE    │  │ AMOUNT RANGE (Popover)        │  │
-│  │               │  │               │  │                               │  │
-│  │ - All         │  │ DateRange     │  │ ┌─────────────────────────┐   │  │
-│  │ - Authorized  │  │ Picker        │  │ │ Min: <CurrencyInput>    │   │  │
-│  │ - Captured    │  │ component     │  │ │ Max: <CurrencyInput>    │   │  │
-│  │ - Refunded    │  │               │  │ │ [Apply Button]          │   │  │
-│  │ - Failed      │  │               │  │ └─────────────────────────┘   │  │
-│  └───────────────┘  └───────────────┘  └───────────────────────────────┘  │
-│                                                                            │
-│  ┌───────────────────────────────────────────────────────────────────────┐│
-│  │  [Clear all] button - visible when any filter is active               ││
-│  └───────────────────────────────────────────────────────────────────────┘│
-└───────────────────────────────────────────────────────────────────────────┘
-```
+## 💾 D — Data Model (5 min)
 
-### Local vs Global Filter State
+| Entity | Shape | Cache key | Freshness |
+|--------|-------|-----------|-----------|
+| `Payment` | `id`, `status`, `amount`, `currency`, `refundedAmount`, `refundableAmount`, `card {brand, last4}`, `fee`, `net`, `createdAt`, `timeline[]`, `version` | `['payment', id]`, and inside list pages | Updated by events; `staleTime` 30 s |
+| `PaymentsPage` | `items: Payment[]`, `nextCursor` | `['payments', {status, from, to, q}]` (infinite) | Invalidated after mutations; patched by events |
+| `Refund` | `id`, `paymentId`, `amount`, `status` (`pending`, `succeeded`, `failed`), `createdAt` | `['refunds', paymentId]` | Invalidated after a refund |
+| `LedgerEntry` | `journalId`, `account`, `direction`, `amount`, `createdAt` | `['ledger', paymentId]` | Immutable once loaded (the ledger is append-only) |
+| `Balance` | `available`, `pending`, `currency`, `asOf` | `['balance']` | Invalidated by refunds and capture events |
+| `RefundDraft` | `amount`, `reason`, `idempotencyKey`, `status` | `sessionStorage['refund-draft:{paymentId}']` | Cleared on success |
+| `PaymentEvent` | `id`, `type`, `paymentId`, `data` | Not cached; applied to the entities above | Stream |
+
+Three modeling decisions:
+
+- **Money is an integer in minor units plus an ISO currency**, end to end. The client never adds or multiplies floats. User input is parsed into minor units using the currency's exponent — 2 for USD, 0 for JPY, 3 for BHD — and displayed with `Intl.NumberFormat` in the viewer's locale. "Refund 12.50" becomes 1250, not 1249.9999.
+- **`refundableAmount` comes from the server.** The client could compute amount minus refunds, but pending refunds, disputes and fee rules all affect it; one source of truth avoids a UI that promises a refund the server will reject.
+- **The ledger view is immutable.** Ledger entries never change after they're written, so once loaded I cache them indefinitely — the only append-only data in the app, and the easiest to cache.
+
+---
+
+## 🔌 I — Interface (5 min)
+
+### The API as the client sees it
 
 ```
-┌──────────────────────┐                    ┌──────────────────────┐
-│   localFilters       │                    │   Zustand Store      │
-│   (useState)         │                    │   filters            │
-├──────────────────────┤                    ├──────────────────────┤
-│ Immediate UI updates │  ──▶ Apply ──▶    │ Triggers API fetch   │
-│ before user commits  │                    │ Updates URL params   │
-└──────────────────────┘                    └──────────────────────┘
+POST /v1/tokens                      card fields → tok_…   (from the checkout iframe only)
+POST /v1/checkout/{session}/confirm  Idempotency-Key → succeeded | requires_action | 202 processing
+GET  /v1/payments?status&from&to&q&cursor   → {items, next_cursor}
+GET  /v1/payments/{id}               → Payment with timeline and refundable amount
+POST /v1/payments/{id}/capture       → 200 (also on repeat) | 409 wrong state
+POST /v1/payments/{id}/refunds       {amount, reason} + Idempotency-Key → 201 | 200 replay | 422
+GET  /v1/events                      SSE stream of payment.* and refund.*; honors Last-Event-ID
+GET  /v1/balance                     → {available, pending, as_of}
 ```
 
-## Deep Dive: Transaction Details with Timeline
+- **`202` is a first-class outcome**, not an error: the UI shows "Processing" and waits for the event.
+- **`409` with `Retry-After`** means the same key is still in flight; the client waits and retries with the same key.
+- **`422`** arrives as `application/problem+json` with a `code` (`amount_exceeds_refundable`, `idempotency_key_reused`); the API client maps codes to form fields and everything else to a toast.
 
-### Transaction Details Page
+### Component contracts
 
-```
-┌───────────────────────────────────────────────────────────────────────────┐
-│                     Transaction Details Page Layout                        │
-├───────────────────────────────────────────────────────────────────────────┤
-│  HEADER                                                                    │
-│  ├── Amount (formatted with currency) + StatusBadge                        │
-│  ├── Transaction ID (monospace font)                                       │
-│  └── [Refund Button] - visible if captured && refunded_amount < amount     │
-├───────────────────────────────────────────────────────────────────────────┤
-│                                                                            │
-│  ┌──────────────────────────────────────┐  ┌───────────────────────────┐  │
-│  │  PAYMENT DETAILS CARD (col-span-2)   │  │  TIMELINE CARD            │  │
-│  │                                       │  │                           │  │
-│  │  ┌─────────────────────────────────┐ │  │  ○ Created (Clock)        │  │
-│  │  │ Amount:     $150.00             │ │  │  │ Oct 15, 2024 2:30 PM   │  │
-│  │  │ Currency:   USD                 │ │  │  │                        │  │
-│  │  │ Captured:   $150.00             │ │  │  ○ Authorized (Check)    │  │
-│  │  │ Refunded:   $0.00               │ │  │  │ Oct 15, 2024 2:30 PM   │  │
-│  │  │ Processor:  ch_1234abcd         │ │  │  │                        │  │
-│  │  └─────────────────────────────────┘ │  │  ● Captured (Dollar)     │  │
-│  │                                       │  │    Oct 15, 2024 2:31 PM   │  │
-│  │  ┌─────────────────────────────────┐ │  │                           │  │
-│  │  │ RISK ASSESSMENT (if fraud_score)│ │  │  Event icons:             │  │
-│  │  │ FraudScoreDisplay component     │ │  │  - created: Clock         │  │
-│  │  │ shows score + fraud_flags       │ │  │  - authorized: CheckCircle│  │
-│  │  └─────────────────────────────────┘ │  │  - captured: DollarSign   │  │
-│  └──────────────────────────────────────┘  │  - refunded: RotateCcw    │  │
-│                                             │  - failed: XCircle        │  │
-│                                             │  - voided: Slash          │  │
-│                                             └───────────────────────────┘  │
-└───────────────────────────────────────────────────────────────────────────┘
-```
+| Component / hook | Contract |
+|------------------|----------|
+| `<CheckoutElement session onResult>` | Mounts the card iframe; emits `succeeded`, `failed(reason)` or `processing(paymentId)`; owns the Pay button state |
+| `<PaymentsTable query onSelect>` | Virtualized rows, keyboard navigation, status badges with text, not color alone |
+| `<RefundDialog payment onDone>` | Owns the draft lifecycle: validate → freeze → submit → retry with the same key |
+| `<StatusTimeline paymentId>` | Renders server events in order; shows "Processing" honestly while pending |
+| `useRefund(paymentId)`, `useCapture(paymentId)` | Wrap the mutation, the idempotency key and every cache update, so components never touch query keys |
+| `usePaymentEvents()` | One `EventSource` per tab; applies events to the cache; exposes connection status |
 
-### Transaction Timeline Component
+---
 
-```
-┌──────────────────────────────────────────────────────────────────────────┐
-│                     TransactionTimeline Structure                         │
-├──────────────────────────────────────────────────────────────────────────┤
-│  <ol> with relative border-left (gray timeline line)                      │
-│                                                                           │
-│  For each event:                                                          │
-│  ├── <span> absolute positioned icon (-left-3)                            │
-│  │   ├── First event: bg-blue-100, ring-4 ring-white                      │
-│  │   └── Other events: bg-gray-100                                        │
-│  ├── <h3> event type (capitalized)                                        │
-│  ├── <time> formatted date (MMM d, yyyy h:mm a)                           │
-│  └── <p> metadata (if present) - formatEventMetadata helper               │
-│                                                                           │
-│  Events rendered in chronological order with 6px margin between           │
-└──────────────────────────────────────────────────────────────────────────┘
-```
+## 🔧 O — Optimizations & Deep Dives (18 min)
 
-## Deep Dive: Refund Modal
+### Deep dive 1: a checkout that never sees the card and never charges twice (6 min)
 
-### Refund Dialog Component
+"Two requirements pull against each other: the checkout must feel native in the merchant's page, yet the merchant's code must never be able to read a card number — if it can, the merchant is in full PCI scope, and one XSS on their site leaks cards."
 
-```
-┌───────────────────────────────────────────────────────────────────────────┐
-│                          RefundDialog Modal                                │
-├───────────────────────────────────────────────────────────────────────────┤
-│  HEADER                                                                    │
-│  ├── Title: "Refund Transaction"                                           │
-│  └── Description: "Issue a refund for transaction {id}..."                 │
-├───────────────────────────────────────────────────────────────────────────┤
-│  FORM                                                                      │
-│                                                                            │
-│  ┌─────────────────────────────────────────────────────────────────────┐  │
-│  │  REFUND TYPE TOGGLE (radio buttons)                                  │  │
-│  │  ○ Full refund ($150.00)                                             │  │
-│  │  ○ Partial refund                                                    │  │
-│  └─────────────────────────────────────────────────────────────────────┘  │
-│                                                                            │
-│  ┌─────────────────────────────────────────────────────────────────────┐  │
-│  │  AMOUNT INPUT (visible when partial selected)                        │  │
-│  │  Label: "Amount (max: $150.00)"                                      │  │
-│  │  <CurrencyInput> with max validation                                 │  │
-│  └─────────────────────────────────────────────────────────────────────┘  │
-│                                                                            │
-│  ┌─────────────────────────────────────────────────────────────────────┐  │
-│  │  ERROR DISPLAY (conditional)                                         │  │
-│  │  bg-red-50, text-red-600, rounded                                    │  │
-│  └─────────────────────────────────────────────────────────────────────┘  │
-│                                                                            │
-│  FOOTER                                                                    │
-│  ├── [Cancel] - variant="outline", disabled when processing               │
-│  └── [Process Refund] - shows Loader2 spinner when processing             │
-├───────────────────────────────────────────────────────────────────────────┤
-│  STATE                                                                     │
-│  ├── amount: initialized to (transaction.amount - refunded_amount)        │
-│  ├── isFullRefund: boolean (default: true)                                 │
-│  ├── isProcessing: boolean                                                 │
-│  └── error: string | null                                                  │
-├───────────────────────────────────────────────────────────────────────────┤
-│  SUBMIT FLOW                                                               │
-│  1. Set isProcessing = true                                                │
-│  2. Call refundTransaction(id, isFullRefund ? undefined : amount)         │
-│  3. On success: close dialog, show toast.success                          │
-│  4. On failure: set error message, keep dialog open                       │
-│  5. Set isProcessing = false                                               │
-└───────────────────────────────────────────────────────────────────────────┘
-```
+**The decision: card fields in an iframe from our domain, tokenized inside it.** The merchant's page hosts Checkout.js, which mounts an iframe from our origin for the card fields. The same-origin policy is the security boundary: scripts on the merchant's page cannot read inside the iframe. When the customer presses Pay, Checkout.js asks the iframe (via `postMessage`, checking `event.origin` on both sides) to tokenize; the iframe posts the card to our tokenization endpoint and hands back only a token. The merchant's page confirms the payment with that token.
 
-## Deep Dive: Analytics Dashboard
+**Never charging twice.** The Pay button is a small state machine — idle → submitting → (requires action) → succeeded, failed or processing — and it locks on the same frame as the click. But a locked button is not the guarantee; the network is the problem. The confirm call carries an idempotency key derived from the checkout session, so:
 
-### Revenue Chart Component
+1. A timeout followed by an automatic retry confirms the same payment.
+2. A refresh mid-payment reloads the session, sees it is already confirmed or processing, and shows that instead of a fresh Pay button.
+3. A `202` shows "Your payment is processing — don't pay again", and the page waits for the result rather than re-enabling Pay.
 
-```
-┌───────────────────────────────────────────────────────────────────────────┐
-│                         RevenueChart (Recharts)                            │
-├───────────────────────────────────────────────────────────────────────────┤
-│  CARD HEADER                                                               │
-│  ├── Title: "Revenue"                                                      │
-│  └── <PeriodSelector> (7d, 30d, 90d, 1y)                                   │
-├───────────────────────────────────────────────────────────────────────────┤
-│  CHART CONTENT (height: 300px)                                             │
-│                                                                            │
-│  <ResponsiveContainer width="100%" height="100%">                          │
-│    <AreaChart data={revenueData}>                                          │
-│                                                                            │
-│      defs:                                                                 │
-│      └── linearGradient "colorRevenue" (blue, fading to transparent)       │
-│                                                                            │
-│      <XAxis>                                                               │
-│      ├── dataKey: "date"                                                   │
-│      └── tickFormatter: format(date, 'MMM d')                              │
-│                                                                            │
-│      <YAxis>                                                               │
-│      └── tickFormatter: "$X,XXX" (divide by 100 for cents)                 │
-│                                                                            │
-│      <Tooltip>                                                             │
-│      └── Custom content:                                                   │
-│          ├── Date: "October 15, 2024"                                      │
-│          ├── Amount: formatCurrency(amount, 'USD')                         │
-│          └── Count: "X transactions"                                       │
-│                                                                            │
-│      <Area>                                                                │
-│      ├── type: "monotone"                                                  │
-│      ├── dataKey: "amount"                                                 │
-│      ├── stroke: #3B82F6 (blue-500)                                        │
-│      ├── fill: url(#colorRevenue)                                          │
-│      └── strokeWidth: 2                                                    │
-│    </AreaChart>                                                            │
-│  </ResponsiveContainer>                                                    │
-└───────────────────────────────────────────────────────────────────────────┘
-```
+**3-D Secure** opens the bank's challenge in a modal iframe with a focus trap, a visible title and an Escape-to-cancel path; when it completes, the same confirm call (same key) resumes.
 
-## Deep Dive: Secure Payment Form (Embedded)
+| Approach | Verdict |
+|----------|---------|
+| ✅ Iframe card fields + token, key per checkout session | Card data never in the merchant's DOM; retries and refreshes can't duplicate |
+| ❌ Card inputs in the merchant's page, posted to our API | Any script on the merchant's page — an analytics tag, an injected skimmer — can read the card |
+| ❌ Full redirect to a hosted payment page | Simplest and safest, but the customer leaves the merchant's site; conversion drops and styling is limited |
+| ❌ Disable the button and hope | Stops double clicks, not retries after a timeout or a refresh |
 
-### Payment Element Component
+"What I give up: iframes are awkward to style — I expose a small style API for fonts and colors, and resize the iframe from height messages it posts — and every interaction crosses a frame boundary, which adds a few milliseconds and real complexity to focus management and error display. It's the price of keeping card data out of the merchant's reach."
 
-```
-┌───────────────────────────────────────────────────────────────────────────┐
-│                    PaymentForm (PCI-Compliant)                             │
-├───────────────────────────────────────────────────────────────────────────┤
-│  ARCHITECTURE                                                              │
-│                                                                            │
-│  ┌─────────────────────┐       ┌─────────────────────────────────────┐    │
-│  │  Parent Component   │       │  Secure Iframe (card input)         │    │
-│  │  (our domain)       │  ◄──► │  (payment processor domain)         │    │
-│  │                     │       │  Card data never touches our code   │    │
-│  └─────────────────────┘       └─────────────────────────────────────┘    │
-│                                                                            │
-│  FORM LAYOUT                                                               │
-│  ┌─────────────────────────────────────────────────────────────────────┐  │
-│  │  Card number                                                         │  │
-│  │  ┌───────────────────────────────────────────────────────────────┐  │  │
-│  │  │  <CardNumberInput> (iframe)                                    │  │  │
-│  │  │  onComplete ──▶ setCardComplete({...c, number: true})          │  │  │
-│  │  └───────────────────────────────────────────────────────────────┘  │  │
-│  │                                                                       │  │
-│  │  ┌──────────────────────────────┐  ┌───────────────────────────────┐│  │
-│  │  │  Expiry                      │  │  CVC                          ││  │
-│  │  │  <CardExpiryInput> (iframe)  │  │  <CardCvcInput> (iframe)      ││  │
-│  │  └──────────────────────────────┘  └───────────────────────────────┘│  │
-│  │                                                                       │  │
-│  │  ┌───────────────────────────────────────────────────────────────┐  │  │
-│  │  │  [Pay now]                                                     │  │  │
-│  │  │  disabled when: !allComplete || isLoading                      │  │  │
-│  │  │  shows: Loader2 spinner when processing                        │  │  │
-│  │  └───────────────────────────────────────────────────────────────┘  │  │
-│  └─────────────────────────────────────────────────────────────────────┘  │
-├───────────────────────────────────────────────────────────────────────────┤
-│  STATE                                                                     │
-│  ├── isLoading: boolean                                                    │
-│  └── cardComplete: { number: false, expiry: false, cvc: false }           │
-│      └── allComplete = Object.values(cardComplete).every(Boolean)         │
-├───────────────────────────────────────────────────────────────────────────┤
-│  SUBMIT FLOW                                                               │
-│  1. cardIframeRef.current.tokenize() ──▶ get token from secure iframe     │
-│  2. api.confirmPayment(clientSecret, { payment_method_token: token })     │
-│  3. onSuccess(result) or onError(err)                                      │
-└───────────────────────────────────────────────────────────────────────────┘
-```
+### Deep dive 2: honest money states in the dashboard (5 min)
 
-## Accessibility (a11y)
+"The temptation in a dashboard is to make everything optimistic so it feels instant. For money, that's a lie with consequences: if the UI shows 'Refunded' and the server then rejects the refund, the merchant has already told the customer their money is on the way."
 
-### Semantic Structure
+**The decision.** I split mutations by what they touch:
 
-```
-┌───────────────────────────────────────────────────────────────────────────┐
-│                      Dashboard Semantic Structure                          │
-├───────────────────────────────────────────────────────────────────────────┤
-│  <main role="main" aria-label="Transaction Dashboard">                     │
-│    │                                                                       │
-│    ├── <nav aria-label="Dashboard navigation">                             │
-│    │   └── Sidebar navigation links                                        │
-│    │                                                                       │
-│    ├── <section aria-label="Transaction filters">                          │
-│    │   ├── <h2 className="sr-only">Filter transactions</h2>               │
-│    │   └── Filter controls                                                 │
-│    │                                                                       │
-│    └── <section aria-label="Transaction list">                             │
-│        ├── <h2 className="sr-only">Transactions</h2>                       │
-│        └── <div role="table" aria-label="Transaction data">                │
-│            ├── <div role="rowgroup">                                       │
-│            │   └── <div role="row" aria-label="Column headers">            │
-│            │       └── <div role="columnheader">Transaction ID</div>       │
-│            └── <div role="rowgroup">                                       │
-│                └── Transaction rows                                        │
-│  </main>                                                                   │
-└───────────────────────────────────────────────────────────────────────────┘
-```
+| Mutation | Strategy | Why |
+|----------|----------|-----|
+| Refund, capture, void | Pessimistic: pending state on the button, then the server's answer | Money moves; the server can refuse |
+| Notes, tags, metadata | Optimistic with rollback | No money; failures are rare and harmless |
+| Status changes from events | Applied as they arrive | The server already decided |
 
-### Keyboard Navigation Hook
+**How the refund form stays honest.** The dialog shows the server's `refundableAmount` and validates against it on the client for fast feedback, but the authoritative check is the server's: if another refund landed a second earlier, the `422 amount_exceeds_refundable` arrives with the new refundable amount, and the form shows it on the amount field. The draft and its idempotency key are frozen at submit and stored in `sessionStorage`; editing the amount creates a new key, because it is a different request.
 
-```
-┌───────────────────────────────────────────────────────────────────────────┐
-│                    useTableKeyboardNav Hook                                │
-├───────────────────────────────────────────────────────────────────────────┤
-│  INPUT                                                                     │
-│  ├── rowCount: number                                                      │
-│  └── onSelect: (index: number) => void                                     │
-├───────────────────────────────────────────────────────────────────────────┤
-│  STATE                                                                     │
-│  └── focusedRow: number (default: -1)                                      │
-├───────────────────────────────────────────────────────────────────────────┤
-│  KEY HANDLERS                                                              │
-│  ├── ArrowDown ──▶ focusedRow = min(current + 1, rowCount - 1)             │
-│  ├── ArrowUp   ──▶ focusedRow = max(current - 1, 0)                        │
-│  ├── Enter     ──▶ onSelect(focusedRow) if focusedRow >= 0                 │
-│  ├── Home      ──▶ focusedRow = 0                                          │
-│  └── End       ──▶ focusedRow = rowCount - 1                               │
-├───────────────────────────────────────────────────────────────────────────┤
-│  OUTPUT                                                                    │
-│  └── returns focusedRow for visual focus indicator                         │
-└───────────────────────────────────────────────────────────────────────────┘
-```
+**The timeline is server events, not client guesses.** "Authorized 14:02 → Captured 14:02 → Refund of $40.00 pending 14:10 → Refund succeeded 14:11" comes from the payment's event history, so it matches what the merchant's webhooks saw.
 
-## Performance Optimizations
+**"Processing" is a real state.** A payment the processor didn't answer for is shown as "Processing — we're confirming with the card network" with no Refund or Capture actions, and it resolves when the event arrives. The UI never infers success or failure from a timeout.
 
-### 1. Virtual Scrolling for Large Lists
+"What I give up is snappiness: a refund takes 300–800 ms to confirm, during which the button says 'Refunding…'. For an action a merchant takes a few times a day, correctness is worth that half second."
 
-Already implemented with `@tanstack/react-virtual` for transaction list.
-- estimateSize: 72px per row
-- overscan: 5 rows above/below viewport
-- Handles thousands of transactions efficiently
+### Deep dive 3: live updates without a socket per widget (3 min)
 
-### 2. Debounced Search
+| Option | Verdict |
+|--------|---------|
+| ✅ One `EventSource` per tab, `Last-Event-ID` resume | One-way and low volume; the browser reconnects and replays missed events; works through proxies as plain HTTP |
+| ⚠️ Polling only pending payments every 5 s | The fallback when SSE is blocked by a corporate proxy; cheap because few payments are pending |
+| ❌ WebSocket | Bidirectional and stateful for a stream that only flows one way; heartbeats and resume logic I'd have to build |
+| ❌ Polling the whole list | Thousands of requests per merchant per hour to notice a handful of changes |
 
-```
-User input ──▶ useDebouncedCallback(300ms) ──▶ setFilters ──▶ API call
-```
+Events are applied with `setQueryData` to `['payment', id]` and patched into any list page that contains the payment. If the server reports a gap it can't replay, I invalidate payment queries rather than trusting a partial history. Only one tab holds the connection — the others listen on a `BroadcastChannel` — so ten open tabs don't mean ten streams.
 
-Prevents excessive API calls during rapid typing.
+### Deep dive 4: a payments table that stays fast at 100,000 rows (2 min)
 
-### 3. Selective Store Subscriptions
+1. **Server-side filtering with cursor pagination.** Filters live in the URL; `useInfiniteQuery` loads 50 rows per page from `next_cursor`, with `keepPreviousData` so the table doesn't flash empty while new results load. Cursors stay stable when new payments arrive at the top; `OFFSET` pages would shift.
+2. **Virtualization.** Only the ~25 visible rows plus overscan are rendered, at a fixed row height. For accessibility I set `aria-rowcount` and `aria-rowindex`, use a roving `tabindex`, and scroll the focused row into view.
+3. **Prefetch on intent.** Hovering or focusing a row prefetches `['payment', id]`, so the detail view usually opens from cache.
+4. **Exports are server jobs.** "Export last quarter" starts a job and notifies when the file is ready; generating 200,000 rows of CSV in the browser would freeze the tab.
 
-```
-┌──────────────────────────────────────────────────────────────────────────┐
-│  Zustand Selector Pattern                                                 │
-├──────────────────────────────────────────────────────────────────────────┤
-│  const transactions = useTransactionStore(state => state.transactions);  │
-│  const isLoading = useTransactionStore(state => state.isLoading);         │
-│                                                                           │
-│  Component only re-renders when selected slice changes, not entire store │
-└──────────────────────────────────────────────────────────────────────────┘
-```
+### Deep dive 5: security checklist (2 min)
 
-### 4. Lazy Loading Routes
+- **No secret keys in the browser.** The dashboard authenticates with an `HttpOnly`, `SameSite=Lax` session cookie plus a CSRF header on mutations. A secret API key in `localStorage` would hand any XSS full control of the merchant's money.
+- **Merchant-supplied strings are attacker-controlled.** Descriptions, metadata and customer emails are rendered as text, never as HTML.
+- **Content-Security-Policy** with `script-src 'self'`; the dashboard sets `frame-ancestors 'none'` against clickjacking, while the card iframe allows framing by registered merchant origins only.
+- **`postMessage` discipline:** both sides check `event.origin` and accept only expected message types.
 
-```
-┌──────────────────────────────────────────────────────────────────────────┐
-│  Code Splitting with React.lazy                                           │
-├──────────────────────────────────────────────────────────────────────────┤
-│  const TransactionDetails = lazy(() => import('./transactions.$id'));    │
-│  const Analytics = lazy(() => import('./analytics'));                     │
-│  const Webhooks = lazy(() => import('./webhooks'));                       │
-│                                                                           │
-│  Routes loaded on-demand, reducing initial bundle size                    │
-└──────────────────────────────────────────────────────────────────────────┘
-```
+---
 
-## Trade-offs Summary
+## 🧯 Loading, Error and Empty States (2 min)
 
-| Decision | Pros | Cons |
-|----------|------|------|
-| Zustand over Context | Less boilerplate, selectors | Extra dependency |
-| Virtual scrolling | Handles 1000s of rows | More complex implementation |
-| Optimistic updates | Instant feedback | Rollback complexity |
-| Debounced search | Fewer API calls | Slight input lag |
-| Iframe for card input | PCI compliant | Cross-origin complexity |
+"In a payments UI, the error states are where trust is won or lost, so I design them first."
 
-## Future Frontend Enhancements
+| Situation | What the user sees | How |
+|-----------|--------------------|-----|
+| Checkout confirm times out | "Your payment is processing — don't pay again"; no Pay button | `202` or a timeout with the same key; wait for the result |
+| Card declined | Inline message on the card field, focus moved there, announced via `aria-live` | Decline codes mapped to plain language ("Your bank declined this card") |
+| 3-D Secure abandoned | "Verification was cancelled" with a Try again button | Same session key; retry resumes rather than creating a payment |
+| First load of the payments list | Skeleton rows at the real row height | `isPending` on the first page only |
+| Live connection lost | "Reconnecting… some statuses may be out of date" | `EventSource` retries; polling fallback for pending payments |
+| Refund exceeds refundable | "Only $30.00 can still be refunded" on the amount field | `422` problem code mapped to the field |
+| Session expires mid-refund | Login dialog over the form; the draft is still there | Draft and key in `sessionStorage`; resubmitted with the same key after login |
+| No payments yet | "No payments yet" with a link to the test-mode guide | The empty state is onboarding |
+| Filter matches nothing | "No payments match these filters" and a Clear filters button | An empty table looks like a bug |
 
-1. **Real-time Updates**: WebSocket connection for live transaction feed
-2. **Offline Support**: Service worker for dashboard caching
-3. **Export Features**: CSV/PDF export for transaction reports
-4. **Dark Mode**: Theme toggle with system preference detection
-5. **Mobile App**: React Native version for transaction monitoring
+---
+
+## ⚖️ Wrap-up (2 min)
+
+| Decision | ✅ Chosen | ❌ Alternative | Why |
+|----------|-----------|----------------|-----|
+| Card entry | Iframe from our domain + tokenization | Inputs in the merchant's page | Card data out of the merchant's reach; minimal PCI scope |
+| Double-charge protection | Idempotency key per checkout session and per refund draft | Disabled button only | Survives timeouts, retries and refreshes |
+| Money mutations | Pessimistic with honest pending states | Optimistic updates | The server can refuse; a wrong "Refunded" has real consequences |
+| Server state | TanStack Query; URL for filters | Copying server data into Zustand | Caching and invalidation without bespoke code |
+| Live updates | SSE with `Last-Event-ID`, polling fallback | WebSocket or polling everything | One-way stream with built-in resume |
+| Money representation | Integer minor units + currency, `Intl.NumberFormat` | Floats | No rounding drift; correct formatting per locale |
+| Large lists | Cursor pages + virtualization | Load all and filter | Constant DOM size at 100K rows |
+
+"With more time I'd add a test-mode toggle that switches the whole dashboard to test data with an unmistakable banner, saved views for the payments table, and real-user monitoring of checkout INP segmented by merchant, because a slow merchant page makes our checkout look slow."

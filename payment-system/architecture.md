@@ -1,812 +1,568 @@
-# Payment System - Architecture Design
+# Payment System — Architecture
 
 ## System Overview
 
-A transaction processing and payment platform that handles payment authorization, capture, refunds, and multi-currency conversions with built-in fraud detection. The system implements double-entry bookkeeping for financial integrity, idempotent payment processing, and webhook delivery for merchant notifications. Learning goals: financial transaction atomicity, ledger consistency, idempotency patterns, fraud scoring, and webhook reliability.
+A payment platform in the style of Stripe: merchants call an API to charge a customer's card, capture or void the authorization, refund it, and get webhooks as the payment moves through its life, while every movement of money is recorded in a double-entry ledger. The hard part is not throughput. It is **moving money exactly once** when every network hop can fail: a merchant retries after a timeout, the card processor (PSP) never answers, two refunds race, a process dies between the processor call and the database commit. The design answers that with three mechanisms that reinforce each other: **idempotency keys stored with the payment itself**, a **guarded payment state machine**, and an **append-only ledger whose balance the database enforces**.
+
+This document describes the production-scale design first, then — in [Implementation Notes](#implementation-notes) — what the local Express + PostgreSQL + Redis + RabbitMQ + React implementation actually does.
+
+**Learning goals**
+
+- Idempotency end to end: client key, server claim, processor reference, replay semantics.
+- Double-entry bookkeeping as a database invariant rather than an application convention.
+- A payment state machine whose transitions are compare-and-set, so races have exactly one winner.
+- Treating "the processor didn't answer" as a third outcome that is reconciled, never retried blindly.
+- At-least-once webhooks from a transactional outbox, with consumers that deduplicate.
 
 ## Requirements
 
-### Functional Requirements
+### Functional requirements
 
-- **Payment processing**: Authorize, capture, and settle payments via card networks and bank transfers
-- **Refunds**: Full and partial refunds with proper ledger accounting
-- **Multi-currency**: Support 10+ currencies with real-time exchange rate lookups
-- **Fraud detection**: Rule-based scoring with velocity checks and device fingerprinting
-- **Merchant management**: Onboarding, API key management, and webhook configuration
-- **Reconciliation**: Daily settlement reports and dispute handling
-- **Chargeback handling**: Dispute management with evidence tracking and resolution workflow
+1. **Create a payment**: authorize a card for an amount, optionally capturing immediately (`capture_method = automatic`) or later (`manual`).
+2. **Capture or void** an authorization; **refund** a captured payment fully or in parts.
+3. **Disputes**: record chargebacks and their outcome, with the money movement each implies.
+4. **Merchant balance and reports** derived from the ledger, plus a daily reconciliation against the processor's settlement file.
+5. **Webhooks** for every state change (`payment.captured`, `refund.succeeded`, ...), signed and retried.
+6. **Merchant dashboard**: search payments, see a payment's timeline and ledger entries, issue refunds.
 
-### Non-Functional Requirements
+Out of scope: payouts to merchant bank accounts, multi-currency conversion, subscriptions and invoicing, card vaulting beyond tokenization, and building the card network side of the processor.
+
+### Non-functional requirements
 
 | Requirement | Target |
 |-------------|--------|
-| Availability | 99.9% uptime (8.7 hours downtime/year) |
-| Authorization latency | p50 < 200ms, p99 < 800ms |
-| Throughput | 500 RPS sustained, burst to 2,000 RPS |
-| Consistency | Strong consistency for ledger writes; eventual consistency for analytics |
-| Idempotency | Every payment mutation must be safely retryable |
-| Durability | Zero lost transactions, complete audit trail for PCI-DSS compliance |
+| Payment API availability | 99.99% (about 52 minutes a year) |
+| Authorization latency | p99 < 1.5 s end to end; our own overhead p99 < 100 ms (the processor dominates) |
+| Duplicate charges | Zero: at most one processor authorization per payment, whatever the client retries |
+| Ledger correctness | Every journal balances, enforced at commit; account balances equal the sum of their entries |
+| Durability | A payment acknowledged to the merchant survives the loss of the primary database (synchronous replica) |
+| Unknown outcomes | Resolved within 5 minutes of the processor timing out |
+| Webhooks | At least once; 99% delivered within 1 minute to a healthy endpoint; retried for 3 days |
+| Audit | Seven-year retention of payments and ledger entries |
 
 ## Capacity Estimation
 
-### Production Scale
+| Quantity | Estimate | Design consequence |
+|----------|----------|--------------------|
+| Payments | 50M/day → ~580/s average, ~3,000/s peak (holiday spikes ~5×) | One primary handles it today; shard by merchant later |
+| API writes | ~2 per payment (create, then capture or refund for some) → ~1,200/s average | Stateless API tier, horizontal |
+| Processor calls | ~750/s average | Circuit breaker and bulkhead per processor |
+| Unknown outcomes | ~0.05% of calls time out → ~25,000/day | Small volume, but each is money at risk: the reconciler must be reliable, not fast |
+| Ledger entries | 3 per capture plus refunds and disputes → ~155M/day ≈ 25 GB/day with indexes | ~9 TB/year; partition monthly, archive after 13 months |
+| Payment rows | ~1 KB × 50M/day ≈ 50 GB/day | ~18 TB/year; 7-year retention lives mostly in cold storage |
+| Webhook events | ~3 per payment → ~150M/day, ~1,700/s average | Kafka partitions keyed by merchant; dispatcher pool scales with lag |
+| Hot ledger rows | Every capture credits platform revenue and debits receivables | ~3,000 updates/s on two rows at peak: shard system accounts (see [Scalability](#scalability-considerations)) |
 
-| Metric | Value | Sizing Implication |
-|--------|-------|-------------------|
-| Daily transactions | 2M | ~23 RPS average, 500 RPS peak |
-| Average payload | 2 KB | 4 GB/day ingress |
-| Transaction records | 60M/month | ~15 GB/month PostgreSQL growth |
-| Ledger entries | 180M/month (3x transactions) | ~25 GB/month |
-| Active merchants | 10,000 | Negligible metadata storage |
-| Webhook events | 4M/day | 100 RPS to webhook workers |
+The number that shapes the ledger design is the last one. A single PostgreSQL row can take roughly 1,000–2,000 locked updates per second, so a "platform revenue" account with a stored running balance becomes the bottleneck long before disk or CPU do.
 
 ### Local Development Scale
 
-| Metric | Value |
-|--------|-------|
-| Concurrent users | 2-5 |
-| Transactions/day | 100-500 |
-| API servers | 3 instances on ports 3001-3003 |
-| PostgreSQL | Single instance, 50 GB disk |
-| Valkey/Redis | 512 MB (rate limits, idempotency, sessions) |
-| RabbitMQ | 256 MB, 10K messages in flight max |
+One Express process, a reconciler process, two optional RabbitMQ workers (webhooks, async fraud), PostgreSQL, Redis and the Vite dev server; a few hundred payments a day from the dashboard's test-payment form and `curl`. `dev:server1..3` run extra API instances against the same database to exercise the concurrency guarantees. Ports and setup are in the [README](./README.md).
 
 ## High-Level Architecture
 
 ```
-┌──────────────────┐
-│   Merchant App   │
-│   / React SPA    │
-└────────┬─────────┘
-         │ HTTPS
-         ▼
-┌──────────────────────────────────────────────────┐
-│                  API Gateway / CDN                │
-│       (TLS Termination, Rate Limiting, WAF)       │
-└────────────────────────┬─────────────────────────┘
-                         │
-          ┌──────────────┼──────────────┐
-          ▼              ▼              ▼
-   ┌────────────┐ ┌────────────┐ ┌────────────┐
-   │ Payment    │ │ Payment    │ │ Payment    │
-   │ API Server │ │ API Server │ │ API Server │
-   │ (Node.js)  │ │ (Node.js)  │ │ (Node.js)  │
-   └──────┬─────┘ └──────┬─────┘ └──────┬─────┘
-          │              │              │
-          └──────────────┼──────────────┘
-                         │
-    ┌────────┬───────────┼───────────┬────────────┐
-    ▼        ▼           ▼           ▼            ▼
-┌────────┐ ┌────────┐ ┌────────┐ ┌──────────┐ ┌──────────────┐
-│Postgres│ │ Valkey  │ │RabbitMQ│ │ Fraud    │ │  Prometheus  │
-│(Primary│ │(Cache + │ │(Async  │ │ Service  │ │  + Grafana   │
-│+ Read  │ │ Locks)  │ │ Queue) │ │(Scoring) │ │              │
-│Replica)│ │         │ │        │ │          │ │              │
-└────────┘ └────────┘ └────┬───┘ └──────────┘ └──────────────┘
-                            │
-              ┌─────────────┼─────────────┐
-              ▼             ▼             ▼
-        ┌──────────┐ ┌──────────┐ ┌──────────────┐
-        │ Webhook  │ │  Fraud   │ │  Settlement  │
-        │ Worker   │ │  Worker  │ │  Worker      │
-        └──────────┘ └──────────┘ └──────────────┘
+  ┌───────────────────────────┐                           ┌───────────────────────────┐
+  │ Merchant backend          │                           │ Merchant dashboard (SPA)  │
+  │ server-side API client    │                           │ payments and refunds      │
+  └─────────────┬─────────────┘                           └─────────────┬─────────────┘
+                │ (1) POST /v1/payments                                 │ GET /v1/payments, refunds
+                │     Idempotency-Key: K                                │
+                ▼                                                       ▼
+  ┌───────────────────────────────────────────────────────────────────────────────────┐
+  │ API gateway · TLS · API keys and dashboard sessions · per-merchant rate limits    │
+  └────────────────────────────────────────┬──────────────────────────────────────────┘
+                                           ▼
+  ┌────────────────┐          ┌─────────────────────────┐ authorize(ref)  ┌────────────────┐
+  │ Redis          │ velocity │ Payment API             ├────────────────▶│ PSP / acquirer │
+  │ rate limits,   │◀─────────┤ idempotency, state      │                 │ card networks  │
+  │ fraud velocity │          │ machine, ledger posting │                 └────────────────┘
+  └────────────────┘          └────────────┬────────────┘                         ▲
+                                           │ 1 tx: payment, journal, outbox       │ (3) look up ref
+                                           ▼                         ┌────────────┴──────────┐
+                        ┌──────────────────────────────────┐         │ Reconciler            │
+                        │ PostgreSQL primary               │  apply  │ stuck 'pending' rows, │
+                        │ payments, ledger_entries, outbox │◀────────┤ settlement files      │
+                        └────────────────┬─────────────────┘ outcome └───────────────────────┘
+                                         │ (2) outbox relay publishes events
+                                         ▼
+                                ┌────────────────┐ consume  ┌────────────────────┐
+                                │ Kafka          ├─────────▶│ Webhook dispatcher │
+                                │ payment-events │          │ retries, then DLQ  │
+                                └────────────────┘          └─────────┬──────────┘
+                                                                      │ POST, HMAC-signed
+                                                                      ▼
+                                                            ┌────────────────────┐
+                                                            │ Merchant's webhook │
+                                                            │ endpoint (HTTPS)   │
+                                                            └────────────────────┘
 ```
 
-## Core Components
+1. **Create (1).** The merchant's server calls `POST /v1/payments` with an `Idempotency-Key`. The Payment API claims the key by inserting the payment as `pending` (a unique index on merchant and key decides who owns it), scores fraud using velocity counters in Redis, and asks the processor to authorize using the payment id as the processor's idempotency reference. It then commits the new status, the ledger journal and an outbox row in one PostgreSQL transaction and answers `201`.
+2. **Notify (2).** An outbox relay publishes committed outbox rows to Kafka. The webhook dispatcher signs each event with the merchant's secret and delivers it, retrying with backoff for three days before dead-lettering it.
+3. **Reconcile (3).** If the processor never answers, the payment stays `pending` and the merchant gets `202`. The reconciler finds payments stuck in `pending`, asks the processor what happened to that reference, and applies the answer through the same guarded transition. Once a day it also matches the processor's settlement file against the ledger.
 
-### 1. API Gateway
+| Component | Responsibility | Scales with | Notes |
+|-----------|----------------|-------------|-------|
+| API gateway | TLS, API-key and session auth, per-merchant rate limits | Requests | Rejects bad keys before they reach the Payment API |
+| Payment API | Idempotency claim, fraud rules, processor calls, state machine, ledger posting | Payment rate | Stateless; all state is in PostgreSQL |
+| PostgreSQL | Payments, refunds, ledger journals and entries, outbox | Writes (~1,200/s) | Source of truth; synchronous replica; shard by merchant later |
+| Redis | Rate-limit counters, fraud velocity windows | Requests | Not on the correctness path: losing it weakens fraud scoring, never duplicates a charge |
+| PSP / acquirer | Authorizes, captures and refunds on the card networks | — | External; every call carries our reference |
+| Reconciler | Resolves unknown outcomes; matches settlement files to the ledger | Stuck payments (~25K/day) | Several instances claim work with `SKIP LOCKED` |
+| Kafka · payment-events | Durable, replayable event log | Event rate | Partitioned by merchant so a merchant's events stay ordered |
+| Webhook dispatcher | Signs and delivers events, retries, dead-letters | Consumer lag | One slow merchant cannot block others: per-endpoint concurrency limits |
 
-The API gateway is the single entry point for all merchant traffic. In production, this is a managed gateway (AWS API Gateway, Kong, or Nginx Plus) that handles:
+The Payment API and the reconciler are the only writers of payment state, and both go through the same transition function. That is what lets a timeout, a crash and a retry all converge on one answer.
 
-- TLS termination and certificate management
-- Request rate limiting per merchant API key
-- Request routing to backend instances via round-robin
-- Request/response logging for audit
-- Web Application Firewall (WAF) rules for PCI-DSS compliance
+## Core Components / Request Flows
 
-### 2. Payment API Service (Stateless)
+### Payment state machine
 
-Handles the full payment lifecycle: authorize, capture, void, refund, and chargeback. Each instance is stateless -- all state lives in PostgreSQL and Valkey -- enabling horizontal scaling by adding instances behind the gateway.
+```
+ pending ──▶ authorized ──▶ captured ──▶ partially_refunded ──▶ refunded
+    │             │             │                                  ▲
+    ▼             ▼             └──────────────────────────────────┘
+  failed        voided
+```
 
-Key responsibilities:
-- Validate merchant API keys (bcrypt-hashed; the plaintext `Bearer pk_...` key is compared against stored hashes)
-- Enforce idempotency: check Valkey for existing key before processing
-- Acquire distributed locks to prevent concurrent processing of the same payment
-- Execute payment within a PostgreSQL transaction (transaction + ledger entries + audit log)
-- Publish events to RabbitMQ for async processing (webhooks, fraud scoring, settlement)
+Every status change is a compare-and-set: `UPDATE payments SET status = 'captured' ... WHERE id = $1 AND status = 'authorized'`. When two requests race — two captures, a capture and a void, the live request and the reconciler — exactly one `UPDATE` matches a row; the other sees zero rows, re-reads the payment and answers from its real state (a repeated capture returns the captured payment; a capture after a void is a `409`). No transition reads the status in one statement and writes it in another.
 
-### 3. PostgreSQL (Primary Data Store)
+**Only capture writes to the ledger.** An authorization is a hold on the customer's card: no money has moved, and a voided or expired hold never will. If authorization wrote entries, the books would show revenue the platform may never receive and every abandoned pre-order would need a compensating entry. Holds also expire (typically after 7 days), so `authorized_until` is tracked and a sweeper voids stale authorizations before the processor silently releases them.
 
-Stores all financial data with ACID guarantees:
-- **Transactions**: Payment records with status tracking
-- **Ledger entries**: Double-entry bookkeeping for every balance change
-- **Merchants**: Account configuration, API key hashes, webhook URLs
-- **Audit log**: Immutable record of every action for PCI-DSS Requirement 10
+### Creating a payment
 
-Uses SERIALIZABLE isolation for ledger writes to prevent phantom reads and ensure balance consistency.
+```
+Merchant                      Payment API                                PostgreSQL    PSP
+    │                              │                                          │         │
+    │ 1 POST /v1/payments (key K)  │                                          │         │
+    │─────────────────────────────▶│                                          │         │
+    │                              │ 2 INSERT pending ON CONFLICT DO NOTHING  │         │
+    │                              │─────────────────────────────────────────▶│         │
+    │                              │ 3 1 row: this request owns K             │         │
+    │                              │◀─────────────────────────────────────────│         │
+    │                              │ 4 fraud score (Redis velocity)           │         │
+    │                              │ 5 authorize(ref = payment id)                      │
+    │                              │───────────────────────────────────────────────────▶│
+    │                              │ 6 approved, psp_ref                                │
+    │                              │◀───────────────────────────────────────────────────│
+    │                              │ 7 1 tx: status, journal, outbox          │         │
+    │                              │─────────────────────────────────────────▶│         │
+    │ 8 201 {status: captured}     │                                          │         │
+    │◀─────────────────────────────│                                          │         │
+    │                              │                                          │         │
+```
 
-### 4. Valkey/Redis (Cache + Coordination)
+- **Step 2 is the idempotency claim.** `INSERT ... ON CONFLICT (merchant_id, idempotency_key) DO NOTHING` returns a row only to the first request. A later request with the same key reads the existing payment: same body (by SHA-256 fingerprint) → replay it with `Idempotent-Replayed: true`; different body → `422`; still `pending` → `409` with `Retry-After`.
+- **Step 5 carries our payment id as the processor's idempotency key**, so even a retry of the processor call cannot create a second authorization.
+- **Step 7 is one transaction**: the guarded `pending → authorized → captured` transitions, the capture journal (debit receivables for the gross, credit the merchant for the net, credit revenue for the fee) and the outbox row. If any part fails, none of it happened.
+- Fraud scoring runs before the processor call; a score above 90 fails the payment without calling out, and 70–90 asks the processor for 3-D Secure.
 
-- **Idempotency keys**: `SET idempotency:{merchant}:{key} {response} EX 86400` -- 24-hour TTL prevents duplicate charges
-- **Rate limit counters**: Sliding window using sorted sets with `ZRANGEBYSCORE`
-- **Distributed locks**: `SET lock:payment:{key} 1 NX EX 30` -- prevents concurrent processing
-- **Merchant config cache**: 5-minute TTL avoids DB round-trip on every request
-- **Exchange rate cache**: 5-minute TTL for FX lookups
+### When the processor doesn't answer
 
-### 5. RabbitMQ (Async Processing)
+```
+Merchant                     Payment API   PostgreSQL             PSP                Reconciler
+    │                             │             │                  │                      │
+    │ 1 POST /v1/payments, key K  │             │                  │                      │
+    │────────────────────────────▶│             │                  │                      │
+    │                             │ 2 authorize(ref = payment id)  │                      │
+    │                             │───────────────────────────────▶│                      │
+    │                             │ 3 no answer (timeout)          │                      │
+    │                             │◀───────────────────────────────│                      │
+    │ 4 202 {status: pending}     │             │                  │                      │
+    │◀────────────────────────────│             │                  │                      │
+    ····································· 30 s later ······································
+    │                             │             │ 5 claim rows (SKIP LOCKED)              │
+    │                             │             │◀────────────────────────────────────────│
+    │                             │             │                  │ 6 look up ref        │
+    │                             │             │                  │◀─────────────────────│
+    │                             │             │                  │ 7 approved, psp_ref  │
+    │                             │             │                  │─────────────────────▶│
+    │                             │             │ 8 guarded UPDATE + journal              │
+    │                             │             │◀────────────────────────────────────────│
+    ························· merchant retries with the same key ··························
+    │ 9 POST /v1/payments, key K  │             │                  │                      │
+    │────────────────────────────▶│             │                  │                      │
+    │ 10 200 replay: captured     │             │                  │                      │
+    │◀────────────────────────────│             │                  │                      │
+    │                             │             │                  │                      │
+```
 
-Topic exchange (`payment.events`) with routing keys:
+A timeout after the request was sent is **not** a decline: the processor may have authorized the card. Marking the payment `failed` invites the merchant to retry with a new key and charge twice; retrying the call with a new reference is the same mistake made by the server. So the payment stays `pending`, the merchant gets `202`, and the reconciler asks the processor about that exact reference:
 
-| Queue | Routing Key | Consumer | Purpose |
-|-------|-------------|----------|---------|
-| `webhook.delivery` | `payment.*`, `refund.*` | Webhook Worker | Deliver events to merchant endpoints |
-| `fraud.scoring` | `payment.authorized` | Fraud Worker | Async deep fraud analysis |
-| `settlement.batch` | `payment.captured` | Settlement Worker | Batch for daily settlement |
+| Processor says | Reconciler does |
+|----------------|-----------------|
+| Approved | Apply the approval: authorize, and capture with its journal if `capture_method` is automatic |
+| Declined | Fail the payment |
+| Never heard of it | Resubmit under the **same** reference; the processor deduplicates, so at most one authorization can exist |
+| Still no answer | Leave it for the next pass; alert if a payment stays `pending` for more than 5 minutes |
 
-Dead-letter queues (DLQ) handle messages that fail after 5 retries. DLQ messages are reviewed manually or re-queued after root cause fix.
+Claiming work is one statement — `UPDATE ... WHERE id IN (SELECT ... FOR UPDATE SKIP LOCKED) RETURNING *` — that also bumps `updated_at` as a lease, so several reconcilers never pick the same payment and a live request still inside its first 30 seconds is left alone. If the circuit breaker is open, the request never left our process; that is a known non-attempt, safe to report as `failed`.
 
-### 6. Background Workers
+### Refunding a payment
 
-- **Webhook Worker**: Delivers payment events to merchant endpoints with HMAC-SHA256 signatures. Exponential backoff retry: 1s, 5s, 30s, 2min, 10min, then DLQ.
-- **Fraud Worker**: Deep fraud analysis post-authorization. Checks velocity patterns, device fingerprints, geolocation anomalies. Can trigger auto-void if score exceeds threshold.
-- **Settlement Worker**: Batches captured transactions by merchant and currency for daily settlement file generation.
+```
+ Dashboard                               Payment API                                    PostgreSQL
+     │                                        │                                              │
+     │ 1 POST /payments/{id}/refunds, key R   │                                              │
+     │───────────────────────────────────────▶│                                              │
+     │                                        │ 2 BEGIN; SELECT payment FOR UPDATE           │
+     │                                        │─────────────────────────────────────────────▶│
+     │                                        │ 3 captured 10,000 (later refunds wait here)  │
+     │                                        │◀─────────────────────────────────────────────│
+     │                                        │ 4 refund with key R exists? (replay)         │
+     │                                        │─────────────────────────────────────────────▶│
+     │                                        │ 5 SUM(refunds): 7,000 refundable             │
+     │                                        │─────────────────────────────────────────────▶│
+     │                                        │ 6 INSERT refund, journal, status, outbox     │
+     │                                        │─────────────────────────────────────────────▶│
+     │                                        │ 7 COMMIT (trigger: journal balances)         │
+     │                                        │─────────────────────────────────────────────▶│
+     │ 8 201 refund | 422 exceeds refundable  │                                              │
+     │◀───────────────────────────────────────│                                              │
+     │                                        │                                              │
+```
+
+- **The row lock serializes refunds of one payment.** Without it, two partial refunds both read "7,000 refundable", both pass the check and refund 14,000. With `SELECT ... FOR UPDATE`, the second waits, then sees the first refund and is rejected with `422`.
+- Pending refunds count against the refundable amount; only succeeded refunds count when computing the fee to return.
+- **Fee rounding is cumulative**: each partial refund returns `round(fee × refunded_after / amount) − round(fee × refunded_before / amount)`, so a series of partial refunds that adds up to the full amount returns exactly the original fee — no cent lost to rounding.
+- The refund's idempotency key is checked under the same lock, so a retry finds the refund it already created.
+
+### Delivering webhooks
+
+```
+Outbox relay                      Kafka     Dispatcher                  Merchant
+      │                             │            │                          │
+      │ 1 publish payment.captured  │            │                          │
+      │────────────────────────────▶│            │                          │
+      │ 2 ack: mark row sent        │            │                          │
+      │◀────────────────────────────│            │                          │
+      │                             │ 3 consume  │                          │
+      │                             │◀───────────│                          │
+      │                             │            │ 4 POST, signed           │
+      │                             │            │─────────────────────────▶│
+      │                             │            │ 5 503 or timeout         │
+      │                             │            │◀─────────────────────────│
+      │                             │            │ 6 backoff, up to 3 days  │
+      │                             │            │ 7 POST same event_id     │
+      │                             │            │─────────────────────────▶│
+      │                             │            │ 8 200, dedupes event_id  │
+      │                             │            │◀─────────────────────────│
+      │                             │            │                          │
+```
+
+Events are written to the outbox inside the transaction that changed the payment, so an event exists if and only if the change committed. The relay marks rows sent only after Kafka acknowledges them; a crash in between republishes, and every event carries a stable `event_id` that merchants deduplicate on. Each delivery is signed with `HMAC-SHA256(secret, timestamp + "." + body)`; merchants reject signatures older than five minutes to stop replays. After three days of failures the event goes to a dead-letter store and the dashboard shows the endpoint as failing; merchants can always catch up from `GET /v1/events`.
 
 ## Database Schema
 
+### Production schema
+
+PostgreSQL holds everything that must be correct. Money is `BIGINT` minor units (cents) everywhere; floats never touch an amount.
+
 ```sql
-CREATE TABLE merchants (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    name VARCHAR(255) NOT NULL,
-    email VARCHAR(255) UNIQUE NOT NULL,
-    api_key_hash VARCHAR(255) NOT NULL,  -- bcrypt hash of the pk_ API key
-    webhook_url TEXT,
-    webhook_secret VARCHAR(64),
-    status VARCHAR(20) DEFAULT 'active',  -- active, suspended, closed
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    updated_at TIMESTAMPTZ DEFAULT NOW()
+CREATE TABLE accounts (
+  id          UUID PRIMARY KEY,
+  owner_id    UUID,                          -- merchant id; NULL for platform accounts
+  kind        TEXT NOT NULL,                 -- receivable, merchant_payable, fee_revenue, ...
+  shard       SMALLINT NOT NULL DEFAULT 0,   -- platform accounts are split into 64 shards
+  currency    CHAR(3) NOT NULL,
+  balance     BIGINT NOT NULL DEFAULT 0,     -- credit-positive; always = signed sum of entries
+  UNIQUE (owner_id, kind, shard, currency)
 );
 
-CREATE TABLE customers (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    merchant_id UUID NOT NULL REFERENCES merchants(id),
-    external_id VARCHAR(255),  -- Merchant's customer ID
-    email VARCHAR(255),
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    UNIQUE(merchant_id, external_id)
+CREATE TABLE payments (
+  id               UUID PRIMARY KEY,         -- also the processor idempotency reference
+  merchant_id      UUID NOT NULL,
+  idempotency_key  TEXT,
+  request_hash     CHAR(64),                 -- SHA-256 of the creating request
+  amount           BIGINT NOT NULL CHECK (amount > 0),
+  currency         CHAR(3) NOT NULL,
+  status           TEXT NOT NULL CHECK (status IN ('pending', 'authorized', 'captured',
+                     'partially_refunded', 'refunded', 'voided', 'failed')),
+  capture_method   TEXT NOT NULL DEFAULT 'automatic',
+  psp_reference    TEXT,
+  authorized_until TIMESTAMPTZ,              -- hold expiry
+  reconcile_attempts INT NOT NULL DEFAULT 0,
+  version          INT NOT NULL DEFAULT 0,
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (merchant_id, idempotency_key)      -- the idempotency claim
+);
+CREATE INDEX payments_stuck ON payments (updated_at) WHERE status = 'pending';
+
+CREATE TABLE refunds (
+  id               UUID PRIMARY KEY,
+  payment_id       UUID NOT NULL REFERENCES payments(id),
+  merchant_id      UUID NOT NULL,
+  idempotency_key  TEXT,
+  request_hash     CHAR(64),
+  amount           BIGINT NOT NULL CHECK (amount > 0),
+  status           TEXT NOT NULL CHECK (status IN ('pending', 'succeeded', 'failed')),
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (merchant_id, idempotency_key)
 );
 
-CREATE TABLE payment_methods (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    customer_id UUID NOT NULL REFERENCES customers(id),
-    type VARCHAR(20) NOT NULL,  -- card, bank_account
-    last_four VARCHAR(4),
-    brand VARCHAR(20),  -- visa, mastercard, amex
-    exp_month INTEGER,
-    exp_year INTEGER,
-    token_vault_ref VARCHAR(255),  -- Reference to secure vault
-    is_default BOOLEAN DEFAULT false,
-    created_at TIMESTAMPTZ DEFAULT NOW()
-);
-
-CREATE TABLE transactions (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    merchant_id UUID NOT NULL REFERENCES merchants(id),
-    customer_id UUID REFERENCES customers(id),
-    payment_method_id UUID REFERENCES payment_methods(id),
-
-    -- Idempotency
-    idempotency_key VARCHAR(255),
-
-    -- Amounts (stored in smallest currency unit, e.g., cents)
-    amount BIGINT NOT NULL,
-    currency VARCHAR(3) NOT NULL,  -- ISO 4217
-    captured_amount BIGINT DEFAULT 0,
-    refunded_amount BIGINT DEFAULT 0,
-
-    -- Status tracking
-    status VARCHAR(20) NOT NULL,  -- pending, authorized, captured, voided, failed, refunded
-    failure_code VARCHAR(50),
-    failure_message TEXT,
-
-    -- External references
-    processor_ref VARCHAR(255),  -- Payment processor transaction ID
-
-    -- Fraud scoring
-    fraud_score INTEGER,  -- 0-100
-    fraud_flags JSONB DEFAULT '[]',
-
-    -- Metadata
-    description TEXT,
-    metadata JSONB DEFAULT '{}',
-
-    created_at TIMESTAMPTZ DEFAULT NOW(),
-    updated_at TIMESTAMPTZ DEFAULT NOW(),
-
-    UNIQUE(merchant_id, idempotency_key)
+CREATE TABLE journals (
+  id          UUID PRIMARY KEY,
+  payment_id  UUID NOT NULL REFERENCES payments(id),
+  kind        TEXT NOT NULL,                 -- capture, refund, chargeback, chargeback_reversal
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE TABLE ledger_entries (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    transaction_id UUID NOT NULL REFERENCES transactions(id),
+  id          BIGINT GENERATED ALWAYS AS IDENTITY,
+  journal_id  UUID NOT NULL REFERENCES journals(id),
+  account_id  UUID NOT NULL REFERENCES accounts(id),
+  direction   TEXT NOT NULL CHECK (direction IN ('debit', 'credit')),
+  amount      BIGINT NOT NULL CHECK (amount > 0),
+  currency    CHAR(3) NOT NULL,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (id, created_at)
+) PARTITION BY RANGE (created_at);
+-- Plus: a DEFERRABLE INITIALLY DEFERRED constraint trigger that rejects any journal
+-- whose debits and credits differ at COMMIT, and a trigger that rejects UPDATE/DELETE.
 
-    -- Double-entry bookkeeping
-    entry_type VARCHAR(20) NOT NULL,  -- debit, credit
-    account_type VARCHAR(30) NOT NULL,  -- merchant_balance, platform_fee, processor_cost, customer_refund
-
-    amount BIGINT NOT NULL,
-    currency VARCHAR(3) NOT NULL,
-
-    -- Running balance for account
-    balance_after BIGINT,
-
-    created_at TIMESTAMPTZ DEFAULT NOW()
+CREATE TABLE outbox (
+  id           BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  event_id     UUID NOT NULL UNIQUE,
+  merchant_id  UUID NOT NULL,
+  type         TEXT NOT NULL,                -- payment.captured, refund.succeeded, ...
+  payload      JSONB NOT NULL,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  published_at TIMESTAMPTZ
 );
-CREATE INDEX idx_ledger_transaction ON ledger_entries(transaction_id);
-CREATE INDEX idx_ledger_account ON ledger_entries(account_type, created_at);
-
-CREATE TABLE webhooks (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    merchant_id UUID NOT NULL REFERENCES merchants(id),
-    transaction_id UUID NOT NULL REFERENCES transactions(id),
-
-    event_type VARCHAR(50) NOT NULL,  -- payment.authorized, payment.captured, payment.failed, refund.created
-    payload JSONB NOT NULL,
-
-    -- Delivery tracking
-    status VARCHAR(20) DEFAULT 'pending',  -- pending, delivered, failed
-    attempts INTEGER DEFAULT 0,
-    last_attempt_at TIMESTAMPTZ,
-    next_retry_at TIMESTAMPTZ,
-    last_response_code INTEGER,
-    last_error TEXT,
-
-    created_at TIMESTAMPTZ DEFAULT NOW()
-);
-CREATE INDEX idx_webhooks_pending ON webhooks(status, next_retry_at) WHERE status != 'delivered';
-
-CREATE TABLE audit_log (
-    id BIGSERIAL PRIMARY KEY,
-    entity_type VARCHAR(50) NOT NULL,  -- transaction, merchant, refund
-    entity_id UUID NOT NULL,
-    action VARCHAR(50) NOT NULL,  -- created, status_changed, refunded
-    actor_type VARCHAR(20),  -- api_key, admin, system
-    actor_id VARCHAR(255),
-    changes JSONB,
-    ip_address INET,
-    user_agent TEXT,
-    created_at TIMESTAMPTZ DEFAULT NOW()
-);
-CREATE INDEX idx_audit_entity ON audit_log(entity_type, entity_id);
-CREATE INDEX idx_audit_time ON audit_log(created_at);
-
--- Indexes for common queries
-CREATE INDEX idx_transactions_merchant ON transactions(merchant_id, created_at DESC);
-CREATE INDEX idx_transactions_status ON transactions(status, created_at DESC);
-CREATE INDEX idx_transactions_idempotency ON transactions(idempotency_key) WHERE idempotency_key IS NOT NULL;
+CREATE INDEX outbox_unpublished ON outbox (id) WHERE published_at IS NULL;
 ```
 
-### Storage Strategy
+Two schema decisions matter more than they look:
 
-| Data Type | Storage | Rationale |
-|-----------|---------|-----------|
-| Transactions & Ledger | PostgreSQL | ACID compliance, complex queries for reconciliation |
-| Idempotency keys | Valkey (24h TTL) | Fast lookups, auto-expiry |
-| Rate limit counters | Valkey | Atomic increments, sliding window support |
-| Session data | Valkey (1h TTL) | Fast access, ephemeral |
-| Webhook payloads | PostgreSQL + RabbitMQ | Durability for retry; queue for delivery |
-| Audit logs | PostgreSQL | Queryable, long-term retention |
+- **The idempotency key lives on the payment row**, not in a separate cache with a TTL. The claim, the payment and the money movement are in one database, so a key cannot be "forgotten" while its payment exists, and a retry a week later still replays instead of charging again.
+- **`payments` cannot be range-partitioned by time** while `UNIQUE (merchant_id, idempotency_key)` must hold across all time: PostgreSQL requires the partition key in every unique index. Payments are sharded by `merchant_id` instead; the append-only `ledger_entries` table, which needs no business-level unique key, is the one partitioned by month.
+
+### Local schema
+
+The local schema is [`backend/src/db/init.sql`](./backend/src/db/init.sql); every statement is guarded, so it can be applied repeatedly to a fresh or existing database. It maps to the production design like this:
+
+| Production | Local | Difference |
+|------------|-------|------------|
+| `payments` | `transactions` | Same idempotency columns (`idempotency_key`, `request_hash`, unique per merchant), `auto_capture` instead of `capture_method`, `processor_ref`, `reconcile_attempts`, a `CHECK` on status; no `authorized_until` |
+| `journals` + `ledger_entries` | `ledger_entries` with a `journal_id` column | No separate journals table; the same deferred balance trigger and append-only trigger; not partitioned; entries also carry `balance_after` |
+| `accounts` (sharded) | `accounts` | Three platform accounts plus one per merchant, no shards; credit-positive balances |
+| `refunds` | `refunds` | Unique `(merchant_id, idempotency_key)`, `request_hash`; statuses `pending`/`completed`/`failed` |
+| `outbox` | — | Not implemented: events are published to RabbitMQ after commit |
+| Chargebacks, webhook deliveries, audit | `chargebacks`, `webhook_deliveries`, `audit_log` | Same idea |
 
 ## API Design
 
-### Authentication
-
-API key in `Authorization: Bearer pk_xxx` header. Keys are generated with a `pk_` prefix at merchant creation and hashed with bcrypt before storage -- the plaintext key is shown to the merchant only once. Authentication compares the presented key against stored bcrypt hashes of active merchants. (A production system would add `sk_live_*`/`sk_test_*` environment prefixes and an indexed key-id lookup rather than scanning; the local build keeps the single `pk_` scheme.)
-
-### Core Endpoints
+### Production API
 
 ```
-POST   /v1/payments              # Create and authorize a payment
-POST   /v1/payments/:id/capture  # Capture an authorized payment
-POST   /v1/payments/:id/void     # Void an authorized payment
-POST   /v1/payments/:id/refund   # Refund a captured payment
-GET    /v1/payments/:id          # Get payment details
-GET    /v1/payments              # List payments (paginated)
-
-POST   /v1/customers             # Create customer
-GET    /v1/customers/:id         # Get customer
-POST   /v1/customers/:id/payment_methods  # Add payment method
-
-GET    /v1/merchants/me          # Current merchant profile
-PATCH  /v1/merchants/me          # Update webhook URL, etc.
-
-# Admin endpoints (session auth)
-GET    /v1/admin/transactions    # Search/filter transactions
-GET    /v1/admin/merchants       # List merchants
-POST   /v1/admin/merchants/:id/suspend  # Suspend merchant
-GET    /v1/admin/reconciliation  # Daily settlement reports
+POST /v1/payments                  Idempotency-Key → 201 | 202 pending | 200 replay | 409 in progress | 422 key reused
+GET  /v1/payments?status&cursor    merchant's payments, newest first (keyset pagination)
+GET  /v1/payments/{id}             current state, timeline, refundable amount
+POST /v1/payments/{id}/capture     authorized → captured; repeat → 200; wrong state → 409
+POST /v1/payments/{id}/void        authorized → voided; repeat → 200; wrong state → 409
+POST /v1/payments/{id}/refunds     Idempotency-Key, amount ≤ refundable → 201 | 422
+GET  /v1/events?after={event_id}   the same events webhooks deliver, for catching up
+GET  /v1/balance                   merchant balance, derived from the ledger
 ```
 
-## Request Flows
+- **`202 Accepted`** means "we don't know yet": the processor did not answer. The body is the `pending` payment; the client polls or waits for the webhook, and may safely retry with the same key.
+- **Errors** are `application/problem+json` with a machine-readable `code` (`invalid_state`, `amount_exceeds_refundable`, `idempotency_key_reused`, `request_in_progress`).
+- **Amounts** are integers in minor units with an explicit currency; the API rejects fractional or negative amounts at the boundary.
 
-### Payment Authorization Flow
+### Local routes
 
-```
-1. Client ──▶ API Server: POST /v1/payments (with Idempotency-Key header)
-
-2. API Server:
-   a. Validate API key ──▶ fetch merchant from cache or DB
-   b. Check Valkey for existing idempotency key
-      - If exists: return cached response (no processing)
-   c. Acquire distributed lock: SET lock:payment:{key} 1 NX EX 30
-   d. Validate request payload
-   e. Rate limit check (Valkey sliding window)
-
-3. API Server ──▶ Fraud Service (inline, <50ms budget):
-   a. Calculate fraud score based on:
-      - Velocity (transactions per hour for this card)
-      - Device fingerprint match
-      - Geolocation vs billing address
-   b. If score > 80: auto-decline
-
-4. API Server ──▶ PostgreSQL (single transaction):
-   BEGIN;
-   INSERT INTO transactions (...) VALUES (...);
-   INSERT INTO ledger_entries (...) VALUES (...);  -- Hold funds
-   INSERT INTO audit_log (...) VALUES (...);
-   COMMIT;
-
-5. API Server ──▶ Valkey:
-   SET idempotency:{merchant}:{key} {response} EX 86400
-
-6. API Server ──▶ RabbitMQ:
-   Publish to webhook.delivery queue
-   Publish to fraud.scoring queue (async deep analysis)
-
-7. API Server ──▶ Client: 201 Created with payment object
-
-8. Release distributed lock
-```
-
-### Refund Flow
-
-```
-1. Client ──▶ API Server: POST /v1/payments/:id/refund { amount: 2500 }
-
-2. API Server:
-   a. Validate API key and ownership of transaction
-   b. Acquire lock: SET lock:refund:{transaction_id} 1 NX EX 30
-   c. Validate: captured_amount - refunded_amount >= requested_amount
-
-3. API Server ──▶ PostgreSQL (single transaction):
-   BEGIN;
-   UPDATE transactions SET refunded_amount = refunded_amount + 2500;
-   INSERT INTO ledger_entries (...);  -- Credit customer, debit merchant
-   INSERT INTO audit_log (...);
-   COMMIT;
-
-4. API Server ──▶ RabbitMQ:
-   Publish refund.created webhook event
-
-5. Return updated payment object
-```
+| Method | Path | Behavior |
+|--------|------|----------|
+| POST | `/api/v1/merchants` | Public signup → `201` with the API key, shown once |
+| GET, PATCH, POST | `/api/v1/merchants/me`, `/me/stats`, `/me/volume`, `/me/webhook`, `/me/rotate-key` | Profile, dashboard stats, webhook URL, key rotation |
+| POST | `/api/v1/payments` | Optional `Idempotency-Key` (1–64 chars); amount 50–99,999,999 cents → `201`, `202` pending, `200` replay, `400`, `409` in progress, `422` key reused |
+| GET | `/api/v1/payments`, `/:id`, `/:id/refunds`, `/:id/ledger` | List (`limit`/`offset`), detail, refunds, ledger entries; owner only (`403` otherwise) |
+| POST | `/api/v1/payments/:id/capture`, `/:id/void` | Guarded transition → `200` (also on repeat), `404`, `409` |
+| POST | `/api/v1/payments/:id/refund` | Optional key; amount defaults to the remainder → `201`, `200` replay, `404`, `409`, `422` |
+| GET, POST | `/api/v1/refunds`, `/api/v1/chargebacks`, `/:id/respond` | Lists and details; dispute response is a stub |
+| GET | `/api/v1/ledger/verify`, `/summary` | Debit/credit totals, unbalanced journals, account drift |
+| GET | `/health`, `/health/live`, `/health/ready`, `/metrics` | Operations |
 
 ## Key Design Decisions
 
-### Transaction Consistency (Double-Entry Ledger)
+### 1. Idempotency lives in PostgreSQL, next to the money
 
-**Problem**: Payment operations must be atomic -- we cannot have partial state where money is debited but the transaction record is missing.
+A payment API's worst failure is charging a customer twice, and the classic cause is a client retrying after a timeout. The idempotency record must therefore be at least as durable as the payment it protects, and it must be claimed atomically. A Redis cache with a 24-hour TTL fails on both counts: an `appendonly everysec` Redis can lose the last second of claims in a crash, and a key that expires while its payment lives means a retry next week charges again. Putting the key on the payment row turns the claim into a unique-index insert in the same database as the money movement — exactly one of N concurrent requests wins, with no second system to keep consistent. The cost is a database round trip on every create (about 1 ms, against a 300–800 ms processor call) and a unique index that grows with the payments table, which is why payments are sharded by merchant rather than range-partitioned by time.
 
-**Chosen: Double-entry bookkeeping within PostgreSQL transactions.** Every balance change creates paired debit/credit entries in the `ledger_entries` table. The transaction record captures the business event; the ledger entries capture the accounting impact. If the ledger ever disagrees with the expected balance, we know something went wrong.
+### 2. The ledger's balance is a database invariant
 
-**Why not event sourcing?** Event sourcing would provide a complete replay log, but adds significant complexity: event store, projection rebuilding, eventual consistency between views. For a payment system where we need immediate balance consistency, a relational ledger within ACID transactions is simpler and equally correct. Event sourcing makes more sense when the domain has complex state transitions (e.g., order management with many status changes) rather than the straightforward debit/credit pattern of payments.
+Every movement of money is a journal: entries that sum to zero. Checking that in application code works until someone adds a new journal type or a hand-written migration posts one entry of a pair — and an unbalanced ledger is discovered weeks later at month-end close, when nobody remembers why. A deferred constraint trigger checks each journal at `COMMIT`, after all its entries exist, and aborts the whole transaction if debits and credits differ; a second trigger makes entries append-only, so corrections are reversing journals and history is never edited. The alternative — a single mutable `balance` column per account — is cheaper to write but has no audit trail and cannot be reconciled after a bug. What we give up is write amplification (three entries and three balance updates per capture instead of one `UPDATE`) and a hot-row problem on platform accounts, addressed in [Scalability](#scalability-considerations).
 
-### Idempotency Storage in Valkey
+### 3. Timeouts are a third outcome, resolved by reconciliation
 
-**Problem**: Network timeouts, client retries, and load balancer retries can cause duplicate payment processing. A customer charged twice is the worst possible payment system failure.
+Treating a processor timeout as a decline is the most common way payment systems double-charge. The processor may have approved the card; we just never heard. If we mark the payment failed, the merchant retries under a new key and the customer has two holds. If the server retries the processor call under a new reference, the same thing happens one layer down. So the processor call carries our payment id as its idempotency reference, a timeout leaves the payment `pending` with a `202`, and the reconciler resolves it by asking the processor about that reference — resubmitting under the same reference only if the processor has never heard of it. What we give up is a clean synchronous answer: the merchant must handle `202` and wait for a webhook, and a small fraction of customers see "processing" for up to a few minutes.
 
-**Chosen: Valkey with 24-hour TTL for idempotency keys.** The server checks Valkey before beginning any processing. If the key exists, the cached response is returned immediately. Keys are scoped per merchant (`idempotency:{merchant_id}:{key}`) to prevent cross-merchant collisions.
+### 4. Compare-and-set transitions instead of read-then-write
 
-**Why Valkey instead of PostgreSQL?** Idempotency checks happen on every mutation request, before the business logic begins. A Valkey GET is sub-millisecond; a PostgreSQL query adds 1-5ms. Since idempotency keys are ephemeral (24h TTL), they do not warrant permanent storage. The trade-off: if Valkey loses data (restart without persistence), a small window of duplicate risk exists. We mitigate this by also storing the idempotency key in the transactions table (`UNIQUE(merchant_id, idempotency_key)`) as a database-level fallback.
+The original failure mode is easy to write: read the payment, check `status = 'authorized'`, then post the capture journal and update the status. Two concurrent captures both pass the check and post two journals — the merchant is credited twice for one payment. Wrapping the read in `SELECT ... FOR UPDATE` would work but holds a row lock across the processor call. A guarded `UPDATE ... WHERE status = 'authorized' RETURNING *` inside the ledger transaction makes the transition itself the check: one request matches the row and posts the journal; the other matches nothing and answers from the current state. Refunds are the exception, because their guard is an amount ("refunded so far + this ≤ captured") rather than a status, so they take the row lock — briefly, and never across a network call.
 
-### Sync Fraud Scoring with Async Deep Analysis
+### 5. A transactional outbox for events, at-least-once webhooks
 
-**Problem**: Fraud checks must be fast enough to fit within the authorization latency budget, but thorough enough to catch sophisticated attacks.
+Publishing an event to the broker after the database commit is a dual write: a crash between the two loses the event, and publishing before the commit can announce a payment that then rolls back. Writing the event into an outbox table in the same transaction as the state change, and relaying it to Kafka afterwards, makes the event exist exactly when the change does. Delivery is then at least once — the relay or the dispatcher may send an event twice — so every event carries a stable `event_id` and the contract tells merchants to deduplicate on it. The cost is a relay process to operate and a few hundred milliseconds of extra latency on webhooks.
 
-**Chosen: Two-phase approach.** Phase 1 runs inline during authorization with a 50ms budget -- velocity checks, device fingerprint matching, geolocation comparison. If the score exceeds 80, the payment is auto-declined. Phase 2 runs asynchronously via the fraud worker, performing deeper analysis (cross-merchant velocity, network graph analysis) that can take seconds.
+### 6. A circuit breaker on the processor, designed with idempotency
 
-**Why not fully async?** Allowing a fraudulent payment through and reversing it later damages merchant trust and creates chargeback costs. The inline check catches 90%+ of fraud at minimal latency cost. The async check catches the remaining sophisticated attacks within minutes, enabling manual review or auto-void before settlement.
-
-### Webhook Delivery via Message Queue
-
-**Problem**: Merchants need real-time notification of payment events, but webhook delivery is inherently unreliable (merchant servers may be down, slow, or returning errors).
-
-**Chosen: RabbitMQ with dedicated webhook workers.** Payment events are published to the `webhook.delivery` queue immediately after the payment transaction commits. The webhook worker delivers events with exponential backoff (1s, 5s, 30s, 2min, 10min) and moves permanently failed events to a DLQ.
-
-**Why not deliver webhooks inline during the payment request?** If the merchant's webhook endpoint is slow (5+ seconds) or down, the payment authorization would either timeout or fail. By decoupling via a queue, the payment response returns in <800ms regardless of webhook endpoint health. The trade-off is eventual delivery -- merchants may receive the webhook seconds after the payment, not simultaneously.
+When the processor degrades, a plain timeout means every in-flight payment holds a connection for the full timeout; the pool drains, and unrelated endpoints (dashboard reads, refunds) start failing. A breaker that opens after five consecutive failures rejects new authorizations in microseconds, keeping the blast radius on the payment path; a half-open probe after 30 seconds recovers automatically. The two designs depend on each other: fail-fast rejection makes client retries more likely, and the idempotency key is what makes those retries safe. A rejection by the open breaker is a known non-attempt, so it is the one processor failure that may be reported as `failed`.
 
 ## Consistency and Idempotency
 
-### Idempotency Semantics
+| Operation | Guarantee | Mechanism |
+|-----------|-----------|-----------|
+| Create payment | At most one payment and one processor authorization per (merchant, key) | Unique-index claim on the payment row; payment id as the processor reference |
+| Retry with the same key | Replays the payment's current state; `409` while pending; `422` for a different body | `request_hash` fingerprint compared on conflict |
+| Capture / void | Exactly one transition and one capture journal under any concurrency | Compare-and-set `UPDATE ... WHERE status = ...` inside the ledger transaction |
+| Refund | Refunded total never exceeds the captured amount | `SELECT ... FOR UPDATE` on the payment; key checked under the lock |
+| Ledger | Every journal balances; entries are never edited | Deferred constraint trigger; append-only trigger |
+| Account balances | Equal the signed sum of their entries | Updated in the journal's transaction; nightly drift check |
+| Unknown outcome | Converges to the processor's answer exactly once | Reconciler with `SKIP LOCKED` leases and the same guarded transitions |
+| Events and webhooks | Emitted if and only if the change committed; delivered at least once | Transactional outbox; stable `event_id`; consumer deduplication |
 
-- Keys are scoped per merchant (same key from different merchants = different operations)
-- Keys expire after 24 hours (Valkey TTL)
-- Subsequent requests with the same key return the cached response without reprocessing
-- If the original request failed, the key is not cached (failure is not idempotent -- the client can retry)
-- A distributed lock prevents concurrent processing of the same idempotency key
+Reads are strongly consistent on the primary for anything that feeds a money decision (the refundable amount, the current status). Dashboards and reports may read replicas, which lag by well under a second.
 
-### Multi-Currency Handling
+## Security / Auth
 
-- All amounts stored in smallest currency unit (cents, pence, yen)
-- Exchange rates fetched from external service and cached in Valkey for 5 minutes
-- Merchant settles in their configured currency
-- FX conversion happens at capture time; the locked rate is stored on the transaction record
-
-## Security
-
-### Authentication and Authorization
-
-| Endpoint Type | Auth Method | Details |
-|--------------|-------------|---------|
-| Merchant API | API Key (Bearer token) | `sk_live_*` / `sk_test_*` prefixes |
-| Admin Dashboard | Session cookie | Express-session + Valkey store |
-| Webhook verification | HMAC-SHA256 signature | Shared secret per merchant |
-
-### API Key Management
-
-API keys are generated with `crypto.randomBytes(24).toString('base64url')` and prefixed with `sk_live_` or `sk_test_`. Only the SHA-256 hash is stored. The plaintext key is returned to the merchant once at creation and never stored.
-
-### RBAC for Admin Operations
-
-```
-support:    read:transactions, read:merchants
-operations: read:transactions, read:merchants, write:refunds
-admin:      read:*, write:*, manage:merchants
-```
-
-### Data Protection
-
-- Card numbers never stored; tokenized via payment processor reference
-- PII encrypted at rest (PostgreSQL pgcrypto for email/name)
-- TLS 1.3 for all external communication
-- API keys hashed with SHA-256 before storage
+- **Merchant API keys** are high-entropy random secrets of the form `sk_live_<key_id>_<secret>`. The `key_id` is indexed, so authentication is one lookup, and the secret is stored as SHA-256 — sufficient for 256-bit random secrets; slow hashes like bcrypt exist for low-entropy passwords. Publishable keys (`pk_`) can only tokenize cards from the browser.
+- **The dashboard** uses a session cookie (`HttpOnly`, `Secure`, `SameSite=Lax`) and role-based permissions (support can read, operations can refund, admins manage merchants). Secret API keys never reach the browser.
+- **Authorization:** every payment, refund and ledger read is scoped to the authenticated merchant; platform-wide ledger reports are an internal role only.
+- **Card data** is entered in an iframe served from the platform's domain and tokenized there, so raw card numbers never touch the merchant's servers or the Payment API (PCI scope stays in the vault).
+- **Webhooks** are signed with a per-merchant secret over timestamp and body; merchants verify the signature and reject stale timestamps.
+- **Audit:** every money-moving action is written to an append-only audit log with actor, IP and before/after state.
+- **Rate limits** per merchant and per key at the gateway, backed by Redis; they fail open, because they protect capacity, not correctness.
 
 ## Observability
 
-### Prometheus Metrics
-
-| Metric | Type | Labels | Purpose |
-|--------|------|--------|---------|
-| `payment_request_duration_seconds` | Histogram | method, endpoint, status | Latency SLO tracking |
-| `payment_total` | Counter | status, currency | Volume and success rate |
-| `webhook_delivery_total` | Counter | status | Webhook reliability |
-| `rabbitmq_queue_depth` | Gauge | queue | Queue health |
-| `fraud_score_distribution` | Histogram | - | Risk distribution |
-| `db_active_connections` | Gauge | - | Pool utilization |
-
-### Alert Thresholds
-
-| Alert | Condition | Severity |
-|-------|-----------|----------|
-| High error rate | Error rate > 1% for 5 min | Critical |
-| High latency | p99 > 2s for 5 min | Warning |
-| Queue backup | Queue depth > 1000 for 10 min | Warning |
-| Webhook failures | Failure rate > 5% for 15 min | Warning |
-| DB connections exhausted | Active connections > 80% pool | Critical |
-
-### Structured Logging
-
-JSON-structured logging with Pino, including contextual fields: `event`, `transaction_id`, `merchant_id`, `amount`, `currency`, `status`, `duration_ms`, `fraud_score`, `trace_id`. Trace IDs are generated at the API gateway and propagated through all service calls via headers.
-
-### Distributed Tracing
-
-- Generate `trace_id` at load balancer or first API server
-- Pass through all service calls and queue messages in headers
-- Store on `audit_log` entries for correlation
-- OpenTelemetry SDK for span creation across async boundaries
+- **Payments:** outcomes by status and processor, authorization latency (ours vs the processor's), processor timeout rate, breaker state.
+- **Unknown outcomes:** count and age of `pending` payments (alert when any is older than 5 minutes), reconciler results (`authorized`, `failed`, `still_pending`, `needs_review`).
+- **Idempotency:** new claims, replays, in-progress conflicts and body mismatches per merchant; a spike in mismatches usually means a client bug reusing keys.
+- **Ledger:** journal-balance trigger violations (must be zero; any is a page), nightly account-drift results, settlement-file differences.
+- **Events:** outbox lag (oldest unpublished row), Kafka consumer lag, webhook success rate and retry depth per endpoint, dead-letter count.
+- Structured logs carry the request id, merchant id and payment id; traces span gateway → Payment API → PostgreSQL → processor.
 
 ## Failure Handling
 
-### Retry Strategy with Idempotency
-
-| Operation | Retries | Backoff | Idempotency |
-|-----------|---------|---------|-------------|
-| Payment authorization | 0 (client retries with same key) | N/A | Required |
-| Webhook delivery | 5 | Exponential (1s to 10min) | Webhook ID in header |
-| Settlement batch | 3 | Fixed 5min | Date-based batch ID |
-| Fraud scoring | 2 | 1s, 5s | Transaction ID |
-
-### Circuit Breaker Pattern
-
-Circuit breakers wrap calls to external payment processors and the fraud scoring service. Configuration:
-- **Failure threshold**: 5 consecutive failures opens the circuit
-- **Recovery timeout**: 30 seconds in open state before allowing a test request
-- **Half-open**: 2 successful requests needed to close the circuit
-
-When the processor circuit breaker is open, payment requests receive a `503 Service Unavailable` immediately instead of waiting for a 30-second timeout. This prevents connection pool exhaustion and cascading failures.
-
-### Graceful Degradation
-
-- **Fraud service down**: Approve payments with `fraud_score=50`, flag for manual review
-- **Webhook queue full**: Store in PostgreSQL overflow table, process later via polling
-- **Valkey down**: Fall back to DB-based rate limiting and idempotency checks (slower but functional)
-- **RabbitMQ down**: Store events in PostgreSQL for later replay
+| Failure | What happens | Mitigation |
+|---------|--------------|------------|
+| Processor times out | Payment stays `pending`; merchant gets `202` | Reconciler looks up the reference; resubmits only under the same reference |
+| Processor down | Breaker opens; new payments fail fast as not attempted | Half-open probe after 30 s; optional failover to a second processor for new payments only |
+| Payment API crashes mid-request | Payment stays `pending` (or `authorized`) | Reconciler resolves it; a client retry with the same key gets `409`, then the result |
+| Concurrent duplicate requests | One claim wins | Others get `409` while in flight, then replays |
+| PostgreSQL primary lost | Writes fail with `503` for the failover window | Synchronous replica promoted; nothing acknowledged is lost |
+| Redis down | Fraud scoring loses velocity signals; rate limits open | Payments continue; the risk team is alerted |
+| Kafka down | Outbox grows; webhooks are delayed, not lost | Relay resumes from the oldest unpublished row |
+| Merchant endpoint failing | Retries with backoff for 3 days | Dead-letter store, dashboard alert, `GET /v1/events` to catch up |
+| Ledger bug posts an unbalanced journal | The transaction aborts; nothing is written | Trigger violation alert; fix forward with a reversing journal if ever needed |
 
 ## Scalability Considerations
 
-### Horizontal Scaling
-
-- **API servers**: Stateless; add instances behind load balancer. No session affinity needed for API key auth.
-- **Workers**: Scale independently based on queue depth. Webhook workers scale with merchant count; fraud workers scale with transaction volume.
-- **Database**: Read replicas for reporting queries (admin dashboard, reconciliation). Primary handles all writes.
-
-### Sharding Strategy
-
-If transaction volume exceeds single-node PostgreSQL capacity:
-- Shard by `merchant_id` (hash-based, 5 initial shards)
-- Each shard handles ~20% of traffic
-- Cross-shard queries (admin search) via application-level aggregation
-- Ledger entries co-located with their transaction (same shard key)
-
-### Connection Pooling
-
-With 3 API servers each holding 20 connections, total pool is 60. PostgreSQL `max_connections` set to 100, leaving headroom for admin connections and workers. At higher scale, use PgBouncer for connection multiplexing.
-
-### Storage Tiering
-
-| Data Age | Storage | Cost Tier |
-|----------|---------|-----------|
-| 0-30 days | PostgreSQL (hot, SSD) | High |
-| 30-365 days | PostgreSQL (archive partition) | Medium |
-| 365+ days | S3/MinIO (Parquet exports) | Low |
-
-Transactions table partitioned by `created_at` month for efficient archival:
-
-```sql
-CREATE TABLE transactions (
-    -- columns as above
-) PARTITION BY RANGE (created_at);
-
-CREATE TABLE transactions_2025_01 PARTITION OF transactions
-    FOR VALUES FROM ('2025-01-01') TO ('2025-02-01');
-```
+1. **Hot platform accounts break first.** Every capture updates the receivables and revenue balances; at ~3,000 captures/s that is more than one row lock can serialize. Platform accounts are split into 64 shards (`shard = hash(payment_id) % 64`), each a row of its own, and reports sum the shards. Large merchants get the same treatment for their payable account.
+2. **Shard by merchant.** A payment, its refunds, journals and outbox rows share a `merchant_id`, so a hash-sharded cluster keeps every transaction on one shard; each shard has its own platform sub-accounts, consolidated in reporting. Cross-merchant queries (risk, finance) read from a warehouse fed by the event stream.
+3. **Read replicas for dashboards**, with money decisions (refundable amount, capture) always on the primary.
+4. **Ledger storage:** monthly partitions; partitions older than 13 months are exported to columnar files in object storage and detached, keeping the hot ledger around 10 TB.
+5. **Webhooks** scale by Kafka partitions and dispatcher instances, with per-endpoint concurrency caps so one slow merchant cannot consume the pool.
+6. **Multiple processors**: routing by card network or region, each with its own breaker; a payment's processor is fixed at creation so reconciliation always asks the right one.
 
 ## Trade-offs Summary
 
 | Decision | Chosen | Alternative | Rationale |
 |----------|--------|-------------|-----------|
-| Sync fraud check | Inline (<50ms) | Async only | Decline bad payments immediately |
-| Idempotency storage | Valkey with DB fallback | PostgreSQL only | Sub-ms lookups; DB as safety net |
-| Ledger model | Double-entry in SQL | Event sourcing | Simpler; sufficient for debit/credit pattern |
-| Webhook delivery | RabbitMQ + worker | Direct HTTP in request | Decouples merchant latency from payment response |
-| Multi-currency | FX at capture time | FX at authorization | Locked rate prevents merchant surprise |
-| Auth model | API keys (hashed) | OAuth2 / JWT | Simpler for M2M; immediate revocation via DB |
-
----
-
-## Frontend Architecture
-
-### Component Hierarchy
-
-The frontend is a React SPA built with Vite, TypeScript, and Tailwind CSS. It serves as a merchant dashboard for managing payments, refunds, and viewing transaction analytics.
-
-```
-__root.tsx (RootLayout)
-├── Nav bar with auth-aware links (Dashboard, Transactions, Refunds, Test Payment)
-├── Merchant name display + logout
-└── <Outlet /> renders child routes:
-    ├── /login ─────────── Login (API key entry + merchant creation)
-    ├── / ──────────────── Dashboard (balance card, stats grid: volume, txns, fees, success rate, refund rate, avg txn)
-    ├── /transactions ──── Transactions (paginated table with status filter dropdown, links to detail)
-    ├── /transactions/$id ─ Transaction Detail (single transaction view with capture/void/refund actions)
-    ├── /refunds ────────── Refunds (paginated table of refund records)
-    └── /test-payment ──── Test Payment (form to simulate payment creation with card details)
-```
-
-### Zustand Store
-
-**`authStore`** (persisted to localStorage under `payment-auth`): Stores the merchant API key, merchant ID, merchant name, and `isAuthenticated` flag. The API key is used as a Bearer token in all requests. Persistence means the merchant stays logged in across browser sessions. The store exposes `setApiKey`, `setMerchant`, and `logout` actions.
-
-This project uses API key auth rather than session cookies, so the store reads the key from localStorage on every request via the `getAuthHeaders()` helper in the API service.
-
-### Routing
-
-Uses TanStack Router with file-based routing. Routes are defined in `frontend/src/routes/` and auto-generated into `routeTree.gen.ts`. Each route component checks `isAuthenticated` from the auth store and redirects to `/login` if not authenticated. There is no route guard middleware; authentication is checked inline at the top of each route component.
-
-### Data Fetching
-
-All API calls go through a centralized `fetchApi<T>()` wrapper in `frontend/src/services/api.ts`. This wrapper automatically attaches the Bearer token from localStorage, parses JSON responses, and throws errors with the server's error message. Data fetching is done with `useEffect` + `useState` in each route component (no React Query or SWR). Each route manages its own loading, error, and data states locally.
-
-The API service is organized by domain: merchants, payments (create, get, list, capture, void, refund), refunds (list), chargebacks (list), and ledger (verify, summary). Idempotency keys are auto-generated client-side for payment and refund creation using `Date.now()` + random string.
-
-### Key UI Patterns
-
-- **Merchant balance card**: Gradient banner at top of dashboard showing available balance, merchant name, and email
-- **Stats grid**: Six metric cards (volume, transactions, fees, success rate, refund rate, avg transaction) with colored icons
-- **Paginated table**: Used for both transactions and refunds lists with Previous/Next buttons and result count
-- **Status filter**: Dropdown on transactions page to filter by payment status (pending, authorized, captured, etc.)
-- **Status badges**: Color-coded pill badges for transaction statuses using a `getStatusColor()` utility
-- **Currency formatting**: Centralized `formatCurrency()` and `formatPercent()` utilities in `frontend/src/utils/format.ts`
-- **Inline auth guard**: Each authenticated route returns `<Navigate to="/login" />` if not authenticated, rather than using a wrapper
-
-## Deep Pattern Explanations
-
-This section explains each production-grade pattern used in this project. Each explanation assumes no prior familiarity with the pattern.
-
-### RBAC (Role-Based Access Control)
-
-RBAC is an authorization model where permissions are assigned to roles, and roles are assigned to users. Instead of granting individual permissions to each user (which becomes unmanageable at scale), you define a set of roles like "support", "operations", and "admin", each with a specific set of allowed actions. When a user makes a request, the system checks their role against the required permission for that endpoint.
-
-In this project, admin operations use three roles: `support` (read-only access to transactions and merchants), `operations` (read access plus the ability to issue refunds), and `admin` (full read/write access plus merchant management). This prevents a support agent from accidentally suspending a merchant or issuing an unauthorized refund. The role is stored on the user record and checked by middleware before the route handler executes.
-
-The alternative -- checking individual user IDs against an access list -- does not scale. With 50 support agents, you would need to update 50 records every time a new endpoint is added. With RBAC, you update the role definition once.
-
-File: `backend/src/shared/auth.ts` (RBAC middleware)
-
-### Redis Cache-Aside
-
-Cache-aside (also called "lazy loading") is a caching strategy where the application checks the cache before querying the database. If the data is in the cache (a "hit"), it is returned immediately. If not (a "miss"), the application queries the database, stores the result in the cache with a TTL (time-to-live), and then returns it. The cache is never populated proactively -- it is filled on demand as requests arrive.
-
-In this project, merchant configuration is cached in Valkey with a 5-minute TTL. Every API request must validate the merchant's API key, which requires looking up the merchant record. Without caching, every request would hit PostgreSQL. With cache-aside, the first request for a given merchant hits the database and populates the cache; subsequent requests for the next 5 minutes are served from Valkey in sub-millisecond time. Exchange rates are also cached with a 5-minute TTL.
-
-The trade-off is staleness: if a merchant's status is changed to "suspended" in the database, the cache may serve the old "active" status for up to 5 minutes. For merchant config this is acceptable. For idempotency keys, where correctness is critical, the system uses Valkey as the primary store (not as a cache-aside layer).
-
-### Circuit Breaker
-
-A circuit breaker is a stability pattern borrowed from electrical engineering. It wraps calls to an external service (like a payment processor or fraud service) and monitors failure rates. When failures exceed a threshold, the circuit "opens" and immediately rejects all subsequent calls without actually making the request. After a cooldown period, it enters a "half-open" state where it allows one test request through. If that succeeds, the circuit closes and normal traffic resumes. If it fails, the circuit opens again.
-
-The purpose is to prevent cascading failures. Without a circuit breaker, if the payment processor is down, every incoming payment request would wait for a 30-second TCP timeout before failing. With 500 concurrent requests, this exhausts the connection pool and causes the entire API to become unresponsive -- even for endpoints that do not call the processor. The circuit breaker detects the failure pattern and fails fast (milliseconds instead of 30 seconds), preserving system resources for healthy operations.
-
-In this project, circuit breakers wrap the payment processor and fraud scoring service using the `cockatiel` library. Configuration: 5 consecutive failures opens the circuit, 30-second recovery timeout, 2 successful requests needed to close. When the processor circuit is open, clients receive `503 Service Unavailable` immediately.
-
-File: `backend/src/shared/circuit-breaker.ts`
-
-### Structured Logging
-
-Structured logging means emitting log entries as machine-parseable JSON objects rather than free-form text strings. Instead of `"Payment 123 authorized for $50.00 in 45ms"`, the system emits `{"event": "payment.authorized", "transaction_id": "123", "amount": 5000, "currency": "USD", "duration_ms": 45, "trace_id": "abc-def"}`. Each field is a named key-value pair.
-
-The benefit is searchability and aggregation. With free-form text, finding all failed payments over $1000 requires regex parsing across millions of log lines. With structured JSON, a log aggregator (Elasticsearch, Datadog, Splunk) can index each field and answer the query in seconds: `status:failed AND amount:>100000`. Structured logs also enable automated alerting -- you can trigger an alert when `error_rate > 0.01` without writing custom parsers.
-
-In this project, Pino produces JSON logs with contextual fields: `event`, `transaction_id`, `merchant_id`, `amount`, `currency`, `status`, `duration_ms`, `fraud_score`, and `trace_id`. The audit logger additionally writes to the PostgreSQL `audit_log` table for PCI-DSS compliance.
-
-Files: `backend/src/shared/logger.ts`, `backend/src/shared/audit.ts`
-
-### Prometheus Metrics
-
-Prometheus is a time-series monitoring system. The application exposes an HTTP endpoint (`GET /metrics`) that returns numeric measurements in a specific text format. A Prometheus server scrapes this endpoint at regular intervals (typically every 15 seconds) and stores the data points over time. Grafana then visualizes these time series as dashboards and graphs.
-
-There are four metric types: **Counter** (monotonically increasing, e.g., total payments processed), **Gauge** (goes up and down, e.g., current database connections), **Histogram** (measures distribution of values, e.g., request latency percentiles), and **Summary** (similar to histogram but calculated client-side).
-
-In this project, key metrics include: `payment_request_duration_seconds` (histogram for latency SLO tracking), `payment_total` (counter by status and currency for volume monitoring), `webhook_delivery_total` (counter for webhook reliability), `fraud_score_distribution` (histogram for risk analysis), and `db_active_connections` (gauge for pool health). Alert rules trigger when error rate exceeds 1% for 5 minutes or p99 latency exceeds 2 seconds.
-
-File: `backend/src/shared/metrics.ts`
-
-### Rate Limiting
-
-Rate limiting restricts the number of requests a client can make within a time window. It prevents abuse (a single client flooding the API with thousands of requests per second), protects against denial-of-service attacks, and ensures fair resource sharing among merchants.
-
-The most common algorithm is the **sliding window**: track timestamps of recent requests in a sorted set, remove entries older than the window, and check if the count exceeds the limit. If it does, return `429 Too Many Requests`.
-
-In this project, rate limits are enforced per merchant API key using Valkey sorted sets with `ZRANGEBYSCORE`. Each merchant has a configured limit (e.g., 100 requests per second). The rate limiter runs as Express middleware before any business logic. When Valkey is unavailable, the system degrades to no rate limiting rather than rejecting all requests -- availability is prioritized over strict enforcement during infrastructure failures.
-
-### Idempotency
-
-Idempotency means that performing the same operation multiple times produces the same result as performing it once. In a payment system, this is critical because network failures cause ambiguity: the client sends a payment request, the connection drops, and the client does not know if the payment was processed. Without idempotency, retrying the request could charge the customer twice.
-
-The implementation works as follows: the client generates a unique key (e.g., UUID) and sends it with the request in the `Idempotency-Key` header. Before processing, the server checks Valkey for this key. If found, the server returns the cached response from the original request without re-executing any logic. If not found, the server processes the request, stores the result in Valkey keyed by the idempotency key with a 24-hour TTL, and returns the response. A distributed lock (`SET key NX EX 30`) prevents concurrent processing of the same key.
-
-The database also has a `UNIQUE(merchant_id, idempotency_key)` constraint as a fallback. If Valkey is restarted and loses data, this constraint prevents duplicate payments at the database level (the insert fails with a constraint violation rather than creating a duplicate charge).
-
-File: `backend/src/shared/idempotency.ts`
-
-### Health Checks
-
-Health checks are HTTP endpoints that report whether the service is functioning correctly. They serve two purposes: load balancers use them to route traffic away from unhealthy instances, and orchestration systems (Kubernetes, ECS) use them to restart failed containers.
-
-There are typically three levels: **Liveness** (`/health/live`) reports whether the process is running -- if this fails, the process should be restarted. **Readiness** (`/health/ready`) reports whether the service can accept traffic -- it may be alive but not ready (e.g., still connecting to the database). **Deep health** (`/health`) checks all dependencies (database, cache, external services) and reports individual status.
-
-In this project, the health endpoint tests PostgreSQL connectivity (runs a `SELECT 1` query), Valkey connectivity (runs a `PING`), and reports circuit breaker states. The load balancer removes instances that fail readiness checks, preventing users from hitting a server that cannot process payments. During graceful shutdown, the readiness check returns unhealthy immediately so the load balancer drains traffic before the process exits.
-
-File: `backend/src/index.ts`
-
----
+| Idempotency store | Key on the payment row in PostgreSQL | Redis with 24 h TTL | Same durability and transaction as the money; never expires |
+| Ledger invariant | Deferred trigger + append-only entries | Application checks, mutable balances | Bugs abort at commit instead of surfacing at month-end |
+| Processor timeouts | `pending` + reconcile by reference | Treat as decline, or retry | Never a second authorization; costs a `202` path |
+| State changes | Compare-and-set transitions | Read-then-write, or long row locks | One winner per race; no locks across network calls |
+| Refund limits | Row lock on the payment | Optimistic retry | The guard is an amount, not a status; lock is short |
+| Events | Transactional outbox → Kafka | Publish after commit | No lost or phantom events |
+| Webhook delivery | At least once + `event_id` dedupe | Exactly once | Exactly once across the internet is not achievable |
+| Processor isolation | Circuit breaker + idempotency | Timeouts only | Keeps the pool alive; retries stay safe |
+| Scaling the ledger | Sharded platform accounts | One global revenue row | One row cannot take thousands of locked updates per second |
 
 ## Implementation Notes
 
-This section maps the production architecture above to the actual local implementation running on Docker Compose.
+The local project runs the payment lifecycle on a single-node stack: one Express process ([`backend/src/index.ts`](./backend/src/index.ts)), a reconciler worker, PostgreSQL 16 and Redis from [`docker-compose.yml`](./docker-compose.yml) (plus RabbitMQ for the optional webhook and fraud workers), and a React 19 + TanStack Router + Zustand dashboard. This section maps the production design to the code as of the 2026-10-10 review.
 
-### Local Setup Diagram
+### Production design → local implementation
 
-```
-┌────────────────────┐
-│   React SPA        │
-│   (Vite :5173)     │
-└─────────┬──────────┘
-          │ HTTP
-          ▼
-┌────────────────────┐
-│   API Server       │
-│   (Express :3000)  │
-│   or 3 instances   │
-│   (:3001-3003)     │
-├────────────────────┤
-│  /health           │
-│  /metrics          │
-│  /api/v1/payments  │
-│  /api/v1/merchants │
-│  /api/v1/refunds   │
-│  /api/v1/ledger    │
-└──┬──────┬──────┬───┘
-   │      │      │
-   ▼      ▼      ▼
-┌──────┐┌──────┐┌────────┐
-│Postgr││Valkey││RabbitMQ│
-│:5432 ││:6379 ││:5672   │
-│      ││      ││:15672  │
-└──────┘└──────┘└───┬────┘
-                    │
-          ┌─────────┼─────────┐
-          ▼         ▼         ▼
-    ┌──────────┐┌──────────┐  (Settlement
-    │ Webhook  ││  Fraud   │   worker not
-    │ Worker   ││  Worker  │   implemented)
-    └──────────┘└──────────┘
+| Production design | Local implementation | Where |
+|-------------------|----------------------|-------|
+| Gateway auth and rate limits | API-key bearer auth in Express; no rate limiting | [middleware/auth.ts](./backend/src/middleware/auth.ts) |
+| Idempotency on the payment row | Implemented: unique `(merchant_id, idempotency_key)`, request fingerprint, replay / `409` / `422` | [transaction.ts](./backend/src/services/payment/transaction.ts), [authorize.ts](./backend/src/services/payment/authorize.ts) |
+| Guarded state machine | Implemented for every transition | [state-machine.ts](./backend/src/services/payment/state-machine.ts) |
+| Journals with a deferred balance trigger | Implemented (`journal_id` column, deferred trigger, append-only trigger) | [init.sql](./backend/src/db/init.sql), [ledger.service.ts](./backend/src/services/ledger.service.ts) |
+| Processor with reference idempotency | Simulated processor that keeps its own records in Redis | [processor.ts](./backend/src/services/payment/processor.ts) |
+| Reconciler | Implemented for unknown authorization outcomes; no settlement-file matching | [reconcile.ts](./backend/src/services/payment/reconcile.ts), [workers/reconciler.ts](./backend/src/workers/reconciler.ts) |
+| Refund under a row lock | Implemented, with per-merchant keys and cumulative fee rounding | [refund.service.ts](./backend/src/services/refund.service.ts) |
+| Outbox → Kafka → dispatcher | Best-effort publish to RabbitMQ after commit; worker with retries | [capture.ts](./backend/src/services/payment/capture.ts), [queue.ts](./backend/src/shared/queue.ts), [webhook-worker.ts](./backend/src/workers/webhook-worker.ts) |
+| Circuit breaker | cockatiel, opens after 5 consecutive failures, half-open after 30 s | [circuit-breaker.ts](./backend/src/shared/circuit-breaker.ts) |
+
+### Ledger enforced by PostgreSQL
+
+Captures, refunds and chargebacks are built as journals by pure functions (`buildCaptureJournal`, `buildRefundJournal`, `buildChargebackJournal`, `buildChargebackReversalJournal`) and posted by `postJournal()`, which refuses an unbalanced set before touching the database and updates accounts in id order so two journals can never deadlock on each other's rows. `balance = balance + delta` under the row lock is what keeps `balance_after` exact, so `READ COMMITTED` is sufficient. The database re-checks every journal at commit:
+
+```sql
+-- backend/src/db/init.sql (abridged)
+SELECT COALESCE(SUM(CASE WHEN entry_type = 'debit' THEN amount ELSE -amount END), 0), COUNT(*), COUNT(DISTINCT currency)
+  INTO imbalance, entry_count, currencies
+  FROM ledger_entries WHERE journal_id = NEW.journal_id;
+IF imbalance <> 0 OR entry_count < 2 OR currencies <> 1 THEN
+    RAISE EXCEPTION 'ledger journal % is unbalanced ...', NEW.journal_id USING ERRCODE = 'check_violation';
+END IF;
+-- CREATE CONSTRAINT TRIGGER ledger_journal_balanced AFTER INSERT ON ledger_entries
+--   DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION check_ledger_journal_balanced();
 ```
 
-### Production-Grade Patterns Actually Implemented
+- `ledger_entries` rejects `UPDATE` and `DELETE`. Balances are credit-positive for every account, so receivables reads negative and all balances sum to zero.
+- `GET /api/v1/ledger/verify` reports window totals, unbalanced journals and per-account drift (stored balance vs the sum of entries).
+- Refund and chargeback entries reference the original payment (`transaction_id`) and their own `journal_id`. Before the 2026-10 review they used the refund or chargeback id as `transaction_id`, which violates the foreign key, so every refund failed; a won dispute also changed the merchant's balance without any ledger entry.
+- The seed's balances equal the sum of its entries, and it now includes the journals for its partial refund and its chargeback.
 
-**1. Idempotency** -- Every payment mutation checks Valkey for an existing idempotency key before processing. Keys are scoped per merchant with 24-hour TTL. The distributed lock prevents concurrent processing of the same key.
+### Payment state machine and idempotency
 
-File: `backend/src/shared/idempotency.ts`
+`transitionStatus()` is the only writer of `transactions.status`. It validates the transition against a table, accepts only whitelisted extra columns, and issues `UPDATE ... WHERE id = $1 AND status = ANY($3) RETURNING *`. Capture runs the transition and the capture journal in one transaction; void is a single guarded `UPDATE`. A repeated capture or void returns the payment unchanged (`200`); any other state is `409`.
 
-**2. Double-Entry Ledger** -- Payment, capture, and refund operations create paired debit/credit entries in the `ledger_entries` table within a single PostgreSQL transaction.
+Payment creation inserts the row as `pending` with `ON CONFLICT (merchant_id, idempotency_key) DO NOTHING`. The request fingerprint is a SHA-256 of the canonical JSON body (sorted keys, idempotency key excluded). Replays return the payment's current state with `Idempotent-Replayed: true` rather than a stored copy of the first response, so a retry after reconciliation shows the final outcome. Without a key, every request creates a payment. Keys are limited to 64 characters (the column width).
 
-Files: `backend/src/services/ledger.service.ts`, `backend/src/services/payment/`
+### Unknown processor outcomes
 
-**3. Circuit Breaker** -- Uses `cockatiel` library for circuit breakers on external processor and fraud service calls. Separate breakers for processor and fraud with configurable thresholds.
+The simulated processor stores each decision in Redis under `psp-sim:payment:{reference}` with `SET NX`, so the same reference always gets the same answer. `authorizeWithProcessor()` never throws; it classifies every call as `approved`, `declined`, `not_attempted` (breaker open) or `unknown` (timeout, error). Test cards:
 
-File: `backend/src/shared/circuit-breaker.ts`
+| `last_four` | Behavior |
+|-------------|----------|
+| `0000` | Declined |
+| `0001` | Approved at the processor, response lost: `202`, then the reconciler captures it |
+| `0002` | First attempt lost before the processor records it: `202`, then the reconciler resubmits under the same reference |
+| anything else | Approved, except `PSP_DECLINE_RATE` (default 5%, 30% above $10,000) random declines |
 
-**4. Prometheus Metrics** -- HTTP request duration histograms, payment counters by status/currency, fraud score distributions, circuit breaker state gauges, and DB connection metrics. Exposed at `GET /metrics`.
+`npm run dev:reconciler` runs a pass every `RECONCILE_INTERVAL_MS` (15 s) over payments pending for `RECONCILE_AFTER_SECONDS` (30 s); `npm run reconcile:once` runs one pass. After 10 attempts a payment is logged for manual review and left `pending`.
 
-File: `backend/src/shared/metrics.ts`
+### Refunds, chargebacks and webhooks
 
-**5. Structured Logging** -- Pino JSON logger with request context. Audit logger writes to both PostgreSQL `audit_log` table and structured log output.
+- Refunds lock the payment row, replay by key under the lock, count pending and completed refunds against the refundable amount, default to the remainder, and complete synchronously — there is no processor refund call or `pending` refund lifecycle.
+- Chargebacks are written by `ChargebackService` (with balanced journals) but no route creates one; the seed contains one. `POST /chargebacks/:id/respond` is a stub.
+- Webhooks are published to RabbitMQ after the commit, best effort: a crash or broker outage between commit and publish loses the event (the production outbox closes that gap). The webhook worker signs `timestamp.payload` with HMAC-SHA256 (`X-Signature-256`, `X-Webhook-Timestamp`, `X-Webhook-Id`) and retries five times with exponential backoff capped at 60 s.
 
-Files: `backend/src/shared/logger.ts`, `backend/src/shared/audit.ts`
+### Authentication and known security limits
 
-**6. Health Check** -- Full dependency health check at `GET /health` (PostgreSQL, Valkey, circuit breaker states), liveness probe at `/health/live`, readiness probe at `/health/ready`.
+- Merchants authenticate with a bearer API key (`pk_...`) stored as a bcrypt hash; authentication bcrypt-compares against every active merchant, which is O(merchants) per request. The production `key_id` lookup is not implemented.
+- The dashboard logs in with the same secret API key and keeps it in `localStorage` (Zustand `persist`), so any XSS would expose a full-access key. The production design uses a session cookie instead.
+- `GET /api/v1/ledger/verify` and `/summary` return platform-wide totals to any authenticated merchant.
+- There is no rate limiting and no admin RBAC.
 
-File: `backend/src/index.ts`
+### Operations
 
-**7. Graceful Shutdown** -- SIGTERM/SIGINT handlers stop accepting new connections, drain in-flight requests, close database and Redis connections, with a 30-second forced exit timeout.
+Prometheus metrics in [metrics.ts](./backend/src/shared/metrics.ts) include payment outcomes and latency, fraud scores, breaker state, `idempotency_requests_total{outcome}` and `payment_reconcile_total{result}`. Pino writes structured logs with a request id; money-moving actions are also written to the `audit_log` table, which `init.sql` now creates. `/health` checks PostgreSQL, Redis and breaker state; `/health/ready` checks PostgreSQL and Redis. Shutdown closes the HTTP server, then PostgreSQL and Redis, with a forced exit after 30 seconds.
 
-File: `backend/src/index.ts`
+### Verification (2026-10-10)
 
-**8. Webhook Delivery Workers** -- Separate processes consume from RabbitMQ with exponential backoff retry.
+- `npm test` in `backend/` runs 22 offline vitest tests (journal builders and fee rounding, `postJournal` ordering, the state machine's guarded SQL, request fingerprints, reconciler decisions). Backend `tsc` and lint, and frontend `tsc`, lint and build, are clean.
+- Against PostgreSQL 16 and Redis (RabbitMQ absent): `init.sql` loads three times, including on a populated database; 20 concurrent creates with one key produce one `201`, three `409` and sixteen `200` replays, one payment and one journal; a different body gets `422`; another merchant can use the same key; 10 concurrent captures post one journal; a capture-vs-void race has one winner; 10 concurrent 30% refunds produce three refunds and seven `422`; four partial refunds return the fee exactly; cards `0001` and `0002` return `202` and the reconciler captures each with one journal and one processor record; an unbalanced journal inserted by hand fails at `COMMIT`; `UPDATE ledger_entries` is rejected; the final ledger check reports no drift and balances summing to zero.
+- Not exercised: the RabbitMQ webhook and fraud workers.
 
-File: `backend/src/workers/webhook-worker.ts`
+### Simplified or omitted
 
-### What Was Simplified or Substituted
-
-| Production Component | Local Substitute | Reason |
-|---------------------|-----------------|--------|
-| API Gateway (Kong, AWS) | Direct Express access on :3000 | No need for managed gateway locally |
-| Payment processor integration | Simulated processor responses | No real card network connection |
-| HSM / PCI-compliant vault | `token_vault_ref` column (placeholder) | Hardware security modules out of scope |
-| PostgreSQL sharding (Citus) | Single PostgreSQL instance | Sufficient for dev scale |
-| Read replicas | Single instance handles reads/writes | No replication needed locally |
-| Multi-region deployment | Single Docker Compose stack | Local development only |
-| Managed queue (Amazon MQ) | Local RabbitMQ container | Same AMQP protocol |
-
-### What Was Omitted
-
-- **CDN** for frontend static assets
-- **WAF** (Web Application Firewall) for PCI-DSS network requirements
-- **Multi-region** active-passive deployment
-- **Kubernetes** orchestration and auto-scaling
-- **PgBouncer** connection pooling proxy
-- **Settlement worker** (queue and schema exist but worker is not implemented)
-- **Notification service** (email/SMS for payment receipts)
-- **Full PCI-DSS compliance** (encryption at rest, network segmentation, penetration testing)
-- **Real FX rate service** integration
-- **Grafana dashboards** (Prometheus metrics are collected but no dashboards configured)
+There is no API gateway, outbox, Kafka, hold-expiry sweeper, 3-D Secure, settlement-file reconciliation, payouts, multi-currency conversion, sharding, read replicas or PCI vault (payment methods are stored as JSON with the last four digits). List endpoints use `limit`/`offset` pagination, and `GET` responses return `BIGINT` amounts as strings (the `pg` default). Five Playwright smoke tests (`tests/smoke.spec.ts`) check page rendering only.

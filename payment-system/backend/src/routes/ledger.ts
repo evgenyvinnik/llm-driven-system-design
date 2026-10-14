@@ -40,6 +40,8 @@ router.get('/verify', async (req: Request, res: Response) => {
       balanced: result.balanced,
       total_debits: result.totalDebits,
       total_credits: result.totalCredits,
+      unbalanced_journals: result.unbalancedJournals,
+      account_drift: result.accountDrift,
       period: {
         start: startDate,
         end: endDate,

@@ -194,12 +194,23 @@ export const redisOperationsTotal = new Counter({
 // ============================================================================
 
 /**
- * Idempotency cache hits and misses.
- * Labels: result (hit, miss)
+ * Idempotency-Key outcomes on money-moving POSTs.
+ * Labels: outcome (new, replay, in_progress, mismatch)
  */
-export const idempotencyCacheTotal = new Counter({
-  name: 'idempotency_cache_total',
-  help: 'Idempotency key cache lookups',
+export const idempotencyRequestsTotal = new Counter({
+  name: 'idempotency_requests_total',
+  help: 'Requests carrying an Idempotency-Key, by outcome',
+  labelNames: ['outcome'] as const,
+  registers: [metricsRegistry],
+});
+
+/**
+ * Reconciliation results for payments whose processor outcome was unknown.
+ * Labels: result (authorized, captured, failed, still_pending, needs_review)
+ */
+export const paymentReconcileTotal = new Counter({
+  name: 'payment_reconcile_total',
+  help: 'Pending payments resolved by the reconciler, by result',
   labelNames: ['result'] as const,
   registers: [metricsRegistry],
 });

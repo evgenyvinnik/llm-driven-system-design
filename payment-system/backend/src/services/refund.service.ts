@@ -9,13 +9,24 @@ import type {
   Chargeback,
   ChargebackStatus,
 } from '../types/index.js';
-import { LedgerService } from './ledger.service.js';
-import { redis } from '../db/connection.js';
+import {
+  LedgerService,
+  buildChargebackJournal,
+  buildChargebackReversalJournal,
+  buildRefundJournal,
+} from './ledger.service.js';
+import { transitionStatus } from './payment/state-machine.js';
+import { requestFingerprint } from './payment/validation.js';
+import {
+  PaymentError,
+  idempotencyKeyReused,
+  invalidState,
+  notFound,
+} from './payment/errors.js';
 
 // Import shared modules for observability and resilience
 import {
   logger,
-  withIdempotency,
   refundTransactionsTotal,
   chargebackEventsTotal,
   paymentProcessingDuration,
@@ -41,202 +52,149 @@ export class RefundService {
   }
 
   /**
-   * Checks if a refund request has already been processed.
-   * Prevents duplicate refunds when clients retry requests.
-   * @param key - Unique idempotency key for the refund request
-   * @returns Existing refund if found, null otherwise
-   * @deprecated Use withIdempotency from shared/idempotency.ts instead
-   */
-  async checkIdempotency(key: string): Promise<Refund | null> {
-    const cached = await redis.get(`refund_idempotency:${key}`);
-    if (cached) {
-      return JSON.parse(cached) as Refund;
-    }
-
-    const existing = await queryOne<Refund>(
-      'SELECT * FROM refunds WHERE idempotency_key = $1',
-      [key]
-    );
-
-    if (existing) {
-      await redis.setex(`refund_idempotency:${key}`, 86400, JSON.stringify(existing));
-    }
-
-    return existing;
-  }
-
-  /**
-   * Creates a full or partial refund for a captured transaction.
-   * Validates refund amount against remaining refundable balance.
-   * Creates reversing ledger entries and updates transaction status.
+   * Creates a full or partial refund for a captured payment.
    *
-   * IDEMPOTENCY: If idempotency_key is provided, duplicate requests return
-   * the cached response without reprocessing.
+   * CONCURRENCY: the payment row is locked (SELECT ... FOR UPDATE) for the
+   * whole refund, so refunds of one payment run one at a time and each sees
+   * what the previous one committed. Without the lock two partial refunds can
+   * both pass the "remaining amount" check and refund more than was captured.
    *
-   * @param transactionId - UUID of the original captured transaction
-   * @param merchantId - UUID of the merchant for ownership verification
-   * @param merchantAccountId - UUID of the merchant's ledger account
-   * @param request - Refund details including optional amount and reason
-   * @param clientInfo - Optional client info for audit logging
-   * @returns Created refund record with completed status
-   * @throws Error if transaction not refundable or amount exceeds limit
+   * IDEMPOTENCY: (merchant_id, idempotency_key) is unique on refunds. A retry
+   * takes the same lock, finds the refund the key already created and returns
+   * it; the same key with a different body or payment is rejected with 422.
+   *
+   * The refund row, its ledger journal and the payment's status change commit
+   * together. Amounts omitted from the request default to everything that is
+   * still refundable.
    */
   async createRefund(
     transactionId: string,
     merchantId: string,
-    merchantAccountId: string,
     request: RefundRequest,
     clientInfo?: { ipAddress?: string; userAgent?: string }
-  ): Promise<Refund> {
+  ): Promise<{ refund: Refund; replayed: boolean }> {
     const startTime = Date.now();
-    const { idempotency_key } = request;
+    const { idempotency_key, reason } = request;
+    const requestHash = idempotency_key
+      ? requestFingerprint({ payment: transactionId, amount: request.amount ?? null, reason: reason ?? null })
+      : null;
 
-    // Use shared idempotency wrapper for refund operations
-    const { result, fromCache } = await withIdempotency<Refund>(
-      'refund',
-      merchantId,
-      idempotency_key,
-      async () => {
-        return this.processRefund(
-          transactionId,
-          merchantId,
-          merchantAccountId,
-          request,
-          clientInfo
+    const outcome = await withTransaction(async (client: PoolClient) => {
+      const payment = (
+        await client.query<Transaction>(
+          'SELECT * FROM transactions WHERE id = $1 AND merchant_id = $2 FOR UPDATE',
+          [transactionId, merchantId]
+        )
+      ).rows[0];
+      if (!payment) throw notFound('Payment');
+
+      if (idempotency_key) {
+        const prior = (
+          await client.query<Refund>(
+            'SELECT * FROM refunds WHERE merchant_id = $1 AND idempotency_key = $2',
+            [merchantId, idempotency_key]
+          )
+        ).rows[0];
+        if (prior) {
+          if ((prior.request_hash && prior.request_hash !== requestHash) || prior.original_tx_id !== transactionId) {
+            throw idempotencyKeyReused();
+          }
+          return { refund: prior, replayed: true, isFullRefund: false };
+        }
+      }
+
+      if (payment.status !== 'captured' && payment.status !== 'partially_refunded') {
+        throw invalidState(payment.status, 'refund');
+      }
+
+      const totals = (
+        await client.query<{ reserved: string; completed: string }>(
+          `SELECT COALESCE(SUM(amount) FILTER (WHERE status IN ('pending', 'completed')), 0) AS reserved,
+                  COALESCE(SUM(amount) FILTER (WHERE status = 'completed'), 0) AS completed
+           FROM refunds WHERE original_tx_id = $1`,
+          [transactionId]
+        )
+      ).rows[0];
+
+      const paymentAmount = Number(payment.amount);
+      const completed = Number(totals.completed);
+      const refundable = paymentAmount - Number(totals.reserved);
+      const refundAmount = request.amount ?? refundable;
+
+      if (!Number.isSafeInteger(refundAmount) || refundAmount <= 0) {
+        throw new PaymentError(422, 'invalid_amount', 'Refund amount must be a positive integer (in cents) and something must remain refundable', { refundable });
+      }
+      if (refundAmount > refundable) {
+        throw new PaymentError(
+          422,
+          'amount_exceeds_refundable',
+          `Refund amount ${refundAmount} exceeds remaining refundable amount ${refundable}`,
+          { refundable }
         );
       }
-    );
 
-    // Record metrics
-    const duration = (Date.now() - startTime) / 1000;
-    paymentProcessingDuration.labels('refund', result.status).observe(duration);
-
-    if (fromCache) {
-      logger.info(
-        { merchantId, idempotencyKey: idempotency_key, refundId: result.id },
-        'Returned cached refund response'
-      );
-    }
-
-    return result;
-  }
-
-  /**
-   * Internal refund processing logic.
-   * Called by createRefund after idempotency check.
-   */
-  private async processRefund(
-    transactionId: string,
-    merchantId: string,
-    merchantAccountId: string,
-    request: RefundRequest,
-    clientInfo?: { ipAddress?: string; userAgent?: string }
-  ): Promise<Refund> {
-    const { amount, reason, idempotency_key } = request;
-
-    // Get original transaction
-    const transaction = await queryOne<Transaction>(
-      'SELECT * FROM transactions WHERE id = $1 AND merchant_id = $2',
-      [transactionId, merchantId]
-    );
-
-    if (!transaction) {
-      throw new Error('Transaction not found');
-    }
-
-    if (transaction.status !== 'captured' && transaction.status !== 'partially_refunded') {
-      throw new Error(`Cannot refund transaction in status: ${transaction.status}`);
-    }
-
-    // Calculate refund amount (default to full refund)
-    const refundAmount = amount ?? transaction.amount;
-
-    // Check if refund amount is valid
-    const existingRefunds = await this.getRefundsForTransaction(transactionId);
-    const totalRefunded = existingRefunds.reduce(
-      (sum, r) => sum + (r.status === 'completed' ? r.amount : 0),
-      0
-    );
-
-    if (totalRefunded + refundAmount > transaction.amount) {
-      throw new Error(
-        `Refund amount ${refundAmount} exceeds remaining refundable amount ${transaction.amount - totalRefunded}`
-      );
-    }
-
-    const refundId = uuidv4();
-    const isFullRefund = totalRefunded + refundAmount === transaction.amount;
-
-    // Process refund atomically
-    const _refund = await withTransaction(async (client: PoolClient) => {
-      // Create refund record
-      const refundResult = await client.query<Refund>(
-        `INSERT INTO refunds (id, idempotency_key, original_tx_id, merchant_id, amount, reason, status)
-         VALUES ($1, $2, $3, $4, $5, $6, 'pending')
-         RETURNING *`,
-        [refundId, idempotency_key, transactionId, merchantId, refundAmount, reason]
+      const merchant = await client.query<{ account_id: string }>(
+        'SELECT account_id FROM merchants WHERE id = $1',
+        [merchantId]
       );
 
-      // Record ledger entries
-      await this.ledgerService.recordRefund(
+      const refund = (
+        await client.query<Refund>(
+          `INSERT INTO refunds (id, idempotency_key, request_hash, original_tx_id, merchant_id, amount, reason, status)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, 'completed')
+           RETURNING *`,
+          [uuidv4(), idempotency_key ?? null, requestHash, transactionId, merchantId, refundAmount, reason]
+        )
+      ).rows[0];
+
+      await this.ledgerService.postJournal(
         client,
         transactionId,
-        refundId,
-        merchantAccountId,
-        refundAmount,
-        transaction.amount,
-        transaction.fee_amount,
-        transaction.currency
+        payment.currency,
+        buildRefundJournal(
+          merchant.rows[0].account_id,
+          refundAmount,
+          completed,
+          paymentAmount,
+          Number(payment.fee_amount),
+          transactionId
+        )
       );
 
-      // Update refund status
-      await client.query(
-        `UPDATE refunds SET status = 'completed', updated_at = NOW() WHERE id = $1`,
-        [refundId]
+      const isFullRefund = completed + refundAmount === paymentAmount;
+      await transitionStatus(
+        client,
+        transactionId,
+        ['captured', 'partially_refunded'],
+        isFullRefund ? 'refunded' : 'partially_refunded'
       );
 
-      // Update transaction status
-      const newStatus = isFullRefund ? 'refunded' : 'partially_refunded';
-      await client.query(
-        `UPDATE transactions SET status = $1, updated_at = NOW(), version = version + 1 WHERE id = $2`,
-        [newStatus, transactionId]
-      );
-
-      return refundResult.rows[0];
+      return { refund, replayed: false, isFullRefund };
     });
 
-    // Get completed refund
-    const completedRefund = await queryOne<Refund>(
-      'SELECT * FROM refunds WHERE id = $1',
-      [refundId]
-    );
+    const { refund, replayed, isFullRefund } = outcome;
+    if (replayed) {
+      logger.info({ merchantId, idempotencyKey: idempotency_key, refundId: refund.id }, 'Idempotent replay of refund');
+      return { refund, replayed };
+    }
 
-    // Audit log: refund created
     await auditRefundCreated(
-      refundId,
+      refund.id,
       transactionId,
       merchantId,
-      refundAmount,
+      Number(refund.amount),
       isFullRefund,
       clientInfo?.ipAddress,
       clientInfo?.userAgent
     );
-
-    // Record metrics
     refundTransactionsTotal.labels(isFullRefund ? 'full' : 'partial', 'completed').inc();
-
+    paymentProcessingDuration.labels('refund', refund.status).observe((Date.now() - startTime) / 1000);
     logger.info(
-      {
-        refundId,
-        transactionId,
-        merchantId,
-        amount: refundAmount,
-        isFullRefund,
-      },
+      { refundId: refund.id, transactionId, merchantId, amount: Number(refund.amount), isFullRefund },
       'Refund processed successfully'
     );
 
-    return completedRefund!;
+    return { refund, replayed };
   }
 
   /**
@@ -358,14 +316,11 @@ export class ChargebackService {
       );
 
       // Record ledger entries (debit merchant account)
-      await this.ledgerService.recordChargeback(
+      await this.ledgerService.postJournal(
         client,
         transactionId,
-        chargebackId,
-        merchantAccountId,
-        amount,
-        this.chargebackFee,
-        transaction.currency
+        transaction.currency,
+        buildChargebackJournal(merchantAccountId, amount, this.chargebackFee, transactionId)
       );
 
       return result.rows[0];
@@ -432,16 +387,32 @@ export class ChargebackService {
     // If won, we need to reverse the chargeback debit
     if (status === 'won') {
       await withTransaction(async (client: PoolClient) => {
-        // Credit back the merchant account
-        await client.query(
-          `UPDATE accounts SET balance = balance + $1, updated_at = NOW() WHERE id = $2`,
-          [chargeback.amount + this.chargebackFee, merchantAccountId]
-        );
-
-        // Update chargeback status
-        await client.query(
-          `UPDATE chargebacks SET status = 'won', updated_at = NOW() WHERE id = $1`,
+        // Guarded status change first, so a dispute is reversed at most once
+        const updated = await client.query(
+          `UPDATE chargebacks SET status = 'won', updated_at = NOW()
+           WHERE id = $1 AND status IN ('open', 'pending_response')`,
           [chargebackId]
+        );
+        if (updated.rowCount === 0) {
+          throw new PaymentError(409, 'invalid_state', 'Chargeback was already resolved');
+        }
+
+        // Return the disputed amount and the fee through a balanced reversing
+        // journal (it used to be a bare balance update with no ledger entries)
+        const payment = await client.query<{ currency: string }>(
+          'SELECT currency FROM transactions WHERE id = $1',
+          [chargeback.transaction_id]
+        );
+        await this.ledgerService.postJournal(
+          client,
+          chargeback.transaction_id,
+          payment.rows[0].currency,
+          buildChargebackReversalJournal(
+            merchantAccountId,
+            Number(chargeback.amount),
+            this.chargebackFee,
+            chargeback.transaction_id
+          )
         );
       });
 
