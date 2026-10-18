@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "console-growth",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["--prefix", "console-growth", "run", "dev"],
+      "port": 3000
+    }
+  ]
+}

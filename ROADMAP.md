@@ -27,7 +27,7 @@ The **Signal** column says how strong the evidence is that a question appears in
 | Guide-reported | A preparation guide summarizes a candidate's experience. The underlying account was not inspected |
 | Practice extension | A recommended exercise. Not known to have been asked |
 
-Sources surveyed: Glassdoor, Aced (formerly Exponent) and Hello Interview.
+Sources surveyed: Glassdoor, Aced (formerly Exponent) and Hello Interview. Project 16 also draws on Lodely, PracHub and 1point3acres.
 
 ## Summary
 
@@ -48,6 +48,8 @@ Sources surveyed: Glassdoor, Aced (formerly Exponent) and Hello Interview.
 | 13 | [File Cache](#13-file-cache) | `file-cache/` | 3 | Anthropic (candidate report) | distributed-cache |
 | 14 | [Model Distribution](#14-model-distribution) | `model-distribution/` | 3 | Anthropic (candidate report) | — |
 | 15 | [Online Chess](#15-online-chess) | `online-chess/` | 3 | OpenAI (community) | r-place, online-auction |
+| 16 | [File System](#16-file-system) | `file-system/` | 3 | Anthropic (community, online assessment; candidate report for the dedup variant) | dropbox |
+| 17 | [Console Growth Take-Home](#17-console-growth-take-home) ✅ Built | [`console-growth/`](./console-growth/) | 3 | Anthropic (candidate report: growth engineering take-home) | experimentation-platform |
 
 - **Tier 1** covers the core product-facing work for AI and full-stack roles. Build these first, in the order listed.
 - **Tier 2** covers variations on tier-1 designs. Each reuses a tier-1 data model or an existing project's patterns.
@@ -507,6 +509,70 @@ Each answer should also walk through **one successful and one failed execution t
 - **Spectators** watch on a read-only, optionally delayed fan-out channel.
 
 **Local scope.** A WebSocket gateway, a game service that routes each game to a single writer, PostgreSQL, Valkey pub/sub for spectators and `chess.js` for move validation.
+
+### 16. File System
+
+**Folder:** `file-system/` · **Signal:** Anthropic (community attribution: a 2026 preparation guide lists a cloud storage or file system simulation among the online assessment's problems, though most reports describe an in-memory database variant of the same format. A separate candidate report describes an onsite coding round on finding duplicate files)
+
+**Problem.** Build an in-memory file storage system in four levels, each extending the last, then scale the same model into a service. The online assessment is reported as a timed CodeSignal test of about 90 minutes. It has one problem with four levels and hidden tests, and the next level unlocks only after the current one passes. Later levels can't be read in advance, so the skill being tested is choosing a data model that survives requirements you haven't seen yet. If that assessment is coming up, build this before the other tier-3 projects.
+
+**Different deliverables.** The core of this project is a library, not a service. In addition to the standard files, it ships:
+- `levels.md`: the practice spec, written for this repository, with the operations and edge cases for each level. It is not a copy of any real assessment.
+- `backend/src/fs/`: the library, with one vitest suite per level, so a practice attempt can be checked one level at a time.
+- Practice notes in the project `CLAUDE.md`: the time each level took, and what the data model had to change to fit the next level.
+
+**Practice levels.**
+1. **Files.** Add, read, overwrite and delete a file at a path, with a size. Return defined failure values for duplicate and missing paths.
+2. **Queries.** List a directory, and return the N largest files under a prefix, sorted by size descending and then by name.
+3. **Users and quotas.** Every file has an owner, and every user has a byte capacity. A write that would exceed it fails with no partial effect. Merging two users moves the files and combines the capacities.
+4. **History.** Two alternative tracks, to cover both reported variants. *Backup:* back up a user's files and restore them later, skipping paths another user now owns. *Time:* every operation carries a timestamp, files can have a time to live, and reads can ask for the state as of a past time.
+
+**Hard problems to implement.**
+- **A data model that survives level 4.** Store each file once, with its owner, size and timestamps, in one map keyed by full path. Update per-user usage in the same operation that changes the file map. Two copies of a fact that must stay in sync are where hidden tests catch you.
+- **Path-keyed map or tree of nodes.** A flat map makes lookups O(1) but turns a directory rename into a rewrite of every path under it. A tree of nodes makes rename one pointer change, but every lookup walks the path. Say which one the levels need and what changes if a later level adds move or rename.
+- **Validate before mutating.** Merge, restore and quota-checked writes check every precondition before changing anything, so a failure leaves no partial state.
+- **Exact output rules.** Tie-breaking (equal sizes sort by name) and output formats are where hidden tests fail most often. Write the edge-case tests before the code.
+- **Duplicate files**, the onsite variant. Find groups of identical files in a very large tree without loading whole files into memory. Group by size, then by a hash of the first block, then by a full streaming hash.
+
+**Scaling it into a service.** The interview answers take the same model to production:
+- The namespace becomes a metadata service, separate from blob storage. [dropbox](./dropbox/) already covers chunked blobs and sync, so this project covers the metadata tree.
+- Quotas are enforced with reserve-then-commit under concurrent uploads.
+- Moving a directory between metadata shards needs a cross-shard transaction, or a sharding scheme that keeps each subtree on one shard.
+- Snapshots use copy-on-write, so a backup doesn't copy every file.
+- The N largest files under a prefix need a maintained index once a scan is too slow.
+
+**Trap.** Writing level 1 so cleverly that it eats the time levels 3 and 4 need, or so narrowly that level 3 forces a rewrite. Pass each level first, then refactor before opening the next one.
+
+**Local scope.** The library and its per-level tests, with a script that resets the library to stubs for a timed practice attempt. A thin Express API over it, with PostgreSQL for the persistent variant, and a React file browser that shows the tree, each user's quota and their backups.
+
+### 17. Console Growth Take-Home
+
+**Folder:** [`console-growth/`](./console-growth/) · **Signal:** Anthropic (candidate report: a two-hour take-home for a growth engineering role, done in a hosted IDE with an AI coding assistant, whose transcript is reviewed) · ✅ Built
+
+**Problem.** The take-home gives you:
+- a small, working slice of a developer console for an LLM API (Workbench, API keys, usage, limits, billing), seeded with one account;
+- a product-wide metrics snapshot;
+- an experiment framework: deterministic assignment, overrides and exposure logging.
+
+You find the highest-leverage growth opportunities and propose one large and one small experiment, sized by expected impact. Then you ship both as A/B experiments with tests, and write a readout of what you built and how you'd measure and roll it out. The brief grades product sense and engineering about equally, and it requires the ideas and sizing to be the candidate's own.
+
+**Different deliverables.** A take-home, not a system design question, so there are no interview answers. It ships instead:
+- `README.md`: the practice brief, written for this repository.
+- `METRICS.md`: a fictitious, internally consistent snapshot with several opportunities planted in it, not only the two that were built.
+- `EXPERIMENTS.md`: a worked answer.
+- The bare starter as its own commit, for timed practice. See the project `CLAUDE.md`.
+
+**What it tests.**
+- **Finding and sizing.** Turning funnel, segment and support data into a dollar estimate, with the assumptions labeled.
+- **Exposure placement.** Log exposure where the user would meet the difference, under the same condition in both arms, not on page load.
+- **Randomization unit.** Org for anything billing-shaped, so teammates see the same thing.
+- **Server-side conversions with source attribution.** Fix the snapshot's instrumentation gaps rather than work around them.
+- **Choosing the primary metric.** The problem (fewer orgs running out of credits), not the mechanism (auto-reload adoption).
+- **Keeping the control unchanged**, and testing that it is.
+
+**Traps.** Building past the time box instead of shipping a scoped slice and writing down the cut. Ideas without sizing. Logging exposure only in the treatment. Pasting AI-generated ideas: the brief forbids it, and the transcript is reviewed.
+
+**Local scope.** An in-memory Express API (port 3001) and a React app on Vite (port 3000), following the brief's stack: plain JS, mocha + supertest, plus vitest for components. A Dev toolbar to force variants, stream events, reset the seed and simulate API traffic. `npm run readout` computes each experiment's metrics from the event log. [Experimentation Platform](#9-experimentation-platform) is the system design counterpart.
 
 ---
 

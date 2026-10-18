@@ -1,0 +1,29 @@
+{
+  "name": "console-growth",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Developer console for an LLM API, seeded with one account, used to practice shipping instrumented growth experiments",
+  "type": "module",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "postinstall": "npm --prefix client install --no-audit --no-fund",
+    "dev": "node scripts/stop.js && concurrently -k -n api,web -c blue,magenta \"node --watch-path=server server/index.js\" \"npm --prefix client run dev\"",
+    "start": "npm --prefix client run build && NODE_ENV=production API_PORT=3000 node server/index.js",
+    "stop": "node scripts/stop.js",
+    "doctor": "node scripts/doctor.js",
+    "test": "npm run test:server && npm run test:client",
+    "test:server": "NODE_ENV=test mocha",
+    "test:client": "npm --prefix client test",
+    "readout": "node scripts/readout.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2",
+    "mocha": "^11.1.0",
+    "supertest": "^7.0.0"
+  }
+}

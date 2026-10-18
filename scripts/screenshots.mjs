@@ -1022,6 +1022,7 @@ async function captureWithPlaywright(config, outputDir) {
       //   "steps": [
       //     { "fill": "#pickup", "value": "100 Main St" },
       //     { "click": "button:has-text('Set')" },
+      //     { "select": "select#plan", "value": "pro" },
       //     { "press": "#pickup", "key": "Enter" },
       //     { "wait": 1500 }
       //   ]
@@ -1038,13 +1039,15 @@ async function captureWithPlaywright(config, outputDir) {
             // locators support .nth() — several of these forms have repeated
             // controls (two "Set" buttons, one per address field) that a bare
             // selector cannot disambiguate.
-            const target = step.fill ?? step.click ?? step.press;
+            const target = step.fill ?? step.click ?? step.select ?? step.press;
             const locator = step.nth === undefined
               ? page.locator(target).first()
               : page.locator(target).nth(step.nth);
             await locator.waitFor({ state: 'visible', timeout: 8000 });
             if (step.fill !== undefined) {
               await locator.fill(String(step.value ?? ''));
+            } else if (step.select !== undefined) {
+              await locator.selectOption(String(step.value ?? ''));
             } else if (step.click !== undefined) {
               await locator.click();
             } else if (step.press !== undefined) {
@@ -1052,7 +1055,7 @@ async function captureWithPlaywright(config, outputDir) {
             }
             await page.waitForTimeout(step.delay || 600);
           } catch {
-            const target = step.fill || step.click || step.press;
+            const target = step.fill || step.click || step.select || step.press;
             logWarning(`Step target not found: ${target}`);
           }
         }

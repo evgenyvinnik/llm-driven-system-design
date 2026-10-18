@@ -1,0 +1,67 @@
+{
+  "name": "console-growth",
+  "frontendPort": 3000,
+  "backendRequired": true,
+  "auth": { "enabled": false },
+  "screens": [
+    { "name": "01-dashboard-control", "path": "/", "waitFor": ".stat-value", "delay": 800 },
+    {
+      "name": "02-runway-banner-treatment",
+      "path": "/",
+      "waitFor": ".stat-value",
+      "steps": [
+        { "click": "button.dev-toggle" },
+        { "select": "select[aria-label='Variant for credit_runway_autoreload']", "value": "treatment", "delay": 800 },
+        { "click": "button.dev-toggle", "delay": 600 }
+      ]
+    },
+    {
+      "name": "03-auto-reload-modal",
+      "path": "/",
+      "waitFor": "[data-testid='runway-banner']",
+      "steps": [{ "click": "[data-testid='runway-banner'] button:has-text('Turn on auto-reload')", "delay": 600 }]
+    },
+    {
+      "name": "04-rate-limit-nudge-treatment",
+      "path": "/usage",
+      "waitFor": ".chart",
+      "steps": [
+        { "click": "button.dev-toggle" },
+        { "select": "select[aria-label='Variant for rate_limit_upgrade_nudge']", "value": "treatment", "delay": 800 },
+        { "click": "button.dev-toggle", "delay": 600 }
+      ]
+    },
+    {
+      "name": "05-dev-toolbar-experiments",
+      "path": "/usage",
+      "waitFor": ".chart",
+      "steps": [{ "click": "button.dev-toggle", "delay": 600 }]
+    },
+    {
+      "name": "06-dev-toolbar-events",
+      "path": "/usage",
+      "waitFor": ".chart",
+      "steps": [
+        { "click": "button.dev-toggle" },
+        { "click": ".dev-tab:has-text('Events')", "delay": 600 }
+      ]
+    },
+    {
+      "name": "07-depleted-banner",
+      "path": "/workbench",
+      "waitFor": "textarea",
+      "steps": [
+        { "click": "button.dev-toggle" },
+        { "click": ".dev-tab:has-text('Data')" },
+        { "click": "button:has-text('Simulate a day of API traffic')", "delay": 1500 },
+        { "click": "button.dev-toggle" },
+        { "click": ".dev-tab:has-text('Data')" },
+        { "click": "button:has-text('Simulate a day of API traffic')", "delay": 1500 },
+        { "click": "button.dev-toggle" },
+        { "click": ".dev-tab:has-text('Data')" },
+        { "click": "button:has-text('Simulate a day of API traffic')", "delay": 1500 },
+        { "click": "button.btn-primary:has-text('Run')", "delay": 800 }
+      ]
+    }
+  ]
+}
