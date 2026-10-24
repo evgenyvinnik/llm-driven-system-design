@@ -518,7 +518,8 @@ Each answer should also walk through **one successful and one failed execution t
 
 **Different deliverables.** The core of this project is a library, not a service. In addition to the standard files, it ships:
 - `levels.md`: the practice spec, written for this repository, with the operations and edge cases for each level. It is not a copy of any real assessment.
-- `backend/src/fs/`: the library, with one vitest suite per level, so a practice attempt can be checked one level at a time.
+- `levels-db.md`: a second spec in the same format for the in-memory database variant, also written for this repository. `npm run practice -- start --problem db` runs it.
+- `backend/src/fs/` and `backend/src/kv/`: the two worked answers, each with one vitest suite per level, so a practice attempt can be checked one level at a time.
 - Practice notes in the project `CLAUDE.md`: the time each level took, and what the data model had to change to fit the next level.
 
 **Practice levels.**
@@ -526,6 +527,12 @@ Each answer should also walk through **one successful and one failed execution t
 2. **Queries.** List a directory, and return the N largest files under a prefix, sorted by size descending and then by name.
 3. **Users and quotas.** Every file has an owner, and every user has a byte capacity. A write that would exceed it fails with no partial effect. Merging two users moves the files and combines the capacities.
 4. **History.** Two alternative tracks, to cover both reported variants. *Backup:* back up a user's files and restore them later, skipping paths another user now owns. *Time:* every operation carries a timestamp, files can have a time to live, and reads can ask for the state as of a past time.
+
+**Second variant: an in-memory database.** Most reports describe this one, so it gets its own four levels in the same format:
+1. **Records.** Set, read and delete fields within records. A record exists while it holds a field, and an empty value is still a value.
+2. **Scans.** List a record's fields, all or by name prefix, and the records with the most fields under a key prefix, each with exact ordering and output-format rules.
+3. **Timestamps and expiry.** Every method gains a timestamped twin, values can have a time to live, and every write starts a new lifetime.
+4. **History.** Two alternative tracks. *History:* read a field or a record as of a past time. *Backup:* back up the whole store at a timestamp and restore it later, with each field's remaining lifetime restarting at the restore.
 
 **Hard problems to implement.**
 - **A data model that survives level 4.** Store each file once, with its owner, size and timestamps, in one map keyed by full path. Update per-user usage in the same operation that changes the file map. Two copies of a fact that must stay in sync are where hidden tests catch you.
@@ -543,7 +550,7 @@ Each answer should also walk through **one successful and one failed execution t
 
 **Trap.** Writing level 1 so cleverly that it eats the time levels 3 and 4 need, or so narrowly that level 3 forces a rewrite. Pass each level first, then refactor before opening the next one.
 
-**Local scope.** The library and its per-level tests, with a script that resets the library to stubs for a timed practice attempt. A thin Express API over it, with PostgreSQL for the persistent variant, and a React file browser that shows the tree, each user's quota and their backups.
+**Local scope.** The library and its per-level tests, with a script that resets the library to stubs for a timed practice attempt, for either variant. A thin Express API over the file store, with PostgreSQL for the persistent variant, and a React file browser that shows the tree, each user's quota and their backups.
 
 ### 17. Console Growth Take-Home
 

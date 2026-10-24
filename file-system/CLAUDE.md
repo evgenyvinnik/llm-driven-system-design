@@ -4,7 +4,7 @@
 
 Practice for a **four-level online coding assessment** in which one problem grows over about 90 minutes, and the next level unlocks only when the current one's hidden tests pass. A 2026 preparation guide lists a cloud storage or file system simulation among the variants of Anthropic's assessment, although most reports describe an in-memory database. [ROADMAP.md entry 16](../ROADMAP.md#16-file-system) records the sources and how strong they are.
 
-Everything here was written for this repository: the spec in [levels.md](./levels.md), its method names and examples, the tests, and the demo data. It reconstructs the *format* and the reported *themes* (files, queries, users with quotas, history), not any real assessment. Anthropic's candidate guidance asks that take-home and live assessments be done without AI help unless stated otherwise, so this project is practice for *before* an assessment.
+Everything here was written for this repository: the specs in [levels.md](./levels.md) and [levels-db.md](./levels-db.md), their method names and examples, the tests, and the demo data. They reconstruct the *format* and the reported *themes* (files, queries, users with quotas, history; and for the database variant, fields within records, scans, timestamps with expiry, history or backups), not any real assessment. Anthropic's candidate guidance asks that take-home and live assessments be done without AI help unless stated otherwise, so this project is practice for *before* an assessment.
 
 The design is in [architecture.md](./architecture.md). This file records how the project was built, the choices that aren't obvious from the code, and the practice log.
 
@@ -15,7 +15,8 @@ The design is in [architecture.md](./architecture.md). This file records how the
 | Worked answer, all four levels | `backend/src/fs/file-store.ts` | One file map; every change through `link`, `unlink`, `resize` |
 | Level tests | `backend/src/fs/tests/level*.test.ts` | Import `createStore` from `../subject.js`, so the same files test the worked answer, PostgreSQL, and a practice attempt |
 | Onsite bonus | `backend/src/fs/dedup.ts` | Staged duplicate detection; `dedup.test.ts` checks its cost |
-| Practice runner | `backend/src/practice/cli.ts` | Copies one level's spec and tests at a time into `backend/practice-attempt/` |
+| Second practice problem | `backend/src/kv/kv-store.ts`, `backend/src/kv/tests/` | The key-value database in `levels-db.md`. Same test pattern, no service behind it |
+| Practice runner | `backend/src/practice/cli.ts` | Copies one level's spec and tests at a time into `backend/practice-attempt/`. `--problem fs` (default) or `db`; per-problem files in `templates.ts` |
 | API | `backend/src/api/` on :3000 | Express over an `FsBackend`: `PgBackend` (default) or `MemoryBackend` |
 | PostgreSQL backend | `backend/src/store/pg-backend.ts` | Primary-key placement rules, reserve-first quotas, one lock order |
 | Frontend | `frontend/` on :5173 | Files (`/?path=`) and Users (`/users`) |
@@ -25,9 +26,9 @@ The design is in [architecture.md](./architecture.md). This file records how the
 
 Record each timed attempt here (`npm run practice -- status` prints the splits). The useful column is the last one: what the data model had to change when the next level arrived.
 
-| Date | Track | L1 | L2 | L3 | L4 | Total | What changed between levels |
-|------|-------|----|----|----|----|-------|------------------------------|
-| | | | | | | | |
+| Date | Problem | Track | L1 | L2 | L3 | L4 | Total | What changed between levels |
+|------|---------|-------|----|----|----|----|-------|------------------------------|
+| | | | | | | | | |
 
 ## Deviations from Repository Defaults (and why)
 
@@ -36,7 +37,7 @@ Record each timed attempt here (`npm run practice -- status` prints the splits).
 | Session auth with Valkey | No login; the UI can act as any user | Users are quota principals in the spec. Authentication isn't what this project practices, and the admin page's purpose is to act on others' accounts |
 | PostgreSQL + Valkey | PostgreSQL only | Nothing needs a cache or sessions at this scale. Production caching is in the design docs |
 | Backend is a set of services | One API process plus a library | The core deliverable is a library. The service exists to show the same rules under concurrency |
-| `architecture.md` + three answers | Plus `levels.md` and a practice runner | The roadmap entry asks for a different format: practice for a timed coding assessment |
+| `architecture.md` + three answers | Plus `levels.md`, `levels-db.md` and a practice runner | The roadmap entry asks for a different format: practice for a timed coding assessment |
 | Port 5173 for the frontend | Still 5173 | `.claude/launch.json` starts it on 5180 because, during the build, another app on the machine held 5173 |
 
 ## Development Phases
@@ -47,6 +48,7 @@ Record each timed attempt here (`npm run practice -- status` prints the splits).
 4. **Practice runner**, exercised end to end: a stub fails, the next level stays locked, and the worked answer passes every level.
 5. **API, seed and frontend**, verified in the browser against PostgreSQL.
 6. **Benchmark**, then docs. The scaling sections cite measured numbers rather than predictions.
+7. **Second practice problem: the key-value database.** `levels-db.md` first, then the worked answer and five level suites (88 tests, all passing on the first run), then `--problem db` in the runner. Exercised end to end on both tracks, and the fs problem rechecked through the same runner. A mutation pass then injected nine typical mistakes into the worked answer (`|| null` for `?? null`, no tie-break, an off-by-one expiry, an overwrite that keeps the old expiry, a restore that doesn't restart lifetimes, and so on). The suites caught every one.
 
 ## Key Implementation Decisions
 
@@ -55,6 +57,10 @@ Record each timed attempt here (`npm run practice -- status` prints the splits).
 - **Directories are rows, and the root isn't.** A directory row carries its total and file count, so `listDir` and `dirSize` are index reads. The root has no row, so it can't be the single row every write updates; its totals are summed from its children.
 - **Restores use a savepoint per file.** An unavailable path rolls back only its own partial work (ancestor upserts, quota charge), and is reported as skipped.
 - **The seed tells the restore story.** alice backs up while she owns `/shared/roadmap.md`, deletes it, and bob creates his own. Restoring alice then demonstrates every rule at once: a skipped path, a deleted post-backup file, and a reverted size.
+- **The database spec lives here, not in a sibling `in-memory-db/` folder.** The two specs share everything except the domain: the runner, the attempt folder, the vitest setup and the practice log. Here it costs one `--problem` flag. A sibling project would need a second copy of the runner and, by the repository's conventions, its own `architecture.md` and three interview answers, for a system design that [distributed-cache](../distributed-cache/) already covers. The code lives in `src/kv/`, because `src/db/` already holds this project's PostgreSQL migrations.
+- **The attempt remembers its problem.** Only `start` takes `--problem`, and `.practice.json` records it, so `check`, `next` and `status` can't be pointed at the wrong spec. An attempt file without the field is read as `fs`, the only problem when it was written.
+- **The database's level 3 uses timestamped twins, not a clock.** The file store's time track already practices `setTime`. The database practices the other common shape: every method gains an `At` variant, and the untimestamped ones act at the latest timestamp. The refactor that level rewards, each old method becoming a one-line call to its twin, is the main lesson of that spec.
+- **Opposite expiry rules on purpose.** The file store's `updateFile` keeps a file's expiry, but in the database every write starts a new lifetime. Each spec states its rule in bold, because carrying an assumption from one problem to the other is exactly the mistake hidden tests catch.
 - **The dedup hint sits outside the practice markers.** The first draft of `levels.md` described the staged approach inside the practice section, which gave the answer away. It now states only the constraints, with the approach after the markers.
 - **Quota refusals are 409, not 507**, because clients retry 5xx.
 - **BIGINT parsed as a number once.** `pg` returns int8 as a string by default (repo bug class 7); `shared/db.ts` sets one type parser instead of converting at every call site. Sizes stay far below 2^53.
@@ -78,5 +84,5 @@ Record each timed attempt here (`npm run practice -- status` prints the splits).
 - **Idempotency keys** on writes. A retried create currently gets `409 PATH_EXISTS` for the client's own file. Doing it properly means storing the key in the write's transaction, which means threading a client through `FsBackend`.
 - **Rename and move**, which would push the PostgreSQL backend from path keys toward the inode model the design describes.
 - **The time track in SQL** (versioned rows), which is also the copy-on-write backup design.
-- **Practice variants.** An in-memory database spec in the same four-level shape, since that's the variant most reports describe. Also a Python stub, in case the assessment is taken in Python.
+- **A Python stub** for each practice problem, in case the assessment is taken in Python. The tests would need porting too, since the runner runs vitest.
 - **Listing cache and virtualization** in the frontend, which the frontend answer designs but the demo's small directories don't need.

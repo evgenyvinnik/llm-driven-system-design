@@ -129,6 +129,8 @@ Every mutation goes through three private methods, `link`, `unlink` and `resize`
 
 The levels deliberately change earlier methods: `updateFile` gains a quota failure at level 3, and every method must ignore expired files at level 4. A design with one mutation path absorbs those changes in one place.
 
+**A second practice problem.** [levels-db.md](./levels-db.md) is a key-value database in the same four-level format, for the variant most reports describe. Its worked answer, `backend/src/kv/kv-store.ts`, follows the same principle: a field's value and expiry live together, only `write` and `remove` change state, and every untimestamped method is a one-line call to its timestamped twin. It is practice only, with no service behind it; [distributed-cache](../distributed-cache/) covers a key-value store as a system design.
+
 ### 2. Namespace and placement rules
 
 The rules are: a path is a file or a directory, never both, and nothing lives below a file. Directories are implicit, like prefixes in an object store, but unlike an object store they are *exclusive* with files.
@@ -468,7 +470,7 @@ ON CONFLICT (path) DO UPDATE SET size = fs_nodes.size + EXCLUDED.size, file_coun
 
 **Prometheus metrics, pino logs, health and readiness checks**, and graceful shutdown in `api/index.ts`.
 
-**Practice runner** (`backend/src/practice/cli.ts`): reveals `levels.md` one level at a time, copies that level's tests into a git-ignored attempt folder, keeps split times, and unlocks the next level only when the current one passes.
+**Practice runner** (`backend/src/practice/cli.ts`): reveals `levels.md`, or `levels-db.md` with `--problem db`, one level at a time, copies that level's tests into a git-ignored attempt folder, keeps split times, and unlocks the next level only when the current one passes.
 
 ### Simplified or substituted
 
@@ -489,4 +491,4 @@ ON CONFLICT (path) DO UPDATE SET size = fs_nodes.size + EXCLUDED.size, file_coun
 
 ### Verified locally
 
-PostgreSQL 16 in Docker. `npm test`: 107 tests (the level suites against the worked answer, dedup correctness and cost, API routes over the memory backend). `npm run test:pg`: the same level suites against PostgreSQL plus 5 concurrency tests, repeated several times with no deadlocks. `npm run bench` for the throughput table above. The practice runner was exercised end to end (a stub fails, levels unlock only on pass, the worked answer passes every level and the dedup bonus). In the browser: navigation, a refused over-quota create, a create below a file, resize and delete, and alice's restore reporting `/shared/roadmap.md` as skipped. Playwright smoke tests (6) and screenshots run through the repository harness.
+PostgreSQL 16 in Docker. `npm test`: 195 tests (the level suites of both practice problems against their worked answers, dedup correctness and cost, API routes over the memory backend). `npm run test:pg`: the same level suites against PostgreSQL plus 5 concurrency tests, repeated several times with no deadlocks. `npm run bench` for the throughput table above. The practice runner was exercised end to end for both problems (a stub fails, levels unlock only on pass, the worked answer passes every level, plus the dedup bonus for the file store and both level-4 tracks for the database). In the browser: navigation, a refused over-quota create, a create below a file, resize and delete, and alice's restore reporting `/shared/roadmap.md` as skipped. Playwright smoke tests (6) and screenshots run through the repository harness.
