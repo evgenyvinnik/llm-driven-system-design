@@ -31,6 +31,7 @@ Each folder contains an independent implementation of a system design problem.
 |---------|-------------|--------|
 | [Dropbox](./dropbox/) | Cloud file storage and synchronization | ✅ Implemented |
 | [Distributed Cache](./distributed-cache/) | High-performance caching layer | ✅ Implemented |
+| [File System](./file-system/) | Four-level file store practice, scaled into a namespace service with quotas and restores | ✅ Implemented |
 
 ### Social Media & Content
 
@@ -214,7 +215,6 @@ The next round, focused on AI products and developer platforms. See [ROADMAP.md]
 | [File Cache](./ROADMAP.md#13-file-cache) | Byte-bounded cache for large files with single-flight fills | 📋 Planned |
 | [Model Distribution](./ROADMAP.md#14-model-distribution) | Peer-assisted distribution of a huge file to a fleet, then safe activation | 📋 Planned |
 | [Online Chess](./ROADMAP.md#15-online-chess) | Real-time games with authoritative state, clocks, matchmaking, and spectators | 📋 Planned |
-| [File System](./ROADMAP.md#16-file-system) | Four-level in-memory file storage practice, scaled into a metadata service | 📋 Planned |
 
 ## Project Structure
 

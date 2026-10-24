@@ -48,7 +48,7 @@ Sources surveyed: Glassdoor, Aced (formerly Exponent) and Hello Interview. Proje
 | 13 | [File Cache](#13-file-cache) | `file-cache/` | 3 | Anthropic (candidate report) | distributed-cache |
 | 14 | [Model Distribution](#14-model-distribution) | `model-distribution/` | 3 | Anthropic (candidate report) | — |
 | 15 | [Online Chess](#15-online-chess) | `online-chess/` | 3 | OpenAI (community) | r-place, online-auction |
-| 16 | [File System](#16-file-system) | `file-system/` | 3 | Anthropic (community, online assessment; candidate report for the dedup variant) | dropbox |
+| 16 | [File System](#16-file-system) ✅ Built | [`file-system/`](./file-system/) | 3 | Anthropic (community, online assessment; candidate report for the dedup variant) | dropbox |
 | 17 | [Console Growth Take-Home](#17-console-growth-take-home) ✅ Built | [`console-growth/`](./console-growth/) | 3 | Anthropic (candidate report: growth engineering take-home) | experimentation-platform |
 
 - **Tier 1** covers the core product-facing work for AI and full-stack roles. Build these first, in the order listed.
@@ -512,7 +512,7 @@ Each answer should also walk through **one successful and one failed execution t
 
 ### 16. File System
 
-**Folder:** `file-system/` · **Signal:** Anthropic (community attribution: a 2026 preparation guide lists a cloud storage or file system simulation among the online assessment's problems, though most reports describe an in-memory database variant of the same format. A separate candidate report describes an onsite coding round on finding duplicate files)
+**Folder:** [`file-system/`](./file-system/) · **Signal:** Anthropic (community attribution: a 2026 preparation guide lists a cloud storage or file system simulation among the online assessment's problems, though most reports describe an in-memory database variant of the same format. A separate candidate report describes an onsite coding round on finding duplicate files) · ✅ Built
 
 **Problem.** Build an in-memory file storage system in four levels, each extending the last, then scale the same model into a service. The online assessment is reported as a timed CodeSignal test of about 90 minutes. It has one problem with four levels and hidden tests, and the next level unlocks only after the current one passes. Later levels can't be read in advance, so the skill being tested is choosing a data model that survives requirements you haven't seen yet. If that assessment is coming up, build this before the other tier-3 projects.
 

@@ -6,6 +6,18 @@
       "runtimeExecutable": "npm",
       "runtimeArgs": ["--prefix", "console-growth", "run", "dev"],
       "port": 3000
+    },
+    {
+      "name": "file-system-api",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["--prefix", "file-system/backend", "run", "dev"],
+      "port": 3000
+    },
+    {
+      "name": "file-system-web",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["--prefix", "file-system/frontend", "run", "dev", "--", "--port", "5180", "--strictPort"],
+      "port": 5180
     }
   ]
 }
