@@ -1,4 +1,6 @@
 import { useCanvasStore } from '../stores/canvasStore';
+import { wsClient } from '../services/websocket';
+import type { ExcalidrawElement } from '../types';
 
 const STROKE_COLORS = [
   '#1e1e1e', '#e03131', '#c2255c', '#9c36b5', '#6741d9',
@@ -33,42 +35,50 @@ export function PropertiesPanel() {
   } = useCanvasStore();
 
   const selectedElement = selectedElementId
-    ? elements.find((el) => el.id === selectedElementId)
+    ? elements.find((el) => el.id === selectedElementId && !el.isDeleted)
     : null;
+
+  // With a shape selected the controls show and edit that shape; otherwise
+  // they set the defaults for the next shape drawn.
+  const shown = {
+    strokeColor: selectedElement?.strokeColor ?? strokeColor,
+    fillColor: selectedElement?.fillColor ?? fillColor,
+    strokeWidth: selectedElement?.strokeWidth ?? strokeWidth,
+    opacity: selectedElement?.opacity ?? opacity,
+    fontSize: selectedElement?.fontSize ?? fontSize,
+  };
+
+  /** Applies a style change to the selected shape and sends it to collaborators. */
+  const applyToSelection = (updates: Partial<ExcalidrawElement>) => {
+    if (!selectedElementId) return;
+    updateElement(selectedElementId, updates);
+    const updated = useCanvasStore.getState().elements.find((el) => el.id === selectedElementId);
+    if (updated) wsClient.sendShapeUpdate(updated);
+  };
 
   const handleStrokeColorChange = (color: string) => {
     setStrokeColor(color);
-    if (selectedElementId) {
-      updateElement(selectedElementId, { strokeColor: color });
-    }
+    applyToSelection({ strokeColor: color });
   };
 
   const handleFillColorChange = (color: string) => {
     setFillColor(color);
-    if (selectedElementId) {
-      updateElement(selectedElementId, { fillColor: color });
-    }
+    applyToSelection({ fillColor: color });
   };
 
   const handleStrokeWidthChange = (width: number) => {
     setStrokeWidth(width);
-    if (selectedElementId) {
-      updateElement(selectedElementId, { strokeWidth: width });
-    }
+    applyToSelection({ strokeWidth: width });
   };
 
   const handleOpacityChange = (value: number) => {
     setOpacity(value);
-    if (selectedElementId) {
-      updateElement(selectedElementId, { opacity: value });
-    }
+    applyToSelection({ opacity: value });
   };
 
   const handleFontSizeChange = (size: number) => {
     setFontSize(size);
-    if (selectedElementId && selectedElement?.type === 'text') {
-      updateElement(selectedElementId, { fontSize: size });
-    }
+    if (selectedElement?.type === 'text') applyToSelection({ fontSize: size });
   };
 
   return (
@@ -83,7 +93,7 @@ export function PropertiesPanel() {
             {STROKE_COLORS.map((color) => (
               <button
                 key={color}
-                className={`color-swatch ${strokeColor === color ? 'selected' : ''}`}
+                className={`color-swatch ${shown.strokeColor === color ? 'selected' : ''}`}
                 style={{ backgroundColor: color }}
                 onClick={() => handleStrokeColorChange(color)}
               />
@@ -100,7 +110,7 @@ export function PropertiesPanel() {
             {FILL_COLORS.map((color, i) => (
               <button
                 key={i}
-                className={`color-swatch ${fillColor === color ? 'selected' : ''} ${
+                className={`color-swatch ${shown.fillColor === color ? 'selected' : ''} ${
                   color === 'transparent' ? 'bg-white border-dashed' : ''
                 }`}
                 style={color !== 'transparent' ? { backgroundColor: color } : undefined}
@@ -121,7 +131,7 @@ export function PropertiesPanel() {
               <button
                 key={width}
                 className={`flex-1 h-8 rounded border transition-colors flex items-center justify-center ${
-                  strokeWidth === width
+                  shown.strokeWidth === width
                     ? 'border-selection-blue bg-selection-light'
                     : 'border-panel-border hover:bg-panel-bg'
                 }`}
@@ -139,27 +149,27 @@ export function PropertiesPanel() {
         {/* Opacity */}
         <div>
           <label className="text-xs font-medium text-text-secondary uppercase tracking-wide mb-2 block">
-            Opacity: {Math.round(opacity * 100)}%
+            Opacity: {Math.round(shown.opacity * 100)}%
           </label>
           <input
             type="range"
             min="0.1"
             max="1"
             step="0.05"
-            value={opacity}
+            value={shown.opacity}
             onChange={(e) => handleOpacityChange(parseFloat(e.target.value))}
             className="w-full accent-selection-blue"
           />
         </div>
 
         {/* Font Size (when text is selected) */}
-        {(selectedElement?.type === 'text' || true) && (
+        {(!selectedElement || selectedElement.type === 'text') && (
           <div>
             <label className="text-xs font-medium text-text-secondary uppercase tracking-wide mb-2 block">
               Font Size
             </label>
             <select
-              value={fontSize}
+              value={shown.fontSize}
               onChange={(e) => handleFontSizeChange(parseInt(e.target.value))}
               className="w-full border border-panel-border rounded px-2 py-1 text-sm"
             >

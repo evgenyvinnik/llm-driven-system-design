@@ -163,18 +163,9 @@ export const addCollaborator = async (
   permission: string = 'view'
 ): Promise<CollaboratorRow | null> => {
   try {
-    const result = await query<CollaboratorRow>(
-      `INSERT INTO drawing_collaborators (drawing_id, user_id, permission)
-       VALUES ($1, $2, $3)
-       ON CONFLICT (drawing_id, user_id) DO UPDATE SET permission = $3
-       RETURNING dc.*, u.username, u.display_name
-       FROM drawing_collaborators dc
-       JOIN users u ON dc.user_id = u.id
-       WHERE dc.drawing_id = $1 AND dc.user_id = $2`,
-      [drawingId, userId, permission]
-    );
-
-    // Simpler approach due to RETURNING with JOIN limitations
+    // (An earlier version ran an INSERT ... RETURNING ... FROM ... JOIN first.
+    // That is not valid SQL, so it always threw into the catch below and every
+    // share returned null, which the share dialog then crashed on.)
     const insertResult = await query(
       `INSERT INTO drawing_collaborators (drawing_id, user_id, permission)
        VALUES ($1, $2, $3)

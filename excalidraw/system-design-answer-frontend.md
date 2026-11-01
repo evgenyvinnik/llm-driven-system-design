@@ -412,12 +412,11 @@ recoverable. Those are separate promises, so the interface should expose separat
 them.”
 
 The local application uses Canvas 2D, React effects, Zustand, mouse handlers, process-local
-WebSocket rooms, and idle SQL saves. It has no durable pending-command queue, accepted
-sequence, shared canonical reducer, live gesture preview, resize behavior, undo, or working
-export.
-
-Its socket access checks are absent, reconnect replaces the scene, property changes are not
-broadcast, and pixel-density transforms are inconsistent. These are implementation limits,
+WebSocket rooms, and debounced SQL saves. It renders a live gesture preview, broadcasts
+property changes, keeps device-pixel and viewport transforms consistent, and switches to a
+view-only interface when the server says so. It has no durable pending-command queue,
+accepted sequence, shared canonical reducer, resize behavior, undo, or working export, and
+reconnect replaces the scene. These are implementation limits,
 not features the interview proposal claims to have delivered. The [architecture
 document](./architecture.md#implementation-notes) maps them to source.
 

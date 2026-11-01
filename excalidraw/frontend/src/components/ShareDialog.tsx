@@ -29,7 +29,11 @@ export function ShareDialog({ drawingId, collaborators, isOwner, onClose, onColl
         permission,
       });
 
-      onCollaboratorsChange([...collaborators, response.collaborator]);
+      // Re-sharing with someone changes their permission; replace, don't duplicate.
+      onCollaboratorsChange([
+        ...collaborators.filter((c) => c.userId !== response.collaborator.userId),
+        response.collaborator,
+      ]);
       setUsername('');
     } catch (err) {
       setError((err as Error).message);
