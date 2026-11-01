@@ -2,7 +2,20 @@
 
 A local learning project with a market overview, candlestick chart, order book, buy/sell form, portfolio, and order history. Prices and deposits are simulated; there is no connection to Coinbase, a blockchain, a bank, or a real market-data provider.
 
-The project demonstrates price-time sorting, conditional wallet reservation, WebSocket broadcasting, and relational order records. It does **not** provide consistent exchange accounting: matching, order updates, and wallet settlement can diverge, and monetary calculations use JavaScript numbers despite decimal database columns. [Implementation Notes](./architecture.md#implementation-notes) explain these limits.
+The project demonstrates price-time matching with exact fixed-point arithmetic, per-order fund holds, one-transaction settlement with maker/taker fees, stop orders, book rebuild on restart, and a session-authenticated private order feed. Accounting stays consistent within one API process; several processes would run unrelated order books. [Implementation Notes](./architecture.md#implementation-notes) explain what is implemented and what is simulated.
+
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 8,182 |
+| Source Files | 85 |
+| .ts | 4,397 |
+| .md | 1,576 |
+| .tsx | 1,519 |
+| .sql | 319 |
+| .json | 151 |
+
 
 ## What you can explore
 
@@ -136,7 +149,7 @@ export PORT=3001 NODE_ENV=development
 
 `DATABASE_URL` and `REDIS_URL` are not read. The migration runner reads PG* environment variables directly and does not load dotenv. The active database pool has 20 connections and a two-second connection timeout.
 
-`npm run dev` explicitly sets port 3001. The `dev:server2` and `dev:server3` scripts call it after setting another port, so the inner command resets both to 3001. For an isolated port experiment, `PORT=3002 NODE_ENV=development npx tsx src/index.ts` uses that port, but it also creates an independent price simulation and order book. Multiple API instances are not a coherent shared exchange, and no load balancer is provided.
+`npm run dev` explicitly sets port 3001. `dev:server2` and `dev:server3` start instances on 3002 and 3003, but each creates an independent price simulation, order book, and per-pair command queue. Multiple API instances are not a coherent shared exchange, and no load balancer is provided.
 
 ## Optional demo data
 
@@ -169,18 +182,18 @@ curl -s http://localhost:3001/metrics
 
 Health returns a fixed healthy response without checking the database, Redis, Kafka, book recovery, or settlement consistency. It also runs behind session middleware and the general API rate limiter.
 
-Backend scripts include `npm run build`, `npm test`, and `npm run lint`. Frontend scripts include `npm run build`, `npm run lint`, and `npm run preview`. The backend's fifteen mocked HTTP tests cover route shape, validation, and unauthenticated access; they do not exercise successful settlement, concurrent matching, or database recovery.
+Backend scripts include `npm run build`, `npm test`, and `npm run lint`. Frontend scripts include `npm run build`, `npm run lint`, and `npm run preview`. The backend's fifteen mocked HTTP tests cover route shape, validation, and unauthenticated access, and `src/services/matching.test.ts` covers exact decimal parsing, price-time matching, stop ordering, and the per-pair command queue. Settlement and recovery were verified against the live stack (see the architecture's Implementation Notes); there is no automated database-backed test.
 
 From the repository root, `npm run test:smoke coinbase` runs seven page checks against an already running stack and seeded Alice account. Their container assertions do not prove trading or chart correctness. The project-level `test:e2e` can start Vite but does not start infrastructure or the API.
 
 ## Important implementation boundaries
 
-- Reservation and order insertion are separate writes. Matching mutates the in-memory book before trade insertion, order updates, and wallet settlement complete. Failures can leave orphan reserves or divergent records; restart does not rebuild open orders into the book.
-- Matched buyer fees are computed in quote currency and subtracted directly from base quantity. Market fallback creates a synthetic fill without a counterparty or trade row and leaves the already filled order in the book. Limit-price improvements can leave unused reserves locked.
-- Price, quantity, fee, and valuation calculations use floating point. Decimal columns and some string responses do not make the full path exact. Crypto-to-crypto prices are incorrectly labelled with dollar signs in several views.
-- Idempotency uses a global unbound Redis response key without a lock or durable result lookup. The browser creates a new timestamp/random key for each submission rather than preserving an attempt through recovery.
+- **Order lifecycle.** The reservation and the order insert commit together. Each trade settles in one transaction (trade row, both fills, wallets, quote-currency fees to the exchange account, unspent-hold release). Commands for one pair are serialized per process, and the book is rebuilt from Postgres at boot and after a failed settlement. All of this is per process: running several API instances gives several unrelated books.
+- **Market orders** are immediate-or-cancel within 5% of the reference price. When the book runs out they fill against an exchange-owned liquidity account, minted at boot and recorded as deposits, so every fill has a counterparty and a trade row. Stop orders are stop-market and trigger from the last price, which any trade sets; there is no self-trade prevention.
+- **Arithmetic.** Matching, holds, and fees use exact BigInt fixed-point arithmetic at the database's 18-decimal scale. Valuation and browser estimates still use floating point for display. Crypto-to-crypto prices are incorrectly labelled with dollar signs in several views.
+- **Idempotency** keys are scoped per user in Redis and backed by a `UNIQUE (user_id, idempotency_key)` index, so a same-user race returns the first order. The browser still creates a new timestamp/random key for each submission rather than preserving an attempt through recovery.
 - Browser prices, persisted candles, and portfolio-worker valuations come from separate process-local price maps. “24h” statistics are synthetic cumulative/process-lifetime values, and overview sparklines are newly generated on render.
-- The development StrictMode effect cleanup removes the WebSocket price handler, while a ref prevents it from being registered again. Other request races can mix symbols or accounts. The chart is recreated when its candle array changes; it does not receive live candle updates.
-- WebSocket auth trusts a supplied user ID and arbitrary channel subscriptions. No private order/book events are currently published, but those helpers are not an authorization boundary. HTTP cookies remain insecure even in production configuration; no admin or account-verification workflow exists.
+- Request races can mix symbols or accounts. The chart keeps its viewport across refreshes but does not receive live candle updates.
+- The WebSocket identity comes from the session cookie on the upgrade request; clients cannot subscribe to `user:` channels by name, and order state changes are pushed to the owner's channel. HTTP cookies remain insecure even in production configuration; no admin or account-verification workflow exists.
 
-This review inspected source/configuration and ran isolated password, matching, arithmetic, and candle-lifecycle checks. It did not start the exchange, execute its SQL fixture, run browser tests, or validate live settlement. The detailed architecture records these findings without treating proposed production mechanisms as implemented features.
+The order lifecycle was exercised against a running stack (Postgres and Valkey, Kafka down) with a scripted alice/bob session and a restart. Browser behavior beyond the smoke checks was not systematically tested. The detailed architecture records these findings without treating proposed production mechanisms as implemented features.

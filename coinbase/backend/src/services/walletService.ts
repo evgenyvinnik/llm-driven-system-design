@@ -1,3 +1,4 @@
+import type { PoolClient } from 'pg';
 import { pool } from './db.js';
 
 /** Returns all wallet balances for a user including available (balance minus reserved). */
@@ -69,13 +70,21 @@ export async function deposit(
   }
 }
 
-/** Reserves balance for a pending order. Returns false if insufficient available funds. */
+/** Anything that can run a query: the pool, or a client inside a transaction. */
+type Queryable = Pick<PoolClient, 'query'>;
+
+/**
+ * Reserves balance for a pending order. Returns false if insufficient available funds.
+ * The availability check is the UPDATE's WHERE clause, so two concurrent
+ * reservations cannot both pass it.
+ */
 export async function reserveBalance(
   userId: string,
   currencyId: string,
-  amount: string
+  amount: string,
+  db: Queryable = pool
 ): Promise<boolean> {
-  const result = await pool.query(
+  const result = await db.query(
     `UPDATE wallets
      SET reserved_balance = reserved_balance + $3, updated_at = NOW()
      WHERE user_id = $1 AND currency_id = $2
@@ -86,93 +95,56 @@ export async function reserveBalance(
   return result.rowCount !== null && result.rowCount > 0;
 }
 
-/** Releases previously reserved balance when an order is cancelled. */
+/**
+ * Returns held funds to the available balance. Deliberately not clamped at
+ * zero: releasing more than is held is an accounting bug, and the
+ * reserved_balance >= 0 CHECK turns it into a failed transaction instead of
+ * silently absorbing it.
+ */
 export async function releaseReserve(
   userId: string,
   currencyId: string,
-  amount: string
+  amount: string,
+  db: Queryable = pool
 ): Promise<void> {
-  await pool.query(
+  await db.query(
     `UPDATE wallets
-     SET reserved_balance = GREATEST(reserved_balance - $3, 0), updated_at = NOW()
+     SET reserved_balance = reserved_balance - $3, updated_at = NOW()
      WHERE user_id = $1 AND currency_id = $2`,
     [userId, currencyId, amount]
   );
 }
 
-/** Executes an atomic trade transfer between buyer and seller wallets with fee deduction. */
-export async function executeTradeTransfer(
-  buyerUserId: string,
-  sellerUserId: string,
-  baseCurrencyId: string,
-  quoteCurrencyId: string,
-  baseAmount: string,
-  quoteAmount: string,
-  buyerFee: string,
-  sellerFee: string,
-  tradeId: string
+/** Pays out of held funds: the amount leaves both the balance and the reservation. */
+export async function spendReserved(
+  db: Queryable,
+  userId: string,
+  currencyId: string,
+  amount: string
 ): Promise<void> {
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-
-    // Buyer: deduct quote currency (reserved), add base currency
-    await client.query(
-      `UPDATE wallets SET balance = balance - $3, reserved_balance = reserved_balance - $3, updated_at = NOW()
-       WHERE user_id = $1 AND currency_id = $2`,
-      [buyerUserId, quoteCurrencyId, quoteAmount]
-    );
-
-    // Buyer: add base currency (minus fee)
-    const buyerReceives = (parseFloat(baseAmount) - parseFloat(buyerFee)).toString();
-    await client.query(
-      `INSERT INTO wallets (user_id, currency_id, balance)
-       VALUES ($1, $2, $3)
-       ON CONFLICT (user_id, currency_id)
-       DO UPDATE SET balance = wallets.balance + $3, updated_at = NOW()`,
-      [buyerUserId, baseCurrencyId, buyerReceives]
-    );
-
-    // Seller: deduct base currency (reserved), add quote currency
-    await client.query(
-      `UPDATE wallets SET balance = balance - $3, reserved_balance = reserved_balance - $3, updated_at = NOW()
-       WHERE user_id = $1 AND currency_id = $2`,
-      [sellerUserId, baseCurrencyId, baseAmount]
-    );
-
-    // Seller: add quote currency (minus fee)
-    const sellerReceives = (parseFloat(quoteAmount) - parseFloat(sellerFee)).toString();
-    await client.query(
-      `INSERT INTO wallets (user_id, currency_id, balance)
-       VALUES ($1, $2, $3)
-       ON CONFLICT (user_id, currency_id)
-       DO UPDATE SET balance = wallets.balance + $3, updated_at = NOW()`,
-      [sellerUserId, quoteCurrencyId, sellerReceives]
-    );
-
-    // Record trade transactions
-    await client.query(
-      `INSERT INTO transactions (user_id, type, currency_id, amount, fee, reference_id, status) VALUES
-       ($1, 'trade', $2, $3, $4, $5, 'completed'),
-       ($6, 'trade', $7, $8, $9, $5, 'completed')`,
-      [
-        buyerUserId,
-        baseCurrencyId,
-        baseAmount,
-        buyerFee,
-        tradeId,
-        sellerUserId,
-        quoteCurrencyId,
-        quoteAmount,
-        sellerFee,
-      ]
-    );
-
-    await client.query('COMMIT');
-  } catch (error) {
-    await client.query('ROLLBACK');
-    throw error;
-  } finally {
-    client.release();
+  const result = await db.query(
+    `UPDATE wallets
+     SET balance = balance - $3, reserved_balance = reserved_balance - $3, updated_at = NOW()
+     WHERE user_id = $1 AND currency_id = $2`,
+    [userId, currencyId, amount]
+  );
+  if (result.rowCount === 0) {
+    throw new Error(`No ${currencyId} wallet to debit for user ${userId}`);
   }
+}
+
+/** Adds funds to a wallet, creating it on first credit. */
+export async function credit(
+  db: Queryable,
+  userId: string,
+  currencyId: string,
+  amount: string
+): Promise<void> {
+  await db.query(
+    `INSERT INTO wallets (user_id, currency_id, balance)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (user_id, currency_id)
+     DO UPDATE SET balance = wallets.balance + $3, updated_at = NOW()`,
+    [userId, currencyId, amount]
+  );
 }

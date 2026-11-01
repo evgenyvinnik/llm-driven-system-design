@@ -148,9 +148,8 @@ router.get('/:symbol/trades', async (req: Request, res: Response) => {
               t.buyer_fee::text AS "buyerFee",
               t.seller_fee::text AS "sellerFee",
               t.created_at AS "createdAt",
-              bo.side AS "takerSide"
+              t.taker_side AS "takerSide"
        FROM trades t
-       JOIN orders bo ON bo.id = t.buy_order_id
        WHERE t.trading_pair_id = $1
        ORDER BY t.created_at DESC
        LIMIT $2`,

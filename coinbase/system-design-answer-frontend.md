@@ -389,10 +389,10 @@ Precision cases include tiny quantities, large values, tick/step boundaries, non
 quotes, and fees in a different asset. Rendering tests keep keyboard input responsive
 during bursts and verify that a chart update preserves the user's viewport.
 
-The local demo has no sequence/resnapshot protocol, durable command lookup, private
-order feed, or exact order arithmetic. It has global unkeyed chart/book state, request
-races, a development subscription-lifecycle gap, and a chart recreated on candle
-changes. Its sparklines and prices are simulated.
+The local demo has no sequence/resnapshot protocol or durable command lookup. Its
+private feed is a session-authenticated `order_update` push that prompts a refetch
+rather than carrying state. It has global unkeyed chart/book state and request races,
+and its sparklines and prices are simulated.
 
 Those limitations inform the design without needing to recite every implementation bug
 in the interview. I would demonstrate one trustworthy order journey and one market

@@ -29,8 +29,15 @@ export const config = {
     maxAge: 24 * 60 * 60 * 1000, // 24 hours
   },
 
+  // Rates are decimal strings so they enter the exact arithmetic in decimal.ts
+  // without passing through float64.
   fees: {
-    makerFee: 0.001, // 0.1%
-    takerFee: 0.002, // 0.2%
+    makerFee: '0.001', // 0.1%, charged to the resting order
+    takerFee: '0.002', // 0.2%, charged to the order that crossed the spread
   },
+
+  // A market order never executes more than 5% away from the reference price
+  // (the current price for market orders, the stop price for triggered stops).
+  // It is also the worst case a buy order's hold is sized for.
+  marketProtection: '0.05',
 };

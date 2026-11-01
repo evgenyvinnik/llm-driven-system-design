@@ -201,7 +201,9 @@ CREATE TABLE orders (
   filled_quantity DECIMAL(28,18) DEFAULT 0,
   avg_fill_price DECIMAL(28,18),
   status VARCHAR(20) DEFAULT 'pending' CHECK (status IN ('pending', 'open', 'partially_filled', 'filled', 'cancelled', 'rejected')),
-  idempotency_key VARCHAR(64) UNIQUE,
+  idempotency_key VARCHAR(64),             -- unique per user, see index below
+  hold_remaining DECIMAL(28,18) NOT NULL DEFAULT 0 CHECK (hold_remaining >= 0),
+  arrival_seq BIGSERIAL,                   -- time priority; the book is rebuilt in this order
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
@@ -213,8 +215,9 @@ CREATE TABLE trades (
   sell_order_id UUID NOT NULL REFERENCES orders(id),
   price DECIMAL(28,18) NOT NULL,
   quantity DECIMAL(28,18) NOT NULL,
-  buyer_fee DECIMAL(28,18) DEFAULT 0,
-  seller_fee DECIMAL(28,18) DEFAULT 0,
+  buyer_fee DECIMAL(28,18) DEFAULT 0,      -- quote currency
+  seller_fee DECIMAL(28,18) DEFAULT 0,     -- quote currency
+  taker_side VARCHAR(4) CHECK (taker_side IN ('buy', 'sell')),
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
@@ -258,9 +261,15 @@ CREATE INDEX idx_trades_pair ON trades(trading_pair_id, created_at DESC);
 CREATE INDEX idx_price_candles_lookup ON price_candles(symbol, interval, open_time DESC);
 CREATE INDEX idx_portfolio_snapshots_user ON portfolio_snapshots(user_id, created_at DESC);
 CREATE INDEX idx_transactions_user ON transactions(user_id, created_at DESC);
+CREATE UNIQUE INDEX idx_orders_user_idempotency ON orders(user_id, idempotency_key)
+  WHERE idempotency_key IS NOT NULL;
+CREATE INDEX idx_orders_live ON orders(trading_pair_id, arrival_seq)
+  WHERE status IN ('open', 'partially_filled');
 ```
 
-The wallet checks constrain individual stored rows. They do not prove that order holds reconcile, fees use the correct asset, or transfers conserve assets across accounts. Balance and reserve columns are nullable; order quantity/price/fill columns lack positive, finite, scale, and fill-not-above-quantity constraints. Transaction references are UUIDs without a foreign key or unique effect identity.
+The actual `init.sql` uses `IF NOT EXISTS`/`ON CONFLICT` throughout and ends with `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` upgrades, because Compose applies it on a fresh volume and `npm run db:migrate` re-runs it against an existing one.
+
+The checks constrain individual stored rows, and `hold_remaining >= 0` makes overspending an order's hold a failed transaction rather than a stored state. Cross-row properties (each wallet's `reserved_balance` equals the holds of its live orders; trades conserve every currency) are maintained by the settlement code and verified by the end-to-end checks described in Implementation Notes, not enforced by the schema. Order quantity/price columns still lack positive and scale constraints at the database level; the service validates them before insert.
 
 ### Proposed extensions
 
@@ -375,7 +384,7 @@ Separate liveness, command readiness, and market-data freshness. Readiness inclu
 |---------|-------------------|--------------------------|
 | Lost order response | Recover the same command receipt | Global Redis replay only; no lookup endpoint |
 | Settlement rejection | Roll back the whole planned command | Trade/order records may already be committed |
-| Process failure | Replay committed book mutations before trading | Open database orders are not rehydrated |
+| Process failure | Replay committed book mutations before trading | Live orders rebuilt from Postgres in `arrival_seq` order before the server listens; interrupted market orders cancelled |
 | Competing cancel/fill | Resolve through one pair sequence | SQL and memory operations can race |
 | Redis outage | Defined session failure; durable receipt recovery | Replay reads/writes throw; no fallback recovery |
 | Kafka outage | Retain outbox work and limit backlog | Publish errors are logged/swallowed after writes |
@@ -407,53 +416,51 @@ Bound historical queries and retain enough command history to meet recovery obje
 
 ### Setup and persistence
 
-[Configuration](./backend/src/config/index.ts) loads dotenv for API/workers and reads PGHOST/PGPORT/PGUSER/PGPASSWORD/PGDATABASE plus REDIS_HOST/REDIS_PORT. DATABASE_URL and REDIS_URL are unused. [The migration runner](./backend/src/db/migrate.ts) reads PG* directly without dotenv and reexecutes non-idempotent initialization SQL. Compose already applies that SQL on a fresh volume.
+[Configuration](./backend/src/config/index.ts) loads dotenv for API/workers and reads PGHOST/PGPORT/PGUSER/PGPASSWORD/PGDATABASE plus REDIS_HOST/REDIS_PORT. DATABASE_URL and REDIS_URL are unused. [The migration runner](./backend/src/db/migrate.ts) reads PG* directly without dotenv and re-executes the initialization SQL, which is idempotent (and upgrades older volumes with the hold/sequence columns). Compose also applies it on a fresh volume.
 
-The default API port and npm dev port are 3001. The server2/server3 scripts invoke dev, whose inner PORT assignment overrides their 3002/3003 values. Even a correctly overridden direct tsx invocation creates independent books and prices. There is no load balancer or shared matching owner.
+The default API port and npm dev port are 3001; `dev:server2`/`dev:server3` bind 3002/3003. Each instance has its own books, prices, and pair queue, so several instances are not one exchange. There is no load balancer or shared matching owner.
 
-The full seed has valid UUIDs and a password123 hash verified with bcrypt. It creates Alice/Bob and fifteen wallets, one-minute candles for three USD markets, and five deposit records. Repeated imports append deposit records and may add newer candle timestamps. Existing usernames with other IDs can break fixed wallet references. There are no seeded orders, trade rows, liquidity, or administrator role.
+The full seed has valid UUIDs and a password123 hash verified with bcrypt. It creates Alice/Bob and fifteen wallets, one-minute candles for three USD markets, and five deposit records. Repeated imports append deposit records and may add newer candle timestamps. Existing usernames with other IDs can break fixed wallet references. There are no seeded orders, trade rows, or administrator role. Liquidity comes from the exchange account the API creates at boot (below).
 
-### Order and reservation boundaries
+### Order lifecycle (implemented)
 
-[placeOrder](./backend/src/services/orderService.ts) first reads a Redis result when given a key, fetches the trading pair, parses quantity/price to numbers, and calls [reserveBalance](./backend/src/services/walletService.ts). The conditional wallet update is atomic for that row:
+The order path in [orderService.ts](./backend/src/services/orderService.ts) is built around three rules: one command per pair at a time, every hold attributed to an order, and every fill two-sided.
+
+**Exact arithmetic.** [decimal.ts](./backend/src/services/decimal.ts) holds every price and quantity as a BigInt scaled by 10^18, the same scale as the `DECIMAL(28,18)` columns. Parsing is strict (`^\d+(\.\d+)?$`, at most the pair's `quantity_precision`/`price_precision` significant decimals, at most ten integer digits), so `"12abc"`, `"1e3"`, `"-1"` and over-precise prices are 400s instead of reaching SQL. [OrderBook](./backend/src/services/orderBook.ts) compares and subtracts BigInts, so filling 0.7 out of seven 0.1 asks leaves exactly 0.3 (float64 left `2.78e-17` residue in the old engine). Fees are exact too: notional has at most `price_precision + quantity_precision` decimals, and multiplying by a three-decimal rate stays within 18.
+
+**Per-pair serialization.** [pairQueue.ts](./backend/src/services/pairQueue.ts) chains commands per symbol. Place, cancel, stop trigger and book rebuild for one pair run one at a time in arrival order; different pairs run concurrently. This is what stops a cancel from slipping between "the book consumed this resting order" and "the fill committed". It is a per-process guarantee: several API instances still mean several unrelated books.
+
+**Placement.** Validation runs first, outside the queue. Inside it, the hold is computed and the reservation plus the order insert commit in **one transaction**, so a failed insert can no longer strand a reserve:
 
 ```sql
-UPDATE wallets
-SET reserved_balance = reserved_balance + $3, updated_at = NOW()
-WHERE user_id = $1 AND currency_id = $2
-  AND (balance - reserved_balance) >= $3
-RETURNING id;
+UPDATE wallets SET reserved_balance = reserved_balance + $3
+WHERE user_id = $1 AND currency_id = $2 AND (balance - reserved_balance) >= $3;
+INSERT INTO orders (..., hold_remaining, ...) VALUES (..., $hold, ...) RETURNING id, arrival_seq;
 ```
 
-Order insertion is a separate pool query. A duplicate key, malformed quantity, or later failure can therefore leave a reserve without a corresponding successful order. Validation checks a parsed quantity against min/max, but does not enforce finite positive prices, full-string numeric syntax, configured price/quantity precision, or a common per-currency rounding policy. A value such as a numeric prefix followed by junk can pass parseFloat before SQL rejects the original string.
+A sell holds its base quantity. A buy holds `quantity × worst price × (1 + taker fee)` in quote, where the worst price is the limit price, or for market and stop orders a protection price 5% beyond the reference (current price, or stop price), rounded outward to the tick. Fills can only happen at that price or better and the taker rate is the larger fee, so the hold always covers what the order can spend.
 
-[OrderBook](./backend/src/services/orderBook.ts) uses number-valued sorted arrays. matchOrders mutates quantities and removes entries before any database settlement is attempted. processMatches then inserts a trade, updates each order in separate queries, and only afterward opens the wallet-transfer transaction. That transaction cannot roll back the already committed trade/order records or restore memory.
+**Matching and settlement.** `OrderBook.match` walks the opposite side for an incoming order without inserting it; executions happen at the resting order's price, the incoming order is the taker, the resting one the maker. Each match settles in its own transaction that inserts the trade (with `taker_side`), updates both orders, and moves value:
 
-There is no pair command queue, owner epoch, transaction spanning these stages, per-order fill revision guard, or book rehydration. JavaScript's synchronous matching loop does not prevent asynchronous settlement and cancellation from interleaving. Multiple process-local books cannot coordinate shared wallet/order records.
+| Party | Effect |
+|-------|--------|
+| Buyer | spends `notional + buyer fee` quote out of its hold; receives base |
+| Seller | spends base out of its hold; receives `notional − seller fee` quote |
+| Exchange account | receives both fees |
 
-Price-time ties use Date.now milliseconds. An isolated check inserted an ask at 99 and then a bid at 101 with the same timestamp; the match chose 101 because the tie branch favors the bid, despite the ask arriving first. Another check matched 0.3 against 0.1 plus 0.2 and left an ask residue of about 2.78e-17. There is no exact quantity grid or dust reconciliation.
+Fees are always quote-denominated and follow maker/taker roles (0.1% maker, 0.2% taker). The fill update is guarded (`WHERE status IN ('open','partially_filled') AND filled_quantity + q <= quantity`) and decrements `hold_remaining`, whose `>= 0` CHECK refuses overspending. When an order finishes, whatever its worst-case hold did not spend (price improvement, maker-vs-taker difference, the protection band) is released in the same transaction. Ledger rows record each received currency as `trade` and each fee as a separate `fee` row in quote, so amounts never carry ambiguous units. If a settlement fails, the book has already consumed resting quantity in memory, so the pair's book is rebuilt from Postgres before the error is returned.
 
-### Fees, synthetic fills, and cancellation
+**Market orders and liquidity.** Market orders (and triggered stops) are immediate-or-cancel. They sweep the book down to the protection price; any remainder fills against the **exchange account** ([exchangeAccount.ts](./backend/src/services/exchangeAccount.ts)) at the simulated market price, as a real trade with a real counter-order, if that price is inside the protection band. Whatever is still unfilled is cancelled and its hold released. The exchange account is created at boot and topped up to 10^9 units per currency, each top-up recorded as a `deposit`, so the only place value enters the system is visible. It does not log in (random password hash) and is excluded from portfolio snapshots.
 
-Matched fees are computed as quantity × price × rate, so both are quote-denominated. executeTradeTransfer subtracts buyerFee directly from baseAmount. At the code's illustrative 65,000 price, a one-unit buy computes a 130 quote-unit fee and a negative 129 base-unit credit. This isolated arithmetic demonstrates a unit error; the resulting database outcome depends on existing balances and constraints. The buyer is always charged the taker rate and seller the maker rate, regardless of which order rested first.
+**Stops.** [stopOrders.ts](./backend/src/services/stopOrders.ts) keeps untriggered stops apart from the book. A buy stop must be above the current price and a sell stop below it, otherwise it is rejected as an order that would fire instantly. Stops are checked on every price tick and after every trade (a trade moves the price), fire nearest-first, and execute as protected market orders relative to their stop price. Cancellation removes them before they can fire; a trigger queued behind a cancel re-checks status and does nothing.
 
-Wallet settlement has no exchange fee account or balanced journal. It logs two positive incoming trade records rather than all asset movements. Buyer limit reserves are reduced by actual execution cost instead of releasing the accepted limit allowance for the filled quantity, leaving price-improvement residue. Aggregate holds have no order attribution.
+**Cancellation** runs in the pair queue: `SELECT ... FOR UPDATE` on the live order, set `cancelled`, zero `hold_remaining`, and release exactly that amount, all in one transaction; memory is updated only after commit. Releases are no longer clamped at zero: releasing more than is held is a bug, and the `reserved_balance >= 0` CHECK now surfaces it.
 
-A market order is added to the book at 110% of the current price for buys or 90% for sells, while a buy reserves only quantity × current price. A higher eligible fill can exceed that reservation. If matching returns no results, simulateMarketFill marks the order filled and updates that user's wallets, with no counterparty or trades row. It leaves the original market entry in the book, permitting later matches against an already filled database order.
+**Rehydration.** Before the server listens, [index.ts](./backend/src/index.ts) rebuilds every pair from `orders WHERE status IN ('open','partially_filled') ORDER BY arrival_seq`. `arrival_seq` is assigned by Postgres at insert and is also the in-memory tie-breaker, so replay reproduces exactly the priority the lost book had (it used to be `Date.now()` milliseconds, and an isolated check showed a same-millisecond bid winning over an earlier ask). Untriggered stops go back to the stop list; market orders and already-triggered stops still live were interrupted mid-execution and are cancelled with their holds released. Startup retries while Postgres is unavailable and refuses to serve if the book cannot be rebuilt.
 
-If a market order matches only partially, its remainder stays in the book; there is no immediate-or-cancel policy or synthetic fill of that remainder. Simulated fills record a transaction and Kafka event, but do not update the market-service price. Their buyer fee is converted to base before crediting, unlike the matched path, while transaction fee/amount units remain ambiguous.
+**Idempotency.** Keys are scoped per user in Redis (`idempotency:<user>:<key>`) and in Postgres (`UNIQUE (user_id, idempotency_key)`). Two users choosing the same key get separate orders. A same-user race that slips past Redis hits the unique index, and the second request returns the first order instead of an error. The cached response is still a snapshot of the order at placement time.
 
-Stop orders reserve funds and create an open row without entering the book or any trigger queue. Buy stops and remaining buy market orders have null price, so cancellation's price-dependent release branch does not release their quote hold.
-
-Cancellation starts a transaction but selects without FOR UPDATE, updates status without an expected status/version predicate, removes memory state, and calls releaseReserve through a separate pool query. That release commits outside the cancellation transaction and clamps the aggregate reserve at zero. Concurrent cancellations can release twice; fill updates can overwrite cancelled status. No repeated-operation identity makes cancellation recoverable.
-
-### Idempotency
-
-[The helper](./backend/src/services/idempotency.ts) uses global idempotency:<key> entries for 24 hours. It has no account/body binding, atomic claim, lease, or database-result lookup. Two concurrent misses can both reserve; the database unique key may reject the second insert only after its reserve committed. A cache hit can return another account's order result for a reused key.
-
-Redis errors propagate rather than invoking a database fallback. A post-processing setex failure returns an error after state changes. After cache expiry, the unique database key produces an error instead of recovering the original result. The cached result is an old order snapshot and can remain open after later fill/cancel.
-
-The frontend generates Date.now plus Math.random on every placeOrder invocation, not UUID v4 and not one durable identity across retries. It supplies no command lookup or unknown-outcome state. Repeated submission after a timeout is a new attempt.
+**Verification.** Beyond the mocked route tests, [matching.test.ts](./backend/src/services/matching.test.ts) covers strict parsing, exact arithmetic, price-time priority with arrival sequences, limit stops, depth aggregation, stop ordering, and the pair queue. A scripted run against the live stack (Postgres + Valkey, Kafka down) placed, matched, cancelled and triggered orders between the two seeded users and checked after each phase that (a) every currency's total across all wallets is unchanged by trading, (b) every wallet's `reserved_balance` equals the sum of `hold_remaining` over its live orders, and (c) finished orders hold nothing; it then restarted the API and confirmed a resting order and an armed stop were rebuilt and still matched/cancellable.
 
 ### Price, candles, and Kafka
 
@@ -469,15 +476,15 @@ Price broadcasting awaits publication per symbol, and recurring async timers can
 
 ### Frontend behavior
 
-[The root](./frontend/src/routes/__root.tsx) mounts a [WebSocket hook](./frontend/src/hooks/useWebSocket.ts) under React StrictMode. Its connected ref remains true after effect cleanup removes the handler, so the development setup/cleanup/setup cycle skips re-registration. This defect is inferred from source and React's documented [development effect cycle](https://react.dev/reference/react/useEffect); no browser reproduction was run. The socket can remain connected without applying price messages.
+[The root](./frontend/src/routes/__root.tsx) mounts a [WebSocket hook](./frontend/src/hooks/useWebSocket.ts) under React StrictMode. It registers its price and order-update handlers on every effect run and removes them on cleanup, so the development setup/cleanup/setup cycle ends with exactly one live handler. (An earlier "connected" ref skipped the second setup and left prices unapplied in development.)
 
-[The client](./frontend/src/services/websocket.ts) retries up to ten consecutive failures with exponential delays capped at 30 seconds, resetting attempts on open. There is no jitter, heartbeat, sequence recovery, or stale-data indicator. connect guards OPEN but not CONNECTING; disconnect can trigger its own reconnect through onclose. Subscriptions use a set without reference counts. The ticker hook is unused, and no component authenticates a private socket.
+[The client](./frontend/src/services/websocket.ts) retries up to ten consecutive failures with exponential delays capped at 30 seconds, resetting attempts on open. There is no jitter, heartbeat, sequence recovery, or stale-data indicator. connect is a no-op while a socket is OPEN or CONNECTING, and a socket replaced by `reconnect()` cannot schedule a second connection. The root hook reconnects when the signed-in user changes, because the server binds the private channel from the session cookie at upgrade time, and refreshes orders and wallets on each `order_update` push. Subscriptions use a set without reference counts; the ticker hook is unused.
 
 The market overview polls pairs every ten seconds. The trade page fetches candles on entry/interval changes and polls depth every five seconds; it does not poll or stream live candles. Interval clicks can duplicate fetches. A global candle array and book object have no symbol/request-generation guard, and the unused setSelectedSymbol reset is never called. Late old responses can populate the current symbol's screen.
 
-[PriceChart](./frontend/src/components/PriceChart.tsx) uses the actual Lightweight Charts 5 addSeries API, but destroys/recreates the whole chart whenever candles change and calls fitContent, losing the previous viewport. Its symbol argument is unused, and empty data always displays Loading chart data, including unsupported intervals or failed requests. The existing API usage agrees with the [v5 migration reference](https://tradingview.github.io/lightweight-charts/docs/5.0/migrations/from-v4-to-v5); a missing live update contract is not an obsolete-series-method bug.
+[PriceChart](./frontend/src/components/PriceChart.tsx) uses the Lightweight Charts 5 addSeries API. The chart is created once; new candles replace the series data, and the view is fitted only when the symbol changes, so zoom and scroll survive each refresh. Empty data always displays Loading chart data, including unsupported intervals or failed requests. The existing API usage agrees with the [v5 migration reference](https://tradingview.github.io/lightweight-charts/docs/5.0/migrations/from-v4-to-v5); a missing live update contract is not an obsolete-series-method bug.
 
-[TradeForm](./frontend/src/components/TradeForm.tsx) performs float estimates, labels every pair with dollar amounts, and shows a fixed 0.2% estimate even for a sell or maker execution. Only submit is disabled during the request; side/type/amount controls stay editable, and completion clears the newer draft. No accepted order reference, fill detail, price protection, balance check, or recovery state is shown. Changing route can preserve the old form draft because it is not keyed/reset by pair.
+[TradeForm](./frontend/src/components/TradeForm.tsx) offers market, limit, and stop orders. Its estimates are floats (display only), it labels every pair with dollar amounts, and it shows the maker-to-taker fee range for limits and the taker rate otherwise. For buys it shows the funds the server will hold (worst price plus taker fee) so the user can see why an order needs more than its estimated total. The result message distinguishes filled, resting, armed-stop, and cancelled-remainder outcomes. Only submit is disabled during the request; side/type/amount controls stay editable, and completion clears the newer draft. Changing route can preserve the old form draft because it is not keyed/reset by pair.
 
 [Portfolio state](./frontend/src/stores/portfolioStore.ts) is shared without account identity. Logout does not clear wallets, holdings, or orders, and pending old-account queries can overwrite new state. Orders/wallets refresh after mutations without being awaited; portfolio totals do not. Private pages correctly wait for resolved authentication, but server errors often leave old data or an empty display. Logout clears local identity even if the HTTP operation failed.
 
@@ -489,14 +496,14 @@ The portfolio is a holdings list and stacked allocation bar, with no history cha
 
 [Session setup](./backend/src/app.ts) uses coinbase:sess: Redis keys and a 24-hour HttpOnly/SameSite=Lax cookie, with secure false in every environment. CORS reflects arbitrary origins with credentials. SameSite behavior is not a complete authorization or CSRF policy. There is no administrator role or operational UI, and is_verified is not checked for trading.
 
-[WebSocket handling](./backend/src/websocket.ts) trusts auth.userId and accepts any subscription string, including user channels. It checks neither session nor origin. No private publisher currently exposes order data through that path, so this is an unprotected capability boundary rather than evidence of a working private feed. Error and close handlers both decrement the connection gauge, potentially counting one disconnection twice.
+[WebSocket handling](./backend/src/websocket.ts) resolves identity during the HTTP upgrade by running the same Express session middleware on the upgrade request. A socket with a session is subscribed to `user:<id>` by the server; `subscribe` refuses any `user:` channel by name, and the legacy `auth` message only reports the server-established identity (a client-supplied `userId` is ignored). Order state changes are pushed to the owner's channel as `order_update`. Anonymous sockets still receive public price broadcasts. Origin is not checked. Close and error share one idempotent cleanup, so the connection gauge is decremented once.
 
 | Pattern | Actual wiring | Limitation |
 |---------|---------------|------------|
-| Conditional reservation | walletService.reserveBalance | Atomic one-row check; outside order/settlement transaction |
+| Conditional reservation | walletService.reserveBalance | Atomic one-row check, in the same transaction as the order insert |
 | Deposit transaction | walletService.deposit | Wallet/log commit together; simulated and non-idempotent |
-| Wallet transfer transaction | executeTradeTransfer | Excludes trade/order writes and contains fee unit error |
-| Idempotency cache | services/idempotency.ts | Global unbound replay; no claim or durable recovery |
+| Settlement transaction | orderService.applySettlement | Trade, both fills, wallets, fee credit and hold release commit together |
+| Idempotency | services/idempotency.ts + unique (user, key) | Per-user Redis replay with database backstop; cached result is a placement-time snapshot |
 | Rate limits | [services/rateLimiter.ts](./backend/src/services/rateLimiter.ts) | Per-process default IP stores, not Redis/account limits |
 | Metrics | [services/metrics.ts](./backend/src/services/metrics.ts) | Order/depth/settlement meanings need separate interpretation |
 | Logging | [services/logger.ts](./backend/src/services/logger.ts) | Pino used mainly in entry points/workers; no request context/redaction policy |
@@ -504,12 +511,12 @@ The portfolio is a holdings list and stacked allocation bar, with no history cha
 
 The active rate limits are 100 API requests/minute, ten placements/second, and twenty login/register attempts per fifteen minutes. They are shared by IP within one process, not calibrated proof that a caller uses at most ten percent of capacity. rate-limit-redis is installed but unused.
 
-Prometheus exposes orders_total, trades_total, active_websocket_connections, and HTTP duration. Order depth is declared but never set. Trades_total includes synthetic fills with no trades row; placed orders can later fail processing without a failure counter. HTTP route labels omit mounted prefixes for matched routes and use raw paths otherwise. The health response is always healthy if reached and does not test dependencies or recovered book state.
+Prometheus exposes orders_total, trades_total, active_websocket_connections, and HTTP duration. Order depth is declared but never set. Every trades_total increment corresponds to a trades row (exchange-liquidity fills included); placed orders can later fail settlement without a failure counter. HTTP route labels omit mounted prefixes for matched routes and use raw paths otherwise. The health response is always healthy if reached and does not test dependencies or recovered book state.
 
 The API calls server.close on SIGINT/SIGTERM, but does not explicitly drain/close WebSockets, stop its price timer, disconnect Kafka/Redis, or close the pool. There is no shutdown deadline or worker shutdown protocol. This is not demonstrated complete exchange recovery or connection draining.
 
 ### Simplifications, omissions, and verification
 
-The local project intentionally uses simulated funding and prices, a single PostgreSQL instance, one Valkey, and optional Kafka. It omits real custody, funding rails, an immutable balanced journal, a shared sequencer, complete book replay, transactional outbox, private account streams, replica/failover topology, and production deployment infrastructure. Accounting and lifecycle defects are separate from these scope reductions.
+The local project intentionally uses simulated funding and prices, a single PostgreSQL instance, one Valkey, and optional Kafka. It omits real custody, funding rails, an immutable balanced journal (settlement is balanced per trade, but there is no signed double-entry table), a shared sequencer across instances (the pair queue is per process), a checkpointed command log (the book is rebuilt from the orders table instead), transactional outbox, replica/failover topology, and production deployment infrastructure. Private account streams exist only as `order_update` notifications that prompt the client to refetch.
 
-The fifteen [mocked HTTP tests](./backend/src/app.test.ts) exercise route responses, validation, and unauthenticated access. The seven [smoke checks](./tests/smoke.spec.ts) mostly assert page containers. Neither suite proves successful matching, settlement, reconnect freshness, or reserve reconciliation. This review inspected source/configuration and ran isolated bcrypt, actual order-book, fee arithmetic, and fake-clock candle checks. It did not run the application stack, execute SQL, perform browser tests, or measure production targets.
+The fifteen [mocked HTTP tests](./backend/src/app.test.ts) exercise route responses, validation, and unauthenticated access; [matching.test.ts](./backend/src/services/matching.test.ts) exercises the matching engine, decimal handling, stops, and the pair queue. The seven [smoke checks](./tests/smoke.spec.ts) mostly assert page containers. The order lifecycle was additionally verified against the live stack as described under Order lifecycle. Reconnect freshness, candle persistence, and production targets were not measured.
