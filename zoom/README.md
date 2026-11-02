@@ -4,13 +4,13 @@
 
 | Metric | Value |
 |--------|-------|
-| Total SLOC | 6,514 |
-| Source Files | 75 |
-| .ts | 2,653 |
-| .tsx | 1,738 |
-| .md | 1,698 |
+| Total SLOC | 8,910 |
+| Source Files | 83 |
+| .ts | 4,773 |
+| .tsx | 1,881 |
+| .md | 1,815 |
 | .json | 146 |
-| .sql | 117 |
+| .sql | 133 |
 
 
 ## Overview
@@ -74,6 +74,16 @@ Then follow the backend/frontend steps from Option A.
 | PostgreSQL | zoom | zoom123 | zoom |
 | Redis/Valkey | - | - | (no auth) |
 
+### Environment Variables (backend, all optional)
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `ALLOWED_ORIGINS` | `http://localhost:5173,http://127.0.0.1:5173` | Browser origins allowed for CORS and the `/ws` upgrade. Add yours if the frontend runs on another port (e.g. `npm run dev -- --port 5199` needs `ALLOWED_ORIGINS=http://localhost:5199`) |
+| `RECONNECT_GRACE_MS` | `10000` | How long a dropped participant keeps their seat |
+| `EMPTY_MEETING_GRACE_MS` | `30000` | How long an empty meeting stays open before it ends |
+| `API_RATE_LIMIT` / `AUTH_RATE_LIMIT` | `100` / `20` | Requests / failed logins per IP per 15 minutes |
+| `DB_*`, `REDIS_*`, `SESSION_SECRET` | see `src/config/index.ts` | Connections |
+
 ### Test Users (after seeding)
 
 | Username | Password | Display Name |
@@ -81,6 +91,8 @@ Then follow the backend/frontend steps from Option A.
 | alice | password123 | Alice Johnson |
 | bob | password123 | Bob Smith |
 | charlie | password123 | Charlie Davis |
+
+Seeded meetings: `abc-defg-hij` (alice hosts, mute on entry), `bob-wait-rom` (bob hosts, waiting room on: sign in as alice or charlie to wait, as bob to admit), and an ended `xyz-abcd-efg` with chat history.
 
 ## Architecture
 
@@ -171,4 +183,5 @@ zoom/
 
 - **SFU is simulated** — The sfuService models mediasoup concepts (Worker, Router, Transport, Producer, Consumer) without requiring native C++ compilation. The signaling protocol is fully implemented.
 - **WebRTC media not exchanged** — Audio/video streams are captured locally for the lobby preview, but actual media routing between peers is simulated. The architecture is correct for production use.
-- **Session auth** — Uses express-session with Redis store. No OAuth/JWT complexity.
+- **Session auth** — Uses express-session with Redis store, for REST and for the `/ws` upgrade (the socket's identity is the session user). No OAuth/JWT complexity.
+- **Host controls** — Waiting room, lock, mute/mute all, remove, co-host, transfer host and End for all are enforced server-side in `backend/src/websocket/meetingRooms.ts`.

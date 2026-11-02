@@ -59,6 +59,54 @@
           "delay": 4000
         }
       ]
+    },
+    {
+      "name": "07-host-controls",
+      "path": "/meeting/abc-defg-hij",
+      "waitFor": "button:has-text('Join Meeting')",
+      "delay": 1500,
+      "steps": [
+        {
+          "click": "button:has-text('Join Meeting')",
+          "delay": 3000
+        },
+        {
+          "click": "button[title='Participants']",
+          "delay": 1500
+        }
+      ]
+    },
+    {
+      "name": "08-breakout-rooms",
+      "path": "/meeting/abc-defg-hij",
+      "waitFor": "button:has-text('Join Meeting')",
+      "delay": 1500,
+      "steps": [
+        {
+          "click": "button:has-text('Join Meeting')",
+          "delay": 3000
+        },
+        {
+          "click": "button[title='Breakout Rooms']",
+          "delay": 1200
+        },
+        {
+          "click": "button:has-text('Create Rooms')",
+          "delay": 2000
+        }
+      ]
+    },
+    {
+      "name": "09-waiting-room",
+      "path": "/meeting/bob-wait-rom",
+      "waitFor": "button:has-text('Join Meeting')",
+      "delay": 1500,
+      "steps": [
+        {
+          "click": "button:has-text('Join Meeting')",
+          "delay": 3000
+        }
+      ]
     }
   ],
   "viewport": {

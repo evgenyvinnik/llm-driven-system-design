@@ -1,4 +1,4 @@
-import { createFileRoute, useNavigate } from '@tanstack/react-router';
+import { createFileRoute } from '@tanstack/react-router';
 import { useState, useEffect } from 'react';
 import { useAuthStore } from '../stores/authStore';
 import * as api from '../services/api';
@@ -20,16 +20,16 @@ interface MeetingData {
 
 function HistoryPage() {
   const { user } = useAuthStore();
-  const navigate = useNavigate();
   const [meetings, setMeetings] = useState<MeetingData[]>([]);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     if (!user) return;
-    api.getMeetings().then(({ meetings: data }) => {
-      setMeetings(data as unknown as MeetingData[]);
-      setLoading(false);
-    });
+    api
+      .getMeetings()
+      .then(({ meetings: data }) => setMeetings(data as unknown as MeetingData[]))
+      .catch((err) => console.error('Failed to load meetings:', err))
+      .finally(() => setLoading(false));
   }, [user]);
 
   if (!user) return null;
@@ -51,8 +51,7 @@ function HistoryPage() {
           {pastMeetings.map((meeting) => (
             <div
               key={meeting.id}
-              className="bg-zoom-card rounded-lg p-4 border border-zoom-surface hover:border-zoom-primary transition-colors cursor-pointer"
-              onClick={() => navigate({ to: '/meeting/$code', params: { code: meeting.meeting_code } })}
+              className="bg-zoom-card rounded-lg p-4 border border-zoom-surface"
             >
               <div className="flex items-center justify-between">
                 <div>

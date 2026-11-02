@@ -1,13 +1,17 @@
+import type { BreakoutRoom, ChatMessage } from '../types';
+
 const BASE_URL = '/api';
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE_URL}${path}`, {
+    ...options,
     credentials: 'include',
+    // Spread options first: spreading it last replaced these merged headers with
+    // options.headers, dropping Content-Type whenever a caller passed any header.
     headers: {
       'Content-Type': 'application/json',
       ...options?.headers,
     },
-    ...options,
   });
 
   if (!res.ok) {
@@ -44,20 +48,29 @@ export function getMe() {
 }
 
 // Meetings
-export function createMeeting(data: {
-  title?: string;
-  scheduledStart?: string;
-  scheduledEnd?: string;
-  settings?: {
-    waitingRoom?: boolean;
-    muteOnEntry?: boolean;
-    allowScreenShare?: boolean;
-    maxParticipants?: number;
-  };
-}) {
+/**
+ * Creates a meeting. Pass the same idempotencyKey when retrying one user action
+ * (double click, network retry) and the server returns the first meeting.
+ * scheduledStart/End must be ISO-8601 with an offset (Date#toISOString).
+ */
+export function createMeeting(
+  data: {
+    title?: string;
+    scheduledStart?: string;
+    scheduledEnd?: string;
+    settings?: {
+      waitingRoom?: boolean;
+      muteOnEntry?: boolean;
+      allowScreenShare?: boolean;
+      maxParticipants?: number;
+    };
+  },
+  idempotencyKey?: string
+) {
   return request<{ meeting: Record<string, unknown> }>('/meetings', {
     method: 'POST',
     body: JSON.stringify(data),
+    headers: idempotencyKey ? { 'Idempotency-Key': idempotencyKey } : undefined,
   });
 }
 
@@ -88,26 +101,26 @@ export function getParticipants(meetingId: string) {
 // Chat
 export function getChatMessages(meetingId: string, limit?: number) {
   const query = limit ? `?limit=${limit}` : '';
-  return request<{ messages: Record<string, unknown>[] }>(`/chat/${meetingId}/messages${query}`);
-}
-
-export function sendChatMessage(meetingId: string, content: string, recipientId?: string) {
-  return request<{ message: Record<string, unknown> }>(`/chat/${meetingId}/messages`, {
-    method: 'POST',
-    body: JSON.stringify({ content, recipientId }),
-  });
+  return request<{ messages: ChatMessage[] }>(`/chat/${meetingId}/messages${query}`);
 }
 
 // Breakout Rooms
 export function createBreakoutRooms(meetingId: string, rooms: { name: string }[]) {
-  return request<{ rooms: Record<string, unknown>[] }>(`/rooms/${meetingId}/breakout-rooms`, {
+  return request<{ rooms: BreakoutRoom[] }>(`/rooms/${meetingId}/breakout-rooms`, {
     method: 'POST',
     body: JSON.stringify({ rooms }),
   });
 }
 
 export function getBreakoutRooms(meetingId: string) {
-  return request<{ rooms: Record<string, unknown>[] }>(`/rooms/${meetingId}/breakout-rooms`);
+  return request<{ rooms: BreakoutRoom[] }>(`/rooms/${meetingId}/breakout-rooms`);
+}
+
+export function assignToBreakoutRoom(roomId: string, userId: string) {
+  return request<{ assignment: { roomId: string; userId: string } }>(`/rooms/breakout-rooms/${roomId}/assign`, {
+    method: 'POST',
+    body: JSON.stringify({ userId }),
+  });
 }
 
 export function activateBreakoutRooms(meetingId: string) {

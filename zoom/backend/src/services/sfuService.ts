@@ -38,7 +38,7 @@ interface SimulatedRtpCapabilities {
   }>;
 }
 
-interface ProducerInfo {
+export interface ProducerInfo {
   id: string;
   kind: 'audio' | 'video' | 'screen';
   userId: string;
@@ -130,6 +130,17 @@ class SfuService {
       room = this.rooms.get(meetingId)!;
     }
 
+    // Re-joining replaces the previous transports; their producers must go with
+    // them or they stay advertised to everyone as live tracks forever.
+    if (room.participants.has(userId)) {
+      this.leaveRoom(meetingId, userId);
+      room = this.rooms.get(meetingId);
+      if (!room) {
+        this.createRoom(meetingId);
+        room = this.rooms.get(meetingId)!;
+      }
+    }
+
     const sendTransportOptions = generateSimulatedTransportOptions();
     const recvTransportOptions = generateSimulatedTransportOptions();
 
@@ -169,6 +180,12 @@ class SfuService {
     const participant = room.participants.get(userId);
     if (!participant) throw new Error(`Participant ${userId} not in SFU room ${meetingId}`);
 
+    // One track per kind per participant, as a real client sends. Unbounded
+    // produce calls would otherwise grow the producer map without limit.
+    if (this.findProducer(meetingId, userId, kind)) {
+      throw new Error(`Participant ${userId} is already producing ${kind}`);
+    }
+
     const producerId = uuidv4();
     participant.producerIds.push(producerId);
 
@@ -199,8 +216,20 @@ class SfuService {
     const participant = room.participants.get(userId);
     if (!participant) throw new Error(`Participant ${userId} not in SFU room ${meetingId}`);
 
+    // A Router only forwards tracks within its own room: consuming a producer from
+    // another meeting would hand that meeting's media to an outsider.
     const producer = this.producers.get(producerId);
-    if (!producer) throw new Error(`Producer ${producerId} not found`);
+    if (!producer || producer.meetingId !== meetingId) throw new Error(`Producer ${producerId} not found`);
+    if (producer.userId === userId) throw new Error('Cannot consume your own producer');
+
+    // Idempotent per (subscriber, producer): a retried consume returns the same
+    // Consumer instead of stacking duplicates that are never closed.
+    for (const consumerId of participant.consumerIds) {
+      const existing = this.consumers.get(consumerId);
+      if (existing && existing.producerId === producerId) {
+        return { consumerId, kind: existing.kind, rtpParameters: existing.rtpParameters };
+      }
+    }
 
     const consumerId = uuidv4();
     participant.consumerIds.push(consumerId);
@@ -238,7 +267,7 @@ class SfuService {
       }
     }
 
-    // Close all consumers of this producer
+    // Close all consumers of this producer, including the ids each subscriber holds
     const consumersToRemove: string[] = [];
     for (const [consumerId, consumer] of this.consumers) {
       if (consumer.producerId === producerId) {
@@ -246,6 +275,11 @@ class SfuService {
       }
     }
     for (const consumerId of consumersToRemove) {
+      const consumer = this.consumers.get(consumerId);
+      const subscriber = consumer && room?.participants.get(consumer.userId);
+      if (subscriber) {
+        subscriber.consumerIds = subscriber.consumerIds.filter((id) => id !== consumerId);
+      }
       this.consumers.delete(consumerId);
     }
 
@@ -259,15 +293,17 @@ class SfuService {
     return producer.userId;
   }
 
-  leaveRoom(meetingId: string, userId: string): void {
+  /** Removes a participant and everything they produced or consumed. Returns the closed producer ids. */
+  leaveRoom(meetingId: string, userId: string): string[] {
     const room = this.rooms.get(meetingId);
-    if (!room) return;
+    if (!room) return [];
 
     const participant = room.participants.get(userId);
-    if (!participant) return;
+    if (!participant) return [];
 
     // Close all producers for this participant
-    for (const producerId of [...participant.producerIds]) {
+    const closedProducerIds = [...participant.producerIds];
+    for (const producerId of closedProducerIds) {
       this.closeProducer(meetingId, producerId);
     }
 
@@ -288,6 +324,30 @@ class SfuService {
       this.rooms.delete(meetingId);
       logger.info({ meetingId }, 'SFU: Room empty — Router closed');
     }
+    return closedProducerIds;
+  }
+
+  /** Closes a meeting's Router with every participant in it (meeting ended). */
+  closeRoom(meetingId: string): void {
+    const room = this.rooms.get(meetingId);
+    if (!room) return;
+    for (const userId of [...room.participants.keys()]) {
+      this.leaveRoom(meetingId, userId);
+    }
+    this.rooms.delete(meetingId);
+  }
+
+  getProducer(producerId: string): ProducerInfo | undefined {
+    return this.producers.get(producerId);
+  }
+
+  findProducer(meetingId: string, userId: string, kind: ProducerInfo['kind']): ProducerInfo | undefined {
+    for (const producer of this.producers.values()) {
+      if (producer.meetingId === meetingId && producer.userId === userId && producer.kind === kind) {
+        return producer;
+      }
+    }
+    return undefined;
   }
 
   getRoom(meetingId: string): SfuRoom | undefined {
