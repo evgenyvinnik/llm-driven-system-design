@@ -2,7 +2,6 @@ import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
 import rateLimit from 'express-rate-limit';
-import { WebSocketServer } from 'ws';
 import { createServer } from 'http';
 
 import { pool, redis, minioClient, testConnections, closeConnections } from './db.js';
@@ -111,9 +110,9 @@ app.use((err: AppError, req: Request, res: Response, _next: NextFunction) => {
   });
 });
 
-// WebSocket for real-time sync notifications
-const wss = new WebSocketServer({ server, path: '/ws' });
-setupWebSocket(wss);
+// WebSocket for real-time sync notifications; authenticates the upgrade
+// request with the same session lookup as authMiddleware
+const wss = setupWebSocket(server);
 
 // Track WebSocket connections for metrics
 wss.on('connection', () => {
