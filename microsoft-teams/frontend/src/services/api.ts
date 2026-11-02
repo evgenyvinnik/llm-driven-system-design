@@ -1,18 +1,33 @@
 const API_BASE = '/api';
 
+/**
+ * An HTTP error response. Network failures surface as a plain TypeError from
+ * fetch instead, which is how callers tell "the server said no" (don't retry)
+ * from "the request may not have arrived" (safe to retry with the same id).
+ */
+export class ApiError extends Error {
+  constructor(
+    public readonly status: number,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'ApiError';
+  }
+}
+
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
   const res = await fetch(`${API_BASE}${url}`, {
     credentials: 'include',
+    ...options,
     headers: {
       'Content-Type': 'application/json',
       ...options?.headers,
     },
-    ...options,
   });
 
   if (!res.ok) {
     const data = await res.json().catch(() => ({}));
-    throw new Error(data.error || `Request failed: ${res.status}`);
+    throw new ApiError(res.status, data.error || `Request failed: ${res.status}`);
   }
 
   return res.json();
@@ -57,12 +72,12 @@ export const orgApi = {
 export const teamApi = {
   list: (orgId: string) =>
     request<{ teams: import('../types').Team[] }>(`/teams?orgId=${orgId}`),
-  create: (orgId: string, name: string, description?: string) =>
+  create: (orgId: string, name: string, description?: string, isPrivate?: boolean) =>
     request<{ team: import('../types').Team; defaultChannel: import('../types').Channel }>(
       '/teams',
       {
         method: 'POST',
-        body: JSON.stringify({ orgId, name, description }),
+        body: JSON.stringify({ orgId, name, description, isPrivate }),
       },
     ),
   get: (teamId: string) =>
@@ -74,6 +89,9 @@ export const teamApi = {
       method: 'POST',
       body: JSON.stringify({ userId }),
     }),
+  /** Leave (your own id) or remove a member; 409 if they are the last owner. */
+  removeMember: (teamId: string, userId: string) =>
+    request(`/teams/${teamId}/members/${userId}`, { method: 'DELETE' }),
 };
 
 /** Channel API client for listing, creating, managing members, and marking as read. */
@@ -94,24 +112,35 @@ export const channelApi = {
       method: 'POST',
       body: JSON.stringify({ userId }),
     }),
+  /** Leave or remove someone from a private channel. */
+  removeMember: (channelId: string, userId: string) =>
+    request(`/channels/${channelId}/members/${userId}`, { method: 'DELETE' }),
   markRead: (channelId: string) =>
     request(`/channels/${channelId}/read`, { method: 'POST' }),
 };
 
 /** Message API client for listing, sending, editing, deleting, and thread retrieval. */
 export const messageApi = {
-  list: (channelId: string, before?: string, limit?: number) => {
+  /** One page, newest first. `beforeId` is the oldest message already loaded. */
+  list: (channelId: string, beforeId?: string, limit?: number) => {
     let url = `/messages?channelId=${channelId}`;
-    if (before) url += `&before=${before}`;
+    if (beforeId) url += `&before=${beforeId}`;
     if (limit) url += `&limit=${limit}`;
-    return request<{ messages: import('../types').Message[] }>(url);
+    return request<{ messages: import('../types').Message[]; hasMore: boolean }>(url);
   },
   getThread: (messageId: string) =>
     request<{ messages: import('../types').Message[] }>(`/messages/${messageId}/thread`),
-  send: (channelId: string, content: string, parentMessageId?: string) =>
+  /** `id` is a client-generated UUID: re-sending it after a lost response can't duplicate the message. */
+  send: (input: {
+    id: string;
+    channelId: string;
+    content: string;
+    parentMessageId?: string;
+    fileIds?: string[];
+  }) =>
     request<{ message: import('../types').Message }>('/messages', {
       method: 'POST',
-      body: JSON.stringify({ channelId, content, parentMessageId }),
+      body: JSON.stringify(input),
     }),
   edit: (messageId: string, content: string) =>
     request<{ message: import('../types').Message }>(`/messages/${messageId}`, {
@@ -152,7 +181,7 @@ export const fileApi = {
 
     if (!res.ok) {
       const data = await res.json().catch(() => ({}));
-      throw new Error(data.error || 'Upload failed');
+      throw new ApiError(res.status, data.error || 'Upload failed');
     }
 
     return res.json() as Promise<{ file: import('../types').FileAttachment }>;

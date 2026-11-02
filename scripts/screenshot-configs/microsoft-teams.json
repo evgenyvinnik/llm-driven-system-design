@@ -76,6 +76,72 @@
       "delay": 2200,
       "click": "[data-testid='create-channel']",
       "clickDelay": 1200
+    },
+    {
+      "name": "11-private-channel",
+      "path": "/org/aaaaaaaa-0000-0000-0000-000000000001/team/bbbbbbbb-0000-0000-0000-000000000001/channel/cccccccc-0000-0000-0000-000000000004",
+      "delay": 2500
+    },
+    {
+      "name": "12-bob-no-private-channel",
+      "path": "/org/aaaaaaaa-0000-0000-0000-000000000001/team/bbbbbbbb-0000-0000-0000-000000000001/channel/cccccccc-0000-0000-0000-000000000001",
+      "loginAs": {
+        "username": "bob",
+        "password": "password123"
+      },
+      "delay": 2500
+    },
+    {
+      "name": "13-bob-private-channel-denied",
+      "path": "/org/aaaaaaaa-0000-0000-0000-000000000001/team/bbbbbbbb-0000-0000-0000-000000000001/channel/cccccccc-0000-0000-0000-000000000004",
+      "loginAs": {
+        "username": "bob",
+        "password": "password123"
+      },
+      "delay": 2500
+    },
+    {
+      "name": "14-carol-join-public-team",
+      "path": "/org/aaaaaaaa-0000-0000-0000-000000000001/team/bbbbbbbb-0000-0000-0000-000000000001",
+      "loginAs": {
+        "username": "carol",
+        "password": "password123"
+      },
+      "waitFor": "main",
+      "delay": 2500
+    },
+    {
+      "name": "15-cross-tenant-hidden",
+      "path": "/org/aaaaaaaa-0000-0000-0000-000000000002/team/bbbbbbbb-0000-0000-0000-000000000004/channel/cccccccc-0000-0000-0000-000000000006",
+      "delay": 2500
+    },
+    {
+      "name": "16-edit-own-message",
+      "path": "/org/aaaaaaaa-0000-0000-0000-000000000001/team/bbbbbbbb-0000-0000-0000-000000000001/channel/cccccccc-0000-0000-0000-000000000001",
+      "delay": 2200,
+      "steps": [
+        {
+          "click": "text=Morning everyone! Welcome to the Engineering general channel."
+        },
+        {
+          "click": "[data-testid='message-edit']",
+          "delay": 800
+        }
+      ]
+    },
+    {
+      "name": "17-last-owner-cannot-leave",
+      "path": "/org/aaaaaaaa-0000-0000-0000-000000000001/team/bbbbbbbb-0000-0000-0000-000000000001/channel/cccccccc-0000-0000-0000-000000000001",
+      "delay": 1500,
+      "steps": [
+        {
+          "click": "[data-testid='leave-team']"
+        },
+        {
+          "click": "[data-testid='leave-team']",
+          "delay": 1200
+        }
+      ]
     }
   ],
   "viewport": {
