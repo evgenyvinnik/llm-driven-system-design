@@ -17,6 +17,8 @@ import type { PresenceState, UserPublic, Operation } from '../../types/index.js'
  * @property {WebSocket} ws - The active WebSocket connection instance
  * @property {UserPublic} user - The authenticated user's public profile data
  * @property {string | null} documentId - UUID of the document currently being edited, or null if not subscribed
+ * @property {boolean} canEdit - Whether the user may send OPERATIONs to documentId (owner or 'edit' grant)
+ * @property {number} accessCheckedAt - Unix timestamp (ms) when canEdit was last read from the database
  * @property {number} lastActivity - Unix timestamp (ms) of last message received, used for idle timeout
  *
  * @example
@@ -24,6 +26,8 @@ import type { PresenceState, UserPublic, Operation } from '../../types/index.js'
  *   ws: websocketInstance,
  *   user: { id: 'user-123', name: 'Alice', avatar_color: '#FF5733' },
  *   documentId: 'doc-456',
+ *   canEdit: true,
+ *   accessCheckedAt: Date.now(),
  *   lastActivity: Date.now(),
  * };
  */
@@ -31,6 +35,8 @@ export interface ClientConnection {
   ws: WebSocket;
   user: UserPublic;
   documentId: string | null;
+  canEdit: boolean;
+  accessCheckedAt: number;
   lastActivity: number;
 }
 

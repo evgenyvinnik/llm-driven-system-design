@@ -557,13 +557,17 @@ create UUID tokens and seven-day database/cache sessions; a SQL fallback fills a
 one-hour cache entry without clamping it to remaining session lifetime.
 
 The browser also persists the token in localStorage and puts it in the WebSocket URL.
-WebSocket admission checks only Redis. Neither session revocation nor document grant
-changes evict existing sockets, and the server does not validate WebSocket origin.
-These details differ from the old “instant revocation” and cookie-only claims.
+The [WebSocket upgrade](./backend/src/services/collaboration/index.ts) resolves the
+`session_token` cookie (falling back to that `?token=`) with the same lookup as HTTP
+authentication and answers 401 before a socket exists. Session revocation and grant
+changes do not evict sockets that only watch, and the server does not validate
+WebSocket origin. These details differ from the old “instant revocation” claim.
 
 [RBAC middleware](./backend/src/shared/rbac.ts) is wired to document title/share/delete
-routes, with owner-only sharing/deletion. Other routes perform their own SQL checks;
-WebSocket edits do not use that middleware. No admin-management or transfer-ownership
+routes, with owner-only sharing/deletion. Other routes perform their own SQL checks.
+WebSocket edits use the same capability table: SUBSCRIBE records whether the user may
+edit, and every OPERATION must name the joined document, pass that check (re-read with
+`getDocumentAccess` once it is five seconds old), and contain well-formed operations. No admin-management or transfer-ownership
 route is mounted. Email-only grants are not converted on registration.
 
 [HTTP idempotency middleware](./backend/src/middleware/idempotency.ts) is optional on

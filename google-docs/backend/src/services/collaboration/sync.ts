@@ -10,7 +10,15 @@ import type { ClientConnection, DocumentState } from './types.js';
 import _logger, { createChildLogger } from '../../shared/logger.js';
 import { documents, updateDocumentsMetric } from './state.js';
 import { handleLeaveDocument, addUserToDocument } from './presence.js';
-import { checkDocumentPermission, hasAccess, getEffectivePermission } from './permissions.js';
+import {
+  checkDocumentPermission,
+  hasAccess,
+  getEffectivePermission,
+  canEditDocument,
+} from './permissions.js';
+
+/** Document IDs are UUIDs; anything else is refused before it reaches Postgres. */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
  * Initializes document state if not already cached.
@@ -45,9 +53,11 @@ export function ensureDocumentState(documentId: string, currentVersion: number):
  * @description Processes a SUBSCRIBE message from a client. Performs the following steps:
  * 1. Verifies the document exists and user has access permission
  * 2. Leaves any previously subscribed document
- * 3. Initializes document state if not already cached
- * 4. Adds user to the document's presence map
- * 5. Sends SYNC message with current content, version, presence list, and permissions
+ * 3. Records whether the user may edit it (owner or 'edit' grant), which every
+ *    OPERATION is checked against
+ * 4. Initializes document state if not already cached
+ * 5. Adds user to the document's presence map
+ * 6. Sends SYNC message with current content, version, presence list, and permissions
  *
  * @param {WebSocket} ws - The WebSocket connection of the subscribing client
  * @param {ClientConnection} client - The client metadata including user info
@@ -69,8 +79,13 @@ export function ensureDocumentState(documentId: string, currentVersion: number):
 export async function handleSubscribe(
   ws: WebSocket,
   client: ClientConnection,
-  documentId: string
+  documentId: unknown
 ): Promise<void> {
+  if (typeof documentId !== 'string' || !UUID_RE.test(documentId)) {
+    ws.send(JSON.stringify({ type: 'ERROR', code: 'NOT_FOUND', error: 'Document not found' }));
+    return;
+  }
+
   const opLogger = createChildLogger({
     userId: client.user.id,
     documentId,
@@ -97,8 +112,14 @@ export async function handleSubscribe(
     handleLeaveDocument(ws, client.documentId);
   }
 
-  // Join new document
+  // Join new document. documentId and canEdit change together, with no await
+  // in between, so an OPERATION never sees one document's id with another's rights.
   client.documentId = documentId;
+  client.canEdit = canEditDocument(
+    permResult.ownerId === client.user.id,
+    permResult.permissionLevel
+  );
+  client.accessCheckedAt = Date.now();
 
   // Initialize document state if not exists
   const docState = ensureDocumentState(documentId, permResult.currentVersion!);
@@ -109,6 +130,7 @@ export async function handleSubscribe(
   opLogger.info({
     version: docState.version,
     activeUsers: docState.presence.size,
+    canEdit: client.canEdit,
   }, 'User subscribed to document');
 
   // Send sync message with current document state

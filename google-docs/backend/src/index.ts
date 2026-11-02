@@ -8,7 +8,6 @@ import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
 import { createServer } from 'http';
-import { WebSocketServer } from 'ws';
 import pinoHttp from 'pino-http';
 
 import authRoutes from './routes/auth.js';
@@ -170,11 +169,11 @@ app.use((err: Error, req: Request, res: Response, _next: NextFunction) => {
 /** HTTP server instance for Express and WebSocket */
 const server = createServer(app);
 
-/** WebSocket server for real-time collaboration, mounted at /ws path */
-const wss = new WebSocketServer({ server, path: '/ws' });
-
-/** Initialize WebSocket handlers for document collaboration */
-initWebSocket(wss);
+/**
+ * WebSocket server for real-time collaboration on the /ws path. Upgrades are
+ * authenticated with the same session lookup as the REST API before a socket exists.
+ */
+initWebSocket(server);
 
 /** Start the HTTP server and log connection details */
 server.listen(port, () => {
