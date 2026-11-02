@@ -1,5 +1,6 @@
 import { Router, Request, Response } from "express";
 import { tokenRegistry } from "../services/tokenRegistry.js";
+import { requireProvider, canAccessBundle } from "../shared/auth.js";
 import {
   validateDeviceToken,
   validateBundleId,
@@ -15,6 +16,11 @@ import {
  *
  * Handles device token registration, lookup, invalidation, and topic subscriptions.
  * These endpoints are called by iOS apps and backend services.
+ *
+ * Routes keyed by the raw token are authorized by possession of that token —
+ * it is the device's secret, stored only as a hash. Routes keyed by the
+ * server-assigned device ID need a provider JWT covering the device's app (or
+ * an admin session), because device IDs are not secret.
  *
  * Routes:
  * - POST /register - Register a device token
@@ -118,13 +124,13 @@ router.get("/token/:token", async (req: Request, res: Response) => {
  * @param deviceId - UUID device identifier
  * @returns Device record
  */
-router.get("/:deviceId", async (req: Request, res: Response) => {
+router.get("/:deviceId", requireProvider(), async (req: Request, res: Response) => {
   try {
     const { deviceId } = req.params;
 
     const device = await tokenRegistry.lookupById(deviceId);
 
-    if (!device) {
+    if (!device || !canAccessBundle(req.principal, device.app_bundle_id)) {
       return res.status(404).json({
         error: "NotFound",
         message: "Device not found",
@@ -274,9 +280,17 @@ router.post("/topics/unsubscribe", async (req: Request, res: Response) => {
  * @param deviceId - UUID device identifier
  * @returns {device_id, topics: string[]}
  */
-router.get("/:deviceId/topics", async (req: Request, res: Response) => {
+router.get("/:deviceId/topics", requireProvider(), async (req: Request, res: Response) => {
   try {
     const { deviceId } = req.params;
+
+    const device = await tokenRegistry.lookupById(deviceId);
+    if (!device || !canAccessBundle(req.principal, device.app_bundle_id)) {
+      return res.status(404).json({
+        error: "NotFound",
+        message: "Device not found",
+      });
+    }
 
     const topics = await tokenRegistry.getDeviceTopics(deviceId);
 

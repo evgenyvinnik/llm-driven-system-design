@@ -3,14 +3,28 @@ import { tokenRegistry } from "../services/tokenRegistry.js";
 import { pushService } from "../services/pushService.js";
 import { feedbackService } from "../services/feedbackService.js";
 import db from "../db/index.js";
-import { generateUUID, hashPassword, verifyPassword, generateRandomToken } from "../utils/index.js";
-import { setSession, getSession, deleteSession } from "../db/redis.js";
+import {
+  generateUUID,
+  hashPassword,
+  verifyPassword,
+  generateRandomToken,
+  validateBundleId,
+} from "../utils/index.js";
+import { setSession, deleteSession } from "../db/redis.js";
+import { requireAdmin } from "../shared/auth.js";
+import { auditAdmin } from "../shared/logger.js";
+import {
+  createProviderKey,
+  listProviderKeys,
+  revokeProviderKey,
+} from "../services/providerKeys.js";
 
 /**
  * Admin Dashboard Routes.
  *
  * Provides authentication and administrative endpoints for the APNs management dashboard.
  * Includes session-based authentication and dashboard statistics.
+ * Every route except login and logout requires an admin session.
  *
  * Routes:
  * - POST /login - Authenticate admin user
@@ -23,6 +37,9 @@ import { setSession, getSession, deleteSession } from "../db/redis.js";
  * - POST /broadcast - Send to all devices
  * - POST /cleanup - Clean up expired notifications
  * - POST /users - Create admin user
+ * - POST /provider-keys - Issue a provider signing key (private key returned once)
+ * - GET /provider-keys - List provider keys
+ * - DELETE /provider-keys/:keyId - Revoke a provider key
  */
 const router = Router();
 
@@ -135,6 +152,9 @@ router.post("/logout", async (req: Request, res: Response) => {
   }
 });
 
+// Everything below requires an admin session (login and logout are above).
+router.use(requireAdmin);
+
 /**
  * Get current authenticated user.
  * Validates the session token and returns user info.
@@ -143,42 +163,13 @@ router.post("/logout", async (req: Request, res: Response) => {
  * @header Authorization: Bearer <token>
  * @returns {id, username, role}
  */
-router.get("/me", async (req: Request, res: Response) => {
-  try {
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith("Bearer ")) {
-      return res.status(401).json({
-        error: "Unauthorized",
-        message: "Authentication required",
-      });
-    }
-
-    const token = authHeader.substring(7);
-    const session = await getSession<{
-      user_id: string;
-      username: string;
-      role: string;
-    }>(token);
-
-    if (!session) {
-      return res.status(401).json({
-        error: "Unauthorized",
-        message: "Invalid or expired session",
-      });
-    }
-
-    return res.json({
-      id: session.user_id,
-      username: session.username,
-      role: session.role,
-    });
-  } catch (error) {
-    console.error("Error getting current user:", error);
-    return res.status(500).json({
-      error: "InternalServerError",
-      message: "Failed to get current user",
-    });
-  }
+router.get("/me", (req: Request, res: Response) => {
+  const session = req.admin!;
+  return res.json({
+    id: session.user_id,
+    username: session.username,
+    role: session.role,
+  });
 });
 
 /**
@@ -405,6 +396,8 @@ router.post("/users", async (req: Request, res: Response) => {
       [userId, username, passwordHash, role || "admin"]
     );
 
+    auditAdmin("admin_user_created", req.admin!.user_id, { username });
+
     return res.status(201).json({
       id: userId,
       username,
@@ -415,6 +408,106 @@ router.post("/users", async (req: Request, res: Response) => {
     return res.status(500).json({
       error: "InternalServerError",
       message: "Failed to create admin user",
+    });
+  }
+});
+
+/** Team and key IDs follow the APNs 10-character format. */
+const TEAM_ID_PATTERN = /^[A-Z0-9]{10}$/;
+
+/**
+ * Issue a provider signing key scoped to a set of apps.
+ * The private key is in this response only; the server keeps the public key.
+ *
+ * @route POST /api/v1/admin/provider-keys
+ * @body {team_id, app_bundle_ids: string[]}
+ * @returns {key_id, team_id, app_bundle_ids, created_at, private_key}
+ */
+router.post("/provider-keys", async (req: Request, res: Response) => {
+  try {
+    const { team_id, app_bundle_ids } = req.body ?? {};
+
+    if (typeof team_id !== "string" || !TEAM_ID_PATTERN.test(team_id)) {
+      return res.status(400).json({
+        error: "BadRequest",
+        message: "team_id must be 10 uppercase letters or digits",
+      });
+    }
+
+    if (
+      !Array.isArray(app_bundle_ids) ||
+      app_bundle_ids.length === 0 ||
+      !app_bundle_ids.every((id) => typeof id === "string" && validateBundleId(id))
+    ) {
+      return res.status(400).json({
+        error: "BadRequest",
+        message: "app_bundle_ids must be a non-empty array of bundle IDs",
+      });
+    }
+
+    const key = await createProviderKey(team_id, app_bundle_ids, req.admin!.user_id);
+
+    auditAdmin("provider_key_created", req.admin!.user_id, {
+      key_id: key.key_id,
+      team_id,
+      app_bundle_ids,
+    });
+
+    return res.status(201).json(key);
+  } catch (error) {
+    console.error("Error creating provider key:", error);
+    return res.status(500).json({
+      error: "InternalServerError",
+      message: "Failed to create provider key",
+    });
+  }
+});
+
+/**
+ * List provider keys (metadata only).
+ *
+ * @route GET /api/v1/admin/provider-keys
+ * @returns {keys: ProviderKeySummary[]}
+ */
+router.get("/provider-keys", async (req: Request, res: Response) => {
+  try {
+    return res.json({ keys: await listProviderKeys() });
+  } catch (error) {
+    console.error("Error listing provider keys:", error);
+    return res.status(500).json({
+      error: "InternalServerError",
+      message: "Failed to list provider keys",
+    });
+  }
+});
+
+/**
+ * Revoke a provider key. Tokens it signed stop verifying immediately.
+ *
+ * @route DELETE /api/v1/admin/provider-keys/:keyId
+ * @returns 204 No Content, or 404 if no active key has that ID
+ */
+router.delete("/provider-keys/:keyId", async (req: Request, res: Response) => {
+  try {
+    const revoked = await revokeProviderKey(req.params.keyId);
+
+    if (!revoked) {
+      return res.status(404).json({
+        error: "NotFound",
+        message: "No active provider key with that ID",
+      });
+    }
+
+    auditAdmin("provider_key_revoked", req.admin!.user_id, {
+      key_id: req.params.keyId,
+    });
+
+    return res.status(204).send();
+  } catch (error) {
+    console.error("Error revoking provider key:", error);
+    return res.status(500).json({
+      error: "InternalServerError",
+      message: "Failed to revoke provider key",
     });
   }
 });
