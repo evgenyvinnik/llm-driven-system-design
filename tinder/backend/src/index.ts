@@ -83,8 +83,9 @@ app.use(cors({
 app.use(express.json());
 app.use(cookieParser());
 
-// Session configuration
-app.use(session({
+// Session configuration. Kept as a named middleware so the WebSocket upgrade
+// resolves the same session (MemoryStore, same process) the REST API reads.
+const sessionMiddleware = session({
   secret: serverConfig.sessionSecret,
   resave: false,
   saveUninitialized: false,
@@ -94,7 +95,8 @@ app.use(session({
     maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
     sameSite: 'lax',
   },
-}));
+});
+app.use(sessionMiddleware);
 
 // Apply general rate limiting to API routes
 app.use('/api', apiRateLimiter);
@@ -278,7 +280,7 @@ async function start() {
     }
 
     // Initialize WebSocket
-    wsGateway = new WebSocketGateway(server);
+    wsGateway = new WebSocketGateway(server, sessionMiddleware);
     logger.info('WebSocket gateway initialized');
 
     // Update WebSocket connection gauge periodically
