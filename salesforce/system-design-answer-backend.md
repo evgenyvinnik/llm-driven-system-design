@@ -101,7 +101,7 @@ A note on the service boxes: they're domain modules, not necessarily six deploya
 | roles | id, org_id, name, parent_role_id | (org_id) | Self-referencing tree — this *is* the sharing hierarchy |
 | accounts | id, **org_id**, name, industry, annual_revenue_cents (BIGINT), owner_id, custom (JSONB) | (org_id, owner_id), (org_id, name) | Money in cents, never float |
 | contacts | id, org_id, account_id, name, email, title, owner_id, custom | (org_id, account_id) | No unique constraint on email — a shared `support@` inbox legitimately appears on contacts at different companies |
-| opportunities | id, org_id, account_id, name, amount_cents, stage, probability, close_date, owner_id, **version**, custom | (org_id, stage), (org_id, owner_id), (org_id, close_date) | `version` drives optimistic concurrency on kanban moves |
+| opportunities | id, org_id, account_id, name, amount_cents, stage, probability, close_date, **closed_at**, owner_id, **version**, custom | (org_id, stage), (org_id, owner_id), (org_id, close_date) | `version` drives optimistic concurrency on kanban moves. `closed_at` is stamped by the server on entering Closed Won/Lost; revenue is booked by it, never by `updated_at`, which moves on any edit |
 | leads | id, org_id, name, company, source, status, **converted_account_id**, **converted_contact_id**, **converted_opportunity_id**, converted_at, owner_id | (org_id, status), (org_id, source) | The three `converted_*` FKs are the permanent audit trail of a conversion |
 | activities | id, org_id, type, subject, **related_type**, **related_id**, owner_id, due_date, completed | (org_id, related_type, related_id), (org_id, owner_id, due_date) | Polymorphic. No FK — see below |
 | custom_fields | id, org_id, entity_type, field_name, field_type, options (JSONB) | unique(org_id, entity_type, field_name) | The org's schema, stored as data |
@@ -168,7 +168,7 @@ Conversion turns one lead into three entities. It's the riskiest operation in th
 
 Inside one PostgreSQL transaction:
 
-1. `BEGIN`, then verify the lead exists and `converted_at IS NULL` — the idempotency guard
+1. `BEGIN`, then read the lead **with a row lock** (`SELECT … FOR UPDATE`) and verify that it exists, that the caller owns it (or is an admin), and that `converted_at IS NULL`
 2. Insert the account, built from the lead's company
 3. Insert the contact, linked to that new account
 4. If the rep opted in, insert the opportunity, linked to the same account
@@ -181,7 +181,7 @@ Any failure rolls back all four writes. The lead is untouched; the user retries.
 
 > "The trade I'll state explicitly: the transaction holds row locks for its full duration, roughly 200ms across four round-trips. If conversions ever became the dominant write pattern, that's real pressure on the connection pool. So I keep the transaction minimal — inserts and one update, and **zero external calls inside the boundary**. That last rule is the one people break: someone adds 'send a welcome email' inside the transaction, the mail provider hangs for 30 seconds, and now a lead conversion holds locks for half a minute and the pool exhausts. Side effects go in an outbox row written inside the transaction and processed after commit. The transaction boundary must contain exactly the things that need to be atomic and nothing else."
 
-**Idempotency.** The `converted_at IS NULL` guard catches a double-click. A client-supplied `Idempotency-Key` in Redis catches a network-level retry, where the client never saw the first response. And the durable backstop is a partial unique index on `leads.converted_account_id` — a lead can only ever point at one account, enforced by the database.
+**Idempotency.** The `converted_at IS NULL` check only stops a double-click *because of the lock*. Without it, two requests arriving together both read "unconverted", both create an account and a contact, and the second update quietly overwrites the first lead's links — two Acme accounts, and nothing errored. With `FOR UPDATE`, the second transaction waits for the first to commit, re-reads the row, sees it converted, and gets a 409. The final update repeats the condition (`WHERE converted_at IS NULL`) and aborts the transaction if it matches nothing, so the write itself refuses a second conversion. A client-supplied `Idempotency-Key` in Redis then turns a network-level retry (the client never saw the first response) into the original success instead of a 409.
 
 **What we give up.** If accounts/contacts/opportunities ever split into separate services with separate stores, this transaction stops being possible and a saga becomes unavoidable. That's a real future cost — and it's a strong argument for **keeping these five objects in one service and one database for as long as possible**. The transactional boundary should follow the *workflow* boundary, and conversion is the workflow that binds them. Splitting them apart is not a free refactor; it's a decision to take on distributed-transaction complexity, and it should be made on purpose.
 

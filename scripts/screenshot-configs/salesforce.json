@@ -1,6 +1,7 @@
 {
   "name": "salesforce",
   "frontendPort": 5173,
+  "backendPort": 3001,
   "backendRequired": true,
   "dbName": "salesforce",
   "dbUser": "salesforce",
@@ -27,7 +28,7 @@
     {
       "name": "02-dashboard",
       "path": "/",
-      "waitFor": "h1",
+      "waitFor": "main h1",
       "delay": 1000
     },
     {
@@ -58,6 +59,63 @@
       "name": "07-reports",
       "path": "/reports",
       "waitFor": "main, h1",
+      "delay": 1000
+    },
+    {
+      "name": "08-account-detail",
+      "path": "/accounts/acc00001-0000-0000-0000-000000000001",
+      "waitFor": "h2",
+      "delay": 1000
+    },
+    {
+      "name": "09-account-opportunities",
+      "path": "/accounts/acc00002-0000-0000-0000-000000000002",
+      "waitFor": "h2",
+      "click": "nav button:has-text('Opportunities')",
+      "delay": 800
+    },
+    {
+      "name": "10-new-opportunity",
+      "path": "/opportunities",
+      "waitFor": "main h2",
+      "click": "button:has-text('New Opportunity')",
+      "delay": 800
+    },
+    {
+      "name": "11-pipeline-closed-columns",
+      "path": "/opportunities",
+      "waitFor": "main h2",
+      "click": "h3:has-text('Closed Lost')",
+      "delay": 800
+    },
+    {
+      "name": "12-rep-opportunities",
+      "path": "/opportunities",
+      "waitFor": "main h2",
+      "loginAs": {
+        "username": "bob",
+        "password": "password123"
+      },
+      "delay": 1000
+    },
+    {
+      "name": "13-rep-reports",
+      "path": "/reports",
+      "waitFor": "[data-testid='report-scope']",
+      "loginAs": {
+        "username": "bob",
+        "password": "password123"
+      },
+      "delay": 1000
+    },
+    {
+      "name": "14-rep-hidden-account",
+      "path": "/accounts/acc00001-0000-0000-0000-000000000001",
+      "waitFor": "main",
+      "loginAs": {
+        "username": "bob",
+        "password": "password123"
+      },
       "delay": 1000
     }
   ],

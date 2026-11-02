@@ -6,12 +6,52 @@ import { logger } from '../services/logger.js';
 
 const router = Router();
 
+interface SessionUser {
+  id: string;
+  username: string;
+  email: string;
+  display_name: string | null;
+  role: string;
+}
+
+/**
+ * Starts a fresh session for a user who just proved who they are. Reusing the
+ * pre-login session ID would let anyone who planted or saw that ID (session
+ * fixation) ride the authenticated session.
+ */
+function startSession(req: Request, user: SessionUser): Promise<void> {
+  return new Promise((resolve, reject) => {
+    req.session.regenerate((err) => {
+      if (err) {
+        reject(err);
+        return;
+      }
+      req.session.userId = user.id;
+      req.session.username = user.username;
+      req.session.role = user.role;
+      req.session.displayName = user.display_name ?? user.username;
+      req.session.save((saveErr) => (saveErr ? reject(saveErr) : resolve()));
+    });
+  });
+}
+
+function publicUser(user: SessionUser) {
+  return {
+    id: user.id,
+    username: user.username,
+    email: user.email,
+    displayName: user.display_name,
+    role: user.role,
+  };
+}
+
 // POST /api/auth/register
 router.post('/register', authLimiter, async (req: Request, res: Response) => {
   try {
     const { username, email, password, displayName } = req.body;
 
-    if (!username || !email || !password) {
+    if (typeof username !== 'string' || typeof email !== 'string' || typeof password !== 'string'
+      || !username || !email || !password) {
       res.status(400).json({ error: 'Username, email, and password are required' });
       return;
     }
@@ -38,6 +78,8 @@ router.post('/register', authLimiter, async (req: Request, res: Response) => {
 
     const passwordHash = await bcrypt.hash(password, 10);
 
+    // Self-registration always creates a regular user; the role column keeps
+    // its 'user' default and is never taken from the request.
     const result = await pool.query(
       `INSERT INTO users (username, email, password_hash, display_name)
        VALUES ($1, $2, $3, $4)
@@ -46,21 +88,15 @@ router.post('/register', authLimiter, async (req: Request, res: Response) => {
     );
 
     const user = result.rows[0];
+    await startSession(req, user);
 
-    req.session.userId = user.id;
-    req.session.username = user.username;
-    req.session.role = user.role;
-
-    res.status(201).json({
-      user: {
-        id: user.id,
-        username: user.username,
-        email: user.email,
-        displayName: user.display_name,
-        role: user.role,
-      },
-    });
+    res.status(201).json({ user: publicUser(user) });
   } catch (err) {
+    // Two registrations racing past the existence check hit the UNIQUE index.
+    if ((err as { code?: string }).code === '23505') {
+      res.status(409).json({ error: 'Username or email already exists' });
+      return;
+    }
     logger.error({ err }, 'Registration failed');
     res.status(500).json({ error: 'Internal server error' });
   }
@@ -71,7 +107,7 @@ router.post('/login', authLimiter, async (req: Request, res: Response) => {
   try {
     const { username, password } = req.body;
 
-    if (!username || !password) {
+    if (typeof username !== 'string' || typeof password !== 'string' || !username || !password) {
       res.status(400).json({ error: 'Username and password are required' });
       return;
     }
@@ -94,19 +130,9 @@ router.post('/login', authLimiter, async (req: Request, res: Response) => {
       return;
     }
 
-    req.session.userId = user.id;
-    req.session.username = user.username;
-    req.session.role = user.role;
+    await startSession(req, user);
 
-    res.json({
-      user: {
-        id: user.id,
-        username: user.username,
-        email: user.email,
-        displayName: user.display_name,
-        role: user.role,
-      },
-    });
+    res.json({ user: publicUser(user) });
   } catch (err) {
     logger.error({ err }, 'Login failed');
     res.status(500).json({ error: 'Internal server error' });
@@ -137,6 +163,7 @@ router.get('/me', (req: Request, res: Response) => {
     user: {
       id: req.session.userId,
       username: req.session.username,
+      displayName: req.session.displayName,
       role: req.session.role,
     },
   });
