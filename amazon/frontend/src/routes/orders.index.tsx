@@ -4,7 +4,7 @@ import { useAuthStore } from '../stores/authStore';
 import { api } from '../services/api';
 import type { Order } from '../types';
 
-export const Route = createFileRoute('/orders')({
+export const Route = createFileRoute('/orders/')({
   component: OrdersPage,
 });
 
