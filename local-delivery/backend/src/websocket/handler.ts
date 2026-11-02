@@ -38,6 +38,12 @@ interface WSClient {
 const clients = new Map<string, WSClient>();
 
 /**
+ * Order statuses after which the driver no longer works this order. Their live
+ * location then belongs to other customers' deliveries and must not be streamed.
+ */
+const TERMINAL_ORDER_STATUSES = ['delivered', 'cancelled'];
+
+/**
  * Initializes the WebSocket server and attaches it to the HTTP server.
  * Handles connection authentication, message routing, and cleanup.
  *
@@ -203,10 +209,13 @@ async function handleSubscribeOrder(
   // Subscribe to order status updates
   await subscriber.subscribe(`order:${order_id}:status`);
 
-  // If order has a driver, subscribe to driver location
-  if (order.driver_id) {
-    await subscriber.subscribe(`driver:${order.driver_id}:location`);
-    client.driverId = order.driver_id;
+  // Stream the driver's location only while they are working this order.
+  // A delivered or cancelled order still has driver_id set, and subscribing
+  // through it would follow that driver through their later deliveries.
+  const driverChannel = order.driver_id ? `driver:${order.driver_id}:location` : null;
+  if (driverChannel && !TERMINAL_ORDER_STATUSES.includes(order.status)) {
+    await subscriber.subscribe(driverChannel);
+    client.driverId = order.driver_id ?? undefined;
   }
 
   // Add to Redis tracking set
@@ -218,6 +227,11 @@ async function handleSubscribeOrder(
       const data = JSON.parse(message);
 
       if (channel.includes(':status')) {
+        // The order just ended: stop following its driver
+        if (driverChannel && client.driverId && TERMINAL_ORDER_STATUSES.includes(data.status)) {
+          client.driverId = undefined;
+          await subscriber.unsubscribe(driverChannel);
+        }
         client.ws.send(
           JSON.stringify({
             type: 'status_update',
@@ -225,6 +239,7 @@ async function handleSubscribeOrder(
           })
         );
       } else if (channel.includes(':location')) {
+        if (!client.driverId) return;
         // Calculate ETA to delivery address
         const eta = calculateETA(
           haversineDistance(
