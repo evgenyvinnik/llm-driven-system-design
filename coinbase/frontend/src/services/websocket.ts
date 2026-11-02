@@ -14,7 +14,16 @@ class WebSocketClient {
   private subscriptions: Set<string> = new Set();
 
   connect(): void {
-    if (this.ws?.readyState === WebSocket.OPEN) return;
+    if (
+      this.ws?.readyState === WebSocket.OPEN ||
+      this.ws?.readyState === WebSocket.CONNECTING
+    ) {
+      return;
+    }
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
 
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const host = window.location.host;
@@ -66,8 +75,10 @@ class WebSocketClient {
       }
     };
 
-    this.ws.onclose = () => {
-      this.attemptReconnect();
+    const socket = this.ws;
+    socket.onclose = () => {
+      // A socket replaced by reconnect() must not schedule a second connection.
+      if (this.ws === socket) this.attemptReconnect();
     };
 
     this.ws.onerror = () => {
@@ -135,6 +146,19 @@ class WebSocketClient {
     return () => {
       this.priceHandlers = this.priceHandlers.filter((h) => h !== handler);
     };
+  }
+
+  /**
+   * Drops the current socket and opens a new one. The server reads identity
+   * from the session cookie during the upgrade, so after login or logout the
+   * socket must be reopened to gain (or lose) the private order channel.
+   */
+  reconnect(): void {
+    const previous = this.ws;
+    this.ws = null;
+    previous?.close();
+    this.reconnectAttempts = 0;
+    this.connect();
   }
 
   disconnect(): void {

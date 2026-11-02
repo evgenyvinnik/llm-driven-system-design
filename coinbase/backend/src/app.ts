@@ -20,22 +20,22 @@ export const app = express();
 app.use(cors({ origin: true, credentials: true }));
 app.use(express.json());
 
-// Session
+// Session. Exported so the WebSocket upgrade can resolve the same session
+// from the same cookie instead of trusting a client-supplied user ID.
 const redisStore = new RedisStore({ client: redis, prefix: 'coinbase:sess:' });
-app.use(
-  session({
-    store: redisStore,
-    secret: config.session.secret,
-    resave: false,
-    saveUninitialized: false,
-    cookie: {
-      secure: false,
-      httpOnly: true,
-      maxAge: config.session.maxAge,
-      sameSite: 'lax',
-    },
-  })
-);
+export const sessionMiddleware = session({
+  store: redisStore,
+  secret: config.session.secret,
+  resave: false,
+  saveUninitialized: false,
+  cookie: {
+    secure: false,
+    httpOnly: true,
+    maxAge: config.session.maxAge,
+    sameSite: 'lax',
+  },
+});
+app.use(sessionMiddleware);
 
 // Request duration tracking
 app.use((req, res, next) => {

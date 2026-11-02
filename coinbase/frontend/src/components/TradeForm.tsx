@@ -8,12 +8,20 @@ interface TradeFormProps {
   currentPrice: number;
 }
 
-/** Renders the buy/sell trade form with market/limit toggle, quantity input, and order summary. */
+type OrderType = 'market' | 'limit' | 'stop';
+
+// Mirror the backend's fee and protection settings (backend/src/config/index.ts).
+const TAKER_FEE = 0.002;
+const MAKER_FEE = 0.001;
+const MARKET_PROTECTION = 0.05;
+
+/** Renders the buy/sell trade form with market/limit/stop types, quantity input, and order summary. */
 export function TradeForm({ pair, currentPrice }: TradeFormProps) {
   const [side, setSide] = useState<'buy' | 'sell'>('buy');
-  const [orderType, setOrderType] = useState<'market' | 'limit'>('market');
+  const [orderType, setOrderType] = useState<OrderType>('market');
   const [quantity, setQuantity] = useState('');
   const [limitPrice, setLimitPrice] = useState('');
+  const [stopPrice, setStopPrice] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(
     null
@@ -21,8 +29,27 @@ export function TradeForm({ pair, currentPrice }: TradeFormProps) {
 
   const placeOrder = usePortfolioStore((s) => s.placeOrder);
 
-  const effectivePrice = orderType === 'limit' && limitPrice ? parseFloat(limitPrice) : currentPrice;
-  const totalCost = parseFloat(quantity || '0') * effectivePrice;
+  const effectivePrice =
+    orderType === 'limit' && limitPrice
+      ? parseFloat(limitPrice)
+      : orderType === 'stop' && stopPrice
+        ? parseFloat(stopPrice)
+        : currentPrice;
+  const qty = parseFloat(quantity || '0');
+  const totalCost = qty * effectivePrice;
+  // A limit order pays the maker rate if it rests and the taker rate if it crosses.
+  const feeLabel = orderType === 'limit' ? 'Fee (0.1–0.2%)' : 'Fee (0.2%)';
+  const feeEstimate = totalCost * (orderType === 'limit' ? MAKER_FEE : TAKER_FEE);
+  // What the server reserves for a buy: the worst price this order can fill at,
+  // plus the taker fee. Anything unspent is released when the order finishes.
+  const worstPrice = orderType === 'limit' ? effectivePrice : effectivePrice * (1 + MARKET_PROTECTION);
+  const buyHold = qty * worstPrice * (1 + TAKER_FEE);
+  const stopHint =
+    orderType === 'stop'
+      ? side === 'buy'
+        ? `Triggers a market buy when the price rises to this level (above ${formatPrice(currentPrice, pair.pricePrecision)})`
+        : `Triggers a market sell when the price falls to this level (below ${formatPrice(currentPrice, pair.pricePrecision)})`
+      : null;
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -36,14 +63,25 @@ export function TradeForm({ pair, currentPrice }: TradeFormProps) {
         orderType,
         quantity,
         price: orderType === 'limit' ? limitPrice : undefined,
+        stopPrice: orderType === 'stop' ? stopPrice : undefined,
       });
 
+      const outcome: Record<string, string> = {
+        filled: 'Order filled',
+        partially_filled: 'Order partially filled; the rest is on the book',
+        open: orderType === 'stop' ? 'Stop order armed' : 'Order placed on the book',
+        cancelled:
+          parseFloat(result.filledQuantity) > 0
+            ? 'Partially filled; unfilled remainder cancelled'
+            : 'No liquidity within 5% of the price; order cancelled',
+      };
       setMessage({
-        type: 'success',
-        text: `Order ${result.status === 'filled' ? 'filled' : 'placed'} successfully`,
+        type: result.status === 'cancelled' && parseFloat(result.filledQuantity) === 0 ? 'error' : 'success',
+        text: outcome[result.status] ?? `Order ${result.status}`,
       });
       setQuantity('');
       setLimitPrice('');
+      setStopPrice('');
     } catch (error) {
       setMessage({
         type: 'error',
@@ -102,6 +140,16 @@ export function TradeForm({ pair, currentPrice }: TradeFormProps) {
         >
           Limit
         </button>
+        <button
+          onClick={() => setOrderType('stop')}
+          className={`px-3 py-1.5 rounded text-xs font-medium transition-colors ${
+            orderType === 'stop'
+              ? 'bg-cb-primary text-white'
+              : 'bg-cb-surface text-cb-text-secondary hover:text-cb-text'
+          }`}
+        >
+          Stop
+        </button>
       </div>
 
       <form onSubmit={handleSubmit} className="space-y-3">
@@ -120,6 +168,25 @@ export function TradeForm({ pair, currentPrice }: TradeFormProps) {
               className="w-full bg-cb-surface border border-cb-border rounded-lg px-3 py-2.5 text-sm text-cb-text focus:outline-none focus:border-cb-primary"
               required
             />
+          </div>
+        )}
+
+        {/* Stop price */}
+        {orderType === 'stop' && (
+          <div>
+            <label className="block text-xs text-cb-text-secondary mb-1">
+              Stop Price ({pair.quoteCurrency})
+            </label>
+            <input
+              type="number"
+              value={stopPrice}
+              onChange={(e) => setStopPrice(e.target.value)}
+              placeholder={formatPrice(currentPrice, pair.pricePrecision)}
+              step="any"
+              className="w-full bg-cb-surface border border-cb-border rounded-lg px-3 py-2.5 text-sm text-cb-text focus:outline-none focus:border-cb-primary"
+              required
+            />
+            <p className="text-[11px] text-cb-text-secondary mt-1">{stopHint}</p>
           </div>
         )}
 
@@ -159,7 +226,7 @@ export function TradeForm({ pair, currentPrice }: TradeFormProps) {
         <div className="bg-cb-surface rounded-lg p-3 space-y-2 text-xs">
           <div className="flex justify-between">
             <span className="text-cb-text-secondary">
-              {orderType === 'market' ? 'Market' : 'Limit'} Price
+              {orderType === 'market' ? 'Market' : orderType === 'limit' ? 'Limit' : 'Stop'} Price
             </span>
             <span>
               ${formatPrice(effectivePrice, pair.pricePrecision)}
@@ -172,11 +239,17 @@ export function TradeForm({ pair, currentPrice }: TradeFormProps) {
             </span>
           </div>
           <div className="flex justify-between">
-            <span className="text-cb-text-secondary">Fee (0.2%)</span>
+            <span className="text-cb-text-secondary">{feeLabel}</span>
             <span>
-              ${isNaN(totalCost) ? '0.00' : formatPrice(totalCost * 0.002, 2)}
+              ${isNaN(feeEstimate) ? '0.00' : formatPrice(feeEstimate, 2)}
             </span>
           </div>
+          {side === 'buy' && (
+            <div className="flex justify-between" title="Worst-case price plus fee. Unspent funds are released when the order finishes.">
+              <span className="text-cb-text-secondary">Funds held</span>
+              <span>${isNaN(buyHold) ? '0.00' : formatPrice(buyHold, 2)}</span>
+            </div>
+          )}
         </div>
 
         {/* Submit */}

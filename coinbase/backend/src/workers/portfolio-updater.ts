@@ -1,4 +1,5 @@
 import { pool } from '../services/db.js';
+import { EXCHANGE_USER_ID } from '../services/exchangeAccount.js';
 import { marketService } from '../services/marketService.js';
 import { logger } from '../services/logger.js';
 
@@ -9,7 +10,8 @@ async function takePortfolioSnapshots(): Promise<void> {
   try {
     // Get all users with non-zero balances
     const usersResult = await pool.query(
-      `SELECT DISTINCT user_id FROM wallets WHERE balance > 0`
+      `SELECT DISTINCT user_id FROM wallets WHERE balance > 0 AND user_id <> $1`,
+      [EXCHANGE_USER_ID]
     );
 
     for (const row of usersResult.rows) {

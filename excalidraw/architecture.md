@@ -6,7 +6,7 @@ This learning project combines an infinite vector canvas with multi-user shape e
 
 This document separates a **proposed production design** from the **actual implementation**. Requirements, estimates, the main diagram, and design decisions describe the proposal; they are not facts about the real Excalidraw service or measured results. Database Schema reproduces the local SQL, API Design inventories actual routes/messages, and the final Implementation Notes map the code and its limits. The [README](./README.md) provides setup; the three interview answers present smaller, role-focused discussions.
 
-The local app is a single Express/WebSocket process and a React client. **Its WebSocket path does not authenticate users or enforce drawing permissions.** Its merge, client update, and persistence paths also do not establish the convergence or durability guarantees claimed by a complete collaborative editor. HTTP access checks and a helper named CRDT do not supply those missing properties.
+The local app is a single Express/WebSocket process and a React client. Its WebSocket upgrade resolves the same Express session as HTTP, joins check view access, and every edit message checks edit access. Permission changes reach sockets that are already open. HTTP saves and socket edits merge through one last-writer-wins rule, and room saves are bounded and retried. It still does not establish the convergence or durability guarantees of a complete collaborative editor: there is no operation log, acknowledgment, or replay, and rooms are process-local.
 
 ## Requirements
 
@@ -252,29 +252,30 @@ Use PostgreSQL transactions for metadata and durable command acceptance initiall
 | GET | `/api/health/detailed`, `/api/health/ready` | PostgreSQL/Redis probes; detailed includes process memory |
 | GET | `/metrics` | Prometheus text after session middleware |
 
-HTTP JSON bodies have a 10 MB parser limit. Application code does not validate element arrays, shape types, finite coordinates, style ranges, point counts, or document revision before replacement. Invalid collaborator permission values fall through to database constraints rather than a clear validation response.
+HTTP JSON bodies have a 10 MB parser limit. `PUT /drawings/:id` checks that `elements` is an array of well-formed elements (known type, string ID up to 64 characters, finite `version` and `updatedAt`, boolean `isDeleted`). Coordinates, style ranges and point counts are not validated. The elements are **merged** per element with the same last-writer-wins rule as the live room, never written over the stored array (see Implementation Notes). Collaborator permissions other than `view`/`edit` are a 400.
 
-The collaborator helper issues `INSERT … ON CONFLICT … RETURNING dc.*, u.username, u.display_name FROM …`. That is not valid PostgreSQL INSERT syntax; the later simpler query is never reached after the error. The helper catches the error and returns null, and the route responds 201 with a null collaborator. See the [PostgreSQL INSERT grammar](https://www.postgresql.org/docs/16/sql-insert.html) and [drawingService.ts](./backend/src/services/drawingService.ts).
+Adding a collaborator returns `{userId, username, displayName, permission}` and re-checks every open socket on that drawing. (The helper previously began with `INSERT … ON CONFLICT … RETURNING … FROM … JOIN`, which is not valid [PostgreSQL INSERT syntax](https://www.postgresql.org/docs/16/sql-insert.html). The error was caught and turned into `null`, so every share answered 201 with a null collaborator and the share dialog crashed on it.) Listing collaborators requires view access to the drawing.
 
 ### Implemented WebSocket messages
 
-The `/ws` endpoint is attached directly to the HTTP server. Express session, CORS, and rate-limit middleware do not authorize its upgrades or messages.
+The `/ws` upgrade runs through the Express session middleware ([handler.ts](./backend/src/websocket/handler.ts)), so each connection's identity is the session user, or anonymous with none. Messages from one connection are processed strictly in order, so an edit sent right after `join-room` cannot overtake the join's access check. CORS and rate limits do not apply to the socket.
 
 | Direction | Message | Actual contents / handling |
 |-----------|---------|----------------------------|
-| Client → server | `join-room` | Drawing ID plus optional user ID/name; trusted without access check |
-| Client → server | `leave-room` | Leave the current process-local room |
-| Client → server | `shape-add`, `shape-update`, `shape-move` | Full element payload; operation-specific server rules |
-| Client → server | `shape-delete` | Element ID; server increments its current version and timestamps deletion |
-| Client → server | `elements-sync` | Whole element array merged by version/time helper; browser helper is unused |
-| Client → server | `cursor-move` | World x/y; raw mouse-move frequency, no application throttle |
-| Server → client | `connected` | Assigned palette color |
-| Server → client | `room-state` | Drawing ID and complete process-local array |
-| Server → peers | Shape messages / `elements-sync` | Original shape payloads for individual operations, merged array for bulk sync; excludes sender |
-| Server → peers | `cursor-move`, `user-joined`, `user-left` | Supplied identity/name and cursor information |
-| Server → client | `error` | Some syntax/message errors; asynchronous handler failures are only logged |
+| Client → server | `join-room` | Drawing ID only (any `userId`/`username` is ignored). Requires view access; anonymous sockets may join public drawings only |
+| Client → server | `leave-room` | Leave the current room; the last one out triggers the final save |
+| Client → server | `shape-add`, `shape-update`, `shape-move` | Full element payload, validated; requires edit access |
+| Client → server | `shape-delete` | Element ID; requires edit access; server increments the version and timestamps deletion |
+| Client → server | `elements-sync` | Whole element array (up to 10,000), validated and merged; requires edit access |
+| Client → server | `cursor-move` | Finite world x/y; signed-in participants only; raw mouse-move frequency, no throttle |
+| Server → client | `connected` | Per-connection `clientId`, palette color, `authenticated` flag |
+| Server → client | `room-state` | Drawing ID, complete room array, this connection's `canEdit`, and the other participants |
+| Server → peers | Shape messages / `elements-sync` | Sender's `clientId` plus the payload (merged array for bulk sync); never echoed to the sender |
+| Server → peers | `cursor-move`, `user-joined`, `user-left` | Keyed by `clientId`, so two tabs of one account are two participants |
+| Server → client | `permission-changed`, `access-revoked` | Pushed when sharing, visibility, or deletion changes this connection's rights |
+| Server → client | `error` | `forbidden` (join refused), `read-only` (edit refused), malformed input |
 
-There is no accepted-operation ID, durable acknowledgment, drawing sequence, permission revision, heartbeat, or replay cursor. A nonexistent drawing ID becomes an empty room. No configured application message-size, per-room membership, point-count, or slow-client buffer limit protects the room path.
+There is no accepted-operation ID, durable acknowledgment, drawing sequence, heartbeat, or replay cursor. The socket's `maxPayload` is 2 MB; there is no per-room membership, message-rate, or slow-client buffer limit.
 
 ## Key Design Decisions
 
@@ -311,14 +312,12 @@ Clients maintain committed state at a known sequence and pending commands separa
 | Code path | Actual rule | Consequence |
 |-----------|-------------|-------------|
 | `mergeElements` | Higher version wins, then higher timestamp; exact ties keep existing | Equal clock/version conflicts depend on input order; array order also depends on insertion order |
-| Add | Unconditional map replacement for the ID | A stale add can replace a newer object or resurrect a tombstone |
-| Update | Accept when incoming version is at least current | Equal-version older timestamp can replace newer state |
+| Add, Update | Same rule as merge: higher version, then later timestamp | A replayed add cannot resurrect a tombstone; an equal-version older edit loses |
 | Delete | Mark current object deleted and increment version using server time | Replaying the same delete increments again |
 | Move | Change x/y regardless of stale version; take max version and server time | Old positions can replace new positions without consistent ordering |
-| Browser remote update | Apply payload but increment from the browser's current version and use local time | Server and browsers do not retain the same version/time metadata |
-| Browser remote add | Append to array | Duplicate IDs can coexist locally |
+| Browser remote add/update | `applyRemoteElement`: same last-writer-wins rule, keeps the sender's version | Browsers and server hold the same version/time metadata for accepted edits |
 
-These rules are in [crdtService.ts](./backend/src/services/crdtService.ts), [the room handler](./backend/src/websocket/handler.ts), [canvasStore.ts](./frontend/src/stores/canvasStore.ts), and [the drawing route](./frontend/src/routes/draw.$drawingId.tsx). Individual broadcasts send original payloads even if server merge rejected or transformed them; the sender gets no canonical correction. Same-user browser tabs ignore each other's shape messages. There is no end-to-end exactly-once or convergence guarantee.
+These rules are in [crdtService.ts](./backend/src/services/crdtService.ts), [the room handler](./backend/src/websocket/handler.ts), [canvasStore.ts](./frontend/src/stores/canvasStore.ts), and [the drawing route](./frontend/src/routes/draw.$drawingId.tsx). Individual broadcasts send original payloads even if server merge rejected or transformed them; the sender gets no canonical correction. Messages are filtered by connection, not user, so two tabs of one account see each other's edits. There is no end-to-end exactly-once or convergence guarantee.
 
 ## Security / Auth
 
@@ -326,7 +325,7 @@ In production, authenticate upgrades with the same session authority used by HTT
 
 Locally, HTTP auth uses bcryptjs (cost 12 for new accounts) and Redis-backed `express-session`. Cookies last seven days, are HttpOnly/SameSite Lax, and are Secure in production. Registration lowercases username/email and enforces username length and a six-character minimum password; it does not regenerate the session on login/register. `SESSION_SECRET` signs cookies; session data lives in Redis. The installed connect-redis adapter supports the supplied ioredis client.
 
-[HTTP drawing routes](./backend/src/routes/drawings.ts) check ownership/edit access for changes and owner access for delete/grant management. Listing collaborators only checks login. Drawing GET uses cached `is_public` to decide whether private access checks are necessary, so stale cache state can also affect read authorization. Edit collaborators can change publicity through the generic PUT. The UI has no public/private toggle despite holding `isPublic` state.
+[HTTP drawing routes](./backend/src/routes/drawings.ts) check ownership/edit access for changes and owner access for delete/grant management; listing collaborators requires view access. The WebSocket enforces the same rules per connection, and sharing, unsharing, visibility changes and deletion re-check open sockets immediately (`refreshRoomAccess` / `closeRoom` in [rooms.ts](./backend/src/websocket/rooms.ts)). Origins are not validated on upgrade. Drawing GET uses cached `is_public` to decide whether private access checks are necessary, so stale cache state can also affect read authorization. Edit collaborators can change publicity through the generic PUT. The UI has no public/private toggle despite holding `isPublic` state.
 
 [WebSocket setup](./backend/src/index.ts) passes every connection to an anonymous client record, and [join-room](./backend/src/websocket/handler.ts) trusts message identity and drawing ID. There is no session parsing, drawing access check, edit check, origin gate, logout revocation, or deleted-room closure. A socket can read and mutate a known private drawing independently of HTTP credentials.
 
@@ -346,15 +345,15 @@ Health and readiness check PostgreSQL/Redis, not valid collaboration, permission
 |---------|-------------------|------------------------|
 | Response/ack lost | Resend stable operation ID and retrieve receipt | No operation acknowledgment or receipt |
 | Disconnection | Preserve pending commands; catch up and reconcile | Sends while closed are dropped; room-state replaces local elements |
-| Database unavailable | Stop durable acknowledgments, bound pending work | In-memory edits continue; failed idle saves log and disappear from timer tracking |
+| Database unavailable | Stop durable acknowledgments, bound pending work | In-memory edits continue; a failed save keeps the room dirty and retries every 5 s |
 | Redis unavailable | Explicit session/access failure; optional caches can fail open where safe | Cache helpers throw; sessions/rate limiting can fail HTTP requests |
 | Room owner crashes | New fenced owner replays log after snapshot | First join reloads last SQL/cache state; unsaved room memory is lost |
-| Last client leaves | Persist or retain retryable state before release | Fire-and-forget flush, then room state and timer are removed |
-| Planned shutdown | Stop admissions, drain/ack work, persist, close sockets and dependencies | Ends database/Redis and exits without draining rooms/server/sockets |
-| Join races editing | Snapshot and tail have a defined sequence boundary | Async scene loading can overwrite edits received before load completes |
-| Permission revoked | Prevent future mutations and remove/restrict connections | Active sockets keep editing |
+| Last client leaves | Persist or retain retryable state before release | Room stays in memory until its final save commits; a join in that window reuses it |
+| Planned shutdown | Stop admissions, drain/ack work, persist, close sockets and dependencies | Stops the HTTP server, saves every dirty room, then closes PostgreSQL/Redis (idempotent on repeated signals) |
+| Join races editing | Snapshot and tail have a defined sequence boundary | Room loads run under the per-drawing write lock; the client keeps room-state over a later REST response |
+| Permission revoked | Prevent future mutations and remove/restrict connections | Open sockets are downgraded or removed when sharing or visibility changes |
 
-[The Opossum helper](./backend/src/services/circuitBreaker.ts) configures a 10-second timeout, 50% failure threshold after five requests, a 10-second statistics window, and 30-second reset. It is **unused by the running database path**. There is no database circuit breaker, queued save retry, or Redis-to-memory limiter fallback to claim. PostgreSQL uses a 20-connection pool, 30-second idle timeout, and two-second connection-acquisition timeout; ordinary queries have no explicit execution deadline.
+[The Opossum helper](./backend/src/services/circuitBreaker.ts) configures a 10-second timeout, 50% failure threshold after five requests, a 10-second statistics window, and 30-second reset. It is **unused by the running database path**. There is no database circuit breaker or Redis-to-memory limiter fallback; the only retry is the room save's. PostgreSQL uses a 20-connection pool, 30-second idle timeout, and two-second connection-acquisition timeout; ordinary queries have no explicit execution deadline.
 
 ## Scalability Considerations
 
@@ -381,13 +380,13 @@ Global collaboration adds latency and authority placement choices. Start with a 
 
 ### Actual topology and persistence
 
-[app.ts](./backend/src/app.ts) mounts HTTP routes and sessions; [index.ts](./backend/src/index.ts) attaches `/ws` to the same server. [handler.ts](./backend/src/websocket/handler.ts) holds rooms, clients, element arrays, and timers in process-local maps. Redis is used for HTTP sessions, rate counters, a full-drawing cache, and cursor writes; it is not used for room fan-out or durable operations.
+[app.ts](./backend/src/app.ts) mounts HTTP routes and sessions; [index.ts](./backend/src/index.ts) attaches `/ws` to the same server. [handler.ts](./backend/src/websocket/handler.ts) authenticates upgrades and dispatches messages; [rooms.ts](./backend/src/websocket/rooms.ts) holds rooms, element arrays and timers in process-local maps and owns persistence. Redis is used for HTTP and WebSocket sessions, rate counters, a full-drawing cache, and cursor writes; it is not used for room fan-out or durable operations.
 
-Socket edits reset a two-second inactivity timer. The callback captures the full array and calls `updateDrawing`; errors are logged, with no automatic retry. Continuous mutations can postpone the timer indefinitely. An in-flight old save can overlap newer work, and timer cleanup has no generation guard. On last departure, the handler starts a flush and immediately discards memory; a new join can race that flush and load older SQL/cache state. Shutdown does not invoke a room flush at all.
+**Room saves.** Each edit restarts a two-second quiet-period timer, capped at ten seconds after the first unsaved edit, so continuous drawing no longer postpones the save indefinitely. Every write for a drawing (room flushes, HTTP saves, room loads) runs through one per-drawing promise chain (`withDrawingLock`). An older snapshot therefore cannot land after a newer one, and a load never reads a half-written row. The snapshot is the element array at the moment the save starts. Arrays are replaced, never mutated, so later edits mark the room dirty again rather than changing what is being written. A failed save keeps the room dirty and retries after five seconds. When the last client leaves, the room stays in memory until its final save commits; a join in that window reuses the newer in-memory state instead of reloading the row. Graceful shutdown stops the HTTP server and saves every dirty room before closing the pool.
 
-HTTP Save replaces the entire array through [drawingService.ts](./backend/src/services/drawingService.ts). The frontend first filters out deleted elements, so it removes tombstones from SQL. It does not update room memory or broadcast metadata/style changes. A subsequent socket flush can overwrite that save with an older in-memory scene. There is no compare-and-swap or common save authority.
+**One merge authority.** HTTP Save no longer replaces the array. With the drawing open, the incoming elements are merged into the room (`mergeElements`, last-writer-wins per element), every participant (including the saver) receives the merged list as `elements-sync`, and the room saves it. With nobody connected, the stored array is merged under the drawing lock. The browser now sends tombstones too, so a save from a stale tab cannot overwrite newer socket edits or resurrect deleted shapes. Version snapshots record the merged scene. Title, visibility and app state are still plain column updates.
 
-`saveVersion` is launched asynchronously only after an HTTP PUT containing elements succeeds. Its separate transaction selects max version plus one, inserts the submitted scene, and deletes versions at least fifty numbers behind the new maximum. Concurrent numbers can collide and the saved snapshot need not correspond to a unique live-scene revision. No route reads/restores those versions; `operations` remains unused.
+`saveVersion` is launched asynchronously only after an HTTP PUT containing elements succeeds, with the merged scene. Its separate transaction selects max version plus one, inserts the submitted scene, and deletes versions at least fifty numbers behind the new maximum. Concurrent numbers can collide and the saved snapshot need not correspond to a unique live-scene revision. No route reads/restores those versions; `operations` remains unused.
 
 ### Wired patterns and helper boundaries
 
@@ -398,11 +397,11 @@ HTTP Save replaces the entire array through [drawingService.ts](./backend/src/se
 **Presence.** [presenceService.ts](./backend/src/services/presenceService.ts) performs the following pattern for each cursor update:
 
 ```text
-HSET presence:cursors:<drawingId> <userId> <cursor JSON>
+HSET presence:cursors:<drawingId> <clientId> <cursor JSON>
 EXPIRE presence:cursors:<drawingId> 30
 ```
 
-The expiry belongs to the whole hash, so one moving user keeps every field alive. It does not expire an idle user's cursor independently. `getCursors` is never called by the join path; Redis data does not initialize late joiners. Browser cursors have no timestamp expiry either and disappear only on explicit leave notifications. See [Redis EXPIRE semantics](https://redis.io/docs/latest/commands/expire/). Multiple tabs share a user field and can remove one another's presence.
+The expiry belongs to the whole hash, so one moving user keeps every field alive. It does not expire an idle user's cursor independently. `getCursors` is never called by the join path; Redis data does not initialize late joiners. Browser cursors have no timestamp expiry either and disappear only on explicit leave notifications. See [Redis EXPIRE semantics](https://redis.io/docs/latest/commands/expire/). Presence is keyed by connection, so two tabs of one account are two cursors and cannot remove each other's.
 
 **Metrics/logs.** HTTP and WebSocket counters and Pino request logging are wired. Circuit-breaker, query-timing, and cache-log helpers are not automatically connected merely because they are exported. The Observability and Failure Handling sections distinguish actual wiring from the proposed instrumentation.
 
@@ -410,23 +409,23 @@ The expiry belongs to the whole hash, so one moving user keeps every field alive
 
 The [canvas store](./frontend/src/stores/canvasStore.ts) is in memory; [auth state](./frontend/src/stores/authStore.ts) persists user/auth flags under `excalidraw-auth-storage` and [main.tsx](./frontend/src/main.tsx) validates the session on mount. The drawing route starts requests/sockets from the current user object before that check necessarily finishes. All canvas subscribers read the whole store, so cursor updates still rerender React subscribers even though the canvas drawing effect does not depend on cursors.
 
-[Canvas.tsx](./frontend/src/components/Canvas.tsx) redraws through a React effect on elements, viewport, selection, and size. There is no animation-frame loop, viewport culling, dirty-rectangle rendering, offscreen layer, or error isolation per element. It allocates a fixed 2× backing bitmap, then [CanvasRenderer.ts](./frontend/src/renderer/CanvasRenderer.ts) calls:
+[Canvas.tsx](./frontend/src/components/Canvas.tsx) redraws through a React effect on elements, viewport, selection, and size. There is no animation-frame loop, viewport culling, dirty-rectangle rendering, offscreen layer, or error isolation per element. The backing bitmap is the CSS size times `devicePixelRatio`, and [CanvasRenderer.ts](./frontend/src/renderer/CanvasRenderer.ts) folds that ratio into the world transform:
 
 ```typescript
-ctx.setTransform(viewState.zoom, 0, 0, viewState.zoom, viewState.scrollX, viewState.scrollY);
+ctx.setTransform(dpr * zoom, 0, 0, dpr * zoom, dpr * scrollX, dpr * scrollY);
 ```
 
-`setTransform` replaces the previous transform; it does not multiply the earlier 2× scale. Shapes/selection therefore render at half the expected CSS size/position in that backing store, while hit tests and cursor overlays use the unscaled viewport. The grid is drawn before this replacement; its spacing scales with zoom rather than staying constant. See [Canvas setTransform](https://developer.mozilla.org/en-US/docs/Web/API/CanvasRenderingContext2D/setTransform).
+[`setTransform`](https://developer.mozilla.org/en-US/docs/Web/API/CanvasRenderingContext2D/setTransform) *replaces* the current matrix. The earlier code first set a fixed 2× retina scale and then replaced it with the bare viewport transform, so every shape and selection box was drawn at half its CSS size and position. Hit tests and cursor overlays used full-size coordinates, so a click landed beside the shape it was aimed at. The grid is drawn in screen space and its spacing scales with zoom.
 
-The renderer supports the seven shapes, smoothed freehand lines, multiline text, and decorative selection handles. Hit testing is a reverse linear scan. Negative-size diamond hit testing divides by signed dimensions and can accept distant points. Freehand selection bounds do not include the minimum point offset. Path simplification uses a fixed two-world-unit tolerance and distance to an infinite line, so collinear backtracking excursions can disappear; no zoom-aware error guarantee is provided.
+The renderer supports the seven shapes, smoothed freehand lines, multiline text, and decorative selection handles. Hit testing is a reverse linear scan. New boxes are stored with positive width and height whichever way they were dragged, and freehand strokes are re-anchored so the element's origin is their bounding-box corner. That removes the negative-size and missing-offset hit-test errors for shapes drawn in this client (elements from older data or other clients may still carry them). Path simplification uses a fixed two-world-unit tolerance and distance to an infinite line, so collinear backtracking excursions can disappear; no zoom-aware error guarantee is provided.
 
-[Canvas input](./frontend/src/components/Canvas.tsx) stores freehand points during mouse movement and commits/sends a completed shape only on mouseup. Dragging updates locally on movement and sends a move at mouseup. The preview renderer is unused; points/draft geometry are not drawn during capture. There is no pointer capture, pointer cancel, touch support, resize handling, Shift constraints, snapping, or existing-text editor. [PropertiesPanel.tsx](./frontend/src/components/PropertiesPanel.tsx) changes local state without sending a shape update, and its controls display global defaults rather than synchronizing to each selected element's values.
+[Canvas input](./frontend/src/components/Canvas.tsx) draws the shape under construction live and commits/sends it on mouseup. Dragging updates locally on movement and, if the shape actually moved, sends its current state at mouseup. With view-only access, any drag pans, and the toolbar, properties panel and Save button are hidden. There is no pointer capture, pointer cancel, touch support, resize handling, Shift constraints, snapping, or existing-text editor. [PropertiesPanel.tsx](./frontend/src/components/PropertiesPanel.tsx) shows the selected element's style (or the defaults when nothing is selected) and sends each change as a `shape-update`.
 
-[websocket.ts](./frontend/src/services/websocket.ts) drops sends unless open, reconnects after 1/2/4/8/16 seconds without jitter, and rejoins without replaying pending operations. `room-state` replaces local elements. It can create another socket while an earlier one is still connecting; leaving a drawing does not close the connection, and pending reconnect timers are not tracked/cancelled. The route ignores messages carrying its own user ID, so two tabs of the same account miss each other's operations.
+[websocket.ts](./frontend/src/services/websocket.ts) drops sends unless open, reconnects after 1/2/4/8/16 seconds without jitter, and rejoins without replaying pending operations. `room-state` replaces local elements. `connect()` is a no-op while a socket is open or connecting, reconnect timers are tracked, and a replaced socket cannot schedule another. The route reopens the socket when the signed-in user changes, because identity is bound at upgrade. Leaving a drawing does not close the connection.
 
-REST scene loading and socket initialization run independently and can overwrite each other. Route handlers do not reject stale drawing IDs or request generations; navigation can receive old scene responses. Store viewport, selection, tool, and cursors are not fully reset between drawings/accounts. A save error replaces the editor with an error page rather than preserving an actionable unsaved state.
+The route resets scene, selection, viewport, tool, cursors and edit rights when the drawing changes. Once `room-state` has arrived, a later REST response may update the title but not the elements, because the room is newer than Postgres by up to one debounce. A save error is shown inline and leaves the editor intact. The page reacts to `permission-changed`, `access-revoked` and `forbidden` by switching to view-only or showing the reason.
 
-The share dialog appends the null collaborator returned by the broken helper and then dereferences it while rendering. It has no link-copy/public-toggle workflow, focus trap, or dialog semantics. Drawing cards use clickable divs and hover-only actions; toolbar/property controls and form labels need additional keyboard/accessible naming work. Anonymous public viewers see editing controls but have no normal authenticated save/socket session; authenticated view-only users can still edit through the unprotected socket path.
+The share dialog replaces an existing collaborator entry when their permission changes instead of duplicating it. It has no link-copy/public-toggle workflow, focus trap, or dialog semantics. Drawing cards use clickable divs and hover-only actions; toolbar/property controls and form labels need additional keyboard/accessible naming work. Anonymous viewers of public drawings join the room read-only and receive live edits.
 
 ### Local substitutions and omitted production work
 
@@ -434,4 +433,14 @@ Compose provides PostgreSQL/Valkey with volumes, not a distributed room cluster.
 
 The SQL fixture creates Alice/Bob (`password123`), four drawings, and two edit grants. It is neither transaction-wrapped nor rerunnable without conflicts. Registration hashes use cost 12, while seeded hashes have cost 10. The [README](./README.md) describes one-time seeding and the existing two-account collaboration demo.
 
-Omitted mechanisms include WebSocket authorization/revocation, canonical command receipts/sequences, a fenced room owner, durable pending-client recovery, safe snapshot/tombstone retention, cross-server fan-out/replay, autosave retries, room draining, actual exports, history restore, undo/redo, group selection, and fully accessible object navigation. Backend tests mock dependencies/session behavior; smoke tests cover login and drawing-list rendering, while screenshot configuration additionally opens seeded canvases. Neither establishes collaboration correctness. This review used source inspection and isolated mocked protocol/merge/renderer checks, not a live-stack run or benchmark.
+Omitted mechanisms include canonical command receipts/sequences, a fenced room owner, durable pending-client recovery, safe snapshot/tombstone retention, cross-server fan-out/replay, autosave retries, room draining, actual exports, history restore, undo/redo, group selection, and fully accessible object navigation. Backend tests mock dependencies/session behavior; [rooms.test.ts](./backend/src/websocket/rooms.test.ts) covers the save debounce and max-wait, retry after failure, the leave/rejoin window, HTTP merges, access refresh, and the add/update merge rules. Smoke tests cover login and drawing-list rendering, while screenshot configuration additionally opens seeded canvases. A scripted run against the live stack checked the following with real sockets:
+- anonymous/private/forbidden joins;
+- read-only enforcement;
+- same-account multi-tab fan-out;
+- both save paths;
+- stale-tab HTTP merges;
+- live downgrade and revocation;
+- the last-one-out rejoin window;
+- a SIGTERM with an unsaved edit in an open room.
+
+It is not a benchmark, and convergence under concurrent conflicting edits is still not established.

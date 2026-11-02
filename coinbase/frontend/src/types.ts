@@ -30,6 +30,7 @@ export interface Order {
   orderType: 'market' | 'limit' | 'stop';
   quantity: number;
   price: number | null;
+  stopPrice: string | null;
   filledQuantity: number;
   avgFillPrice: number | null;
   status: 'pending' | 'open' | 'partially_filled' | 'filled' | 'cancelled';

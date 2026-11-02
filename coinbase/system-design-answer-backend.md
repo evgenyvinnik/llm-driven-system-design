@@ -398,12 +398,12 @@ acknowledgement, replay the command, duplicate outbox publication, and reject a 
 owner epoch. A successful restart must restore unfilled orders as well as completed
 trades.
 
-The local code has an atomic conditional reserve update and a wallet-transfer
-transaction, but these are separate from order insertion and trade/fill updates.
-Matching mutates memory first, fees contain a base/quote unit error, and synthetic
-market fills leave book entries behind.
+The local code commits the conditional reserve with the order insert, attributes
+each hold to its order, and settles each trade (trade row, both fills, wallets, fees,
+unspent-hold release) in one transaction. It serializes commands per pair in process
+and rebuilds the book from live orders, in arrival order, at boot.
 
-There is no durable pair log, book rehydration, attributed hold table, balanced
-journal, or transactional outbox. Redis replay is global and unbound, and Kafka has no
+There is no durable pair log, fenced owner, signed double-entry journal, or
+transactional outbox. Redis replay is global and unbound, and Kafka has no
 connected application consumer. Those source boundaries are why the proposed commit
 and recovery design is the core of this answer.

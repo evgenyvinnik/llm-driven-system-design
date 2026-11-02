@@ -404,15 +404,16 @@ full-scene cache, and process-local room maps. It has seven element types and de
 full-scene writes. It does not implement the durable command protocol, fenced ownership, or
 snapshot-and-tail recovery described above.
 
-Several current behaviors are important limitations. WebSocket joins and edits do not
-authenticate or enforce drawing permissions. The merge helper and operation reducer disagree
-on versions and ties, and clients rewrite remote metadata. The operations table is unused;
-history is written only by HTTP scene updates.
+The local code does have the single-process version of the access story: WebSocket upgrades
+resolve the HTTP session, joins and edits check permissions, and sharing changes reach open
+connections. Add, update and merge follow one last-writer-wins rule, and HTTP saves merge
+into the room instead of replacing it. Room saves are serialized per drawing, capped at ten
+seconds, retried on failure, and flushed when the room empties and on shutdown.
 
-An initial room load can overwrite edits made while it was pending. Continuous edits
-postpone the save timer, and failed saves have no durable retry. HTTP scene saves and room
-saves can overwrite each other. The collaborator insertion query is invalid and its caught
-error can produce a success response containing a null collaborator.
+The limitations are the ones this answer is about. There is no durable command log,
+acknowledgment, or replay, so a crash loses up to ten seconds of edits. Permission
+invalidation and save ordering are in-process only. The operations table is unused, and
+history is written only by HTTP scene updates.
 
 > “My first backend milestone would be a secure, single-process authority with canonical
 > events and durable receipts. I would demonstrate crash recovery and conflict behavior

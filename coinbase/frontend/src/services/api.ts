@@ -89,9 +89,10 @@ export const ordersApi = {
   placeOrder: (data: {
     tradingPairId: string;
     side: 'buy' | 'sell';
-    orderType: 'market' | 'limit';
+    orderType: 'market' | 'limit' | 'stop';
     quantity: string;
     price?: string;
+    stopPrice?: string;
     idempotencyKey?: string;
   }) =>
     request<{ order: { id: string; status: string; filledQuantity: string; avgFillPrice: string | null } }>(

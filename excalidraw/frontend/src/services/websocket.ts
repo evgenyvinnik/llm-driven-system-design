@@ -1,11 +1,15 @@
-import type { ExcalidrawElement, Cursor } from '../types';
+import type { ExcalidrawElement } from '../types';
 
 export type WsMessageHandler = (message: WsMessage) => void;
 
 export interface WsMessage {
   type: string;
   drawingId?: string;
-  userId?: string;
+  clientId?: string;
+  userId?: string | null;
+  canEdit?: boolean;
+  code?: string;
+  reason?: string;
   username?: string;
   elementId?: string;
   elementData?: ExcalidrawElement;
@@ -24,32 +28,42 @@ class WebSocketClient {
   private maxReconnectAttempts = 5;
   private reconnectDelay = 1000;
   private drawingId: string | null = null;
-  private userId: string | null = null;
-  private username: string | null = null;
+  private clientId: string | null = null;
   private assignedColor: string = '#6965db';
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
+  /**
+   * Opens the socket if there isn't one. Identity is not sent by the client:
+   * the server reads it from the session cookie during the upgrade.
+   */
   connect(): void {
-    if (this.ws?.readyState === WebSocket.OPEN) return;
+    if (this.ws?.readyState === WebSocket.OPEN || this.ws?.readyState === WebSocket.CONNECTING) return;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
 
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const host = window.location.host;
-    this.ws = new WebSocket(`${protocol}//${host}/ws`);
+    const socket = new WebSocket(`${protocol}//${host}/ws`);
+    this.ws = socket;
 
-    this.ws.onopen = () => {
+    socket.onopen = () => {
       this.reconnectAttempts = 0;
 
-      // Re-join room if we were in one
-      if (this.drawingId && this.userId) {
-        this.joinRoom(this.drawingId, this.userId, this.username || 'Anonymous');
+      // Re-join the room we were in
+      if (this.drawingId) {
+        this.send({ type: 'join-room', drawingId: this.drawingId });
       }
     };
 
-    this.ws.onmessage = (event) => {
+    socket.onmessage = (event) => {
       try {
         const message = JSON.parse(event.data) as WsMessage;
 
-        if (message.type === 'connected' && message.color) {
-          this.assignedColor = message.color;
+        if (message.type === 'connected') {
+          if (message.color) this.assignedColor = message.color;
+          this.clientId = message.clientId ?? null;
         }
 
         const handlers = this.handlers.get(message.type) || [];
@@ -67,25 +81,38 @@ class WebSocketClient {
       }
     };
 
-    this.ws.onclose = () => {
+    socket.onclose = () => {
+      // A socket that was replaced or deliberately closed must not reconnect.
+      if (this.ws !== socket) return;
       if (this.reconnectAttempts < this.maxReconnectAttempts) {
         const delay = this.reconnectDelay * Math.pow(2, this.reconnectAttempts);
         this.reconnectAttempts++;
-        setTimeout(() => this.connect(), delay);
+        this.reconnectTimer = setTimeout(() => this.connect(), delay);
       }
     };
 
-    this.ws.onerror = () => {
+    socket.onerror = () => {
       // Error handling is done in onclose
     };
   }
 
+  /** Reopens the socket, e.g. after login or logout changes the session identity. */
+  reconnect(): void {
+    const previous = this.ws;
+    this.ws = null;
+    previous?.close();
+    this.reconnectAttempts = 0;
+    this.connect();
+  }
+
   disconnect(): void {
-    if (this.ws) {
-      this.reconnectAttempts = this.maxReconnectAttempts; // Prevent reconnect
-      this.ws.close();
-      this.ws = null;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
     }
+    const previous = this.ws;
+    this.ws = null;
+    previous?.close();
   }
 
   send(message: WsMessage): void {
@@ -122,17 +149,10 @@ class WebSocketClient {
     }
   }
 
-  joinRoom(drawingId: string, userId: string, username: string): void {
+  /** Joins a drawing now, or as soon as the socket opens. */
+  joinRoom(drawingId: string): void {
     this.drawingId = drawingId;
-    this.userId = userId;
-    this.username = username;
-
-    this.send({
-      type: 'join-room',
-      drawingId,
-      userId,
-      username,
-    });
+    this.send({ type: 'join-room', drawingId });
   }
 
   leaveRoom(): void {
@@ -187,6 +207,10 @@ class WebSocketClient {
 
   getColor(): string {
     return this.assignedColor;
+  }
+
+  getClientId(): string | null {
+    return this.clientId;
   }
 
   isConnected(): boolean {

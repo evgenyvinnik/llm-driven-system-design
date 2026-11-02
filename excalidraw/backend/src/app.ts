@@ -59,20 +59,21 @@ const redisStore = new RedisStore({
   prefix: 'sess:',
 });
 
-app.use(
-  session({
-    store: redisStore,
-    secret: config.session.secret,
-    resave: false,
-    saveUninitialized: false,
-    cookie: {
-      secure: config.nodeEnv === 'production',
-      httpOnly: true,
-      maxAge: config.session.maxAge,
-      sameSite: 'lax',
-    },
-  })
-);
+// Exported so the WebSocket upgrade resolves the same session from the same cookie.
+export const sessionMiddleware = session({
+  store: redisStore,
+  secret: config.session.secret,
+  resave: false,
+  saveUninitialized: false,
+  cookie: {
+    secure: config.nodeEnv === 'production',
+    httpOnly: true,
+    maxAge: config.session.maxAge,
+    sameSite: 'lax',
+  },
+});
+
+app.use(sessionMiddleware);
 
 // Attach user context for logging
 app.use(attachUserContext as express.RequestHandler);

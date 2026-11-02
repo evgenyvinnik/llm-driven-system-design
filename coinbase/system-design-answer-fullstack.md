@@ -416,10 +416,11 @@ large values, and tick/step boundaries. Browser tests verify that an old result 
 not clear a new draft or enter another account's view, and that chart updates preserve
 the chosen viewport.
 
-The local implementation has conditional reserve updates and wallet transactions, but
-order insertion, trade records, fill updates, and wallet settlement are separate
-commits. It uses floating-point matching, incorrect matched buyer fee units, synthetic
-fills, and no book rehydration.
+The local implementation commits the reservation with the order insert and settles
+each trade in one transaction with quote-denominated maker/taker fees. It matches with
+exact fixed-point arithmetic, serializes each pair's commands in process, and rebuilds
+the book from Postgres at boot. What it lacks is the durable pair log and fenced owner,
+so the "one owner per pair" property holds only for a single API process.
 
 Its API, price worker, and portfolio worker have independent price state. The UI lacks
 command recovery, sequence-aware streams, and account-scoped request guards, while

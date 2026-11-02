@@ -20,6 +20,9 @@ interface CanvasState {
   // Cursors
   cursors: Cursor[];
 
+  // Whether the server lets this connection edit the open drawing.
+  canEdit: boolean;
+
   // Style
   strokeColor: string;
   fillColor: string;
@@ -32,6 +35,8 @@ interface CanvasState {
   addElement: (element: ExcalidrawElement) => void;
   updateElement: (id: string, updates: Partial<ExcalidrawElement>) => void;
   deleteElement: (id: string) => void;
+  applyRemoteElement: (element: ExcalidrawElement) => void;
+  applyRemoteMove: (element: ExcalidrawElement) => void;
   setSelectedElementId: (id: string | null) => void;
   setActiveTool: (tool: Tool) => void;
   setViewState: (viewState: Partial<ViewState>) => void;
@@ -41,7 +46,9 @@ interface CanvasState {
   addCurrentPoint: (point: Point) => void;
   setCursors: (cursors: Cursor[]) => void;
   updateCursor: (cursor: Cursor) => void;
-  removeCursor: (userId: string) => void;
+  removeCursor: (clientId: string) => void;
+  setCanEdit: (canEdit: boolean) => void;
+  resetForDrawing: () => void;
   setStrokeColor: (color: string) => void;
   setFillColor: (color: string) => void;
   setStrokeWidth: (width: number) => void;
@@ -60,6 +67,7 @@ export const useCanvasStore = create<CanvasState>()((set) => ({
   drawingStartPoint: null,
   currentPoints: [],
   cursors: [],
+  canEdit: false,
   strokeColor: '#1e1e1e',
   fillColor: 'transparent',
   strokeWidth: 2,
@@ -88,6 +96,32 @@ export const useCanvasStore = create<CanvasState>()((set) => ({
       selectedElementId: state.selectedElementId === id ? null : state.selectedElementId,
     })),
 
+  // Remote changes follow the server's last-writer-wins rule and keep the
+  // sender's version. Routing them through updateElement bumped the version a
+  // second time, so this client's copy disagreed with everyone else's.
+  applyRemoteElement: (element) =>
+    set((state) => {
+      const index = state.elements.findIndex((el) => el.id === element.id);
+      if (index === -1) return { elements: [...state.elements, element] };
+      const current = state.elements[index];
+      const wins =
+        element.version > current.version ||
+        (element.version === current.version && element.updatedAt > current.updatedAt);
+      if (!wins) return {};
+      const elements = [...state.elements];
+      elements[index] = element;
+      return { elements };
+    }),
+
+  applyRemoteMove: (element) =>
+    set((state) => ({
+      elements: state.elements.map((el) =>
+        el.id === element.id
+          ? { ...el, x: element.x, y: element.y, version: Math.max(el.version, element.version) }
+          : el
+      ),
+    })),
+
   setSelectedElementId: (id) => set({ selectedElementId: id }),
 
   setActiveTool: (tool) => set({ activeTool: tool, selectedElementId: null }),
@@ -112,7 +146,7 @@ export const useCanvasStore = create<CanvasState>()((set) => ({
 
   updateCursor: (cursor) =>
     set((state) => {
-      const existing = state.cursors.findIndex((c) => c.userId === cursor.userId);
+      const existing = state.cursors.findIndex((c) => c.clientId === cursor.clientId);
       if (existing >= 0) {
         const updated = [...state.cursors];
         updated[existing] = cursor;
@@ -121,10 +155,27 @@ export const useCanvasStore = create<CanvasState>()((set) => ({
       return { cursors: [...state.cursors, cursor] };
     }),
 
-  removeCursor: (userId) =>
+  removeCursor: (clientId) =>
     set((state) => ({
-      cursors: state.cursors.filter((c) => c.userId !== userId),
+      cursors: state.cursors.filter((c) => c.clientId !== clientId),
     })),
+
+  setCanEdit: (canEdit) => set({ canEdit }),
+
+  // Opening another drawing must not inherit the previous one's scene,
+  // selection, viewport, cursors, or edit rights.
+  resetForDrawing: () =>
+    set({
+      elements: [],
+      selectedElementId: null,
+      activeTool: 'select',
+      viewState: { scrollX: 0, scrollY: 0, zoom: 1 },
+      isDrawing: false,
+      drawingStartPoint: null,
+      currentPoints: [],
+      cursors: [],
+      canEdit: false,
+    }),
 
   setStrokeColor: (color) => set({ strokeColor: color }),
   setFillColor: (color) => set({ fillColor: color }),
