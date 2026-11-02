@@ -66,6 +66,6 @@ function AccountsPage() {
   );
 }
 
-export const Route = createFileRoute('/accounts')({
+export const Route = createFileRoute('/accounts/')({
   component: AccountsPage,
 });
