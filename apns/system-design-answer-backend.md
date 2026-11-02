@@ -455,8 +455,8 @@ The console reads a timestamped projection rather than each worker's local count
 A health check verifies dependencies; targeted synthetic devices verify the actual path.
 
 The local repository demonstrates hashed token lookup, PostgreSQL history, Valkey routing,
-WebSocket clients, and polling administration. It lacks durable acceptance recovery,
-authenticated delivery, generation leases, and an active priority worker.
+token-authenticated WebSocket clients, app-scoped provider JWTs, and polling administration.
+It lacks durable acceptance recovery, generation leases, and an active priority worker.
 Those are design gaps to explain honestly, not guarantees established by its page smoke tests.
 
 ## ⚖️ Trade-offs and close — 2 minutes

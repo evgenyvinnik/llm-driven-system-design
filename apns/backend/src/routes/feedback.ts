@@ -1,6 +1,7 @@
 import { Router, Request, Response } from "express";
 import { feedbackService } from "../services/feedbackService.js";
 import { validateBundleId } from "../utils/index.js";
+import { requireProvider, canAccessBundle } from "../shared/auth.js";
 
 /**
  * Feedback Routes.
@@ -9,11 +10,21 @@ import { validateBundleId } from "../utils/index.js";
  * Providers poll these endpoints to learn about invalidated device tokens
  * so they can stop sending notifications to those devices.
  *
+ * Requires a provider JWT whose key covers the app (or an admin session).
+ *
  * Routes:
  * - GET /:appBundleId - Get feedback entries for an app
  * - DELETE /:appBundleId - Clear processed feedback entries
  */
 const router = Router();
+
+router.use(requireProvider());
+
+/** 403 body when a provider asks for another app's feedback. */
+const NOT_IN_SCOPE_RESPONSE = {
+  error: "Forbidden",
+  message: "This provider key does not cover that app",
+};
 
 /**
  * Get feedback entries for an app.
@@ -35,6 +46,10 @@ router.get("/:appBundleId", async (req: Request, res: Response) => {
         error: "InvalidBundleId",
         message: "Invalid app bundle ID format",
       });
+    }
+
+    if (!canAccessBundle(req.principal, appBundleId)) {
+      return res.status(403).json(NOT_IN_SCOPE_RESPONSE);
     }
 
     const sinceDate = since ? new Date(since as string) : undefined;
@@ -70,6 +85,10 @@ router.delete("/:appBundleId", async (req: Request, res: Response) => {
         error: "InvalidBundleId",
         message: "Invalid app bundle ID format",
       });
+    }
+
+    if (!canAccessBundle(req.principal, appBundleId)) {
+      return res.status(403).json(NOT_IN_SCOPE_RESPONSE);
     }
 
     const beforeDate = before ? new Date(before as string) : undefined;

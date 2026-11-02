@@ -452,9 +452,10 @@ export interface WSAck extends WSMessage {
 
 /**
  * WebSocket connection message from device to register for push delivery.
+ * The raw token authenticates the device; a device ID alone is not accepted.
  */
 export interface WSConnect extends WSMessage {
   type: "connect";
-  /** Device ID to associate with this WebSocket connection */
-  device_id: string;
+  /** Raw 64-character hex device token, verified against its stored hash */
+  device_token: string;
 }

@@ -413,8 +413,8 @@ fetch, 20-row lists, a 30-second overview poll, and a send form.
 It does not implement the operation recovery, scope isolation, versioned queries,
 cursor paging, or receipt-tracking experience proposed here.
 
-Its backend currently reports publication as delivered and leaves most APIs unguarded.
-Those contract problems need backend changes; changing the badge text alone is insufficient.
+Its backend currently reports publication as delivered; changing the badge text alone is insufficient.
+It does guard its APIs (console session, app-scoped provider JWTs), but has no per-operator roles.
 The existing smoke checks exercise page shells, not these failure scenarios.
 
 ## ⚖️ Trade-offs and close — 3 minutes
