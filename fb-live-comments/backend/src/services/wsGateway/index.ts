@@ -142,10 +142,10 @@ export class WebSocketGateway {
   }
 
   private async handleReaction(ws: ExtendedWebSocket, payload: ReactPayload): Promise<void> {
-    if (!ws.streamId || !ws.userId) {
-      sendError(ws, 'NOT_IN_STREAM', 'You must join a stream first');
-      return;
-    }
+    // Same binding as comments: the reaction must name the stream and user this
+    // socket joined, or a socket joined elsewhere could react into a stream whose
+    // join-time ban check it never passed.
+    if (!validateUserSession(ws, payload.stream_id, payload.user_id)) return;
 
     try {
       await reactionService.addReaction(payload.stream_id, payload.user_id, payload.reaction_type, payload.comment_id);
