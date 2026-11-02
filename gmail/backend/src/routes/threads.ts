@@ -2,6 +2,7 @@ import { Router, Request, Response } from 'express';
 import { requireAuth, AuthenticatedRequest } from '../middleware/auth.js';
 import * as threadService from '../services/threadService.js';
 import logger from '../services/logger.js';
+import { isUuid } from '../services/validation.js';
 
 const router = Router();
 
@@ -52,6 +53,9 @@ router.get('/:threadId', requireAuth as unknown as import('express').RequestHand
     const authReq = req as AuthenticatedRequest;
     const userId = authReq.session.userId!;
     const { threadId } = req.params;
+    if (!isUuid(threadId)) {
+      return res.status(404).json({ error: 'Thread not found' });
+    }
 
     const thread = await threadService.getThread(userId, threadId);
     if (!thread) {
@@ -82,14 +86,20 @@ router.patch('/:threadId/state', requireAuth as unknown as import('express').Req
     const userId = authReq.session.userId!;
     const { threadId } = req.params;
     const { isRead, isStarred, isArchived, isTrashed, isSpam } = req.body;
+    if (!isUuid(threadId)) {
+      return res.status(404).json({ error: 'Thread not found' });
+    }
 
-    await threadService.updateThreadState(userId, threadId, {
+    const updated = await threadService.updateThreadState(userId, threadId, {
       isRead,
       isStarred,
       isArchived,
       isTrashed,
       isSpam,
     });
+    if (!updated) {
+      return res.status(404).json({ error: 'Thread not found' });
+    }
 
     res.json({ message: 'Thread state updated' });
   } catch (error) {

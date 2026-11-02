@@ -60,6 +60,28 @@
       "path": "/label/TRASH",
       "waitFor": "main",
       "delay": 1000
+    },
+    {
+      "name": "08-thread-full-view",
+      "path": "/thread/d6666666-6666-6666-6666-666666666666",
+      "waitFor": "main",
+      "delay": 1500
+    },
+    {
+      "name": "09-thread-partial-view",
+      "path": "/thread/d6666666-6666-6666-6666-666666666666",
+      "waitFor": "main",
+      "delay": 1500,
+      "loginAs": {
+        "username": "charlie",
+        "password": "password123"
+      }
+    },
+    {
+      "name": "10-thread-bcc-recipient",
+      "path": "/thread/d7777777-7777-7777-7777-777777777777",
+      "waitFor": "[data-testid='bcc-line']",
+      "delay": 1500
     }
   ],
   "viewport": {

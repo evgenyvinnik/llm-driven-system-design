@@ -4,6 +4,19 @@ This learning project models conversation threads, independent mailbox state, an
 
 Read [architecture.md](./architecture.md) for the implemented flows, limitations, and a separate production proposal. The [frontend](./system-design-answer-frontend.md), [backend](./system-design-answer-backend.md), and [full-stack](./system-design-answer-fullstack.md) answers present proposed designs for a 45-minute interview. [CLAUDE.md](./CLAUDE.md) contains development history; some older completion claims exceed the current wiring.
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 8,688 |
+| Source Files | 79 |
+| .ts | 4,665 |
+| .tsx | 1,727 |
+| .md | 1,589 |
+| .sql | 369 |
+| .json | 158 |
+
+
 ## What you can explore
 
 - Register and sign in with a username, then browse Inbox, Sent, Starred, Spam, Trash, All Mail, and custom-label views. Thread lists request 25 records per page and use TanStack Virtual.
@@ -16,9 +29,13 @@ Read [architecture.md](./architecture.md) for the implemented flows, limitations
 
 Compose has **no draft save or restore integration**: closing it discards its text. The Drafts navigation item queries thread labels, so it does not display rows from the drafts API. The label-management component is not mounted. Attachment storage/upload, admin tools, live delivery notifications, undo, and mail keyboard shortcuts are absent.
 
-Archive writes a flag that inbox queries do not filter, so archived items can return. List invalidation uses literal Redis keys containing `*`, and read-state changes omit unread-count invalidation. Cached results can therefore remain stale for their 30-second TTL. Detail and list state are not reconciled consistently; a direct thread visit can have a nonfunctional star button.
+- **Privacy.** You see only the messages you sent or received, even inside a shared thread: a reply that leaves you off, or a message you were BCC'd on, stays private in the thread view, the inbox list and search. Replying requires being on the thread.
+- **Sending.** Messages to addresses with no account are refused (400) rather than half-delivered, and duplicate addresses are collapsed.
+- **Rendering.** Message HTML is sanitized on send and again when rendered, and search snippets are escaped.
+- **Mailbox state.** Archive removes a thread from the inbox until new mail arrives. List and unread-count caches are invalidated immediately on every change.
+- **Search.** If Elasticsearch is down, search falls back to SQL and says so.
 
-Send has no idempotency receipt and silently skips unregistered recipient addresses. Use only the demo accounts below when exploring delivery. Reply authorization, per-message visibility within a thread, label ownership checks, and HTML/snippet sanitization are incomplete. These are documented implementation gaps; this demo is not ready to hold real private mail. Search failures appear as empty results, and the polling checkpoint can replay or skip messages; a five-second polling interval is not a freshness guarantee.
+Detail and list state are not reconciled consistently; a direct thread visit can have a nonfunctional star button. Send has no idempotency receipt, so retrying an uncertain send can send twice. Remote images load (no tracking-pixel protection). Use only the demo accounts below when exploring delivery; this is a teaching system, not a place for real mail.
 
 ## Stack and processes
 
@@ -29,7 +46,7 @@ Send has no idempotency receipt and silently skips unregistered recipient addres
 | Database | PostgreSQL 16; ten tables and seven explicit secondary indexes |
 | Sessions/cache/limits | Valkey 7 through ioredis; Redis-backed request counters |
 | Search | Elasticsearch 8.11.0; one `emails` index, one shard, no replica |
-| Indexer | Separate Node process polling PostgreSQL and storing its checkpoint in Redis |
+| Indexer | Node process (started by `npm run dev`) indexing messages whose `indexed_at` marker is unset |
 | Diagnostics | Pino logs and an API Prometheus endpoint; circuit-breaker helper is unused |
 
 Use Node.js 22 and npm; the repository baseline is Node 20 or later, but individual dependency versions can require a newer minor release. Install PostgreSQL client tools for migration verification and seeding. Run commands from the indicated directory, using separate terminals for long-lived processes.
@@ -92,13 +109,9 @@ PGPASSWORD=gmail123 psql -v ON_ERROR_STOP=1 -h localhost -U gmail -d gmail -f db
 npm run dev
 ```
 
-The migration script applies `src/db/init.sql`; its `IF NOT EXISTS` statements create missing objects but do not upgrade existing table definitions. The seed uses fixed IDs for users/messages and random recipient-row IDs: rerunning it can duplicate recipient rows despite `ON CONFLICT DO NOTHING`. It does not reset existing accounts or modified mailbox state.
+The migration script applies `src/db/init.sql`; its `IF NOT EXISTS` statements create missing objects but do not upgrade existing table definitions. The migration also adds the indexing-marker columns and a unique recipient index to an existing database. The seed is safe to rerun (it skips existing rows) but does not reset modified mailbox state.
 
-In a second terminal at `gmail/backend/`:
-
-```bash
-npm run dev:worker
-```
+`npm run dev` starts the API and the search indexer together. If the Elasticsearch index is ever reset, rebuild it with `npm run search:reindex`.
 
 In a third terminal at `gmail/frontend/`:
 
@@ -117,7 +130,7 @@ Open [the local client](http://localhost:5173). Vite proxies `/api` to port 3001
 | bob | password123 | bob@gmail.local |
 | charlie | password123 | charlie@gmail.local |
 
-The fixture has five threads, nine messages, eight system labels per user, Alice's Work/Personal labels, six contacts, and one Alice draft accessible through the API. It has no BCC or attachment example. Registration hashes passwords with cost 12; the supplied fixture uses cost 10. Some seeded snippets/counts are illustrative rather than recomputed from the latest message.
+The fixture has seven threads and twelve messages, eight system labels per user, Alice's Work/Personal labels, six contacts, and one Alice draft accessible through the API. Two threads demonstrate visibility. In *Q4 offsite planning*, Bob replies to Alice only, so Charlie never sees that reply. In *Interview loop feedback*, Charlie BCCs Alice: Bob doesn't see her, and she sees herself under bcc. There is no attachment example. Registration hashes passwords with cost 12; the supplied fixture uses cost 10. Some seeded snippets/counts are illustrative rather than recomputed from the latest message.
 
 ## Configuration and multiple instances
 
@@ -135,19 +148,10 @@ API and worker load `.env` from their working directory through dotenv. The migr
 | `PORT` | Config fallback `3000`; `npm run dev` forces `3001` | API listener and log labels |
 | `NODE_ENV` | `development` | Production enables Secure cookies and info-level logging |
 
-`dev:server2` and `dev:server3` delegate to `dev`, whose inline `PORT=3001` overrides their requested ports. To actually run extra instances, use these commands in separate backend terminals:
-
-```bash
-PORT=3002 NODE_ENV=development npx tsx watch src/index.ts
-PORT=3003 NODE_ENV=development npx tsx watch src/index.ts
-```
-
-There is no load balancer configuration. The browser still targets 3001, and extra indexers share an unfenced checkpoint; keep one indexer for the demo. PostgreSQL, Valkey, and Elasticsearch bind host ports 5432, 6379, and 9200, so avoid conflicting local stacks.
+`dev:server2` and `dev:server3` start extra API instances on 3002 and 3003 (without another indexer). There is no load balancer configuration; the browser still targets 3001. Keep one indexer: indexers do not lease work, so two would index the same messages twice (harmless but wasteful). PostgreSQL, Valkey, and Elasticsearch bind host ports 5432, 6379, and 9200, so avoid conflicting local stacks.
 
 ## Verification commands and limits
 
 Backend scripts include `npm run build`, `npm test`, `npm run test:watch`, `npm run lint`, and `npm run format`. Frontend scripts include `npm run build`, `npm run lint`, `npm run format`, and `npm run preview`. The backend compiler emits under `dist/src`; there is no `start` script, and SQL assets are not copied by TypeScript.
 
-The backend tests mock persistence, sessions, rate limits, and core mail services; they do not establish send, draft, or indexing correctness. From the repository root, `npm run test:smoke gmail` exercises broad login/page-render checks. From `gmail/`, `npm run test:e2e` can start Vite but requires the backend and datastores already running. The seven existing [screenshots](./screenshots/03-inbox.png) are visual references, not evidence that drafts or search work end to end.
-
-This documentation review used source tracing and isolated checks with mocked dependencies. It did not run the full application, build, or performance benchmarks.
+The backend tests mock persistence and sessions. They cover routes, recipient deduplication, HTML sanitization, the visibility rule, and cache invalidation. Visibility, sending, search, and indexing recovery were verified against a running stack (see the architecture's Implementation Notes). From the repository root, `npm run test:smoke gmail` exercises broad login/page-render checks. From `gmail/`, `npm run test:e2e` can start Vite but requires the backend and datastores already running. The [screenshots](./screenshots/03-inbox.png) include the same thread as seen by a full and a partial participant, and the BCC recipient's view. Draft editing in the browser is not wired, and there are no performance benchmarks.

@@ -424,9 +424,10 @@ sophisticated editing and offline behavior can follow after the save/send lifecy
 reliable.
 
 The local demo already has cookie sessions, a virtualized paged list, contact
-debounce, and optimistic list actions. Its draft API is not connected to compose,
-label management is unmounted, account/query generations are absent, raw HTML is
-injected, and list/detail state can disagree. Those are implementation limitations,
+debounce, and optimistic list actions. Message HTML is sanitized twice (on send and
+render), snippets are escaped, reply-all includes CC, and logout clears mailbox state.
+Its draft API is not connected to compose, label management is unmounted, query
+generations are absent, and list/detail state can disagree. Those are implementation limitations,
 not properties of the proposed interview design. [The architecture
 document](./architecture.md) traces the actual source and the production extensions
 separately.

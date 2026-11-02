@@ -116,3 +116,19 @@ CREATE INDEX IF NOT EXISTS idx_thread_user_state_user ON thread_user_state(user_
 CREATE INDEX IF NOT EXISTS idx_drafts_user ON drafts(user_id, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_contacts_user ON contacts(user_id, frequency DESC);
 CREATE INDEX IF NOT EXISTS idx_threads_last_message ON threads(last_message_at DESC);
+
+-- Upgrades for databases created before these columns/indexes existed. Every
+-- statement is safe to re-run (`npm run db:migrate` executes this whole file).
+
+-- Search indexing is acknowledged per message: indexed_at is set when the
+-- message's document is written, so a missing marker always means "still to do".
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS indexed_at TIMESTAMPTZ;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS index_attempts INT NOT NULL DEFAULT 0;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS index_error TEXT;
+CREATE INDEX IF NOT EXISTS idx_messages_unindexed ON messages(created_at, id) WHERE indexed_at IS NULL;
+
+-- One recipient row per person per message. Duplicate addresses used to create
+-- duplicate rows (and re-running the seed duplicated them all).
+DELETE FROM message_recipients a USING message_recipients b
+WHERE a.message_id = b.message_id AND a.user_id = b.user_id AND a.ctid > b.ctid;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_message_recipients_unique ON message_recipients(message_id, user_id);

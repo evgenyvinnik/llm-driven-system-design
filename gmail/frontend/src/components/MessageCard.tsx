@@ -1,6 +1,15 @@
 import { useState } from 'react';
 import type { Message } from '../types';
 import { formatFullDate, getInitials, stringToColor } from '../utils/format';
+import DOMPurify from 'dompurify';
+
+/**
+ * Message HTML is sanitized on the server when sent; this second pass covers
+ * rows written before that (and anything inserted directly, like the seed).
+ * Mail is written by other people, so its HTML is never trusted as-is.
+ */
+const safeHtml = (html: string): string =>
+  DOMPurify.sanitize(html, { FORBID_TAGS: ['style', 'form', 'input'], FORBID_ATTR: ['style'] });
 
 interface MessageCardProps {
   message: Message;
@@ -58,6 +67,11 @@ export function MessageCard({ message, isLast }: MessageCardProps) {
                   , cc: {message.cc.map((r) => r.displayName || r.email).join(', ')}
                 </span>
               )}
+              {message.bcc.length > 0 && (
+                <span data-testid="bcc-line">
+                  , bcc: {message.bcc.map((r) => r.displayName || r.email).join(', ')}
+                </span>
+              )}
             </div>
           )}
         </div>
@@ -69,7 +83,7 @@ export function MessageCard({ message, isLast }: MessageCardProps) {
           {message.bodyHtml ? (
             <div
               className="text-sm text-gmail-text leading-relaxed prose prose-sm max-w-none"
-              dangerouslySetInnerHTML={{ __html: message.bodyHtml }}
+              dangerouslySetInnerHTML={{ __html: safeHtml(message.bodyHtml) }}
             />
           ) : (
             <div className="text-sm text-gmail-text leading-relaxed whitespace-pre-wrap">

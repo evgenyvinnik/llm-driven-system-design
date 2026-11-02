@@ -25,10 +25,25 @@ interface MailState {
   archiveThread: (threadId: string) => Promise<void>;
   setComposeOpen: (open: boolean) => void;
   clearCurrentThread: () => void;
+  /** Drops all mailbox data, e.g. on logout, so the next account never sees it. */
+  reset: () => void;
 }
 
 /** Mail state managing threads, labels, unread counts, compose modal, and thread actions. */
+const initialMailState = {
+  threads: [],
+  totalThreads: 0,
+  currentThread: null,
+  labels: [],
+  unreadCounts: {},
+  currentLabel: 'INBOX',
+  currentPage: 1,
+  isLoading: false,
+  composeOpen: false,
+};
+
 export const useMailStore = create<MailState>((set, get) => ({
+  reset: () => set({ ...initialMailState }),
   threads: [],
   totalThreads: 0,
   currentThread: null,
