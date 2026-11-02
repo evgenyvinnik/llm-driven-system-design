@@ -16,4 +16,22 @@ redis.on('error', (err: Error) => {
   console.error('Redis connection error:', err);
 });
 
+/**
+ * Deletes every key matching a glob pattern (e.g. "artists:*") and returns how many were removed.
+ * DEL never expands patterns — `redis.del('artists:*')` only removes a key literally named
+ * "artists:*" — so the pattern is walked with SCAN, which unlike KEYS does not block the server.
+ */
+export async function deleteByPattern(pattern: string): Promise<number> {
+  let cursor = '0';
+  let deleted = 0;
+  do {
+    const [next, keys] = await redis.scan(cursor, 'MATCH', pattern, 'COUNT', 100);
+    if (keys.length > 0) {
+      deleted += await redis.del(...keys);
+    }
+    cursor = next;
+  } while (cursor !== '0');
+  return deleted;
+}
+
 export default redis;
