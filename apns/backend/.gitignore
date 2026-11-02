@@ -29,3 +29,4 @@ coverage/
 
 # Misc
 *.tgz
+provider-key*.json

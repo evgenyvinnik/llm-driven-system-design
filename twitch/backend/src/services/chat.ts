@@ -1,8 +1,12 @@
 import { v4 as uuidv4 } from 'uuid';
 import type { RedisClientType } from 'redis';
 import type { WebSocket, WebSocketServer, RawData } from 'ws';
+import type { IncomingMessage, Server } from 'http';
+import type { Duplex } from 'stream';
+import type { Request, Response } from 'express';
+import cookieParser from 'cookie-parser';
 import { query } from './database.js';
-import { publishMessage, subscribe, unsubscribe, checkRateLimit, getRedisClient } from './redis.js';
+import { publishMessage, subscribe, unsubscribe, checkRateLimit, getRedisClient, getSession } from './redis.js';
 import { logger, logChatEvent } from '../utils/logger.js';
 import { incChatMessage, incChatRateLimited, incWsConnection, decWsConnection } from '../utils/metrics.js';
 import { checkChatMessageDedup, generateChatMessageId } from '../utils/idempotency.js';
@@ -17,20 +21,26 @@ interface Badge {
 
 interface ClientInfo {
   clientId: string;
-  channels: Set<string>;
+  channels: Set<number>;
   userId: number | null;
-  username: string | null;
+  username: string;
   role?: string;
 }
 
 interface ChatMessage {
   type: string;
-  userId?: number;
-  username?: string;
-  channelId?: string;
+  channelId?: unknown;
   text?: string;
   messageId?: string;
 }
+
+interface SessionUser {
+  userId: number;
+  username: string;
+  role: string;
+}
+
+const CHAT_PATH = '/ws/chat';
 
 interface BroadcastMessage {
   id?: string;
@@ -46,7 +56,7 @@ interface BroadcastMessage {
 }
 
 // Map of channelId -> Set of WebSocket clients
-const channelClients = new Map<string, Set<WebSocket>>();
+const channelClients = new Map<number, Set<WebSocket>>();
 
 // Map of WebSocket -> client info
 const clientInfo = new Map<WebSocket, ClientInfo>();
@@ -54,8 +64,36 @@ const clientInfo = new Map<WebSocket, ClientInfo>();
 // Circuit breaker for Redis publish operations
 let redisChatBreaker: CircuitBreaker<[string, unknown], unknown> | null = null;
 
+/** Channel IDs are integers; accepts a number or a numeric string, anything else is rejected. */
+function parseChannelId(value: unknown): number | null {
+  const id = typeof value === 'string' && /^\d+$/.test(value) ? Number(value) : value;
+  return typeof id === 'number' && Number.isSafeInteger(id) && id > 0 ? id : null;
+}
+
+/**
+ * Resolves the chat identity from the `session` cookie on the upgrade request,
+ * using the same cookie parsing and Redis session lookup as the REST
+ * `requireAuth` middleware. Returns null for anonymous viewers.
+ */
+async function resolveSessionUser(req: IncomingMessage): Promise<SessionUser | null> {
+  const request = req as Request;
+  await new Promise<void>((resolve) => cookieParser()(request, {} as Response, () => resolve()));
+  const sessionId = request.cookies?.session as string | undefined;
+  if (!sessionId) return null;
+
+  const userId = await getSession(sessionId);
+  if (!userId) return null;
+
+  const result = await query<{ username: string; role: string }>(
+    'SELECT username, role FROM users WHERE id = $1',
+    [userId]
+  );
+  const user = result.rows[0];
+  return user ? { userId, username: user.username, role: user.role || 'user' } : null;
+}
+
 // Local broadcast fallback when Redis is unavailable
-function localBroadcast(channelId: string, message: unknown): void {
+function localBroadcast(channelId: number, message: unknown): void {
   const clients = channelClients.get(channelId);
   if (!clients) return;
 
@@ -67,8 +105,13 @@ function localBroadcast(channelId: string, message: unknown): void {
   });
 }
 
-/** Initializes WebSocket chat server with Redis pub/sub for cross-instance message delivery. */
-function setupChatWebSocket(wss: WebSocketServer, _redisClient: RedisClientType): void {
+/**
+ * Initializes WebSocket chat server with Redis pub/sub for cross-instance message delivery.
+ * The upgrade request's session cookie decides who the socket is: anonymous
+ * viewers can join and read chat, only a logged-in session can send messages,
+ * and identity fields in client messages are ignored.
+ */
+function setupChatWebSocket(server: Server, wss: WebSocketServer, _redisClient: RedisClientType): void {
   // Initialize circuit breaker for Redis chat publishing
   redisChatBreaker = createCircuitBreaker(
     'redis-chat-publish',
@@ -86,54 +129,79 @@ function setupChatWebSocket(wss: WebSocketServer, _redisClient: RedisClientType)
   // Set up fallback for when Redis is unavailable
   redisChatBreaker.fallback((channel: string, message: unknown) => {
     logger.warn({ channel }, 'Redis unavailable, using local broadcast only');
-    const channelId = channel.replace('chat:', '');
+    const channelId = Number(channel.replace('chat:', ''));
     localBroadcast(channelId, message);
     return { fallback: true };
   });
 
-  wss.on('connection', (ws: WebSocket) => {
-    const clientId = uuidv4();
-    logger.debug({ client_id: clientId }, 'Chat client connected');
-    incWsConnection();
-
-    clientInfo.set(ws, { clientId, channels: new Set(), userId: null, username: null });
-
-    ws.on('message', async (data: RawData) => {
-      try {
-        const message = JSON.parse(data.toString()) as ChatMessage;
-        await handleChatMessage(ws, message);
-      } catch (error) {
-        logger.error({ error: (error as Error).message, client_id: clientId }, 'Error handling chat message');
-        ws.send(JSON.stringify({ type: 'error', message: 'Invalid message format' }));
-      }
-    });
-
-    ws.on('close', () => {
-      const info = clientInfo.get(ws);
-      if (info) {
-        // Remove from all channel rooms
-        info.channels.forEach(channelId => {
-          const clients = channelClients.get(channelId);
-          if (clients) {
-            clients.delete(ws);
-            if (clients.size === 0) {
-              channelClients.delete(channelId);
-            }
-          }
-        });
-        clientInfo.delete(ws);
-        logger.debug({ client_id: info.clientId }, 'Chat client disconnected');
-        decWsConnection();
-      }
-    });
-
-    ws.on('error', (error: Error) => {
-      logger.error({ error: error.message }, 'WebSocket error');
-    });
+  server.on('upgrade', (req: IncomingMessage, socket: Duplex, head: Buffer) => {
+    if (new URL(req.url ?? '/', 'http://localhost').pathname !== CHAT_PATH) {
+      socket.destroy();
+      return;
+    }
+    resolveSessionUser(req)
+      .then((user) => {
+        wss.handleUpgrade(req, socket, head, (ws) => onConnection(ws, user));
+      })
+      .catch((error: Error) => {
+        logger.error({ error: error.message }, 'Chat upgrade session lookup failed');
+        socket.write('HTTP/1.1 500 Internal Server Error\r\n\r\n');
+        socket.destroy();
+      });
   });
 
   // Subscribe to Redis pub/sub for cross-instance chat
   setupRedisSubscriptions();
+}
+
+function onConnection(ws: WebSocket, user: SessionUser | null): void {
+  const clientId = uuidv4();
+  logger.debug({ client_id: clientId, user_id: user?.userId }, 'Chat client connected');
+  incWsConnection();
+
+  const info: ClientInfo = {
+    clientId,
+    channels: new Set(),
+    userId: user?.userId ?? null,
+    username: user?.username ?? `Guest_${clientId.slice(0, 6)}`,
+    role: user?.role,
+  };
+  clientInfo.set(ws, info);
+
+  ws.on('message', async (data: RawData) => {
+    try {
+      const message = JSON.parse(data.toString()) as ChatMessage;
+      await handleChatMessage(ws, message);
+    } catch (error) {
+      logger.error({ error: (error as Error).message, client_id: clientId }, 'Error handling chat message');
+      ws.send(JSON.stringify({ type: 'error', message: 'Invalid message format' }));
+    }
+  });
+
+  ws.on('close', () => {
+    const info = clientInfo.get(ws);
+    if (info) {
+      // Remove from all channel rooms
+      info.channels.forEach(channelId => {
+        const clients = channelClients.get(channelId);
+        if (clients) {
+          clients.delete(ws);
+          if (clients.size === 0) {
+            channelClients.delete(channelId);
+          }
+        }
+      });
+      clientInfo.delete(ws);
+      logger.debug({ client_id: info.clientId }, 'Chat client disconnected');
+      decWsConnection();
+    }
+  });
+
+  ws.on('error', (error: Error) => {
+    logger.error({ error: error.message }, 'WebSocket error');
+  });
+
+  sendAuthState(ws, info);
 }
 
 async function handleChatMessage(ws: WebSocket, message: ChatMessage): Promise<void> {
@@ -142,7 +210,9 @@ async function handleChatMessage(ws: WebSocket, message: ChatMessage): Promise<v
 
   switch (message.type) {
     case 'auth':
-      await handleAuth(ws, info, message);
+      // Kept for older clients: reports the identity established from the
+      // session cookie at connect time. userId/username in the message are ignored.
+      sendAuthState(ws, info);
       break;
 
     case 'join':
@@ -162,39 +232,15 @@ async function handleChatMessage(ws: WebSocket, message: ChatMessage): Promise<v
   }
 }
 
-async function handleAuth(ws: WebSocket, info: ClientInfo, message: ChatMessage): Promise<void> {
-  const { userId, username } = message;
-
-  if (userId && username) {
-    info.userId = userId as unknown as number;
-    info.username = username;
-
-    // Fetch user badges
-    const badgeResult = await query<{ role: string }>(`
-      SELECT role FROM users WHERE id = $1
-    `, [userId]);
-
-    info.role = badgeResult.rows[0]?.role || 'user';
-
-    ws.send(JSON.stringify({
-      type: 'auth_success',
-      userId,
-      username,
-      role: info.role
-    }));
-
-    logChatEvent('auth', null, { user_id: userId, username });
-  } else {
-    // Guest user
-    info.userId = null;
-    info.username = `Guest_${info.clientId.slice(0, 6)}`;
-    ws.send(JSON.stringify({
-      type: 'auth_success',
-      userId: null,
-      username: info.username,
-      isGuest: true
-    }));
-  }
+function sendAuthState(ws: WebSocket, info: ClientInfo): void {
+  ws.send(JSON.stringify({
+    type: 'auth_success',
+    userId: info.userId,
+    username: info.username,
+    role: info.role,
+    ...(info.userId ? {} : { isGuest: true })
+  }));
+  if (info.userId) logChatEvent('auth', null, { user_id: info.userId, username: info.username });
 }
 
 interface RecentMessage {
@@ -223,7 +269,7 @@ interface RecentMessage {
  * @param channelId - Channel to count viewers for
  * @returns Viewer count from the channel record, falling back to local sockets
  */
-async function getChannelViewerCount(channelId: string): Promise<number> {
+async function getChannelViewerCount(channelId: number): Promise<number> {
   const result = await query<{ current_viewers: number }>(
     'SELECT current_viewers FROM channels WHERE id = $1',
     [channelId]
@@ -233,7 +279,7 @@ async function getChannelViewerCount(channelId: string): Promise<number> {
 }
 
 async function handleJoin(ws: WebSocket, info: ClientInfo, message: ChatMessage): Promise<void> {
-  const { channelId } = message;
+  const channelId = parseChannelId(message.channelId);
   if (!channelId) return;
 
   // Add to channel room
@@ -278,7 +324,7 @@ async function handleJoin(ws: WebSocket, info: ClientInfo, message: ChatMessage)
 }
 
 async function handleLeave(ws: WebSocket, info: ClientInfo, message: ChatMessage): Promise<void> {
-  const { channelId } = message;
+  const channelId = parseChannelId(message.channelId);
   if (!channelId) return;
 
   const clients = channelClients.get(channelId);
@@ -304,16 +350,24 @@ async function handleLeave(ws: WebSocket, info: ClientInfo, message: ChatMessage
 }
 
 async function handleChat(ws: WebSocket, info: ClientInfo, message: ChatMessage): Promise<void> {
-  const { channelId, text, messageId: clientMessageId } = message;
+  const channelId = parseChannelId(message.channelId);
+  const { text, messageId: clientMessageId } = message;
 
-  if (!channelId || !text || text.trim().length === 0) {
+  if (!channelId || typeof text !== 'string' || text.trim().length === 0) {
     ws.send(JSON.stringify({ type: 'error', message: 'Invalid message' }));
     return;
   }
 
-  // Check if user is authenticated (guests can still chat)
-  if (!info.username) {
-    ws.send(JSON.stringify({ type: 'error', message: 'Not authenticated' }));
+  // Only a logged-in session may chat. Anonymous guests read only: otherwise a
+  // banned user could keep chatting just by dropping their identity.
+  if (!info.userId) {
+    ws.send(JSON.stringify({ type: 'error', message: 'Log in to chat' }));
+    return;
+  }
+
+  // The message must target a channel this socket has joined
+  if (!info.channels.has(channelId)) {
+    ws.send(JSON.stringify({ type: 'error', message: 'Join the channel before chatting' }));
     return;
   }
 
@@ -344,7 +398,7 @@ async function handleChat(ws: WebSocket, info: ClientInfo, message: ChatMessage)
     return;
   }
 
-  // Check if user is banned
+  // Check if user is banned (timeouts are bans with an expiry)
   if (info.userId) {
     const banCheck = await query(`
       SELECT 1 FROM channel_bans
@@ -419,7 +473,7 @@ async function handleChat(ws: WebSocket, info: ClientInfo, message: ChatMessage)
   incChatMessage(channelId);
 }
 
-function broadcastToChannel(channelId: string, message: BroadcastMessage): void {
+function broadcastToChannel(channelId: number, message: BroadcastMessage): void {
   const clients = channelClients.get(channelId);
   if (!clients) return;
 

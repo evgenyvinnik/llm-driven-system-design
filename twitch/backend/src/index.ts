@@ -82,7 +82,9 @@ app.use('/api/moderation', moderationRoutes);
 // WebSocket Server
 // ===================
 
-const wss = new WebSocketServer({ server, path: '/ws/chat' });
+// noServer: chat.ts handles the /ws/chat upgrade itself so it can resolve the
+// session cookie before accepting the socket.
+const wss = new WebSocketServer({ noServer: true });
 
 // ===================
 // Server Initialization
@@ -110,7 +112,7 @@ async function start(): Promise<void> {
     app.get('/health/ready', healthChecks.readiness);
 
     // Setup WebSocket chat handler
-    setupChatWebSocket(wss, redis);
+    setupChatWebSocket(server, wss, redis);
 
     // Setup stream simulator for demo
     setupStreamSimulator();

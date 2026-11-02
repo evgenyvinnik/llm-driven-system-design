@@ -19,9 +19,64 @@ declare global {
 }
 
 /**
+ * Resolves a session token to its user.
+ * First checks the Redis cache, falls back to the sessions table for cache misses
+ * (re-caching the result). Shared by the REST middleware and the WebSocket upgrade,
+ * so both transports accept exactly the same sessions.
+ *
+ * @param token - Session token from the cookie, Authorization header or WS query
+ * @returns The session's user, or null if the token is unknown or expired
+ */
+export async function resolveSessionUser(token: string): Promise<UserPublic | null> {
+  // Check Redis for session
+  const sessionData = await redis.get(`session:${token}`);
+
+  if (sessionData) {
+    recordCacheAccess('session', true);
+    return JSON.parse(sessionData) as UserPublic;
+  }
+
+  recordCacheAccess('session', false);
+
+  // Check database as fallback
+  const sessionResult = await pool.query(
+    `SELECT s.*, u.id as user_id, u.email, u.name, u.avatar_color, u.role
+     FROM sessions s
+     JOIN users u ON s.user_id = u.id
+     WHERE s.token = $1 AND s.expires_at > NOW()`,
+    [token]
+  );
+
+  if (sessionResult.rows.length === 0) {
+    return null;
+  }
+
+  const session = sessionResult.rows[0];
+
+  // Cache in Redis
+  const userPublic: UserPublic = {
+    id: session.user_id,
+    email: session.email,
+    name: session.name,
+    avatar_color: session.avatar_color,
+    role: session.role,
+  };
+
+  await redis.setex(
+    `session:${token}`,
+    3600, // 1 hour TTL
+    JSON.stringify(userPublic)
+  );
+
+  logger.debug({ userId: userPublic.id }, 'Session validated from database');
+
+  return userPublic;
+}
+
+/**
  * Authentication middleware that validates session tokens.
  * Checks tokens from cookies (session_token) or Authorization header (Bearer token).
- * First checks Redis cache, falls back to database for cache misses.
+ * Resolves the token with resolveSessionUser (Redis, then database).
  * On successful validation, attaches user info to request object.
  *
  * @param req - Express request object
@@ -46,54 +101,15 @@ export async function authenticate(
       return;
     }
 
-    // Check Redis for session
-    const sessionData = await redis.get(`session:${token}`);
+    const user = await resolveSessionUser(token);
 
-    if (!sessionData) {
-      recordCacheAccess('session', false);
-
-      // Check database as fallback
-      const sessionResult = await pool.query(
-        `SELECT s.*, u.id as user_id, u.email, u.name, u.avatar_color, u.role
-         FROM sessions s
-         JOIN users u ON s.user_id = u.id
-         WHERE s.token = $1 AND s.expires_at > NOW()`,
-        [token]
-      );
-
-      if (sessionResult.rows.length === 0) {
-        logger.debug({ path: req.path }, 'Auth failed: invalid or expired session');
-        res.status(401).json({ success: false, error: 'Invalid or expired session' });
-        return;
-      }
-
-      const session = sessionResult.rows[0];
-
-      // Cache in Redis
-      const userPublic: UserPublic = {
-        id: session.user_id,
-        email: session.email,
-        name: session.name,
-        avatar_color: session.avatar_color,
-        role: session.role,
-      };
-
-      await redis.setex(
-        `session:${token}`,
-        3600, // 1 hour TTL
-        JSON.stringify(userPublic)
-      );
-
-      logger.debug({ userId: userPublic.id, path: req.path }, 'Session validated from database');
-
-      req.user = userPublic;
-      req.sessionToken = token;
-      next();
+    if (!user) {
+      logger.debug({ path: req.path }, 'Auth failed: invalid or expired session');
+      res.status(401).json({ success: false, error: 'Invalid or expired session' });
       return;
     }
 
-    recordCacheAccess('session', true);
-    req.user = JSON.parse(sessionData) as UserPublic;
+    req.user = user;
     req.sessionToken = token;
     next();
   } catch (error) {

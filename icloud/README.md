@@ -20,7 +20,7 @@ preservation are proposed extensions, not completed features.
 | Sync API | Vector comparison, changes query, conflicts, device state, delta manifest | No reliable replay log, transactional conflict admission, or restorable history |
 | Photos | Upload, 200-pixel square thumbnails, previews up to 1024 pixels, favorites, delete | 50 MiB uploads; EXIF capture data is not parsed |
 | Photo UI | Four-column row virtualization, lazy thumbnails, preview viewer, album creation | No album browser, offline originals, or storage eviction manager |
-| Notifications | WebSocket events within one API process | Session restoration and cross-instance delivery are incomplete |
+| Notifications | WebSocket events within one API process, authenticated by the session cookie | No cross-instance delivery; reconnects do not replay missed changes |
 | Administration | Statistics, user search, operation/conflict lists, manual cleanup/purge | Counts are diagnostic; maintenance is not concurrency-safe |
 
 Double-click a Drive folder to open it or a file to download it; right-click for rename
@@ -211,7 +211,7 @@ Current limitations worth investigating:
 - Conflict copies have metadata but no copied chunk manifest; history does not preserve
   immutable file bytes. The changes endpoint scans mutable timestamps, not a replay log.
 - Browser state disappears on reload. Request races and reconnect gaps can leave stale
-  lists; WebSocket delivery is process-local and restored sessions do not reconnect it.
+  lists; WebSocket delivery is process-local.
 - Private photo routes currently send public cache directives. Album membership checks,
   cached authorization, and optional idempotency-key scoping need further hardening.
 - Cleanup and purge are experimental maintenance paths. They do not implement safe

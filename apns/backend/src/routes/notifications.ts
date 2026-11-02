@@ -1,5 +1,6 @@
 import { Router, Request, Response } from "express";
-import { pushService } from "../services/pushService.js";
+import { pushService, DEVICE_NOT_IN_SCOPE } from "../services/pushService.js";
+import { requireProvider, allowedBundleIds } from "../shared/auth.js";
 import {
   validateDeviceToken,
   validatePayload,
@@ -14,6 +15,9 @@ import { SendNotificationRequest, NotificationPriority } from "../types/index.js
  * Handles sending push notifications to devices and topics.
  * Provides status checking and notification listing endpoints.
  *
+ * Every route requires a provider JWT or an admin session. A provider only
+ * reaches devices, topic subscribers, and history of its key's app bundles.
+ *
  * Routes:
  * - POST /device/:deviceToken - Send to device by token
  * - POST /device-id/:deviceId - Send to device by ID
@@ -23,6 +27,14 @@ import { SendNotificationRequest, NotificationPriority } from "../types/index.js
  * - GET /:notificationId/status - Get notification status
  */
 const router = Router();
+
+router.use(requireProvider());
+
+/** 403 body for a send to a device of an app the provider key does not cover. */
+const NOT_IN_SCOPE_RESPONSE = {
+  error: "Forbidden",
+  message: "Device belongs to an app this provider key does not cover",
+};
 
 /**
  * Send a notification to a device by its raw token.
@@ -60,6 +72,7 @@ router.post("/device/:deviceToken", async (req: Request, res: Response) => {
       priority: notificationPriority,
       expiration,
       collapseId: collapse_id,
+      allowedBundleIds: allowedBundleIds(req.principal),
     });
 
     return res.status(200).json(result);
@@ -71,6 +84,10 @@ router.post("/device/:deviceToken", async (req: Request, res: Response) => {
         error: "Unregistered",
         message: "Device token is not registered or has been invalidated",
       });
+    }
+
+    if (errorMessage === DEVICE_NOT_IN_SCOPE) {
+      return res.status(403).json(NOT_IN_SCOPE_RESPONSE);
     }
 
     console.error("Error sending notification:", error);
@@ -110,6 +127,7 @@ router.post("/device-id/:deviceId", async (req: Request, res: Response) => {
       priority: notificationPriority,
       expiration,
       collapseId: collapse_id,
+      allowedBundleIds: allowedBundleIds(req.principal),
     });
 
     return res.status(200).json(result);
@@ -121,6 +139,10 @@ router.post("/device-id/:deviceId", async (req: Request, res: Response) => {
         error: "NotFound",
         message: "Device not found or invalid",
       });
+    }
+
+    if (errorMessage === DEVICE_NOT_IN_SCOPE) {
+      return res.status(403).json(NOT_IN_SCOPE_RESPONSE);
     }
 
     console.error("Error sending notification:", error);
@@ -167,6 +189,7 @@ router.post("/topic/:topic", async (req: Request, res: Response) => {
       priority: notificationPriority,
       expiration,
       collapseId: collapse_id,
+      allowedBundleIds: allowedBundleIds(req.principal),
     });
 
     return res.status(200).json(result);
@@ -191,7 +214,10 @@ router.get("/:notificationId", async (req: Request, res: Response) => {
   try {
     const { notificationId } = req.params;
 
-    const notification = await pushService.getNotification(notificationId);
+    const notification = await pushService.getNotification(
+      notificationId,
+      allowedBundleIds(req.principal)
+    );
 
     if (!notification) {
       return res.status(404).json({
@@ -230,6 +256,7 @@ router.get("/", async (req: Request, res: Response) => {
       status: status as "pending" | "queued" | "delivered" | "failed" | "expired" | undefined,
       limit: limit ? parseInt(limit as string, 10) : 100,
       offset: offset ? parseInt(offset as string, 10) : 0,
+      bundleIds: allowedBundleIds(req.principal),
     });
 
     return res.json(result);
@@ -254,7 +281,10 @@ router.get("/:notificationId/status", async (req: Request, res: Response) => {
   try {
     const { notificationId } = req.params;
 
-    const notification = await pushService.getNotification(notificationId);
+    const notification = await pushService.getNotification(
+      notificationId,
+      allowedBundleIds(req.principal)
+    );
 
     if (!notification) {
       return res.status(404).json({

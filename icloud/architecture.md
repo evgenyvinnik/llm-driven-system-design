@@ -649,10 +649,12 @@ frame-rate claim. Grid focus semantics, modal focus trapping, responsive row siz
 request cancellation, stable viewer identity, and account-scoped reset are unfinished.
 Pagination is offset-based; filter changes and push-triggered reloads can race requests.
 
-[WebSocket auth](./backend/src/services/websocket.ts) requires a Redis-cached session;
-login itself only writes SQL, so an initial socket can fail before a protected HTTP
-request warms that cache. Cookie session restoration never reconnects the browser socket.
-Subscriptions accumulate without cleanup, and reconnection does not pull missed changes.
+[WebSocket auth](./backend/src/services/websocket.ts) resolves the upgrade request's
+`session_token` cookie (or Bearer header, or legacy `?token=`) with the same
+Redis-then-SQL lookup as the REST middleware and refuses anything else with 401, so a
+socket opened straight after login works and cookie session restoration reconnects it.
+`subscribe` accepts only file ids the user owns. An open socket is not closed when its
+session is logged out or expires, and reconnection does not pull missed changes.
 
 [Administrative purge](./backend/src/routes/admin.ts) and chunk cleanup use independent
 queries and object deletes. New references can race deletion; retries can distort counts;

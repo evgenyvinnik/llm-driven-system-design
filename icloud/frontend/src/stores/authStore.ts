@@ -50,8 +50,8 @@ export const useAuthStore = create<AuthStore>((set, _get) => ({
         token: result.token,
         isLoading: false,
       });
-      // Connect WebSocket
-      wsService.connect(result.token);
+      // Connect WebSocket (authenticated by the session cookie just set)
+      wsService.connect();
     } catch (error) {
       set({
         isLoading: false,
@@ -71,8 +71,8 @@ export const useAuthStore = create<AuthStore>((set, _get) => ({
         token: result.token,
         isLoading: false,
       });
-      // Connect WebSocket
-      wsService.connect(result.token);
+      // Connect WebSocket (authenticated by the session cookie just set)
+      wsService.connect();
     } catch (error) {
       set({
         isLoading: false,
@@ -102,9 +102,10 @@ export const useAuthStore = create<AuthStore>((set, _get) => ({
         deviceId: result.deviceId,
         isLoading: false,
       });
-      // Get token from cookie and connect WebSocket
-      // Note: Token is in httpOnly cookie, so we use a different approach
-      // WebSocket will use the same session
+      // The token is in an httpOnly cookie we can't read, but the browser
+      // sends it on the WebSocket upgrade, which is how the server
+      // authenticates the socket
+      wsService.connect();
     } catch (error) {
       set({ user: null, deviceId: null, token: null, isLoading: false });
     }

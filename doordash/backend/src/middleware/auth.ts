@@ -10,29 +10,22 @@ declare global {
   }
 }
 
+// Resolve the `session` cookie value to a user. Shared by the REST middleware
+// and the WebSocket upgrade so both trust exactly the same session.
+export async function resolveSessionUser(sessionId: string | undefined): Promise<User | null> {
+  if (!sessionId) return null;
+  const session = await getSession(sessionId);
+  if (!session) return null;
+  return getUserById(session.userId);
+}
+
 export async function authMiddleware(
   req: Request,
   res: Response,
   next: NextFunction
 ): Promise<void> {
-  const sessionId = req.cookies?.session;
-
-  if (!sessionId) {
-    req.user = null;
-    next();
-    return;
-  }
-
   try {
-    const session = await getSession(sessionId);
-    if (!session) {
-      req.user = null;
-      next();
-      return;
-    }
-
-    const user = await getUserById(session.userId);
-    req.user = user;
+    req.user = await resolveSessionUser(req.cookies?.session);
     next();
   } catch (err) {
     console.error('Auth middleware error:', err);
