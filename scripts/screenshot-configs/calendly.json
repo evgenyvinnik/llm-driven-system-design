@@ -57,7 +57,7 @@
     },
     {
       "name": "07-booking-detail",
-      "path": "/bookings/bk511111-1111-1111-1111-111111111111",
+      "path": "/bookings/bc511111-1111-1111-1111-111111111111",
       "waitFor": "main",
       "delay": 500
     },

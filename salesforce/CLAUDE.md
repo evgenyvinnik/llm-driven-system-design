@@ -84,6 +84,7 @@ Simulated or omitted: `custom_fields` and `custom_field_values` exist in the sch
 - **Lead conversion guard is a read-then-write:** the `converted_at IS NULL` check inside the transaction has no `FOR UPDATE`, so simultaneous conversions of one lead can both pass. Narrow in practice — leads are single-owner — but it is a genuine race, not a guarantee.
 - **2026-08-04 — screenshot coverage missed the two most distinctive screens.** The app itself was healthy (dashboard KPIs, pipeline bars, and all list views rendered real seeded data), but the config only captured dashboard/leads/accounts/contacts — not the **kanban opportunities board**, which is the headline UI and the subject of decision 4, nor the reports page that decision 5's CSS charts exist for. Both added; 5 → 7 screenshots.
 - **CI:** the repo-wide smoke-test workflow was removed; a runner can't provide Postgres and Valkey for these paths. Verification is local (`npm run triage salesforce`).
+- **2026-11-01 — the account detail page was unreachable:** under TanStack flat routing `accounts.tsx` was the parent of `accounts.$accountId.tsx` but never rendered `<Outlet/>`, so navigating there changed the URL while the parent page kept rendering. Renamed the parent to `accounts.index.tsx` so they are siblings, and regenerated `routeTree.gen.ts`. Any `X.tsx` + `X.<more>.tsx` pair needs an `<Outlet/>` in `X` or an `X.index.tsx`.
 
 ## Open Questions
 

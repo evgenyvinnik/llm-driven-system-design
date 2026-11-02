@@ -92,7 +92,7 @@ test.describe('calendly Smoke Tests', () => {
 
   test('07 booking detail loads correctly', async ({ page }) => {
     await login(page);
-    await page.goto('/bookings/bk511111-1111-1111-1111-111111111111');
+    await page.goto('/bookings/bc511111-1111-1111-1111-111111111111');
     await page.waitForTimeout(500);
 
     // Verify page content loads

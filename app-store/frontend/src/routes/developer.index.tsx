@@ -10,7 +10,7 @@ import type { App } from '../types';
 import api from '../services/api';
 
 /** Developer dashboard route definition */
-export const Route = createFileRoute('/developer')({
+export const Route = createFileRoute('/developer/')({
   component: DeveloperDashboard,
 });
 

@@ -6,12 +6,12 @@ import { FileTree } from '../components/FileTree';
 import { Star, GitFork, Eye, Code, GitPullRequest, CircleDot, MessageSquare, Settings, Book } from 'lucide-react';
 import type { Repository, TreeItem, Commit } from '../types';
 
-export const Route = createFileRoute('/$owner/$repo')({
+export const Route = createFileRoute('/$owner/$repo/')({
   component: RepoPage,
 });
 
 function RepoPage() {
-  const { owner, repo } = useParams({ from: '/$owner/$repo' });
+  const { owner, repo } = useParams({ from: '/$owner/$repo/' });
   const { user } = useAuthStore();
   const [repoData, setRepoData] = useState<Repository | null>(null);
   const [tree, setTree] = useState<TreeItem[]>([]);

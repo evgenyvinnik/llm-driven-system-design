@@ -1,6 +1,6 @@
 import { Router, Request, Response } from 'express';
 import { pool } from '../db/index.js';
-import { redis } from '../services/redis.js';
+import { redis, deleteByPattern } from '../services/redis.js';
 import { authenticate, requireAdmin } from '../middleware/auth.js';
 
 const router = Router();
@@ -227,8 +227,8 @@ router.post('/artists', async (req: Request<object, unknown, CreateArtistBody>, 
       [name, bio || '', imageUrl || '', genres || [], verified || false]
     );
 
-    // Invalidate cache
-    await redis.del('artists:*');
+    // Invalidate every cached page of the artist list (artists:{limit}:{offset}:{sort}:{order})
+    await deleteByPattern('artists:*');
 
     res.status(201).json(result.rows[0]);
   } catch (error) {
@@ -288,6 +288,8 @@ router.patch('/artists/:id', async (req: Request<{ id: string }, unknown, Update
       return;
     }
 
+    await deleteByPattern('artists:*');
+
     res.json(result.rows[0]);
   } catch (error) {
     console.error('Update artist error:', error);
@@ -312,6 +314,8 @@ router.post('/albums', async (req: Request<object, unknown, CreateAlbumBody>, re
        RETURNING *`,
       [title, artistId, releaseDate, albumType || 'album', genres || [], artworkUrl || '', explicit || false]
     );
+
+    await deleteByPattern('albums:*');
 
     res.status(201).json(result.rows[0]);
   } catch (error) {
@@ -349,6 +353,8 @@ router.post('/tracks', async (req: Request<object, unknown, CreateTrackBody>, re
         );
       }
     }
+
+    await deleteByPattern('tracks:*');
 
     res.status(201).json(track);
   } catch (error) {
@@ -404,11 +410,8 @@ router.post('/cache/clear', async (req: Request<object, unknown, { pattern?: str
     const { pattern } = req.body;
 
     if (pattern) {
-      const keys = await redis.keys(pattern);
-      if (keys.length > 0) {
-        await redis.del(...keys);
-      }
-      res.json({ message: `Cleared ${keys.length} keys matching ${pattern}` });
+      const cleared = await deleteByPattern(pattern);
+      res.json({ message: `Cleared ${cleared} keys matching ${pattern}` });
     } else {
       await redis.flushdb();
       res.json({ message: 'Cache cleared' });

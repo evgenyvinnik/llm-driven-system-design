@@ -6,7 +6,7 @@ import { StarRating } from '../components/StarRating';
 import api from '../services/api';
 import type { Business, Review } from '../types';
 
-export const Route = createFileRoute('/dashboard')({
+export const Route = createFileRoute('/dashboard/')({
   component: DashboardPage,
 });
 
