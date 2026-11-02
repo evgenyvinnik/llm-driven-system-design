@@ -137,7 +137,7 @@ The driver dashboard receives assignment events, but subsequent restaurant statu
 
 The pre-existing sample order is a **display fixture**, not a valid completed checkout: it is `PREPARING` at Burger Barn with an assigned driver still flagged available, an address shaped as street/city/state/zip rather than address/lat/lon, and totals inconsistent with its three line items. It has no ETA. Do not use it as proof that delivery calculations or financial totals work.
 
-Registration alone does not create a driver profile. `POST /api/auth/become-driver` creates a profile for the current user but does not change their role; the dashboard requires role `driver`. The seeded driver avoids this onboarding gap.
+Sign-up always creates a customer; the server ignores any `role` in the request body. Choosing **Deliver Food** on the form then calls `POST /api/auth/become-driver` with the vehicle type and optional plate, which creates the driver profile and sets role `driver`. **Sell Food** calls `POST /api/auth/become-restaurant-owner`. Only customer accounts can take either step, so no API path creates or reaches `admin`. A new restaurant owner starts with no restaurants, and the dashboard has no create form, so use `POST /api/restaurants` or the seeded owner.
 
 ## Verification and useful commands
 
