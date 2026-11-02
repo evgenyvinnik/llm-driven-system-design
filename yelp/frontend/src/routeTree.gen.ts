@@ -9,40 +9,20 @@
 // Additionally, you should also exclude this file from your linter and/or formatter to prevent it from being checked or modified.
 
 import { Route as rootRouteImport } from './routes/__root'
-import { Route as SearchRouteImport } from './routes/search'
-import { Route as RegisterRouteImport } from './routes/register'
-import { Route as ProfileRouteImport } from './routes/profile'
-import { Route as LoginRouteImport } from './routes/login'
-import { Route as DashboardRouteImport } from './routes/dashboard'
-import { Route as AdminRouteImport } from './routes/admin'
 import { Route as IndexRouteImport } from './routes/index'
+import { Route as AdminRouteImport } from './routes/admin'
+import { Route as LoginRouteImport } from './routes/login'
+import { Route as ProfileRouteImport } from './routes/profile'
+import { Route as RegisterRouteImport } from './routes/register'
+import { Route as SearchRouteImport } from './routes/search'
 import { Route as BusinessSlugRouteImport } from './routes/business.$slug'
-import { Route as DashboardBusinessNewRouteImport } from './routes/dashboard.business.new'
+import { Route as DashboardIndexRouteImport } from './routes/dashboard.index'
 import { Route as DashboardBusinessIdRouteImport } from './routes/dashboard.business.$id'
+import { Route as DashboardBusinessNewRouteImport } from './routes/dashboard.business.new'
 
-const SearchRoute = SearchRouteImport.update({
-  id: '/search',
-  path: '/search',
-  getParentRoute: () => rootRouteImport,
-} as any)
-const RegisterRoute = RegisterRouteImport.update({
-  id: '/register',
-  path: '/register',
-  getParentRoute: () => rootRouteImport,
-} as any)
-const ProfileRoute = ProfileRouteImport.update({
-  id: '/profile',
-  path: '/profile',
-  getParentRoute: () => rootRouteImport,
-} as any)
-const LoginRoute = LoginRouteImport.update({
-  id: '/login',
-  path: '/login',
-  getParentRoute: () => rootRouteImport,
-} as any)
-const DashboardRoute = DashboardRouteImport.update({
-  id: '/dashboard',
-  path: '/dashboard',
+const IndexRoute = IndexRouteImport.update({
+  id: '/',
+  path: '/',
   getParentRoute: () => rootRouteImport,
 } as any)
 const AdminRoute = AdminRouteImport.update({
@@ -50,9 +30,24 @@ const AdminRoute = AdminRouteImport.update({
   path: '/admin',
   getParentRoute: () => rootRouteImport,
 } as any)
-const IndexRoute = IndexRouteImport.update({
-  id: '/',
-  path: '/',
+const LoginRoute = LoginRouteImport.update({
+  id: '/login',
+  path: '/login',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ProfileRoute = ProfileRouteImport.update({
+  id: '/profile',
+  path: '/profile',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const RegisterRoute = RegisterRouteImport.update({
+  id: '/register',
+  path: '/register',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const SearchRoute = SearchRouteImport.update({
+  id: '/search',
+  path: '/search',
   getParentRoute: () => rootRouteImport,
 } as any)
 const BusinessSlugRoute = BusinessSlugRouteImport.update({
@@ -60,38 +55,43 @@ const BusinessSlugRoute = BusinessSlugRouteImport.update({
   path: '/business/$slug',
   getParentRoute: () => rootRouteImport,
 } as any)
-const DashboardBusinessNewRoute = DashboardBusinessNewRouteImport.update({
-  id: '/business/new',
-  path: '/business/new',
-  getParentRoute: () => DashboardRoute,
+const DashboardIndexRoute = DashboardIndexRouteImport.update({
+  id: '/dashboard/',
+  path: '/dashboard/',
+  getParentRoute: () => rootRouteImport,
 } as any)
 const DashboardBusinessIdRoute = DashboardBusinessIdRouteImport.update({
-  id: '/business/$id',
-  path: '/business/$id',
-  getParentRoute: () => DashboardRoute,
+  id: '/dashboard/business/$id',
+  path: '/dashboard/business/$id',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const DashboardBusinessNewRoute = DashboardBusinessNewRouteImport.update({
+  id: '/dashboard/business/new',
+  path: '/dashboard/business/new',
+  getParentRoute: () => rootRouteImport,
 } as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/admin': typeof AdminRoute
-  '/dashboard': typeof DashboardRouteWithChildren
   '/login': typeof LoginRoute
   '/profile': typeof ProfileRoute
   '/register': typeof RegisterRoute
   '/search': typeof SearchRoute
   '/business/$slug': typeof BusinessSlugRoute
+  '/dashboard/': typeof DashboardIndexRoute
   '/dashboard/business/$id': typeof DashboardBusinessIdRoute
   '/dashboard/business/new': typeof DashboardBusinessNewRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/admin': typeof AdminRoute
-  '/dashboard': typeof DashboardRouteWithChildren
   '/login': typeof LoginRoute
   '/profile': typeof ProfileRoute
   '/register': typeof RegisterRoute
   '/search': typeof SearchRoute
   '/business/$slug': typeof BusinessSlugRoute
+  '/dashboard': typeof DashboardIndexRoute
   '/dashboard/business/$id': typeof DashboardBusinessIdRoute
   '/dashboard/business/new': typeof DashboardBusinessNewRoute
 }
@@ -99,12 +99,12 @@ export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/admin': typeof AdminRoute
-  '/dashboard': typeof DashboardRouteWithChildren
   '/login': typeof LoginRoute
   '/profile': typeof ProfileRoute
   '/register': typeof RegisterRoute
   '/search': typeof SearchRoute
   '/business/$slug': typeof BusinessSlugRoute
+  '/dashboard/': typeof DashboardIndexRoute
   '/dashboard/business/$id': typeof DashboardBusinessIdRoute
   '/dashboard/business/new': typeof DashboardBusinessNewRoute
 }
@@ -113,36 +113,36 @@ export interface FileRouteTypes {
   fullPaths:
     | '/'
     | '/admin'
-    | '/dashboard'
     | '/login'
     | '/profile'
     | '/register'
     | '/search'
     | '/business/$slug'
+    | '/dashboard/'
     | '/dashboard/business/$id'
     | '/dashboard/business/new'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
     | '/admin'
-    | '/dashboard'
     | '/login'
     | '/profile'
     | '/register'
     | '/search'
     | '/business/$slug'
+    | '/dashboard'
     | '/dashboard/business/$id'
     | '/dashboard/business/new'
   id:
     | '__root__'
     | '/'
     | '/admin'
-    | '/dashboard'
     | '/login'
     | '/profile'
     | '/register'
     | '/search'
     | '/business/$slug'
+    | '/dashboard/'
     | '/dashboard/business/$id'
     | '/dashboard/business/new'
   fileRoutesById: FileRoutesById
@@ -150,49 +150,23 @@ export interface FileRouteTypes {
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   AdminRoute: typeof AdminRoute
-  DashboardRoute: typeof DashboardRouteWithChildren
   LoginRoute: typeof LoginRoute
   ProfileRoute: typeof ProfileRoute
   RegisterRoute: typeof RegisterRoute
   SearchRoute: typeof SearchRoute
   BusinessSlugRoute: typeof BusinessSlugRoute
+  DashboardIndexRoute: typeof DashboardIndexRoute
+  DashboardBusinessIdRoute: typeof DashboardBusinessIdRoute
+  DashboardBusinessNewRoute: typeof DashboardBusinessNewRoute
 }
 
 declare module '@tanstack/react-router' {
   interface FileRoutesByPath {
-    '/search': {
-      id: '/search'
-      path: '/search'
-      fullPath: '/search'
-      preLoaderRoute: typeof SearchRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/register': {
-      id: '/register'
-      path: '/register'
-      fullPath: '/register'
-      preLoaderRoute: typeof RegisterRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/profile': {
-      id: '/profile'
-      path: '/profile'
-      fullPath: '/profile'
-      preLoaderRoute: typeof ProfileRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/login': {
-      id: '/login'
-      path: '/login'
-      fullPath: '/login'
-      preLoaderRoute: typeof LoginRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/dashboard': {
-      id: '/dashboard'
-      path: '/dashboard'
-      fullPath: '/dashboard'
-      preLoaderRoute: typeof DashboardRouteImport
+    '/': {
+      id: '/'
+      path: '/'
+      fullPath: '/'
+      preLoaderRoute: typeof IndexRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/admin': {
@@ -202,11 +176,32 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AdminRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/': {
-      id: '/'
-      path: '/'
-      fullPath: '/'
-      preLoaderRoute: typeof IndexRouteImport
+    '/login': {
+      id: '/login'
+      path: '/login'
+      fullPath: '/login'
+      preLoaderRoute: typeof LoginRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/profile': {
+      id: '/profile'
+      path: '/profile'
+      fullPath: '/profile'
+      preLoaderRoute: typeof ProfileRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/register': {
+      id: '/register'
+      path: '/register'
+      fullPath: '/register'
+      preLoaderRoute: typeof RegisterRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/search': {
+      id: '/search'
+      path: '/search'
+      fullPath: '/search'
+      preLoaderRoute: typeof SearchRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/business/$slug': {
@@ -216,46 +211,41 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof BusinessSlugRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/dashboard/business/new': {
-      id: '/dashboard/business/new'
-      path: '/business/new'
-      fullPath: '/dashboard/business/new'
-      preLoaderRoute: typeof DashboardBusinessNewRouteImport
-      parentRoute: typeof DashboardRoute
+    '/dashboard/': {
+      id: '/dashboard/'
+      path: '/dashboard'
+      fullPath: '/dashboard/'
+      preLoaderRoute: typeof DashboardIndexRouteImport
+      parentRoute: typeof rootRouteImport
     }
     '/dashboard/business/$id': {
       id: '/dashboard/business/$id'
-      path: '/business/$id'
+      path: '/dashboard/business/$id'
       fullPath: '/dashboard/business/$id'
       preLoaderRoute: typeof DashboardBusinessIdRouteImport
-      parentRoute: typeof DashboardRoute
+      parentRoute: typeof rootRouteImport
+    }
+    '/dashboard/business/new': {
+      id: '/dashboard/business/new'
+      path: '/dashboard/business/new'
+      fullPath: '/dashboard/business/new'
+      preLoaderRoute: typeof DashboardBusinessNewRouteImport
+      parentRoute: typeof rootRouteImport
     }
   }
 }
 
-interface DashboardRouteChildren {
-  DashboardBusinessIdRoute: typeof DashboardBusinessIdRoute
-  DashboardBusinessNewRoute: typeof DashboardBusinessNewRoute
-}
-
-const DashboardRouteChildren: DashboardRouteChildren = {
-  DashboardBusinessIdRoute: DashboardBusinessIdRoute,
-  DashboardBusinessNewRoute: DashboardBusinessNewRoute,
-}
-
-const DashboardRouteWithChildren = DashboardRoute._addFileChildren(
-  DashboardRouteChildren,
-)
-
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   AdminRoute: AdminRoute,
-  DashboardRoute: DashboardRouteWithChildren,
   LoginRoute: LoginRoute,
   ProfileRoute: ProfileRoute,
   RegisterRoute: RegisterRoute,
   SearchRoute: SearchRoute,
   BusinessSlugRoute: BusinessSlugRoute,
+  DashboardIndexRoute: DashboardIndexRoute,
+  DashboardBusinessIdRoute: DashboardBusinessIdRoute,
+  DashboardBusinessNewRoute: DashboardBusinessNewRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)
