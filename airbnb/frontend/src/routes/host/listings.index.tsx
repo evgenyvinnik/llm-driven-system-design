@@ -5,7 +5,7 @@ import { Listing } from '../../types';
 import { useAuthStore } from '../../stores/authStore';
 import { formatCurrency, formatRating } from '../../utils/helpers';
 
-export const Route = createFileRoute('/host/listings')({
+export const Route = createFileRoute('/host/listings/')({
   component: HostListingsPage,
 });
 

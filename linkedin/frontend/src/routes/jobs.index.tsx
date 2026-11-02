@@ -6,7 +6,7 @@ import type { Job } from '../types';
 import { JobCard } from '../components/JobCard';
 import { Search, Briefcase, MapPin, Building2 } from 'lucide-react';
 
-export const Route = createFileRoute('/jobs')({
+export const Route = createFileRoute('/jobs/')({
   component: JobsPage,
 });
 

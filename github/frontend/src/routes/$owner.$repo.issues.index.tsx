@@ -5,12 +5,12 @@ import { useAuthStore } from '../stores/authStore';
 import { IssueCard } from '../components/IssueCard';
 import { Plus, Search, CircleDot, CheckCircle } from 'lucide-react';
 
-export const Route = createFileRoute('/$owner/$repo/issues')({
+export const Route = createFileRoute('/$owner/$repo/issues/')({
   component: IssuesPage,
 });
 
 function IssuesPage() {
-  const { owner, repo } = useParams({ from: '/$owner/$repo/issues' });
+  const { owner, repo } = useParams({ from: '/$owner/$repo/issues/' });
   const { user } = useAuthStore();
   const [issues, setIssues] = useState<any[]>([]);
   const [total, setTotal] = useState(0);

@@ -149,6 +149,6 @@ function AdminPage() {
   );
 }
 
-export const Route = createFileRoute('/admin')({
+export const Route = createFileRoute('/admin/')({
   component: AdminPage,
 });

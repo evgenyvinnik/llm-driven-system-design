@@ -78,30 +78,32 @@ ON CONFLICT DO NOTHING;
 -- SAMPLE BOOKINGS
 -- ============================================================================
 
--- Upcoming bookings for Demo User (from init.sql: a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11)
+-- More upcoming bookings for Alice. These once belonged to a demo user (a0eebc99…) and its
+-- meeting types (b1/b2/b3eebc99…) that init.sql used to create; that data is gone, so they point at
+-- Alice's own 15/30/60-minute meeting types instead.
 INSERT INTO bookings (id, meeting_type_id, host_user_id, invitee_name, invitee_email, start_time, end_time, invitee_timezone, status, notes, idempotency_key) VALUES
     -- Tomorrow's meetings
-    ('bk111111-1111-1111-1111-111111111111',
-     'b2eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', -- 30-minute meeting type
-     'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
+    ('bc111111-1111-1111-1111-111111111111',
+     '4613eebc-9c0b-4ef8-bb6d-6bb9bd380a11', -- Team Sync (30 min)
+     'd1eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
      'John Davis', 'john.davis@company.com',
      (CURRENT_DATE + INTERVAL '1 day' + TIME '10:00')::timestamp with time zone,
      (CURRENT_DATE + INTERVAL '1 day' + TIME '10:30')::timestamp with time zone,
      'America/New_York', 'confirmed', 'Discuss Q4 planning',
      'idem-111111'),
 
-    ('bk222222-2222-2222-2222-222222222222',
-     'b2eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
-     'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
+    ('bc222222-2222-2222-2222-222222222222',
+     '4613eebc-9c0b-4ef8-bb6d-6bb9bd380a11',
+     'd1eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
      'Sarah Miller', 'sarah.miller@startup.io',
      (CURRENT_DATE + INTERVAL '1 day' + TIME '14:00')::timestamp with time zone,
      (CURRENT_DATE + INTERVAL '1 day' + TIME '14:30')::timestamp with time zone,
      'America/Los_Angeles', 'confirmed', 'Product demo walkthrough',
      'idem-222222'),
 
-    ('bk333333-3333-3333-3333-333333333333',
-     'b3eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', -- 60-minute meeting type
-     'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
+    ('bc333333-3333-3333-3333-333333333333',
+     '4612eebc-9c0b-4ef8-bb6d-6bb9bd380a11', -- Strategy Session (60 min)
+     'd1eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
      'Mike Thompson', 'mike.t@enterprise.com',
      (CURRENT_DATE + INTERVAL '2 days' + TIME '11:00')::timestamp with time zone,
      (CURRENT_DATE + INTERVAL '2 days' + TIME '12:00')::timestamp with time zone,
@@ -109,9 +111,9 @@ INSERT INTO bookings (id, meeting_type_id, host_user_id, invitee_name, invitee_e
      'idem-333333'),
 
     -- Next week meetings
-    ('bk444444-4444-4444-4444-444444444444',
-     'b1eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', -- 15-minute meeting type
-     'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
+    ('bc444444-4444-4444-4444-444444444444',
+     '4611eebc-9c0b-4ef8-bb6d-6bb9bd380a11', -- Quick Call (15 min)
+     'd1eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
      'Emily Chen', 'emily.chen@tech.co',
      (CURRENT_DATE + INTERVAL '7 days' + TIME '09:00')::timestamp with time zone,
      (CURRENT_DATE + INTERVAL '7 days' + TIME '09:15')::timestamp with time zone,
@@ -121,7 +123,7 @@ ON CONFLICT (id) DO NOTHING;
 
 -- Bookings for Alice
 INSERT INTO bookings (id, meeting_type_id, host_user_id, invitee_name, invitee_email, start_time, end_time, invitee_timezone, status, notes, idempotency_key) VALUES
-    ('bk511111-1111-1111-1111-111111111111',
+    ('bc511111-1111-1111-1111-111111111111',
      '4611eebc-9c0b-4ef8-bb6d-6bb9bd380a11', -- Quick Call
      'd1eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
      'Tom Wilson', 'tom.wilson@corp.com',
@@ -130,7 +132,7 @@ INSERT INTO bookings (id, meeting_type_id, host_user_id, invitee_name, invitee_e
      'America/New_York', 'confirmed', NULL,
      'idem-511111'),
 
-    ('bk522222-2222-2222-2222-222222222222',
+    ('bc522222-2222-2222-2222-222222222222',
      '4612eebc-9c0b-4ef8-bb6d-6bb9bd380a11', -- Strategy Session
      'd1eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
      'Lisa Park', 'lisa.park@agency.io',
@@ -142,18 +144,18 @@ ON CONFLICT (id) DO NOTHING;
 
 -- Past bookings (for history)
 INSERT INTO bookings (id, meeting_type_id, host_user_id, invitee_name, invitee_email, start_time, end_time, invitee_timezone, status, notes, idempotency_key) VALUES
-    ('bk611111-1111-1111-1111-111111111111',
-     'b2eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
-     'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
+    ('bc611111-1111-1111-1111-111111111111',
+     '4613eebc-9c0b-4ef8-bb6d-6bb9bd380a11',
+     'd1eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
      'Robert Brown', 'robert.b@old-client.com',
      (CURRENT_DATE - INTERVAL '7 days' + TIME '10:00')::timestamp with time zone,
      (CURRENT_DATE - INTERVAL '7 days' + TIME '10:30')::timestamp with time zone,
      'America/New_York', 'confirmed', 'Follow-up on proposal',
      'idem-611111'),
 
-    ('bk622222-2222-2222-2222-222222222222',
-     'b3eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
-     'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
+    ('bc622222-2222-2222-2222-222222222222',
+     '4612eebc-9c0b-4ef8-bb6d-6bb9bd380a11',
+     'd1eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
      'Amanda Lee', 'amanda.lee@cancelled.co',
      (CURRENT_DATE - INTERVAL '5 days' + TIME '15:00')::timestamp with time zone,
      (CURRENT_DATE - INTERVAL '5 days' + TIME '16:00')::timestamp with time zone,
@@ -164,26 +166,26 @@ ON CONFLICT (id) DO NOTHING;
 -- Update cancelled booking with cancellation reason
 UPDATE bookings
 SET cancellation_reason = 'Client requested to reschedule'
-WHERE id = 'bk622222-2222-2222-2222-222222222222';
+WHERE id = 'bc622222-2222-2222-2222-222222222222';
 
 -- ============================================================================
 -- EMAIL NOTIFICATIONS
 -- ============================================================================
 
 INSERT INTO email_notifications (booking_id, recipient_email, notification_type, subject, body, status) VALUES
-    ('bk111111-1111-1111-1111-111111111111', 'john.davis@company.com', 'confirmation',
+    ('bc111111-1111-1111-1111-111111111111', 'john.davis@company.com', 'confirmation',
      'Meeting Confirmed: 30 Minute Meeting with Demo User',
      'Your meeting has been confirmed for tomorrow at 10:00 AM EST. Meeting notes: Discuss Q4 planning',
      'sent'),
-    ('bk111111-1111-1111-1111-111111111111', 'demo@example.com', 'confirmation',
+    ('bc111111-1111-1111-1111-111111111111', 'demo@example.com', 'confirmation',
      'New Booking: 30 Minute Meeting with John Davis',
      'You have a new booking for tomorrow at 10:00 AM EST. Invitee: John Davis (john.davis@company.com)',
      'sent'),
-    ('bk222222-2222-2222-2222-222222222222', 'sarah.miller@startup.io', 'confirmation',
+    ('bc222222-2222-2222-2222-222222222222', 'sarah.miller@startup.io', 'confirmation',
      'Meeting Confirmed: 30 Minute Meeting with Demo User',
      'Your meeting has been confirmed for tomorrow at 2:00 PM PST.',
      'sent'),
-    ('bk622222-2222-2222-2222-222222222222', 'amanda.lee@cancelled.co', 'cancellation',
+    ('bc622222-2222-2222-2222-222222222222', 'amanda.lee@cancelled.co', 'cancellation',
      'Meeting Cancelled: 60 Minute Meeting with Demo User',
      'Your meeting scheduled for the listed time has been cancelled. Reason: Client requested to reschedule',
      'sent');
@@ -193,18 +195,18 @@ INSERT INTO email_notifications (booking_id, recipient_email, notification_type,
 -- ============================================================================
 
 INSERT INTO bookings_archive (id, meeting_type_id, host_user_id, invitee_name, invitee_email, start_time, end_time, invitee_timezone, status, notes, created_at, archived_at) VALUES
-    ('ar111111-1111-1111-1111-111111111111',
-     'b2eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
-     'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
+    ('a0111111-1111-1111-1111-111111111111',
+     '4613eebc-9c0b-4ef8-bb6d-6bb9bd380a11',
+     'd1eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
      'Old Client One', 'old.client1@archive.com',
      (CURRENT_DATE - INTERVAL '120 days' + TIME '10:00')::timestamp with time zone,
      (CURRENT_DATE - INTERVAL '120 days' + TIME '10:30')::timestamp with time zone,
      'America/New_York', 'confirmed', 'Historical meeting 1',
      NOW() - INTERVAL '120 days', NOW() - INTERVAL '30 days'),
 
-    ('ar222222-2222-2222-2222-222222222222',
-     'b3eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
-     'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
+    ('a0222222-2222-2222-2222-222222222222',
+     '4612eebc-9c0b-4ef8-bb6d-6bb9bd380a11',
+     'd1eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
      'Old Client Two', 'old.client2@archive.com',
      (CURRENT_DATE - INTERVAL '100 days' + TIME '14:00')::timestamp with time zone,
      (CURRENT_DATE - INTERVAL '100 days' + TIME '15:00')::timestamp with time zone,

@@ -46,6 +46,7 @@ Login returns a `sessionId` stored in Redis with a 7-day TTL; `authMiddleware` r
 - **Schema-apply path.** No `migrate.ts` / `db:migrate` script exists. The schema in `backend/src/db/init.sql` is applied via the Postgres `docker-entrypoint-initdb.d` mount (fresh volume only); sample data is loaded with `npm run db:seed` (`src/db/seed.ts`). After a schema change, recreate the volume (`docker-compose down -v`) then reseed.
 - **Password normalization.** Seed users (`johndoe`, `janedoe`, `admin`) all use `password123`, hashed with bcrypt (cost 10) in `seed.ts` — consistent with the repo-wide normalized login password.
 - **`redis` v4 client**, not `ioredis` — this project uses the `redis` package; connection helpers live in `backend/src/db/redis.ts`.
+- **2026-11-01 — every repo sub-page (issues, issue detail, pulls, PR detail, discussions, tree, blob) was unreachable:** under TanStack flat routing `$owner.$repo.tsx` was the parent of `$owner.$repo.*.tsx` but never rendered `<Outlet/>`, so navigating there changed the URL while the parent page kept rendering. Renamed it and `$owner.$repo.issues.tsx` to `*.index.tsx`, and regenerated `routeTree.gen.ts`. The old `04-pulls.png` was byte-identical to `02-repo.png`. Any `X.tsx` + `X.<more>.tsx` pair needs an `<Outlet/>` in `X` or an `X.index.tsx`.
 
 ## Open Questions
 

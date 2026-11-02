@@ -172,6 +172,6 @@ function Profile() {
   );
 }
 
-export const Route = createFileRoute('/profile/$id')({
+export const Route = createFileRoute('/profile/$id/')({
   component: Profile,
 });
