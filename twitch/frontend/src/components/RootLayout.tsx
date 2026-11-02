@@ -7,7 +7,7 @@ import { AuthModal } from './AuthModal';
 /** Renders the root layout with navigation header, WebSocket chat connection, and auth modal. */
 export function RootLayout() {
   const { user, isLoading, fetchUser, logout } = useAuthStore();
-  const { connect, disconnect, authenticate } = useChatStore();
+  const { connect, disconnect } = useChatStore();
   const [showAuthModal, setShowAuthModal] = useState(false);
   const [authMode, setAuthMode] = useState<'login' | 'register'>('login');
 
@@ -15,16 +15,13 @@ export function RootLayout() {
     fetchUser();
   }, [fetchUser]);
 
+  // Chat identity comes from the session cookie on the WebSocket upgrade, so
+  // reconnect whenever the logged-in user changes (login, logout).
+  const userId = user?.id;
   useEffect(() => {
     connect();
     return () => disconnect();
-  }, [connect, disconnect]);
-
-  useEffect(() => {
-    if (user) {
-      authenticate(user.id, user.username);
-    }
-  }, [user, authenticate]);
+  }, [connect, disconnect, userId]);
 
   const handleShowLogin = () => {
     setAuthMode('login');
