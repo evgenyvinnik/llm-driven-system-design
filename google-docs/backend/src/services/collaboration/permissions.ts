@@ -6,6 +6,8 @@
  */
 
 import pool from '../../utils/db.js';
+import { PERMISSION_CAPABILITIES } from '../../shared/rbac.js';
+import type { PermissionLevel } from '../../types/index.js';
 
 /**
  * Result of a document permission check.
@@ -80,7 +82,8 @@ export async function checkDocumentPermission(
   return {
     found: true,
     ownerId: owner_id,
-    currentVersion: current_version,
+    // BIGINT arrives from pg as a string; the version counter is a number everywhere else.
+    currentVersion: Number(current_version),
     content,
     permissionLevel: permission_level,
   };
@@ -139,3 +142,30 @@ export function getEffectivePermission(
 ): string {
   return ownerId === userId ? 'edit' : (permissionLevel || 'none');
 }
+
+/** Permission levels a document_permissions row can grant ('owner' is not a grant). */
+const GRANT_LEVELS = new Set<string>(['view', 'comment', 'edit']);
+
+/**
+ * Determines if a user may send edit operations to a document.
+ *
+ * @description Uses the same capability table as the REST RBAC middleware
+ * (`requireEdit` in shared/rbac.ts): owners and 'edit' grants may edit, while
+ * 'comment' and 'view' grants are read-only on the collaboration channel too.
+ *
+ * @param {boolean} isOwner - Whether the user owns the document
+ * @param {string | null | undefined} permissionLevel - Permission level granted to user, if any
+ * @returns {boolean} True if the user may edit the document's content
+ *
+ * @example
+ * canEditDocument(true, null);       // true  (owner)
+ * canEditDocument(false, 'edit');    // true
+ * canEditDocument(false, 'comment'); // false
+ * canEditDocument(false, null);      // false
+ */
+export function canEditDocument(isOwner: boolean, permissionLevel: string | null | undefined): boolean {
+  if (isOwner) return PERMISSION_CAPABILITIES.owner.canEdit;
+  if (!permissionLevel || !GRANT_LEVELS.has(permissionLevel)) return false;
+  return PERMISSION_CAPABILITIES[permissionLevel as PermissionLevel].canEdit;
+}
+

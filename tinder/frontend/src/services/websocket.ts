@@ -27,8 +27,9 @@ class WebSocketService {
   private isConnecting = false;
 
   /**
-   * Establishes WebSocket connection and authenticates with the server.
-   * @param userId - User ID to authenticate with
+   * Establishes WebSocket connection. The server identifies the user from the
+   * session cookie sent with the upgrade request.
+   * @param userId - The logged-in user's ID; only used to decide whether to reconnect
    */
   connect(userId: string): void {
     if (this.ws?.readyState === WebSocket.OPEN || this.isConnecting) {
@@ -49,8 +50,8 @@ class WebSocketService {
         this.isConnecting = false;
         this.reconnectAttempts = 0;
 
-        // Authenticate
-        this.send({ type: 'auth', userId });
+        // Ask the server which user it bound this socket to (from the session)
+        this.send({ type: 'auth' });
       };
 
       this.ws.onmessage = (event) => {

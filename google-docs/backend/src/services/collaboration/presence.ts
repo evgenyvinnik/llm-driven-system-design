@@ -112,6 +112,7 @@ export function handleLeaveDocument(ws: WebSocket, documentId: string): void {
   }
 
   client.documentId = null;
+  client.canEdit = false;
 }
 
 /**

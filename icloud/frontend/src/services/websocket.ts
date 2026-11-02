@@ -31,19 +31,25 @@ class WebSocketService {
   private maxReconnectAttempts = 5;
   /** Base delay for reconnection (doubles with each attempt) */
   private reconnectDelay = 1000;
-  /** Authentication token for WebSocket connection */
-  private token: string | null = null;
+  /** Whether the app wants a connection (false after logout) */
+  private active = false;
 
   /**
-   * Initiates a WebSocket connection with the given authentication token.
+   * Opens the WebSocket connection for the logged-in user.
    *
-   * The token is passed as a query parameter since WebSocket doesn't support
-   * custom headers in the browser. Stores the token for reconnection attempts.
-   *
-   * @param token - JWT or session token for authentication
+   * The server authenticates the upgrade request with the httpOnly
+   * `session_token` cookie, which the browser sends automatically, so no
+   * token is passed in the URL. Safe to call again while already connected.
    */
-  connect(token: string) {
-    this.token = token;
+  connect() {
+    this.active = true;
+    this.reconnectAttempts = 0;
+    if (
+      this.ws &&
+      (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)
+    ) {
+      return;
+    }
     this.doConnect();
   }
 
@@ -54,11 +60,11 @@ class WebSocketService {
    * Automatically selects ws:// or wss:// based on the current page protocol.
    */
   private doConnect() {
-    if (!this.token) return;
+    if (!this.active) return;
 
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const host = window.location.host;
-    const wsUrl = `${protocol}//${host}/ws?token=${this.token}`;
+    const wsUrl = `${protocol}//${host}/ws`;
 
     this.ws = new WebSocket(wsUrl);
 
@@ -116,15 +122,15 @@ class WebSocketService {
    * Closes the WebSocket connection and prevents reconnection.
    *
    * Should be called on logout or when the user leaves the application.
-   * Clears the token and sets reconnect attempts to max to prevent
+   * Marks the service inactive and sets reconnect attempts to max to prevent
    * automatic reconnection.
    */
   disconnect() {
+    this.active = false;
     if (this.ws) {
       this.ws.close();
       this.ws = null;
     }
-    this.token = null;
     this.reconnectAttempts = this.maxReconnectAttempts; // Prevent reconnection
   }
 

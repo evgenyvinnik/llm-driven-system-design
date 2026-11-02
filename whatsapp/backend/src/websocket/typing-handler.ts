@@ -27,9 +27,10 @@ const wsLogger = createServiceLogger('websocket-typing');
  * Handles typing indicator events from WebSocket clients.
  *
  * @description Processes typing start and stop events:
- * 1. Stores typing state in Redis with 5-second auto-expiry (handles abandoned typing)
- * 2. Broadcasts typing status to all other conversation participants
- * 3. Routes to local connections or via Redis pub/sub for cross-server delivery
+ * 1. Drops the event unless the sender is a participant (same rule as sending a message)
+ * 2. Stores typing state in Redis with 5-second auto-expiry (handles abandoned typing)
+ * 3. Broadcasts typing status to all other conversation participants
+ * 4. Routes to local connections or via Redis pub/sub for cross-server delivery
  *
  * Typing indicators are ephemeral and do not persist beyond the Redis TTL.
  *
@@ -58,10 +59,21 @@ export async function handleTyping(
   message: WSTypingMessage
 ): Promise<void> {
   const userId = socket.userId;
-  const { conversationId } = message.payload;
+  const conversationId = message.payload?.conversationId;
   const isTyping = message.type === 'typing';
+  if (typeof conversationId !== 'string') return;
 
   try {
+    // Get participants first: only a participant may signal typing in a conversation
+    const participants = await getConversationParticipants(conversationId);
+    if (!participants.some((participant) => participant.user_id === userId)) {
+      sendToSocket(socket, {
+        type: 'error',
+        payload: { message: 'Not a participant in this conversation', conversationId },
+      });
+      return;
+    }
+
     // Store typing state briefly with circuit breaker
     await withRedisCircuit(async () => {
       if (isTyping) {
@@ -71,9 +83,7 @@ export async function handleTyping(
       }
     });
 
-    // Get participants and notify them
-    const participants = await getConversationParticipants(conversationId);
-
+    // Notify the other participants
     for (const participant of participants) {
       if (participant.user_id === userId) continue;
 

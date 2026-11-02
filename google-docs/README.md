@@ -151,10 +151,13 @@ Those tests cover login/register/home rendering, not collaboration or durable ed
   array offsets, loses its origin after restart/trimming, and has no durable replay
   or safe retry protocol. Redis pub/sub forwards messages without updating peer
   servers' in-memory version/log state.
-- WebSocket subscription checks read access; edit messages do not recheck edit
-  permission. Revocation, deletion, and session logout do not close an already
-  authorized document connection. Several auxiliary REST routes also omit the
-  soft-delete check.
+- WebSocket upgrades are authenticated with the REST session lookup (the
+  `session_token` cookie, or the older `?token=` URL parameter). Subscription checks
+  read access, and every edit message checks edit permission (owner or `edit` grant;
+  `comment` and `view` are read-only), re-read from PostgreSQL at most every five
+  seconds. A downgrade or deletion therefore stops edits within five seconds, but
+  revocation, deletion, and session logout do not close a socket that only watches.
+  Several auxiliary REST routes also omit the soft-delete check.
 - Restore copies a stored snapshot through separate SQL writes. It does not update
   live collaboration state, and the default PostgreSQL BIGINT string representation
   makes `current_version + 1` concatenate values (for example, `5` becomes `51`).
