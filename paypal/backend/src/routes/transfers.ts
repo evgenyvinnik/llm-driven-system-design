@@ -1,64 +1,58 @@
 import { Router, Request, Response } from 'express';
 import { requireAuth } from '../middleware/auth.js';
 import { executeTransfer } from '../services/transferService.js';
-import { transferLimiter } from '../services/rateLimiter.js';
+import { moneyLimiter } from '../services/rateLimiter.js';
 import { pool } from '../services/db.js';
-import { logger } from '../services/logger.js';
+import { PaymentError, sendError } from '../services/errors.js';
+import {
+  MAX_TRANSFER_CENTS,
+  isUuid,
+  parseAmountCents,
+  parseIdempotencyKey,
+  parseIntParam,
+  parseNote,
+} from '../services/validation.js';
 
 const router = Router();
 
 // POST /api/transfers - Send money (P2P transfer with idempotency)
-router.post('/', requireAuth, transferLimiter, async (req: Request, res: Response) => {
+router.post('/', requireAuth, moneyLimiter, async (req: Request, res: Response) => {
   try {
-    const { recipientId, amountCents, note, idempotencyKey } = req.body;
-
+    const { recipientId } = req.body ?? {};
     if (!recipientId) {
-      res.status(400).json({ error: 'Recipient is required' });
-      return;
+      throw new PaymentError(400, 'RECIPIENT_REQUIRED', 'Recipient is required');
+    }
+    if (!isUuid(recipientId)) {
+      // Malformed IDs would otherwise surface as a Postgres cast error (500).
+      throw new PaymentError(404, 'RECIPIENT_NOT_FOUND', 'Recipient not found');
     }
 
-    if (!amountCents || amountCents <= 0) {
-      res.status(400).json({ error: 'Amount must be positive' });
-      return;
-    }
-
-    if (amountCents > 5000000) { // $50,000 limit
-      res.status(400).json({ error: 'Transfer amount exceeds limit' });
-      return;
-    }
-
-    const result = await executeTransfer(
-      req.session.userId!,
+    const { result, replayed } = await executeTransfer({
+      senderId: req.session.userId!,
       recipientId,
-      amountCents,
-      note,
-      idempotencyKey,
-    );
+      amountCents: parseAmountCents(req.body.amountCents, MAX_TRANSFER_CENTS),
+      note: parseNote(req.body.note),
+      idempotencyKey: parseIdempotencyKey(req),
+    });
 
+    if (replayed) res.set('Idempotent-Replayed', 'true');
     res.json(result);
   } catch (err) {
-    const message = err instanceof Error ? err.message : 'Transfer failed';
-    logger.error({ err }, 'Transfer failed');
-
-    if (message === 'Insufficient funds') {
-      res.status(400).json({ error: message });
-    } else if (message === 'Cannot transfer to yourself') {
-      res.status(400).json({ error: message });
-    } else {
-      res.status(500).json({ error: message });
-    }
+    sendError(res, err, 'Transfer failed');
   }
 });
 
-// GET /api/transfers - Get transaction history
+// GET /api/transfers - Get the caller's transaction history
 router.get('/', requireAuth, async (req: Request, res: Response) => {
   try {
     const userId = req.session.userId!;
-    const { type, limit = '50', offset = '0' } = req.query;
+    const { type } = req.query;
+    const limit = parseIntParam(req.query.limit, 50, 1, 100);
+    const offset = parseIntParam(req.query.offset, 0, 0, 1_000_000);
 
     let query = `
       SELECT t.id, t.sender_id, t.recipient_id, t.amount_cents, t.currency,
-             t.type, t.status, t.note, t.created_at,
+             t.type, t.status, t.note, t.payment_method_id, t.created_at,
              su.username as sender_username, su.display_name as sender_display_name,
              ru.username as recipient_username, ru.display_name as recipient_display_name
       FROM transactions t
@@ -76,8 +70,9 @@ router.get('/', requireAuth, async (req: Request, res: Response) => {
       paramIndex++;
     }
 
-    query += ` ORDER BY t.created_at DESC LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`;
-    params.push(parseInt(limit as string, 10), parseInt(offset as string, 10));
+    // id breaks ties so pagination is stable when rows share a timestamp.
+    query += ` ORDER BY t.created_at DESC, t.id DESC LIMIT $${paramIndex} OFFSET $${paramIndex + 1}`;
+    params.push(limit, offset);
 
     const result = await pool.query(query, params);
 
@@ -85,11 +80,12 @@ router.get('/', requireAuth, async (req: Request, res: Response) => {
       id: row.id,
       senderId: row.sender_id,
       recipientId: row.recipient_id,
-      amountCents: parseInt(row.amount_cents, 10),
+      amountCents: Number(row.amount_cents),
       currency: row.currency,
       type: row.type,
       status: row.status,
       note: row.note,
+      paymentMethodId: row.payment_method_id,
       createdAt: row.created_at,
       senderUsername: row.sender_username,
       senderDisplayName: row.sender_display_name,
@@ -99,8 +95,7 @@ router.get('/', requireAuth, async (req: Request, res: Response) => {
 
     res.json({ transactions });
   } catch (err) {
-    logger.error({ err }, 'Failed to get transactions');
-    res.status(500).json({ error: 'Internal server error' });
+    sendError(res, err, 'Failed to get transactions');
   }
 });
 

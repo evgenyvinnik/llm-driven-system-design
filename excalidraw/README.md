@@ -2,9 +2,22 @@
 
 A local learning project for drawing shapes on an infinite canvas and exchanging edits over WebSocket. It includes rectangle, ellipse, diamond, line, arrow, freehand, and text tools; pan/zoom; a properties panel; drawing lists; session login; and PostgreSQL persistence. The main lessons are coordinate transforms, concurrent editing, ephemeral presence, and the difference between an edit being visible and durably saved.
 
-**Current implementation boundary:** the HTTP API has drawing access checks, but the WebSocket handler does not authenticate users or check drawing permissions. Anyone who knows a drawing ID can join its socket room and submit edits, including for private drawings. The current merge and save paths also do not guarantee convergence or recovery of unsaved work. Treat this as an implementation to study, with the specific limitations below.
+**Current implementation boundary:** the WebSocket upgrade uses the same session as the HTTP API. Joining requires view access (anonymous visitors may watch public drawings read-only), edits require edit access, and sharing or visibility changes apply to open sockets immediately. HTTP saves and socket edits merge with one last-writer-wins rule, and room saves are bounded, retried, and flushed on shutdown. There is still no operation log, acknowledgment, or replay, and rooms are process-local, so convergence under conflicting edits and recovery after a crash are not guaranteed. Treat this as an implementation to study, with the specific limitations below.
 
 The [architecture document](./architecture.md) separates a proposed production design from source-linked local behavior. The [frontend](./system-design-answer-frontend.md), [backend](./system-design-answer-backend.md), and [fullstack](./system-design-answer-fullstack.md) interview answers describe bounded designs that can be discussed at a whiteboard; their proposed correctness mechanisms are not all present in the app.
+
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 7,805 |
+| Source Files | 68 |
+| .ts | 4,197 |
+| .md | 1,564 |
+| .tsx | 1,563 |
+| .json | 155 |
+| .sql | 148 |
+
 
 ## What the demo includes
 
@@ -31,7 +44,7 @@ Use Node.js 20+ and npm. Frontend dependencies specify React 19, Vite 6, TypeScr
 | PostgreSQL 16 | localhost:5432 | User/database `excalidraw`, password `excalidraw123` |
 | Valkey 7 | localhost:6379 | No development password; Compose enables append-only persistence |
 
-The configuration fallback is port 3000, but the development script overrides it to 3001. The `dev:server2` and `dev:server3` scripts call `dev`, which overrides their requested ports back to 3001. They cannot be used to start three instances as written. Even with distinct ports, separate processes would have isolated rooms and competing full-scene saves; there is no cross-process collaboration protocol.
+The configuration fallback is port 3000, but the development script overrides it to 3001. `dev:server2` and `dev:server3` start instances on 3002 and 3003. Separate processes have isolated rooms, per-process save locks and per-process permission invalidation, so they compete on full-scene saves; there is no cross-process collaboration protocol.
 
 ## Infrastructure
 
@@ -180,15 +193,14 @@ Project Playwright configuration can start Vite, but does not start PostgreSQL, 
 
 `/api/health` and `/api/health/live` report liveness. `/api/health/ready` and `/api/health/detailed` query PostgreSQL and ping Redis. These routes run after session middleware and the general API limiter, so they can be affected by those dependencies too. `/metrics` exposes Prometheus text; no Prometheus/Grafana stack is bundled.
 
-This documentation review inspected source and exercised isolated handlers, merge functions, stores, and the renderer with mocked services. It did not run a full application stack, build, or browser test suite.
+`npm test` in `backend/` runs the mocked route suite plus `src/websocket/rooms.test.ts` (save debounce and max-wait, retry, the leave/rejoin window, HTTP merges, access refresh, merge rules). The collaboration and permission paths were also exercised against a running stack with real sockets; see the architecture's Implementation Notes.
 
 ## Important implementation limits
 
-- **Permissions:** sockets accept supplied identities and drawing IDs without session, ownership, view/edit, or origin checks. Collaborator-list HTTP reads require login but do not check drawing access. HTTP edit collaborators can also change `isPublic`. Removing a collaborator or logging out does not revoke an existing socket's ability to edit.
-- **Sharing:** the collaborator helper executes an invalid `INSERT … RETURNING … FROM` statement before its valid alternative. It catches the SQL error and returns null; the route responds 201 and the dialog appends the null value, which can break rendering.
-- **Merge:** equal version/timestamp conflicts retain whichever element arrived first. Add, update, move, and delete use different rules; stale adds can resurrect tombstones, repeated deletes increment again, and clients apply remote operations with new local versions. Broadcasts do not return canonical accepted state to the sender.
-- **Saving and recovery:** a two-second debounce means two seconds of inactivity, not a maximum data-loss window. Failed saves are logged without a retry queue. Last-room flush is asynchronous and drops memory immediately; shutdown does not flush rooms. Reconnect replaces local elements and does not replay dropped sends.
-- **Competing writers:** explicit Save replaces SQL elements with visible elements only, removing tombstones. It does not update active room memory, which can later overwrite it. Initial HTTP loads, room loads, and incoming edits can race. There is no revision check, operation receipt, durable replay cursor, or cross-server writer coordination.
+- **Permissions:** socket identity comes from the session cookie; origins are not checked. Permission changes are invalidated in-process only, so a second instance would not hear about a revocation. HTTP edit collaborators can change `isPublic`.
+- **Merge:** add, update and bulk sync use one last-writer-wins rule (higher version, then later timestamp); exact ties keep the existing element. Move takes the higher version, delete increments it, and a repeated delete increments again. Broadcasts do not return canonical accepted state to the sender.
+- **Saving and recovery:** room saves fire after two quiet seconds and at most ten seconds after the first unsaved edit, so a crash (not a graceful stop) can lose up to ten seconds of edits. Failed saves retry every five seconds. Reconnect replaces local elements and does not replay sends dropped while disconnected.
+- **Competing writers:** within one process, room saves, HTTP saves and room loads for a drawing are serialized and HTTP saves merge rather than replace. There is no revision check, operation receipt, durable replay cursor, or cross-server writer coordination.
 - **Presence and scope:** cursors are sent on every mouse move. Redis expiration is for the entire room hash, and its read helper is unused; there is no per-cursor expiry in the browser, heartbeat, or late-join cursor snapshot. Full drawing data is cached for five minutes. Undo, offline recovery, exports, safe tombstone cleanup, and room-aware horizontal scaling are absent.
 
 See [Implementation Notes](./architecture.md#implementation-notes) for details and the proposed mechanisms that would address these limits.

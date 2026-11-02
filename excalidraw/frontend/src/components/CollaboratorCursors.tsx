@@ -17,7 +17,7 @@ export function CollaboratorCursors({ cursors, scrollX, scrollY, zoom }: Collabo
 
         return (
           <div
-            key={cursor.userId}
+            key={cursor.clientId}
             className="absolute pointer-events-none z-50 transition-all duration-75"
             style={{
               left: screenX,

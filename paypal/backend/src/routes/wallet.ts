@@ -1,7 +1,15 @@
 import { Router, Request, Response } from 'express';
 import { requireAuth } from '../middleware/auth.js';
 import { getWallet, deposit, withdraw } from '../services/walletService.js';
-import { logger } from '../services/logger.js';
+import { moneyLimiter } from '../services/rateLimiter.js';
+import { PaymentError, sendError } from '../services/errors.js';
+import {
+  MAX_WALLET_OP_CENTS,
+  isUuid,
+  parseAmountCents,
+  parseIdempotencyKey,
+  parseNote,
+} from '../services/validation.js';
 
 const router = Router();
 
@@ -17,60 +25,39 @@ router.get('/', requireAuth, async (req: Request, res: Response) => {
 
     res.json({ wallet });
   } catch (err) {
-    logger.error({ err }, 'Failed to get wallet');
-    res.status(500).json({ error: 'Internal server error' });
+    sendError(res, err, 'Failed to get wallet');
   }
 });
 
-// POST /api/wallet/deposit - Deposit funds into wallet
-router.post('/deposit', requireAuth, async (req: Request, res: Response) => {
-  try {
-    const { amountCents, note } = req.body;
-
-    if (!amountCents || amountCents <= 0) {
-      res.status(400).json({ error: 'Amount must be positive' });
-      return;
+/** Shared handler: deposits and withdrawals take the same body and differ only in direction. */
+function walletOperationHandler(operation: typeof deposit) {
+  return async (req: Request, res: Response) => {
+    try {
+      const amountCents = parseAmountCents(req.body?.amountCents, MAX_WALLET_OP_CENTS);
+      const { paymentMethodId } = req.body ?? {};
+      if (!isUuid(paymentMethodId)) {
+        throw new PaymentError(400, 'PAYMENT_METHOD_REQUIRED', 'Choose a linked payment method');
+      }
+      const { result, replayed } = await operation({
+        userId: req.session.userId!,
+        amountCents,
+        paymentMethodId,
+        note: parseNote(req.body?.note),
+        idempotencyKey: parseIdempotencyKey(req),
+      });
+      if (replayed) res.set('Idempotent-Replayed', 'true');
+      res.json(result);
+    } catch (err) {
+      sendError(res, err, 'Wallet operation failed');
     }
+  };
+}
 
-    if (amountCents > 1000000) { // $10,000 limit
-      res.status(400).json({ error: 'Deposit amount exceeds limit' });
-      return;
-    }
+// POST /api/wallet/deposit - Deposit funds from a linked payment method
+router.post('/deposit', requireAuth, moneyLimiter, walletOperationHandler(deposit));
 
-    const result = await deposit(req.session.userId!, amountCents, note);
-
-    res.json(result);
-  } catch (err) {
-    const message = err instanceof Error ? err.message : 'Deposit failed';
-    logger.error({ err }, 'Deposit failed');
-    res.status(400).json({ error: message });
-  }
-});
-
-// POST /api/wallet/withdraw - Withdraw funds from wallet
-router.post('/withdraw', requireAuth, async (req: Request, res: Response) => {
-  try {
-    const { amountCents, note } = req.body;
-
-    if (!amountCents || amountCents <= 0) {
-      res.status(400).json({ error: 'Amount must be positive' });
-      return;
-    }
-
-    if (amountCents > 1000000) { // $10,000 limit
-      res.status(400).json({ error: 'Withdrawal amount exceeds limit' });
-      return;
-    }
-
-    const result = await withdraw(req.session.userId!, amountCents, note);
-
-    res.json(result);
-  } catch (err) {
-    const message = err instanceof Error ? err.message : 'Withdrawal failed';
-    logger.error({ err }, 'Withdrawal failed');
-    res.status(400).json({ error: message });
-  }
-});
+// POST /api/wallet/withdraw - Withdraw funds to a linked payment method
+router.post('/withdraw', requireAuth, moneyLimiter, walletOperationHandler(withdraw));
 
 /** Wallet router for balance queries, deposits, and withdrawals with validation. */
 export default router;

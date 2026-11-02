@@ -1,138 +1,113 @@
 import { Router, Request, Response } from 'express';
 import { pool } from '../services/db.js';
 import { requireAuth } from '../middleware/auth.js';
-import { executeQuery } from '../services/queryExecutor.js';
+import { executeUserSql } from '../services/queryExecutor.js';
 import { queryLimiter } from '../services/rateLimiter.js';
 import { queryExecutionDuration } from '../services/metrics.js';
-import { logger } from '../services/logger.js';
+import { ApiError, respondError } from '../services/errors.js';
+import { isUuid, requireProject } from '../services/projectAccess.js';
 
 const router = Router();
 
-async function getProjectConfig(projectId: string) {
-  const result = await pool.query(
-    'SELECT db_host, db_port, db_name, db_user, db_password FROM projects WHERE id = $1',
-    [projectId],
-  );
-  if (result.rows.length === 0) return null;
-  const r = result.rows[0];
-  return { host: r.db_host, port: r.db_port, database: r.db_name, user: r.db_user, password: r.db_password };
+// The first keyword is user input; bucketing it keeps the metric's label set bounded.
+const QUERY_TYPES = new Set(['SELECT', 'WITH', 'INSERT', 'UPDATE', 'DELETE', 'CREATE', 'ALTER', 'DROP', 'TRUNCATE', 'EXPLAIN', 'DO']);
+
+function queryType(sql: string): string {
+  const first = sql.trim().split(/\s+/)[0]?.toUpperCase() ?? '';
+  return QUERY_TYPES.has(first) ? first : 'OTHER';
 }
 
-// POST /api/projects/:projectId/sql/execute
+function savedQueryDto(r: Record<string, unknown>) {
+  return {
+    id: r.id,
+    projectId: r.project_id,
+    name: r.name,
+    queryText: r.query_text,
+    createdBy: r.created_by,
+    createdByUsername: r.created_by_username,
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+  };
+}
+
+function parseSavedQuery(body: unknown, partial: boolean): { name?: string; queryText?: string } {
+  const { name, queryText } = (body ?? {}) as Record<string, unknown>;
+  if (!partial && (!name || !queryText)) throw new ApiError(400, 'name and queryText are required');
+  if (name !== undefined && (typeof name !== 'string' || name.trim() === '' || name.length > 100)) {
+    throw new ApiError(400, 'name must be 1-100 characters');
+  }
+  if (queryText !== undefined && (typeof queryText !== 'string' || queryText.trim() === '')) {
+    throw new ApiError(400, 'queryText must be a non-empty string');
+  }
+  return { name: name?.trim(), queryText };
+}
+
+// POST /api/projects/:projectId/sql/execute — viewers run read-only
 router.post('/:projectId/sql/execute', requireAuth, queryLimiter, async (req: Request, res: Response) => {
   try {
-    const config = await getProjectConfig(req.params.projectId);
-    if (!config) {
-      res.status(404).json({ error: 'Project not found' });
-      return;
-    }
-
-    const { sql } = req.body;
+    const access = await requireProject(req, 'view');
+    const { sql } = req.body ?? {};
 
     if (!sql || typeof sql !== 'string') {
-      res.status(400).json({ error: 'SQL query string is required' });
-      return;
+      throw new ApiError(400, 'SQL query string is required');
     }
-
     if (sql.trim().length === 0) {
-      res.status(400).json({ error: 'SQL query cannot be empty' });
-      return;
+      throw new ApiError(400, 'SQL query cannot be empty');
     }
 
-    const timer = queryExecutionDuration.startTimer({
-      project_id: req.params.projectId,
-      query_type: sql.trim().split(/\s+/)[0]?.toUpperCase() || 'UNKNOWN',
-    });
-
+    const timer = queryExecutionDuration.startTimer({ project_id: access.projectId, query_type: queryType(sql) });
     try {
-      const result = await executeQuery(req.params.projectId, config, sql);
+      const result = await executeUserSql(access.projectId, access.connection(), sql, { readOnly: !access.canEdit });
+      res.json({ ...result, readOnly: !access.canEdit });
+    } finally {
       timer();
-
-      res.json({
-        rows: result.rows,
-        fields: result.fields,
-        rowCount: result.rowCount,
-      });
-    } catch (queryErr) {
-      timer();
-      const message = queryErr instanceof Error ? queryErr.message : 'Query execution failed';
-      res.status(400).json({ error: message });
     }
   } catch (err) {
-    logger.error({ err }, 'SQL execution error');
-    res.status(500).json({ error: 'Internal server error' });
+    respondError(res, err, 'SQL execution error');
   }
 });
 
 // GET /api/projects/:projectId/sql/saved
 router.get('/:projectId/sql/saved', requireAuth, async (req: Request, res: Response) => {
   try {
+    const access = await requireProject(req, 'view');
     const result = await pool.query(
       `SELECT sq.*, u.username AS created_by_username
        FROM saved_queries sq
        LEFT JOIN users u ON u.id = sq.created_by
        WHERE sq.project_id = $1
        ORDER BY sq.updated_at DESC`,
-      [req.params.projectId],
+      [access.projectId],
     );
-
-    const queries = result.rows.map((r) => ({
-      id: r.id,
-      projectId: r.project_id,
-      name: r.name,
-      queryText: r.query_text,
-      createdBy: r.created_by,
-      createdByUsername: r.created_by_username,
-      createdAt: r.created_at,
-      updatedAt: r.updated_at,
-    }));
-
-    res.json({ queries });
+    res.json({ queries: result.rows.map(savedQueryDto) });
   } catch (err) {
-    logger.error({ err }, 'Failed to list saved queries');
-    res.status(500).json({ error: 'Internal server error' });
+    respondError(res, err, 'Failed to list saved queries');
   }
 });
 
 // POST /api/projects/:projectId/sql/saved
 router.post('/:projectId/sql/saved', requireAuth, async (req: Request, res: Response) => {
   try {
-    const { name, queryText } = req.body;
-
-    if (!name || !queryText) {
-      res.status(400).json({ error: 'name and queryText are required' });
-      return;
-    }
-
+    const access = await requireProject(req, 'edit');
+    const { name, queryText } = parseSavedQuery(req.body, false);
     const result = await pool.query(
       `INSERT INTO saved_queries (project_id, name, query_text, created_by)
        VALUES ($1, $2, $3, $4)
        RETURNING *`,
-      [req.params.projectId, name, queryText, req.session.userId],
+      [access.projectId, name, queryText, req.session.userId],
     );
-
-    const r = result.rows[0];
-    res.status(201).json({
-      query: {
-        id: r.id,
-        projectId: r.project_id,
-        name: r.name,
-        queryText: r.query_text,
-        createdBy: r.created_by,
-        createdAt: r.created_at,
-        updatedAt: r.updated_at,
-      },
-    });
+    res.status(201).json({ query: savedQueryDto({ ...result.rows[0], created_by_username: req.session.username }) });
   } catch (err) {
-    logger.error({ err }, 'Failed to save query');
-    res.status(500).json({ error: 'Internal server error' });
+    respondError(res, err, 'Failed to save query');
   }
 });
 
 // PUT /api/projects/:projectId/sql/saved/:queryId
 router.put('/:projectId/sql/saved/:queryId', requireAuth, async (req: Request, res: Response) => {
   try {
-    const { name, queryText } = req.body;
+    const access = await requireProject(req, 'edit');
+    if (!isUuid(req.params.queryId)) throw new ApiError(404, 'Saved query not found');
+    const { name, queryText } = parseSavedQuery(req.body, true);
 
     const result = await pool.query(
       `UPDATE saved_queries
@@ -141,49 +116,28 @@ router.put('/:projectId/sql/saved/:queryId', requireAuth, async (req: Request, r
            updated_at = NOW()
        WHERE id = $3 AND project_id = $4
        RETURNING *`,
-      [name, queryText, req.params.queryId, req.params.projectId],
+      [name ?? null, queryText ?? null, req.params.queryId, access.projectId],
     );
-
-    if (result.rows.length === 0) {
-      res.status(404).json({ error: 'Saved query not found' });
-      return;
-    }
-
-    const r = result.rows[0];
-    res.json({
-      query: {
-        id: r.id,
-        projectId: r.project_id,
-        name: r.name,
-        queryText: r.query_text,
-        createdBy: r.created_by,
-        createdAt: r.created_at,
-        updatedAt: r.updated_at,
-      },
-    });
+    if (result.rows.length === 0) throw new ApiError(404, 'Saved query not found');
+    res.json({ query: savedQueryDto(result.rows[0]) });
   } catch (err) {
-    logger.error({ err }, 'Failed to update saved query');
-    res.status(500).json({ error: 'Internal server error' });
+    respondError(res, err, 'Failed to update saved query');
   }
 });
 
 // DELETE /api/projects/:projectId/sql/saved/:queryId
 router.delete('/:projectId/sql/saved/:queryId', requireAuth, async (req: Request, res: Response) => {
   try {
-    const result = await pool.query(
-      'DELETE FROM saved_queries WHERE id = $1 AND project_id = $2',
-      [req.params.queryId, req.params.projectId],
-    );
-
-    if ((result.rowCount ?? 0) === 0) {
-      res.status(404).json({ error: 'Saved query not found' });
-      return;
-    }
-
+    const access = await requireProject(req, 'edit');
+    if (!isUuid(req.params.queryId)) throw new ApiError(404, 'Saved query not found');
+    const result = await pool.query('DELETE FROM saved_queries WHERE id = $1 AND project_id = $2', [
+      req.params.queryId,
+      access.projectId,
+    ]);
+    if ((result.rowCount ?? 0) === 0) throw new ApiError(404, 'Saved query not found');
     res.json({ message: 'Saved query deleted' });
   } catch (err) {
-    logger.error({ err }, 'Failed to delete saved query');
-    res.status(500).json({ error: 'Internal server error' });
+    respondError(res, err, 'Failed to delete saved query');
   }
 });
 

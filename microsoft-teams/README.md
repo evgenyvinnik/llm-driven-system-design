@@ -6,13 +6,13 @@ A system design study implementing an enterprise chat platform with organization
 
 | Metric | Value |
 |--------|-------|
-| Total SLOC | 5,878 |
-| Source Files | 81 |
-| .ts | 2,521 |
-| .md | 1,445 |
-| .tsx | 1,331 |
-| .sql | 220 |
-| .json | 163 |
+| Total SLOC | 8,578 |
+| Source Files | 90 |
+| .ts | 4,597 |
+| .tsx | 1,803 |
+| .md | 1,555 |
+| .sql | 261 |
+| .json | 164 |
 
 
 ## Architecture
@@ -35,6 +35,8 @@ docker-compose up -d
 cd backend
 npm install
 npm run db:migrate
+# Seed users, orgs, teams, channels and messages (password123 for everyone)
+cat db-seed/seed.sql | docker exec -i teams-postgres psql -U teams -d teams
 npm run dev
 
 # Frontend setup (new terminal)
@@ -84,12 +86,18 @@ Then follow the backend/frontend setup steps above.
 
 ## Getting Started
 
-1. Register a new account at http://localhost:5173/register
-2. Create an organization
-3. Create a team (a "General" channel is auto-created)
-4. Start chatting!
+Sign in as one of the seeded users (password `password123` for all of them). Each one shows a different part of the access model:
 
-To test multi-user chat, open a second browser window and register another account.
+| User | What they show |
+|------|----------------|
+| `alice` | Owner of Acme, Engineering and the private Leadership team. Member of the private `#incident-response` channel. Has 2 unread messages in `#deployments`. She can't leave Engineering until someone else is an owner. |
+| `bob` | On Engineering but not in `#incident-response`: it isn't in his channel list, and its URL says he has no access. |
+| `carol` | Owns Design and is the only member of a second org, Globex. She isn't on Engineering, so opening it shows a "Join team" panel. |
+| `dave` | In `#incident-response`. Remove him from it and his open stream closes. |
+
+Or start fresh: register at http://localhost:5173/register, create an organization, create a team with the **+** next to the team picker (a "General" channel is created with it), and start chatting. Open a second browser window as another user to watch messages, edits, deletions and reactions arrive live.
+
+Access rules in short: you see an organization only if you're in it, and a channel only if you're on its team (and, for a private channel, in the channel). Anything else is a 404. See [architecture.md](./architecture.md#organization-hierarchy).
 
 ## Environment Variables
 
@@ -113,10 +121,10 @@ PORT=3001
 ```bash
 npm run dev          # Start dev server with hot reload
 npm run dev:server1  # Port 3001
-npm run dev:server2  # Port 3002
+npm run dev:server2  # Port 3002 (a second instance: SSE fan-out goes through Redis pub/sub)
 npm run dev:server3  # Port 3003
 npm run build        # Compile TypeScript
-npm run test         # Run tests
+npm run test         # Run unit + route tests (vitest, no Docker needed)
 npm run lint         # Run ESLint
 npm run format       # Run Prettier
 npm run db:migrate   # Run database migrations
@@ -133,13 +141,13 @@ npm run type-check   # TypeScript type checking
 
 ## Features
 
-- **Organizations**: Create and manage organizations with member roles
-- **Teams**: Create teams within organizations (public/private)
-- **Channels**: Topic-based channels within teams
-- **Messaging**: Real-time chat with message editing and deletion
+- **Organizations**: Create and manage organizations with owner/admin/member roles
+- **Teams**: Create, join (public), leave teams; private teams are invisible to non-members; every team keeps an owner
+- **Channels**: Public channels open to the whole team, private channels by invitation, unread badges
+- **Messaging**: Real-time chat with editing, soft deletion, idempotent sends, and "load older" pagination
 - **Threading**: Reply to messages in side-panel threads
 - **Reactions**: Emoji reactions on messages
-- **File Sharing**: Upload and download files via MinIO
+- **File Sharing**: Attach files to messages (MinIO); downloads only for channel members
 - **Presence**: Online/offline indicators with heartbeat tracking
 - **User Search**: Find and add users to teams/channels
 

@@ -8,26 +8,29 @@ const router = Router();
 // GET /api/users/search?q=term
 router.get('/search', requireAuth, async (req: Request, res: Response) => {
   try {
-    const q = req.query.q as string;
+    const q = req.query.q;
 
-    if (!q || q.length < 2) {
+    if (typeof q !== 'string' || q.length < 2) {
       res.status(400).json({ error: 'Search query must be at least 2 characters' });
       return;
     }
 
+    // Used to find people to add to a project. Emails are matched exactly and never
+    // returned, so the endpoint can't be used to harvest every account's address.
+    const pattern = `%${q.replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
     const result = await pool.query(
-      `SELECT id, username, email, display_name
+      `SELECT id, username, display_name
        FROM users
-       WHERE (username ILIKE $1 OR email ILIKE $1 OR display_name ILIKE $1)
+       WHERE (username ILIKE $1 OR display_name ILIKE $1 OR lower(email) = lower($3))
          AND id != $2
+       ORDER BY username
        LIMIT 10`,
-      [`%${q}%`, req.session.userId],
+      [pattern, req.session.userId, q],
     );
 
     const users = result.rows.map((r) => ({
       id: r.id,
       username: r.username,
-      email: r.email,
       displayName: r.display_name,
     }));
 

@@ -116,7 +116,7 @@ GET/PUT          /api/projects/:pid/settings             connection config (PUT 
 4. Backend opens a **fresh, unpooled** connection to the target and runs the introspection queries
 5. Backend returns structured TableInfo[]; frontend renders the schema viewer directly from that shape — no client-side interpretation of raw catalog rows, because the wire format *is* the frontend's data model
 
-**Why a fresh connection instead of reusing a pool for step 4?** Pooled sessions can carry stale catalog caches; a dedicated connection guarantees the response reflects DDL that committed a moment ago. This is a backend implementation detail, but it's the mechanism underwriting a frontend promise: *what you see in the schema viewer is current*. If the backend cut this corner for speed, the frontend's entire freshness contract (Deep Dive 2) would be built on sand.
+**Is a pooled connection fresh enough for step 4?** Yes, and it's worth saying why, because the frontend's freshness contract (Deep Dive 2) rests on it. Postgres invalidates catalog caches on commit, so a pooled session sees DDL that committed a moment ago. What a pooled session *can* carry is state another user left behind: a SET, an open transaction, an advisory lock. The backend removes that where it's created, by resetting every SQL-editor session before the connection returns to the pool. *What you see in the schema viewer is current* is a property of the reset discipline, not of opening a fresh connection per page view.
 
 **The seam, stated plainly**: the frontend cannot verify freshness independently — it has no other channel into the target database. It has to *trust* that every introspection response is live. That trust is the API contract, and it's why I treat "fresh connection for introspection" as a correctness requirement, not a performance knob.
 
@@ -139,7 +139,7 @@ This is the deep dive that only makes sense told full-stack, because it's a sing
 
 **The trade-off across the stack**: extra round trips, on both sides — the backend's fresh-connection introspection and the frontend's refetch-after-mutate both spend latency to buy correctness. For a database console, that's the right trade. It would be wrong for a social feed, which is exactly why I want to be explicit that this decision is *product-specific*, not a default I reach for everywhere.
 
-## 🔧 Deep Dive 3: DDL Generation — a Form on One Side, a Sanitizer on the Other
+## 🔧 Deep Dive 3: DDL Generation — a Form on One Side, a Validator on the Other
 
 Users create and alter tables through structured forms rather than raw SQL. This flow crosses the stack more times than any other feature.
 
@@ -148,7 +148,7 @@ Users create and alter tables through structured forms rather than raw SQL. This
 1. Frontend's CreateTableModal pre-seeds an id (serial PK) and created_at (timestamptz, now() default) — the common starting point for any new table
 2. User adds columns via repeated ColumnEditor rows: name (text), type (a fixed dropdown of ~16 common PostgreSQL types, not free text), nullable, primary key, default
 3. Frontend submits structured column definitions as JSON — never a SQL string — to POST `/api/projects/:pid/tables`
-4. Backend's DDL generator builds the CREATE statement from these definitions, sanitizing every identifier (strip to alphanumeric-and-underscore, quote reserved words) before it ever touches a query string
+4. Backend's DDL generator builds the CREATE statement from these definitions. It quotes every identifier, rejects invalid new names (never silently rewriting them), and checks the type and default slots against patterns before anything touches a query string
 5. Backend executes against the target and returns the generated SQL alongside the result
 6. Frontend shows that generated SQL in a confirmation toast — a deliberate transparency feature, not just a debug aid
 7. Frontend refetches the schema domain and renders the new table from live introspection
@@ -157,11 +157,11 @@ Users create and alter tables through structured forms rather than raw SQL. This
 
 | Approach | Pros | Cons |
 |----------|------|------|
-| ✅ Structured form (frontend) → sanitized generator (backend) | Validated before submission, injection-safe by construction, guided UX | Limited to ~16 types and common constraints |
+| ✅ Structured form (frontend) → validating generator (backend) | Validated before submission, injection-safe by construction, guided UX | Limited to ~16 types and common constraints |
 | ❌ Raw SQL textarea only, no structured path | Full flexibility from day one | No client-side validation; every table-creation typo is a round trip and a cryptic Postgres error |
-| ❌ Client-side SQL string building, backend executes as-is | Simple backend | Identifier sanitization now has to happen in the browser, where it can't be trusted — the backend must re-validate anyway, so the frontend's work is redundant *and* the security boundary is in the wrong place |
+| ❌ Client-side SQL string building, backend executes as-is | Simple backend | Identifier quoting and validation now have to happen in the browser, where they can't be trusted — the backend must re-validate anyway, so the frontend's work is redundant *and* the security boundary is in the wrong place |
 
-> "The type dropdown is a frontend UX decision with a backend security consequence, and that pairing is the interesting part. Free-text type input would need backend validation against the real PostgreSQL type catalog anyway — so constraining it in the UI doesn't remove backend work, but it does turn a class of errors (typo'd type name) from a server round trip into instant client-side feedback. Meanwhile the identifier sanitizer is backend-only and non-negotiable regardless of what the frontend sends, because the frontend's dropdown constrains the common path but a malicious client can still POST whatever JSON it wants directly to the API. The frontend UX and the backend security boundary are solving different problems that happen to line up on the same feature."
+> "The type dropdown is a frontend UX decision with a backend security consequence, and that pairing is the interesting part. Free-text type input would need backend validation against the real PostgreSQL type catalog anyway — so constraining it in the UI doesn't remove backend work, but it does turn a class of errors (typo'd type name) from a server round trip into instant client-side feedback. Meanwhile the backend's validation is non-negotiable regardless of what the frontend sends, because the frontend's dropdown constrains the common path but a malicious client can still POST whatever JSON it wants directly to the API — including a "type" like INT followed by a second statement, which is exactly what the type pattern exists to refuse. The frontend UX and the backend security boundary are solving different problems that happen to line up on the same feature."
 
 **The 80/20 boundary is enforced consistently on both sides**: the type dropdown and the alter-table operations (add/drop/rename column only, no type changes) cover common cases; anything beyond — partial indexes, CHECK constraints, custom types, column type changes with USING casts — routes to the SQL editor on the frontend and the unrestricted execute path on the backend. Neither side pretends to support more than it does.
 
@@ -229,17 +229,18 @@ your own table is legitimate.
                   │  (their credentials) │
                   └──────────────────────┘
 
-   our metadata DB  ← never reachable from this path, separate pool, separate creds
+   our metadata DB  ← refused on this path: each new pool checks server identity
 ```
 
-Four properties carry the whole model:
+Five properties carry the whole model:
 
 | Control | What it prevents |
 |---------|------------------|
 | **Connection is project-scoped** | A query can only ever touch the database the caller is authorized for — there is no connection object in that path that can reach another tenant |
-| **Separate pool and credentials for metadata** | No user SQL can read our `projects`, `users`, or stored connection secrets, because that database isn't on the other end of this socket |
+| **Target is never the metadata server** | Separate pools and credentials aren't enough when users choose the host: a project at our own database's address turns the editor into a reader of every hash and secret. Each new pool compares the server's identity with ours and refuses a match, whatever alias reached it |
 | **Statement timeout** | A runaway or deliberately expensive query burns the user's own database, then gets cut — it can't hold our worker indefinitely |
-| **Authorization before execution** | Project membership is checked against metadata before a target connection is even acquired |
+| **Authorization before execution** | Project membership is checked against metadata before a target connection is even acquired; viewers' statements run in a READ ONLY transaction |
+| **Clean sessions** | One statement per request, then rollback and reset before the connection is reused, so no user's SET, lock or open transaction reaches the next request |
 
 ### What we're accepting
 
@@ -319,7 +320,7 @@ The two halves need different signals because they're diagnosing different failu
 |----------|--------|-------------|-----------|
 | Database architecture | ✅ Two PostgreSQL instances | ❌ Single DB, schema separation | No namespace collision, no shared blast radius, external DBs are the product |
 | Freshness contract | ✅ Fresh-read backend + refetch-after-mutate frontend | ❌ Cache-and-patch on either side | A one-sided contract fails exactly when correctness matters most |
-| DDL path | ✅ Structured form + backend sanitizer | ❌ Raw SQL only, or client-built SQL | Guided UX and the real security boundary land in the right places |
+| DDL path | ✅ Structured form + backend validation | ❌ Raw SQL only, or client-built SQL | Guided UX and the real security boundary land in the right places |
 | Auth simulation | ✅ Metadata-DB CRUD, no JWT | ❌ Full GoTrue-equivalent build | Right-sized scope; neither side pretends to support what isn't built |
 | Connection pooling | ✅ Cached per-project pools | ❌ Per-request connections | Amortizes 50-100ms setup; frontend never sees the difference |
 | Error surface | ✅ Verbatim PostgreSQL errors, both layers | ❌ Sanitized generic errors | For this audience the error text is the product |

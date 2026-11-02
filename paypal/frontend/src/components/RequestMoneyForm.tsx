@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { requestsApi } from '../services/api';
 import { UserSearch } from './UserSearch';
 import type { User } from '../types';
+import { formatCents, parseDollarsToCents } from '../utils/money';
 
 interface RequestMoneyFormProps {
   onSuccess: () => void;
@@ -24,9 +25,9 @@ export function RequestMoneyForm({ onSuccess }: RequestMoneyFormProps) {
       return;
     }
 
-    const amountCents = Math.round(parseFloat(amount) * 100);
-    if (isNaN(amountCents) || amountCents <= 0) {
-      setError('Please enter a valid amount');
+    const amountCents = parseDollarsToCents(amount);
+    if (amountCents === null) {
+      setError('Please enter a valid amount (up to two decimal places)');
       return;
     }
 
@@ -90,7 +91,7 @@ export function RequestMoneyForm({ onSuccess }: RequestMoneyFormProps) {
           disabled={submitting || !payer || !amount}
           className="w-full py-3 bg-paypal-primary text-white rounded-lg hover:bg-paypal-hover font-medium disabled:opacity-50 text-lg"
         >
-          {submitting ? 'Requesting...' : `Request ${amount ? `$${parseFloat(amount).toFixed(2)}` : 'Money'}`}
+          {submitting ? 'Requesting...' : `Request ${parseDollarsToCents(amount) ? formatCents(parseDollarsToCents(amount)!) : 'Money'}`}
         </button>
       </form>
     </div>

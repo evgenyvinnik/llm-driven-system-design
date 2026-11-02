@@ -2,18 +2,32 @@ import { useRef, useEffect } from 'react';
 import { useChatStore } from '../stores/chatStore';
 import { MessageList } from './MessageList';
 import { MessageInput } from './MessageInput';
+import { EmptyPane } from './EmptyPane';
 
 /** Main chat area with message list, input, and auto-scroll on new messages. */
 export function ChatArea() {
-  const { messages, currentChannelId, channels, loading, sendMessage, toggleMemberList } =
-    useChatStore();
+  const {
+    messages,
+    currentChannelId,
+    channels,
+    loading,
+    loadingOlder,
+    hasMoreMessages,
+    channelError,
+    sendMessage,
+    loadMoreMessages,
+    toggleMemberList,
+  } = useChatStore();
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   const currentChannel = channels.find((c) => c.id === currentChannelId);
+  const lastMessageId = messages.length > 0 ? messages[messages.length - 1].id : null;
 
+  // Scroll to the bottom when a message is appended, not on every change —
+  // prepending older history must leave the reader where they were.
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages]);
+  }, [lastMessageId]);
 
   if (!currentChannelId) {
     return (
@@ -23,15 +37,21 @@ export function ChatArea() {
     );
   }
 
+  if (channelError) {
+    return <EmptyPane title={channelError} body="Pick another channel from the list." />;
+  }
+
   return (
-    <div className="flex-1 flex flex-col bg-teams-bg">
+    <div className="flex-1 flex flex-col bg-teams-bg min-w-0">
       {/* Channel header */}
       <div className="h-12 bg-teams-surface border-b border-teams-border flex items-center justify-between px-4">
-        <div className="flex items-center gap-2">
-          <span className="text-teams-secondary">#</span>
+        <div className="flex items-center gap-2 min-w-0">
+          <span className="text-teams-secondary">{currentChannel?.is_private ? '🔒' : '#'}</span>
           <h2 className="font-semibold text-teams-text">{currentChannel?.name || 'Channel'}</h2>
           {currentChannel?.description && (
-            <span className="text-sm text-teams-secondary ml-2">{currentChannel.description}</span>
+            <span className="text-sm text-teams-secondary ml-2 truncate">
+              {currentChannel.description}
+            </span>
           )}
         </div>
         <div className="flex items-center gap-2">
@@ -59,14 +79,26 @@ export function ChatArea() {
           </div>
         ) : (
           <>
+            {hasMoreMessages && (
+              <div className="flex justify-center py-2">
+                <button
+                  data-testid="load-older"
+                  onClick={loadMoreMessages}
+                  disabled={loadingOlder}
+                  className="text-xs text-teams-primary hover:underline disabled:opacity-50"
+                >
+                  {loadingOlder ? 'Loading...' : 'Load older messages'}
+                </button>
+              </div>
+            )}
             <MessageList messages={messages} />
             <div ref={messagesEndRef} />
           </>
         )}
       </div>
 
-      {/* Input */}
-      <MessageInput onSend={sendMessage} channelId={currentChannelId} />
+      {/* Input (keyed so a draft or pending upload never carries into another channel) */}
+      <MessageInput key={currentChannelId} onSend={sendMessage} channelId={currentChannelId} />
     </div>
   );
 }

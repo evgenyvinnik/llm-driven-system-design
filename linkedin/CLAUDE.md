@@ -49,6 +49,7 @@ Intentionally omitted: precomputed 2nd-degree graph tables, the connection path-
 - **Async fan-out via RabbitMQ added.** Post/profile/notification events were moved onto `FEED_FANOUT` / `SEARCH_INDEX` / `NOTIFICATIONS` queues so ES reindexing and notifications no longer block the write path.
 - **README service-list drift (this pass).** The "Start Infrastructure" step and Tech Stack listed only Postgres/Redis/Elasticsearch and omitted RabbitMQ, which `docker-compose.yml` starts and the routes depend on. Added, and a `db:migrate` step added before `npm run seed` (schema also auto-applies via the `docker-entrypoint-initdb.d` init.sql mount on a fresh volume).
 - **CLAUDE.md rewrite (this pass).** Replaced the Phase 1–4 checklist (with a stale "Phase 2: IN PROGRESS") with architecture + decision rationale grounded in `connectionService.ts` and `feedService.ts`. The PYMK weights and feed signals here are taken from the actual scoring code.
+- **2026-11-01 — the job detail page was unreachable:** under TanStack flat routing `jobs.tsx` was the parent of `jobs.$jobId.tsx` but never rendered `<Outlet/>`, so navigating there changed the URL while the parent page kept rendering. Renamed the parent to `jobs.index.tsx` so they are siblings, and regenerated `routeTree.gen.ts`. Any `X.tsx` + `X.<more>.tsx` pair needs an `<Outlet/>` in `X` or an `X.index.tsx`.
 
 ## Open Questions
 

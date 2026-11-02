@@ -8,8 +8,7 @@ import type {
   Comment,
   Template,
   Approval,
-  SearchResult,
-} from '../types';
+  SearchResult, SpaceAccessInfo } from '../types';
 
 const API_BASE = '/api/v1';
 
@@ -65,7 +64,7 @@ export async function getSpaces(): Promise<{ spaces: Space[] }> {
 }
 
 /** Fetches a single space by its key. */
-export async function getSpace(key: string): Promise<{ space: Space }> {
+export async function getSpace(key: string): Promise<{ space: Space; access: SpaceAccessInfo }> {
   return request(`${API_BASE}/spaces/${key}`);
 }
 
@@ -123,6 +122,8 @@ export async function updatePage(
     contentHtml?: string;
     contentText?: string;
     changeMessage?: string;
+    /** The version this edit was based on; the server refuses (409) if it moved on. */
+    version?: number;
   },
 ): Promise<{ page: Page }> {
   return request(`${API_BASE}/pages/${id}`, {
@@ -241,6 +242,8 @@ export async function getPendingApprovals(): Promise<{ approvals: Approval[] }> 
 }
 
 /** Fetches all approvals for a specific page. */
-export async function getPageApprovals(pageId: string): Promise<{ approvals: Approval[] }> {
+export async function getPageApprovals(
+  pageId: string,
+): Promise<{ approvals: Approval[]; canReview: boolean }> {
   return request(`${API_BASE}/approvals/page/${pageId}`);
 }

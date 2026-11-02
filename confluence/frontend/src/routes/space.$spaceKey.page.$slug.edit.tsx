@@ -69,16 +69,18 @@ function PageEditView() {
         });
       } else {
         if (!currentPage) return;
-        await api.updatePage(currentPage.id, {
+        const { page } = await api.updatePage(currentPage.id, {
           title,
           contentHtml,
           contentText,
           contentJson: {},
           changeMessage: changeMessage || undefined,
+          version: currentPage.version,
         });
+        // A rename changes the slug; the old one no longer resolves.
         navigate({
           to: '/space/$spaceKey/page/$slug',
-          params: { spaceKey, slug: currentPage.slug },
+          params: { spaceKey, slug: page.slug },
         });
       }
     } catch (err) {

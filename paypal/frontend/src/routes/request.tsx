@@ -2,6 +2,7 @@ import { createFileRoute, useNavigate } from '@tanstack/react-router';
 import { useEffect, useState } from 'react';
 import { useAuthStore } from '../stores/authStore';
 import { RequestMoneyForm } from '../components/RequestMoneyForm';
+import { OutgoingRequests } from '../components/OutgoingRequests';
 
 function RequestPage() {
   const user = useAuthStore((s) => s.user);
@@ -57,6 +58,7 @@ function RequestPage() {
     <div className="max-w-xl mx-auto px-4 py-8">
       <h1 className="text-2xl font-bold text-paypal-text mb-6">Request Money</h1>
       <RequestMoneyForm onSuccess={() => setSuccess(true)} />
+      <OutgoingRequests currentUserId={user.id} />
     </div>
   );
 }

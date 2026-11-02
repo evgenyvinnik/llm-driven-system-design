@@ -1,20 +1,21 @@
 import http from 'http';
-import { WebSocketServer } from 'ws';
-import { app } from './app.js';
+import { app, sessionMiddleware } from './app.js';
 import config from './config/index.js';
 import redis from './services/redis.js';
 import logger, { logError } from './services/logger.js';
 import pool from './services/db.js';
 import { setupWebSocket } from './websocket/handler.js';
+import { flushAllRooms } from './websocket/rooms.js';
+
+let server: http.Server | null = null;
 
 const startServer = async (): Promise<void> => {
   try {
     // Create HTTP server from Express app
-    const server = http.createServer(app);
+    server = http.createServer(app);
 
-    // Create WebSocket server attached to the same HTTP server
-    const wss = new WebSocketServer({ server, path: '/ws' });
-    setupWebSocket(wss);
+    // Collaboration WebSocket on the same server, authenticated by the session cookie
+    setupWebSocket(server, sessionMiddleware);
 
     // Start the server
     server.listen(config.port, () => {
@@ -35,8 +36,25 @@ const startServer = async (): Promise<void> => {
 };
 
 // Graceful shutdown
+let shuttingDown = false;
+
 const gracefulShutdown = async (signal: string): Promise<void> => {
+  // A signal can arrive twice (e.g. relayed by tsx and sent directly); a second
+  // run would close the pool or exit while the first is still saving rooms.
+  if (shuttingDown) return;
+  shuttingDown = true;
   logger.info({ signal }, `Received ${signal}, starting graceful shutdown`);
+
+  // Stop accepting work, then save every open room before the pool closes:
+  // otherwise up to one debounce window of edits per room is lost on restart.
+  server?.close();
+  server?.closeAllConnections();
+  try {
+    await flushAllRooms();
+    logger.info('Open rooms saved');
+  } catch (err) {
+    logError(err as Error, { context: 'shutdown', component: 'rooms' });
+  }
 
   try {
     await pool.end();

@@ -1,4 +1,4 @@
-import { createFileRoute, Outlet, useNavigate } from '@tanstack/react-router';
+import { createFileRoute, Link, Outlet, useNavigate } from '@tanstack/react-router';
 import { useEffect } from 'react';
 import { useAuthStore } from '../stores/authStore';
 import { useProjectStore } from '../stores/projectStore';
@@ -8,7 +8,9 @@ import { Breadcrumb } from '../components/Breadcrumb';
 function ProjectLayout() {
   const { projectId } = Route.useParams();
   const { user, loading: authLoading } = useAuthStore();
-  const { currentProject, loadProject } = useProjectStore();
+  const { currentProject, projectError, loadProject } = useProjectStore();
+  // Children render only once the project (and so the caller's role) is known for this ID.
+  const ready = currentProject?.id === projectId;
   const navigate = useNavigate();
 
   useEffect(() => {
@@ -39,7 +41,23 @@ function ProjectLayout() {
       <div className="flex-1 flex flex-col overflow-hidden">
         <Breadcrumb projectName={currentProject?.name || 'Project'} />
         <main className="flex-1 overflow-auto">
-          <Outlet />
+          {projectError ? (
+            <div className="flex items-center justify-center h-full text-center">
+              <div>
+                <p className="text-lg text-supabase-text mb-2">Project not found</p>
+                <p className="text-sm text-supabase-secondary mb-4">
+                  It doesn&apos;t exist, or you aren&apos;t a member of it.
+                </p>
+                <Link to="/" className="text-supabase-primary hover:text-supabase-hover text-sm">
+                  Back to projects
+                </Link>
+              </div>
+            </div>
+          ) : ready ? (
+            <Outlet />
+          ) : (
+            <div className="p-6 text-supabase-secondary">Loading project...</div>
+          )}
         </main>
       </div>
     </div>

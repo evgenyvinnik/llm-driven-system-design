@@ -20,17 +20,29 @@ export const renderCanvas = (
   viewState: ViewState,
   selectedElementId: string | null,
   canvasWidth: number,
-  canvasHeight: number
+  canvasHeight: number,
+  pixelRatio: number = 1,
+  draft: ExcalidrawElement | null = null
 ): void => {
-  // Clear canvas
+  // Screen space: CSS pixels scaled to the backing store's device pixels.
+  ctx.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
   ctx.clearRect(0, 0, canvasWidth, canvasHeight);
 
   // Draw grid background
   drawGrid(ctx, viewState, canvasWidth, canvasHeight);
 
-  // Apply viewport transform
+  // World space. setTransform REPLACES the current matrix, so the pixel ratio
+  // has to be folded in here; replacing it with the bare viewport transform
+  // drew every shape at 1/pixelRatio size while hit testing assumed full size.
   ctx.save();
-  ctx.setTransform(viewState.zoom, 0, 0, viewState.zoom, viewState.scrollX, viewState.scrollY);
+  ctx.setTransform(
+    pixelRatio * viewState.zoom,
+    0,
+    0,
+    pixelRatio * viewState.zoom,
+    pixelRatio * viewState.scrollX,
+    pixelRatio * viewState.scrollY
+  );
 
   // Render all visible elements
   for (const element of elements) {
@@ -38,6 +50,13 @@ export const renderCanvas = (
 
     ctx.save();
     renderElement(ctx, element);
+    ctx.restore();
+  }
+
+  // The shape being drawn, before it is committed
+  if (draft) {
+    ctx.save();
+    renderElement(ctx, draft);
     ctx.restore();
   }
 
@@ -146,21 +165,6 @@ const drawSelectionBox = (ctx: CanvasRenderingContext2D, element: ExcalidrawElem
     ctx.fillRect(corner.x - handleSize / 2, corner.y - handleSize / 2, handleSize, handleSize);
     ctx.strokeRect(corner.x - handleSize / 2, corner.y - handleSize / 2, handleSize, handleSize);
   }
-};
-
-/**
- * Render a preview element (while drawing).
- */
-/** Renders a small preview thumbnail of the drawing for the drawing list. */
-export const renderPreview = (
-  ctx: CanvasRenderingContext2D,
-  element: ExcalidrawElement,
-  viewState: ViewState
-): void => {
-  ctx.save();
-  ctx.setTransform(viewState.zoom, 0, 0, viewState.zoom, viewState.scrollX, viewState.scrollY);
-  renderElement(ctx, element);
-  ctx.restore();
 };
 
 export default renderCanvas;

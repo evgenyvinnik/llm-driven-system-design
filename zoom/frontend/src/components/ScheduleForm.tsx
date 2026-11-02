@@ -15,18 +15,39 @@ export function ScheduleForm() {
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
 
+  // One key per filled-in form: a double submit or retry returns the same meeting.
+  const [idempotencyKey] = useState(() => crypto.randomUUID());
+  const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
-    setLoading(true);
 
+    // datetime-local values carry no zone ("2026-11-02T10:00"); sent as-is the
+    // server read them as UTC, shifting the meeting by the user's offset.
+    // new Date() interprets them in the browser's zone; toISOString() makes that explicit.
+    const start = scheduledStart ? new Date(scheduledStart) : null;
+    const end = scheduledEnd ? new Date(scheduledEnd) : null;
+    if (end && !start) {
+      setError('Set a start time before an end time');
+      return;
+    }
+    if (start && end && end <= start) {
+      setError('End time must be after start time');
+      return;
+    }
+
+    setLoading(true);
     try {
-      const result = await api.createMeeting({
-        title: title || 'Untitled Meeting',
-        scheduledStart: scheduledStart || undefined,
-        scheduledEnd: scheduledEnd || undefined,
-        settings: { muteOnEntry, waitingRoom, allowScreenShare, maxParticipants },
-      });
+      const result = await api.createMeeting(
+        {
+          title: title || 'Untitled Meeting',
+          scheduledStart: start?.toISOString(),
+          scheduledEnd: end?.toISOString(),
+          settings: { muteOnEntry, waitingRoom, allowScreenShare, maxParticipants },
+        },
+        idempotencyKey
+      );
       const meeting = result.meeting;
       const code = (meeting.meeting_code as string) || (meeting.meetingCode as string);
       navigate({ to: '/meeting/$code', params: { code } });
@@ -57,6 +78,7 @@ export function ScheduleForm() {
       </div>
 
       <div className="grid grid-cols-2 gap-4">
+        <p className="col-span-2 text-xs text-zoom-secondary -mb-2">Times are in your time zone ({timeZone}).</p>
         <div>
           <label className="block text-sm font-medium text-zoom-secondary mb-1">Start Time</label>
           <input
@@ -115,7 +137,7 @@ export function ScheduleForm() {
           <input
             type="number"
             value={maxParticipants}
-            onChange={(e) => setMaxParticipants(parseInt(e.target.value) || 100)}
+            onChange={(e) => setMaxParticipants(Math.min(1000, Math.max(2, parseInt(e.target.value) || 100)))}
             min={2}
             max={1000}
             className="w-24 bg-zoom-surface border border-zoom-card rounded-lg px-3 py-2 text-zoom-text text-sm focus:outline-none focus:border-zoom-primary"

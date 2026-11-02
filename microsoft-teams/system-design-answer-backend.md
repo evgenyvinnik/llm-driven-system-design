@@ -50,10 +50,10 @@ Creating a team automatically creates a "General" channel and adds the creator t
 | organizations | id (UUID PK), name, slug (unique), created_by (FK users) | slug | Top-level container |
 | org_members | id, org_id (FK), user_id (FK), role | (org_id, user_id) unique, user_id | Roles: owner, admin, member |
 | teams | id, org_id (FK), name, is_private, created_by (FK) | org_id | Cascade delete from org |
-| team_members | id, team_id (FK), user_id (FK), role | (team_id, user_id) unique, user_id | Roles: owner, member |
-| channels | id, team_id (FK), name, is_private, created_by (FK) | team_id | Cascade delete from team |
+| team_members | id, team_id (FK), user_id (FK), role | (team_id, user_id) unique, user_id | Roles: owner, admin, member; always at least one owner |
+| channels | id, team_id (FK), name, is_private, created_by (FK) | team_id, (team_id, lower(name)) unique | Cascade delete from team |
 | channel_members | id, channel_id (FK), user_id (FK), last_read_at | (channel_id, user_id) unique, user_id | Read tracking per user |
-| messages | id, channel_id (FK), user_id (FK), parent_message_id (self FK), content, is_edited | (channel_id, created_at DESC), parent_message_id | Thread via self-reference |
+| messages | id, channel_id (FK), user_id (FK), parent_message_id (self FK), content, is_edited, deleted_at | (channel_id, created_at DESC, id DESC), parent_message_id | Thread via self-reference; soft delete keeps replies attached |
 | message_reactions | id, message_id (FK), user_id (FK), emoji | message_id, (message_id, user_id, emoji) unique | One reaction per emoji per user |
 | files | id, message_id (FK), channel_id (FK), user_id (FK), filename, storage_path, size_bytes | channel_id, message_id | Cascade delete from message |
 
@@ -89,12 +89,14 @@ GET  /api/organizations             → List user's orgs
 POST /api/organizations             → Create org (auto-adds creator as owner)
 GET  /api/organizations/:id         → Get org details
 GET  /api/organizations/:id/members → List org members
-POST /api/organizations/:id/members → Add member
+POST /api/organizations/:id/members → Add member (owners/admins; only owners grant admin/owner)
+PATCH/DELETE /api/organizations/:id/members/:userId → Change role / leave or remove
 GET  /api/teams?orgId=xxx           → List teams in org
 POST /api/teams                     → Create team (auto-creates General channel)
 GET  /api/teams/:id                 → Get team details
 GET  /api/teams/:id/members         → List team members
-POST /api/teams/:id/members         → Add member
+POST /api/teams/:id/members         → Join a public team, or add a member (owners/admins)
+PATCH/DELETE /api/teams/:id/members/:userId → Change role / leave or remove (last owner refused)
 ```
 
 ### Channels and Messaging
@@ -103,9 +105,10 @@ GET  /api/channels?teamId=xxx                 → List channels
 POST /api/channels                            → Create channel
 GET  /api/channels/:id                        → Get channel details
 GET  /api/channels/:id/members                → List channel members
-POST /api/channels/:id/members                → Add member
+POST /api/channels/:id/members                → Add a team member to the channel
+DELETE /api/channels/:id/members/:userId      → Leave or remove (private channels)
 POST /api/channels/:id/read                   → Mark as read
-GET  /api/messages?channelId=xxx&before=ts    → Paginated messages
+GET  /api/messages?channelId=xxx&before=id    → Paginated messages + hasMore
 POST /api/messages                            → Send message
 PUT  /api/messages/:id                        → Edit message (owner only)
 DELETE /api/messages/:id                      → Delete message (owner only)
@@ -127,7 +130,7 @@ GET    /api/users/search?q=xxx       → Search users by name
 
 ### Pagination Design
 
-> "Messages use cursor-based pagination with a `before` timestamp parameter rather than offset-based pagination. With offset pagination, new messages arriving between page loads shift all offsets -- page 2 at offset 50 would include messages from page 1 if 5 new messages were posted. Cursor pagination anchors to a timestamp, guaranteeing no duplicates or gaps regardless of concurrent writes."
+> "Messages use cursor-based pagination rather than offset-based pagination. With offset pagination, new messages arriving between page loads shift all offsets -- page 2 at offset 50 would include messages from page 1 if 5 new messages were posted. The cursor is the id of the oldest message the client already has, and the server compares on the pair (created_at, id). A bare timestamp cursor looks equivalent and isn't: two messages can share a created_at, and a timestamp that round-trips through JSON loses Postgres's microseconds, so the messages sitting on a page boundary get skipped. Resolving the cursor row server-side keeps full precision, and the id breaks ties."
 
 ## 🔒 Security and Rate Limiting
 
@@ -169,11 +172,13 @@ Session-based authentication using Redis-backed express-session with HTTP-only, 
 ### SSE Connection Management
 
 Each server maintains a `Map<channelId, Set<SSEClient>>`. When a client connects:
+- Server takes the user from the session cookie and checks channel access first; a refused stream is a plain 404, which also stops EventSource from retrying
 - Server sets SSE headers (text/event-stream, no-cache, keep-alive, X-Accel-Buffering: no)
 - Subscribes to the Redis pub/sub channel if not already subscribed
 - Adds client to the in-memory map
 - Sends periodic heartbeat comments every 30 seconds to prevent proxy timeout
 - On disconnect, removes client from the set and unsubscribes from Redis if set is empty
+- When someone loses access (left or removed from the channel, team or org), a `member_removed` event goes through pub/sub and every instance closes that user's open streams
 
 The `X-Accel-Buffering: no` header is critical for nginx reverse proxies -- without it, nginx buffers SSE events and delivers them in bursts rather than streaming immediately.
 
@@ -308,6 +313,8 @@ I'd walk the chain. The costs are asymmetric in a way that makes this lopsided: 
 
 **What this costs at scale:** every message read carries a membership join, so the hot path grows a dependency on tables that change rarely but are read constantly. The right escape hatch, if it ever becomes necessary, isn't to skip the check but to cache the *narrowest* part of it — an org-level membership set per user, which changes on the order of days — while still verifying channel membership per request. That keeps the fast-moving, security-critical half authoritative and caches only the half that's nearly static.
 
+**Revocation has to reach open connections too.** A stream is authorized once, when it opens. Without more, a member removed from a private channel keeps receiving its messages until their browser happens to reconnect, which could be hours. So removal publishes a `member_removed` event on the channel. Every instance closes that user's streams, and their reconnect is refused by the same membership check. Two related rules: anything the caller can't see is a 404, never a 403, so IDs from another tenant can't be probed for existence; and every team and org keeps at least one owner. That last check runs under a lock on the parent row, so two owners leaving at the same moment can't both pass a "2 owners left" test.
+
 **Private channels are where the model earns its keep.** `channels.is_private` means team membership is no longer sufficient — a user can be on the team and still not belong in the channel. A model that treated channel access as derived from team access would have no way to express that, and adding private channels later would require rewriting every authorization path. Carrying `channel_members` from the start costs a table and a join; retrofitting it would cost an audit of every query in the system.
 
 ### Typing Indicators: The Case Against Building Them
@@ -336,11 +343,11 @@ It's also the strongest argument the WebSocket side has. Typing is genuinely cli
 - **Phase 4**: CQRS -- PostgreSQL for writes, Elasticsearch for search, Cassandra for reads
 - **Phase 5**: Multi-region with per-region storage and cross-region metadata sync
 
-### The Subscription Leak
+### Subscription Lifecycle
 
-One honest note on the pub/sub layer: subscribing happens on every SSE connect, and unsubscribing — though implemented — is never called on disconnect. Each instance's subscription set therefore only grows for the life of the process.
+One subtle point on the pub/sub layer: an instance should hold a Redis subscription only for channels someone on that instance is watching. The naive versions both fail. Subscribing on every connect and never unsubscribing is a slow leak with an unpleasant shape: memory grows monotonically, a restart appears to "fix" it, and the symptom is periodic unexplained instance churn rather than anything pointing at pub/sub. Unsubscribing on every disconnect is worse, because it silently cuts off the other clients on that instance still watching the same channel.
 
-At this scale nothing breaks; Redis handles thousands of subscriptions without noticing. At real scale it's a slow leak with an unpleasant shape: memory grows monotonically, a restart appears to "fix" it, and the symptom shows up as periodic unexplained instance churn rather than as anything pointing at pub/sub. The fix is to reference-count subscriptions per channel and unsubscribe when the last local client for that channel disconnects — not to unsubscribe on every disconnect, which would silently cut off the other clients on that instance still watching the same channel.
+So subscriptions are reference-counted per channel: the first local client subscribes, the last one to leave unsubscribes. The count changes synchronously before any network call, so a disconnect and a new connect racing on the same channel issue UNSUBSCRIBE then SUBSCRIBE in order on the single subscriber connection, and the newcomer still ends up subscribed.
 
 ## ⚖️ Trade-offs Summary
 

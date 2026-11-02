@@ -23,9 +23,9 @@ function RootComponent() {
   return (
     <div className="min-h-screen bg-salesforce-bg">
       {user && <Sidebar />}
-      <div className={user ? 'ml-56' : ''}>
+      <main className={user ? 'ml-56' : ''}>
         <Outlet />
-      </div>
+      </main>
     </div>
   );
 }

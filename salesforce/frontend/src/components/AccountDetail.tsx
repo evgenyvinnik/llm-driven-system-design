@@ -4,6 +4,7 @@ import { accountsApi, activitiesApi } from '../services/api';
 import { StatusBadge } from './StatusBadge';
 import { ActivityTimeline } from './ActivityTimeline';
 import { ActivityForm } from './ActivityForm';
+import { formatCalendarDate } from '../utils/dates';
 
 interface AccountDetailProps {
   accountId: string;
@@ -175,7 +176,7 @@ export function AccountDetail({ accountId }: AccountDetailProps) {
                         <td className="py-2 font-medium text-salesforce-primary">{o.name}</td>
                         <td className="py-2"><StatusBadge status={o.stage} type="opportunity" /></td>
                         <td className="py-2">{formatCurrency(o.amount_cents)}</td>
-                        <td className="py-2">{o.close_date || '-'}</td>
+                        <td className="py-2">{formatCalendarDate(o.close_date)}</td>
                       </tr>
                     ))}
                   </tbody>

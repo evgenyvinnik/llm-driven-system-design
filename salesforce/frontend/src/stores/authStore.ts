@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import type { User } from '../types';
 import { authApi } from '../services/api';
+import { useCrmStore } from './crmStore';
 
 interface AuthState {
   user: User | null;
@@ -23,6 +24,7 @@ export const useAuthStore = create<AuthState>((set) => ({
     set({ loading: true, error: null });
     try {
       const { user } = await authApi.login(username, password);
+      useCrmStore.getState().reset();
       set({ user, loading: false });
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Login failed';
@@ -49,6 +51,7 @@ export const useAuthStore = create<AuthState>((set) => ({
     } catch {
       // ignore
     }
+    useCrmStore.getState().reset();
     set({ user: null, loading: false });
   },
 

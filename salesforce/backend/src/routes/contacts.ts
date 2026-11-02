@@ -1,96 +1,101 @@
 import { Router, Request, Response } from 'express';
 import { pool } from '../services/db.js';
 import { requireAuth } from '../middleware/auth.js';
-import { logger } from '../services/logger.js';
+import {
+  callerFrom,
+  isUuid,
+  ownerScope,
+  requireRecord,
+  requireReference,
+  respondError,
+  whereClause,
+  HttpError,
+} from '../services/accessPolicy.js';
+import { containsPattern, parsePagination, queryString } from '../services/queryParams.js';
 
 const router = Router();
 
 // GET /api/contacts
 router.get('/', requireAuth, async (req: Request, res: Response) => {
   try {
-    const { search, accountId, page = '1', limit = '20' } = req.query;
-    const offset = (parseInt(page as string) - 1) * parseInt(limit as string);
-    const params: (string | number)[] = [];
-    const conditions: string[] = [];
+    const caller = callerFrom(req);
+    const { page, limit, offset } = parsePagination(req.query, 20);
+    const search = queryString(req.query.search);
+    const accountId = queryString(req.query.accountId);
+    if (accountId !== undefined && !isUuid(accountId)) {
+      throw new HttpError(400, 'accountId must be a UUID');
+    }
+    const params: unknown[] = [];
+    const conditions: (string | null)[] = [ownerScope(caller, 'c', params)];
 
     if (search) {
-      params.push(`%${search}%`);
+      params.push(containsPattern(search));
       conditions.push(`(c.first_name ILIKE $${params.length} OR c.last_name ILIKE $${params.length} OR c.email ILIKE $${params.length})`);
     }
     if (accountId) {
-      params.push(accountId as string);
+      params.push(accountId);
       conditions.push(`c.account_id = $${params.length}`);
     }
 
-    const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
-
-    params.push(parseInt(limit as string));
-    const limitParam = params.length;
-    params.push(offset);
-    const offsetParam = params.length;
+    const where = whereClause(conditions);
+    const countParams = [...params];
+    params.push(limit, offset);
 
     const result = await pool.query(
       `SELECT c.*, a.name as account_name, u.display_name as owner_name
        FROM contacts c
        LEFT JOIN accounts a ON c.account_id = a.id
        LEFT JOIN users u ON c.owner_id = u.id
-       ${whereClause}
+       ${where}
        ORDER BY c.created_at DESC
-       LIMIT $${limitParam} OFFSET $${offsetParam}`,
+       LIMIT $${params.length - 1} OFFSET $${params.length}`,
       params,
     );
 
-    const countParams = params.slice(0, params.length - 2);
-    const countResult = await pool.query(
-      `SELECT COUNT(*) FROM contacts c ${whereClause}`,
-      countParams,
-    );
+    const countResult = await pool.query(`SELECT COUNT(*) FROM contacts c ${where}`, countParams);
 
     res.json({
       contacts: result.rows,
       total: parseInt(countResult.rows[0].count),
-      page: parseInt(page as string),
-      limit: parseInt(limit as string),
+      page,
+      limit,
     });
   } catch (err) {
-    logger.error({ err }, 'Failed to fetch contacts');
-    res.status(500).json({ error: 'Internal server error' });
+    respondError(res, err, 'Failed to fetch contacts');
   }
 });
 
 // GET /api/contacts/:id
 router.get('/:id', requireAuth, async (req: Request, res: Response) => {
   try {
+    const record = await requireRecord('contact', req.params.id, callerFrom(req));
     const result = await pool.query(
       `SELECT c.*, a.name as account_name, u.display_name as owner_name
        FROM contacts c
        LEFT JOIN accounts a ON c.account_id = a.id
        LEFT JOIN users u ON c.owner_id = u.id
        WHERE c.id = $1`,
-      [req.params.id],
+      [record.id],
     );
-
-    if (result.rows.length === 0) {
-      res.status(404).json({ error: 'Contact not found' });
-      return;
-    }
-
     res.json({ contact: result.rows[0] });
   } catch (err) {
-    logger.error({ err }, 'Failed to fetch contact');
-    res.status(500).json({ error: 'Internal server error' });
+    respondError(res, err, 'Failed to fetch contact');
   }
 });
 
 // POST /api/contacts
 router.post('/', requireAuth, async (req: Request, res: Response) => {
   try {
-    const { firstName, lastName, email, phone, title, department, accountId } = req.body;
+    const { firstName, lastName, email, phone, title, department } = req.body;
+    const accountId = req.body.accountId || null;
 
     if (!firstName || !lastName) {
       res.status(400).json({ error: 'First name and last name are required' });
       return;
     }
+    // A contact can only be attached to an account the caller can see;
+    // otherwise any rep could hang records off another rep's account.
+    if (accountId) await requireReference('account', accountId, callerFrom(req));
 
     const result = await pool.query(
       `INSERT INTO contacts (first_name, last_name, email, phone, title, department, account_id, owner_id)
@@ -101,15 +106,21 @@ router.post('/', requireAuth, async (req: Request, res: Response) => {
 
     res.status(201).json({ contact: result.rows[0] });
   } catch (err) {
-    logger.error({ err }, 'Failed to create contact');
-    res.status(500).json({ error: 'Internal server error' });
+    respondError(res, err, 'Failed to create contact');
   }
 });
 
 // PUT /api/contacts/:id
 router.put('/:id', requireAuth, async (req: Request, res: Response) => {
   try {
-    const { firstName, lastName, email, phone, title, department, accountId } = req.body;
+    if (!isUuid(req.params.id)) throw new HttpError(404, 'Contact not found');
+    const caller = callerFrom(req);
+    const { firstName, lastName, email, phone, title, department } = req.body;
+    const accountId = req.body.accountId || null;
+    if (accountId) await requireReference('account', accountId, caller);
+
+    const params: unknown[] = [firstName, lastName, email, phone, title, department, accountId, req.params.id];
+    const scope = ownerScope(caller, 'contacts', params);
 
     const result = await pool.query(
       `UPDATE contacts
@@ -121,9 +132,9 @@ router.put('/:id', requireAuth, async (req: Request, res: Response) => {
            department = COALESCE($6, department),
            account_id = COALESCE($7, account_id),
            updated_at = NOW()
-       WHERE id = $8
+       WHERE id = $8 ${scope ? `AND ${scope}` : ''}
        RETURNING *`,
-      [firstName, lastName, email, phone, title, department, accountId, req.params.id],
+      params,
     );
 
     if (result.rows.length === 0) {
@@ -133,17 +144,19 @@ router.put('/:id', requireAuth, async (req: Request, res: Response) => {
 
     res.json({ contact: result.rows[0] });
   } catch (err) {
-    logger.error({ err }, 'Failed to update contact');
-    res.status(500).json({ error: 'Internal server error' });
+    respondError(res, err, 'Failed to update contact');
   }
 });
 
 // DELETE /api/contacts/:id
 router.delete('/:id', requireAuth, async (req: Request, res: Response) => {
   try {
+    if (!isUuid(req.params.id)) throw new HttpError(404, 'Contact not found');
+    const params: unknown[] = [req.params.id];
+    const scope = ownerScope(callerFrom(req), 'contacts', params);
     const result = await pool.query(
-      'DELETE FROM contacts WHERE id = $1 RETURNING id',
-      [req.params.id],
+      `DELETE FROM contacts WHERE id = $1 ${scope ? `AND ${scope}` : ''} RETURNING id`,
+      params,
     );
 
     if (result.rows.length === 0) {
@@ -153,8 +166,7 @@ router.delete('/:id', requireAuth, async (req: Request, res: Response) => {
 
     res.json({ message: 'Contact deleted' });
   } catch (err) {
-    logger.error({ err }, 'Failed to delete contact');
-    res.status(500).json({ error: 'Internal server error' });
+    respondError(res, err, 'Failed to delete contact');
   }
 });
 

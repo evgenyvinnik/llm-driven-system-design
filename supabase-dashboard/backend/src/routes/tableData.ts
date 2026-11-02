@@ -1,167 +1,162 @@
 import { Router, Request, Response } from 'express';
-import { pool } from '../services/db.js';
+import type pg from 'pg';
 import { requireAuth } from '../middleware/auth.js';
-import { executeQuery } from '../services/queryExecutor.js';
-import { logger } from '../services/logger.js';
+import { runStatement, withTargetClient } from '../services/queryExecutor.js';
+import { getTableKeyInfo, type TableKeyInfo } from '../services/schemaIntrospector.js';
+import { qualifiedTable, quoteIdent } from '../services/sqlIdentifiers.js';
+import { ApiError, respondError } from '../services/errors.js';
+import { requireProject } from '../services/projectAccess.js';
+
+/*
+ * Row CRUD for the table browser. Identifiers (table, columns) are quoted with
+ * quoteIdent — they can't be parameters — and every value is a bound `$N`
+ * parameter. Table and column names are checked against the live schema first,
+ * so a missing table is a 404 and a misspelled column a 400, and updates and
+ * deletes address rows by the table's real single-column primary key.
+ */
 
 const router = Router();
 
-async function getProjectConfig(projectId: string) {
-  const result = await pool.query(
-    'SELECT db_host, db_port, db_name, db_user, db_password FROM projects WHERE id = $1',
-    [projectId],
-  );
-  if (result.rows.length === 0) return null;
-  const r = result.rows[0];
-  return { host: r.db_host, port: r.db_port, database: r.db_name, user: r.db_user, password: r.db_password };
+async function requireTable(client: pg.ClientBase, tableName: string): Promise<TableKeyInfo> {
+  const info = await getTableKeyInfo(client, tableName);
+  if (!info) throw new ApiError(404, `Table "${tableName}" not found`);
+  return info;
 }
 
-function sanitizeIdentifier(name: string): string {
-  return name.replace(/[^a-zA-Z0-9_]/g, '');
+function requireRowData(data: unknown, allowEmpty: boolean): [string, unknown][] {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    throw new ApiError(400, 'data object is required');
+  }
+  const entries = Object.entries(data as Record<string, unknown>);
+  if (!allowEmpty && entries.length === 0) throw new ApiError(400, 'data must contain at least one column');
+  return entries;
+}
+
+function requireKnownColumns(info: TableKeyInfo, names: string[]): void {
+  const unknown = names.filter((n) => !info.columns.includes(n));
+  if (unknown.length > 0) throw new ApiError(400, `Unknown column(s): ${unknown.join(', ')}`);
+}
+
+/** The table's single primary-key column, or a 400: without one, "this row" isn't well defined. */
+function singlePrimaryKey(info: TableKeyInfo, tableName: string): string {
+  if (info.primaryKey.length !== 1) {
+    throw new ApiError(
+      400,
+      info.primaryKey.length === 0
+        ? `Table "${tableName}" has no primary key; edit its rows from the SQL editor`
+        : `Table "${tableName}" has a composite primary key; edit its rows from the SQL editor`,
+    );
+  }
+  return info.primaryKey[0];
 }
 
 // GET /api/projects/:projectId/tables/:tableName/rows
 router.get('/:projectId/tables/:tableName/rows', requireAuth, async (req: Request, res: Response) => {
   try {
-    const config = await getProjectConfig(req.params.projectId);
-    if (!config) {
-      res.status(404).json({ error: 'Project not found' });
-      return;
-    }
-
-    const tableName = sanitizeIdentifier(req.params.tableName);
-    const page = parseInt(req.query.page as string) || 1;
-    const limit = Math.min(parseInt(req.query.limit as string) || 50, 200);
+    const access = await requireProject(req, 'view');
+    const tableName = req.params.tableName;
+    const table = qualifiedTable(tableName);
+    const page = Math.max(1, parseInt(req.query.page as string, 10) || 1);
+    const limit = Math.min(Math.max(1, parseInt(req.query.limit as string, 10) || 50), 200);
     const offset = (page - 1) * limit;
-    const sortBy = req.query.sortBy ? sanitizeIdentifier(req.query.sortBy as string) : null;
+    const sortBy = typeof req.query.sortBy === 'string' && req.query.sortBy !== '' ? req.query.sortBy : null;
     const sortOrder = req.query.sortOrder === 'desc' ? 'DESC' : 'ASC';
 
-    // Get total count
-    const countResult = await executeQuery(
-      req.params.projectId,
-      config,
-      `SELECT COUNT(*) AS total FROM ${tableName}`,
-    );
-    const total = parseInt(countResult.rows[0]?.total as string) || 0;
+    const data = await withTargetClient(access.projectId, access.connection(), async (client) => {
+      const info = await requireTable(client, tableName);
+      if (sortBy) requireKnownColumns(info, [sortBy]);
 
-    // Get rows
-    const orderClause = sortBy ? `ORDER BY ${sortBy} ${sortOrder}` : '';
-    const result = await executeQuery(
-      req.params.projectId,
-      config,
-      `SELECT * FROM ${tableName} ${orderClause} LIMIT ${limit} OFFSET ${offset}`,
-    );
+      const countResult = await runStatement(client, `SELECT COUNT(*) AS total FROM ${table}`);
+      const orderClause = sortBy ? `ORDER BY ${quoteIdent(sortBy, 'sort column')} ${sortOrder}` : '';
+      const result = await runStatement(client, `SELECT * FROM ${table} ${orderClause} LIMIT $1 OFFSET $2`, [
+        limit,
+        offset,
+      ]);
+      return { result, total: parseInt(countResult.rows[0]?.total as string, 10) || 0 };
+    });
 
     res.json({
-      rows: result.rows,
-      fields: result.fields,
-      total,
+      rows: data.result.rows,
+      fields: data.result.fields,
+      total: data.total,
       page,
       limit,
-      totalPages: Math.ceil(total / limit),
+      totalPages: Math.ceil(data.total / limit),
     });
   } catch (err) {
-    logger.error({ err }, 'Failed to fetch table data');
-    const message = err instanceof Error ? err.message : 'Failed to fetch table data';
-    res.status(500).json({ error: message });
+    respondError(res, err, 'Failed to fetch table data');
   }
 });
 
 // POST /api/projects/:projectId/tables/:tableName/rows
 router.post('/:projectId/tables/:tableName/rows', requireAuth, async (req: Request, res: Response) => {
   try {
-    const config = await getProjectConfig(req.params.projectId);
-    if (!config) {
-      res.status(404).json({ error: 'Project not found' });
-      return;
-    }
+    const access = await requireProject(req, 'edit');
+    const tableName = req.params.tableName;
+    const table = qualifiedTable(tableName);
+    const entries = requireRowData(req.body?.data, true);
 
-    const tableName = sanitizeIdentifier(req.params.tableName);
-    const { data } = req.body;
+    const row = await withTargetClient(access.projectId, access.connection(), async (client) => {
+      const info = await requireTable(client, tableName);
+      requireKnownColumns(info, entries.map(([k]) => k));
 
-    if (!data || typeof data !== 'object') {
-      res.status(400).json({ error: 'data object is required' });
-      return;
-    }
+      const sql =
+        entries.length === 0
+          ? `INSERT INTO ${table} DEFAULT VALUES RETURNING *`
+          : `INSERT INTO ${table} (${entries.map(([k]) => quoteIdent(k, 'column name')).join(', ')}) ` +
+            `VALUES (${entries.map((_, i) => `$${i + 1}`).join(', ')}) RETURNING *`;
+      const result = await runStatement(client, sql, entries.map(([, v]) => v));
+      return result.rows[0];
+    });
 
-    const keys = Object.keys(data).map(sanitizeIdentifier);
-    const values = Object.values(data);
-    const placeholders = values.map((_, i) => `'${String(_).replace(/'/g, "''")}'`);
-
-    const sql = `INSERT INTO ${tableName} (${keys.join(', ')}) VALUES (${placeholders.join(', ')}) RETURNING *`;
-    const result = await executeQuery(req.params.projectId, config, sql);
-
-    res.status(201).json({ row: result.rows[0] });
+    res.status(201).json({ row });
   } catch (err) {
-    logger.error({ err }, 'Failed to insert row');
-    const message = err instanceof Error ? err.message : 'Failed to insert row';
-    res.status(500).json({ error: message });
+    respondError(res, err, 'Failed to insert row');
   }
 });
 
 // PUT /api/projects/:projectId/tables/:tableName/rows/:id
 router.put('/:projectId/tables/:tableName/rows/:id', requireAuth, async (req: Request, res: Response) => {
   try {
-    const config = await getProjectConfig(req.params.projectId);
-    if (!config) {
-      res.status(404).json({ error: 'Project not found' });
-      return;
-    }
+    const access = await requireProject(req, 'edit');
+    const tableName = req.params.tableName;
+    const table = qualifiedTable(tableName);
+    const entries = requireRowData(req.body?.data, false);
 
-    const tableName = sanitizeIdentifier(req.params.tableName);
-    const { data, primaryKey } = req.body;
+    const result = await withTargetClient(access.projectId, access.connection(), async (client) => {
+      const info = await requireTable(client, tableName);
+      requireKnownColumns(info, entries.map(([k]) => k));
+      // The real key, not the client's `primaryKey` hint.
+      const pk = singlePrimaryKey(info, tableName);
 
-    if (!data || typeof data !== 'object') {
-      res.status(400).json({ error: 'data object is required' });
-      return;
-    }
+      const setClauses = entries.map(([k], i) => `${quoteIdent(k, 'column name')} = $${i + 1}`).join(', ');
+      const sql = `UPDATE ${table} SET ${setClauses} WHERE ${quoteIdent(pk)} = $${entries.length + 1} RETURNING *`;
+      return runStatement(client, sql, [...entries.map(([, v]) => v), req.params.id]);
+    });
 
-    const pkColumn = sanitizeIdentifier(primaryKey || 'id');
-    const setClauses = Object.entries(data)
-      .map(([key, value]) => `${sanitizeIdentifier(key)} = '${String(value).replace(/'/g, "''")}'`)
-      .join(', ');
-
-    const sql = `UPDATE ${tableName} SET ${setClauses} WHERE ${pkColumn} = '${String(req.params.id).replace(/'/g, "''")}' RETURNING *`;
-    const result = await executeQuery(req.params.projectId, config, sql);
-
-    if (result.rowCount === 0) {
-      res.status(404).json({ error: 'Row not found' });
-      return;
-    }
-
+    if (result.rowCount === 0) throw new ApiError(404, 'Row not found');
     res.json({ row: result.rows[0] });
   } catch (err) {
-    logger.error({ err }, 'Failed to update row');
-    const message = err instanceof Error ? err.message : 'Failed to update row';
-    res.status(500).json({ error: message });
+    respondError(res, err, 'Failed to update row');
   }
 });
 
 // DELETE /api/projects/:projectId/tables/:tableName/rows/:id
 router.delete('/:projectId/tables/:tableName/rows/:id', requireAuth, async (req: Request, res: Response) => {
   try {
-    const config = await getProjectConfig(req.params.projectId);
-    if (!config) {
-      res.status(404).json({ error: 'Project not found' });
-      return;
-    }
+    const access = await requireProject(req, 'edit');
+    const tableName = req.params.tableName;
+    const table = qualifiedTable(tableName);
 
-    const tableName = sanitizeIdentifier(req.params.tableName);
-    const primaryKey = sanitizeIdentifier((req.query.primaryKey as string) || 'id');
+    const result = await withTargetClient(access.projectId, access.connection(), async (client) => {
+      const pk = singlePrimaryKey(await requireTable(client, tableName), tableName);
+      return runStatement(client, `DELETE FROM ${table} WHERE ${quoteIdent(pk)} = $1`, [req.params.id]);
+    });
 
-    const sql = `DELETE FROM ${tableName} WHERE ${primaryKey} = '${String(req.params.id).replace(/'/g, "''")}' RETURNING *`;
-    const result = await executeQuery(req.params.projectId, config, sql);
-
-    if (result.rowCount === 0) {
-      res.status(404).json({ error: 'Row not found' });
-      return;
-    }
-
+    if (result.rowCount === 0) throw new ApiError(404, 'Row not found');
     res.json({ message: 'Row deleted' });
   } catch (err) {
-    logger.error({ err }, 'Failed to delete row');
-    const message = err instanceof Error ? err.message : 'Failed to delete row';
-    res.status(500).json({ error: message });
+    respondError(res, err, 'Failed to delete row');
   }
 });
 

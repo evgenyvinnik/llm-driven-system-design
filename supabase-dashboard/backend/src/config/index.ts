@@ -13,6 +13,12 @@ export const config = {
   redis: {
     url: process.env.REDIS_URL || 'redis://localhost:6379',
   },
+  credentials: {
+    // Encrypts projects.db_password at rest. The key must live outside the metadata
+    // database for the encryption to mean anything; the fallback is for local dev only.
+    key: process.env.TARGET_CREDENTIALS_KEY || 'supabase-dev-credentials-key-change-in-production',
+    usingDevKey: !process.env.TARGET_CREDENTIALS_KEY,
+  },
   session: {
     secret: process.env.SESSION_SECRET || 'supabase-dev-secret-change-in-production',
     maxAge: 24 * 60 * 60 * 1000,

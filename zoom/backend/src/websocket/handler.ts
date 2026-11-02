@@ -1,435 +1,196 @@
+import type { IncomingMessage, Server } from 'http';
+import type { Duplex } from 'stream';
+import type { Request, RequestHandler, Response } from 'express';
 import { WebSocket, WebSocketServer } from 'ws';
-import { IncomingMessage } from 'http';
+import { v4 as uuidv4 } from 'uuid';
+import { config } from '../config/index.js';
 import { logger } from '../services/logger.js';
-import { sfuService } from '../services/sfuService.js';
-import * as meetingService from '../services/meetingService.js';
-import * as chatService from '../services/chatService.js';
-import { wsConnections, activeParticipants } from '../services/metrics.js';
+import { wsConnections } from '../services/metrics.js';
+import * as rooms from './meetingRooms.js';
+import { CloseCode, type ClientConn } from './meetingRooms.js';
 
-interface WsClient {
-  ws: WebSocket;
-  userId: string;
-  username: string;
-  displayName: string;
-  meetingId: string | null;
-  meetingCode: string | null;
-}
+type Message = { type: string; [key: string]: unknown };
 
-// Meeting code -> set of client user IDs in that meeting
-const meetingClients: Map<string, Map<string, WsClient>> = new Map();
-
-function broadcastToMeeting(meetingId: string, message: object, excludeUserId?: string) {
-  const clients = meetingClients.get(meetingId);
-  if (!clients) return;
-
-  const data = JSON.stringify(message);
-  for (const [userId, client] of clients) {
-    if (userId !== excludeUserId && client.ws.readyState === WebSocket.OPEN) {
-      client.ws.send(data);
-    }
-  }
-}
-
-function sendToUser(meetingId: string, userId: string, message: object) {
-  const clients = meetingClients.get(meetingId);
-  if (!clients) return;
-
-  const client = clients.get(userId);
-  if (client && client.ws.readyState === WebSocket.OPEN) {
-    client.ws.send(JSON.stringify(message));
-  }
-}
-
-function send(ws: WebSocket, message: object) {
-  if (ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify(message));
-  }
-}
-
-/** Initializes WebSocket server with meeting signaling, SFU orchestration, and chat handlers. */
-export function setupWebSocket(wss: WebSocketServer) {
-  wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
-    // Parse session info from query params (simplified auth for WebSocket)
-    const url = new URL(req.url || '', `http://${req.headers.host}`);
-    const userId = url.searchParams.get('userId');
-    const username = url.searchParams.get('username');
-
-    if (!userId || !username) {
-      ws.close(4001, 'Authentication required');
+/** Routes one signaling message. Every handler validates its own fields and checks the caller's role. */
+export async function dispatch(conn: ClientConn, message: Message) {
+  switch (message.type) {
+    case 'join-meeting':
+      return rooms.joinMeeting(conn, message);
+    case 'leave-meeting':
+      return rooms.leaveMeeting(conn);
+    case 'produce':
+      return rooms.produce(conn, message);
+    case 'consume':
+      return rooms.consume(conn, message);
+    case 'producer-close':
+      return rooms.closeProducer(conn, message);
+    case 'toggle-mute':
+      return rooms.updateOwnState(conn, 'toggle-mute', message.muted);
+    case 'toggle-video':
+      return rooms.updateOwnState(conn, 'toggle-video', message.videoOn);
+    case 'raise-hand':
+      return rooms.updateOwnState(conn, 'raise-hand', message.raised);
+    case 'start-screen-share':
+      return rooms.startScreenShare(conn);
+    case 'stop-screen-share':
+      return rooms.stopScreenShare(conn);
+    case 'chat-message': {
+      if (!conn.meetingId || conn.waiting) {
+        conn.send({ type: 'error', requestType: 'chat-message', code: 'not-in-meeting', message: 'Not in a meeting' });
+        return;
+      }
+      const result = await rooms.sendChatMessage(conn.meetingId, conn.userId, message.content, message.recipientId);
+      if (!result.ok) {
+        conn.send({ type: 'error', requestType: 'chat-message', code: result.code, message: result.error });
+      }
       return;
     }
-
-    const client: WsClient = {
-      ws,
-      userId,
-      username,
-      displayName: username,
-      meetingId: null,
-      meetingCode: null,
-    };
-
-    wsConnections.inc();
-    logger.info({ userId, username }, 'WebSocket client connected');
-
-    ws.on('message', async (data) => {
-      try {
-        const message = JSON.parse(data.toString());
-        await handleMessage(client, message);
-      } catch (err) {
-        logger.error({ err, userId }, 'WebSocket message error');
-        send(ws, { type: 'error', message: 'Invalid message format' });
-      }
-    });
-
-    ws.on('close', () => {
-      wsConnections.dec();
-      logger.info({ userId, username }, 'WebSocket client disconnected');
-      handleDisconnect(client);
-    });
-
-    ws.on('error', (err) => {
-      logger.error({ err, userId }, 'WebSocket error');
-    });
-  });
-}
-
-async function handleMessage(client: WsClient, message: { type: string; [key: string]: unknown }) {
-  const { type } = message;
-
-  switch (type) {
-    case 'join-meeting':
-      await handleJoinMeeting(client, message as { type: string; meetingCode: string; displayName: string });
-      break;
-    case 'leave-meeting':
-      await handleLeaveMeeting(client);
-      break;
-    case 'produce':
-      handleProduce(client, message as { type: string; kind: 'audio' | 'video' | 'screen'; rtpParameters: unknown });
-      break;
-    case 'consume':
-      handleConsume(client, message as { type: string; producerId: string });
-      break;
-    case 'producer-close':
-      handleProducerClose(client, message as { type: string; producerId: string });
-      break;
-    case 'toggle-mute':
-      await handleToggleMute(client, message as { type: string; muted: boolean });
-      break;
-    case 'toggle-video':
-      await handleToggleVideo(client, message as { type: string; videoOn: boolean });
-      break;
-    case 'start-screen-share':
-      await handleStartScreenShare(client);
-      break;
-    case 'stop-screen-share':
-      await handleStopScreenShare(client);
-      break;
-    case 'raise-hand':
-      await handleRaiseHand(client, message as { type: string; raised: boolean });
-      break;
-    case 'chat-message':
-      await handleChatMessage(client, message as { type: string; content: string; recipientId?: string });
-      break;
+    // Host controls
+    case 'admit-participant':
+      return rooms.admitParticipant(conn, message);
+    case 'deny-participant':
+      return rooms.denyParticipant(conn, message);
+    case 'mute-participant':
+      return rooms.muteParticipant(conn, message);
+    case 'mute-all':
+      return rooms.muteAll(conn);
+    case 'remove-participant':
+      return rooms.removeFromMeeting(conn, message);
+    case 'transfer-host':
+      return rooms.transferHost(conn, message);
+    case 'set-role':
+      return rooms.setParticipantRole(conn, message);
+    case 'lock-meeting':
+      return rooms.setLocked(conn, message);
+    case 'end-meeting':
+      return rooms.endMeetingForAll(conn);
     default:
-      send(client.ws, { type: 'error', message: `Unknown message type: ${type}` });
+      conn.send({ type: 'error', code: 'unknown-type', message: `Unknown message type: ${message.type}` });
   }
 }
 
-async function handleJoinMeeting(
-  client: WsClient,
-  message: { meetingCode: string; displayName: string }
-) {
-  const { meetingCode, displayName } = message;
-  client.displayName = displayName || client.username;
+interface TrackedSocket extends WebSocket {
+  isAlive?: boolean;
+}
 
-  // Look up meeting by code
-  const meeting = await meetingService.getMeetingByCode(meetingCode);
-  if (!meeting) {
-    send(client.ws, { type: 'error', message: 'Meeting not found' });
+function onConnection(ws: TrackedSocket, userId: string | null, username: string | null) {
+  // Identity comes only from the session resolved on the upgrade request. The
+  // old handler read userId/username from the query string, so anyone could
+  // connect as anyone — including as a meeting's host.
+  if (!userId || !username) {
+    ws.close(CloseCode.AUTH_REQUIRED, 'Authentication required');
     return;
   }
 
-  const meetingId = meeting.id;
-  client.meetingId = meetingId;
-  client.meetingCode = meetingCode;
-
-  // Auto-start if scheduled
-  if (meeting.status === 'scheduled') {
-    try {
-      await meetingService.startMeeting(meetingId, meeting.host_id);
-    } catch {
-      // Not the host, that's fine — meeting may already be active
-    }
-  }
-
-  // Join in DB
-  await meetingService.joinMeeting(meetingId, client.userId, client.displayName);
-
-  // Set host role if applicable
-  if (meeting.host_id === client.userId) {
-    await meetingService.setParticipantRole(meetingId, client.userId, 'host');
-  }
-
-  // Add to meeting clients map
-  if (!meetingClients.has(meetingId)) {
-    meetingClients.set(meetingId, new Map());
-  }
-  meetingClients.get(meetingId)!.set(client.userId, client);
-  activeParticipants.inc();
-
-  // Set up SFU room + transports
-  const { sendTransportOptions, recvTransportOptions, routerRtpCapabilities } =
-    sfuService.joinRoom(meetingId, client.userId);
-
-  // Get existing participants
-  const participants = await meetingService.getParticipants(meetingId);
-
-  // Get existing producers in the room (to consume)
-  const existingProducers = sfuService.getProducersForRoom(meetingId, client.userId);
-
-  // Send joined response to the new participant
-  send(client.ws, {
-    type: 'joined',
-    meetingId,
-    meetingCode,
-    hostId: meeting.host_id,
-    participants: participants.map((p: { user_id: string; display_name: string; role: string; is_muted: boolean; is_video_on: boolean; is_screen_sharing: boolean; is_hand_raised: boolean }) => ({
-      userId: p.user_id,
-      displayName: p.display_name,
-      role: p.role,
-      isMuted: p.is_muted,
-      isVideoOn: p.is_video_on,
-      isScreenSharing: p.is_screen_sharing,
-      isHandRaised: p.is_hand_raised,
-    })),
-    routerRtpCapabilities,
-    sendTransportOptions,
-    recvTransportOptions,
-    existingProducers: existingProducers.map((p) => ({
-      producerId: p.id,
-      userId: p.userId,
-      kind: p.kind,
-    })),
-  });
-
-  // Notify existing participants
-  broadcastToMeeting(meetingId, {
-    type: 'participant-joined',
-    userId: client.userId,
-    displayName: client.displayName,
-    role: meeting.host_id === client.userId ? 'host' : 'participant',
-  }, client.userId);
-
-  logger.info({ meetingId, userId: client.userId, displayName: client.displayName }, 'Participant joined meeting via WS');
-}
-
-async function handleLeaveMeeting(client: WsClient) {
-  if (!client.meetingId) return;
-
-  const meetingId = client.meetingId;
-
-  // Clean up SFU
-  sfuService.leaveRoom(meetingId, client.userId);
-
-  // Update DB
-  await meetingService.leaveMeeting(meetingId, client.userId);
-
-  // Notify others
-  broadcastToMeeting(meetingId, {
-    type: 'participant-left',
-    userId: client.userId,
-  }, client.userId);
-
-  // Remove from clients map
-  const clients = meetingClients.get(meetingId);
-  if (clients) {
-    clients.delete(client.userId);
-    if (clients.size === 0) {
-      meetingClients.delete(meetingId);
-    }
-  }
-  activeParticipants.dec();
-
-  client.meetingId = null;
-  client.meetingCode = null;
-
-  send(client.ws, { type: 'left', meetingId });
-  logger.info({ meetingId, userId: client.userId }, 'Participant left meeting');
-}
-
-function handleProduce(
-  client: WsClient,
-  message: { kind: 'audio' | 'video' | 'screen'; rtpParameters: unknown }
-) {
-  if (!client.meetingId) {
-    send(client.ws, { type: 'error', message: 'Not in a meeting' });
-    return;
-  }
-
-  const { kind, rtpParameters } = message;
-  const producerId = sfuService.createProducer(client.meetingId, client.userId, kind, rtpParameters);
-
-  // Tell the producer their producerId
-  send(client.ws, {
-    type: 'produced',
-    producerId,
-    kind,
-  });
-
-  // Notify all other participants about the new producer
-  broadcastToMeeting(client.meetingId, {
-    type: 'new-producer',
-    userId: client.userId,
-    producerId,
-    kind,
-  }, client.userId);
-
-  logger.info({ meetingId: client.meetingId, userId: client.userId, producerId, kind }, 'Producer created');
-}
-
-function handleConsume(client: WsClient, message: { producerId: string }) {
-  if (!client.meetingId) {
-    send(client.ws, { type: 'error', message: 'Not in a meeting' });
-    return;
-  }
-
-  try {
-    const { consumerId, kind, rtpParameters } = sfuService.createConsumer(
-      client.meetingId,
-      client.userId,
-      message.producerId
-    );
-
-    send(client.ws, {
-      type: 'consume-response',
-      consumerId,
-      producerId: message.producerId,
-      kind,
-      rtpParameters,
-    });
-  } catch (err) {
-    logger.error({ err }, 'Consume error');
-    send(client.ws, { type: 'error', message: 'Failed to consume' });
-  }
-}
-
-function handleProducerClose(client: WsClient, message: { producerId: string }) {
-  if (!client.meetingId) return;
-
-  sfuService.closeProducer(client.meetingId, message.producerId);
-
-  broadcastToMeeting(client.meetingId, {
-    type: 'producer-closed',
-    producerId: message.producerId,
-    userId: client.userId,
-  }, client.userId);
-}
-
-async function handleToggleMute(client: WsClient, message: { muted: boolean }) {
-  if (!client.meetingId) return;
-
-  await meetingService.updateParticipantState(client.meetingId, client.userId, {
-    isMuted: message.muted,
-  });
-
-  broadcastToMeeting(client.meetingId, {
-    type: 'participant-update',
-    userId: client.userId,
-    isMuted: message.muted,
-  });
-}
-
-async function handleToggleVideo(client: WsClient, message: { videoOn: boolean }) {
-  if (!client.meetingId) return;
-
-  await meetingService.updateParticipantState(client.meetingId, client.userId, {
-    isVideoOn: message.videoOn,
-  });
-
-  broadcastToMeeting(client.meetingId, {
-    type: 'participant-update',
-    userId: client.userId,
-    isVideoOn: message.videoOn,
-  });
-}
-
-async function handleStartScreenShare(client: WsClient) {
-  if (!client.meetingId) return;
-
-  await meetingService.updateParticipantState(client.meetingId, client.userId, {
-    isScreenSharing: true,
-  });
-
-  broadcastToMeeting(client.meetingId, {
-    type: 'participant-update',
-    userId: client.userId,
-    isScreenSharing: true,
-  });
-}
-
-async function handleStopScreenShare(client: WsClient) {
-  if (!client.meetingId) return;
-
-  await meetingService.updateParticipantState(client.meetingId, client.userId, {
-    isScreenSharing: false,
-  });
-
-  broadcastToMeeting(client.meetingId, {
-    type: 'participant-update',
-    userId: client.userId,
-    isScreenSharing: false,
-  });
-}
-
-async function handleRaiseHand(client: WsClient, message: { raised: boolean }) {
-  if (!client.meetingId) return;
-
-  await meetingService.updateParticipantState(client.meetingId, client.userId, {
-    isHandRaised: message.raised,
-  });
-
-  broadcastToMeeting(client.meetingId, {
-    type: 'participant-update',
-    userId: client.userId,
-    isHandRaised: message.raised,
-  });
-}
-
-async function handleChatMessage(
-  client: WsClient,
-  message: { content: string; recipientId?: string }
-) {
-  if (!client.meetingId) return;
-
-  const { content, recipientId } = message;
-
-  // Save to DB
-  const saved = await chatService.saveMessage(client.meetingId, client.userId, content, recipientId);
-
-  const chatMsg = {
-    type: 'chat-message',
-    id: saved.id,
-    senderId: client.userId,
-    senderName: client.displayName,
-    content,
-    recipientId: recipientId || null,
-    createdAt: saved.created_at,
+  const conn: ClientConn = {
+    connectionId: uuidv4(),
+    userId,
+    username,
+    meetingId: null,
+    waiting: false,
+    closed: false,
+    send(message) {
+      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(message));
+    },
+    close(code, reason) {
+      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) ws.close(code, reason);
+    },
   };
 
-  if (recipientId) {
-    // DM: send only to recipient and sender
-    sendToUser(client.meetingId, recipientId, chatMsg);
-    send(client.ws, chatMsg);
-  } else {
-    // Broadcast to all in meeting
-    broadcastToMeeting(client.meetingId, chatMsg);
-  }
+  ws.isAlive = true;
+  ws.on('pong', () => {
+    ws.isAlive = true;
+  });
+
+  wsConnections.inc();
+  logger.info({ userId, connectionId: conn.connectionId }, 'WebSocket client connected');
+
+  // One message at a time per connection, in arrival order. Handlers await the
+  // database; without this a 'produce' sent right after 'join-meeting' ran
+  // before the join finished, and a leave could interleave with a join.
+  let queue: Promise<void> = Promise.resolve();
+  const enqueue = (task: () => Promise<void> | void) => {
+    queue = queue.then(task).catch((err) => {
+      logger.error({ err, userId }, 'WebSocket message handler error');
+      conn.send({ type: 'error', code: 'internal', message: 'Something went wrong' });
+    });
+  };
+
+  ws.on('message', (data) => {
+    let message: unknown;
+    try {
+      message = JSON.parse(data.toString());
+    } catch {
+      conn.send({ type: 'error', code: 'invalid', message: 'Invalid message format' });
+      return;
+    }
+    if (!message || typeof message !== 'object' || typeof (message as Message).type !== 'string') {
+      conn.send({ type: 'error', code: 'invalid', message: 'Message type is required' });
+      return;
+    }
+    enqueue(() => dispatch(conn, message as Message));
+  });
+
+  ws.on('close', () => {
+    wsConnections.dec();
+    logger.info({ userId, connectionId: conn.connectionId }, 'WebSocket client disconnected');
+    // Marked now so an in-flight join stops after its database read instead of
+    // seating a dead socket; the cleanup itself queues behind that message.
+    conn.closed = true;
+    enqueue(() => rooms.handleDisconnect(conn));
+  });
+
+  ws.on('error', (err) => {
+    logger.error({ err, userId }, 'WebSocket error');
+  });
 }
 
-function handleDisconnect(client: WsClient) {
-  if (client.meetingId) {
-    handleLeaveMeeting(client).catch((err) => {
-      logger.error({ err, userId: client.userId }, 'Error during disconnect cleanup');
+function rejectUpgrade(socket: Duplex, status: string) {
+  socket.write(`HTTP/1.1 ${status}\r\nConnection: close\r\n\r\n`);
+  socket.destroy();
+}
+
+/**
+ * Attaches the signaling WebSocket to the HTTP server on /ws. The upgrade
+ * request runs through the Express session middleware, so the socket belongs
+ * to the logged-in user; browser upgrades from other origins are refused.
+ */
+export function setupWebSocket(server: Server, sessionMiddleware: RequestHandler): WebSocketServer {
+  const wss = new WebSocketServer({ noServer: true, maxPayload: config.ws.maxPayloadBytes });
+
+  server.on('upgrade', (req: IncomingMessage, socket: Duplex, head: Buffer) => {
+    if (new URL(req.url ?? '/', 'http://localhost').pathname !== '/ws') {
+      socket.destroy();
+      return;
+    }
+    const origin = req.headers.origin;
+    if (origin && !config.allowedOrigins.includes(origin)) {
+      rejectUpgrade(socket, '403 Forbidden');
+      return;
+    }
+    sessionMiddleware(req as Request, {} as Response, () => {
+      const session = (req as Request).session;
+      wss.handleUpgrade(req, socket, head, (ws) => {
+        onConnection(ws, session?.userId ?? null, session?.username ?? null);
+      });
     });
-  }
+  });
+
+  // Heartbeat: a socket that did not answer the previous ping is dead (closed
+  // lid, lost network). Terminating it fires 'close', which starts the seat's
+  // reconnect grace window and, failing a reconnect, frees it.
+  const heartbeat = setInterval(() => {
+    for (const ws of wss.clients as Set<TrackedSocket>) {
+      if (ws.isAlive === false) {
+        ws.terminate();
+        continue;
+      }
+      ws.isAlive = false;
+      ws.ping();
+    }
+  }, config.ws.heartbeatIntervalMs);
+  heartbeat.unref?.();
+  wss.on('close', () => clearInterval(heartbeat));
+
+  return wss;
 }

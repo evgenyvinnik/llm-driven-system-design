@@ -1,33 +1,44 @@
 # Confluence: a wiki and knowledge-base learning project
 
-This project explores spaces, hierarchical pages, rich-text editing, revision history, comments, review requests, and asynchronous search indexing. It pairs a React interface with an Express API, PostgreSQL, Valkey, Elasticsearch, and a RabbitMQ indexing worker. It is a teaching implementation with several unfinished paths, not a reproduction of Confluence's production system.
+This project explores spaces, hierarchical pages, rich-text editing, revision history, comments, review requests, and asynchronous search indexing. It pairs a React interface with an Express API, PostgreSQL, Valkey, Elasticsearch, and a RabbitMQ indexing worker. It is a teaching implementation, not a reproduction of Confluence's production system.
 
 Read [architecture.md](./architecture.md) for the proposed production design and a source-based account of the local implementation. The [frontend](./system-design-answer-frontend.md), [backend](./system-design-answer-backend.md), and [fullstack](./system-design-answer-fullstack.md) interview answers explain the design in a 45-minute discussion.
+
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 8,614 |
+| Source Files | 87 |
+| .ts | 4,169 |
+| .tsx | 1,995 |
+| .md | 1,670 |
+| .sql | 300 |
+| .json | 167 |
+
 
 ## What is available
 
 | Area | Current behavior |
 |------|------------------|
-| Accounts | Registration, login, logout, and Redis-backed sessions; two seeded accounts |
-| Spaces | Dashboard, space overview, recursive page tree; space/member management through the API |
-| Pages | APIs for create, read, update, hard delete, labels, and moves; editor/viewer components exist |
+| Accounts | Registration, login, logout, and Redis-backed sessions (regenerated on login); three seeded accounts |
+| Access | Space roles enforced on every route: viewers read, members edit and see drafts, admins manage the space and review; private spaces are invisible (404) to non-members |
+| Spaces | Dashboard, space overview, page tree (drafts only for members); space settings and membership through the API |
+| Pages | View and edit in the browser; create, update with a stale-version check (409), delete, labels, moves with cycle refusal; unique slugs; HTML sanitized on save |
 | History | Full revision snapshots, line-based HTML diffs, and restore-as-new-version APIs |
 | Discussion | Top-level comments and direct replies; author-only comment editing/deletion in the API |
-| Review | Request/review records; approval publishes the current page, without binding to a reviewed revision |
-| Search | Elasticsearch title/body/label matching, a separate indexing worker, and SQL substring fallback on search errors |
+| Review | Requests bound to the reviewed version; a space admin other than the requester approves or rejects; approval publishes the page |
+| Search | Elasticsearch over the spaces you can see, results linking by slug; an indexer with retries, a dead-letter queue, versioned writes, and periodic reconciliation; SQL substring fallback if Elasticsearch fails |
 
-**Page navigation is currently incomplete.** The generated route tree nests page viewing inside the space route and editing inside the page route. Both parent components omit the child outlet, so those URLs render the space overview instead of the intended page/editor. The source contains the downstream components, but they are not a verified working browser flow. Search links also pass a page UUID where the destination expects a slug.
+Material limitations:
 
-Other material limitations:
+- Permissions are space-level only: no page-level restrictions or groups. Publication flips a page's status, so after first approval, further edits to a published page are live without review.
+- Saves carry no durable request identity: retrying an uncertain save can create another revision. The stale-version check applies when the client sends the version it edited (the bundled editor does).
+- Search indexing is eventually consistent. Messages buffer in memory while RabbitMQ is down, and a reconciliation pass every 10 minutes repairs anything lost, such as a crash with messages buffered. There is no transactional outbox.
+- Slugs change on rename, with no redirect from the old one.
+- Templates have APIs and an unused picker component. The table-of-contents macro is a placeholder. There is no autosave, local draft recovery, live co-editing, drag-and-drop move, or admin screen.
 
-- Authentication does not enforce space membership. Private spaces, drafts, page history, and comments are readable through direct APIs; most writes require only a login. The member list exposes email addresses. This is not an access-controlled team wiki.
-- Client-supplied HTML reaches page rendering without sanitization; search snippets also use raw HTML insertion.
-- Saves have no expected-version check or durable request identity. Stale editors can overwrite newer content, concurrent updates can return a database error, and retrying an uncertain save can create another revision.
-- Root-level moves have a SQL parameter-count defect. Other moves lack cycle and same-space checks. There is no drag-and-drop move interface.
-- Restores, approval changes, labels, and space deletion do not consistently update caches or search. Worker helpers swallow indexing errors, allowing failed work to be acknowledged.
-- Templates have APIs and an unused picker component. The table-of-contents macro is a placeholder. There is no autosave, local draft recovery, live co-editing, or admin screen.
-
-These findings come from source inspection; the documentation review did not start the stack or repair application code. Detailed paths and consequences are in [Implementation Notes](./architecture.md#implementation-notes).
+Details and the reasoning behind each choice are in [Implementation Notes](./architecture.md#implementation-notes).
 
 ## Stack and ports
 
@@ -64,20 +75,23 @@ In a terminal at the project directory, seed a fresh database once:
 docker compose exec -T postgres psql -U confluence -d confluence -v ON_ERROR_STOP=1 < backend/db-seed/seed.sql
 ```
 
-The seed creates Alice and Bob, two spaces (`ENG` and `PROD`), nine published pages, ten historical snapshots, labels, two top-level comments, and three global template records. Both accounts use **`password123`**. Alice has the global `admin` role, but this does not activate an admin interface or enforce space permissions. Seed content is fictional sample material.
+The seed creates three accounts, all with password **`password123`**:
+
+| Account | Roles | What it shows |
+|---------|-------|---------------|
+| `alice` | Global admin; admin of `ENG` and the private `SEC` space | Everything, including the pending review |
+| `bob` | Member of `ENG`, admin of `PROD` | Drafts in Engineering; no access to `SEC` |
+| `carol` | Viewer of `ENG` | Read-only Engineering, no drafts |
+
+It also creates eleven pages (one a draft with a pending approval), historical snapshots, labels, comments, and three global templates. Seed content is fictional sample material.
 
 The seed is not generally rerunnable: some inserts skip conflicts, while others fail or append duplicate records. Use it once on a fresh schema rather than as a migration or repair command.
 
 Start each application process in its own terminal:
 
 ```bash
-# From confluence/backend
+# From confluence/backend: API on 3001 plus the search indexer
 npm run dev
-```
-
-```bash
-# From confluence/backend
-npm run dev:worker
 ```
 
 ```bash
@@ -86,49 +100,11 @@ npm install
 npm run dev
 ```
 
-Open [the wiki](http://localhost:5173), sign in as `alice` or `bob`, and inspect the dashboard and space overview. Page/editor navigation remains subject to the routing issue above. The API's `/api/health` returns a process-level status, not a dependency readiness result.
+Open [the wiki](http://localhost:5173) and sign in as `alice`, `bob`, or `carol` to compare what each role sees. The API's `/api/health` returns a process-level status, not a dependency readiness result.
 
-### Populate search for the seeded pages
+### Search for the seeded pages
 
-Seeding PostgreSQL does not publish indexing messages. A healthy empty Elasticsearch index returns zero results and does not trigger SQL fallback. There is no supplied backfill command.
-
-For this fresh local seed, the following one-time command indexes the current pages directly. Run it from `confluence/backend` after installing dependencies and starting Elasticsearch. It deliberately calls Elasticsearch directly so a failed write surfaces instead of being swallowed by the worker helper. It is a small setup procedure, not a concurrent production rebuild or deletion reconciliation tool.
-
-```bash
-node --import tsx --input-type=module <<'JS'
-import { pool } from './src/services/db.ts';
-import { esClient, ensureIndex } from './src/services/elasticsearch.ts';
-import { config } from './src/config/index.ts';
-try {
-  await ensureIndex();
-  if (!(await esClient.indices.exists({ index: config.elasticsearch.index }))) {
-    throw new Error('wiki_pages index was not created');
-  }
-  const { rows } = await pool.query(`
-    SELECT p.*, s.key AS space_key,
-      ARRAY(SELECT label FROM page_labels WHERE page_id = p.id) AS labels
-    FROM pages p JOIN spaces s ON s.id = p.space_id
-  `);
-  for (const p of rows) {
-    await esClient.index({
-      index: config.elasticsearch.index,
-      id: p.id,
-      document: {
-        page_id: p.id, space_id: p.space_id, space_key: p.space_key,
-        title: p.title, content_text: p.content_text, labels: p.labels,
-        created_by: p.created_by, updated_at: p.updated_at, status: p.status,
-      },
-    });
-  }
-  await esClient.indices.refresh({ index: config.elasticsearch.index });
-  console.log(`Indexed ${rows.length} pages`);
-} finally {
-  await Promise.all([pool.end(), esClient.close()]);
-}
-JS
-```
-
-Try a seeded title such as “Getting Started” in search. Subsequent page create/update/delete requests attempt queue publication, but the delivery and invalidation gaps described above remain. This setup command has been checked against module exports and fields, not executed against a live database during the documentation review.
+No manual step is needed. When the indexer starts, it waits for Elasticsearch and RabbitMQ and then reconciles the index with PostgreSQL, so seeded pages become searchable as soon as `npm run dev` has been running for a few seconds. It repeats that pass every 10 minutes. Messages that fail every retry are kept on the `page-index.dlq` queue (visible in the RabbitMQ management UI).
 
 ### Stop or reset infrastructure
 
@@ -214,24 +190,18 @@ SESSION_SECRET=confluence-dev-secret-change-in-production
 
 The Elasticsearch index is fixed to `wiki_pages`, the queue to `page-index`, and the session duration to 24 hours. CORS is hardcoded to `http://localhost:5173`. Vite proxies `/api` to port 3001.
 
-For multiple API processes, bypass the existing `dev:server2`/`dev:server3` wrappers: they call `npm run dev`, which resets `PORT` to 3001. From `backend`, use a separate terminal for each explicit command:
-
-```bash
-PORT=3002 NODE_ENV=development ./node_modules/.bin/tsx watch src/index.ts
-```
-
-Repeat with port 3003 if desired. This does not configure a load balancer; Vite still targets 3001.
+For multiple API processes, `npm run dev:server2` and `dev:server3` start API instances on 3002 and 3003 (without a second indexer). This does not configure a load balancer; Vite still targets 3001.
 
 ## Verification and source map
 
 | Command | Scope |
 |---------|-------|
 | `npm run build` in `backend` | TypeScript compilation; current layout emits `dist/src/index.js` |
-| `npm test` in `backend` | Mocked health/auth/space/recent-page route tests |
+| `npm test` in `backend` | Mocked route tests, the role matrix, HTML sanitization, and queue buffering |
 | `npm run build` in `frontend` | TypeScript check followed by Vite build |
 | `npm run lint` in either package | Existing package lint command |
 | `npm run test:e2e` in `confluence` | Existing Playwright smoke suite; requires the stack |
 
-There is no backend `start` script or package-level `type-check` script. The backend `main` field points to `dist/index.js`, which differs from the compiler's output path. Existing browser smoke tests look for `main` elements that the current layouts do not render; they do not establish page editing, authorization, or worker recovery correctness. No builds or full-stack tests were run for this documentation review.
+There is no backend `start` script or package-level `type-check` script. The backend `main` field points to `dist/index.js`, which differs from the compiler's output path. The smoke tests check that the screenshot pages render. Authorization, search, and indexing recovery were verified against a running stack; see the architecture's Implementation Notes.
 
-Start with [API composition](./backend/src/app.ts), [page operations](./backend/src/services/pageService.ts), [versions](./backend/src/services/versionService.ts), [search indexing](./backend/src/workers/search-indexer.ts), [database schema](./backend/src/db/init.sql), [browser state](./frontend/src/stores/wikiStore.ts), and [generated route nesting](./frontend/src/routeTree.gen.ts).
+Start with [API composition](./backend/src/app.ts), [page operations](./backend/src/services/pageService.ts), [versions](./backend/src/services/versionService.ts), [search indexing](./backend/src/workers/search-indexer.ts), [database schema](./backend/src/db/init.sql), [access control](./backend/src/services/accessService.ts), and [browser state](./frontend/src/stores/wikiStore.ts).

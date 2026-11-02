@@ -26,6 +26,8 @@ export interface ExcalidrawElement {
 }
 
 export interface Cursor {
+  /** Per-connection ID: two tabs of one account are two cursors. */
+  clientId: string;
   userId: string;
   username: string;
   x: number;

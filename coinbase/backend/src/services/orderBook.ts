@@ -1,11 +1,28 @@
+import { toNumber } from './decimal.js';
+
+/** A resting limit order. Price and quantity are scaled BigInts (see decimal.ts). */
 export interface OrderBookEntry {
   orderId: string;
   userId: string;
-  price: number;
-  quantity: number;
-  remainingQuantity: number;
   side: 'buy' | 'sell';
-  timestamp: number;
+  price: bigint;
+  remainingQuantity: bigint;
+  /**
+   * Arrival sequence assigned by Postgres (orders.arrival_seq). Breaks price
+   * ties, so in-memory time priority is exactly the durable priority and a
+   * rebuild from the database reproduces the same book.
+   */
+  sequence: number;
+}
+
+/** An order arriving at the book. It is the taker for every fill it produces. */
+export interface IncomingOrder {
+  orderId: string;
+  userId: string;
+  side: 'buy' | 'sell';
+  /** Worst acceptable price: the limit price, or a market order's protection price. */
+  limitPrice: bigint;
+  quantity: bigint;
 }
 
 export interface OrderBookLevel {
@@ -14,113 +31,114 @@ export interface OrderBookLevel {
   orderCount: number;
 }
 
+/** One execution between the incoming (taker) order and a resting (maker) order. */
 export interface MatchResult {
+  makerOrderId: string;
+  makerUserId: string;
+  takerOrderId: string;
+  takerUserId: string;
+  takerSide: 'buy' | 'sell';
   buyOrderId: string;
   sellOrderId: string;
-  buyUserId: string;
-  sellUserId: string;
-  price: number;
-  quantity: number;
+  /** Executions happen at the resting order's price. */
+  price: bigint;
+  quantity: bigint;
 }
 
-/** In-memory order book with price-time priority matching for a single trading pair. */
-class OrderBook {
-  private bids: OrderBookEntry[] = []; // sorted by price DESC, then time ASC
-  private asks: OrderBookEntry[] = []; // sorted by price ASC, then time ASC
+/** In-memory order book with price-time priority for a single trading pair. */
+export class OrderBook {
+  private bids: OrderBookEntry[] = []; // price DESC, then sequence ASC
+  private asks: OrderBookEntry[] = []; // price ASC, then sequence ASC
 
-  /** Adds an order to the appropriate side of the book in sorted position. */
+  /** Rests an order on its side of the book in priority position. */
   addOrder(entry: OrderBookEntry): void {
-    if (entry.side === 'buy') {
-      this.insertBid(entry);
-    } else {
-      this.insertAsk(entry);
-    }
-  }
+    const side = entry.side === 'buy' ? this.bids : this.asks;
+    const outranks = (other: OrderBookEntry) =>
+      entry.side === 'buy'
+        ? entry.price > other.price ||
+          (entry.price === other.price && entry.sequence < other.sequence)
+        : entry.price < other.price ||
+          (entry.price === other.price && entry.sequence < other.sequence);
 
-  private insertBid(entry: OrderBookEntry): void {
-    let insertIndex = this.bids.length;
-    for (let i = 0; i < this.bids.length; i++) {
-      if (
-        entry.price > this.bids[i].price ||
-        (entry.price === this.bids[i].price && entry.timestamp < this.bids[i].timestamp)
-      ) {
+    let insertIndex = side.length;
+    for (let i = 0; i < side.length; i++) {
+      if (outranks(side[i])) {
         insertIndex = i;
         break;
       }
     }
-    this.bids.splice(insertIndex, 0, entry);
+    side.splice(insertIndex, 0, entry);
   }
 
-  private insertAsk(entry: OrderBookEntry): void {
-    let insertIndex = this.asks.length;
-    for (let i = 0; i < this.asks.length; i++) {
-      if (
-        entry.price < this.asks[i].price ||
-        (entry.price === this.asks[i].price && entry.timestamp < this.asks[i].timestamp)
-      ) {
-        insertIndex = i;
-        break;
-      }
-    }
-    this.asks.splice(insertIndex, 0, entry);
-  }
-
-  /** Removes an order from the book by ID. Returns true if found and removed. */
+  /** Removes a resting order by ID. Returns true if it was in the book. */
   removeOrder(orderId: string): boolean {
-    let idx = this.bids.findIndex((o) => o.orderId === orderId);
-    if (idx !== -1) {
-      this.bids.splice(idx, 1);
-      return true;
-    }
-    idx = this.asks.findIndex((o) => o.orderId === orderId);
-    if (idx !== -1) {
-      this.asks.splice(idx, 1);
-      return true;
+    for (const side of [this.bids, this.asks]) {
+      const idx = side.findIndex((o) => o.orderId === orderId);
+      if (idx !== -1) {
+        side.splice(idx, 1);
+        return true;
+      }
     }
     return false;
   }
 
-  /** Matches crossing orders using price-time priority and returns executed matches. */
-  matchOrders(): MatchResult[] {
+  hasOrder(orderId: string): boolean {
+    return (
+      this.bids.some((o) => o.orderId === orderId) ||
+      this.asks.some((o) => o.orderId === orderId)
+    );
+  }
+
+  /**
+   * Matches an incoming order against the opposite side, best price first,
+   * stopping when the next resting price is worse than `limitPrice` or the
+   * incoming quantity is exhausted. The incoming order is never inserted here:
+   * the caller decides whether a remainder rests (limit) or is cancelled
+   * (market / immediate-or-cancel). Resting entries are consumed in place.
+   */
+  match(incoming: IncomingOrder): { matches: MatchResult[]; remaining: bigint } {
+    const opposite = incoming.side === 'buy' ? this.asks : this.bids;
     const matches: MatchResult[] = [];
+    let remaining = incoming.quantity;
 
-    while (this.bids.length > 0 && this.asks.length > 0) {
-      const bestBid = this.bids[0];
-      const bestAsk = this.asks[0];
+    while (remaining > 0n && opposite.length > 0) {
+      const best = opposite[0];
+      const crosses =
+        incoming.side === 'buy'
+          ? best.price <= incoming.limitPrice
+          : best.price >= incoming.limitPrice;
+      if (!crosses) break;
 
-      if (bestBid.price < bestAsk.price) {
-        break; // No match possible
-      }
-
-      // Match at the earlier order's price (price-time priority)
-      const matchPrice =
-        bestBid.timestamp <= bestAsk.timestamp ? bestBid.price : bestAsk.price;
-      const matchQty = Math.min(bestBid.remainingQuantity, bestAsk.remainingQuantity);
-
+      const quantity = remaining < best.remainingQuantity ? remaining : best.remainingQuantity;
       matches.push({
-        buyOrderId: bestBid.orderId,
-        sellOrderId: bestAsk.orderId,
-        buyUserId: bestBid.userId,
-        sellUserId: bestAsk.userId,
-        price: matchPrice,
-        quantity: matchQty,
+        makerOrderId: best.orderId,
+        makerUserId: best.userId,
+        takerOrderId: incoming.orderId,
+        takerUserId: incoming.userId,
+        takerSide: incoming.side,
+        buyOrderId: incoming.side === 'buy' ? incoming.orderId : best.orderId,
+        sellOrderId: incoming.side === 'sell' ? incoming.orderId : best.orderId,
+        price: best.price,
+        quantity,
       });
 
-      bestBid.remainingQuantity -= matchQty;
-      bestAsk.remainingQuantity -= matchQty;
-
-      if (bestBid.remainingQuantity <= 0) {
-        this.bids.shift();
-      }
-      if (bestAsk.remainingQuantity <= 0) {
-        this.asks.shift();
+      remaining -= quantity;
+      best.remainingQuantity -= quantity;
+      if (best.remainingQuantity === 0n) {
+        opposite.shift();
       }
     }
 
-    return matches;
+    return { matches, remaining };
   }
 
-  /** Returns aggregated bid and ask price levels for order book visualization. */
+  /** Drops every resting order. Used before rebuilding the book from Postgres. */
+  clear(): void {
+    this.bids = [];
+    this.asks = [];
+  }
+
+  /** Returns aggregated price levels for display (numbers are display-only). */
   getDepth(levels: number = 20): { bids: OrderBookLevel[]; asks: OrderBookLevel[] } {
     return {
       bids: this.aggregateLevels(this.bids, levels),
@@ -129,52 +147,38 @@ class OrderBook {
   }
 
   private aggregateLevels(orders: OrderBookEntry[], maxLevels: number): OrderBookLevel[] {
-    const levelMap = new Map<number, { quantity: number; orderCount: number }>();
-
+    const levels: { price: bigint; quantity: bigint; orderCount: number }[] = [];
     for (const order of orders) {
-      const existing = levelMap.get(order.price);
-      if (existing) {
-        existing.quantity += order.remainingQuantity;
-        existing.orderCount += 1;
+      const last = levels[levels.length - 1];
+      if (last && last.price === order.price) {
+        last.quantity += order.remainingQuantity;
+        last.orderCount += 1;
       } else {
-        levelMap.set(order.price, {
-          quantity: order.remainingQuantity,
-          orderCount: 1,
-        });
+        if (levels.length >= maxLevels) break;
+        levels.push({ price: order.price, quantity: order.remainingQuantity, orderCount: 1 });
       }
     }
-
-    const levels: OrderBookLevel[] = [];
-    for (const [price, data] of levelMap) {
-      levels.push({
-        price,
-        quantity: data.quantity,
-        orderCount: data.orderCount,
-      });
-      if (levels.length >= maxLevels) break;
-    }
-
-    return levels;
+    return levels.map((l) => ({
+      price: toNumber(l.price),
+      quantity: toNumber(l.quantity),
+      orderCount: l.orderCount,
+    }));
   }
 
   /** Returns the highest bid price, or null if no bids. */
   getBestBid(): number | null {
-    return this.bids.length > 0 ? this.bids[0].price : null;
+    return this.bids.length > 0 ? toNumber(this.bids[0].price) : null;
   }
 
   /** Returns the lowest ask price, or null if no asks. */
   getBestAsk(): number | null {
-    return this.asks.length > 0 ? this.asks[0].price : null;
+    return this.asks.length > 0 ? toNumber(this.asks[0].price) : null;
   }
 
-  /** Returns the spread between best ask and best bid, or null if either side is empty. */
+  /** Returns best ask minus best bid, or null if either side is empty. */
   getSpread(): number | null {
-    const bestBid = this.getBestBid();
-    const bestAsk = this.getBestAsk();
-    if (bestBid !== null && bestAsk !== null) {
-      return bestAsk - bestBid;
-    }
-    return null;
+    if (this.bids.length === 0 || this.asks.length === 0) return null;
+    return toNumber(this.asks[0].price - this.bids[0].price);
   }
 
   getBidCount(): number {

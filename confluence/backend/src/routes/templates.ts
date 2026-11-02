@@ -2,6 +2,15 @@ import { Router, Request, Response } from 'express';
 import { requireAuth } from '../middleware/auth.js';
 import { pool } from '../services/db.js';
 import { logger } from '../services/logger.js';
+import { AccessError, callerFrom, isUuid, requireSpace, respondError } from '../services/accessService.js';
+
+/** A space template is visible to whoever can view its space; global templates to everyone. */
+async function assertTemplateVisible(template: { is_global: boolean; space_id: string | null }, req: Request) {
+  if (template.is_global || !template.space_id) return;
+  await requireSpace({ id: template.space_id }, callerFrom(req), 'view').catch(() => {
+    throw new AccessError(404, 'Template not found');
+  });
+}
 
 const router = Router();
 
@@ -9,6 +18,7 @@ const router = Router();
 router.get('/', async (req: Request, res: Response) => {
   try {
     const spaceId = req.query.spaceId as string;
+    if (spaceId) await requireSpace({ id: spaceId }, callerFrom(req), 'view');
 
     let query = `
       SELECT t.*, u.username as creator_username
@@ -28,14 +38,14 @@ router.get('/', async (req: Request, res: Response) => {
     const result = await pool.query(query, params);
     res.json({ templates: result.rows });
   } catch (err) {
-    logger.error({ err }, 'Failed to list templates');
-    res.status(500).json({ error: 'Failed to list templates' });
+    respondError(res, err, 'Failed to list templates');
   }
 });
 
 // Get template by ID
 router.get('/:id', async (req: Request, res: Response) => {
   try {
+    if (!isUuid(req.params.id)) throw new AccessError(404, 'Template not found');
     const result = await pool.query(
       `SELECT t.*, u.username as creator_username
        FROM templates t
@@ -48,11 +58,11 @@ router.get('/:id', async (req: Request, res: Response) => {
       res.status(404).json({ error: 'Template not found' });
       return;
     }
+    await assertTemplateVisible(result.rows[0], req);
 
     res.json({ template: result.rows[0] });
   } catch (err) {
-    logger.error({ err }, 'Failed to get template');
-    res.status(500).json({ error: 'Failed to get template' });
+    respondError(res, err, 'Failed to get template');
   }
 });
 
@@ -65,36 +75,50 @@ router.post('/', requireAuth, async (req: Request, res: Response) => {
       res.status(400).json({ error: 'Name and content are required' });
       return;
     }
+    // Global templates appear in every space, so only global admins create them;
+    // a space template needs edit access to that space.
+    if (isGlobal && req.session.role !== 'admin') {
+      throw new AccessError(403, 'Only administrators can create global templates');
+    }
+    if (!isGlobal) {
+      if (!spaceId) throw new AccessError(400, 'A space template needs a spaceId');
+      await requireSpace({ id: spaceId }, callerFrom(req), 'edit');
+    }
 
     const result = await pool.query(
       `INSERT INTO templates (name, description, content_json, space_id, is_global, created_by)
        VALUES ($1, $2, $3, $4, $5, $6)
        RETURNING *`,
-      [name, description || null, JSON.stringify(contentJson), spaceId || null, isGlobal || false, req.session.userId],
+      [name, description || null, JSON.stringify(contentJson), isGlobal ? null : spaceId, Boolean(isGlobal), req.session.userId],
     );
 
     logger.info({ templateId: result.rows[0].id }, 'Template created');
     res.status(201).json({ template: result.rows[0] });
   } catch (err) {
-    logger.error({ err }, 'Failed to create template');
-    res.status(500).json({ error: 'Failed to create template' });
+    respondError(res, err, 'Failed to create template');
   }
 });
 
 // Delete template
 router.delete('/:id', requireAuth, async (req: Request, res: Response) => {
   try {
-    const result = await pool.query('DELETE FROM templates WHERE id = $1 RETURNING id', [req.params.id]);
-
-    if (result.rows.length === 0) {
-      res.status(404).json({ error: 'Template not found' });
-      return;
+    if (!isUuid(req.params.id)) throw new AccessError(404, 'Template not found');
+    const found = await pool.query('SELECT created_by, space_id, is_global FROM templates WHERE id = $1', [
+      req.params.id,
+    ]);
+    const template = found.rows[0];
+    if (!template) throw new AccessError(404, 'Template not found');
+    // Its creator, an admin of its space, or a global admin may delete it.
+    if (template.created_by !== req.session.userId && req.session.role !== 'admin') {
+      if (!template.space_id) throw new AccessError(403, 'Only administrators can delete global templates');
+      await requireSpace({ id: template.space_id }, callerFrom(req), 'admin');
     }
+
+    await pool.query('DELETE FROM templates WHERE id = $1', [req.params.id]);
 
     res.json({ message: 'Template deleted' });
   } catch (err) {
-    logger.error({ err }, 'Failed to delete template');
-    res.status(500).json({ error: 'Failed to delete template' });
+    respondError(res, err, 'Failed to delete template');
   }
 });
 

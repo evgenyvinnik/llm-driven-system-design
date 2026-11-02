@@ -1,6 +1,10 @@
 import { pool } from './db.js';
 import { diffLines, Change } from 'diff';
 import { logger } from './logger.js';
+import { pageOperations } from './metrics.js';
+import { AccessError } from './accessService.js';
+import { afterPageWrite, uniqueSlug } from './pageService.js';
+import { sanitizePageHtml } from './htmlSanitizer.js';
 
 interface PageVersion {
   id: string;
@@ -62,7 +66,7 @@ export async function computeDiff(
   ]);
 
   if (!fromVer || !toVer) {
-    throw new Error(`Version not found: from=${fromVersion}, to=${toVersion}`);
+    throw new AccessError(404, `Version not found: from=${fromVersion}, to=${toVersion}`);
   }
 
   const changes = diffLines(fromVer.content_html, toVer.content_html);
@@ -82,24 +86,35 @@ export async function computeDiff(
   };
 }
 
-/** Restores a page to a previous version, creating a new version record. */
+/**
+ * Restores a page to a previous version by writing it forward as a new
+ * version. Like any edit it invalidates the cache and reindexes the page;
+ * previously the restored content stayed out of search and cached reads kept
+ * serving the replaced version for up to two minutes.
+ */
 export async function restoreVersion(
   pageId: string,
   versionNumber: number,
   restoredBy: string,
-): Promise<void> {
+): Promise<{ version: number; slug: string }> {
   const version = await getVersion(pageId, versionNumber);
-  if (!version) throw new Error('Version not found');
+  if (!version) throw new AccessError(404, 'Version not found');
 
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
 
-    // Get current version number
-    const current = await client.query('SELECT version FROM pages WHERE id = $1', [pageId]);
-    const newVersionNum = current.rows[0].version + 1;
+    const current = await client.query(
+      'SELECT version, space_id, title, slug FROM pages WHERE id = $1 FOR UPDATE',
+      [pageId],
+    );
+    const page = current.rows[0];
+    if (!page) throw new AccessError(404, 'Page not found');
+    const newVersionNum = page.version + 1;
+    const slug = version.title === page.title
+      ? page.slug
+      : await uniqueSlug(client, page.space_id, version.title, pageId);
 
-    // Update page with restored content
     await client.query(
       `UPDATE pages
        SET title = $1, slug = $2, content_json = $3, content_html = $4, content_text = $5,
@@ -107,9 +122,10 @@ export async function restoreVersion(
        WHERE id = $8`,
       [
         version.title,
-        version.title.toLowerCase().replace(/[^a-z0-9\s-]/g, '').replace(/\s+/g, '-'),
+        slug,
         JSON.stringify(version.content_json),
-        version.content_html,
+        // Versions written before sanitization existed may hold unsafe HTML.
+        sanitizePageHtml(version.content_html),
         version.content_text,
         newVersionNum,
         restoredBy,
@@ -117,7 +133,6 @@ export async function restoreVersion(
       ],
     );
 
-    // Create version record for the restoration
     await client.query(
       `INSERT INTO page_versions (page_id, version_number, title, content_json, content_html, content_text, change_message, created_by)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
@@ -126,7 +141,7 @@ export async function restoreVersion(
         newVersionNum,
         version.title,
         JSON.stringify(version.content_json),
-        version.content_html,
+        sanitizePageHtml(version.content_html),
         version.content_text,
         `Restored from version ${versionNumber}`,
         restoredBy,
@@ -134,7 +149,10 @@ export async function restoreVersion(
     );
 
     await client.query('COMMIT');
+    await afterPageWrite(page.space_id, pageId);
+    pageOperations.inc({ operation: 'restore' });
     logger.info({ pageId, restoredFrom: versionNumber, newVersion: newVersionNum }, 'Page version restored');
+    return { version: newVersionNum, slug };
   } catch (err) {
     await client.query('ROLLBACK');
     throw err;

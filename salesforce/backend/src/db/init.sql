@@ -50,8 +50,16 @@ CREATE TABLE IF NOT EXISTS opportunities (
   close_date DATE,
   description TEXT,
   owner_id UUID REFERENCES users(id),
+  -- Stamped by the API on entering Closed Won/Lost, cleared on reopening.
+  -- Revenue is booked by this, not updated_at (which moves on any edit).
+  closed_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ DEFAULT NOW(),
-  updated_at TIMESTAMPTZ DEFAULT NOW()
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  CONSTRAINT opportunities_stage_check CHECK (stage IN (
+    'Prospecting', 'Qualification', 'Needs Analysis', 'Proposal',
+    'Negotiation', 'Closed Won', 'Closed Lost')),
+  CONSTRAINT opportunities_probability_check CHECK (probability BETWEEN 0 AND 100),
+  CONSTRAINT opportunities_amount_check CHECK (amount_cents >= 0)
 );
 
 CREATE TABLE IF NOT EXISTS leads (
@@ -64,13 +72,19 @@ CREATE TABLE IF NOT EXISTS leads (
   title VARCHAR(100),
   source VARCHAR(50),
   status VARCHAR(30) DEFAULT 'New',
-  converted_account_id UUID REFERENCES accounts(id),
-  converted_contact_id UUID REFERENCES contacts(id),
-  converted_opportunity_id UUID REFERENCES opportunities(id),
+  -- SET NULL: deleting an account/contact/opportunity created by a conversion
+  -- must not be blocked by the lead that produced it (it used to fail with an
+  -- FK violation, a 500, for every converted record).
+  converted_account_id UUID REFERENCES accounts(id) ON DELETE SET NULL,
+  converted_contact_id UUID REFERENCES contacts(id) ON DELETE SET NULL,
+  converted_opportunity_id UUID REFERENCES opportunities(id) ON DELETE SET NULL,
   converted_at TIMESTAMPTZ,
   owner_id UUID REFERENCES users(id),
   created_at TIMESTAMPTZ DEFAULT NOW(),
-  updated_at TIMESTAMPTZ DEFAULT NOW()
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  CONSTRAINT leads_status_check CHECK (status IN ('New', 'Contacted', 'Qualified', 'Unqualified', 'Converted')),
+  -- 'Converted' and converted_at go together: only the conversion transaction sets either.
+  CONSTRAINT leads_converted_check CHECK ((status = 'Converted') = (converted_at IS NOT NULL))
 );
 
 CREATE TABLE IF NOT EXISTS activities (
@@ -117,3 +131,59 @@ CREATE INDEX IF NOT EXISTS idx_activities_related ON activities(related_type, re
 CREATE INDEX IF NOT EXISTS idx_activities_owner ON activities(owner_id, due_date);
 CREATE INDEX IF NOT EXISTS idx_custom_field_values_entity ON custom_field_values(entity_id);
 CREATE INDEX IF NOT EXISTS idx_accounts_owner ON accounts(owner_id);
+CREATE INDEX IF NOT EXISTS idx_contacts_owner ON contacts(owner_id);
+
+-- ---------------------------------------------------------------------------
+-- Upgrades for databases created from an earlier version of this file.
+-- CREATE TABLE IF NOT EXISTS skips existing tables, so new columns and
+-- constraints are added here, idempotently. CHECKs are added NOT VALID: they
+-- apply to every new write without failing the migration on old rows.
+-- ---------------------------------------------------------------------------
+ALTER TABLE opportunities ADD COLUMN IF NOT EXISTS closed_at TIMESTAMPTZ;
+UPDATE opportunities SET closed_at = updated_at
+  WHERE closed_at IS NULL AND stage IN ('Closed Won', 'Closed Lost');
+-- After the ADD COLUMN: on an upgraded database the column doesn't exist above.
+CREATE INDEX IF NOT EXISTS idx_opportunities_closed ON opportunities(stage, closed_at);
+
+DO $$
+DECLARE
+  fk RECORD;
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'opportunities_stage_check') THEN
+    ALTER TABLE opportunities ADD CONSTRAINT opportunities_stage_check CHECK (stage IN (
+      'Prospecting', 'Qualification', 'Needs Analysis', 'Proposal',
+      'Negotiation', 'Closed Won', 'Closed Lost')) NOT VALID;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'opportunities_probability_check') THEN
+    ALTER TABLE opportunities ADD CONSTRAINT opportunities_probability_check
+      CHECK (probability BETWEEN 0 AND 100) NOT VALID;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'opportunities_amount_check') THEN
+    ALTER TABLE opportunities ADD CONSTRAINT opportunities_amount_check CHECK (amount_cents >= 0) NOT VALID;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'leads_status_check') THEN
+    ALTER TABLE leads ADD CONSTRAINT leads_status_check
+      CHECK (status IN ('New', 'Contacted', 'Qualified', 'Unqualified', 'Converted')) NOT VALID;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'leads_converted_check') THEN
+    ALTER TABLE leads ADD CONSTRAINT leads_converted_check
+      CHECK ((status = 'Converted') = (converted_at IS NOT NULL)) NOT VALID;
+  END IF;
+
+  -- Re-create the converted_* foreign keys with ON DELETE SET NULL where an
+  -- older schema created them with the default (NO ACTION).
+  FOR fk IN
+    SELECT c.conname, a.attname AS col, cl.relname AS target
+    FROM pg_constraint c
+    JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = c.conkey[1]
+    JOIN pg_class cl ON cl.oid = c.confrelid
+    WHERE c.conrelid = 'leads'::regclass AND c.contype = 'f'
+      AND a.attname IN ('converted_account_id', 'converted_contact_id', 'converted_opportunity_id')
+      AND c.confdeltype <> 'n'
+  LOOP
+    EXECUTE format('ALTER TABLE leads DROP CONSTRAINT %I', fk.conname);
+    EXECUTE format(
+      'ALTER TABLE leads ADD CONSTRAINT %I FOREIGN KEY (%I) REFERENCES %I(id) ON DELETE SET NULL',
+      fk.conname, fk.col, fk.target);
+  END LOOP;
+END $$;

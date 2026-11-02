@@ -3,7 +3,8 @@ import type { SavedQuery } from '../types';
 interface SavedQueryListProps {
   queries: SavedQuery[];
   onSelect: (query: SavedQuery) => void;
-  onDelete: (id: string) => void;
+  /** Omitted for viewers, which hides the delete control. */
+  onDelete?: (id: string) => void;
 }
 
 /** Displays a list of saved SQL queries with click-to-load and delete actions. */
@@ -22,12 +23,14 @@ export function SavedQueryList({ queries, onSelect, onDelete }: SavedQueryListPr
         >
           <div className="flex items-center justify-between">
             <span className="text-sm text-supabase-text truncate">{query.name}</span>
-            <button
-              onClick={(e) => { e.stopPropagation(); onDelete(query.id); }}
-              className="opacity-0 group-hover:opacity-100 text-supabase-secondary hover:text-supabase-danger text-xs transition-opacity"
-            >
-              &times;
-            </button>
+            {onDelete && (
+              <button
+                onClick={(e) => { e.stopPropagation(); onDelete(query.id); }}
+                className="opacity-0 group-hover:opacity-100 text-supabase-secondary hover:text-supabase-danger text-xs transition-opacity"
+              >
+                &times;
+              </button>
+            )}
           </div>
           <div className="text-xs text-supabase-secondary mt-0.5 truncate font-mono">
             {query.queryText.substring(0, 60)}

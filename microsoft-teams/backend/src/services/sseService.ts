@@ -13,6 +13,14 @@ interface SSEClient {
 
 const channelClients = new Map<string, Set<SSEClient>>();
 
+/**
+ * Published when a user loses access to a channel (left or was removed from the
+ * channel, its team or its organization). A stream is authorized once, when it
+ * opens; without this event a removed member would keep receiving the
+ * channel's messages until they happened to reconnect.
+ */
+export const MEMBER_REMOVED_EVENT = 'member_removed';
+
 /** Registers an SSE client for a channel and handles cleanup on disconnect. */
 export function addClient(channelId: string, userId: string, res: Response): void {
   if (!channelClients.has(channelId)) {
@@ -42,11 +50,38 @@ export function broadcastToChannel(channelId: string, event: string, data: unkno
 
   const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
 
-  for (const client of clients) {
+  // Every client learns who left (so member lists can refresh); the removed
+  // user's own streams on this instance are then closed. Their EventSource will
+  // try to reconnect and get a 404 from the membership check, which ends it.
+  const evictUserId =
+    event === MEMBER_REMOVED_EVENT ? (data as { userId?: string } | null)?.userId : undefined;
+
+  for (const client of [...clients]) {
     try {
       client.res.write(payload);
+      if (evictUserId && client.userId === evictUserId) {
+        client.res.end();
+      }
     } catch (err) {
       logger.error({ err, channelId }, 'Failed to send SSE event');
+    }
+  }
+}
+
+/**
+ * Ends every open stream (used on shutdown). `server.close()` waits for all
+ * connections to finish, and SSE connections never finish on their own, so
+ * without this a SIGTERM hung for as long as any client was connected.
+ * Clients' EventSource reconnects to another instance.
+ */
+export function closeAllClients(): void {
+  for (const clients of channelClients.values()) {
+    for (const client of [...clients]) {
+      try {
+        client.res.end();
+      } catch {
+        // already closed
+      }
     }
   }
 }

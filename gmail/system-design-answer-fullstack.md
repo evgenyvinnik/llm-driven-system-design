@@ -480,10 +480,10 @@ health response establish delivery guarantees.
 | Client updates | ✅ Versioned desired state | ❌ Blind inverse rollback | Preserve newer intent across delayed responses |
 
 The repository demo provides internal SQL sends, session cookies, per-user flags,
-draft version checks, a paged virtualized list, and search polling. Its compose window
-never saves drafts, thread detail uses overly broad thread membership, cache
-invalidation and archive filtering are incomplete, and send has no idempotency
-receipt. Raw HTML and stale client responses also need correction. [The architecture
+draft version checks, a paged virtualized list, and marker-based search indexing. It
+enforces viewer-specific message access and summaries, sanitizes HTML, and invalidates
+caches by generation. Its compose window never saves drafts, send has no idempotency
+receipt, and stale client responses still need generation guards. [The architecture
 document](./architecture.md) records actual behavior; these interview decisions
 describe the intended production design.
 

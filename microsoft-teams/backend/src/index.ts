@@ -5,6 +5,7 @@ import { connectRedis } from './services/redis.js';
 import { pool } from './services/db.js';
 import { initPubSub, closePubSub } from './services/pubsub.js';
 import { ensureBucket } from './services/storageService.js';
+import { closeAllClients } from './services/sseService.js';
 
 async function start() {
   try {
@@ -28,6 +29,8 @@ async function start() {
     // Graceful shutdown
     const shutdown = async (signal: string) => {
       logger.info({ signal }, 'Shutting down gracefully');
+      // Drain SSE streams first, or server.close() never completes.
+      closeAllClients();
       server.close(async () => {
         await closePubSub();
         await pool.end();

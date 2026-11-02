@@ -19,11 +19,12 @@ export interface MeetingSettings {
   maxParticipants: number;
 }
 
+export type Role = 'host' | 'co-host' | 'participant';
+
 export interface Participant {
-  id: string;
   userId: string;
   displayName: string;
-  role: 'host' | 'co-host' | 'participant';
+  role: Role;
   isMuted: boolean;
   isVideoOn: boolean;
   isScreenSharing: boolean;
@@ -44,7 +45,14 @@ export interface BreakoutRoom {
   id: string;
   name: string;
   isActive: boolean;
-  participants: string[];
+  participants: { userId: string; displayName: string }[];
+}
+
+/** Someone in the waiting room, as the host sees them. */
+export interface WaitingParticipant {
+  userId: string;
+  displayName: string;
+  since: string;
 }
 
 export interface User {

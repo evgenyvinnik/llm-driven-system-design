@@ -1,7 +1,8 @@
 import { Router, Request, Response } from 'express';
 import { requireAuth, AuthenticatedRequest } from '../middleware/auth.js';
 import * as labelService from '../services/labelService.js';
-import { cacheDel } from '../services/redis.js';
+import { invalidateMailboxes } from '../services/redis.js';
+import { isUuid } from '../services/validation.js';
 import logger from '../services/logger.js';
 
 const router = Router();
@@ -61,6 +62,8 @@ router.put('/:labelId', requireAuth as unknown as import('express').RequestHandl
     const { name, color } = req.body;
 
     const label = await labelService.updateLabel(userId, labelId, name, color);
+    // Cached thread lists embed label names.
+    await invalidateMailboxes(userId);
     if (!label) {
       return res.status(404).json({ error: 'Label not found or is a system label' });
     }
@@ -84,6 +87,7 @@ router.delete('/:labelId', requireAuth as unknown as import('express').RequestHa
     const { labelId } = req.params;
 
     const deleted = await labelService.deleteLabel(userId, labelId);
+    await invalidateMailboxes(userId);
     if (!deleted) {
       return res.status(404).json({ error: 'Label not found or is a system label' });
     }
@@ -107,12 +111,15 @@ router.post('/:labelId/assign', requireAuth as unknown as import('express').Requ
     const { labelId } = req.params;
     const { threadId } = req.body;
 
-    if (!threadId) {
-      return res.status(400).json({ error: 'Thread ID is required' });
+    if (!isUuid(threadId) || !isUuid(labelId)) {
+      return res.status(isUuid(threadId) || !threadId ? 400 : 404).json({ error: 'A valid thread ID and label ID are required' });
     }
 
-    await labelService.assignLabel(userId, threadId, labelId);
-    await cacheDel(`threads:${userId}:*`);
+    const assigned = await labelService.assignLabel(userId, threadId, labelId);
+    if (!assigned) {
+      return res.status(404).json({ error: 'Label or thread not found' });
+    }
+    await invalidateMailboxes(userId);
 
     res.json({ message: 'Label assigned' });
   } catch (error) {
@@ -138,7 +145,7 @@ router.post('/:labelId/remove', requireAuth as unknown as import('express').Requ
     }
 
     await labelService.removeLabel(userId, threadId, labelId);
-    await cacheDel(`threads:${userId}:*`);
+    await invalidateMailboxes(userId);
 
     res.json({ message: 'Label removed' });
   } catch (error) {

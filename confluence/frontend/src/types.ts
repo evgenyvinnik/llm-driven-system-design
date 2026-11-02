@@ -8,7 +8,15 @@ export interface User {
   created_at: string;
 }
 
+/** What the signed-in user may do in a space (from the server). */
+export interface SpaceAccessInfo {
+  role: 'admin' | 'member' | 'viewer' | null;
+  canEdit: boolean;
+  canAdmin: boolean;
+}
+
 export interface Space {
+  access?: SpaceAccessInfo;
   id: string;
   key: string;
   name: string;
@@ -44,6 +52,7 @@ export interface Page {
   };
   labels?: string[];
   breadcrumbs?: Array<{ id: string; title: string; slug: string }>;
+  access?: SpaceAccessInfo;
   space_key?: string;
   space_name?: string;
   author_username?: string;
@@ -128,6 +137,7 @@ export interface SearchResult {
   page_id: string;
   space_id: string;
   space_key: string;
+  slug: string;
   title: string;
   content_text: string;
   labels: string[];

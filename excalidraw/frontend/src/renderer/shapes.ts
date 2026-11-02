@@ -49,8 +49,6 @@ export const renderEllipse = (ctx: CanvasRenderingContext2D, el: ExcalidrawEleme
 export const renderDiamond = (ctx: CanvasRenderingContext2D, el: ExcalidrawElement): void => {
   const cx = el.x + el.width / 2;
   const cy = el.y + el.height / 2;
-  const hw = el.width / 2;
-  const hh = el.height / 2;
 
   ctx.beginPath();
   ctx.moveTo(cx, el.y);          // top

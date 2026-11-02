@@ -73,9 +73,15 @@ CREATE TABLE IF NOT EXISTS messages (
   parent_message_id UUID REFERENCES messages(id),
   content TEXT NOT NULL,
   is_edited BOOLEAN DEFAULT false,
+  -- Soft delete: content is blanked and the row kept, so replies to a deleted
+  -- thread root stay attached (a hard DELETE violated the self-referencing FK).
+  deleted_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
+
+-- Databases created before soft delete existed (migrate re-runs this file).
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
 
 CREATE TABLE IF NOT EXISTS message_reactions (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -98,7 +104,8 @@ CREATE TABLE IF NOT EXISTS files (
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS idx_messages_channel ON messages(channel_id, created_at DESC);
+-- (created_at, id) is the pagination cursor; id breaks created_at ties.
+CREATE INDEX IF NOT EXISTS idx_messages_channel ON messages(channel_id, created_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_parent ON messages(parent_message_id);
 CREATE INDEX IF NOT EXISTS idx_reactions_message ON message_reactions(message_id);
 CREATE INDEX IF NOT EXISTS idx_files_channel ON files(channel_id);
@@ -106,3 +113,6 @@ CREATE INDEX IF NOT EXISTS idx_files_message ON files(message_id);
 CREATE INDEX IF NOT EXISTS idx_org_members ON org_members(user_id);
 CREATE INDEX IF NOT EXISTS idx_team_members ON team_members(user_id);
 CREATE INDEX IF NOT EXISTS idx_channel_members ON channel_members(user_id);
+
+-- Channel names are unique within a team, case-insensitively.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_channels_team_name ON channels(team_id, lower(name));

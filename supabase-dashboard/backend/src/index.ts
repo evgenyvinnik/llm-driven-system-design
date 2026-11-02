@@ -4,6 +4,7 @@ import { logger } from './services/logger.js';
 import { connectRedis } from './services/redis.js';
 import { cleanupTargetPools } from './services/queryExecutor.js';
 import { pool } from './services/db.js';
+import { encryptLegacyPasswords } from './services/credentials.js';
 
 async function start() {
   try {
@@ -13,6 +14,9 @@ async function start() {
     // Test database connection
     await pool.query('SELECT 1');
     logger.info('Database connected');
+
+    // Seeded and pre-encryption rows hold plaintext target passwords; encrypt them before serving.
+    await encryptLegacyPasswords();
 
     const server = app.listen(config.port, () => {
       logger.info({ port: config.port }, 'Supabase Dashboard backend server started');

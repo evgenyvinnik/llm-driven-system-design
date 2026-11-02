@@ -436,10 +436,11 @@ after deletion, two saves from one version, and send racing with save. Those tes
 assess the invariants directly rather than only checking HTTP status on mocked routes.
 
 The local repository uses one SQL send transaction, cookie sessions, Redis request
-counters, a working draft version condition, and a timestamp-polling indexer. It lacks
-send receipts and outbox delivery; archive/cache semantics, reply access,
-message-level visibility, and checkpoint precision have gaps. Search errors become
-empty success, and the circuit-breaker helper is unused.
+counters and a working draft version condition. It enforces message-level visibility in
+thread views, lists and search, and refuses replies from non-participants. The indexer
+acknowledges each message with an `indexed_at` marker, and search falls back to
+visibility-checked SQL with a degraded flag. It lacks send receipts, outbox delivery,
+per-mailbox projections (summaries are computed per query), and indexer leasing.
 [architecture.md](./architecture.md) records those source findings separately from
 this proposal.
 

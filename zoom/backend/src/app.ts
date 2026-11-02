@@ -17,7 +17,7 @@ export const app = express();
 
 // Middleware
 app.use(cors({
-  origin: 'http://localhost:5173',
+  origin: config.allowedOrigins,
   credentials: true,
 }));
 app.use(express.json());
@@ -29,20 +29,22 @@ const redisStore = new RedisStore({
   prefix: 'zoom:session:',
 });
 
-app.use(
-  session({
-    store: redisStore,
-    secret: config.session.secret,
-    resave: false,
-    saveUninitialized: false,
-    cookie: {
-      secure: false,
-      httpOnly: true,
-      maxAge: config.session.maxAge,
-      sameSite: 'lax',
-    },
-  })
-);
+// Exported so the WebSocket upgrade resolves the same session from the same
+// cookie: the socket's identity is the logged-in user, never a client claim.
+export const sessionMiddleware = session({
+  store: redisStore,
+  secret: config.session.secret,
+  resave: false,
+  saveUninitialized: false,
+  cookie: {
+    secure: false,
+    httpOnly: true,
+    maxAge: config.session.maxAge,
+    sameSite: 'lax',
+  },
+});
+
+app.use(sessionMiddleware);
 
 // Rate limiting
 app.use('/api/', apiLimiter);

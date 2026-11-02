@@ -14,6 +14,9 @@ import {
   saveVersion,
 } from '../services/drawingService.js';
 import { drawingRateLimiter } from '../services/rateLimiter.js';
+import { isValidElement } from '../websocket/handler.js';
+import { closeRoom, mergeHttpSave, refreshRoomAccess } from '../websocket/rooms.js';
+import type { CrdtElement } from '../services/crdtService.js';
 import logger from '../services/logger.js';
 import { drawingsCreatedTotal, drawingsDeletedTotal } from '../services/metrics.js';
 
@@ -182,23 +185,39 @@ router.put('/:drawingId', requireAuth as never, async (req: AuthenticatedRequest
 
     const { title, elements, appState, isPublic } = req.body;
 
-    const drawing = await updateDrawing(drawingId, {
-      title,
-      elements,
-      appState,
-      isPublic,
-    });
+    if (elements !== undefined && (!Array.isArray(elements) || !elements.every(isValidElement))) {
+      res.status(400).json({ error: 'elements must be an array of valid elements' });
+      return;
+    }
+
+    // Elements are merged (last-writer-wins per element), never replaced: the
+    // same rule the live room applies, so an HTTP save from a stale tab cannot
+    // overwrite newer socket edits or drop tombstones.
+    let merged: CrdtElement[] | null = null;
+    if (elements !== undefined) {
+      merged = await mergeHttpSave(drawingId, elements as CrdtElement[]);
+      if (!merged) {
+        res.status(404).json({ error: 'Drawing not found' });
+        return;
+      }
+    }
+
+    const drawing = await updateDrawing(drawingId, { title, appState, isPublic });
 
     if (!drawing) {
       res.status(404).json({ error: 'Drawing not found' });
       return;
     }
 
-    // Save version snapshot if elements changed
-    if (elements) {
-      saveVersion(drawingId, elements, userId).catch((err: Error) => {
+    // Save version snapshot of the merged scene
+    if (merged) {
+      saveVersion(drawingId, merged, userId).catch((err: Error) => {
         logger.error({ error: err.message }, 'Failed to save version');
       });
+    }
+    if (isPublic !== undefined) {
+      // Making a drawing private must disconnect anonymous viewers now.
+      await refreshRoomAccess(drawingId);
     }
 
     res.json({
@@ -237,6 +256,7 @@ router.delete('/:drawingId', requireAuth as never, async (req: AuthenticatedRequ
       res.status(404).json({ error: 'Drawing not found' });
       return;
     }
+    closeRoom(drawingId);
 
     drawingsDeletedTotal.inc();
     res.json({ message: 'Drawing deleted' });
@@ -256,6 +276,10 @@ router.post('/:drawingId/collaborators', requireAuth as never, async (req: Authe
 
     if (!username) {
       res.status(400).json({ error: 'Username is required' });
+      return;
+    }
+    if (permission !== undefined && permission !== 'view' && permission !== 'edit') {
+      res.status(400).json({ error: "Permission must be 'view' or 'edit'" });
       return;
     }
 
@@ -284,8 +308,21 @@ router.post('/:drawingId/collaborators', requireAuth as never, async (req: Authe
     }
 
     const collaborator = await addCollaborator(drawingId, targetUserId, permission || 'view');
+    if (!collaborator) {
+      res.status(500).json({ error: 'Failed to add collaborator' });
+      return;
+    }
+    // A changed permission applies to the collaborator's open socket immediately.
+    await refreshRoomAccess(drawingId);
 
-    res.status(201).json({ collaborator });
+    res.status(201).json({
+      collaborator: {
+        userId: collaborator.user_id,
+        username: collaborator.username,
+        displayName: collaborator.display_name,
+        permission: collaborator.permission,
+      },
+    });
   } catch (error) {
     const err = error as Error;
     logger.error({ error: err.message }, 'Failed to add collaborator');
@@ -306,6 +343,8 @@ router.delete('/:drawingId/collaborators/:targetUserId', requireAuth as never, a
     }
 
     await removeCollaborator(drawingId, targetUserId);
+    // Revocation reaches a socket that is already in the room, not just the next join.
+    await refreshRoomAccess(drawingId);
     res.json({ message: 'Collaborator removed' });
   } catch (error) {
     const err = error as Error;
@@ -318,6 +357,11 @@ router.delete('/:drawingId/collaborators/:targetUserId', requireAuth as never, a
 router.get('/:drawingId/collaborators', requireAuth as never, async (req: AuthenticatedRequest, res: Response): Promise<void> => {
   try {
     const { drawingId } = req.params;
+    const access = await hasAccess(drawingId, req.session.userId!);
+    if (!access.canView) {
+      res.status(403).json({ error: 'Access denied' });
+      return;
+    }
     const collaborators = await getCollaborators(drawingId);
 
     res.json({

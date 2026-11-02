@@ -29,15 +29,17 @@ export function FileAttachment({ fileId, filename, contentType, sizeBytes }: Fil
 
   return (
     <div
+      data-testid="file-attachment"
       onClick={handleDownload}
       className="inline-flex items-center gap-2 px-3 py-2 bg-teams-bg border border-teams-border rounded-lg cursor-pointer hover:bg-teams-border transition-colors max-w-xs"
     >
       <span className="text-xl">{icon}</span>
       <div className="min-w-0">
         <p className="text-sm text-teams-text truncate">{filename}</p>
-        {sizeBytes && (
+        {/* `sizeBytes &&` rendered a literal "0" for an empty file. */}
+        {sizeBytes != null ? (
           <p className="text-xs text-teams-secondary">{formatBytes(sizeBytes)}</p>
-        )}
+        ) : null}
       </div>
     </div>
   );

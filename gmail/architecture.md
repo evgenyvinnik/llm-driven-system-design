@@ -4,7 +4,7 @@
 
 This project explores email conversations whose content and mailbox state have different ownership. A message has a specific sender and recipient set; reading, starring, filing, and deleting it belong to each user's mailbox. A thread groups related messages, but membership in one message must not grant access to every message in that thread.
 
-The **production proposal** below describes an internal email service at a stated hypothetical scale. The **local implementation** is a React client, one Express API, a polling indexer, PostgreSQL, Valkey, and Elasticsearch. It has real transactions, sessions, draft version checks, and rate limits, together with substantial gaps described in the final Implementation Notes. It does not implement Google Gmail's infrastructure or external email transport. Setup is in [README.md](./README.md).
+The **production proposal** below describes an internal email service at a stated hypothetical scale. The **local implementation** is a React client, one Express API, a polling indexer, PostgreSQL, Valkey, and Elasticsearch. It enforces per-message visibility (a user sees only messages they sent or received), sanitizes stored HTML, and has real transactions, sessions, draft version checks, and rate limits. It still lacks the durable receipts and per-mailbox projections of the production design, as described in the final Implementation Notes. It does not implement Google Gmail's infrastructure or external email transport. Setup is in [README.md](./README.md).
 
 ## Requirements
 
@@ -94,7 +94,7 @@ After commit, return the accepted message ID and delivery status. Workers create
 
 A crash after delivery but before acknowledgment leads to replay, so the mailbox write and its processed-event receipt commit together. Lease expiry allows another worker to recover abandoned work. Per-message delivery status reports outstanding recipients. Retry budgets distinguish transient infrastructure failures from permanently invalid or disabled recipients; accepted internal addresses have already been resolved to stable account IDs.
 
-**Local:** [messageService.ts](./backend/src/services/messageService.ts) performs message, state, label, and contact SQL in a single database transaction. Recipient cache calls occur inside it, and sender cache calls follow commit. There is no send receipt, outbox, delivery worker, or recipient validation against the complete requested set.
+**Local:** [messageService.ts](./backend/src/services/messageService.ts) performs message, state, label, and contact SQL in a single database transaction. Recipients are normalized and deduplicated, and any address without an account rejects the whole send with 400. Replies require the sender to see the thread and the replied-to message. Body HTML is sanitized, and all caches are invalidated after commit. There is no send receipt, outbox, or delivery worker.
 
 ### Read a mailbox and conversation
 
@@ -102,7 +102,7 @@ The proposal stores a per-user conversation summary derived only from that user'
 
 Fetch message pages using the user's entitlement records, not a global thread lookup alone. Represent read state by the highest visible mailbox sequence actually presented. A later delivery has a higher sequence and remains unread when an older read request arrives late. Archive removes Inbox membership; Spam/Trash follow one canonical location policy. User actions and counts are committed together or associated with a mailbox revision for reconciliation.
 
-**Local:** thread-state membership guards the initial detail query, then all thread messages are returned. Thread snippets, counts, and participants are global. An initial BCC-only recipient can consequently see later replies that exclude them. The list omits BCC recipient identities but includes all senders; a BCC recipient who explicitly replies is now a sender, which is a different visibility event.
+**Local:** visibility is per message: a user sees a message only if they sent it or are one of its recipients. Thread detail returns only those messages. The list computes each thread's count, latest time, snippet and participants over the same set with a `LATERAL` subquery, so a reply that excludes someone never reaches their view. BCC lists are shown to the message's sender, and to a BCC recipient only as themself. This used to be thread-wide: anyone with a state row saw every message, including replies they were left off. Computing the summary per query rather than storing it per mailbox is the local simplification.
 
 ### Save drafts and send a frozen revision
 
@@ -118,7 +118,7 @@ The search service validates operators, bounds query cost, and returns message h
 
 An outbox consumer publishes versioned upserts and tombstones. Old retries cannot restore deleted mail. A rebuild uses a new index generation, a consistent snapshot plus subsequent changes, verification, and an atomic read-alias switch. Retain enough change history to catch up; do not reset a global time checkpoint and assume completeness.
 
-**Local:** each message is indexed once with a `visible_to` array of sender and all recipients. Searchable recipient fields exclude BCC for everyone, including the sender. Results omit that array and recipient fields. This is a useful partial protection, but there is no authoritative SQL hydration, per-user deletion projection, rebuild protocol, or sanitized snippet contract.
+**Local:** each message is indexed once with a `visible_to` array of sender and all recipients. Searchable recipient fields exclude BCC for everyone, including the sender. Hits are re-checked against SQL (visibility plus the user's current Trash/Spam state), snippets are HTML-escaped with only highlight tags added, and `npm run search:reindex` rebuilds the index. There is no per-user index projection.
 
 ## Database Schema
 
@@ -270,20 +270,20 @@ All paths below have `/api/v1` as their prefix. Except register/login/logout, ha
 |--------|------|-----------------|
 | POST | `/auth/register`, `/auth/login` | Register with eight labels; login by username |
 | POST / GET | `/auth/logout` / `/auth/me` | Destroy session / load current user from SQL |
-| GET | `/threads?label=INBOX&page=1` | 25 conversations; global summary plus per-user flags/labels |
-| GET | `/threads/unread-counts` | Label-assignment counts plus a separate Starred count |
-| GET | `/threads/:threadId` | All messages after thread-state check; marks thread read |
-| PATCH | `/threads/:threadId/state` | Update supplied flags; success even when no row matches |
-| POST | `/messages/send`, `/messages/reply` | Internal SQL send; 201 returns threadId and messageId |
+| GET | `/threads?label=INBOX&page=1` | 25 conversations; summary over the caller's visible messages; archived threads excluded from INBOX |
+| GET | `/threads/unread-counts` | Per-label unread counts with the same folder predicates as the lists, plus Starred and Spam |
+| GET | `/threads/:threadId` | The caller's visible messages (404 if none); marks thread read |
+| PATCH | `/threads/:threadId/state` | Update supplied boolean flags; 404 if the caller has no state for the thread |
+| POST | `/messages/send`, `/messages/reply` | Internal SQL send; 400 with `unknownRecipients`, 404 for a thread or parent the sender cannot see; 201 returns threadId and messageId |
 | GET / POST | `/labels` | List labels / create custom label |
 | PUT / DELETE | `/labels/:labelId` | Owner-scoped custom-label mutation; system labels protected |
-| POST | `/labels/:labelId/assign`, `/labels/:labelId/remove` | Assign/remove caller's thread-label relation |
+| POST | `/labels/:labelId/assign`, `/labels/:labelId/remove` | Assign/remove; the label must be the caller's and the thread visible (else 404) |
 | GET / POST | `/drafts` | Unpaged draft list / create another version-1 draft |
 | GET / PUT / DELETE | `/drafts/:draftId` | Owner-scoped read/update/delete; PUT requires version |
-| GET | `/search?q=...&page=1` | 20 message hits; search failures usually return 200 with an empty result |
+| GET | `/search?q=...&page=1` | 20 message hits re-checked against SQL; `degraded: true` when served by the SQL fallback |
 | GET | `/contacts?q=...` | Up to ten matching contacts, ordered by frequency |
 
-Draft conflicts return 409 with `error` and current `draft`; missing drafts return 404. The browser's shared fetch helper converts failures to a plain Error and drops status/current-draft data. New production contracts would add operation receipts, expected versions, cursor/sequence metadata, and explicit degraded search status. They are not accepted by the current endpoints merely because they appear in this design.
+Draft conflicts return 409 with `error` and current `draft`; missing drafts return 404. The browser's shared fetch helper converts failures to a plain Error and drops status/current-draft data. New production contracts would add operation receipts, expected versions, and cursor/sequence metadata. They are not accepted by the current endpoints merely because they appear in this design.
 
 ## Key Design Decisions
 
@@ -309,7 +309,7 @@ Production acceptance commits content, audience, request receipt, and outbox tog
 
 Recipient delivery is at least once in transport with one committed mailbox effect per unique delivery ID. Search is eventually consistent and independently repairable. UI read-your-writes uses a mailbox revision or primary read until replicas catch up. Cache invalidation follows commit; generation checks prevent an older in-flight read from repopulating a newer cache generation.
 
-**Local deviations:** no send or draft-create receipt exists. Recipient SQL and contacts are transactional, but Redis calls inside the transaction can fail it. Sender invalidation can fail after COMMIT; the catch then attempts ROLLBACK and reports an error despite persisted mail. Retrying that request can send again. A client-disabled button does not resolve this outcome. Existing senders' read flags are not set true on conflict, and new deliveries do not clear recipient archive/trash/spam flags.
+**Local deviations:** no send or draft-create receipt exists, so retrying an uncertain send can send again. Recipient SQL and contacts are transactional, and cache invalidation runs after commit and fails open (a per-user generation counter, bumped with `INCR`), so a Redis failure can no longer turn persisted mail into an error. A new delivery un-archives the thread for its recipients but leaves Trash and Spam alone.
 
 ## Security / Auth
 
@@ -331,10 +331,10 @@ Local [metrics.ts](./backend/src/services/metrics.ts) registers HTTP duration/co
 
 | Failure | Proposed response | Actual local behavior |
 |---------|-------------------|-----------------------|
-| Redis unavailable | Fail closed for authentication; isolate optional caches | Sessions/limits depend on Redis; cache helpers throw rather than falling through |
+| Redis unavailable | Fail closed for authentication; isolate optional caches | Sessions/limits depend on Redis; the mailbox cache fails open (misses, no-op writes) |
 | SQL unavailable | Reject new work; retain client drafts and uncertain-operation IDs | Pool errors reach routes; an idle-client error exits the process |
-| Search unavailable | Explicit degraded response, bounded deadline, durable indexing backlog | Search catches errors as ordinary empty results; breaker helper is never imported into this flow |
-| Worker stops | Resume leased outbox records with deduplication | Poll loop retries after errors; timestamp-only cursor has skip/replay/stall cases |
+| Search unavailable | Explicit degraded response, bounded deadline, durable indexing backlog | 5 s client timeout, then a visibility-checked SQL fallback with `degraded: true`; unindexed messages wait in SQL |
+| Worker stops | Resume leased outbox records with deduplication | Per-message `indexed_at` markers; a restarted worker resumes exactly where it stopped (no lease for multiple workers) |
 | Response lost after send | Resolve receipt using the same operation key | No receipt; retry can duplicate an already committed send |
 
 [rateLimiter.ts](./backend/src/services/rateLimiter.ts) applies Redis counters to general `/api/` traffic (1,000/minute), login failures (five/minute, successful requests decremented), sends/replies (50/hour), and search (60/minute). Keys use session user ID or the library's IP/subnet helper. This is a counter with expiration, not a sliding-window log. It limits requests, not recipients or bytes; general limits include health endpoints.
@@ -366,41 +366,55 @@ A conversation that receives continuous mail is a hot aggregate. Batch summary u
 
 ### What actually runs
 
-[app.ts](./backend/src/app.ts) mounts seven route groups in one Express process. [index.ts](./backend/src/index.ts) starts the listener without a dependency-readiness gate. The [worker](./backend/src/workers/search-indexer.ts) is launched separately; only it initializes the search index. Initialization logs and swallows errors, and an existing index's mapping is not migrated.
+[app.ts](./backend/src/app.ts) mounts seven route groups in one Express process. [index.ts](./backend/src/index.ts) starts the listener without a dependency-readiness gate. `npm run dev` starts it together with the [worker](./backend/src/workers/search-indexer.ts) (via `concurrently`); the worker waits for Elasticsearch and initializes the index. An existing index's mapping is not migrated; `npm run search:reindex` recreates it.
 
-[config/index.ts](./backend/src/config/index.ts) loads dotenv, but the [database pool](./backend/src/services/db.ts) ignores `DATABASE_URL` and uses `POSTGRES_*`. The [Redis client](./backend/src/services/redis.ts) ignores `REDIS_URL` and uses `REDIS_HOST`/`REDIS_PORT`. The separate [migration runner](./backend/src/db/migrate.ts) uses exported `DATABASE_URL` without dotenv. Nested instance scripts all force 3001; README supplies direct tsx commands for other ports.
+[config/index.ts](./backend/src/config/index.ts) loads dotenv, but the [database pool](./backend/src/services/db.ts) ignores `DATABASE_URL` and uses `POSTGRES_*`. The [Redis client](./backend/src/services/redis.ts) ignores `REDIS_URL` and uses `REDIS_HOST`/`REDIS_PORT`. The separate [migration runner](./backend/src/db/migrate.ts) uses exported `DATABASE_URL` without dotenv. `dev:server2`/`dev:server3` bind 3002/3003 (they used to call `dev` and inherit its forced 3001).
 
-### Implemented patterns and their limits
+### Visibility, sending, and mailbox semantics (implemented)
 
-The send transaction protects the SQL work actually performed for resolved recipients. It does not guarantee that all requested addresses received mail. Contacts update in that same transaction, not best effort afterward. Duplicate addresses can create duplicate recipient rows and increment contact frequency repeatedly because recipient uniqueness and normalization are absent.
+**Visibility is per message** ([threadService.ts](./backend/src/services/threadService.ts), `visibleMessageSql`): sender or recipient of that message, nothing broader. It drives thread detail, the list's per-user summary (count, latest time, snippet and participants, computed with a `LATERAL` subquery over visible messages), unread counts, search re-checks, label assignment and replies. The seed includes two threads that exercise the rule:
+- Bob replies to Alice only in a thread Charlie was on.
+- Charlie BCCs Alice.
 
-The draft update's essential condition is:
+The trade-off is that the summary is recomputed per list query and not stored per mailbox. That is cheap at local scale, and is the point at which the production design's per-user projection takes over.
+
+**Sending** ([messageService.ts](./backend/src/services/messageService.ts)):
+- Recipients are normalized (trimmed, lowercased) and deduplicated, keeping each person's most visible role (to > cc > bcc). A unique `(message_id, user_id)` index backs this; duplicate addresses used to create duplicate rows and double contact counts.
+- Unknown addresses fail the whole send with 400 and the list, instead of being dropped silently.
+- A reply must target a thread the sender can see and a parent message they can see. Before, posting into any thread ID created a state row for the sender, which then exposed the whole conversation.
+- `bodyHtml` is sanitized with an allow-list ([htmlSanitizer.ts](./backend/src/services/htmlSanitizer.ts)); the reader also runs DOMPurify for rows written earlier.
+- New mail un-archives the thread for its recipients, as Gmail does.
+
+The draft update's essential condition is unchanged:
 
 ```sql
 WHERE id = $1 AND user_id = $2 AND version = $11
 ```
 
-[Draft service](./backend/src/services/draftService.ts) increments the version in that same update and returns the current owner-scoped draft on conflict. This prevents stale database writes, but creation is not idempotent, deletion is unconditional on version, and `COALESCE` prevents clearing some nullable reply/HTML fields. Reply references are not checked against the caller's visible thread.
+Draft creation is still not idempotent, deletion is unconditional on version, and reply references are not checked against the caller's visible thread.
 
-Sessions and Redis-backed rate limits are wired. The [circuit-breaker factory](./backend/src/services/circuitBreaker.ts) is only a helper: no production call site creates a breaker. It must not be credited with protecting Elasticsearch. The actual search path catches errors and returns empty results without a fallback flag.
+**Mailbox semantics.**
+- **Folders.** INBOX excludes archived threads (Archive used to do nothing visible), Spam excludes Trash, and unread counts use the same predicates; an archived thread no longer counts toward INBOX.
+- **Caching.** Thread lists and unread counts are cached for 30 seconds under keys that embed a per-user generation, and every write bumps it with `INCR` after commit: state changes, sends (for all participants), label changes, label renames and deletes. The old code called `DEL` on a key containing `*`, which Redis does not expand, so nothing was invalidated. Cache helpers fail open.
+- **Validation.** Malformed IDs are 404s rather than Postgres cast errors, and a state change on a thread the caller has no part in is a 404.
 
-### Cache and mailbox semantics
+Sessions and Redis-backed rate limits are wired. The [circuit-breaker factory](./backend/src/services/circuitBreaker.ts) still has no production call site; the search path's resilience is a short client timeout plus the SQL fallback.
 
-Only thread lists and unread counts are cached, both for 30 seconds. Labels and thread detail are queried directly. List keys include user, label, and page but omit the service's optional limit. `cacheDel` calls `redis.del` on one exact key; `threads:user:*` does not invalidate matching pages. Read/star/archive/trash updates omit the unread key. Label assignment/removal repeats the ineffective list delete; label rename/delete does not refresh cached thread labels or counts.
+### Indexing and search contract
 
-Recipients' unread keys are deleted before commit, allowing another read to refill stale counts from uncommitted SQL. Sender deletion follows commit and can turn persisted success into an error response. Cache reads/writes themselves throw on dependency failure. There is no bounded fallback, revision check, or request coalescing.
+The [worker](./backend/src/workers/search-indexer.ts) indexes messages whose `indexed_at` is NULL, ordered by `(created_at, id)`, and sets the marker per message once its document is written. That replaced a timestamp checkpoint in Redis with three failure modes:
+- **Ties.** It re-selected the same batch forever when more than 100 messages shared a timestamp (the stored Date lost its microseconds), or skipped rows at an exact boundary.
+- **Late commits.** A transaction committing after a newer message had been indexed fell behind the checkpoint (`created_at` is transaction start time).
+- **Batch coupling.** It retried whole batches after one failure.
 
-Inbox filtering uses label membership plus not-trash/not-spam; it does not check `is_archived` or remove INBOX on archive. Starred, Trash, Spam, and All Mail have special flag predicates; Drafts and Important are ordinary assigned-label queries. The draft table never populates thread labels. Unread counts do not mirror every special-folder predicate, and opening a thread does not invalidate the unread cache. See [threadService.ts](./backend/src/services/threadService.ts) and [labelService.ts](./backend/src/services/labelService.ts).
+A failure now increments `index_attempts` and records `index_error`, and the message is retried up to 10 times. The worker waits for Elasticsearch at boot, `npm run dev` starts it alongside the API, and `npm run search:reindex` recreates the index and clears the markers. There is no lease, so two workers would duplicate work (harmlessly, since document IDs are message IDs).
 
-### Indexer checkpoint and search contract
+[searchService.ts](./backend/src/services/searchService.ts):
+- **Visibility.** Elasticsearch filters by `visible_to`, then hits are re-checked against SQL for visibility and current Trash/Spam state, which the index cannot know. The reported total subtracts what a page drops, so it is an estimate when trashed mail matches.
+- **Escaping.** Highlights use the `html` encoder, and plain-text fallbacks are escaped, so a snippet's only markup is `<em>`.
+- **Fallback.** On an Elasticsearch error (5 s timeout, one retry), search runs an escaped `ILIKE` query over the user's visible, non-trashed messages, supporting `from:`, `to:`, `has:attachment`, `before:` and `after:`, and returns `degraded: true`.
 
-The worker selects `created_at > checkpoint`, orders only by that timestamp, and processes 100 records sequentially. It advances after the entire batch succeeds, so an individual index failure retries earlier successful upserts. Stable message document IDs avoid duplicate search documents, but do not prove complete processing.
-
-The installed PostgreSQL parser returns Date objects despite the worker's string annotation. Passing a Date directly to ioredis serializes its ordinary string representation, losing fractional seconds. An isolated execution with 101 messages in one fractional second repeatedly selected the first 100. With an exact timestamp boundary, equal-timestamp rows beyond the batch can instead be skipped. A transaction that commits late with an older `created_at` can also fall behind the checkpoint; PostgreSQL's [NOW() is transaction-start time](https://www.postgresql.org/docs/16/functions-datetime.html). A timestamp plus ID would fix ties but still would not track late commits safely.
-
-There is no worker lease, per-message index acknowledgment, dead-letter queue, deletion/update feed, or reindex command. Resetting Elasticsearch while keeping Redis can leave old mail absent. Searchable recipient fields exclude BCC; all recipients remain in `visible_to`. The parser extracts only the first occurrence of each simple operator, without quoted-expression grammar or date validation. `from:`/`to:` combine name matching and exact address terms; before/after are inclusive. Free text uses fuzzy best-fields matching over subject boosted threefold, body, sender name, and public recipient names.
-
-Search uses offsets, no unique sort tie-breaker, and discards Elasticsearch's total-hit relation. It does not filter current Trash/Spam state. Highlight fragments and fallback raw body substrings pass directly to the browser; Elasticsearch's [highlight encoder](https://www.elastic.co/docs/reference/elasticsearch/rest-apis/highlighting-settings) is not configured. HTML-safe snippets require an explicit rendering contract even when highlight tags themselves are generated by the server.
+Operator parsing is unchanged: the first occurrence of each simple operator, with no quoting grammar or date validation.
 
 ### Browser implementation
 
@@ -408,14 +422,27 @@ The [mail store](./frontend/src/stores/mailStore.ts) holds one list, one detail 
 
 [ThreadList](./frontend/src/components/ThreadList.tsx) virtualizes one 25-row page with 40 px estimates and five rows of overscan; it does not measure rows or assign thread IDs as virtualizer keys. The layout lacks a rigorously bounded viewport and there is no evidence of a particular frame rate. Rows are clickable divs without keyboard row navigation. The list and detail are alternative routes, not simultaneously mounted columns. Thread detail fetches every body even when [MessageCard](./frontend/src/components/MessageCard.tsx) initially collapses older messages.
 
-Star actions update only a matching item in the list, so detail remains stale and a direct visit with no list match sends no request. Archive/trash remove list items without updating totals/detail; failure refetches may restore cached state. Concurrent star responses can overwrite newer intent. Fetch failures are mostly silent and can leave stale content or a permanent detail loading message. Opening a thread marks SQL state read but does not reconcile list/counts. Reply uses the last sender plus To recipients, retains self, drops CC, and never has BCC to copy; its displayed recipient description is incomplete. Reply errors have no visible explanation.
+Logout now resets the mail store, so a previous account's mail does not stay on screen. Star actions update only a matching item in the list, so detail remains stale and a direct visit with no list match sends no request. Archive/trash remove list items without updating totals/detail; failure refetches may restore cached state. Concurrent star responses can overwrite newer intent. Fetch failures are mostly silent and can leave stale content or a permanent detail loading message. Opening a thread marks SQL state read but does not reconcile list/counts. Reply is reply-all: the last sender plus To and CC, excluding yourself (CC used to be dropped and your own address kept), never copying BCC. Reply errors are shown inline.
 
 [ComposeModal](./frontend/src/components/ComposeModal.tsx) retains text while minimized and while the authenticated shell stays mounted, but closes/discards without saving. Inputs remain editable during send; success closes the window even if newer text was entered. The [draft API wrapper](./frontend/src/services/api.ts) has no UI callers, and [LabelManager](./frontend/src/components/LabelManager.tsx) is unmounted. There is no undo toast, route-lazy compose, offline queue, attachment control, or admin view.
 
-[ContactAutocomplete](./frontend/src/components/ContactAutocomplete.tsx) debounces 200 ms and filters already-selected addresses, but has no stale-response guard or active suggestion keyboard model. Enter/comma/Tab accept text containing `@`; Tab is prevented even when the field is empty. A typed address not committed to a chip is omitted from send. [SearchBar](./frontend/src/components/SearchBar.tsx) submits explicitly, keeps only the first page, lacks URL query state and request ordering, renders subject highlights as literal text, and injects snippet HTML. Message HTML is also injected directly. No sanitizer, remote-image protection, modal focus trap, focus restoration, or comprehensive control labeling is implemented.
+[ContactAutocomplete](./frontend/src/components/ContactAutocomplete.tsx) debounces 200 ms and filters already-selected addresses, but has no stale-response guard or active suggestion keyboard model. Enter/comma/Tab accept text containing `@`; Tab is prevented even when the field is empty. A typed address not committed to a chip is omitted from send. [SearchBar](./frontend/src/components/SearchBar.tsx) submits explicitly, keeps only the first page, and lacks URL query state and request ordering. It renders the server-escaped subject and snippet highlights and notes degraded mode. Message HTML is sanitized on send and again with DOMPurify when rendered, and BCC appears only as the server allows. There is no remote-image protection (tracking pixels load), modal focus trap, focus restoration, or comprehensive control labeling.
 
 ### Simplified, omitted, and verified
 
 The local system uses one PostgreSQL database, one Valkey instance with AOF, one Elasticsearch node, and Vite in place of a CDN. It omits durable acceptance receipts, outbox delivery, repairable search projections, cross-region replication, attachments, protocol gateways, spam classification, push notifications, and a connected draft editor.
 
-The SQL seed has three users, five threads/nine messages, no BCC or attachment fixture, and one API-only draft. Repeated seeding duplicates recipient rows because their generated IDs have no natural uniqueness constraint. Fixed summaries are not always the latest-message summaries. Existing backend tests mock core services; smoke tests assert forms/main and generic error absence, not message correctness. Six isolated checks of actual source with mocked dependencies confirmed cache, send, draft, checkpoint, search, and client-state behavior, plus the fixture password. No application build, browser flow, database mutation, or load benchmark was performed for this review.
+The SQL seed has three users, seven threads and twelve messages, including the reply-excludes-a-participant and BCC fixtures, and one API-only draft. The unique recipient index stops repeated seeding from duplicating recipient rows.
+
+Tests:
+- **Unit tests** (24) cover recipient deduplication, email HTML sanitization, the visibility clause, and fail-open generation caching.
+- **Live run.** A scripted run against the full stack checks 34 behaviours:
+  - per-message visibility in thread detail, list rows and search;
+  - BCC display rules;
+  - refused intrusion into others' threads and replies to invisible messages;
+  - unknown-recipient refusal, recipient deduplication and HTML sanitization;
+  - escaped search snippets;
+  - archive and un-archive, immediate cache invalidation and unread counts;
+  - trash hiding from search, label ownership, and indexing markers.
+- **Outage run.** A second run stops Elasticsearch and confirms the visibility-checked, escaped SQL fallback within about 2 s, that a send during the outage records its failed index attempt, and that the message is indexed after recovery.
+- **Screenshots** were regenerated, including the same thread as seen by its full and partial participants and the BCC recipient's view.

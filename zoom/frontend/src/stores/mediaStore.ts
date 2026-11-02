@@ -34,8 +34,22 @@ export const useMediaStore = create<MediaState>((set) => ({
   ...initialState,
 
   setLocalStream: (stream) => set({ localStream: stream }),
-  setIsMuted: (val) => set({ isMuted: val }),
-  setIsVideoOn: (val) => set({ isVideoOn: val }),
+  // Keep the real tracks in step with the flags: flipping only the flag left the
+  // microphone live while the UI said "muted", and the camera light on.
+  setIsMuted: (val) =>
+    set((state) => {
+      state.localStream?.getAudioTracks().forEach((track) => {
+        track.enabled = !val;
+      });
+      return { isMuted: val };
+    }),
+  setIsVideoOn: (val) =>
+    set((state) => {
+      state.localStream?.getVideoTracks().forEach((track) => {
+        track.enabled = val;
+      });
+      return { isVideoOn: val };
+    }),
   setIsScreenSharing: (val) => set({ isScreenSharing: val }),
   setIsHandRaised: (val) => set({ isHandRaised: val }),
   setSelectedCamera: (deviceId) => set({ selectedCamera: deviceId }),

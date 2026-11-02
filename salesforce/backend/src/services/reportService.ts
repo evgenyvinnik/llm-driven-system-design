@@ -57,7 +57,13 @@ export async function getPipelineReport(userId?: string): Promise<PipelineStage[
   }
 }
 
-/** Returns monthly closed-won revenue totals for the specified period. */
+/**
+ * Returns monthly closed-won revenue totals for the specified period.
+ *
+ * A deal is booked in the month it closed (closed_at, stamped by the server on
+ * entering Closed Won). This used to group by updated_at, so editing the
+ * description of a deal won in March moved its revenue to the current month.
+ */
 export async function getRevenueReport(
   userId?: string,
   months: number = 12,
@@ -72,14 +78,14 @@ export async function getRevenueReport(
 
     const result = await pool.query(
       `SELECT
-         TO_CHAR(DATE_TRUNC('month', updated_at), 'YYYY-MM') as month,
+         TO_CHAR(DATE_TRUNC('month', closed_at), 'YYYY-MM') as month,
          COALESCE(SUM(amount_cents), 0) as total_amount_cents,
          COUNT(*) as count
        FROM opportunities
        WHERE stage = 'Closed Won'
-         AND updated_at >= NOW() - ($1 || ' months')::INTERVAL
+         AND closed_at >= NOW() - make_interval(months => $1::int)
          ${ownerFilter}
-       GROUP BY DATE_TRUNC('month', updated_at)
+       GROUP BY DATE_TRUNC('month', closed_at)
        ORDER BY month`,
       params,
     );

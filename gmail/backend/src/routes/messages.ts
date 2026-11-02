@@ -1,8 +1,9 @@
 import { Router, Request, Response } from 'express';
 import { requireAuth, AuthenticatedRequest } from '../middleware/auth.js';
-import { sendMessage } from '../services/messageService.js';
+import { sendMessage, SendError } from '../services/messageService.js';
 import { sendRateLimiter } from '../services/rateLimiter.js';
 import logger from '../services/logger.js';
+import { isUuid } from '../services/validation.js';
 
 const router = Router();
 
@@ -34,6 +35,10 @@ router.post(
       if (!bodyText) {
         return res.status(400).json({ error: 'Message body is required' });
       }
+      if ((threadId !== undefined && threadId !== null && !isUuid(threadId)) ||
+          (inReplyTo !== undefined && inReplyTo !== null && !isUuid(inReplyTo))) {
+        return res.status(404).json({ error: 'Thread not found' });
+      }
 
       const result = await sendMessage(senderId, {
         to,
@@ -48,6 +53,9 @@ router.post(
 
       res.status(201).json(result);
     } catch (error) {
+      if (error instanceof SendError) {
+        return res.status(error.status).json({ error: error.message, ...error.details });
+      }
       const err = error as Error;
       logger.error({ error: err.message }, 'Failed to send message');
       res.status(500).json({ error: 'Internal server error' });
@@ -82,6 +90,10 @@ router.post(
       if (!bodyText) {
         return res.status(400).json({ error: 'Message body is required' });
       }
+      if ((threadId !== undefined && threadId !== null && !isUuid(threadId)) ||
+          (inReplyTo !== undefined && inReplyTo !== null && !isUuid(inReplyTo))) {
+        return res.status(404).json({ error: 'Thread not found' });
+      }
 
       const result = await sendMessage(senderId, {
         to,
@@ -96,6 +108,9 @@ router.post(
 
       res.status(201).json(result);
     } catch (error) {
+      if (error instanceof SendError) {
+        return res.status(error.status).json({ error: error.message, ...error.details });
+      }
       const err = error as Error;
       logger.error({ error: err.message }, 'Failed to send reply');
       res.status(500).json({ error: 'Internal server error' });

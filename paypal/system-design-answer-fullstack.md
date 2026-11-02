@@ -61,12 +61,12 @@ This system sits at the intersection of distributed systems and financial engine
 | Table | Key Columns | Purpose |
 |-------|-------------|---------|
 | users | id (UUID PK), username (unique), email (unique), password_hash, role | Authentication and identity |
-| wallets | id (UUID PK), user_id (FK unique), balance_cents (BIGINT), version (INT) | One wallet per user, optimistic locking |
-| transactions | id (UUID PK), idempotency_key (unique), sender_id, recipient_id, amount_cents, type, status | Business event record |
+| wallets | id (UUID PK), user_id (FK unique), balance_cents (BIGINT), account_type, version (INT) | One wallet per user, optimistic locking; plus one platform cash account |
+| transactions | id (UUID PK), sender_id, recipient_id, amount_cents, type, status, payment_method_id | Business event record |
 | ledger_entries | id (UUID PK), transaction_id (FK), wallet_id (FK), entry_type (debit/credit), amount_cents, balance_after_cents | Double-entry accounting |
-| transfer_requests | id (UUID PK), requester_id (FK), payer_id (FK), amount_cents, status | Money request workflow |
+| transfer_requests | id (UUID PK), requester_id (FK), payer_id (FK), amount_cents, status, transaction_id | Money request workflow, linked to the transfer that paid it |
 | payment_methods | id (UUID PK), user_id (FK), type (bank/card), label, last_four | Linked payment sources |
-| idempotency_keys | key (PK), response (JSONB), expires_at | 24h TTL, prevents duplicate payments |
+| idempotency_keys | (user_id, key) PK, request_hash, response (JSONB), expires_at | Per-user keys, 24h TTL, prevents duplicate payments |
 
 > "Amounts are stored as BIGINT cents, not DECIMAL. $10.50 is 1050. This eliminates floating-point arithmetic errors in the application layer. The database enforces `CHECK (balance_cents >= 0)` as a safety net -- even if there's a bug in the transfer logic, the database won't allow a negative balance."
 
@@ -82,13 +82,14 @@ The `transactions` table records the business event ("Alice sent $50 to Bob"). T
 
 **Backend: Database Transaction with Double-Entry Bookkeeping**
 
-A P2P transfer creates five database operations within a single transaction:
+A P2P transfer creates six database operations within a single transaction:
 
+0. Claim the idempotency key (sender, key, request hash) -- a duplicate waits on the primary key, then replays the stored response
 1. Lock both wallets in user_id order (prevents deadlocks between concurrent bidirectional transfers)
 2. Debit sender wallet -- decrement balance, increment version with optimistic lock check
 3. Credit recipient wallet -- increment balance, increment version with optimistic lock check
-4. Create transaction record with idempotency key
-5. Create two ledger entries (debit for sender, credit for recipient)
+4. Create the transaction record
+5. Create two ledger entries (debit for sender, credit for recipient), then store the response on the key
 
 If any step fails, PostgreSQL rolls back the entire transaction. The double-entry guarantee means: for every dollar debited, there's exactly one dollar credited. We can verify this at any time by summing all ledger entries.
 
@@ -105,7 +106,7 @@ We use `SELECT ... FOR UPDATE` to prevent deadlocks, but also check the `version
 | Idempotency key in same DB txn | Can't have key without payment or vice versa | Slight write amplification |
 | ❌ Redis-stored idempotency key | Faster lookup | Key and payment can diverge (Redis crash) |
 
-> "Storing the idempotency key in the same database transaction as the payment is critical. If we used Redis, a crash between 'store key in Redis' and 'commit payment in PostgreSQL' could leave us in an inconsistent state -- the key exists but the payment didn't happen, so retries would return a cached response for a payment that never completed. Or worse, the payment committed but the key wasn't stored, allowing duplicate payments on retry."
+> "Storing the idempotency key in the same database transaction as the payment is critical. If we used Redis, a crash between 'store key in Redis' and 'commit payment in PostgreSQL' could leave us in an inconsistent state -- the key exists but the payment didn't happen, so retries would return a cached response for a payment that never completed. Or worse, the payment committed but the key wasn't stored, allowing duplicate payments on retry. The key is also claimed *before* any money moves, not checked up front and saved at the end: otherwise two simultaneous retries both see 'no key' and both pay. And keys are scoped per user, so one customer's key can never replay another customer's receipt."
 
 **Frontend: The Send Flow UX**
 
@@ -115,7 +116,7 @@ The send flow is designed to prevent user error and handle every failure mode:
 
 2. **Amount input** -- Large centered input with dollar prefix. The submit button dynamically shows "Send $50.00" so the user confirms the exact amount before tapping. No separate confirmation dialog needed -- the amount is always visible in the action button.
 
-3. **Idempotency key** -- Generated client-side from `recipient_id + amount + timestamp`. If the network drops after the server processes the payment but before the response arrives, the user can safely retry. The backend recognizes the duplicate key and returns the original result without re-executing.
+3. **Idempotency key** -- A random key per payment *attempt*, created when the form opens and kept until the payment succeeds. If the network drops after the server processes the payment, pressing Send again reuses the key and the backend replays the original result. Changing the recipient, amount or note starts a new attempt with a new key. An earlier version built the key from a timestamp at click time, so every retry got a fresh key and was charged again.
 
 4. **Success state** -- Full-screen success card replaces the form entirely. We never show the populated form after a successful send, preventing confusion about whether the payment already processed. The user can choose "Send More" (which resets the form) or "Back to Dashboard."
 
@@ -140,11 +141,12 @@ For the transfer case specifically, we do use `SELECT ... FOR UPDATE` to lock bo
 **The balance integrity guarantee:**
 
 At any point in time, for every wallet in the system:
-- `wallet.balance_cents` equals `SUM(credit entries) - SUM(debit entries)`
+- `wallet.balance_cents` equals `SUM(credit entries) - SUM(debit entries)` (the reverse for the debit-normal platform cash account)
+- every transaction's entries net to zero, and customer balances sum to platform cash
 - `wallet.balance_cents >= 0` (enforced by CHECK constraint)
 - Every ledger entry has a `balance_after_cents` that forms a monotonic sequence
 
-If any of these invariants are violated, the reconciliation job alerts the operations team. This is fundamentally different from a system that only tracks the balance column -- we can always prove the balance is correct by replaying the ledger.
+An admin reconciliation report checks all of these in one REPEATABLE READ snapshot. This is fundamentally different from a system that only tracks the balance column -- we can always prove the balance is correct by replaying the ledger.
 
 **Frontend: Balance Display Strategy**
 
@@ -324,19 +326,19 @@ For most applications, React Query or SWR provide excellent developer experience
 
 Each payment form (send, request) manages its own state with `useState`. When the component unmounts (user navigates away), state is naturally discarded. There's no need to persist half-filled payment forms -- re-entering a recipient and amount takes seconds, and stale form data is dangerous (the recipient could have changed their username).
 
-## 💰 Not Every Money Movement Is Two-Sided
+## 💰 Every Money Movement Is Two-Sided
 
-A detail that shapes both the schema and the UI: **transfers are paired, deposits and withdrawals are not.**
+A P2P transfer debits one wallet and credits another. A deposit has no *internal* counterparty -- money arrives from a bank the system doesn't control -- so the platform keeps its own **cash account** to stand on the other side:
 
-A P2P transfer debits one wallet and credits another, and those two ledger entries must sum to zero — that's the invariant the whole double-entry model exists to protect. A deposit has no internal counterparty: money arrives from a bank the system doesn't control, so there is a credit and nothing to pair it with inside our books. A withdrawal is the mirror.
+| Movement | Debit | Credit | Counterparty shown in the UI |
+|----------|-------|--------|------------------------------|
+| Transfer | Sender wallet | Recipient wallet | The other person |
+| Deposit | Platform cash | Customer wallet | The funding source ("Transfer from Chase Checking") |
+| Withdrawal | Customer wallet | Platform cash | The destination bank |
 
-| Movement | Internal entries | Counterparty | What the invariant checks |
-|----------|------------------|--------------|---------------------------|
-| Transfer | Debit sender, credit recipient | Another wallet | Debits and credits cancel exactly |
-| Deposit | Credit only | External funding source | `SUM(credits) − SUM(debits)` per wallet still equals `balance_cents` |
-| Withdrawal | Debit only | External bank account | Same, in the other direction |
+Customer wallets are credit-normal (what we owe them); platform cash is debit-normal (what we hold). So every transaction nets to zero, and the sum of customer balances always equals platform cash -- the number finance reconciles against the bank statement.
 
-> "The reconciliation invariant is *per wallet*, not per transaction — `SUM(credits) − SUM(debits)` for a wallet must equal its stored balance. That holds for all three shapes. If I'd written the check as 'every transaction's entries sum to zero,' deposits and withdrawals would fail it, and the temptation would be to invent a fake internal account to balance against. Some ledgers do exactly that, modelling the bank as an account — it's defensible, and it makes the stronger per-transaction invariant hold. I'd only take it on if we needed to reconcile against bank statements, because that's the problem it actually solves."
+> "An earlier version posted deposits as a lone credit and wrote the invariant per wallet to make that pass. It looked fine until I asked what would catch a bug that credits a wallet out of thin air: nothing would, because a single-sided credit was legal. With the cash account, that bug breaks 'customers = cash' immediately. The price is a hot row every deposit touches. I lock it last with an atomic increment so it's held briefly, and at real volume I'd split it into sub-accounts. Deposits and withdrawals also have to name a payment method the caller owns, which is what the funding-source label in the feed comes from."
 
 **This shows up in the UI too.** The activity feed renders a transfer as "From Bob Smith" or "To Carol Williams" — it has a person to name. A deposit or withdrawal has no person, so it renders as the movement itself plus its funding source ("Transfer from Chase Checking"). A feed that assumed every row had a counterparty would render a blank name or crash on a null; the type field is what tells the client which shape it's looking at.
 

@@ -31,6 +31,8 @@ router.get(
         results: result.results,
         total: result.total,
         page,
+        // True when Elasticsearch was unavailable and results came from SQL.
+        degraded: result.degraded,
       });
     } catch (error) {
       const err = error as Error;

@@ -9,7 +9,7 @@ const pinoHttp = (pinoHttpModule as any).pinoHttp || (pinoHttpModule as any).def
 import { config } from './config/index.js';
 import { redis } from './services/redis.js';
 import { logger } from './services/logger.js';
-import { register } from './services/metrics.js';
+import { register, httpRequestDuration, httpRequestTotal } from './services/metrics.js';
 import { apiLimiter } from './services/rateLimiter.js';
 import { pool } from './services/db.js';
 import authRoutes from './routes/auth.js';
@@ -32,6 +32,19 @@ app.use(
   }),
 );
 app.use(express.json({ limit: '10mb' }));
+
+// HTTP metrics, labelled by route template (not the raw URL) so project IDs and
+// table names don't create a time series each.
+app.use((req, res, next) => {
+  const end = httpRequestDuration.startTimer();
+  res.on('finish', () => {
+    const route = req.route?.path ? `${req.baseUrl}${req.route.path}` : 'unmatched';
+    const labels = { method: req.method, route, status_code: String(res.statusCode) };
+    end(labels);
+    httpRequestTotal.inc(labels);
+  });
+  next();
+});
 
 if (config.nodeEnv !== 'test') {
   app.use(pinoHttp({ logger }));
