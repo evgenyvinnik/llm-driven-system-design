@@ -1,6 +1,12 @@
 -- Local Delivery Service Database Schema
 -- PostgreSQL initialization script
 -- Consolidated schema including all migrations
+--
+-- Every timestamp column is TIMESTAMPTZ. The backend passes JS Dates (session
+-- expiry, delivery ETAs) and compares columns against NOW(); with plain TIMESTAMP
+-- the pg driver writes and reads in the Node process's local zone while NOW() is
+-- in the server's zone (UTC in Docker), so a 30s offer stored from a Pacific-time
+-- backend looked 8 hours expired.
 
 -- Enable UUID extension
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
@@ -17,8 +23,8 @@ CREATE TABLE users (
   name VARCHAR(255) NOT NULL,
   phone VARCHAR(20),
   role VARCHAR(20) NOT NULL CHECK (role IN ('customer', 'driver', 'merchant', 'admin')),
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
 
 -- Drivers table
@@ -32,9 +38,9 @@ CREATE TABLE drivers (
   acceptance_rate DECIMAL(5, 4) DEFAULT 1.0000,
   current_lat DECIMAL(10, 8),
   current_lng DECIMAL(11, 8),
-  location_updated_at TIMESTAMP,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  location_updated_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
 
 -- Merchants table
@@ -52,8 +58,8 @@ CREATE TABLE merchants (
   is_open BOOLEAN DEFAULT true,
   opens_at TIME DEFAULT '09:00',
   closes_at TIME DEFAULT '22:00',
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
 
 -- Menu items for merchants
@@ -66,8 +72,8 @@ CREATE TABLE menu_items (
   category VARCHAR(50),
   image_url TEXT,
   is_available BOOLEAN DEFAULT true,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
 
 -- Orders table (includes retention policy columns from migration 002)
@@ -96,17 +102,17 @@ CREATE TABLE orders (
   tip DECIMAL(10, 2) DEFAULT 0,
   total DECIMAL(10, 2) NOT NULL,
   estimated_prep_time_minutes INTEGER,
-  estimated_delivery_time TIMESTAMP,
-  actual_delivery_time TIMESTAMP,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  confirmed_at TIMESTAMP,
-  picked_up_at TIMESTAMP,
-  delivered_at TIMESTAMP,
-  cancelled_at TIMESTAMP,
+  estimated_delivery_time TIMESTAMPTZ,
+  actual_delivery_time TIMESTAMPTZ,
+  created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+  confirmed_at TIMESTAMPTZ,
+  picked_up_at TIMESTAMPTZ,
+  delivered_at TIMESTAMPTZ,
+  cancelled_at TIMESTAMPTZ,
   cancellation_reason TEXT,
-  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
   -- Retention policy columns (from migration 002)
-  archived_at TIMESTAMP,
+  archived_at TIMESTAMPTZ,
   retention_days INTEGER DEFAULT 90
 );
 
@@ -122,7 +128,7 @@ CREATE TABLE order_items (
   quantity INTEGER NOT NULL DEFAULT 1,
   unit_price DECIMAL(10, 2) NOT NULL,
   special_instructions TEXT,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
 
 -- Driver offers (order assignments pending acceptance)
@@ -131,9 +137,9 @@ CREATE TABLE driver_offers (
   order_id UUID REFERENCES orders(id) ON DELETE CASCADE,
   driver_id UUID REFERENCES drivers(id) ON DELETE CASCADE,
   status VARCHAR(20) NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'accepted', 'rejected', 'expired')),
-  offered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  expires_at TIMESTAMP NOT NULL,
-  responded_at TIMESTAMP
+  offered_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+  expires_at TIMESTAMPTZ NOT NULL,
+  responded_at TIMESTAMPTZ
 );
 
 -- Ratings table
@@ -145,7 +151,7 @@ CREATE TABLE ratings (
   rated_merchant_id UUID REFERENCES merchants(id) ON DELETE SET NULL,
   rating INTEGER NOT NULL CHECK (rating >= 1 AND rating <= 5),
   comment TEXT,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
 
 -- Delivery zones
@@ -158,7 +164,7 @@ CREATE TABLE delivery_zones (
   is_active BOOLEAN DEFAULT true,
   base_delivery_fee DECIMAL(10, 2) DEFAULT 2.99,
   per_km_fee DECIMAL(10, 2) DEFAULT 0.50,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
 
 -- Sessions table for authentication
@@ -166,8 +172,8 @@ CREATE TABLE sessions (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   user_id UUID REFERENCES users(id) ON DELETE CASCADE,
   token VARCHAR(255) UNIQUE NOT NULL,
-  expires_at TIMESTAMP NOT NULL,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  expires_at TIMESTAMPTZ NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
 
 -- Driver location history (for analytics)
@@ -178,7 +184,7 @@ CREATE TABLE driver_location_history (
   lng DECIMAL(11, 8) NOT NULL,
   speed DECIMAL(6, 2),
   heading DECIMAL(5, 2),
-  recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  recorded_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
 
 -- ============================================================================
@@ -192,8 +198,8 @@ CREATE TABLE idempotency_keys (
   operation VARCHAR(50) NOT NULL,
   response JSONB,
   status VARCHAR(20) NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'completed', 'failed')),
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  expires_at TIMESTAMP NOT NULL
+  created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+  expires_at TIMESTAMPTZ NOT NULL
 );
 
 COMMENT ON TABLE idempotency_keys IS 'Stores idempotency keys to prevent duplicate operations on retry';
@@ -212,9 +218,9 @@ CREATE TABLE retention_policies (
   hot_storage_days INTEGER NOT NULL DEFAULT 30,
   warm_storage_days INTEGER NOT NULL DEFAULT 365,
   archive_enabled BOOLEAN DEFAULT true,
-  last_cleanup_at TIMESTAMP,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  last_cleanup_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
 
 COMMENT ON TABLE retention_policies IS 'Configures data retention periods for each table';

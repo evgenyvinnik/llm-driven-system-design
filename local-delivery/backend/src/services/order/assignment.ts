@@ -70,14 +70,13 @@ export async function createDriverOffer(
   orderId: string,
   driverId: string
 ): Promise<DriverOffer> {
-  const expiresAt = new Date();
-  expiresAt.setSeconds(expiresAt.getSeconds() + OFFER_EXPIRY_SECONDS);
-
+  // Expiry comes from the database clock, the same one the accept/pending/expire
+  // queries compare against with NOW(), so app-host clock skew can't shrink the window.
   const offer = await queryOne<DriverOffer>(
     `INSERT INTO driver_offers (order_id, driver_id, expires_at)
-     VALUES ($1, $2, $3)
+     VALUES ($1, $2, NOW() + make_interval(secs => $3))
      RETURNING *`,
-    [orderId, driverId, expiresAt]
+    [orderId, driverId, OFFER_EXPIRY_SECONDS]
   );
 
   if (!offer) {

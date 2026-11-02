@@ -161,13 +161,11 @@ async function createIdempotencyKey(
   userId: string,
   operation: string
 ): Promise<void> {
-  const expiresAt = new Date();
-  expiresAt.setHours(expiresAt.getHours() + IDEMPOTENCY_KEY_TTL_HOURS);
-
+  // Expiry is only ever compared against NOW() in SQL, so set it from the same clock
   await pool.query(
     `INSERT INTO idempotency_keys (key, user_id, operation, status, expires_at)
-     VALUES ($1, $2, $3, 'pending', $4)`,
-    [key, userId, operation, expiresAt]
+     VALUES ($1, $2, $3, 'pending', NOW() + make_interval(hours => $4))`,
+    [key, userId, operation, IDEMPOTENCY_KEY_TTL_HOURS]
   );
 }
 
