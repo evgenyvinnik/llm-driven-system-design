@@ -5,7 +5,7 @@ import type { Album, Artist, Playlist } from '../types';
 import { AlbumCard } from '../components/TrackList';
 import { useAuthStore } from '../stores/authStore';
 
-export const Route = createFileRoute('/library')({
+export const Route = createFileRoute('/library/')({
   component: LibraryPage,
 });
 

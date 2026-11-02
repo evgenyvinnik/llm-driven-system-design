@@ -47,6 +47,7 @@ Recommendations come from the user's recent listening history and liked tracks: 
 - **2026-07 (README drift correction):** the README's tech stack and "This starts…" infra list omitted **Kafka** even though `docker-compose.yml` runs Kafka + Zookeeper and the analytics worker is a Kafka consumer; the project-structure block listed `.js` files (`db.js`, `index.js`, `seed.js`) though the backend is TypeScript. Added Kafka + the analytics worker to the stack, added `npm run db:migrate` / `npm run dev:worker` to setup, corrected file extensions, and bumped Node 18→20.
 - **Seed password already normalized:** `src/seed.ts` hashes `password123` for `demo@spotify.local` — consistent with the repo-wide login password; no change needed.
 - **Docs verified against code, not assumed:** confirmed presigned-URL streaming (`storage.ts` `presignedGetObject`), the `playback-events` topic name and `userId` keying (`shared/kafka.ts`), and the 30s/50% stream-count rule (`playbackService.ts`).
+- **2026-11-01 — the Liked Songs page was unreachable:** under TanStack flat routing `library.tsx` was the parent of `library.liked.tsx` but never rendered `<Outlet/>`, so navigating there changed the URL while the parent page kept rendering. Renamed the parent to `library.index.tsx` so they are siblings, and regenerated `routeTree.gen.ts`. Any `X.tsx` + `X.<more>.tsx` pair needs an `<Outlet/>` in `X` or an `X.index.tsx`.
 
 ## Open Questions
 
