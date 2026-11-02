@@ -153,3 +153,51 @@ INSERT INTO templates (id, name, description, content_json, is_global, created_b
   ('d0000000-0000-0000-0000-000000000003', 'Feature Specification', 'Template for product feature specifications.',
    '{"template": true, "sections": ["Problem Statement", "Proposed Solution", "User Stories", "Success Metrics", "Timeline", "Dependencies"]}',
    true, 'b0000000-0000-0000-0000-000000000002');
+
+-- Access-control demo data: a viewer, a private space, a draft under review.
+-- carol can read Engineering but not edit it, and cannot see Security at all;
+-- bob is an Engineering member, so he sees drafts there but not Security.
+INSERT INTO users (id, username, email, password_hash, display_name, role)
+VALUES ('e0000000-0000-0000-0000-000000000003', 'carol', 'carol@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Carol Reader', 'user')
+ON CONFLICT (username) DO NOTHING;
+
+INSERT INTO spaces (id, key, name, description, is_public, created_by)
+VALUES ('c0000000-0000-0000-0000-000000000003', 'SEC', 'Security', 'Incident response and key management. Private to the security team.', false, 'a0000000-0000-0000-0000-000000000001')
+ON CONFLICT (key) DO NOTHING;
+
+INSERT INTO space_members (space_id, user_id, role) VALUES
+  ('c0000000-0000-0000-0000-000000000001', 'e0000000-0000-0000-0000-000000000003', 'viewer'),
+  ('c0000000-0000-0000-0000-000000000003', 'a0000000-0000-0000-0000-000000000001', 'admin')
+ON CONFLICT (space_id, user_id) DO NOTHING;
+
+INSERT INTO pages (id, space_id, parent_id, title, slug, content_html, content_text, version, status, position, created_by, updated_by)
+VALUES
+  ('90000000-0000-0000-0000-00000000000a', 'c0000000-0000-0000-0000-000000000003', NULL,
+   'Incident Response Runbook', 'incident-response-runbook',
+   '<h1>Incident Response Runbook</h1><p>When a credential leak is suspected, rotate the signing keys first, then revoke active sessions.</p><h2>Severity levels</h2><ul><li>SEV1: customer data exposed</li><li>SEV2: internal credentials exposed</li></ul>',
+   'Incident Response Runbook When a credential leak is suspected, rotate the signing keys first, then revoke active sessions. Severity levels SEV1: customer data exposed SEV2: internal credentials exposed',
+   1, 'published', 0, 'a0000000-0000-0000-0000-000000000001', 'a0000000-0000-0000-0000-000000000001'),
+  ('90000000-0000-0000-0000-00000000000b', 'c0000000-0000-0000-0000-000000000001', '90000000-0000-0000-0000-000000000001',
+   'Q3 Platform Migration Plan', 'q3-platform-migration-plan',
+   '<h1>Q3 Platform Migration Plan</h1><p><strong>Draft for review.</strong> Move the job queue from RabbitMQ to Kafka in three phases, with a dual-write period and a rollback switch.</p><h2>Phases</h2><ol><li>Dual-write and compare</li><li>Cut consumers over</li><li>Retire the old queue</li></ol>',
+   'Q3 Platform Migration Plan Draft for review. Move the job queue from RabbitMQ to Kafka in three phases, with a dual-write period and a rollback switch. Phases Dual-write and compare Cut consumers over Retire the old queue',
+   1, 'draft', 5, 'b0000000-0000-0000-0000-000000000002', 'b0000000-0000-0000-0000-000000000002')
+ON CONFLICT (id) DO NOTHING;
+
+UPDATE spaces SET homepage_id = '90000000-0000-0000-0000-00000000000a' WHERE id = 'c0000000-0000-0000-0000-000000000003';
+
+INSERT INTO page_versions (page_id, version_number, title, content_json, content_html, content_text, change_message, created_by)
+SELECT id, 1, title, COALESCE(content_json, '{}'), content_html, content_text, 'Initial version', created_by
+FROM pages
+WHERE id IN ('90000000-0000-0000-0000-00000000000a', '90000000-0000-0000-0000-00000000000b')
+ON CONFLICT (page_id, version_number) DO NOTHING;
+
+INSERT INTO page_labels (page_id, label) VALUES
+  ('90000000-0000-0000-0000-00000000000a', 'incident'),
+  ('90000000-0000-0000-0000-00000000000b', 'migration')
+ON CONFLICT (page_id, label) DO NOTHING;
+
+-- bob asks for the draft to be reviewed; alice (Engineering admin) can approve it.
+INSERT INTO page_approvals (id, page_id, requested_by, status, page_version)
+VALUES ('f0000000-0000-0000-0000-000000000001', '90000000-0000-0000-0000-00000000000b', 'b0000000-0000-0000-0000-000000000002', 'pending', 1)
+ON CONFLICT DO NOTHING;

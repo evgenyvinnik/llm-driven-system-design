@@ -12,7 +12,7 @@ import ApprovalBanner from '../components/ApprovalBanner';
 import MacroRenderer from '../components/MacroRenderer';
 import { formatFullDate } from '../utils/format';
 
-export const Route = createFileRoute('/space/$spaceKey/page/$slug')({
+export const Route = createFileRoute('/space/$spaceKey/page/$slug/')({
   component: PageView,
 });
 
@@ -58,7 +58,12 @@ function PageView() {
           )}
 
           {/* Approval Banner */}
-          <ApprovalBanner pageId={currentPage.id} />
+          {currentPage.status !== 'published' && (
+            <span className="inline-block mb-3 text-xs font-medium uppercase tracking-wide text-yellow-800 bg-yellow-100 px-2 py-0.5 rounded" data-testid="draft-badge">
+              {currentPage.status} — visible to space members only
+            </span>
+          )}
+          <ApprovalBanner pageId={currentPage.id} canEdit={Boolean(currentPage.access?.canEdit)} />
 
           {/* Page Header */}
           <div className="mb-6">
@@ -130,8 +135,8 @@ function PageView() {
               Diff
             </button>
 
-            {/* Edit button */}
-            {user && (
+            {/* Edit button (members and admins of the space) */}
+            {user && currentPage.access?.canEdit && (
               <div className="ml-auto flex items-center">
                 <Link
                   to="/space/$spaceKey/page/$slug/edit"
