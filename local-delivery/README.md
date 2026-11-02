@@ -65,6 +65,12 @@ docker-compose ps
 PGPASSWORD=delivery_secret psql -h localhost -U delivery -d delivery -f backend/db-seed/seed.sql
 ```
 
+Postgres runs `init.sql` only when its volume is empty, so schema changes don't reach an existing database. After pulling one (for example, the 2026-11-02 switch to `TIMESTAMPTZ` columns), recreate the volume, then rerun the seed command above:
+
+```bash
+docker-compose down -v && docker-compose up -d
+```
+
 ### 2. Start Backend
 
 ```bash
