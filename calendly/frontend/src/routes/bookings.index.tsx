@@ -1,4 +1,4 @@
-import { createFileRoute, Link, redirect } from '@tanstack/react-router';
+import { createFileRoute, Link } from '@tanstack/react-router';
 import { useState, useEffect } from 'react';
 import { useAuthStore } from '../stores/authStore';
 import { bookingsApi } from '../services/api';
@@ -6,16 +6,8 @@ import type { Booking } from '../types';
 import { LoadingSpinner } from '../components/LoadingSpinner';
 import { formatDateTime, getLocalTimezone } from '../utils/time';
 
-export const Route = createFileRoute('/bookings')({
-  beforeLoad: async () => {
-    const { isAuthenticated, checkAuth, isLoading } = useAuthStore.getState();
-    if (!isAuthenticated && !isLoading) {
-      await checkAuth();
-      if (!useAuthStore.getState().isAuthenticated) {
-        throw redirect({ to: '/login' });
-      }
-    }
-  },
+// The auth guard lives on the /bookings layout (bookings.tsx), which also covers the detail page.
+export const Route = createFileRoute('/bookings/')({
   component: BookingsPage,
 });
 
