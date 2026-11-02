@@ -11,6 +11,7 @@ function IndexPage() {
   const [showCreate, setShowCreate] = useState(false);
   const [newName, setNewName] = useState('');
   const [newDesc, setNewDesc] = useState('');
+  const [createError, setCreateError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!authLoading && !user) {
@@ -26,14 +27,15 @@ function IndexPage() {
 
   const handleCreate = async () => {
     if (!newName.trim()) return;
+    setCreateError(null);
     try {
       const project = await createProject({ name: newName, description: newDesc || undefined });
       setShowCreate(false);
       setNewName('');
       setNewDesc('');
       navigate({ to: '/project/$projectId/tables', params: { projectId: project.id } });
-    } catch {
-      // handled by store
+    } catch (err) {
+      setCreateError(err instanceof Error ? err.message : 'Failed to create project');
     }
   };
 
@@ -86,6 +88,9 @@ function IndexPage() {
             <div className="bg-supabase-surface border border-supabase-border rounded-lg p-6 w-full max-w-md">
               <h3 className="text-lg font-semibold mb-4">Create New Project</h3>
               <div className="space-y-4">
+                {createError && (
+                  <div className="bg-red-500/10 border border-red-500/20 text-red-400 px-3 py-2 rounded text-sm">{createError}</div>
+                )}
                 <div>
                   <label className="block text-sm text-supabase-secondary mb-1">Name</label>
                   <input
@@ -109,7 +114,7 @@ function IndexPage() {
                 </div>
                 <div className="flex justify-end gap-3">
                   <button
-                    onClick={() => { setShowCreate(false); setNewName(''); setNewDesc(''); }}
+                    onClick={() => { setShowCreate(false); setNewName(''); setNewDesc(''); setCreateError(null); }}
                     className="px-4 py-2 text-sm text-supabase-secondary hover:text-supabase-text"
                   >
                     Cancel

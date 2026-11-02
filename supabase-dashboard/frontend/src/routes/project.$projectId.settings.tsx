@@ -1,12 +1,14 @@
 import { createFileRoute } from '@tanstack/react-router';
 import { useEffect } from 'react';
-import { useProjectStore } from '../stores/projectStore';
+import { useProjectStore, useProjectRole } from '../stores/projectStore';
 import { ProjectSettings } from '../components/ProjectSettings';
 import { ConnectionStatus } from '../components/ConnectionStatus';
+import { ProjectMembers } from '../components/ProjectMembers';
 
 function SettingsPage() {
   const { projectId } = Route.useParams();
   const { settings, settingsLoading, loadSettings, updateSettings } = useProjectStore();
+  const { isOwner } = useProjectRole();
 
   useEffect(() => {
     loadSettings(projectId);
@@ -33,9 +35,12 @@ function SettingsPage() {
       {settings && (
         <ProjectSettings
           settings={settings}
+          readOnly={!isOwner}
           onSave={(data) => updateSettings(projectId, data)}
         />
       )}
+
+      <ProjectMembers projectId={projectId} />
     </div>
   );
 }

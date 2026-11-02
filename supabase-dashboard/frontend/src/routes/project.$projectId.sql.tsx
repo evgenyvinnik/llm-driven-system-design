@@ -1,6 +1,6 @@
 import { createFileRoute } from '@tanstack/react-router';
 import { useEffect, useState } from 'react';
-import { useProjectStore } from '../stores/projectStore';
+import { useProjectStore, useProjectRole } from '../stores/projectStore';
 import { SQLEditor } from '../components/SQLEditor';
 import { QueryResults } from '../components/QueryResults';
 import { SavedQueryList } from '../components/SavedQueryList';
@@ -18,7 +18,9 @@ function SQLPage() {
     deleteSavedQuery,
     clearQueryResult,
   } = useProjectStore();
+  const { canEdit } = useProjectRole();
   const [sql, setSql] = useState('SELECT * FROM products LIMIT 10;');
+  const [saveError, setSaveError] = useState<string | null>(null);
 
   useEffect(() => {
     loadSavedQueries(projectId);
@@ -31,10 +33,23 @@ function SQLPage() {
     }
   };
 
-  const handleSave = () => {
+  const handleSave = async () => {
     const name = prompt('Query name:');
-    if (name && sql.trim()) {
-      saveQuery(projectId, name, sql);
+    if (!name || !sql.trim()) return;
+    setSaveError(null);
+    try {
+      await saveQuery(projectId, name, sql);
+    } catch (err) {
+      setSaveError(err instanceof Error ? err.message : 'Failed to save query');
+    }
+  };
+
+  const handleDeleteSaved = async (id: string) => {
+    setSaveError(null);
+    try {
+      await deleteSavedQuery(projectId, id);
+    } catch (err) {
+      setSaveError(err instanceof Error ? err.message : 'Failed to delete query');
     }
   };
 
@@ -48,7 +63,7 @@ function SQLPage() {
         <SavedQueryList
           queries={savedQueries}
           onSelect={(q) => setSql(q.queryText)}
-          onDelete={(id) => deleteSavedQuery(projectId, id)}
+          onDelete={canEdit ? handleDeleteSaved : undefined}
         />
       </div>
 
@@ -58,14 +73,23 @@ function SQLPage() {
         <div className="border-b border-supabase-border">
           <div className="p-4">
             <div className="flex items-center justify-between mb-3">
-              <h3 className="text-sm font-medium text-supabase-text">SQL Editor</h3>
+              <h3 className="text-sm font-medium text-supabase-text">
+                SQL Editor
+                {!canEdit && (
+                  <span className="ml-2 text-xs text-supabase-secondary border border-supabase-border rounded px-2 py-0.5">
+                    Read-only: viewers' queries run in a READ ONLY transaction
+                  </span>
+                )}
+              </h3>
               <div className="flex gap-2">
-                <button
-                  onClick={handleSave}
-                  className="text-supabase-secondary hover:text-supabase-text text-sm px-3 py-1 border border-supabase-border rounded"
-                >
-                  Save
-                </button>
+                {canEdit && (
+                  <button
+                    onClick={handleSave}
+                    className="text-supabase-secondary hover:text-supabase-text text-sm px-3 py-1 border border-supabase-border rounded"
+                  >
+                    Save
+                  </button>
+                )}
                 <button
                   onClick={handleRun}
                   disabled={queryLoading || !sql.trim()}
@@ -76,6 +100,7 @@ function SQLPage() {
               </div>
             </div>
             <SQLEditor value={sql} onChange={setSql} onRun={handleRun} />
+            {saveError && <div className="mt-2 text-xs text-red-400">{saveError}</div>}
           </div>
         </div>
 

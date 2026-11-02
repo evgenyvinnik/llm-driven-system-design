@@ -1,4 +1,7 @@
-interface ColumnDef {
+import { ApiError } from './errors.js';
+import { newIdentifier, quoteIdent, qualifiedTable, TARGET_SCHEMA } from './sqlIdentifiers.js';
+
+export interface ColumnDef {
   name: string;
   type: string;
   nullable?: boolean;
@@ -8,109 +11,122 @@ interface ColumnDef {
   references?: { table: string; column: string };
 }
 
+/*
+ * Each ColumnDef field arrives in a known slot, so each is validated for what
+ * that slot may contain instead of being spliced into the statement as text:
+ * names go through the identifier rules, types must look like a type name, and
+ * defaults must be a literal or a zero-argument function call. Anything more
+ * exotic (CHECK constraints, generated columns, complex defaults) belongs in the
+ * SQL editor.
+ */
+
+// INTEGER, VARCHAR(255), NUMERIC(10, 2), DOUBLE PRECISION, TIMESTAMP WITH TIME ZONE, TEXT[]
+const TYPE_PATTERN = /^[A-Za-z][A-Za-z0-9_]*( [A-Za-z][A-Za-z0-9_]*)*(\(\s*\d+\s*(,\s*\d+\s*)?\))?(\[\])*$/;
+
+const DEFAULT_PATTERNS = [
+  /^-?\d+(\.\d+)?$/, // numbers
+  /^'(?:[^']|'')*'(::[A-Za-z][A-Za-z0-9_ ]*(\[\])?)?$/, // 'quoted text', optionally cast: '{}'::jsonb
+  /^(true|false|null|current_timestamp|current_date|current_time|localtimestamp)$/i,
+  /^[A-Za-z_][A-Za-z0-9_]*\(\)$/, // zero-argument calls: now(), gen_random_uuid()
+];
+
+function columnType(col: ColumnDef): string {
+  const type = typeof col.type === 'string' ? col.type.trim() : '';
+  if (!TYPE_PATTERN.test(type)) {
+    throw new ApiError(400, `Invalid type "${String(col.type ?? '')}" for column "${String(col.name ?? '')}"`);
+  }
+  return type.toUpperCase();
+}
+
+function defaultClause(col: ColumnDef): string | null {
+  if (col.defaultValue === undefined || col.defaultValue === null || String(col.defaultValue).trim() === '') {
+    return null;
+  }
+  const value = String(col.defaultValue).trim();
+  if (!DEFAULT_PATTERNS.some((p) => p.test(value))) {
+    throw new ApiError(
+      400,
+      `Invalid default for column "${col.name}": use a number, a quoted string like 'pending', ` +
+        `true/false/null, or a function call like now()`,
+    );
+  }
+  return `DEFAULT ${value}`;
+}
+
+function referencesClause(col: ColumnDef): string | null {
+  if (!col.references) return null;
+  return `REFERENCES ${qualifiedTable(col.references.table)}(${quoteIdent(col.references.column, 'referenced column')})`;
+}
+
 /** Generates a CREATE TABLE DDL statement from structured column definitions. */
 export function generateCreateTable(tableName: string, columns: ColumnDef[]): string {
-  const sanitizedName = sanitizeIdentifier(tableName);
+  const table = `${quoteIdent(TARGET_SCHEMA)}.${newIdentifier(tableName, 'table name')}`;
+  if (!Array.isArray(columns) || columns.length === 0) {
+    throw new ApiError(400, 'At least one column is required');
+  }
+
+  // Several PK columns can't each say PRIMARY KEY ("multiple primary keys are not
+  // allowed"), so a composite key becomes one table-level constraint.
+  const pkColumns = columns.filter((c) => c.primaryKey === true);
+  const inlinePk = pkColumns.length === 1;
+
   const columnDefs = columns.map((col) => {
-    const parts = [sanitizeIdentifier(col.name), col.type.toUpperCase()];
-
-    if (col.primaryKey) {
-      parts.push('PRIMARY KEY');
-    }
-
-    if (!col.nullable && !col.primaryKey) {
-      parts.push('NOT NULL');
-    }
-
-    if (col.unique) {
-      parts.push('UNIQUE');
-    }
-
-    if (col.defaultValue !== undefined && col.defaultValue !== '') {
-      parts.push(`DEFAULT ${col.defaultValue}`);
-    }
-
-    if (col.references) {
-      parts.push(`REFERENCES ${sanitizeIdentifier(col.references.table)}(${sanitizeIdentifier(col.references.column)})`);
-    }
-
+    const parts = [newIdentifier(col.name, 'column name'), columnType(col)];
+    if (col.primaryKey === true && inlinePk) parts.push('PRIMARY KEY');
+    if (col.nullable !== true && col.primaryKey !== true) parts.push('NOT NULL');
+    if (col.unique === true) parts.push('UNIQUE');
+    const def = defaultClause(col);
+    if (def) parts.push(def);
+    const ref = referencesClause(col);
+    if (ref) parts.push(ref);
     return '  ' + parts.join(' ');
   });
 
-  return `CREATE TABLE ${sanitizedName} (\n${columnDefs.join(',\n')}\n);`;
+  if (pkColumns.length > 1) {
+    columnDefs.push(`  PRIMARY KEY (${pkColumns.map((c) => newIdentifier(c.name, 'column name')).join(', ')})`);
+  }
+
+  return `CREATE TABLE ${table} (\n${columnDefs.join(',\n')}\n);`;
 }
 
 /** Generates an ALTER TABLE ADD COLUMN DDL statement. */
 export function generateAddColumn(tableName: string, column: ColumnDef): string {
-  const parts = [
-    `ALTER TABLE ${sanitizeIdentifier(tableName)}`,
-    `ADD COLUMN ${sanitizeIdentifier(column.name)} ${column.type.toUpperCase()}`,
-  ];
-
-  if (!column.nullable) {
-    parts[1] += ' NOT NULL';
-  }
-
-  if (column.defaultValue !== undefined && column.defaultValue !== '') {
-    parts[1] += ` DEFAULT ${column.defaultValue}`;
-  }
-
-  return parts.join(' ') + ';';
+  const parts = [`ADD COLUMN ${newIdentifier(column.name, 'column name')} ${columnType(column)}`];
+  if (column.nullable !== true) parts.push('NOT NULL');
+  const def = defaultClause(column);
+  if (def) parts.push(def);
+  return `ALTER TABLE ${qualifiedTable(tableName)} ${parts.join(' ')};`;
 }
 
 /** Generates an ALTER TABLE DROP COLUMN DDL statement. */
 export function generateDropColumn(tableName: string, columnName: string): string {
-  return `ALTER TABLE ${sanitizeIdentifier(tableName)} DROP COLUMN ${sanitizeIdentifier(columnName)};`;
+  return `ALTER TABLE ${qualifiedTable(tableName)} DROP COLUMN ${quoteIdent(columnName, 'column name')};`;
 }
 
 /** Generates an ALTER TABLE RENAME COLUMN DDL statement. */
 export function generateRenameColumn(tableName: string, oldName: string, newName: string): string {
-  return `ALTER TABLE ${sanitizeIdentifier(tableName)} RENAME COLUMN ${sanitizeIdentifier(oldName)} TO ${sanitizeIdentifier(newName)};`;
+  return `ALTER TABLE ${qualifiedTable(tableName)} RENAME COLUMN ${quoteIdent(oldName, 'column name')} TO ${newIdentifier(newName, 'new column name')};`;
 }
 
 /** Generates a DROP TABLE CASCADE DDL statement. */
 export function generateDropTable(tableName: string): string {
-  return `DROP TABLE ${sanitizeIdentifier(tableName)} CASCADE;`;
+  return `DROP TABLE ${qualifiedTable(tableName)} CASCADE;`;
 }
 
 /** Generates an ALTER TABLE ALTER COLUMN TYPE DDL statement. */
 export function generateAlterColumnType(tableName: string, columnName: string, newType: string): string {
-  return `ALTER TABLE ${sanitizeIdentifier(tableName)} ALTER COLUMN ${sanitizeIdentifier(columnName)} TYPE ${newType.toUpperCase()};`;
+  return `ALTER TABLE ${qualifiedTable(tableName)} ALTER COLUMN ${quoteIdent(columnName, 'column name')} TYPE ${columnType({ name: columnName, type: newType })};`;
 }
 
 /** Generates an ALTER TABLE SET/DROP NOT NULL DDL statement. */
 export function generateSetColumnNullable(tableName: string, columnName: string, nullable: boolean): string {
   const action = nullable ? 'DROP NOT NULL' : 'SET NOT NULL';
-  return `ALTER TABLE ${sanitizeIdentifier(tableName)} ALTER COLUMN ${sanitizeIdentifier(columnName)} ${action};`;
+  return `ALTER TABLE ${qualifiedTable(tableName)} ALTER COLUMN ${quoteIdent(columnName, 'column name')} ${action};`;
 }
 
 /** Generates an ALTER TABLE SET/DROP DEFAULT DDL statement. */
 export function generateSetColumnDefault(tableName: string, columnName: string, defaultValue: string | null): string {
-  if (defaultValue === null) {
-    return `ALTER TABLE ${sanitizeIdentifier(tableName)} ALTER COLUMN ${sanitizeIdentifier(columnName)} DROP DEFAULT;`;
-  }
-  return `ALTER TABLE ${sanitizeIdentifier(tableName)} ALTER COLUMN ${sanitizeIdentifier(columnName)} SET DEFAULT ${defaultValue};`;
-}
-
-function sanitizeIdentifier(name: string): string {
-  // Only allow alphanumeric and underscore characters
-  const cleaned = name.replace(/[^a-zA-Z0-9_]/g, '');
-  if (cleaned !== name || isReservedWord(cleaned.toUpperCase())) {
-    return `"${cleaned}"`;
-  }
-  return cleaned;
-}
-
-const RESERVED_WORDS = new Set([
-  'SELECT', 'INSERT', 'UPDATE', 'DELETE', 'DROP', 'CREATE', 'ALTER',
-  'TABLE', 'INDEX', 'WHERE', 'FROM', 'JOIN', 'ORDER', 'GROUP', 'BY',
-  'HAVING', 'LIMIT', 'OFFSET', 'UNION', 'ALL', 'AND', 'OR', 'NOT',
-  'NULL', 'TRUE', 'FALSE', 'AS', 'ON', 'IN', 'IS', 'LIKE', 'BETWEEN',
-  'EXISTS', 'CASE', 'WHEN', 'THEN', 'ELSE', 'END', 'USER', 'ROLE',
-  'DEFAULT', 'PRIMARY', 'KEY', 'FOREIGN', 'REFERENCES', 'CONSTRAINT',
-  'CHECK', 'UNIQUE', 'CASCADE', 'SET', 'VALUES', 'INTO',
-]);
-
-function isReservedWord(word: string): boolean {
-  return RESERVED_WORDS.has(word);
+  const target = `ALTER TABLE ${qualifiedTable(tableName)} ALTER COLUMN ${quoteIdent(columnName, 'column name')}`;
+  const def = defaultValue === null ? null : defaultClause({ name: columnName, type: 'text', defaultValue });
+  return def ? `${target} SET ${def};` : `${target} DROP DEFAULT;`;
 }

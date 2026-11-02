@@ -17,7 +17,9 @@ CREATE TABLE IF NOT EXISTS projects (
   db_port INTEGER NOT NULL DEFAULT 5433,
   db_name VARCHAR(100) NOT NULL DEFAULT 'sample_db',
   db_user VARCHAR(100) NOT NULL DEFAULT 'sample',
-  db_password VARCHAR(255) NOT NULL DEFAULT 'sample123',
+  -- AES-256-GCM ciphertext ("enc:v1:..."), written by services/credentials.ts. TEXT
+  -- because ciphertext is longer than the password it protects.
+  db_password TEXT NOT NULL,
   created_by UUID REFERENCES users(id),
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW()
@@ -27,7 +29,7 @@ CREATE TABLE IF NOT EXISTS project_members (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   project_id UUID REFERENCES projects(id) ON DELETE CASCADE NOT NULL,
   user_id UUID REFERENCES users(id) ON DELETE CASCADE NOT NULL,
-  role VARCHAR(20) DEFAULT 'editor',
+  role VARCHAR(20) NOT NULL DEFAULT 'editor' CHECK (role IN ('owner', 'editor', 'viewer')),
   joined_at TIMESTAMPTZ DEFAULT NOW(),
   UNIQUE(project_id, user_id)
 );
@@ -55,6 +57,10 @@ CREATE TABLE IF NOT EXISTS auth_users (
   updated_at TIMESTAMPTZ DEFAULT NOW(),
   UNIQUE(project_id, email)
 );
+
+-- Upgrades for databases created before credentials were encrypted at rest.
+ALTER TABLE projects ALTER COLUMN db_password TYPE TEXT;
+ALTER TABLE projects ALTER COLUMN db_password DROP DEFAULT;
 
 CREATE INDEX IF NOT EXISTS idx_project_members ON project_members(user_id);
 CREATE INDEX IF NOT EXISTS idx_saved_queries_project ON saved_queries(project_id);

@@ -24,13 +24,21 @@ export function ProjectCard({ project, onDelete }: ProjectCardProps) {
             <p className="text-xs text-supabase-secondary mt-1 line-clamp-2">{project.description}</p>
           )}
         </div>
-        <button
-          onClick={handleDelete}
-          className="opacity-0 group-hover:opacity-100 text-supabase-secondary hover:text-supabase-danger text-sm transition-opacity"
-          title="Delete project"
-        >
-          &times;
-        </button>
+        {project.memberRole === 'owner' ? (
+          <button
+            onClick={handleDelete}
+            className="opacity-0 group-hover:opacity-100 text-supabase-secondary hover:text-supabase-danger text-sm transition-opacity"
+            title="Delete project"
+          >
+            &times;
+          </button>
+        ) : (
+          project.memberRole && (
+            <span className="text-[10px] uppercase tracking-wider text-supabase-secondary border border-supabase-border rounded px-1.5 py-0.5">
+              {project.memberRole}
+            </span>
+          )
+        )}
       </div>
       <div className="mt-4 flex items-center gap-3 text-xs text-supabase-secondary">
         <span className="flex items-center gap-1">

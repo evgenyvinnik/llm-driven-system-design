@@ -9,19 +9,20 @@
 // Additionally, you should also exclude this file from your linter and/or formatter to prevent it from being checked or modified.
 
 import { Route as rootRouteImport } from './routes/__root'
-import { Route as RegisterRouteImport } from './routes/register'
-import { Route as LoginRouteImport } from './routes/login'
 import { Route as IndexRouteImport } from './routes/index'
+import { Route as LoginRouteImport } from './routes/login'
+import { Route as RegisterRouteImport } from './routes/register'
 import { Route as ProjectProjectIdRouteImport } from './routes/project.$projectId'
-import { Route as ProjectProjectIdTablesRouteImport } from './routes/project.$projectId.tables'
-import { Route as ProjectProjectIdSqlRouteImport } from './routes/project.$projectId.sql'
-import { Route as ProjectProjectIdSettingsRouteImport } from './routes/project.$projectId.settings'
+import { Route as ProjectProjectIdIndexRouteImport } from './routes/project.$projectId.index'
 import { Route as ProjectProjectIdAuthRouteImport } from './routes/project.$projectId.auth'
+import { Route as ProjectProjectIdSettingsRouteImport } from './routes/project.$projectId.settings'
+import { Route as ProjectProjectIdSqlRouteImport } from './routes/project.$projectId.sql'
+import { Route as ProjectProjectIdTablesRouteImport } from './routes/project.$projectId.tables'
 import { Route as ProjectProjectIdTablesTableNameRouteImport } from './routes/project.$projectId.tables_.$tableName'
 
-const RegisterRoute = RegisterRouteImport.update({
-  id: '/register',
-  path: '/register',
+const IndexRoute = IndexRouteImport.update({
+  id: '/',
+  path: '/',
   getParentRoute: () => rootRouteImport,
 } as any)
 const LoginRoute = LoginRouteImport.update({
@@ -29,9 +30,9 @@ const LoginRoute = LoginRouteImport.update({
   path: '/login',
   getParentRoute: () => rootRouteImport,
 } as any)
-const IndexRoute = IndexRouteImport.update({
-  id: '/',
-  path: '/',
+const RegisterRoute = RegisterRouteImport.update({
+  id: '/register',
+  path: '/register',
   getParentRoute: () => rootRouteImport,
 } as any)
 const ProjectProjectIdRoute = ProjectProjectIdRouteImport.update({
@@ -39,14 +40,14 @@ const ProjectProjectIdRoute = ProjectProjectIdRouteImport.update({
   path: '/project/$projectId',
   getParentRoute: () => rootRouteImport,
 } as any)
-const ProjectProjectIdTablesRoute = ProjectProjectIdTablesRouteImport.update({
-  id: '/tables',
-  path: '/tables',
+const ProjectProjectIdIndexRoute = ProjectProjectIdIndexRouteImport.update({
+  id: '/',
+  path: '/',
   getParentRoute: () => ProjectProjectIdRoute,
 } as any)
-const ProjectProjectIdSqlRoute = ProjectProjectIdSqlRouteImport.update({
-  id: '/sql',
-  path: '/sql',
+const ProjectProjectIdAuthRoute = ProjectProjectIdAuthRouteImport.update({
+  id: '/auth',
+  path: '/auth',
   getParentRoute: () => ProjectProjectIdRoute,
 } as any)
 const ProjectProjectIdSettingsRoute =
@@ -55,9 +56,14 @@ const ProjectProjectIdSettingsRoute =
     path: '/settings',
     getParentRoute: () => ProjectProjectIdRoute,
   } as any)
-const ProjectProjectIdAuthRoute = ProjectProjectIdAuthRouteImport.update({
-  id: '/auth',
-  path: '/auth',
+const ProjectProjectIdSqlRoute = ProjectProjectIdSqlRouteImport.update({
+  id: '/sql',
+  path: '/sql',
+  getParentRoute: () => ProjectProjectIdRoute,
+} as any)
+const ProjectProjectIdTablesRoute = ProjectProjectIdTablesRouteImport.update({
+  id: '/tables',
+  path: '/tables',
   getParentRoute: () => ProjectProjectIdRoute,
 } as any)
 const ProjectProjectIdTablesTableNameRoute =
@@ -76,17 +82,18 @@ export interface FileRoutesByFullPath {
   '/project/$projectId/settings': typeof ProjectProjectIdSettingsRoute
   '/project/$projectId/sql': typeof ProjectProjectIdSqlRoute
   '/project/$projectId/tables': typeof ProjectProjectIdTablesRoute
+  '/project/$projectId/': typeof ProjectProjectIdIndexRoute
   '/project/$projectId/tables/$tableName': typeof ProjectProjectIdTablesTableNameRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/login': typeof LoginRoute
   '/register': typeof RegisterRoute
-  '/project/$projectId': typeof ProjectProjectIdRouteWithChildren
   '/project/$projectId/auth': typeof ProjectProjectIdAuthRoute
   '/project/$projectId/settings': typeof ProjectProjectIdSettingsRoute
   '/project/$projectId/sql': typeof ProjectProjectIdSqlRoute
   '/project/$projectId/tables': typeof ProjectProjectIdTablesRoute
+  '/project/$projectId': typeof ProjectProjectIdIndexRoute
   '/project/$projectId/tables/$tableName': typeof ProjectProjectIdTablesTableNameRoute
 }
 export interface FileRoutesById {
@@ -99,6 +106,7 @@ export interface FileRoutesById {
   '/project/$projectId/settings': typeof ProjectProjectIdSettingsRoute
   '/project/$projectId/sql': typeof ProjectProjectIdSqlRoute
   '/project/$projectId/tables': typeof ProjectProjectIdTablesRoute
+  '/project/$projectId/': typeof ProjectProjectIdIndexRoute
   '/project/$projectId/tables_/$tableName': typeof ProjectProjectIdTablesTableNameRoute
 }
 export interface FileRouteTypes {
@@ -112,17 +120,18 @@ export interface FileRouteTypes {
     | '/project/$projectId/settings'
     | '/project/$projectId/sql'
     | '/project/$projectId/tables'
+    | '/project/$projectId/'
     | '/project/$projectId/tables/$tableName'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
     | '/login'
     | '/register'
-    | '/project/$projectId'
     | '/project/$projectId/auth'
     | '/project/$projectId/settings'
     | '/project/$projectId/sql'
     | '/project/$projectId/tables'
+    | '/project/$projectId'
     | '/project/$projectId/tables/$tableName'
   id:
     | '__root__'
@@ -134,6 +143,7 @@ export interface FileRouteTypes {
     | '/project/$projectId/settings'
     | '/project/$projectId/sql'
     | '/project/$projectId/tables'
+    | '/project/$projectId/'
     | '/project/$projectId/tables_/$tableName'
   fileRoutesById: FileRoutesById
 }
@@ -146,11 +156,11 @@ export interface RootRouteChildren {
 
 declare module '@tanstack/react-router' {
   interface FileRoutesByPath {
-    '/register': {
-      id: '/register'
-      path: '/register'
-      fullPath: '/register'
-      preLoaderRoute: typeof RegisterRouteImport
+    '/': {
+      id: '/'
+      path: '/'
+      fullPath: '/'
+      preLoaderRoute: typeof IndexRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/login': {
@@ -160,11 +170,11 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof LoginRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/': {
-      id: '/'
-      path: '/'
-      fullPath: '/'
-      preLoaderRoute: typeof IndexRouteImport
+    '/register': {
+      id: '/register'
+      path: '/register'
+      fullPath: '/register'
+      preLoaderRoute: typeof RegisterRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/project/$projectId': {
@@ -174,18 +184,18 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ProjectProjectIdRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/project/$projectId/tables': {
-      id: '/project/$projectId/tables'
-      path: '/tables'
-      fullPath: '/project/$projectId/tables'
-      preLoaderRoute: typeof ProjectProjectIdTablesRouteImport
+    '/project/$projectId/': {
+      id: '/project/$projectId/'
+      path: '/'
+      fullPath: '/project/$projectId/'
+      preLoaderRoute: typeof ProjectProjectIdIndexRouteImport
       parentRoute: typeof ProjectProjectIdRoute
     }
-    '/project/$projectId/sql': {
-      id: '/project/$projectId/sql'
-      path: '/sql'
-      fullPath: '/project/$projectId/sql'
-      preLoaderRoute: typeof ProjectProjectIdSqlRouteImport
+    '/project/$projectId/auth': {
+      id: '/project/$projectId/auth'
+      path: '/auth'
+      fullPath: '/project/$projectId/auth'
+      preLoaderRoute: typeof ProjectProjectIdAuthRouteImport
       parentRoute: typeof ProjectProjectIdRoute
     }
     '/project/$projectId/settings': {
@@ -195,11 +205,18 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ProjectProjectIdSettingsRouteImport
       parentRoute: typeof ProjectProjectIdRoute
     }
-    '/project/$projectId/auth': {
-      id: '/project/$projectId/auth'
-      path: '/auth'
-      fullPath: '/project/$projectId/auth'
-      preLoaderRoute: typeof ProjectProjectIdAuthRouteImport
+    '/project/$projectId/sql': {
+      id: '/project/$projectId/sql'
+      path: '/sql'
+      fullPath: '/project/$projectId/sql'
+      preLoaderRoute: typeof ProjectProjectIdSqlRouteImport
+      parentRoute: typeof ProjectProjectIdRoute
+    }
+    '/project/$projectId/tables': {
+      id: '/project/$projectId/tables'
+      path: '/tables'
+      fullPath: '/project/$projectId/tables'
+      preLoaderRoute: typeof ProjectProjectIdTablesRouteImport
       parentRoute: typeof ProjectProjectIdRoute
     }
     '/project/$projectId/tables_/$tableName': {
@@ -217,6 +234,7 @@ interface ProjectProjectIdRouteChildren {
   ProjectProjectIdSettingsRoute: typeof ProjectProjectIdSettingsRoute
   ProjectProjectIdSqlRoute: typeof ProjectProjectIdSqlRoute
   ProjectProjectIdTablesRoute: typeof ProjectProjectIdTablesRoute
+  ProjectProjectIdIndexRoute: typeof ProjectProjectIdIndexRoute
   ProjectProjectIdTablesTableNameRoute: typeof ProjectProjectIdTablesTableNameRoute
 }
 
@@ -225,6 +243,7 @@ const ProjectProjectIdRouteChildren: ProjectProjectIdRouteChildren = {
   ProjectProjectIdSettingsRoute: ProjectProjectIdSettingsRoute,
   ProjectProjectIdSqlRoute: ProjectProjectIdSqlRoute,
   ProjectProjectIdTablesRoute: ProjectProjectIdTablesRoute,
+  ProjectProjectIdIndexRoute: ProjectProjectIdIndexRoute,
   ProjectProjectIdTablesTableNameRoute: ProjectProjectIdTablesTableNameRoute,
 }
 
