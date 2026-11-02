@@ -1,4 +1,7 @@
+import { useState } from 'react';
 import type { Wallet } from '../types';
+import { formatCents } from '../utils/money';
+import { WalletActionModal } from './WalletActionModal';
 
 interface WalletCardProps {
   wallet: Wallet | null;
@@ -6,14 +9,9 @@ interface WalletCardProps {
   onRefresh: () => void;
 }
 
-/** Displays the PayPal wallet balance with a gradient card and refresh button. */
+/** Displays the PayPal wallet balance with add-money and withdraw actions. */
 export function WalletCard({ wallet, loading, onRefresh }: WalletCardProps) {
-  const formatCurrency = (cents: number) => {
-    return new Intl.NumberFormat('en-US', {
-      style: 'currency',
-      currency: 'USD',
-    }).format(cents / 100);
-  };
+  const [mode, setMode] = useState<'deposit' | 'withdraw' | null>(null);
 
   return (
     <div className="bg-gradient-to-r from-paypal-sidebar to-paypal-primary rounded-xl shadow-lg p-6 text-white">
@@ -30,12 +28,41 @@ export function WalletCard({ wallet, loading, onRefresh }: WalletCardProps) {
         {loading ? (
           <span className="animate-pulse">---.--</span>
         ) : (
-          formatCurrency(wallet?.balanceCents || 0)
+          formatCents(wallet?.balanceCents ?? 0)
         )}
       </div>
-      <div className="text-sm text-white/70">
-        {wallet?.currency || 'USD'} available
+      <div className="flex items-center justify-between">
+        <div className="text-sm text-white/70">
+          {wallet?.currency || 'USD'} available
+        </div>
+        <div className="flex space-x-2">
+          <button
+            onClick={() => setMode('deposit')}
+            className="px-4 py-1.5 bg-white text-paypal-sidebar rounded-full text-sm font-medium hover:bg-white/90"
+          >
+            Add money
+          </button>
+          <button
+            onClick={() => setMode('withdraw')}
+            className="px-4 py-1.5 bg-white/15 text-white rounded-full text-sm font-medium hover:bg-white/25"
+          >
+            Withdraw
+          </button>
+        </div>
       </div>
+
+      {mode && (
+        <div className="text-paypal-text">
+          <WalletActionModal
+            mode={mode}
+            onClose={() => setMode(null)}
+            onDone={() => {
+              setMode(null);
+              onRefresh();
+            }}
+          />
+        </div>
+      )}
     </div>
   );
 }
