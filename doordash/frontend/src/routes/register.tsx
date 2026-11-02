@@ -1,6 +1,7 @@
 import { createFileRoute, useNavigate } from '@tanstack/react-router';
 import { useState } from 'react';
 import { useAuthStore } from '../stores/authStore';
+import type { Driver } from '../types';
 
 /**
  * Registration page route configuration.
@@ -13,9 +14,12 @@ export const Route = createFileRoute('/register')({
 /**
  * Registration page component for new user sign-up.
  * Provides a form for creating customer, restaurant owner, or driver accounts.
+ * The server always registers a customer; choosing Sell Food or Deliver Food
+ * runs the matching onboarding call right after sign-up.
  *
  * Features:
  * - Role selection (Order Food, Sell Food, Deliver Food)
+ * - Vehicle type and optional license plate for drivers
  * - Name, email, phone, and password inputs
  * - Error display with dismiss button
  * - Loading state during registration
@@ -31,11 +35,20 @@ function RegisterPage() {
   const [phone, setPhone] = useState('');
   const [password, setPassword] = useState('');
   const [role, setRole] = useState<'customer' | 'restaurant_owner' | 'driver'>('customer');
+  const [vehicleType, setVehicleType] = useState<Driver['vehicle_type']>('car');
+  const [licensePlate, setLicensePlate] = useState('');
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     try {
-      await register({ email, password, name, phone, role });
+      await register(
+        { email, password, name, phone },
+        role === 'driver'
+          ? { as: 'driver', vehicleType, licensePlate: licensePlate || undefined }
+          : role === 'restaurant_owner'
+            ? { as: 'restaurant_owner' }
+            : undefined
+      );
       navigate({ to: '/' });
     } catch {
       // Error handled by store
@@ -112,6 +125,34 @@ function RegisterPage() {
               className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-doordash-red focus:border-transparent"
             />
           </div>
+
+          {role === 'driver' && (
+            <div className="grid grid-cols-2 gap-2">
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">Vehicle</label>
+                <select
+                  value={vehicleType}
+                  onChange={(e) => setVehicleType(e.target.value as Driver['vehicle_type'])}
+                  className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-doordash-red focus:border-transparent"
+                >
+                  <option value="car">Car</option>
+                  <option value="bike">Bike</option>
+                  <option value="scooter">Scooter</option>
+                  <option value="walk">On foot</option>
+                </select>
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">License plate (optional)</label>
+                <input
+                  type="text"
+                  value={licensePlate}
+                  onChange={(e) => setLicensePlate(e.target.value)}
+                  maxLength={20}
+                  className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-doordash-red focus:border-transparent"
+                />
+              </div>
+            </div>
+          )}
 
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-1">Password</label>
