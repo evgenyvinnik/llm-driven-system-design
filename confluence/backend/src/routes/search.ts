@@ -1,36 +1,32 @@
 import { Router, Request, Response } from 'express';
 import { searchPages } from '../services/searchService.js';
-import { pool } from '../services/db.js';
-import { logger } from '../services/logger.js';
+import { callerFrom, requireSpace, respondError, visibleSpaceIds } from '../services/accessService.js';
 
 const router = Router();
 
-// Search pages
+// Search published pages in the spaces the caller can see
 router.get('/', async (req: Request, res: Response) => {
   try {
-    const query = req.query.q as string;
-    const spaceKey = req.query.space as string;
-    const page = parseInt(req.query.page as string) || 1;
-    const pageSize = parseInt(req.query.pageSize as string) || 20;
+    const query = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+    const spaceKey = req.query.space as string | undefined;
+    const page = Math.max(1, parseInt(req.query.page as string) || 1);
+    const pageSize = Math.min(50, Math.max(1, parseInt(req.query.pageSize as string) || 20));
 
     if (!query) {
       res.status(400).json({ error: 'Search query (q) is required' });
       return;
     }
 
-    let spaceId: string | undefined;
-    if (spaceKey) {
-      const space = await pool.query('SELECT id FROM spaces WHERE key = $1', [spaceKey.toUpperCase()]);
-      if (space.rows.length > 0) {
-        spaceId = space.rows[0].id;
-      }
-    }
+    const caller = callerFrom(req);
+    // A space filter narrows the visible set; it never widens it. An unknown or
+    // invisible space is a 404, not (as before) a silent global search.
+    const spaceIds = spaceKey
+      ? [(await requireSpace({ key: spaceKey }, caller, 'view')).spaceId]
+      : await visibleSpaceIds(caller);
 
-    const results = await searchPages(query, spaceId, page, pageSize);
-    res.json(results);
+    res.json(await searchPages(query, spaceIds, page, pageSize));
   } catch (err) {
-    logger.error({ err }, 'Search failed');
-    res.status(500).json({ error: 'Search failed' });
+    respondError(res, err, 'Search failed');
   }
 });
 

@@ -1,3 +1,4 @@
+import { escapeHtml } from '../utils/format';
 import { createFileRoute, Link } from '@tanstack/react-router';
 import { useEffect, useState } from 'react';
 import { useWikiStore } from '../stores/wikiStore';
@@ -60,7 +61,7 @@ function Dashboard() {
               <Link
                 key={result.page_id}
                 to="/space/$spaceKey/page/$slug"
-                params={{ spaceKey: result.space_key, slug: result.page_id }}
+                params={{ spaceKey: result.space_key, slug: result.slug }}
                 className="block p-4 bg-white rounded-lg border border-confluence-border hover:shadow-md transition-shadow"
               >
                 <div className="flex items-center gap-2 mb-1">
@@ -71,13 +72,15 @@ function Dashboard() {
                 <h3
                   className="text-lg font-medium text-confluence-primary"
                   dangerouslySetInnerHTML={{
-                    __html: result.highlight?.title?.[0] || result.title,
+                    // Highlights arrive HTML-escaped with only <mark> tags; plain
+                    // fallbacks must be escaped here or a page title could inject markup.
+                    __html: result.highlight?.title?.[0] || escapeHtml(result.title),
                   }}
                 />
                 <p
                   className="text-sm text-confluence-text-subtle mt-1 line-clamp-2"
                   dangerouslySetInnerHTML={{
-                    __html: result.highlight?.content_text?.[0] || result.content_text.substring(0, 200),
+                    __html: result.highlight?.content_text?.[0] || escapeHtml(result.content_text.substring(0, 200)),
                   }}
                 />
                 {result.labels.length > 0 && (

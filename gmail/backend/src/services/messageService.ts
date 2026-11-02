@@ -1,7 +1,9 @@
-import { query, getClient } from './db.js';
-import { cacheDel } from './redis.js';
+import { getClient } from './db.js';
+import { invalidateMailboxes } from './redis.js';
 import logger from './logger.js';
 import { emailsSentTotal } from './metrics.js';
+import { visibleMessageSql } from './threadService.js';
+import { sanitizeEmailHtml } from './htmlSanitizer.js';
 
 export interface SendMessageInput {
   to: string[];
@@ -20,6 +22,43 @@ interface UserRow {
   display_name: string;
 }
 
+/** A rejection the client caused; carries its HTTP status. */
+export class SendError extends Error {
+  constructor(
+    public readonly status: number,
+    message: string,
+    public readonly details: Record<string, unknown> = {}
+  ) {
+    super(message);
+    this.name = 'SendError';
+  }
+}
+
+const normalize = (email: unknown): string => String(email ?? '').trim().toLowerCase();
+
+/**
+ * Normalizes and deduplicates recipients. An address listed more than once
+ * keeps its most visible role (to > cc > bcc), so nobody gets two copies and
+ * nobody is BCC'd and CC'd at once. Duplicates used to create duplicate
+ * recipient rows and count twice toward contact frequency.
+ */
+export const resolveRecipientRoles = (
+  input: Pick<SendMessageInput, 'to' | 'cc' | 'bcc'>
+): Map<string, 'to' | 'cc' | 'bcc'> => {
+  const roles = new Map<string, 'to' | 'cc' | 'bcc'>();
+  for (const [list, role] of [
+    [input.to, 'to'],
+    [input.cc ?? [], 'cc'],
+    [input.bcc ?? [], 'bcc'],
+  ] as const) {
+    for (const raw of list) {
+      const email = normalize(raw);
+      if (email && !roles.has(email)) roles.set(email, role);
+    }
+  }
+  return roles;
+};
+
 /**
  * Send a message — creates or adds to a thread
  */
@@ -32,22 +71,46 @@ export const sendMessage = async (
   try {
     await client.query('BEGIN');
 
-    // Look up recipient user IDs by email
-    const allRecipientEmails = [
-      ...input.to,
-      ...(input.cc || []),
-      ...(input.bcc || []),
-    ];
-
+    const roles = resolveRecipientRoles(input);
     const recipientResult = await client.query<UserRow>(
-      `SELECT id, email, display_name FROM users WHERE email = ANY($1)`,
-      [allRecipientEmails]
+      `SELECT id, email, display_name FROM users WHERE lower(email) = ANY($1)`,
+      [[...roles.keys()]]
     );
-
     const recipientMap = new Map<string, UserRow>();
     for (const row of recipientResult.rows) {
-      recipientMap.set(row.email, row);
+      recipientMap.set(normalize(row.email), row);
     }
+
+    // Mail lives entirely inside this system, so an address with no account
+    // can never be delivered. Refuse the send rather than silently dropping
+    // that recipient (the old behavior) and reporting success.
+    const unknown = [...roles.keys()].filter((email) => !recipientMap.has(email));
+    if (unknown.length > 0) {
+      throw new SendError(400, `No account for: ${unknown.join(', ')}`, { unknownRecipients: unknown });
+    }
+
+    // Replying requires being a party to the thread, and the replied-to
+    // message must be one the sender can see. Previously any thread ID was
+    // accepted; posting into a stranger's thread also created a state row for
+    // the sender, which then exposed the whole conversation.
+    if (input.threadId) {
+      const visible = await client.query(
+        `SELECT 1 FROM messages m WHERE m.thread_id = $2 AND ${visibleMessageSql()} LIMIT 1`,
+        [senderId, input.threadId]
+      );
+      if (visible.rowCount === 0) throw new SendError(404, 'Thread not found');
+    }
+    if (input.inReplyTo) {
+      const parent = await client.query(
+        `SELECT 1 FROM messages m WHERE m.id = $2 AND ($3::uuid IS NULL OR m.thread_id = $3::uuid)
+           AND ${visibleMessageSql()}`,
+        [senderId, input.inReplyTo, input.threadId ?? null]
+      );
+      if (parent.rowCount === 0) throw new SendError(404, 'Message being replied to was not found');
+    }
+
+    const bodyHtml = input.bodyHtml ? sanitizeEmailHtml(input.bodyHtml) : null;
+    const snippet = input.bodyText.substring(0, 100);
 
     // Create or use existing thread
     let threadId = input.threadId;
@@ -57,7 +120,7 @@ export const sendMessage = async (
         `INSERT INTO threads (subject, snippet, message_count, last_message_at)
          VALUES ($1, $2, 1, NOW())
          RETURNING id`,
-        [input.subject, input.bodyText.substring(0, 100)]
+        [input.subject, snippet]
       );
       threadId = threadResult.rows[0].id;
     } else {
@@ -67,7 +130,7 @@ export const sendMessage = async (
            message_count = message_count + 1,
            last_message_at = NOW()
          WHERE id = $2`,
-        [input.bodyText.substring(0, 100), threadId]
+        [snippet, threadId]
       );
     }
 
@@ -81,43 +144,19 @@ export const sendMessage = async (
         senderId,
         input.inReplyTo || null,
         input.bodyText,
-        input.bodyHtml || null,
+        bodyHtml,
       ]
     );
     const messageId = messageResult.rows[0].id;
 
-    // Create message_recipients entries
-    for (const email of input.to) {
-      const user = recipientMap.get(email);
-      if (user) {
-        await client.query(
-          `INSERT INTO message_recipients (message_id, user_id, recipient_type)
-           VALUES ($1, $2, 'to')`,
-          [messageId, user.id]
-        );
-      }
-    }
-
-    for (const email of input.cc || []) {
-      const user = recipientMap.get(email);
-      if (user) {
-        await client.query(
-          `INSERT INTO message_recipients (message_id, user_id, recipient_type)
-           VALUES ($1, $2, 'cc')`,
-          [messageId, user.id]
-        );
-      }
-    }
-
-    for (const email of input.bcc || []) {
-      const user = recipientMap.get(email);
-      if (user) {
-        await client.query(
-          `INSERT INTO message_recipients (message_id, user_id, recipient_type)
-           VALUES ($1, $2, 'bcc')`,
-          [messageId, user.id]
-        );
-      }
+    // One recipient row per person (UNIQUE (message_id, user_id)).
+    for (const [email, role] of roles) {
+      await client.query(
+        `INSERT INTO message_recipients (message_id, user_id, recipient_type)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (message_id, user_id) DO NOTHING`,
+        [messageId, recipientMap.get(email)!.id, role]
+      );
     }
 
     // Get sender info for label lookup
@@ -151,47 +190,31 @@ export const sendMessage = async (
       [threadId, senderId]
     );
 
-    // Add INBOX label and thread_user_state for each visible recipient (to + cc)
-    const visibleRecipientEmails = [
-      ...input.to,
-      ...(input.cc || []),
-      ...(input.bcc || []),
-    ];
+    // Every recipient (to, cc and bcc) gets the thread in INBOX, unread. New
+    // mail also brings an archived thread back to the inbox, as in Gmail.
+    const recipientIds = new Set<string>();
+    for (const email of roles.keys()) {
+      const user = recipientMap.get(email)!;
+      if (user.id === senderId) continue;
+      recipientIds.add(user.id);
 
-    for (const email of visibleRecipientEmails) {
-      const user = recipientMap.get(email);
-      if (user && user.id !== senderId) {
-        // Get recipient's INBOX label
-        const inboxLabelResult = await client.query<{ id: string }>(
-          `SELECT id FROM labels WHERE user_id = $1 AND name = 'INBOX'`,
-          [user.id]
-        );
-
-        if (inboxLabelResult.rows.length > 0) {
-          await client.query(
-            `INSERT INTO thread_labels (thread_id, label_id, user_id)
-             VALUES ($1, $2, $3)
-             ON CONFLICT (thread_id, label_id, user_id) DO NOTHING`,
-            [threadId, inboxLabelResult.rows[0].id, user.id]
-          );
-        }
-
-        // Create or update thread_user_state (mark as unread for recipients)
-        await client.query(
-          `INSERT INTO thread_user_state (thread_id, user_id, is_read)
-           VALUES ($1, $2, false)
-           ON CONFLICT (thread_id, user_id) DO UPDATE SET is_read = false, updated_at = NOW()`,
-          [threadId, user.id]
-        );
-
-        // Invalidate recipient's cache
-        await cacheDel(`threads:${user.id}:*`);
-        await cacheDel(`unread:${user.id}`);
-      }
+      await client.query(
+        `INSERT INTO thread_labels (thread_id, label_id, user_id)
+         SELECT $1, id, $2 FROM labels WHERE user_id = $2 AND name = 'INBOX'
+         ON CONFLICT (thread_id, label_id, user_id) DO NOTHING`,
+        [threadId, user.id]
+      );
+      await client.query(
+        `INSERT INTO thread_user_state (thread_id, user_id, is_read)
+         VALUES ($1, $2, false)
+         ON CONFLICT (thread_id, user_id)
+         DO UPDATE SET is_read = false, is_archived = false, updated_at = NOW()`,
+        [threadId, user.id]
+      );
     }
 
-    // Update contacts for sender
-    for (const email of allRecipientEmails) {
+    // Update contacts for sender, once per distinct recipient
+    for (const email of roles.keys()) {
       const user = recipientMap.get(email);
       if (user) {
         await client.query(
@@ -207,9 +230,9 @@ export const sendMessage = async (
 
     await client.query('COMMIT');
 
-    // Invalidate sender's cache
-    await cacheDel(`threads:${senderId}:*`);
-    await cacheDel(`unread:${senderId}`);
+    // After commit, so a concurrent read cannot refill a cache from
+    // uncommitted state (recipients' entries used to be dropped mid-transaction).
+    await invalidateMailboxes(senderId, ...recipientIds);
 
     emailsSentTotal.inc();
 
@@ -218,7 +241,7 @@ export const sendMessage = async (
         senderId,
         threadId,
         messageId,
-        recipientCount: allRecipientEmails.length,
+        recipientCount: roles.size,
       },
       'Message sent successfully'
     );

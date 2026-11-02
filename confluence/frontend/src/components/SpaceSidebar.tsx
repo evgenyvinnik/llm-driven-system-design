@@ -27,7 +27,8 @@ export default function SpaceSidebar({ space, tree, spaceKey }: SpaceSidebarProp
           </span>
         </Link>
 
-        {/* Create page button */}
+        {/* Create page button (members and admins only) */}
+        {space.access?.canEdit && (
         <Link
           to="/space/$spaceKey/page/$slug/edit"
           params={{ spaceKey, slug: 'new' }}
@@ -38,6 +39,12 @@ export default function SpaceSidebar({ space, tree, spaceKey }: SpaceSidebarProp
           </svg>
           Create page
         </Link>
+        )}
+        {space.access && !space.access.canEdit && (
+          <div className="mb-4 px-3 py-2 text-xs text-confluence-text-subtle bg-white border border-confluence-border rounded" data-testid="view-only-space">
+            {space.access.role === 'viewer' ? 'You have view-only access to this space.' : 'Sign in as a member to edit this space.'}
+          </div>
+        )}
 
         {/* Page tree */}
         <div className="text-xs font-medium text-confluence-text-muted uppercase tracking-wider mb-2 px-2">

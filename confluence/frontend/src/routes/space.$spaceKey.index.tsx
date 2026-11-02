@@ -3,7 +3,7 @@ import { useEffect } from 'react';
 import { useWikiStore } from '../stores/wikiStore';
 import SpaceSidebar from '../components/SpaceSidebar';
 
-export const Route = createFileRoute('/space/$spaceKey')({
+export const Route = createFileRoute('/space/$spaceKey/')({
   component: SpacePage,
 });
 

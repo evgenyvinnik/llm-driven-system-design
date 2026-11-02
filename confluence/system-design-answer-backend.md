@@ -437,18 +437,15 @@ asserts HTTP 200 on health cannot establish these properties.
 
 ### Relationship to the local project
 
-The local code stores page snapshots transactionally, but updates have no expected-base
-condition or mutation receipt. Cache failures after commit can surface as save errors.
-Approval targets only a page and can publish later content without cache or search
-updates.
+The local code covers part of this design. Snapshots commit with the page update, an
+optional expected version turns a stale save into a 409, and space membership is enforced
+on every read and write, search included. Approvals bind to the reviewed version. The
+indexing path uses publisher confirms, retries with a dead-letter queue, version-guarded
+index writes, and a periodic full reconciliation.
 
-Its ordinary RabbitMQ publisher is best effort, and index helpers swallow failures
-before worker acknowledgement. Some mutations never publish events. Tree queries return
-full content, moves involving roots have a parameter-count defect, and membership is not
-enforced on page reads/writes. The SQL fallback is substring matching, not full-text
-search.
-
-Those findings explain why the production design adds these boundaries; they are not
-claims that the local demo already has them.
+What it lacks is the durable core: no mutation receipt, no transactional outbox (unsent
+messages buffer in memory), and no separate published revision, so approval flips status
+rather than advancing a pointer. The SQL fallback is substring matching, not full-text
+search. Those gaps are why the production design adds the receipt, outbox and pointer.
 [architecture.md](./architecture.md#implementation-notes) traces the actual source and
 verification limits.

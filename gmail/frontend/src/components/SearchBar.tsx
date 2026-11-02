@@ -7,6 +7,7 @@ import type { SearchResult } from '../types';
 export function SearchBar() {
   const [query, setQuery] = useState('');
   const [results, setResults] = useState<SearchResult[]>([]);
+  const [degraded, setDegraded] = useState(false);
   const [showResults, setShowResults] = useState(false);
   const [isSearching, setIsSearching] = useState(false);
   const navigate = useNavigate();
@@ -19,6 +20,7 @@ export function SearchBar() {
     try {
       const response = await searchApi.search(query);
       setResults(response.results);
+      setDegraded(Boolean(response.degraded));
       setShowResults(true);
     } catch {
       setResults([]);
@@ -84,6 +86,10 @@ export function SearchBar() {
             <div className="p-4 text-center text-gmail-text-secondary text-sm">
               Searching...
             </div>
+          ) : degraded && results.length === 0 ? (
+            <div className="px-4 py-3 text-sm text-gmail-text-secondary">
+              Search is running in a limited mode; no exact matches found.
+            </div>
           ) : results.length === 0 ? (
             <div className="p-4 text-center text-gmail-text-secondary text-sm">
               No results found. Try: from:alice, to:bob, has:attachment
@@ -103,9 +109,11 @@ export function SearchBar() {
                     {result.senderEmail}
                   </span>
                 </div>
-                <div className="text-sm text-gmail-text truncate">
-                  {result.subject}
-                </div>
+                {/* The server escapes subjects and snippets; highlights add only <em>. */}
+                <div
+                  className="text-sm text-gmail-text truncate"
+                  dangerouslySetInnerHTML={{ __html: result.subject }}
+                />
                 <div
                   className="text-xs text-gmail-text-secondary truncate mt-0.5"
                   dangerouslySetInnerHTML={{ __html: result.snippet }}

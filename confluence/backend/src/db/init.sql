@@ -108,6 +108,9 @@ CREATE TABLE IF NOT EXISTS page_approvals (
   reviewed_by UUID REFERENCES users(id),
   status VARCHAR(20) DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected')),
   comment TEXT,
+  -- The page version under review. Approving publishes only if the page is
+  -- still at this version; otherwise the reviewer would approve unseen edits.
+  page_version INT,
   created_at TIMESTAMPTZ DEFAULT NOW(),
   reviewed_at TIMESTAMPTZ
 );
@@ -123,3 +126,10 @@ CREATE INDEX IF NOT EXISTS idx_space_members_space ON space_members(space_id);
 CREATE INDEX IF NOT EXISTS idx_space_members_user ON space_members(user_id);
 CREATE INDEX IF NOT EXISTS idx_templates_space ON templates(space_id);
 CREATE INDEX IF NOT EXISTS idx_page_approvals_page ON page_approvals(page_id, status);
+
+-- Upgrades for databases created before these columns/indexes existed.
+ALTER TABLE page_approvals ADD COLUMN IF NOT EXISTS page_version INT;
+-- One pending approval per page, enforced by the database rather than a
+-- check-then-insert that two concurrent requests could both pass.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_page_approvals_one_pending
+  ON page_approvals(page_id) WHERE status = 'pending';

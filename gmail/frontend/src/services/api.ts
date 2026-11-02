@@ -180,6 +180,8 @@ export const searchApi = {
       results: import('../types').SearchResult[];
       total: number;
       page: number;
+      /** True when Elasticsearch was down and results came from a SQL fallback. */
+      degraded?: boolean;
     }>(`/search?q=${encodeURIComponent(q)}&page=${page}`),
 };
 

@@ -488,14 +488,14 @@ procedure can discard the evidence needed to repair a stale system.
 ### Relationship to the local project
 
 The repository combines React/TanStack Router/Zustand with Express, PostgreSQL, Valkey,
-RabbitMQ, and Elasticsearch. It implements full snapshot history and several UI
-components, but generated page/edit routes sit under parents missing child outlets. The
-resulting browser flow is incomplete, and search passes page IDs into slug routes.
+RabbitMQ, and Elasticsearch. It implements full snapshot history, space-level authorization on every route
+including search, version-checked saves, sanitized page HTML, and reviews bound to a
+version. Search indexing retries failures, rejects stale writes and reconciles
+periodically.
 
-The current save API lacks expected revisions and mutation receipts; its post-commit
-cache failures can become HTTP errors. The worker can acknowledge swallowed index
-failures, and labels/restores/approvals omit necessary updates. Space permissions are
-not enforced, HTML is unsanitized, and review is not revision-bound.
+It lacks mutation receipts, a transactional outbox, and a published-revision pointer:
+approval publishes by flipping status, and an uncertain save retried by the client can
+create a second revision.
 
 The production proposal above addresses those specific boundaries without claiming they
 were implemented by a documentation change. The source evidence and setup limitations

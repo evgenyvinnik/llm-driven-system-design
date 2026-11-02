@@ -6,17 +6,26 @@ import { formatDate } from '../utils/format';
 
 interface ApprovalBannerProps {
   pageId: string;
+  /** Whether the user can edit the page (and so request a review of it). */
+  canEdit: boolean;
 }
 
 /** Displays pending approval status with approve/reject actions and approval history. */
-export default function ApprovalBanner({ pageId }: ApprovalBannerProps) {
+export default function ApprovalBanner({ pageId, canEdit }: ApprovalBannerProps) {
   const [approvals, setApprovals] = useState<Approval[]>([]);
+  const [canReview, setCanReview] = useState(false);
   const { user } = useAuthStore();
 
   useEffect(() => {
-    api.getPageApprovals(pageId).then(({ approvals: a }) => {
+    let cancelled = false;
+    api.getPageApprovals(pageId).then(({ approvals: a, canReview: r }) => {
+      if (cancelled) return;
       setApprovals(a);
+      setCanReview(r);
     }).catch(() => {});
+    return () => {
+      cancelled = true;
+    };
   }, [pageId]);
 
   const pendingApproval = approvals.find((a) => a.status === 'pending');
@@ -32,6 +41,8 @@ export default function ApprovalBanner({ pageId }: ApprovalBannerProps) {
 
   const handleReview = async (approvalId: string, status: 'approved' | 'rejected') => {
     const comment = prompt(`${status === 'approved' ? 'Approval' : 'Rejection'} comment (optional):`);
+    // Cancel means "don't review", not "review with no comment".
+    if (comment === null) return;
     try {
       const { approval } = await api.reviewApproval(approvalId, status, comment || undefined);
       setApprovals(approvals.map((a) => (a.id === approvalId ? approval : a)));
@@ -56,7 +67,7 @@ export default function ApprovalBanner({ pageId }: ApprovalBannerProps) {
                 Requested by {pendingApproval.requester_username} {formatDate(pendingApproval.created_at)}
               </span>
             </div>
-            {pendingApproval.requested_by !== user.id && (
+            {canReview && pendingApproval.requested_by !== user.id && (
               <div className="flex gap-2">
                 <button
                   onClick={() => handleReview(pendingApproval.id, 'approved')}
@@ -77,7 +88,7 @@ export default function ApprovalBanner({ pageId }: ApprovalBannerProps) {
       )}
 
       {/* Request approval button (if no pending) */}
-      {!pendingApproval && (
+      {!pendingApproval && canEdit && (
         <button
           onClick={handleRequestApproval}
           className="mb-4 text-xs text-confluence-text-subtle hover:text-confluence-primary transition-colors"

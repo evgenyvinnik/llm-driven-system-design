@@ -1,18 +1,28 @@
 /**
  * Search indexer worker
  *
- * Polls PostgreSQL for newly created messages and indexes them
- * in Elasticsearch for full-text search. Tracks the last indexed
- * timestamp in Redis to avoid re-indexing.
+ * Indexes messages whose `indexed_at` is still NULL and marks each one when its
+ * document is written. The marker is per message, in the same table as the
+ * message, which replaces a timestamp checkpoint kept in Redis. That
+ * checkpoint had three failure modes:
+ * - Ties: more than a batch of messages sharing a timestamp were re-selected
+ *   forever (the stored Date lost its microseconds), or skipped at the boundary.
+ * - Late commits: a transaction that committed after a newer message had been
+ *   indexed fell behind the checkpoint and was never indexed (created_at is
+ *   transaction start time).
+ * - Silent loss: one failed document made the whole batch retry, while a
+ *   swallowed failure advanced past it.
+ * A missing marker is now always visible and always retried, up to
+ * MAX_ATTEMPTS. `npm run search:reindex` clears the markers to rebuild the index.
  */
 import { query } from '../services/db.js';
-import redis from '../services/redis.js';
-import { indexMessage, initializeIndex } from '../services/elasticsearch.js';
+import { esClient, indexMessage, initializeIndex } from '../services/elasticsearch.js';
 import { indexedMessagesTotal } from '../services/metrics.js';
 import logger from '../services/logger.js';
 
-const LAST_INDEXED_KEY = 'search-indexer:last-indexed';
-const POLL_INTERVAL_MS = 5000;
+const POLL_INTERVAL_MS = 2000;
+const BATCH_SIZE = 100;
+const MAX_ATTEMPTS = 10;
 
 interface MessageToIndex {
   message_id: string;
@@ -34,9 +44,7 @@ interface RecipientInfo {
   recipient_type: string;
 }
 
-const indexNewMessages = async (): Promise<number> => {
-  const lastIndexed = (await redis.get(LAST_INDEXED_KEY)) || '1970-01-01T00:00:00Z';
-
+export const indexPendingMessages = async (): Promise<{ indexed: number; failed: number }> => {
   const messagesResult = await query<MessageToIndex>(
     `SELECT m.id as message_id, m.thread_id, m.sender_id,
             u.display_name as sender_name, u.email as sender_email,
@@ -44,16 +52,14 @@ const indexNewMessages = async (): Promise<number> => {
      FROM messages m
      JOIN users u ON u.id = m.sender_id
      JOIN threads t ON t.id = m.thread_id
-     WHERE m.created_at > $1
-     ORDER BY m.created_at ASC
-     LIMIT 100`,
-    [lastIndexed]
+     WHERE m.indexed_at IS NULL AND m.index_attempts < $1
+     ORDER BY m.created_at ASC, m.id ASC
+     LIMIT $2`,
+    [MAX_ATTEMPTS, BATCH_SIZE]
   );
-
-  if (messagesResult.rows.length === 0) return 0;
+  if (messagesResult.rows.length === 0) return { indexed: 0, failed: 0 };
 
   const messageIds = messagesResult.rows.map((m) => m.message_id);
-
   const recipientsResult = await query<RecipientInfo>(
     `SELECT mr.message_id, mr.user_id, u.display_name, u.email, mr.recipient_type
      FROM message_recipients mr
@@ -61,7 +67,6 @@ const indexNewMessages = async (): Promise<number> => {
      WHERE mr.message_id = ANY($1)`,
     [messageIds]
   );
-
   const recipientsByMessage = new Map<string, RecipientInfo[]>();
   for (const row of recipientsResult.rows) {
     const existing = recipientsByMessage.get(row.message_id) || [];
@@ -69,65 +74,72 @@ const indexNewMessages = async (): Promise<number> => {
     recipientsByMessage.set(row.message_id, existing);
   }
 
-  let lastTimestamp = lastIndexed;
-
+  let indexed = 0;
+  let failed = 0;
   for (const msg of messagesResult.rows) {
     const recipients = recipientsByMessage.get(msg.message_id) || [];
-
-    // visible_to includes sender + all recipients (including bcc, since each person
-    // can only search their own visible emails)
-    const visibleTo = [
-      msg.sender_id,
-      ...recipients.map((r) => r.user_id),
-    ];
-
-    await indexMessage({
-      thread_id: msg.thread_id,
-      message_id: msg.message_id,
-      sender_id: msg.sender_id,
-      sender_name: msg.sender_name,
-      sender_email: msg.sender_email,
-      recipients: recipients
-        .filter((r) => r.recipient_type !== 'bcc')
-        .map((r) => r.email),
-      recipient_names: recipients
-        .filter((r) => r.recipient_type !== 'bcc')
-        .map((r) => r.display_name),
-      subject: msg.subject,
-      body: msg.body_text,
-      has_attachments: msg.has_attachments,
-      created_at: msg.created_at,
-      visible_to: [...new Set(visibleTo)],
-    });
-
-    indexedMessagesTotal.inc();
-    lastTimestamp = msg.created_at;
+    const publicRecipients = recipients.filter((r) => r.recipient_type !== 'bcc');
+    try {
+      await indexMessage({
+        thread_id: msg.thread_id,
+        message_id: msg.message_id,
+        sender_id: msg.sender_id,
+        sender_name: msg.sender_name,
+        sender_email: msg.sender_email,
+        // BCC recipients are not searchable by name/address, but they can
+        // find the message themselves through visible_to.
+        recipients: publicRecipients.map((r) => r.email),
+        recipient_names: publicRecipients.map((r) => r.display_name),
+        subject: msg.subject,
+        body: msg.body_text,
+        has_attachments: msg.has_attachments,
+        created_at: msg.created_at,
+        visible_to: [...new Set([msg.sender_id, ...recipients.map((r) => r.user_id)])],
+      });
+      await query(
+        `UPDATE messages SET indexed_at = NOW(), index_error = NULL WHERE id = $1`,
+        [msg.message_id]
+      );
+      indexedMessagesTotal.inc();
+      indexed++;
+    } catch (error) {
+      failed++;
+      await query(
+        `UPDATE messages SET index_attempts = index_attempts + 1, index_error = $2 WHERE id = $1`,
+        [msg.message_id, String((error as Error).message).slice(0, 500)]
+      );
+    }
   }
+  return { indexed, failed };
+};
 
-  await redis.set(LAST_INDEXED_KEY, lastTimestamp);
-
-  return messagesResult.rows.length;
+const waitForElasticsearch = async (): Promise<void> => {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      await esClient.cluster.health({ wait_for_status: 'yellow', timeout: '5s' });
+      return;
+    } catch {
+      if (attempt % 5 === 1) logger.info('Waiting for Elasticsearch...');
+      await new Promise((resolve) => setTimeout(resolve, 3000));
+    }
+  }
 };
 
 const startWorker = async (): Promise<void> => {
   logger.info('Search indexer worker starting...');
-
-  // Initialize ES index
+  await waitForElasticsearch();
   await initializeIndex();
+  logger.info('Search indexer worker started. Indexing unmarked messages...');
 
-  logger.info('Search indexer worker started. Polling for new messages...');
-
-  while (true) {
+  for (;;) {
     try {
-      const count = await indexNewMessages();
-      if (count > 0) {
-        logger.info({ count }, `Indexed ${count} messages`);
-      }
+      const { indexed, failed } = await indexPendingMessages();
+      if (indexed > 0 || failed > 0) logger.info({ indexed, failed }, 'Indexing pass complete');
+      // Drain a backlog without waiting a full poll interval between batches.
+      if (indexed === BATCH_SIZE) continue;
     } catch (error) {
-      const err = error as Error;
-      logger.error({ error: err.message }, 'Indexing error');
+      logger.error({ error: (error as Error).message }, 'Indexing error');
     }
-
     await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
   }
 };

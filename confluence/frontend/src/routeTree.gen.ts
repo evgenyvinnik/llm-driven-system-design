@@ -9,16 +9,16 @@
 // Additionally, you should also exclude this file from your linter and/or formatter to prevent it from being checked or modified.
 
 import { Route as rootRouteImport } from './routes/__root'
-import { Route as RegisterRouteImport } from './routes/register'
-import { Route as LoginRouteImport } from './routes/login'
 import { Route as IndexRouteImport } from './routes/index'
-import { Route as SpaceSpaceKeyRouteImport } from './routes/space.$spaceKey'
-import { Route as SpaceSpaceKeyPageSlugRouteImport } from './routes/space.$spaceKey.page.$slug'
+import { Route as LoginRouteImport } from './routes/login'
+import { Route as RegisterRouteImport } from './routes/register'
+import { Route as SpaceSpaceKeyIndexRouteImport } from './routes/space.$spaceKey.index'
+import { Route as SpaceSpaceKeyPageSlugIndexRouteImport } from './routes/space.$spaceKey.page.$slug.index'
 import { Route as SpaceSpaceKeyPageSlugEditRouteImport } from './routes/space.$spaceKey.page.$slug.edit'
 
-const RegisterRoute = RegisterRouteImport.update({
-  id: '/register',
-  path: '/register',
+const IndexRoute = IndexRouteImport.update({
+  id: '/',
+  path: '/',
   getParentRoute: () => rootRouteImport,
 } as any)
 const LoginRoute = LoginRouteImport.update({
@@ -26,52 +26,53 @@ const LoginRoute = LoginRouteImport.update({
   path: '/login',
   getParentRoute: () => rootRouteImport,
 } as any)
-const IndexRoute = IndexRouteImport.update({
-  id: '/',
-  path: '/',
+const RegisterRoute = RegisterRouteImport.update({
+  id: '/register',
+  path: '/register',
   getParentRoute: () => rootRouteImport,
 } as any)
-const SpaceSpaceKeyRoute = SpaceSpaceKeyRouteImport.update({
-  id: '/space/$spaceKey',
-  path: '/space/$spaceKey',
+const SpaceSpaceKeyIndexRoute = SpaceSpaceKeyIndexRouteImport.update({
+  id: '/space/$spaceKey/',
+  path: '/space/$spaceKey/',
   getParentRoute: () => rootRouteImport,
 } as any)
-const SpaceSpaceKeyPageSlugRoute = SpaceSpaceKeyPageSlugRouteImport.update({
-  id: '/page/$slug',
-  path: '/page/$slug',
-  getParentRoute: () => SpaceSpaceKeyRoute,
-} as any)
+const SpaceSpaceKeyPageSlugIndexRoute =
+  SpaceSpaceKeyPageSlugIndexRouteImport.update({
+    id: '/space/$spaceKey/page/$slug/',
+    path: '/space/$spaceKey/page/$slug/',
+    getParentRoute: () => rootRouteImport,
+  } as any)
 const SpaceSpaceKeyPageSlugEditRoute =
   SpaceSpaceKeyPageSlugEditRouteImport.update({
-    id: '/edit',
-    path: '/edit',
-    getParentRoute: () => SpaceSpaceKeyPageSlugRoute,
+    id: '/space/$spaceKey/page/$slug/edit',
+    path: '/space/$spaceKey/page/$slug/edit',
+    getParentRoute: () => rootRouteImport,
   } as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/login': typeof LoginRoute
   '/register': typeof RegisterRoute
-  '/space/$spaceKey': typeof SpaceSpaceKeyRouteWithChildren
-  '/space/$spaceKey/page/$slug': typeof SpaceSpaceKeyPageSlugRouteWithChildren
+  '/space/$spaceKey/': typeof SpaceSpaceKeyIndexRoute
   '/space/$spaceKey/page/$slug/edit': typeof SpaceSpaceKeyPageSlugEditRoute
+  '/space/$spaceKey/page/$slug/': typeof SpaceSpaceKeyPageSlugIndexRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/login': typeof LoginRoute
   '/register': typeof RegisterRoute
-  '/space/$spaceKey': typeof SpaceSpaceKeyRouteWithChildren
-  '/space/$spaceKey/page/$slug': typeof SpaceSpaceKeyPageSlugRouteWithChildren
+  '/space/$spaceKey': typeof SpaceSpaceKeyIndexRoute
   '/space/$spaceKey/page/$slug/edit': typeof SpaceSpaceKeyPageSlugEditRoute
+  '/space/$spaceKey/page/$slug': typeof SpaceSpaceKeyPageSlugIndexRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/login': typeof LoginRoute
   '/register': typeof RegisterRoute
-  '/space/$spaceKey': typeof SpaceSpaceKeyRouteWithChildren
-  '/space/$spaceKey/page/$slug': typeof SpaceSpaceKeyPageSlugRouteWithChildren
+  '/space/$spaceKey/': typeof SpaceSpaceKeyIndexRoute
   '/space/$spaceKey/page/$slug/edit': typeof SpaceSpaceKeyPageSlugEditRoute
+  '/space/$spaceKey/page/$slug/': typeof SpaceSpaceKeyPageSlugIndexRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
@@ -79,41 +80,43 @@ export interface FileRouteTypes {
     | '/'
     | '/login'
     | '/register'
-    | '/space/$spaceKey'
-    | '/space/$spaceKey/page/$slug'
+    | '/space/$spaceKey/'
     | '/space/$spaceKey/page/$slug/edit'
+    | '/space/$spaceKey/page/$slug/'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
     | '/login'
     | '/register'
     | '/space/$spaceKey'
-    | '/space/$spaceKey/page/$slug'
     | '/space/$spaceKey/page/$slug/edit'
+    | '/space/$spaceKey/page/$slug'
   id:
     | '__root__'
     | '/'
     | '/login'
     | '/register'
-    | '/space/$spaceKey'
-    | '/space/$spaceKey/page/$slug'
+    | '/space/$spaceKey/'
     | '/space/$spaceKey/page/$slug/edit'
+    | '/space/$spaceKey/page/$slug/'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   LoginRoute: typeof LoginRoute
   RegisterRoute: typeof RegisterRoute
-  SpaceSpaceKeyRoute: typeof SpaceSpaceKeyRouteWithChildren
+  SpaceSpaceKeyIndexRoute: typeof SpaceSpaceKeyIndexRoute
+  SpaceSpaceKeyPageSlugEditRoute: typeof SpaceSpaceKeyPageSlugEditRoute
+  SpaceSpaceKeyPageSlugIndexRoute: typeof SpaceSpaceKeyPageSlugIndexRoute
 }
 
 declare module '@tanstack/react-router' {
   interface FileRoutesByPath {
-    '/register': {
-      id: '/register'
-      path: '/register'
-      fullPath: '/register'
-      preLoaderRoute: typeof RegisterRouteImport
+    '/': {
+      id: '/'
+      path: '/'
+      fullPath: '/'
+      preLoaderRoute: typeof IndexRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/login': {
@@ -123,67 +126,44 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof LoginRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/': {
-      id: '/'
-      path: '/'
-      fullPath: '/'
-      preLoaderRoute: typeof IndexRouteImport
+    '/register': {
+      id: '/register'
+      path: '/register'
+      fullPath: '/register'
+      preLoaderRoute: typeof RegisterRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/space/$spaceKey': {
-      id: '/space/$spaceKey'
+    '/space/$spaceKey/': {
+      id: '/space/$spaceKey/'
       path: '/space/$spaceKey'
-      fullPath: '/space/$spaceKey'
-      preLoaderRoute: typeof SpaceSpaceKeyRouteImport
+      fullPath: '/space/$spaceKey/'
+      preLoaderRoute: typeof SpaceSpaceKeyIndexRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/space/$spaceKey/page/$slug': {
-      id: '/space/$spaceKey/page/$slug'
-      path: '/page/$slug'
-      fullPath: '/space/$spaceKey/page/$slug'
-      preLoaderRoute: typeof SpaceSpaceKeyPageSlugRouteImport
-      parentRoute: typeof SpaceSpaceKeyRoute
+    '/space/$spaceKey/page/$slug/': {
+      id: '/space/$spaceKey/page/$slug/'
+      path: '/space/$spaceKey/page/$slug'
+      fullPath: '/space/$spaceKey/page/$slug/'
+      preLoaderRoute: typeof SpaceSpaceKeyPageSlugIndexRouteImport
+      parentRoute: typeof rootRouteImport
     }
     '/space/$spaceKey/page/$slug/edit': {
       id: '/space/$spaceKey/page/$slug/edit'
-      path: '/edit'
+      path: '/space/$spaceKey/page/$slug/edit'
       fullPath: '/space/$spaceKey/page/$slug/edit'
       preLoaderRoute: typeof SpaceSpaceKeyPageSlugEditRouteImport
-      parentRoute: typeof SpaceSpaceKeyPageSlugRoute
+      parentRoute: typeof rootRouteImport
     }
   }
 }
-
-interface SpaceSpaceKeyPageSlugRouteChildren {
-  SpaceSpaceKeyPageSlugEditRoute: typeof SpaceSpaceKeyPageSlugEditRoute
-}
-
-const SpaceSpaceKeyPageSlugRouteChildren: SpaceSpaceKeyPageSlugRouteChildren = {
-  SpaceSpaceKeyPageSlugEditRoute: SpaceSpaceKeyPageSlugEditRoute,
-}
-
-const SpaceSpaceKeyPageSlugRouteWithChildren =
-  SpaceSpaceKeyPageSlugRoute._addFileChildren(
-    SpaceSpaceKeyPageSlugRouteChildren,
-  )
-
-interface SpaceSpaceKeyRouteChildren {
-  SpaceSpaceKeyPageSlugRoute: typeof SpaceSpaceKeyPageSlugRouteWithChildren
-}
-
-const SpaceSpaceKeyRouteChildren: SpaceSpaceKeyRouteChildren = {
-  SpaceSpaceKeyPageSlugRoute: SpaceSpaceKeyPageSlugRouteWithChildren,
-}
-
-const SpaceSpaceKeyRouteWithChildren = SpaceSpaceKeyRoute._addFileChildren(
-  SpaceSpaceKeyRouteChildren,
-)
 
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   LoginRoute: LoginRoute,
   RegisterRoute: RegisterRoute,
-  SpaceSpaceKeyRoute: SpaceSpaceKeyRouteWithChildren,
+  SpaceSpaceKeyIndexRoute: SpaceSpaceKeyIndexRoute,
+  SpaceSpaceKeyPageSlugEditRoute: SpaceSpaceKeyPageSlugEditRoute,
+  SpaceSpaceKeyPageSlugIndexRoute: SpaceSpaceKeyPageSlugIndexRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

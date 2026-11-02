@@ -3,6 +3,7 @@ import type { ThreadDetail } from '../types';
 import { MessageCard } from './MessageCard';
 import { useMailStore } from '../stores/mailStore';
 import { messageApi } from '../services/api';
+import { useAuthStore } from '../stores/authStore';
 
 interface ThreadViewProps {
   thread: ThreadDetail;
@@ -15,6 +16,8 @@ export function ThreadView({ thread, onBack }: ThreadViewProps) {
   const [replyOpen, setReplyOpen] = useState(false);
   const [replyText, setReplyText] = useState('');
   const [isSending, setIsSending] = useState(false);
+  const [replyError, setReplyError] = useState<string | null>(null);
+  const me = useAuthStore((s) => s.user?.email?.toLowerCase());
 
   const lastMessage = thread.messages[thread.messages.length - 1];
 
@@ -23,23 +26,33 @@ export function ThreadView({ thread, onBack }: ThreadViewProps) {
 
     setIsSending(true);
     try {
-      const recipients = [
-        lastMessage.sender.email,
-        ...lastMessage.to.map((r) => r.email),
-      ].filter((email, idx, arr) => arr.indexOf(email) === idx);
+      // Reply all: the sender plus everyone on To and CC, minus yourself. When
+      // replying to your own message, it goes to that message's recipients.
+      // (CC used to be dropped and your own address kept.) BCC is never copied.
+      const lower = (email: string) => email.toLowerCase();
+      const unique = (emails: string[]) =>
+        emails.map(lower).filter((email, i, all) => email !== me && all.indexOf(email) === i);
+      const to = unique([lastMessage.sender.email, ...lastMessage.to.map((r) => r.email)]);
+      const cc = unique(lastMessage.cc.map((r) => r.email)).filter((email) => !to.includes(email));
+      if (to.length === 0 && cc.length === 0) {
+        setReplyError('There is no one else on this message to reply to.');
+        return;
+      }
 
+      setReplyError(null);
       await messageApi.reply({
         threadId: thread.id,
         inReplyTo: lastMessage.id,
-        to: recipients,
+        to: to.length > 0 ? to : cc,
+        cc: to.length > 0 ? cc : [],
         bodyText: replyText,
       });
 
       setReplyText('');
       setReplyOpen(false);
       fetchThread(thread.id);
-    } catch {
-      // Handle error
+    } catch (error) {
+      setReplyError(error instanceof Error ? error.message : 'Reply failed');
     } finally {
       setIsSending(false);
     }
@@ -154,8 +167,14 @@ export function ThreadView({ thread, onBack }: ThreadViewProps) {
         ) : (
           <div className="p-4">
             <div className="text-xs text-gmail-text-secondary mb-2">
-              Reply to {lastMessage?.sender.displayName}
+              Reply all to {lastMessage?.sender.displayName}
+              {lastMessage && lastMessage.to.length + lastMessage.cc.length > 1 && ' and others'}
             </div>
+            {replyError && (
+              <div className="text-xs text-red-600 mb-2" role="alert">
+                {replyError}
+              </div>
+            )}
             <textarea
               value={replyText}
               onChange={(e) => setReplyText(e.target.value)}

@@ -414,13 +414,14 @@ small-screen navigation.
 ### Relationship to the local project
 
 The local React/Zustand implementation contains a reader, content-editable editor, tree,
-history, comments, and review components. Its generated routes nest page/edit views
-under parents without child outlets, so the normal browser path does not reach those
-components today. Search also builds links using a UUID as a slug.
+history, comments, and review components, all reachable by URL. It renders capability
+flags from the server (edit, review, view-only) and drops responses from superseded
+loads. The editor sends its base version and shows the server's conflict message.
+Search results link by slug, with escaped snippets.
 
-The current editor sends HTML/text and empty structured JSON, has no autosave or draft
-recovery, and can receive stale shared state. Its API lacks expected-version saves and
-space authorization. History uses HTML-line diffs, and templates/TOC behavior is
+It still sends HTML/text with empty structured JSON and has no autosave or draft
+recovery, so a conflict tells the author to reload rather than preserving their draft
+beside the newer version. History uses HTML-line diffs, and templates/TOC behavior is
 incomplete. These are documented teaching gaps, not guarantees established by the
 proposed design. See [architecture.md](./architecture.md#implementation-notes) for the
 source evidence.
