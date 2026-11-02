@@ -22,21 +22,20 @@ function ActivityPage() {
   }, [user, loading, navigate]);
 
   useEffect(() => {
-    if (user) {
-      loadTransactions();
-    }
-  }, [user, filter]);
-
-  const loadTransactions = async () => {
+    if (!user) return;
+    // Ignore a response that arrives after the filter has changed again, so a
+    // slow "All" request can't overwrite the "Deposits" list.
+    let stale = false;
     setDataLoading(true);
-    try {
-      const res = await transfersApi.list(filter || undefined);
-      setTransactions(res.transactions);
-    } catch {
-      // handle error silently
-    }
-    setDataLoading(false);
-  };
+    transfersApi
+      .list(filter || undefined)
+      .then((res) => !stale && setTransactions(res.transactions))
+      .catch(() => undefined)
+      .finally(() => !stale && setDataLoading(false));
+    return () => {
+      stale = true;
+    };
+  }, [user, filter]);
 
   if (loading || !user) {
     return (

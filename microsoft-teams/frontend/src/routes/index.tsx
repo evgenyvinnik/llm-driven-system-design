@@ -2,6 +2,7 @@ import { createFileRoute, useNavigate } from '@tanstack/react-router';
 import { useEffect } from 'react';
 import { useAuthStore } from '../stores/authStore';
 import { useChatStore } from '../stores/chatStore';
+import { orgApi } from '../services/api';
 
 function IndexPage() {
   const user = useAuthStore((s) => s.user);
@@ -27,7 +28,7 @@ function IndexPage() {
   if (!user) return null;
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-teams-bg">
+    <main className="min-h-screen flex items-center justify-center bg-teams-bg">
       <div className="bg-teams-surface rounded-lg shadow-lg p-8 max-w-md w-full text-center">
         <div className="text-6xl mb-4">💬</div>
         <h1 className="text-2xl font-bold text-teams-text mb-2">Welcome to Teams</h1>
@@ -41,9 +42,10 @@ function IndexPage() {
             onClick={() => {
               const name = prompt('Organization name:');
               if (name) {
-                import('../services/api').then(({ orgApi }) => {
-                  orgApi.create(name).then(() => loadOrganizations());
-                });
+                orgApi
+                  .create(name)
+                  .then(() => loadOrganizations())
+                  .catch((err) => alert(err instanceof Error ? err.message : 'Could not create organization'));
               }
             }}
             className="bg-teams-primary text-white px-6 py-2 rounded-md hover:bg-teams-hover transition-colors"
@@ -52,7 +54,7 @@ function IndexPage() {
           </button>
         )}
       </div>
-    </div>
+    </main>
   );
 }
 

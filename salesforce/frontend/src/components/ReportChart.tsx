@@ -15,6 +15,14 @@ function formatCurrency(cents: number): string {
 
 const barColors = ['#0176D3', '#00A1E0', '#FE9339', '#9B59B6', '#E74C3C', '#2E844A', '#706E6B', '#3498DB'];
 
+/**
+ * Tallest column bar, in pixels. Bars are sized in px, not %: a percentage
+ * height resolved against the auto-height flex column around it, so every
+ * column bar rendered 0px tall and the charts showed only their labels.
+ */
+const BAR_AREA_PX = 120;
+const MIN_BAR_PX = 4;
+
 /** Renders CSS-only bar/column charts for pipeline, revenue-by-month, or leads-by-source report data. */
 export function ReportChart({ type, pipelineData, revenueData, leadsData }: ReportChartProps) {
   if (type === 'pipeline' && pipelineData) {
@@ -25,7 +33,7 @@ export function ReportChart({ type, pipelineData, revenueData, leadsData }: Repo
         <h3 className="text-lg font-semibold text-salesforce-text mb-4">Pipeline by Stage</h3>
         <div className="flex items-end gap-3 h-48">
           {pipelineData.map((stage, i) => {
-            const height = Math.max((stage.totalAmountCents / maxAmount) * 100, 5);
+            const height = Math.max((stage.totalAmountCents / maxAmount) * BAR_AREA_PX, MIN_BAR_PX);
             return (
               <div key={stage.stage} className="flex-1 flex flex-col items-center">
                 <span className="text-xs text-salesforce-secondary mb-1">
@@ -33,9 +41,10 @@ export function ReportChart({ type, pipelineData, revenueData, leadsData }: Repo
                 </span>
                 <div
                   className="w-full rounded-t transition-all duration-300"
-                  style={{ height: `${height}%`, backgroundColor: barColors[i % barColors.length] }}
+                  style={{ height: `${height}px`, backgroundColor: barColors[i % barColors.length] }}
                 />
-                <span className="text-xs text-salesforce-secondary mt-2 text-center leading-tight">
+                {/* Fixed two-line height so one- and two-word stage names share a baseline. */}
+                <span className="h-8 text-xs text-salesforce-secondary mt-2 text-center leading-tight">
                   {stage.stage.split(' ').map((w, j) => (
                     <span key={j}>{w}<br /></span>
                   ))}
@@ -59,7 +68,7 @@ export function ReportChart({ type, pipelineData, revenueData, leadsData }: Repo
         <h3 className="text-lg font-semibold text-salesforce-text mb-4">Revenue by Month</h3>
         <div className="flex items-end gap-2 h-48">
           {revenueData.map((month) => {
-            const height = Math.max((month.totalAmountCents / maxAmount) * 100, 5);
+            const height = Math.max((month.totalAmountCents / maxAmount) * BAR_AREA_PX, MIN_BAR_PX);
             return (
               <div key={month.month} className="flex-1 flex flex-col items-center">
                 <span className="text-xs text-salesforce-secondary mb-1">
@@ -67,7 +76,7 @@ export function ReportChart({ type, pipelineData, revenueData, leadsData }: Repo
                 </span>
                 <div
                   className="w-full rounded-t transition-all duration-300 bg-salesforce-success"
-                  style={{ height: `${height}%` }}
+                  style={{ height: `${height}px` }}
                 />
                 <span className="text-xs text-salesforce-secondary mt-2">
                   {month.month.slice(5)}

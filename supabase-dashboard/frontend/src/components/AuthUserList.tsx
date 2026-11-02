@@ -3,8 +3,9 @@ import type { AuthUser } from '../types';
 interface AuthUserListProps {
   users: AuthUser[];
   loading: boolean;
-  onEdit: (id: string) => void;
-  onDelete: (id: string) => void;
+  /** Both omitted for viewers, which hides the row actions. */
+  onEdit?: (id: string) => void;
+  onDelete?: (id: string) => void;
 }
 
 /** Displays a table of auth users with email, role, confirmation status, and edit/delete actions. */
@@ -54,10 +55,12 @@ export function AuthUserList({ users, loading, onEdit, onDelete }: AuthUserListP
                 {new Date(user.createdAt).toLocaleDateString()}
               </td>
               <td className="px-4 py-3">
-                <div className="flex gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
-                  <button onClick={() => onEdit(user.id)} className="text-supabase-secondary hover:text-supabase-text text-xs">Edit</button>
-                  <button onClick={() => onDelete(user.id)} className="text-supabase-secondary hover:text-supabase-danger text-xs">Del</button>
-                </div>
+                {onEdit && onDelete && (
+                  <div className="flex gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
+                    <button onClick={() => onEdit(user.id)} className="text-supabase-secondary hover:text-supabase-text text-xs">Edit</button>
+                    <button onClick={() => onDelete(user.id)} className="text-supabase-secondary hover:text-supabase-danger text-xs">Del</button>
+                  </div>
+                )}
               </td>
             </tr>
           ))}

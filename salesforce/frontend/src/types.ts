@@ -48,10 +48,13 @@ export interface Opportunity {
   amount_cents: number | null;
   stage: string;
   probability: number;
+  /** Calendar day, 'YYYY-MM-DD' (the API keeps DATE columns as text). */
   close_date: string | null;
   description: string | null;
   owner_id: string | null;
   owner_name: string | null;
+  /** Set by the server when the deal entered Closed Won / Closed Lost. */
+  closed_at: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -119,6 +122,9 @@ export interface DashboardKPIs {
   conversionRate: number;
   avgDealSize: number;
 }
+
+/** Whose records a report covers: the whole org (admins only) or the caller's own. */
+export type ReportScope = 'org' | 'own';
 
 export interface PipelineStage {
   stage: string;

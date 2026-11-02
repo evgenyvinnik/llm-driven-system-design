@@ -1,7 +1,6 @@
 import { useMeetingStore } from '../stores/meetingStore';
 import { useMediaStore } from '../stores/mediaStore';
 import { wsClient } from '../services/websocket';
-import { useAuthStore } from '../stores/authStore';
 
 interface ControlBarProps {
   onLeave: () => void;
@@ -9,11 +8,13 @@ interface ControlBarProps {
 
 /** Renders the in-meeting control bar with mute, video, screen share, and leave buttons. */
 export function ControlBar({ onLeave }: ControlBarProps) {
-  const { user } = useAuthStore();
-  const { meeting, participants, toggleChat, toggleParticipantList, toggleBreakout, isChatOpen, isParticipantListOpen } = useMeetingStore();
-  const { isMuted, isVideoOn, isScreenSharing, isHandRaised, setIsMuted, setIsVideoOn, setIsScreenSharing, setIsHandRaised } = useMediaStore();
+  const { meeting, participants, myRole, locked, waiting, toggleChat, toggleParticipantList, toggleBreakout, isChatOpen, isParticipantListOpen } = useMeetingStore();
+  const { isMuted, isVideoOn, isScreenSharing, isHandRaised, setIsMuted, setIsVideoOn, setIsHandRaised } = useMediaStore();
 
-  const isHost = meeting?.hostId === user?.id;
+  // The live role from the server, not "am I the organizer": host can be
+  // transferred, and a co-host shares most host controls.
+  const isHost = myRole === 'host';
+  const isManager = myRole === 'host' || myRole === 'co-host';
 
   const handleToggleMute = () => {
     const newMuted = !isMuted;
@@ -27,12 +28,12 @@ export function ControlBar({ onLeave }: ControlBarProps) {
     wsClient.toggleVideo(newVideoOn);
   };
 
+  // Not optimistic: the server may refuse (sharing disabled, someone else
+  // presenting). Local state follows its participant-update.
   const handleToggleScreenShare = () => {
     if (isScreenSharing) {
-      setIsScreenSharing(false);
       wsClient.stopScreenShare();
     } else {
-      setIsScreenSharing(true);
       wsClient.startScreenShare();
     }
   };
@@ -43,11 +44,16 @@ export function ControlBar({ onLeave }: ControlBarProps) {
     wsClient.raiseHand(newRaised);
   };
 
+  const handleEndForAll = () => {
+    if (window.confirm('End this meeting for everyone?')) wsClient.endMeeting();
+  };
+
   return (
     <div className="bg-zoom-controlbar border-t border-zoom-card px-6 py-3 flex items-center justify-between">
       {/* Left: Meeting info */}
       <div className="flex items-center gap-2 text-sm">
         <span className="text-zoom-secondary font-mono">{meeting?.meetingCode || ''}</span>
+        {locked && <span className="text-yellow-500 text-xs font-medium">Locked</span>}
       </div>
 
       {/* Center: Media controls */}
@@ -146,10 +152,34 @@ export function ControlBar({ onLeave }: ControlBarProps) {
           <span className="absolute -top-1 -right-1 bg-zoom-primary text-white text-[10px] font-bold rounded-full w-5 h-5 flex items-center justify-center">
             {participants.length}
           </span>
+          {isManager && waiting.length > 0 && (
+            <span
+              className="absolute -bottom-1 -right-1 bg-yellow-500 text-black text-[10px] font-bold rounded-full w-5 h-5 flex items-center justify-center"
+              title={`${waiting.length} waiting`}
+            >
+              {waiting.length}
+            </span>
+          )}
         </button>
 
-        {/* Breakout Rooms (host only) */}
-        {isHost && (
+        {/* Lock meeting (host / co-host) */}
+        {isManager && (
+          <button
+            onClick={() => wsClient.lockMeeting(!locked)}
+            className={`w-10 h-10 rounded-full flex items-center justify-center transition-colors ${
+              locked ? 'bg-yellow-500 hover:bg-yellow-600' : 'bg-zinc-700 hover:bg-zinc-600'
+            }`}
+            title={locked ? 'Unlock meeting' : 'Lock meeting'}
+            aria-pressed={locked}
+          >
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="white">
+              <path d="M18 8h-1V6c0-2.76-2.24-5-5-5S7 3.24 7 6v2H6c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2zm-6 9c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2zm3.1-9H8.9V6c0-1.71 1.39-3.1 3.1-3.1 1.71 0 3.1 1.39 3.1 3.1v2z" />
+            </svg>
+          </button>
+        )}
+
+        {/* Breakout Rooms (host / co-host) */}
+        {isManager && (
           <button
             onClick={toggleBreakout}
             className="w-10 h-10 rounded-full flex items-center justify-center bg-zinc-700 hover:bg-zinc-600 transition-colors"
@@ -162,13 +192,24 @@ export function ControlBar({ onLeave }: ControlBarProps) {
         )}
       </div>
 
-      {/* Right: Leave */}
-      <button
-        onClick={onLeave}
-        className="bg-zoom-red hover:bg-red-700 text-white px-6 py-2 rounded-lg font-medium transition-colors"
-      >
-        Leave
-      </button>
+      {/* Right: Leave (and End for all, host only) */}
+      <div className="flex items-center gap-2">
+        {isHost && (
+          <button
+            onClick={handleEndForAll}
+            className="border border-zoom-red text-zoom-red hover:bg-zoom-red hover:text-white px-4 py-2 rounded-lg font-medium transition-colors"
+          >
+            End for all
+          </button>
+        )}
+        <button
+          onClick={onLeave}
+          className="bg-zoom-red hover:bg-red-700 text-white px-6 py-2 rounded-lg font-medium transition-colors"
+          title={isHost ? 'Leave; host passes to a co-host or the longest-present participant' : 'Leave'}
+        >
+          Leave
+        </button>
+      </div>
     </div>
   );
 }

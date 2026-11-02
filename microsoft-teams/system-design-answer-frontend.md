@@ -127,7 +127,9 @@ The ChatStore is the largest piece of state, containing:
 
 **Connection**: sseConnection (EventSource reference), showMemberList toggle
 
-**Actions**: ~18 actions including loadOrganizations, loadTeams, loadChannels, loadMessages, loadMoreMessages, loadThread, loadChannelMembers, sendMessage, sendThreadReply, setCurrentOrg, setCurrentTeam, setCurrentChannel, openThread, closeThread, toggleMemberList, connectSSE, disconnectSSE, addMessageFromSSE, startPresenceHeartbeat
+Org and team selection aren't store actions: picking a team navigates to its URL and the route loads that team's channels. When selection lived only in the store, switching teams swapped the channel list but left the previous team's channel open, and the next click built a URL with the old team id. Each list remembers which org or team it was loaded for, and responses for a superseded selection are dropped.
+
+**Actions**: ~18 actions including loadOrganizations, loadTeams, loadChannels, loadMessages, loadMoreMessages, loadThread, loadChannelMembers, sendMessage, sendThreadReply, setCurrentChannel, editMessage, deleteMessage, toggleReaction, markChannelRead, openThread, closeThread, toggleMemberList, connectSSE, disconnectSSE, addMessageFromSSE, startPresenceHeartbeat
 
 ### Why Two Stores
 
@@ -150,11 +152,11 @@ Messages are loaded newest-first from the API (`ORDER BY created_at DESC LIMIT 5
 
 | Approach | Pros | Cons |
 |----------|------|------|
-| ✅ Cursor-based (before timestamp) | Consistent with insertions | Slightly more complex API |
+| ✅ Cursor-based (before oldest message id) | Consistent with insertions | Slightly more complex API |
 | ❌ Offset-based | Simple | New messages shift offsets, duplicates |
 | ❌ Load all messages | Simple display logic | Memory explosion on large channels |
 
-> "I chose cursor-based pagination using the `before` timestamp parameter because offset-based pagination breaks when new messages arrive. If 5 new messages are posted while the user loads page 2 at offset 50, they'd see 5 duplicates. Cursor pagination always returns messages older than the cursor timestamp, immune to new insertions."
+> "I chose cursor-based pagination because offset-based pagination breaks when new messages arrive. If 5 new messages are posted while the user loads page 2 at offset 50, they'd see 5 duplicates. The cursor is the oldest loaded message's id, not its timestamp: a timestamp echoed back through JSON loses Postgres's microseconds, and two messages can share one, so boundary messages would be skipped. The server resolves the id to (created_at, id) and also returns hasMore, which is what decides whether a 'Load older messages' control appears at all."
 
 ### Scroll Behavior
 
@@ -181,8 +183,8 @@ For channels with 10K+ messages loaded in memory, virtual scrolling with `@tanst
 
 ### Connection Lifecycle
 
-1. **Connect**: When `setCurrentChannel` is called, disconnect any existing SSE, then create a new EventSource for the channel
-2. **Receive**: Event listeners for `new_message`, `message_edited`, `reaction_added`, `reaction_removed`
+1. **Connect**: When `setCurrentChannel` is called, disconnect any existing SSE, then create a new EventSource for the channel. "Already on this channel" means the same channel *and* a live stream. Checking the channel id alone broke under React StrictMode's dev mount, unmount and remount: the cleanup closed the stream, the remount saw the same id and returned early, and nothing arrived in real time.
+2. **Receive**: Event listeners for `new_message`, `message_edited`, `message_deleted`, `reaction_added`, `reaction_removed`, `member_removed`
 3. **Disconnect**: When navigating away from a channel or unmounting, close the EventSource
 4. **Reconnect**: EventSource handles reconnection automatically on network errors
 
@@ -195,6 +197,10 @@ For channels with 10K+ messages loaded in memory, virtual scrolling with `@tanst
 | `message_edited` | Update message content in-place by ID, set is_edited flag |
 | `reaction_added` | Find message, add/increment reaction, update users list |
 | `reaction_removed` | Find message, decrement/remove reaction, filter users list |
+| `message_deleted` | Remove the message, or keep it as a "deleted" tombstone if it has replies |
+| `member_removed` | If it's me: close the stream and show "no longer have access"; otherwise refresh the member list |
+
+Unread badges come from the channel list: the server counts other people's messages since the caller's last read. The open channel is marked read when it loads and, debounced, as messages stream in. The list refreshes on the 30-second presence tick, so channels without an open stream still update. Badges render through a ternary, because `{count && ...}` renders a literal 0.
 
 ### Deduplication
 

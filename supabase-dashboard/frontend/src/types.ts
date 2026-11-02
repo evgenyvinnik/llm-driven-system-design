@@ -6,6 +6,9 @@ export interface User {
   role: string;
 }
 
+/** The caller's role in a project; the backend enforces it, the UI only mirrors it. */
+export type ProjectRole = 'owner' | 'editor' | 'viewer';
+
 export interface Project {
   id: string;
   name: string;
@@ -15,7 +18,7 @@ export interface Project {
   dbName: string;
   dbUser: string;
   createdBy: string;
-  memberRole?: string;
+  memberRole?: ProjectRole;
   createdAt: string;
   updatedAt: string;
 }
@@ -26,7 +29,8 @@ export interface ProjectMember {
   username: string;
   email: string;
   displayName: string;
-  role: string;
+  role: ProjectRole;
+  isCreator: boolean;
   joinedAt: string;
 }
 
@@ -57,7 +61,8 @@ export interface TableInfo {
   tableName: string;
   schema: string;
   columns: ColumnInfo[];
-  rowCount?: number;
+  /** Planner estimate; null when the table has never been analyzed. */
+  rowCount: number | null;
 }
 
 export interface ColumnInfo {
@@ -75,6 +80,11 @@ export interface QueryResult {
   rows: Record<string, unknown>[];
   fields: { name: string; dataTypeID: number }[];
   rowCount: number;
+  command?: string | null;
+  /** More rows existed than the server returns (it caps results at 1000). */
+  truncated?: boolean;
+  /** The statement ran in a READ ONLY transaction (viewer role). */
+  readOnly?: boolean;
 }
 
 export interface TableDataResponse {

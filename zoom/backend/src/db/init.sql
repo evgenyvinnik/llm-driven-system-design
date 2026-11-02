@@ -84,5 +84,7 @@ CREATE INDEX IF NOT EXISTS idx_participants_meeting ON meeting_participants(meet
 CREATE INDEX IF NOT EXISTS idx_participants_user ON meeting_participants(user_id);
 CREATE INDEX IF NOT EXISTS idx_breakout_rooms_meeting ON breakout_rooms(meeting_id);
 CREATE INDEX IF NOT EXISTS idx_breakout_assignments_room ON breakout_assignments(breakout_room_id);
+-- One breakout room per participant (a participant row is already per meeting)
+CREATE UNIQUE INDEX IF NOT EXISTS idx_breakout_assignments_participant ON breakout_assignments(participant_id);
 CREATE INDEX IF NOT EXISTS idx_chat_messages_meeting ON meeting_chat_messages(meeting_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_recordings_meeting ON recordings(meeting_id);

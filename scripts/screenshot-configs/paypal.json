@@ -67,6 +67,34 @@
       "delay": 2000,
       "click": "button:has-text('Withdrawals')",
       "clickDelay": 1500
+    },
+    {
+      "name": "09-add-money",
+      "path": "/",
+      "waitFor": "h1",
+      "delay": 1000,
+      "click": "button:has-text('Add money')",
+      "clickDelay": 1200,
+      "fill": {
+        "input[name='amount']": "250.00"
+      }
+    },
+    {
+      "name": "10-request-history",
+      "path": "/request",
+      "waitFor": "h2:has-text('Your requests')",
+      "delay": 1500,
+      "fullPage": true
+    },
+    {
+      "name": "11-admin-reconciliation",
+      "path": "/admin",
+      "waitFor": "h1, table",
+      "delay": 1500,
+      "loginAs": {
+        "username": "admin",
+        "password": "password123"
+      }
     }
   ],
   "viewport": {

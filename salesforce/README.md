@@ -6,13 +6,13 @@ A customer relationship management system modeled after Salesforce, featuring ac
 
 | Metric | Value |
 |--------|-------|
-| Total SLOC | 6,767 |
-| Source Files | 79 |
-| .ts | 2,585 |
-| .tsx | 2,157 |
-| .md | 1,500 |
-| .sql | 185 |
-| .json | 163 |
+| Total SLOC | 8,150 |
+| Source Files | 89 |
+| .ts | 3,732 |
+| .tsx | 2,225 |
+| .md | 1,580 |
+| .sql | 263 |
+| .json | 173 |
 
 
 ## Features
@@ -23,7 +23,8 @@ A customer relationship management system modeled after Salesforce, featuring ac
 - **Opportunities Pipeline** - Kanban board with drag-drop stage transitions
 - **Leads** - Lead capture with conversion workflow (lead -> account + contact + opportunity)
 - **Activities** - Log calls, emails, meetings, and notes against any entity
-- **Reports** - Pipeline by stage, revenue by month, leads by source
+- **Reports** - Pipeline by stage, revenue by month, leads by source (org-wide for admins, own records for reps)
+- **Record-level access** - Reps see and change only the records they own; admins see everything
 
 ## Tech Stack
 
@@ -45,12 +46,13 @@ A customer relationship management system modeled after Salesforce, featuring ac
 # Start infrastructure
 docker-compose up -d
 
-# Install backend dependencies and run migrations
+# Install backend dependencies, run migrations, load demo data
 cd backend
 npm install
 npm run db:migrate
+cat db-seed/seed.sql | docker-compose exec -T postgres psql -U salesforce -d salesforce
 
-# Start backend
+# Start backend (port 3001)
 npm run dev
 ```
 
@@ -80,7 +82,7 @@ brew install valkey
 brew services start valkey
 ```
 
-Then install dependencies and run migrations as in Option A.
+Then install dependencies and run migrations as in Option A, and load the demo data with `psql -d salesforce -f backend/db-seed/seed.sql`.
 
 ### Access
 
@@ -94,9 +96,9 @@ Then install dependencies and run migrations as in Option A.
 ### Demo Usage
 
 1. Open http://localhost:5173
-2. Register a new account (or use demo credentials if seeded)
-3. Create accounts and contacts
-4. Create opportunities and drag them through pipeline stages
+2. Sign in as `alice` / `password123` (admin, sees every record) or `bob` / `password123` (sales rep, sees only his own records), or register a new rep
+3. Create accounts and contacts, open an account for its contacts / opportunities / activities tabs
+4. Create opportunities from the pipeline board and drag them through stages (a rep can't reopen a closed deal; an admin can)
 5. Create leads and convert them to accounts + contacts + opportunities
 6. Log activities against any entity
 7. View reports for pipeline, revenue, and lead analytics
@@ -116,7 +118,7 @@ Then install dependencies and run migrations as in Option A.
 ### Backend
 
 ```bash
-npm run dev              # Start with hot reload
+npm run dev              # Start with hot reload (port 3001)
 npm run dev:server1      # Start on port 3001
 npm run dev:server2      # Start on port 3002
 npm run dev:server3      # Start on port 3003
@@ -154,6 +156,7 @@ salesforce/
 │   │   │   ├── init.sql               # Database schema (8 tables)
 │   │   │   └── migrate.ts             # Migration runner
 │   │   ├── middleware/auth.ts          # requireAuth, requireAdmin
+│   │   ├── app.test.ts                 # Route tests (supertest, in-memory sessions)
 │   │   ├── routes/
 │   │   │   ├── auth.ts                # Register, login, logout
 │   │   │   ├── dashboard.ts           # Aggregated KPIs
@@ -164,15 +167,19 @@ salesforce/
 │   │   │   ├── activities.ts          # CRUD with polymorphic association
 │   │   │   └── reports.ts             # Pipeline, revenue, leads
 │   │   ├── services/
-│   │   │   ├── db.ts                  # PostgreSQL connection pool
+│   │   │   ├── accessPolicy.ts        # Record-level access (owner or admin, 404s)
+│   │   │   ├── opportunityStages.ts   # Stage state machine + probability mapping
+│   │   │   ├── queryParams.ts         # Pagination, search and money validation
+│   │   │   ├── db.ts                  # PostgreSQL pool + int8/DATE type parsers
 │   │   │   ├── redis.ts               # Redis client
 │   │   │   ├── logger.ts              # Pino structured logging
 │   │   │   ├── metrics.ts             # Prometheus metrics
-│   │   │   ├── circuitBreaker.ts      # Opossum circuit breaker
+│   │   │   ├── circuitBreaker.ts      # Opossum circuit breaker (not yet used)
 │   │   │   ├── rateLimiter.ts         # express-rate-limit
 │   │   │   ├── dashboardService.ts    # KPI aggregation queries
 │   │   │   ├── leadConversionService.ts # Transactional lead conversion
 │   │   │   └── reportService.ts       # Report query functions
+│   ├── db-seed/seed.sql               # Demo users and CRM data
 │   │   ├── app.ts                     # Express app setup
 │   │   └── index.ts                   # Server entry point
 │   ├── package.json
@@ -201,7 +208,7 @@ salesforce/
     │   │   ├── index.tsx               # Dashboard
     │   │   ├── login.tsx               # Login page
     │   │   ├── register.tsx            # Registration page
-    │   │   ├── accounts.tsx            # Account list
+    │   │   ├── accounts.index.tsx      # Account list
     │   │   ├── accounts.$accountId.tsx # Account detail
     │   │   ├── contacts.tsx            # Contact list
     │   │   ├── opportunities.tsx       # Kanban pipeline
@@ -211,6 +218,7 @@ salesforce/
     │   ├── stores/
     │   │   ├── authStore.ts           # Auth state (Zustand)
     │   │   └── crmStore.ts            # CRM data state (Zustand)
+    │   ├── utils/dates.ts             # Calendar-date formatting
     │   ├── types.ts                   # TypeScript interfaces
     │   ├── index.css                  # Tailwind + custom styles
     │   └── main.tsx                   # App entry point

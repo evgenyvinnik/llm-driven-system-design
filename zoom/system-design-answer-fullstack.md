@@ -311,9 +311,9 @@ MediaStore (changes per local toggle)
 
 ### WebSocket Endpoint
 
-`ws://host/ws?userId=<id>&username=<name>`
+`ws://host/ws`, authenticated by the session cookie on the upgrade (plus an Origin allowlist), never by a user id the client sends.
 
-All real-time communication (signaling, participant state, chat) flows through this single WebSocket connection.
+All real-time communication (signaling, participant state, host controls, chat) flows through this single WebSocket connection. The server keeps live meeting state in process: who is admitted, who waits, each person's role and media state. It runs every policy check there synchronously (capacity, one presenter, rank-based host actions), then writes through to PostgreSQL in order.
 
 ---
 
@@ -419,7 +419,7 @@ Host: POST /api/rooms/:meetingId/breakout-rooms/close
 - **Circuit breaker**: Database calls wrapped with Opossum (50% threshold, 30s reset)
 
 ### Frontend Resilience
-- **WebSocket reconnection**: Exponential backoff (1s, 2s, 4s...), auto-rejoin meeting
+- **WebSocket reconnection**: Exponential backoff (1s, 2s, 4s...), auto-rejoin meeting; the server holds the seat and role for 10s, so a blip doesn't announce a leave
 - **Device fallback**: If camera fails, join audio-only with avatar
 - **Optimistic UI**: Control toggles update instantly, server sync is fire-and-forget
 - **Graceful degradation**: If WebSocket disconnects, existing media continues (media plane is independent)

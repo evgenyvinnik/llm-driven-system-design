@@ -1,15 +1,31 @@
 import { useMeetingStore } from '../stores/meetingStore';
+import { useAuthStore } from '../stores/authStore';
+import { wsClient } from '../services/websocket';
 import { getInitials } from '../utils/format';
+import { WaitingRoomList } from './WaitingRoomList';
+import { ParticipantActions } from './ParticipantActions';
 
 /** Renders the side panel listing all meeting participants with their media status. */
 export function ParticipantList() {
-  const { participants } = useMeetingStore();
+  const { participants, myRole } = useMeetingStore();
+  const { user } = useAuthStore();
+  const isManager = myRole === 'host' || myRole === 'co-host';
 
   return (
     <div className="w-72 bg-zoom-surface border-l border-zoom-card flex flex-col h-full">
-      <div className="px-4 py-3 border-b border-zoom-card">
+      <div className="px-4 py-3 border-b border-zoom-card flex items-center justify-between">
         <h2 className="text-sm font-semibold text-zoom-text">Participants ({participants.length})</h2>
+        {isManager && participants.length > 1 && (
+          <button
+            onClick={() => wsClient.muteAll()}
+            className="text-xs bg-zinc-700 hover:bg-zinc-600 text-zoom-text px-2 py-1 rounded"
+          >
+            Mute all
+          </button>
+        )}
       </div>
+
+      {isManager && <WaitingRoomList />}
 
       <div className="flex-1 overflow-y-auto p-2">
         {participants.map((p) => (
@@ -23,7 +39,10 @@ export function ParticipantList() {
 
             <div className="flex-1 min-w-0">
               <div className="flex items-center gap-1.5">
-                <span className="text-sm text-zoom-text truncate">{p.displayName}</span>
+                <span className="text-sm text-zoom-text truncate">
+                  {p.displayName}
+                  {p.userId === user?.id && ' (You)'}
+                </span>
                 {p.role === 'host' && (
                   <span className="text-[10px] bg-zoom-primary/20 text-zoom-primary px-1.5 py-0.5 rounded font-medium">
                     Host
@@ -35,6 +54,7 @@ export function ParticipantList() {
                   </span>
                 )}
               </div>
+              {p.userId !== user?.id && <ParticipantActions participant={p} myRole={myRole} />}
             </div>
 
             <div className="flex items-center gap-1">

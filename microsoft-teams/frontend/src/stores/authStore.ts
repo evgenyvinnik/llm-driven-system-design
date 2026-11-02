@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import type { User } from '../types';
 import { authApi } from '../services/api';
+import { useChatStore } from './chatStore';
 
 interface AuthState {
   user: User | null;
@@ -49,6 +50,9 @@ export const useAuthStore = create<AuthState>((set) => ({
     } catch {
       // ignore
     }
+    // Drop the previous user's orgs, messages and open stream; otherwise the
+    // next person to sign in on this tab is routed into the old user's org.
+    useChatStore.getState().reset();
     set({ user: null, loading: false });
   },
 

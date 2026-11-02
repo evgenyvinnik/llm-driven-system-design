@@ -57,6 +57,35 @@
       "name": "06-project-settings",
       "path": "/project/9a000001-0000-0000-0000-000000000001/settings",
       "delay": 2200
+    },
+    {
+      "name": "07-viewer-read-only-sql",
+      "path": "/project/9a000003-0000-0000-0000-000000000003/sql",
+      "delay": 2000,
+      "click": [
+        "text=Close stale pending orders",
+        "button:has-text('Run')"
+      ],
+      "clickDelay": 1500
+    },
+    {
+      "name": "08-project-members",
+      "path": "/project/9a000001-0000-0000-0000-000000000001/settings",
+      "delay": 2000,
+      "click": [
+        "input[placeholder='Username']"
+      ],
+      "clickDelay": 800
+    },
+    {
+      "name": "09-outsider-project-not-found",
+      "path": "/project/9a000001-0000-0000-0000-000000000001/tables",
+      "waitFor": "main",
+      "delay": 1500,
+      "loginAs": {
+        "username": "carol",
+        "password": "password123"
+      }
     }
   ],
   "viewport": {

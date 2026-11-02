@@ -28,7 +28,9 @@ export function ActivityForm({ relatedType, relatedId, onSaved, onCancel }: Acti
         type,
         subject,
         description: description || undefined,
-        dueDate: dueDate || undefined,
+        // datetime-local has no zone; send an ISO instant so the server doesn't
+        // read the user's local time as its own (UTC) time.
+        dueDate: dueDate ? new Date(dueDate).toISOString() : undefined,
         relatedType,
         relatedId,
       });

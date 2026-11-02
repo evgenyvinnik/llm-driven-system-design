@@ -22,6 +22,8 @@ function Dashboard() {
   const navigate = useNavigate();
   const [meetings, setMeetings] = useState<MeetingData[]>([]);
   const [loading, setLoading] = useState(true);
+  const [creating, setCreating] = useState(false);
+  const [createError, setCreateError] = useState('');
 
   useEffect(() => {
     if (!user) return;
@@ -36,6 +38,20 @@ function Dashboard() {
       console.error('Failed to load meetings:', err);
     } finally {
       setLoading(false);
+    }
+  };
+
+  // Disabled while in flight, and keyed so a retried request cannot create a
+  // second meeting (double clicks used to leave orphaned "Instant Meeting"s).
+  const startInstantMeeting = async () => {
+    setCreating(true);
+    setCreateError('');
+    try {
+      const { meeting } = await api.createMeeting({ title: 'Instant Meeting' }, crypto.randomUUID());
+      navigate({ to: '/meeting/$code', params: { code: meeting.meeting_code as string } });
+    } catch (err) {
+      setCreateError((err as Error).message);
+      setCreating(false);
     }
   };
 
@@ -65,15 +81,11 @@ function Dashboard() {
           <h2 className="text-lg font-semibold text-zoom-text mb-3">Start a New Meeting</h2>
           <div className="flex gap-3">
             <button
-              onClick={() => {
-                api.createMeeting({ title: 'Instant Meeting' }).then(({ meeting }) => {
-                  const code = (meeting.meeting_code as string) || '';
-                  navigate({ to: '/meeting/$code', params: { code } });
-                });
-              }}
-              className="flex-1 bg-zoom-primary hover:bg-zoom-hover text-white py-2.5 px-4 rounded-lg font-medium transition-colors"
+              onClick={startInstantMeeting}
+              disabled={creating}
+              className="flex-1 bg-zoom-primary hover:bg-zoom-hover disabled:opacity-50 text-white py-2.5 px-4 rounded-lg font-medium transition-colors"
             >
-              New Meeting
+              {creating ? 'Starting...' : 'New Meeting'}
             </button>
             <button
               onClick={() => navigate({ to: '/schedule' })}
@@ -82,6 +94,7 @@ function Dashboard() {
               Schedule
             </button>
           </div>
+          {createError && <p className="text-zoom-red text-sm mt-2">{createError}</p>}
         </div>
       </div>
 

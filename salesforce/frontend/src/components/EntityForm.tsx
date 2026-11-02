@@ -90,7 +90,7 @@ export function EntityForm({ entityType, onSave, onCancel, accounts }: EntityFor
           {entityType === 'opportunity' && (
             <>
               <FormField label="Name *" value={formData.name} onChange={(v) => handleChange('name', v)} required />
-              <FormField label="Amount ($)" value={formData.amountCents} onChange={(v) => handleChange('amountCents', v)} type="number" placeholder="Amount in cents" />
+              <FormField label="Amount ($)" value={formData.amount} onChange={(v) => handleChange('amount', v)} type="number" placeholder="e.g. 125000" />
               <div>
                 <label className="block text-xs font-medium text-salesforce-secondary mb-1">Stage</label>
                 <select

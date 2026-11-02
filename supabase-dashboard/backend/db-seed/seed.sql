@@ -1,14 +1,23 @@
 -- Seed data for Supabase Dashboard development
--- Users: alice/password123 (admin), bob/password123 (user)
+-- Users: alice/password123 (admin), bob/password123 (user), carol/password123 (user, no projects)
 -- Passwords hashed with bcrypt (10 rounds)
 --
 -- The seeded project points at the `target-postgres` sample database defined in
 -- docker-compose.yml (sample_db on port 5433), so the table browser and SQL
 -- editor have real tables to introspect on first launch.
+--
+-- Roles: alice owns both Storefront projects (bob is an editor on Production);
+-- bob owns Analytics Sandbox, where alice is a viewer (read-only SQL).
+--
+-- db_password is seeded as plaintext; the backend encrypts any plaintext
+-- passwords at startup (services/credentials.ts), so they are only ever
+-- plaintext between seeding and the first boot.
 
 INSERT INTO users (id, username, email, password_hash, display_name, role) VALUES
   ('a1111111-1111-1111-1111-111111111111', 'alice', 'alice@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Alice Nakamura', 'admin'),
-  ('b2222222-2222-2222-2222-222222222222', 'bob', 'bob@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Bob Ellis', 'user')
+  ('b2222222-2222-2222-2222-222222222222', 'bob', 'bob@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Bob Ellis', 'user'),
+  -- Carol belongs to no project: the account that proves other tenants' projects are invisible.
+  ('c3333333-3333-3333-3333-333333333333', 'carol', 'carol@example.com', '$2b$10$BdLsE.kQm5ryFusMBZ8QjOO.qRkLW/.iX7Wt7G3ZP3tGtFhtO1Rpi', 'Carol Diaz', 'user')
 ON CONFLICT (username) DO NOTHING;
 
 -- ---------------------------------------------------------------------------
@@ -53,6 +62,12 @@ ORDER BY revenue_cents DESC;',
 FROM orders
 GROUP BY status
 ORDER BY orders DESC;',
+   'b2222222-2222-2222-2222-222222222222'),
+  -- A write on the viewer's project: alice (viewer) running it sees Postgres refuse it
+  -- inside the READ ONLY transaction. Matches no seeded rows, so running it as bob is harmless.
+  ('5a000005-0000-0000-0000-000000000005', '9a000003-0000-0000-0000-000000000003', 'Close stale pending orders',
+   'UPDATE orders SET status = ''cancelled''
+WHERE status = ''pending'' AND created_at < NOW() - INTERVAL ''90 days'';',
    'b2222222-2222-2222-2222-222222222222')
 ON CONFLICT DO NOTHING;
 

@@ -47,9 +47,10 @@ export function ThreadPanel() {
         <div ref={messagesEndRef} />
       </div>
 
-      {/* Reply input */}
-      {currentChannelId && (
+      {/* Reply input (none under a deleted root: the server refuses those replies) */}
+      {currentChannelId && !parentMessage?.deleted_at && (
         <MessageInput
+          key={threadParentId}
           onSend={sendThreadReply}
           channelId={currentChannelId}
           placeholder="Reply in thread..."

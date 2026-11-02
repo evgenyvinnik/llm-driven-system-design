@@ -1,7 +1,7 @@
 import { create } from 'zustand';
 import type {
   Account, Contact, Opportunity, Lead, Activity,
-  DashboardKPIs, PipelineStage, RevenueByMonth, LeadsBySource,
+  DashboardKPIs, PipelineStage, RevenueByMonth, LeadsBySource, ReportScope,
 } from '../types';
 import {
   dashboardApi, accountsApi, contactsApi, opportunitiesApi,
@@ -30,8 +30,11 @@ interface CrmState {
   opportunities: Opportunity[];
   opportunitiesTotal: number;
   opportunitiesLoading: boolean;
+  /** Last failed stage change (e.g. a rep dragging a closed deal), shown above the board. */
+  opportunitiesError: string | null;
   fetchOpportunities: (params?: { search?: string; stage?: string; accountId?: string; page?: number; limit?: number }) => Promise<void>;
   updateOpportunityStage: (id: string, stage: string) => Promise<void>;
+  clearOpportunitiesError: () => void;
 
   // Leads
   leads: Lead[];
@@ -49,14 +52,45 @@ interface CrmState {
   pipeline: PipelineStage[];
   revenue: RevenueByMonth[];
   leadsBySource: LeadsBySource[];
+  /** Whose records the reports cover, as decided by the server. */
+  reportsScope: ReportScope | null;
   reportsLoading: boolean;
   fetchPipelineReport: (all?: boolean) => Promise<void>;
   fetchRevenueReport: (months?: number, all?: boolean) => Promise<void>;
   fetchLeadsReport: (all?: boolean) => Promise<void>;
+
+  /** Drops every cached record, so the next user in this tab never sees the last one's data. */
+  reset: () => void;
 }
 
+const initialData: Partial<CrmState> = {
+  kpis: null,
+  kpisLoading: false,
+  accounts: [],
+  accountsTotal: 0,
+  accountsLoading: false,
+  contacts: [],
+  contactsTotal: 0,
+  contactsLoading: false,
+  opportunities: [],
+  opportunitiesTotal: 0,
+  opportunitiesLoading: false,
+  opportunitiesError: null,
+  leads: [],
+  leadsTotal: 0,
+  leadsLoading: false,
+  activities: [],
+  activitiesTotal: 0,
+  activitiesLoading: false,
+  pipeline: [],
+  revenue: [],
+  leadsBySource: [],
+  reportsScope: null,
+  reportsLoading: false,
+};
+
 /** Centralized CRM state managing accounts, contacts, opportunities, leads, activities, and reports. */
-export const useCrmStore = create<CrmState>((set) => ({
+export const useCrmStore = create<CrmState>((set, get) => ({
   // Dashboard
   kpis: null,
   kpisLoading: false,
@@ -111,18 +145,33 @@ export const useCrmStore = create<CrmState>((set) => ({
       set({ opportunitiesLoading: false });
     }
   },
+  opportunitiesError: null,
   updateOpportunityStage: async (id, stage) => {
+    const previous = get().opportunities.find((o) => o.id === id);
+    if (!previous || previous.stage === stage) return;
+
+    // Optimistic: the card lands in its new column immediately. The server's
+    // answer (probability, closed_at) then replaces the guess, or the card goes
+    // back where it was with the server's reason. This used to wait for the
+    // response and then re-fetch the whole board, which flashed "Loading
+    // pipeline..." after every drag and silently swallowed refusals.
+    set((state) => ({
+      opportunitiesError: null,
+      opportunities: state.opportunities.map((o) => (o.id === id ? { ...o, stage } : o)),
+    }));
     try {
       const { opportunity } = await opportunitiesApi.updateStage(id, stage);
       set((state) => ({
-        opportunities: state.opportunities.map((o) =>
-          o.id === id ? { ...o, stage: opportunity.stage, probability: opportunity.probability } : o,
-        ),
+        opportunities: state.opportunities.map((o) => (o.id === id ? { ...o, ...opportunity } : o)),
       }));
-    } catch {
-      // re-fetch on error
+    } catch (err) {
+      set((state) => ({
+        opportunitiesError: err instanceof Error ? err.message : 'Stage change failed',
+        opportunities: state.opportunities.map((o) => (o.id === id ? previous : o)),
+      }));
     }
   },
+  clearOpportunitiesError: () => set({ opportunitiesError: null }),
 
   // Leads
   leads: [],
@@ -156,12 +205,13 @@ export const useCrmStore = create<CrmState>((set) => ({
   pipeline: [],
   revenue: [],
   leadsBySource: [],
+  reportsScope: null,
   reportsLoading: false,
   fetchPipelineReport: async (all) => {
     set({ reportsLoading: true });
     try {
-      const { pipeline } = await reportsApi.pipeline(all);
-      set({ pipeline, reportsLoading: false });
+      const { pipeline, scope } = await reportsApi.pipeline(all);
+      set({ pipeline, reportsScope: scope, reportsLoading: false });
     } catch {
       set({ reportsLoading: false });
     }
@@ -184,4 +234,6 @@ export const useCrmStore = create<CrmState>((set) => ({
       set({ reportsLoading: false });
     }
   },
+
+  reset: () => set(initialData),
 }));

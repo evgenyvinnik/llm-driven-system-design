@@ -1,19 +1,20 @@
-import pg from 'pg';
+import type pg from 'pg';
 import { logger } from './logger.js';
 
-interface ConnectionConfig {
-  host: string;
-  port: number;
-  database: string;
-  user: string;
-  password: string;
-}
+/*
+ * Introspection runs on a client checked out from the project's pool (via
+ * queryExecutor.withTargetClient), so it shares the 5-connection cap, the
+ * circuit breaker and the metadata-server guard with every other target query.
+ * Pooled connections see committed DDL immediately; a fresh client per request
+ * bought nothing but an extra connection outside the cap.
+ */
 
 export interface TableInfo {
   tableName: string;
   schema: string;
   columns: ColumnInfo[];
-  rowCount?: number;
+  /** Planner estimate (pg_class.reltuples); null when the table has never been analyzed. */
+  rowCount: number | null;
 }
 
 export interface ColumnInfo {
@@ -33,20 +34,9 @@ export interface IndexInfo {
   indexDef: string;
 }
 
-function buildConnectionString(config: ConnectionConfig): string {
-  return `postgresql://${config.user}:${config.password}@${config.host}:${config.port}/${config.database}`;
-}
-
 /** Introspects all public tables with columns, primary keys, foreign keys, and row count estimates. */
-export async function introspectTables(config: ConnectionConfig): Promise<TableInfo[]> {
-  const client = new pg.Client({
-    connectionString: buildConnectionString(config),
-    connectionTimeoutMillis: 5000,
-  });
-
+export async function introspectTables(client: pg.ClientBase): Promise<TableInfo[]> {
   try {
-    await client.connect();
-
     // Get all user tables
     const tablesResult = await client.query(`
       SELECT table_name, table_schema
@@ -110,13 +100,16 @@ export async function introspectTables(config: ConnectionConfig): Promise<TableI
         fkMap.set(fk.column_name, `${fk.foreign_table_name}.${fk.foreign_column_name}`);
       }
 
-      // Get row count estimate
+      // Get row count estimate (schema-qualified: relname alone can match a same-named relation elsewhere)
       const countResult = await client.query(`
-        SELECT reltuples::bigint AS estimate
-        FROM pg_class
-        WHERE relname = $1
-      `, [tableName]);
-      const rowCount = countResult.rows[0]?.estimate ?? 0;
+        SELECT c.reltuples::bigint AS estimate
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = $1 AND c.relname = $2
+      `, [schema, tableName]);
+      // reltuples is -1 until the table is first vacuumed/analyzed (small seeded tables
+      // never reach autovacuum's threshold); report "unknown" rather than a false 0.
+      const estimate = Number(countResult.rows[0]?.estimate ?? -1);
 
       const columns: ColumnInfo[] = columnsResult.rows.map((col: {
         column_name: string;
@@ -135,40 +128,69 @@ export async function introspectTables(config: ConnectionConfig): Promise<TableI
         ordinalPosition: col.ordinal_position,
       }));
 
-      tables.push({ tableName, schema, columns, rowCount: Math.max(0, Number(rowCount)) });
+      tables.push({ tableName, schema, columns, rowCount: estimate >= 0 ? estimate : null });
     }
 
     return tables;
   } catch (err) {
     logger.error({ err }, 'Schema introspection failed');
     throw err;
-  } finally {
-    await client.end().catch(() => {});
   }
 }
 
 /** Retrieves all indexes for a specific table from pg_indexes. */
-export async function introspectIndexes(config: ConnectionConfig, tableName: string): Promise<IndexInfo[]> {
-  const client = new pg.Client({
-    connectionString: buildConnectionString(config),
-    connectionTimeoutMillis: 5000,
-  });
+export async function introspectIndexes(client: pg.ClientBase, tableName: string): Promise<IndexInfo[]> {
+  const result = await client.query(`
+    SELECT indexname AS index_name, tablename AS table_name, indexdef AS index_def
+    FROM pg_indexes
+    WHERE schemaname = 'public' AND tablename = $1
+    ORDER BY indexname
+  `, [tableName]);
 
-  try {
-    await client.connect();
-    const result = await client.query(`
-      SELECT indexname AS index_name, tablename AS table_name, indexdef AS index_def
-      FROM pg_indexes
-      WHERE schemaname = 'public' AND tablename = $1
-      ORDER BY indexname
-    `, [tableName]);
+  return result.rows.map((r: { index_name: string; table_name: string; index_def: string }) => ({
+    indexName: r.index_name,
+    tableName: r.table_name,
+    indexDef: r.index_def,
+  }));
+}
 
-    return result.rows.map((r: { index_name: string; table_name: string; index_def: string }) => ({
-      indexName: r.index_name,
-      tableName: r.table_name,
-      indexDef: r.index_def,
-    }));
-  } finally {
-    await client.end().catch(() => {});
-  }
+export interface TableKeyInfo {
+  columns: string[];
+  primaryKey: string[];
+}
+
+/**
+ * Columns and primary-key columns of a base table in `public`, or null if there
+ * is no such table. Row edits use this rather than trusting a client-supplied
+ * key column: a non-unique "id" would turn a one-row edit into a mass update.
+ */
+export async function getTableKeyInfo(client: pg.ClientBase, tableName: string): Promise<TableKeyInfo | null> {
+  const result = await client.query(`
+    SELECT
+      c.column_name,
+      EXISTS (
+        SELECT 1
+        FROM information_schema.table_constraints tc
+        JOIN information_schema.key_column_usage kcu
+          ON kcu.constraint_schema = tc.constraint_schema
+          AND kcu.constraint_name = tc.constraint_name
+          AND kcu.table_name = tc.table_name
+        WHERE tc.constraint_type = 'PRIMARY KEY'
+          AND tc.table_schema = c.table_schema
+          AND tc.table_name = c.table_name
+          AND kcu.column_name = c.column_name
+      ) AS is_pk
+    FROM information_schema.tables t
+    JOIN information_schema.columns c
+      ON c.table_schema = t.table_schema AND c.table_name = t.table_name
+    WHERE t.table_schema = 'public' AND t.table_name = $1 AND t.table_type = 'BASE TABLE'
+    ORDER BY c.ordinal_position
+  `, [tableName]);
+
+  if (result.rows.length === 0) return null;
+  const rows = result.rows as { column_name: string; is_pk: boolean }[];
+  return {
+    columns: rows.map((r) => r.column_name),
+    primaryKey: rows.filter((r) => r.is_pk).map((r) => r.column_name),
+  };
 }

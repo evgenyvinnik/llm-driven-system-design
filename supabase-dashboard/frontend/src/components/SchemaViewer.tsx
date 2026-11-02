@@ -14,11 +14,13 @@ export function SchemaViewer({ table, projectId }: SchemaViewerProps) {
         <div>
           <h2 className="text-lg font-semibold text-supabase-text">{table.tableName}</h2>
           <p className="text-sm text-supabase-secondary mt-1">
-            {table.columns.length} columns &middot; ~{table.rowCount ?? 0} rows
+            {table.columns.length} columns &middot;{' '}
+            {table.rowCount != null ? `~${table.rowCount} rows` : 'row count not estimated yet (run ANALYZE)'}
           </p>
         </div>
         <Link
-          to={`/project/${projectId}/tables/${table.tableName}` as string}
+          to="/project/$projectId/tables/$tableName"
+          params={{ projectId, tableName: table.tableName }}
           className="bg-supabase-surface border border-supabase-border hover:border-supabase-primary text-supabase-text px-4 py-2 rounded text-sm transition-colors"
         >
           View Data

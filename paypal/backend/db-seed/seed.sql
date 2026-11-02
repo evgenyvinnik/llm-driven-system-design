@@ -1,79 +1,110 @@
 -- PayPal demo seed data.
 -- All users share the password: password123
 -- (bcrypt hash below is a valid $2b$10 hash of "password123")
+--
+-- Every row has a fixed UUID so re-running the seed is a no-op instead of
+-- duplicating ledger entries. The ledger is complete: each wallet's balance
+-- equals its ledger, every transaction's entries net to zero, and the sum of
+-- customer balances equals platform cash (GET /api/admin/reconciliation).
 
 BEGIN;
 
--- Deterministic UUIDs so ledger/transaction references stay consistent on re-seed.
 INSERT INTO users (id, username, email, password_hash, display_name, role) VALUES
   ('11111111-1111-1111-1111-111111111111', 'alice', 'alice@example.com', '$2b$10$p4U2V5CayiVxVMj8EJJ0peK3viI8RReSnMq3ou4SDoIbTbY4MNez6', 'Alice Johnson', 'user'),
   ('22222222-2222-2222-2222-222222222222', 'bob',   'bob@example.com',   '$2b$10$p4U2V5CayiVxVMj8EJJ0peK3viI8RReSnMq3ou4SDoIbTbY4MNez6', 'Bob Smith',    'user'),
   ('33333333-3333-3333-3333-333333333333', 'carol', 'carol@example.com', '$2b$10$p4U2V5CayiVxVMj8EJJ0peK3viI8RReSnMq3ou4SDoIbTbY4MNez6', 'Carol Williams', 'user'),
   ('44444444-4444-4444-4444-444444444444', 'admin', 'admin@example.com', '$2b$10$p4U2V5CayiVxVMj8EJJ0peK3viI8RReSnMq3ou4SDoIbTbY4MNez6', 'Admin User',   'admin')
-ON CONFLICT (id) DO NOTHING;
+ON CONFLICT DO NOTHING;
 
--- Wallets with starting balances (in cents).
+-- Final balances after the ledger below (in cents).
 INSERT INTO wallets (id, user_id, balance_cents, currency) VALUES
-  ('a1111111-1111-1111-1111-111111111111', '11111111-1111-1111-1111-111111111111', 271750, 'USD'),
-  ('a2222222-2222-2222-2222-222222222222', '22222222-2222-2222-2222-222222222222', 123500, 'USD'),
+  ('a1111111-1111-1111-1111-111111111111', '11111111-1111-1111-1111-111111111111', 260750, 'USD'),
+  ('a2222222-2222-2222-2222-222222222222', '22222222-2222-2222-2222-222222222222', 119500, 'USD'),
   ('a3333333-3333-3333-3333-333333333333', '33333333-3333-3333-3333-333333333333',  94750, 'USD'),
   ('a4444444-4444-4444-4444-444444444444', '44444444-4444-4444-4444-444444444444', 500000, 'USD')
-ON CONFLICT (id) DO NOTHING;
+ON CONFLICT DO NOTHING;
 
 -- Linked funding sources.
-INSERT INTO payment_methods (user_id, type, label, last_four, is_default) VALUES
-  ('11111111-1111-1111-1111-111111111111', 'bank', 'Chase Checking',      '4821', true),
-  ('11111111-1111-1111-1111-111111111111', 'card', 'Visa Debit',          '1195', false),
-  ('22222222-2222-2222-2222-222222222222', 'bank', 'Bank of America',     '7734', true),
-  ('33333333-3333-3333-3333-333333333333', 'card', 'Mastercard',          '9032', true)
+INSERT INTO payment_methods (id, user_id, type, label, last_four, is_default) VALUES
+  ('b0000000-0000-0000-0000-000000000001', '11111111-1111-1111-1111-111111111111', 'bank', 'Chase Checking',  '4821', true),
+  ('b0000000-0000-0000-0000-000000000002', '11111111-1111-1111-1111-111111111111', 'card', 'Visa Debit',      '1195', false),
+  ('b0000000-0000-0000-0000-000000000003', '22222222-2222-2222-2222-222222222222', 'bank', 'Bank of America', '7734', true),
+  ('b0000000-0000-0000-0000-000000000004', '33333333-3333-3333-3333-333333333333', 'card', 'Mastercard',      '9032', true)
 ON CONFLICT DO NOTHING;
 
--- A couple of completed transfers so the activity feed and ledger have content.
-INSERT INTO transactions (id, idempotency_key, sender_id, recipient_id, amount_cents, type, status, note) VALUES
-  ('c1111111-1111-1111-1111-111111111111', 'seed-tx-1', '22222222-2222-2222-2222-222222222222', '11111111-1111-1111-1111-111111111111', 4500, 'transfer', 'completed', 'Dinner split'),
-  ('c2222222-2222-2222-2222-222222222222', 'seed-tx-2', '11111111-1111-1111-1111-111111111111', '33333333-3333-3333-3333-333333333333', 12000, 'transfer', 'completed', 'Concert tickets'),
+-- Business events, oldest first. Deposits have no internal sender; a
+-- withdrawal's sender and recipient are both the account holder.
+INSERT INTO transactions (id, idempotency_key, sender_id, recipient_id, amount_cents, type, status, note, payment_method_id, created_at) VALUES
+  -- Opening balances: money entering the platform like any other deposit.
+  ('c0000000-0000-0000-0000-000000000001', NULL, NULL, '11111111-1111-1111-1111-111111111111', 250000, 'deposit', 'completed', 'Opening balance', 'b0000000-0000-0000-0000-000000000001', NOW() - INTERVAL '30 days'),
+  ('c0000000-0000-0000-0000-000000000002', NULL, NULL, '22222222-2222-2222-2222-222222222222', 120000, 'deposit', 'completed', 'Opening balance', 'b0000000-0000-0000-0000-000000000003', NOW() - INTERVAL '29 days'),
+  ('c0000000-0000-0000-0000-000000000003', NULL, NULL, '33333333-3333-3333-3333-333333333333',  85000, 'deposit', 'completed', 'Opening balance', 'b0000000-0000-0000-0000-000000000004', NOW() - INTERVAL '28 days'),
+  ('c0000000-0000-0000-0000-000000000004', NULL, NULL, '44444444-4444-4444-4444-444444444444', 500000, 'deposit', 'completed', 'Opening balance', NULL,                                   NOW() - INTERVAL '27 days'),
 
-  -- Deposits and withdrawals have no counterparty: `sender_id` is NULL for a
-  -- deposit (money enters from a funding source) and the recipient is the
-  -- account itself for a withdrawal. Without rows of these two types the
-  -- Activity page's Deposits and Withdrawals filters are permanently empty.
-  ('c3333333-3333-3333-3333-333333333333', 'seed-tx-3', NULL, '11111111-1111-1111-1111-111111111111', 50000, 'deposit', 'completed', 'Transfer from Chase Checking'),
-  ('c4444444-4444-4444-4444-444444444444', 'seed-tx-4', NULL, '11111111-1111-1111-1111-111111111111', 20000, 'deposit', 'completed', 'Transfer from Visa Debit'),
-  ('c5555555-5555-5555-5555-555555555555', 'seed-tx-5', '11111111-1111-1111-1111-111111111111', '11111111-1111-1111-1111-111111111111', 35000, 'withdrawal', 'completed', 'Withdrawal to Chase Checking'),
-
-  -- A withdrawal still clearing, so the status badge isn't uniformly green.
-  ('c6666666-6666-6666-6666-666666666666', 'seed-tx-6', '11111111-1111-1111-1111-111111111111', '11111111-1111-1111-1111-111111111111', 15000, 'withdrawal', 'pending', 'Withdrawal to Chase Checking'),
-
-  ('c7777777-7777-7777-7777-777777777777', 'seed-tx-7', '33333333-3333-3333-3333-333333333333', '11111111-1111-1111-1111-111111111111', 2250, 'transfer', 'completed', 'Coffee round'),
-  ('c8888888-8888-8888-8888-888888888888', 'seed-tx-8', '11111111-1111-1111-1111-111111111111', '22222222-2222-2222-2222-222222222222', 8000, 'transfer', 'completed', 'Rent — utilities top-up')
-ON CONFLICT (id) DO NOTHING;
-
--- Double-entry ledger rows mirroring those transfers.
-INSERT INTO ledger_entries (transaction_id, wallet_id, entry_type, amount_cents, balance_after_cents) VALUES
-  ('c1111111-1111-1111-1111-111111111111', 'a2222222-2222-2222-2222-222222222222', 'debit',  4500, 115500),
-  ('c1111111-1111-1111-1111-111111111111', 'a1111111-1111-1111-1111-111111111111', 'credit', 4500, 254500),
-  ('c2222222-2222-2222-2222-222222222222', 'a1111111-1111-1111-1111-111111111111', 'debit', 12000, 242500),
-  ('c2222222-2222-2222-2222-222222222222', 'a3333333-3333-3333-3333-333333333333', 'credit',12000,  97000),
-  -- Deposits credit the wallet with no matching internal debit; withdrawals do
-  -- the reverse. The counterparty is outside the system (a bank), which is why
-  -- these are single-sided here rather than paired like a transfer.
-  ('c3333333-3333-3333-3333-333333333333', 'a1111111-1111-1111-1111-111111111111', 'credit', 50000, 292500),
-  ('c4444444-4444-4444-4444-444444444444', 'a1111111-1111-1111-1111-111111111111', 'credit', 20000, 312500),
-  ('c5555555-5555-5555-5555-555555555555', 'a1111111-1111-1111-1111-111111111111', 'debit',  35000, 277500),
-  ('c7777777-7777-7777-7777-777777777777', 'a3333333-3333-3333-3333-333333333333', 'debit',   2250,  94750),
-  ('c7777777-7777-7777-7777-777777777777', 'a1111111-1111-1111-1111-111111111111', 'credit',  2250, 279750),
-  ('c8888888-8888-8888-8888-888888888888', 'a1111111-1111-1111-1111-111111111111', 'debit',   8000, 271750),
-  ('c8888888-8888-8888-8888-888888888888', 'a2222222-2222-2222-2222-222222222222', 'credit',  8000, 123500)
+  ('c1111111-1111-1111-1111-111111111111', NULL, '22222222-2222-2222-2222-222222222222', '11111111-1111-1111-1111-111111111111',  4500, 'transfer',   'completed', 'Dinner split',                 NULL, NOW() - INTERVAL '20 days'),
+  ('c2222222-2222-2222-2222-222222222222', NULL, '11111111-1111-1111-1111-111111111111', '33333333-3333-3333-3333-333333333333', 12000, 'transfer',   'completed', 'Concert tickets',              NULL, NOW() - INTERVAL '18 days'),
+  ('c3333333-3333-3333-3333-333333333333', NULL, NULL,                                   '11111111-1111-1111-1111-111111111111', 50000, 'deposit',    'completed', 'Transfer from Chase Checking', 'b0000000-0000-0000-0000-000000000001', NOW() - INTERVAL '15 days'),
+  ('c4444444-4444-4444-4444-444444444444', NULL, NULL,                                   '11111111-1111-1111-1111-111111111111', 20000, 'deposit',    'completed', 'Transfer from Visa Debit',     'b0000000-0000-0000-0000-000000000002', NOW() - INTERVAL '12 days'),
+  ('c5555555-5555-5555-5555-555555555555', NULL, '11111111-1111-1111-1111-111111111111', '11111111-1111-1111-1111-111111111111', 35000, 'withdrawal', 'completed', 'Withdrawal to Chase Checking', 'b0000000-0000-0000-0000-000000000001', NOW() - INTERVAL '10 days'),
+  ('c7777777-7777-7777-7777-777777777777', NULL, '33333333-3333-3333-3333-333333333333', '11111111-1111-1111-1111-111111111111',  2250, 'transfer',   'completed', 'Coffee round',                 NULL, NOW() - INTERVAL '6 days'),
+  ('c8888888-8888-8888-8888-888888888888', NULL, '11111111-1111-1111-1111-111111111111', '22222222-2222-2222-2222-222222222222',  8000, 'transfer',   'completed', 'Rent — utilities top-up',      NULL, NOW() - INTERVAL '4 days'),
+  -- Bob paying Alice's "Groceries" request (linked from transfer_requests below).
+  ('c9999999-9999-9999-9999-999999999999', NULL, '22222222-2222-2222-2222-222222222222', '11111111-1111-1111-1111-111111111111',  4000, 'transfer',   'completed', 'Groceries',                    NULL, NOW() - INTERVAL '2 days'),
+  -- A payout still clearing at the bank. The money has already left the
+  -- wallet (it is debited below), so it can't be spent twice meanwhile.
+  ('c6666666-6666-6666-6666-666666666666', NULL, '11111111-1111-1111-1111-111111111111', '11111111-1111-1111-1111-111111111111', 15000, 'withdrawal', 'pending',   'Withdrawal to Chase Checking', 'b0000000-0000-0000-0000-000000000001', NOW() - INTERVAL '1 day')
 ON CONFLICT DO NOTHING;
 
--- An outstanding money request for the activity page.
-INSERT INTO transfer_requests (requester_id, payer_id, amount_cents, note, status) VALUES
-  ('33333333-3333-3333-3333-333333333333', '11111111-1111-1111-1111-111111111111', 3000, 'Utilities share', 'pending'),
-  ('22222222-2222-2222-2222-222222222222', '11111111-1111-1111-1111-111111111111', 6500, 'Taxi to the airport', 'pending'),
-  -- One of each terminal state, so the request lifecycle is visible rather than
-  -- just its pending step.
-  ('11111111-1111-1111-1111-111111111111', '22222222-2222-2222-2222-222222222222', 4000, 'Groceries', 'paid'),
-  ('11111111-1111-1111-1111-111111111111', '33333333-3333-3333-3333-333333333333', 9000, 'Ski trip deposit', 'declined')
+-- Ledger. Customer wallets are credit-normal (balance = credits - debits);
+-- platform cash 0000...0001 is debit-normal (balance = debits - credits).
+-- Deposits debit cash and credit the customer; withdrawals the reverse;
+-- transfers debit the sender and credit the recipient.
+INSERT INTO ledger_entries (id, transaction_id, wallet_id, entry_type, amount_cents, balance_after_cents, created_at) VALUES
+  ('e0000000-0000-0000-0000-000000000001', 'c0000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000001', 'debit',  250000,  250000, NOW() - INTERVAL '30 days'),
+  ('e0000000-0000-0000-0000-000000000002', 'c0000000-0000-0000-0000-000000000001', 'a1111111-1111-1111-1111-111111111111', 'credit', 250000,  250000, NOW() - INTERVAL '30 days'),
+  ('e0000000-0000-0000-0000-000000000003', 'c0000000-0000-0000-0000-000000000002', '00000000-0000-0000-0000-000000000001', 'debit',  120000,  370000, NOW() - INTERVAL '29 days'),
+  ('e0000000-0000-0000-0000-000000000004', 'c0000000-0000-0000-0000-000000000002', 'a2222222-2222-2222-2222-222222222222', 'credit', 120000,  120000, NOW() - INTERVAL '29 days'),
+  ('e0000000-0000-0000-0000-000000000005', 'c0000000-0000-0000-0000-000000000003', '00000000-0000-0000-0000-000000000001', 'debit',   85000,  455000, NOW() - INTERVAL '28 days'),
+  ('e0000000-0000-0000-0000-000000000006', 'c0000000-0000-0000-0000-000000000003', 'a3333333-3333-3333-3333-333333333333', 'credit',  85000,   85000, NOW() - INTERVAL '28 days'),
+  ('e0000000-0000-0000-0000-000000000007', 'c0000000-0000-0000-0000-000000000004', '00000000-0000-0000-0000-000000000001', 'debit',  500000,  955000, NOW() - INTERVAL '27 days'),
+  ('e0000000-0000-0000-0000-000000000008', 'c0000000-0000-0000-0000-000000000004', 'a4444444-4444-4444-4444-444444444444', 'credit', 500000,  500000, NOW() - INTERVAL '27 days'),
+
+  ('e0000000-0000-0000-0000-000000000009', 'c1111111-1111-1111-1111-111111111111', 'a2222222-2222-2222-2222-222222222222', 'debit',    4500,  115500, NOW() - INTERVAL '20 days'),
+  ('e0000000-0000-0000-0000-000000000010', 'c1111111-1111-1111-1111-111111111111', 'a1111111-1111-1111-1111-111111111111', 'credit',   4500,  254500, NOW() - INTERVAL '20 days'),
+  ('e0000000-0000-0000-0000-000000000011', 'c2222222-2222-2222-2222-222222222222', 'a1111111-1111-1111-1111-111111111111', 'debit',   12000,  242500, NOW() - INTERVAL '18 days'),
+  ('e0000000-0000-0000-0000-000000000012', 'c2222222-2222-2222-2222-222222222222', 'a3333333-3333-3333-3333-333333333333', 'credit',  12000,   97000, NOW() - INTERVAL '18 days'),
+  ('e0000000-0000-0000-0000-000000000013', 'c3333333-3333-3333-3333-333333333333', '00000000-0000-0000-0000-000000000001', 'debit',   50000, 1005000, NOW() - INTERVAL '15 days'),
+  ('e0000000-0000-0000-0000-000000000014', 'c3333333-3333-3333-3333-333333333333', 'a1111111-1111-1111-1111-111111111111', 'credit',  50000,  292500, NOW() - INTERVAL '15 days'),
+  ('e0000000-0000-0000-0000-000000000015', 'c4444444-4444-4444-4444-444444444444', '00000000-0000-0000-0000-000000000001', 'debit',   20000, 1025000, NOW() - INTERVAL '12 days'),
+  ('e0000000-0000-0000-0000-000000000016', 'c4444444-4444-4444-4444-444444444444', 'a1111111-1111-1111-1111-111111111111', 'credit',  20000,  312500, NOW() - INTERVAL '12 days'),
+  ('e0000000-0000-0000-0000-000000000017', 'c5555555-5555-5555-5555-555555555555', 'a1111111-1111-1111-1111-111111111111', 'debit',   35000,  277500, NOW() - INTERVAL '10 days'),
+  ('e0000000-0000-0000-0000-000000000018', 'c5555555-5555-5555-5555-555555555555', '00000000-0000-0000-0000-000000000001', 'credit',  35000,  990000, NOW() - INTERVAL '10 days'),
+  ('e0000000-0000-0000-0000-000000000019', 'c7777777-7777-7777-7777-777777777777', 'a3333333-3333-3333-3333-333333333333', 'debit',    2250,   94750, NOW() - INTERVAL '6 days'),
+  ('e0000000-0000-0000-0000-000000000020', 'c7777777-7777-7777-7777-777777777777', 'a1111111-1111-1111-1111-111111111111', 'credit',   2250,  279750, NOW() - INTERVAL '6 days'),
+  ('e0000000-0000-0000-0000-000000000021', 'c8888888-8888-8888-8888-888888888888', 'a1111111-1111-1111-1111-111111111111', 'debit',    8000,  271750, NOW() - INTERVAL '4 days'),
+  ('e0000000-0000-0000-0000-000000000022', 'c8888888-8888-8888-8888-888888888888', 'a2222222-2222-2222-2222-222222222222', 'credit',   8000,  123500, NOW() - INTERVAL '4 days'),
+  ('e0000000-0000-0000-0000-000000000023', 'c9999999-9999-9999-9999-999999999999', 'a2222222-2222-2222-2222-222222222222', 'debit',    4000,  119500, NOW() - INTERVAL '2 days'),
+  ('e0000000-0000-0000-0000-000000000024', 'c9999999-9999-9999-9999-999999999999', 'a1111111-1111-1111-1111-111111111111', 'credit',   4000,  275750, NOW() - INTERVAL '2 days'),
+  ('e0000000-0000-0000-0000-000000000025', 'c6666666-6666-6666-6666-666666666666', 'a1111111-1111-1111-1111-111111111111', 'debit',   15000,  260750, NOW() - INTERVAL '1 day'),
+  ('e0000000-0000-0000-0000-000000000026', 'c6666666-6666-6666-6666-666666666666', '00000000-0000-0000-0000-000000000001', 'credit',  15000,  975000, NOW() - INTERVAL '1 day')
+ON CONFLICT DO NOTHING;
+
+-- Platform cash is derived from its own ledger rather than hard-coded, so a
+-- re-seed after real deposits and withdrawals stays consistent.
+UPDATE wallets
+SET balance_cents = (
+  SELECT COALESCE(SUM(CASE WHEN entry_type = 'debit' THEN amount_cents ELSE -amount_cents END), 0)
+  FROM ledger_entries WHERE wallet_id = '00000000-0000-0000-0000-000000000001'
+)
+WHERE id = '00000000-0000-0000-0000-000000000001';
+
+-- Money requests: two awaiting Alice, plus one of each terminal state so the
+-- lifecycle is visible. The paid one points at the transfer that settled it.
+INSERT INTO transfer_requests (id, requester_id, payer_id, amount_cents, note, status, transaction_id, created_at, updated_at) VALUES
+  ('d0000000-0000-0000-0000-000000000001', '33333333-3333-3333-3333-333333333333', '11111111-1111-1111-1111-111111111111', 3000, 'Utilities share',     'pending',  NULL, NOW() - INTERVAL '3 days', NOW() - INTERVAL '3 days'),
+  ('d0000000-0000-0000-0000-000000000002', '22222222-2222-2222-2222-222222222222', '11111111-1111-1111-1111-111111111111', 6500, 'Taxi to the airport', 'pending',  NULL, NOW() - INTERVAL '1 day',  NOW() - INTERVAL '1 day'),
+  ('d0000000-0000-0000-0000-000000000003', '11111111-1111-1111-1111-111111111111', '22222222-2222-2222-2222-222222222222', 4000, 'Groceries',           'paid',     'c9999999-9999-9999-9999-999999999999', NOW() - INTERVAL '3 days', NOW() - INTERVAL '2 days'),
+  ('d0000000-0000-0000-0000-000000000004', '11111111-1111-1111-1111-111111111111', '33333333-3333-3333-3333-333333333333', 9000, 'Ski trip deposit',    'declined', NULL, NOW() - INTERVAL '5 days', NOW() - INTERVAL '4 days')
 ON CONFLICT DO NOTHING;
 
 COMMIT;

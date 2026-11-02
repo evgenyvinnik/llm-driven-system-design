@@ -9,7 +9,7 @@ const pinoHttp = (pinoHttpModule as any).pinoHttp || (pinoHttpModule as any).def
 import { config } from './config/index.js';
 import { redis } from './services/redis.js';
 import { logger } from './services/logger.js';
-import { register } from './services/metrics.js';
+import { register, httpRequestDuration, httpRequestTotal } from './services/metrics.js';
 import { apiLimiter } from './services/rateLimiter.js';
 import { pool } from './services/db.js';
 import authRoutes from './routes/auth.js';
@@ -36,6 +36,23 @@ app.use(express.json({ limit: '10mb' }));
 if (config.nodeEnv !== 'test') {
   app.use(pinoHttp({ logger }));
 }
+
+// Request metrics. The histogram and counter were registered but nothing ever
+// observed them, so /metrics exported only process defaults. The route label is
+// the matched pattern (/api/accounts/:id), not the raw URL, to keep label
+// cardinality bounded.
+app.use((req, res, next) => {
+  const end = httpRequestDuration.startTimer();
+  res.on('finish', () => {
+    const route = req.route
+      ? `${req.baseUrl}${req.route.path === '/' ? '' : req.route.path}` || '/'
+      : 'unmatched';
+    const labels = { method: req.method, route, status_code: String(res.statusCode) };
+    end(labels);
+    httpRequestTotal.inc(labels);
+  });
+  next();
+});
 
 // Session
 const redisStore = new RedisStore({

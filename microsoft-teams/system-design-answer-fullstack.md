@@ -76,7 +76,7 @@ GET  /api/channels?teamId=xxx    → Channels in team
 POST /api/channels               → Create channel
 
 Messaging:
-GET  /api/messages?channelId=xxx&before=ts&limit=50  → Paginated messages
+GET  /api/messages?channelId=xxx&before=id&limit=50  → Paginated messages + hasMore
 POST /api/messages               → Send message (or thread reply via parentMessageId)
 PUT  /api/messages/:id           → Edit message (owner only)
 DELETE /api/messages/:id         → Delete message (owner only)
@@ -187,7 +187,7 @@ The primary query pattern loads top-level messages (not thread replies) for a ch
 
 - Filter: `WHERE channel_id = $1 AND parent_message_id IS NULL`
 - Sort: `ORDER BY created_at DESC`
-- Pagination: `AND created_at < $2 LIMIT 50` (cursor-based)
+- Pagination: cursor is the oldest loaded message's id, compared server-side as the pair (created_at, id), so ties and microsecond timestamps never skip a message at a page boundary
 - Join: Users table for username, display_name, avatar_url
 - Subquery: `SELECT COUNT(*)` for reply_count per message
 
@@ -203,7 +203,7 @@ Thread view fetches all messages in a thread (parent + replies):
 
 ### Read Tracking
 
-Each channel_member row has a `last_read_at` timestamp. The client calls `POST /api/channels/:id/read` when the user views a channel. Unread counts can be computed by counting messages with `created_at > last_read_at`, though this query needs optimization at scale (denormalize into a counter).
+Each channel_member row has a `last_read_at` timestamp. The channel list returns an unread count per channel: other people's messages after `last_read_at`, served by the (channel_id, created_at) index. The client marks a channel read when it opens it and, debounced, as messages arrive; the server keeps the read position monotonic so reordered requests can't move it backwards. One cheap write per read and a count per channel on sidebar render is right at this scale; at real scale the count would be denormalized into a per-member counter.
 
 ### Membership Cascade
 
@@ -321,6 +321,8 @@ At extreme scale, split write and read models:
 The hierarchy — organization → team → channel → message — is the product's defining structure, and it's also where the worst possible bug lives. Every level has its own membership table, so "can Alice read this" is a question about which memberships she holds, not one check.
 
 **Server side**, the check belongs inside the query rather than in handler code after the fetch. A handler that loads a message and then decides whether the user may see it has already pulled the row across a trust boundary, and every new endpoint is another chance to forget. As a join, the unauthorized row is simply never selected — the default for a newly written query becomes "returns nothing" instead of "returns everything."
+
+Callers get a 404, not a 403, for anything they can't see, so another tenant's IDs can't be probed. Removal reaches open connections too: leaving or being removed publishes a `member_removed` event, and every instance closes that user's streams for the affected channels.
 
 The tempting optimization is to materialize effective permissions per user per channel so reads are one lookup. I'd resist it, because the two failure modes aren't comparable:
 

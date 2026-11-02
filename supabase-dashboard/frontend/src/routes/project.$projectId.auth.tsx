@@ -1,14 +1,16 @@
 import { createFileRoute } from '@tanstack/react-router';
 import { useEffect, useState } from 'react';
-import { useProjectStore } from '../stores/projectStore';
+import { useProjectStore, useProjectRole } from '../stores/projectStore';
 import { AuthUserList } from '../components/AuthUserList';
 import { AuthUserForm } from '../components/AuthUserForm';
 
 function AuthPage() {
   const { projectId } = Route.useParams();
   const { authUsers, authUsersLoading, loadAuthUsers, createAuthUser, updateAuthUser, deleteAuthUser } = useProjectStore();
+  const { canEdit } = useProjectRole();
   const [showForm, setShowForm] = useState(false);
   const [editingUser, setEditingUser] = useState<string | null>(null);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
 
   useEffect(() => {
     loadAuthUsers(projectId);
@@ -25,8 +27,12 @@ function AuthPage() {
   };
 
   const handleDelete = async (userId: string) => {
-    if (confirm('Delete this user? This cannot be undone.')) {
+    if (!confirm('Delete this user? This cannot be undone.')) return;
+    setDeleteError(null);
+    try {
       await deleteAuthUser(projectId, userId);
+    } catch (err) {
+      setDeleteError(err instanceof Error ? err.message : 'Failed to delete user');
     }
   };
 
@@ -39,13 +45,19 @@ function AuthPage() {
             Manage authentication users for this project
           </p>
         </div>
-        <button
-          onClick={() => setShowForm(true)}
-          className="bg-supabase-primary hover:bg-supabase-hover text-black px-4 py-2 rounded-md text-sm font-medium transition-colors"
-        >
-          Add User
-        </button>
+        {canEdit && (
+          <button
+            onClick={() => setShowForm(true)}
+            className="bg-supabase-primary hover:bg-supabase-hover text-black px-4 py-2 rounded-md text-sm font-medium transition-colors"
+          >
+            Add User
+          </button>
+        )}
       </div>
+
+      {deleteError && (
+        <div className="mb-4 bg-red-500/10 border border-red-500/20 text-red-400 px-4 py-2 rounded text-sm">{deleteError}</div>
+      )}
 
       {showForm && (
         <div className="mb-6">
@@ -72,8 +84,8 @@ function AuthPage() {
       <AuthUserList
         users={authUsers}
         loading={authUsersLoading}
-        onEdit={setEditingUser}
-        onDelete={handleDelete}
+        onEdit={canEdit ? setEditingUser : undefined}
+        onDelete={canEdit ? handleDelete : undefined}
       />
     </div>
   );

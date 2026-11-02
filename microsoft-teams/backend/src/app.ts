@@ -95,3 +95,24 @@ app.use('/api/files', fileRoutes);
 app.use('/api/presence', presenceRoutes);
 app.use('/api/sse', sseRoutes);
 app.use('/api/users', userRoutes);
+
+// Errors raised by middleware rather than route handlers. Without this,
+// Express's default handler answered a malformed JSON body or an oversized
+// upload with an HTML 500 page.
+app.use((err: unknown, _req: express.Request, res: express.Response, next: express.NextFunction) => {
+  if (res.headersSent) {
+    next(err);
+    return;
+  }
+  const e = err as { type?: string; code?: string };
+  if (e.type === 'entity.parse.failed') {
+    res.status(400).json({ error: 'Malformed JSON body' });
+    return;
+  }
+  if (e.code === 'LIMIT_FILE_SIZE') {
+    res.status(413).json({ error: 'File too large (max 50MB)' });
+    return;
+  }
+  logger.error({ err }, 'Unhandled error');
+  res.status(500).json({ error: 'Internal server error' });
+});

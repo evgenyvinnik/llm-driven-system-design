@@ -8,7 +8,7 @@ function ReportsPage() {
   const user = useAuthStore((s) => s.user);
   const navigate = useNavigate();
   const {
-    pipeline, revenue, leadsBySource, reportsLoading,
+    pipeline, revenue, leadsBySource, reportsScope, reportsLoading,
     fetchPipelineReport, fetchRevenueReport, fetchLeadsReport,
   } = useCrmStore();
 
@@ -26,7 +26,15 @@ function ReportsPage() {
 
   return (
     <div className="p-6">
-      <h2 className="text-xl font-semibold text-salesforce-text mb-4">Reports</h2>
+      <div className="mb-4">
+        <h2 className="text-xl font-semibold text-salesforce-text">Reports</h2>
+        {/* The server decides the scope: org-wide for admins, own records for reps. */}
+        {reportsScope && (
+          <p className="text-sm text-salesforce-secondary" data-testid="report-scope">
+            {reportsScope === 'org' ? 'All records across the organization' : 'Records you own'}
+          </p>
+        )}
+      </div>
 
       {reportsLoading ? (
         <div className="text-center py-8 text-salesforce-secondary">Loading reports...</div>
