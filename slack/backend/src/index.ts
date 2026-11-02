@@ -51,8 +51,9 @@ app.use(cors({
 app.use(express.json());
 app.use(cookieParser());
 
-// Session configuration with Redis store
-app.use(session({
+// Session configuration with Redis store. Kept as a named middleware so the
+// WebSocket upgrade can resolve the same session the REST API reads.
+const sessionMiddleware = session({
   store: new RedisStore({ client: redis }),
   secret: process.env.SESSION_SECRET || 'your-session-secret',
   resave: false,
@@ -63,7 +64,8 @@ app.use(session({
     maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
     sameSite: 'lax',
   },
-}));
+});
+app.use(sessionMiddleware);
 
 /**
  * Request logging and metrics middleware.
@@ -259,8 +261,8 @@ app.use((err: Error, req: express.Request, res: express.Response, _next: express
 // Server Startup
 // ============================================================================
 
-// Setup WebSocket
-setupWebSocket(server);
+// Setup WebSocket (identity comes from the session cookie on the upgrade)
+setupWebSocket(server, sessionMiddleware);
 
 /**
  * Initializes all services and starts the HTTP server.

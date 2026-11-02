@@ -5,8 +5,9 @@
  */
 
 import { WebSocketServer, WebSocket } from 'ws';
-import { Server } from 'http';
-import { parse } from 'url';
+import type { IncomingMessage, Server } from 'http';
+import type { Duplex } from 'stream';
+import type { Request, RequestHandler, Response } from 'express';
 import { createSubscriber, setPresence, removePresence, setTyping, publishToUser } from './redis.js';
 import { query } from '../db/index.js';
 import type Redis from 'ioredis';
@@ -31,14 +32,36 @@ interface ExtendedWebSocket extends WebSocket {
  */
 const clients = new Map<string, Set<ExtendedWebSocket>>();
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 /**
  * Sets up the WebSocket server on the provided HTTP server.
  * Handles connection authentication, heartbeat monitoring, message routing,
  * and presence updates. Each user subscribes to their own Redis pub/sub channel.
+ *
+ * Identity comes from the Express session cookie on the upgrade request,
+ * resolved by the same session middleware the REST API uses. A `userId` in the
+ * query string is ignored; sockets without a session are refused with 401.
  * @param server - The HTTP server to attach the WebSocket server to
+ * @param sessionMiddleware - The express-session middleware instance used by the REST API
  */
-export function setupWebSocket(server: Server): void {
-  const wss = new WebSocketServer({ server, path: '/ws' });
+export function setupWebSocket(server: Server, sessionMiddleware: RequestHandler): void {
+  const wss = new WebSocketServer({ noServer: true });
+
+  server.on('upgrade', (req: IncomingMessage, socket: Duplex, head: Buffer) => {
+    if (new URL(req.url ?? '/', 'http://localhost').pathname !== '/ws') {
+      socket.destroy();
+      return;
+    }
+    sessionMiddleware(req as Request, {} as Response, () => {
+      if (!(req as Request).session?.userId) {
+        socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+        socket.destroy();
+        return;
+      }
+      wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
+    });
+  });
 
   // Heartbeat interval
   const heartbeatInterval = setInterval(() => {
@@ -62,12 +85,15 @@ export function setupWebSocket(server: Server): void {
       ws.isAlive = true;
     });
 
-    // Parse query params for auth
-    const { query: queryParams } = parse(req.url || '', true);
-    const { userId, workspaceId } = queryParams as { userId?: string; workspaceId?: string };
+    // The user is the session's; only the workspace is chosen by the client
+    // (falling back to the session's selected workspace), and it is checked below.
+    const session = (req as Request).session;
+    const userId = session.userId;
+    const workspaceId =
+      new URL(req.url ?? '/', 'http://localhost').searchParams.get('workspaceId') || session.workspaceId;
 
-    if (!userId || !workspaceId) {
-      ws.close(1008, 'Missing userId or workspaceId');
+    if (!userId || !workspaceId || !UUID_RE.test(workspaceId)) {
+      ws.close(1008, 'Missing or invalid workspaceId');
       return;
     }
 
@@ -166,16 +192,22 @@ async function handleClientMessage(ws: ExtendedWebSocket, message: { type: strin
 
     case 'typing':
       if (ws.userId && typeof payload === 'object' && payload !== null) {
-        const { channelId } = payload as { channelId: string };
-        if (channelId) {
-          await setTyping(channelId, ws.userId);
-          // Broadcast typing indicator to channel members
+        const { channelId } = payload as { channelId?: unknown };
+        if (typeof channelId === 'string' && UUID_RE.test(channelId)) {
+          // Same rule as sending a message: only channel members may type in it.
           const members = await query<{ user_id: string }>(
-            'SELECT user_id FROM channel_members WHERE channel_id = $1 AND user_id != $2',
-            [channelId, ws.userId]
+            'SELECT user_id FROM channel_members WHERE channel_id = $1',
+            [channelId]
           );
+          if (!members.rows.some((member) => member.user_id === ws.userId)) {
+            ws.send(JSON.stringify({ type: 'error', payload: { message: 'Not a member of this channel', channelId } }));
+            break;
+          }
 
+          await setTyping(channelId, ws.userId);
+          // Broadcast typing indicator to the other channel members
           for (const member of members.rows) {
+            if (member.user_id === ws.userId) continue;
             await publishToUser(member.user_id, {
               type: 'typing',
               payload: { channelId, userId: ws.userId },

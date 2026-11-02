@@ -13,7 +13,10 @@ import type { WSMessage, Message } from '../types';
  * Automatically reconnects on disconnection after 3 seconds.
  * Dispatches incoming messages to the appropriate stores for state updates.
  *
- * @param userId - The authenticated user's ID. If undefined, no connection is made.
+ * The server identifies the user from the session cookie sent with the upgrade
+ * request, so only the workspace goes in the URL.
+ *
+ * @param userId - The authenticated user's ID. If undefined (logged out), no connection is made.
  * @param workspaceId - The workspace to connect to. If undefined, no connection is made.
  * @returns Object containing sendTyping function for typing indicator broadcasts
  */
@@ -33,7 +36,7 @@ export function useWebSocket(userId: string | undefined, workspaceId: string | u
     if (!userId || !workspaceId) return;
 
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.host}/ws?userId=${userId}&workspaceId=${workspaceId}`;
+    const wsUrl = `${protocol}//${window.location.host}/ws?workspaceId=${encodeURIComponent(workspaceId)}`;
 
     const ws = new WebSocket(wsUrl);
     wsRef.current = ws;
