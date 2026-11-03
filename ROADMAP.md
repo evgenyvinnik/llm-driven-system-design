@@ -36,7 +36,7 @@ Sources surveyed: Glassdoor, Aced (formerly Exponent) and Hello Interview.
 | 1 | [Prompt Playground](#1-prompt-playground) ✅ Built | [`prompt-playground/`](./prompt-playground/) | 1 | OpenAI (candidate report); OpenAI, Anthropic (community) | mcplator |
 | 2 | [ChatGPT](#2-chatgpt) | `chatgpt/` | 1 | OpenAI (community) | imessage, mcplator |
 | 3 | [Settings Service](#3-settings-service) | `settings-service/` | 1 | OpenAI (candidate report) | — |
-| 4 | [LLM Chat Analytics](#4-llm-chat-analytics) | `llm-chat-analytics/` | 1 | Anthropic (community) | ad-click-aggregator, dashboarding |
+| 4 | [LLM Chat Analytics](#4-llm-chat-analytics) ✅ Built | [`llm-chat-analytics/`](./llm-chat-analytics/) | 1 | Anthropic (community) | ad-click-aggregator, dashboarding |
 | 5 | [LLM Inference API](#5-llm-inference-api) | `llm-inference-api/` | 1 | Anthropic (candidate reports, including batching and routing variants) | rate-limiter, scalable-api |
 | 6 | [Webhook Platform](#6-webhook-platform) | `webhook-platform/` | 1 | OpenAI (community) | payment-system, stripe |
 | 7 | [Workspace Permissions](#7-workspace-permissions) | `workspace-permissions/` | 2 | Practice extension | notion, google-docs |
@@ -188,6 +188,8 @@ Each answer should also walk through **one successful and one failed execution t
 ### 4. LLM Chat Analytics
 
 **Folder:** `llm-chat-analytics/` · **Signal:** Anthropic (community attribution)
+
+**Status:** ✅ Built. See [llm-chat-analytics/](./llm-chat-analytics/) and its [architecture.md](./llm-chat-analytics/architecture.md). The entry below is kept as the original brief; the build also covers comparison periods, drill-down, rapid filter changes, role-gated metrics, background exports and the backfill follow-up.
 
 **Problem.** Near-real-time dashboards for an AI chat product: active users, conversation activity, response latency, error rates, token usage and adoption of product features.
 

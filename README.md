@@ -162,6 +162,7 @@ Each folder contains an independent implementation of a system design problem.
 | [Scale AI](./scale-ai/) | Data labeling with crowdsourced drawing collection | ✅ Implemented |
 | [Health Data Pipeline](./health-data-pipeline/) | Multi-device health data aggregation | ✅ Implemented |
 | [Prompt Playground](./prompt-playground/) | Versioned prompts, streamed runs, side-by-side comparisons, and share links over a model API | ✅ Implemented |
+| [LLM Chat Analytics](./llm-chat-analytics/) | Near-real-time chat usage, latency and cost dashboards: dedup, late data with watermarks, org-local days, drill-down, role-gated metrics | ✅ Implemented |
 
 ### Infrastructure & System Components
 
@@ -201,7 +202,6 @@ The next round, focused on AI products and developer platforms. See [ROADMAP.md]
 |---------|-------------|--------|
 | [ChatGPT](./ROADMAP.md#2-chatgpt) | Streaming assistant with branching history, cancellation, and multi-device sync | 📋 Planned |
 | [Settings Service](./ROADMAP.md#3-settings-service) | Backend for an existing preferences UI: precise APIs, concurrency, and org policies | 📋 Planned |
-| [LLM Chat Analytics](./ROADMAP.md#4-llm-chat-analytics) | Near-real-time usage, latency, and token dashboards with late-data handling | 📋 Planned |
 | [LLM Inference API](./ROADMAP.md#5-llm-inference-api) | Multi-tenant model API with admission control, batching, and backend routing | 📋 Planned |
 | [Webhook Platform](./ROADMAP.md#6-webhook-platform) | Signed, retried, replayable HTTP event delivery with per-endpoint isolation | 📋 Planned |
 | [Workspace Permissions](./ROADMAP.md#7-workspace-permissions) | Organizations, roles, invitations, and revocable share links | 📋 Planned |

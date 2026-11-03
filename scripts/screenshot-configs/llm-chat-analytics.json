@@ -1,0 +1,37 @@
+{
+  "name": "llm-chat-analytics",
+  "frontendPort": 5173,
+  "backendRequired": true,
+  "dbName": "chat_analytics",
+  "dbUser": "analytics",
+  "auth": {
+    "enabled": true,
+    "loginUrl": "/login",
+    "credentials": { "username": "alice", "password": "password123" },
+    "usernameSelector": "input[name='username']",
+    "passwordSelector": "input[name='password']",
+    "submitSelector": "button[type='submit']",
+    "successIndicator": "main"
+  },
+  "screens": [
+    { "name": "01-login", "path": "/login", "waitFor": "form", "skipAuth": true, "delay": 500 },
+    { "name": "02-dashboard", "path": "/?org=larkspur", "waitFor": "[data-testid='trend'][data-state='ready']", "delay": 1500, "fullPage": true },
+    {
+      "name": "03-drilldown",
+      "path": "/?org=larkspur",
+      "waitFor": "[data-testid='trend'][data-state='ready']",
+      "steps": [{ "click": "[data-testid='trend'] rect[data-bucket]", "nth": 3, "delay": 2500 }],
+      "delay": 800,
+      "fullPage": true
+    },
+    { "name": "04-cross-filter", "path": "/?org=larkspur&models=orion-large&features=code_execution&metric=messages", "waitFor": "[data-testid='trend'][data-state='ready']", "delay": 1500, "fullPage": true },
+    { "name": "05-not-collected", "path": "/?org=larkspur&range=28d&metric=abandon_rate", "waitFor": "[data-testid='trend'][data-state='ready']", "delay": 1500 },
+    { "name": "06-backfill-pending", "path": "/?org=larkspur&range=28d&metric=tokens_per_response", "waitFor": "[data-testid='trend'][data-state='ready']", "delay": 1500 },
+    { "name": "07-small-cohorts", "path": "/?org=larkspur&range=24h&models=orion-think&features=image_input&metric=messages", "waitFor": "[data-testid='trend'][data-state='ready']", "delay": 1500, "fullPage": true },
+    { "name": "08-kestrel-analyst-today", "path": "/?org=kestrel&range=today", "waitFor": "[data-testid='trend'][data-state='ready']", "delay": 1500, "fullPage": true },
+    { "name": "09-definitions", "path": "/definitions", "waitFor": "[data-testid='definitions']", "delay": 800, "fullPage": true },
+    { "name": "10-pipeline", "path": "/pipeline", "waitFor": "[data-testid='pipeline']", "delay": 1500, "fullPage": true },
+    { "name": "11-exports", "path": "/exports", "waitFor": "[data-testid='exports']", "delay": 800 }
+  ],
+  "viewport": { "width": 1440, "height": 900 }
+}
