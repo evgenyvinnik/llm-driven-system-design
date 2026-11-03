@@ -6,7 +6,7 @@ import * as orderService from '../services/orderService.js';
 const router = Router();
 
 // POST /api/v1/orders - Place a new order
-/** POST /api/v1/orders - Places a market or limit order with idempotency support. */
+/** POST /api/v1/orders - Places a market, limit, or stop order with idempotency support. */
 router.post('/', requireAuth, orderLimiter, async (req: Request, res: Response) => {
   try {
     const userId = req.session.userId!;
@@ -32,17 +32,22 @@ router.post('/', requireAuth, orderLimiter, async (req: Request, res: Response) 
       tradingPairId,
       side,
       orderType,
-      quantity: quantity.toString(),
-      price: price?.toString(),
-      stopPrice: stopPrice?.toString(),
+      quantity: String(quantity),
+      price: price === undefined || price === null ? undefined : String(price),
+      stopPrice: stopPrice === undefined || stopPrice === null ? undefined : String(stopPrice),
       idempotencyKey,
     });
 
     res.status(201).json({ order: result });
   } catch (error) {
-    const message = error instanceof Error ? error.message : 'Failed to place order';
-    const status = message.includes('Insufficient') ? 400 : 500;
-    res.status(status).json({ error: message });
+    if (error instanceof orderService.OrderError) {
+      res.status(error.status).json({ error: error.message });
+      return;
+    }
+    // Anything else is ours (a database or invariant failure), not the client's;
+    // log the detail and keep internals out of the response.
+    console.error('Place order error:', error);
+    res.status(500).json({ error: 'Failed to place order' });
   }
 });
 

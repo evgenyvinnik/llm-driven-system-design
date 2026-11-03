@@ -1,4 +1,4 @@
-import { query } from '../db.js';
+import { query, getClient } from '../db.js';
 import redisClient from '../redis.js';
 import { v4 as uuidv4 } from 'uuid';
 import bcrypt from 'bcrypt';
@@ -114,19 +114,20 @@ export async function getUserByEmail(email: string): Promise<User | null> {
   return (result.rows[0] as User) || null;
 }
 
+// Self-registration always creates a customer. Other roles are reached only
+// through the onboarding functions below, and no HTTP path creates an admin.
 export async function createUser(
   email: string,
   password: string,
   name: string,
-  phone?: string,
-  role: string = 'customer'
+  phone?: string
 ): Promise<User> {
   const passwordHash = await bcrypt.hash(password, 10);
   const result = await query(
     `INSERT INTO users (email, password_hash, name, phone, role)
-     VALUES ($1, $2, $3, $4, $5)
+     VALUES ($1, $2, $3, $4, 'customer')
      RETURNING id, email, name, phone, role, created_at`,
-    [email, passwordHash, name, phone, role]
+    [email, passwordHash, name, phone]
   );
   return result.rows[0] as User;
 }
@@ -147,17 +148,52 @@ export async function getDriverByUserId(userId: number): Promise<Driver | null> 
   return (result.rows[0] as Driver) || null;
 }
 
-// Create driver profile
-export async function createDriverProfile(
+// Customer -> driver onboarding: creates the driver profile and switches the role
+// in one transaction. Only customers qualify (plus drivers left without a profile
+// by the old signup form), so restaurant owners and admins never lose their role.
+// Returns null when the user's role does not qualify.
+export async function onboardDriver(
   userId: number,
   vehicleType: string,
   licensePlate?: string
-): Promise<Driver> {
+): Promise<{ user: User; driver: Driver } | null> {
+  const client = await getClient();
+  try {
+    await client.query('BEGIN');
+    const userResult = await client.query(
+      `UPDATE users SET role = 'driver', updated_at = NOW()
+       WHERE id = $1 AND role IN ('customer', 'driver')
+       RETURNING id, email, name, phone, role, created_at`,
+      [userId]
+    );
+    if (userResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return null;
+    }
+    const driverResult = await client.query(
+      `INSERT INTO drivers (user_id, vehicle_type, license_plate)
+       VALUES ($1, $2, $3)
+       RETURNING *`,
+      [userId, vehicleType, licensePlate]
+    );
+    await client.query('COMMIT');
+    return { user: userResult.rows[0] as User, driver: driverResult.rows[0] as Driver };
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+// Customer -> restaurant owner onboarding. Returns null unless the user is
+// currently a customer.
+export async function onboardRestaurantOwner(userId: number): Promise<User | null> {
   const result = await query(
-    `INSERT INTO drivers (user_id, vehicle_type, license_plate)
-     VALUES ($1, $2, $3)
-     RETURNING *`,
-    [userId, vehicleType, licensePlate]
+    `UPDATE users SET role = 'restaurant_owner', updated_at = NOW()
+     WHERE id = $1 AND role = 'customer'
+     RETURNING id, email, name, phone, role, created_at`,
+    [userId]
   );
-  return result.rows[0] as Driver;
+  return (result.rows[0] as User) || null;
 }

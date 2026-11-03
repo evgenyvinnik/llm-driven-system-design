@@ -36,8 +36,11 @@ import notificationsRouter from "./routes/notifications.js";
 import feedbackRouter from "./routes/feedback.js";
 import adminRouter from "./routes/admin.js";
 
-import { pushService } from "./services/pushService.js";
+import { pushService, DEVICE_NOT_IN_SCOPE } from "./services/pushService.js";
+import { tokenRegistry } from "./services/tokenRegistry.js";
 import { WSMessage, WSConnect, WSAck } from "./types/index.js";
+import { validateDeviceToken } from "./utils/index.js";
+import { requireProvider, allowedBundleIds } from "./shared/auth.js";
 
 // Import shared modules
 import {
@@ -132,14 +135,17 @@ app.use("/api/v1/admin", adminRouter);
  * Mimics the real APNs HTTP/2 endpoint format.
  * Reads priority and expiration from custom headers.
  * Supports idempotency via apns-id header.
+ * Requires `authorization: bearer <provider JWT>` (or an admin session); the
+ * device must belong to an app the provider key covers.
  *
  * @route POST /3/device/:deviceToken
+ * @header authorization - bearer provider JWT
  * @header apns-id - Optional idempotency key (notification ID)
  * @header apns-priority - Notification priority (1, 5, or 10)
  * @header apns-expiration - Unix timestamp expiration
  * @header apns-collapse-id - Collapse ID for deduplication
  */
-app.post("/3/device/:deviceToken", async (req: Request, res: Response) => {
+app.post("/3/device/:deviceToken", requireProvider("apns"), async (req: Request, res: Response) => {
   try {
     const { deviceToken } = req.params;
     const payload = req.body;
@@ -154,6 +160,7 @@ app.post("/3/device/:deviceToken", async (req: Request, res: Response) => {
       expiration: expiration > 0 ? expiration : undefined,
       collapseId,
       idempotencyKey: apnsId,
+      allowedBundleIds: allowedBundleIds(req.principal),
     });
 
     res.setHeader("apns-id", result.notification_id);
@@ -163,6 +170,10 @@ app.post("/3/device/:deviceToken", async (req: Request, res: Response) => {
 
     if (errorMessage === "Unregistered device token") {
       return res.status(410).json({ reason: "Unregistered" });
+    }
+
+    if (errorMessage === DEVICE_NOT_IN_SCOPE) {
+      return res.status(400).json({ reason: "DeviceTokenNotForTopic" });
     }
 
     logger.error({
@@ -215,17 +226,53 @@ const wss = new WebSocketServer({ server, path: "/ws" });
 /** Map of connected devices: deviceId -> WebSocket */
 const deviceConnections = new Map<string, WebSocket>();
 
+/** A socket that has not authenticated within this window is closed. */
+const DEVICE_AUTH_TIMEOUT_MS = 10_000;
+
+/** Close code for a socket that failed or skipped device authentication. */
+const WS_CLOSE_UNAUTHORIZED = 4401;
+
+/** Close code for an older socket replaced by a newer one for the same device. */
+const WS_CLOSE_REPLACED = 4409;
+
 /**
  * Handle new WebSocket connections.
- * Devices send a 'connect' message with their device_id to register.
+ *
+ * A device authenticates by sending `{type: "connect", device_token}` with its
+ * raw 64-hex token. The token is resolved through the token registry (which
+ * stores only its hash), so knowing a device's UUID is not enough to receive
+ * its notifications. Until that succeeds the socket can do nothing else; it
+ * is closed after DEVICE_AUTH_TIMEOUT_MS or on a bad token. Acks are accepted
+ * only for notifications addressed to the authenticated device.
+ *
  * Server delivers pending notifications upon connection.
  * Tracks connection metrics for monitoring.
  */
 wss.on("connection", (ws: WebSocket) => {
+  /** Set only after the device token has been verified */
   let deviceId: string | null = null;
+  /** Guards against a second connect racing the first one's token lookup */
+  let authenticating = false;
 
   logger.info({ event: "websocket_client_connected" });
   connectionEvents.inc({ event: "connect" });
+
+  const authTimer = setTimeout(() => {
+    if (!deviceId) {
+      ws.close(WS_CLOSE_UNAUTHORIZED, "Authentication timeout");
+    }
+  }, DEVICE_AUTH_TIMEOUT_MS);
+
+  const sendError = (error: string, message: string) => {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "error", error, message }));
+    }
+  };
+
+  const rejectConnect = (error: string, message: string) => {
+    sendError(error, message);
+    ws.close(WS_CLOSE_UNAUTHORIZED, error);
+  };
 
   ws.on("message", async (data: Buffer) => {
     try {
@@ -233,39 +280,88 @@ wss.on("connection", (ws: WebSocket) => {
 
       switch (message.type) {
         case "connect": {
-          const connectMsg = message as WSConnect;
-          deviceId = connectMsg.device_id;
+          if (deviceId || authenticating) {
+            sendError("AlreadyConnected", "This socket has already sent connect");
+            break;
+          }
 
-          if (deviceId) {
-            deviceConnections.set(deviceId, ws);
-            await setDeviceConnected(deviceId, SERVER_ID);
-
-            // Update active connections gauge
-            activeConnections.set(deviceConnections.size);
-
-            // Deliver pending notifications
-            const deliveredCount = await pushService.deliverPendingToDevice(deviceId);
-
-            ws.send(
-              JSON.stringify({
-                type: "connected",
-                device_id: deviceId,
-                pending_delivered: deliveredCount,
-              })
+          const { device_token: deviceToken } = message as WSConnect;
+          if (typeof deviceToken !== "string" || !validateDeviceToken(deviceToken)) {
+            rejectConnect(
+              "InvalidToken",
+              "connect requires device_token, the device's raw 64-character hex token"
             );
+            break;
+          }
 
-            logger.info({
-              event: "device_connected",
+          authenticating = true;
+          const device = await tokenRegistry.lookup(deviceToken);
+          authenticating = false;
+
+          if (!device) {
+            rejectConnect("Unregistered", "Device token is not registered or has been invalidated");
+            break;
+          }
+
+          // The client may have gone away while the lookup was in flight
+          if (ws.readyState !== WebSocket.OPEN) {
+            break;
+          }
+
+          clearTimeout(authTimer);
+          deviceId = device.device_id;
+
+          // One live connection per device: a newer socket replaces an older one
+          const previous = deviceConnections.get(deviceId);
+          deviceConnections.set(deviceId, ws);
+          if (previous && previous !== ws) {
+            previous.close(WS_CLOSE_REPLACED, "Replaced by a newer connection");
+          }
+          await setDeviceConnected(deviceId, SERVER_ID);
+
+          // Update active connections gauge
+          activeConnections.set(deviceConnections.size);
+
+          // Deliver pending notifications
+          const deliveredCount = await pushService.deliverPendingToDevice(deviceId);
+
+          ws.send(
+            JSON.stringify({
+              type: "connected",
               device_id: deviceId,
               pending_delivered: deliveredCount,
-            });
-          }
+            })
+          );
+
+          logger.info({
+            event: "device_connected",
+            device_id: deviceId,
+            pending_delivered: deliveredCount,
+          });
           break;
         }
 
         case "ack": {
+          if (!deviceId) {
+            sendError("Unauthenticated", "Send connect with device_token first");
+            break;
+          }
+
           const ackMsg = message as WSAck;
-          await pushService.markDelivered(ackMsg.notification_id);
+          const acknowledged =
+            typeof ackMsg.notification_id === "string" &&
+            (await pushService.markDelivered(ackMsg.notification_id, deviceId));
+
+          if (!acknowledged) {
+            sendError("UnknownNotification", "No notification with that ID for this device");
+            logger.warn({
+              event: "ack_rejected",
+              device_id: deviceId,
+              notification_id: ackMsg.notification_id,
+            });
+            break;
+          }
+
           logger.debug({
             event: "notification_acknowledged",
             notification_id: ackMsg.notification_id,
@@ -277,6 +373,8 @@ wss.on("connection", (ws: WebSocket) => {
           logger.warn({ event: "unknown_message_type", type: message.type });
       }
     } catch (error) {
+      authenticating = false;
+      sendError("BadMessage", "Message could not be processed");
       logger.error({
         event: "websocket_message_error",
         error: (error as Error).message,
@@ -285,12 +383,17 @@ wss.on("connection", (ws: WebSocket) => {
   });
 
   ws.on("close", async () => {
-    if (deviceId) {
-      deviceConnections.delete(deviceId);
-      await removeDeviceConnection(deviceId);
+    clearTimeout(authTimer);
 
-      // Update active connections gauge
-      activeConnections.set(deviceConnections.size);
+    if (deviceId) {
+      // A replaced socket must not erase the newer connection's route
+      if (deviceConnections.get(deviceId) === ws) {
+        deviceConnections.delete(deviceId);
+        await removeDeviceConnection(deviceId);
+
+        // Update active connections gauge
+        activeConnections.set(deviceConnections.size);
+      }
       connectionEvents.inc({ event: "disconnect" });
 
       logger.info({ event: "device_disconnected", device_id: deviceId });

@@ -6,12 +6,56 @@ import { authLimiter } from '../services/rateLimiter.js';
 
 const router = Router();
 
+const USERNAME_RE = /^[a-zA-Z0-9_.-]{3,30}$/;
+
+/**
+ * Issues a fresh session id at login: keeping the pre-login id would let anyone
+ * who planted or observed it (session fixation) ride the authenticated session.
+ */
+function startSession(req: Request, userId: string, username: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    req.session.regenerate((err) => {
+      if (err) return reject(err);
+      req.session.userId = userId;
+      req.session.username = username;
+      req.session.save((saveErr) => (saveErr ? reject(saveErr) : resolve()));
+    });
+  });
+}
+
+function toUserDto(row: { id: string; username: string; email: string; display_name: string | null; created_at: string }) {
+  return {
+    id: row.id,
+    username: row.username,
+    email: row.email,
+    displayName: row.display_name || row.username,
+    createdAt: row.created_at,
+  };
+}
+
 router.post('/register', authLimiter, async (req: Request, res: Response) => {
   try {
     const { username, email, password, displayName } = req.body;
 
     if (!username || !email || !password) {
       res.status(400).json({ error: 'Username, email, and password are required' });
+      return;
+    }
+    // Bound every field to its column so bad input is a 400, not a database error.
+    if (typeof username !== 'string' || !USERNAME_RE.test(username)) {
+      res.status(400).json({ error: 'Username must be 3-30 letters, digits, dots, dashes or underscores' });
+      return;
+    }
+    if (typeof email !== 'string' || email.length > 255 || !/^[^\s@]+@[^\s@]+$/.test(email)) {
+      res.status(400).json({ error: 'A valid email is required' });
+      return;
+    }
+    if (typeof password !== 'string' || password.length < 8 || password.length > 200) {
+      res.status(400).json({ error: 'Password must be 8-200 characters' });
+      return;
+    }
+    if (displayName !== undefined && displayName !== null && (typeof displayName !== 'string' || displayName.length > 100)) {
+      res.status(400).json({ error: 'Display name must be at most 100 characters' });
       return;
     }
 
@@ -28,16 +72,22 @@ router.post('/register', authLimiter, async (req: Request, res: Response) => {
     const result = await pool.query(
       `INSERT INTO users (username, email, password_hash, display_name)
        VALUES ($1, $2, $3, $4) RETURNING id, username, email, display_name, created_at`,
-      [username, email, passwordHash, displayName || username]
+      [username, email, passwordHash, (typeof displayName === 'string' && displayName.trim()) || username]
     );
 
     const user = result.rows[0];
-    req.session.userId = user.id;
-    req.session.username = user.username;
+    await startSession(req, user.id, user.username);
 
     logger.info({ userId: user.id, username }, 'User registered');
-    res.status(201).json({ user });
+    // camelCase like /login and /me: the raw row's display_name left the
+    // client's displayName undefined until the next page load.
+    res.status(201).json({ user: toUserDto(user) });
   } catch (err) {
+    // Two registrations racing past the existence check hit the unique index.
+    if ((err as { code?: string }).code === '23505') {
+      res.status(409).json({ error: 'Username or email already exists' });
+      return;
+    }
     logger.error({ err }, 'Registration error');
     res.status(500).json({ error: 'Internal server error' });
   }
@@ -47,7 +97,7 @@ router.post('/login', authLimiter, async (req: Request, res: Response) => {
   try {
     const { username, password } = req.body;
 
-    if (!username || !password) {
+    if (typeof username !== 'string' || typeof password !== 'string' || !username || !password) {
       res.status(400).json({ error: 'Username and password are required' });
       return;
     }
@@ -68,19 +118,10 @@ router.post('/login', authLimiter, async (req: Request, res: Response) => {
       return;
     }
 
-    req.session.userId = user.id;
-    req.session.username = user.username;
+    await startSession(req, user.id, user.username);
 
     logger.info({ userId: user.id, username }, 'User logged in');
-    res.json({
-      user: {
-        id: user.id,
-        username: user.username,
-        email: user.email,
-        displayName: user.display_name,
-        createdAt: user.created_at,
-      },
-    });
+    res.json({ user: toUserDto(user) });
   } catch (err) {
     logger.error({ err }, 'Login error');
     res.status(500).json({ error: 'Internal server error' });

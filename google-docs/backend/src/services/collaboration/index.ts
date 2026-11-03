@@ -7,12 +7,15 @@
  */
 
 import { WebSocket, WebSocketServer } from 'ws';
-import { IncomingMessage } from 'http';
+import type { IncomingMessage, Server } from 'http';
+import type { Duplex } from 'stream';
 import { parse as parseUrl } from 'url';
-import redis, { redisSub } from '../../utils/redis.js';
+import cookieParser from 'cookie-parser';
+import type { Request, Response } from 'express';
+import { redisSub } from '../../utils/redis.js';
 import type { WSMessage, UserPublic } from '../../types/index.js';
 import logger, { createChildLogger } from '../../shared/logger.js';
-import { recordCacheAccess } from '../../shared/metrics.js';
+import { resolveSessionUser } from '../../middleware/auth.js';
 
 // Import from submodules
 import {
@@ -59,7 +62,7 @@ async function handleMessage(ws: WebSocket, message: string): Promise<void> {
 
     switch (msg.type) {
       case 'SUBSCRIBE':
-        await handleSubscribe(ws, client, msg.doc_id!);
+        await handleSubscribe(ws, client, msg.doc_id);
         break;
 
       case 'UNSUBSCRIBE':
@@ -89,36 +92,114 @@ async function handleMessage(ws: WebSocket, message: string): Promise<void> {
   }
 }
 
+/** Stateless cookie parser (no secret), identical to the one the REST app uses. */
+const parseCookies = cookieParser();
+
+/**
+ * Resolves the user of a WebSocket upgrade request.
+ *
+ * @description Uses the same session lookup as the REST `authenticate` middleware
+ * (`resolveSessionUser`: Redis, then the sessions table). The token comes from the
+ * `session_token` cookie the browser sends on the upgrade (what REST reads), falling
+ * back to the `?token=` query parameter older clients put in the URL.
+ *
+ * @param {IncomingMessage} request - The HTTP upgrade request
+ * @returns {Promise<UserPublic | null>} The session's user, or null if unauthenticated
+ */
+async function authenticateUpgrade(request: IncomingMessage): Promise<UserPublic | null> {
+  const req = request as Request;
+  await new Promise<void>((resolve) => parseCookies(req, {} as Response, () => resolve()));
+
+  const queryToken = parseUrl(request.url || '', true).query.token;
+  const token =
+    (req.cookies?.session_token as string | undefined) ||
+    (typeof queryToken === 'string' ? queryToken : undefined);
+
+  if (!token) return null;
+  return resolveSessionUser(token);
+}
+
+/**
+ * Registers an authenticated connection and wires its lifecycle handlers.
+ *
+ * @param {WebSocket} ws - The upgraded WebSocket
+ * @param {UserPublic} user - The session's user, established during the upgrade
+ * @returns {void}
+ */
+function onConnection(ws: WebSocket, user: UserPublic): void {
+  const connectionId = Math.random().toString(36).substring(7);
+  const connLogger = createChildLogger({ connectionId });
+
+  connLogger.info({ userId: user.id, userName: user.name }, 'WebSocket authenticated');
+
+  // Register client
+  clients.set(ws, {
+    ws,
+    user,
+    documentId: null,
+    canEdit: false,
+    accessCheckedAt: 0,
+    lastActivity: Date.now(),
+  });
+
+  // Update metrics
+  updateCollaboratorsMetric();
+
+  // Handle messages
+  ws.on('message', (data) => handleMessage(ws, data.toString()));
+
+  ws.on('close', () => {
+    const client = clients.get(ws);
+    if (client?.documentId) {
+      handleLeaveDocument(ws, client.documentId);
+    }
+    clients.delete(ws);
+    updateCollaboratorsMetric();
+
+    connLogger.info({ userId: user.id }, 'WebSocket disconnected');
+  });
+
+  ws.on('error', (error) => {
+    connLogger.error({ error: error.message }, 'WebSocket error');
+  });
+
+  // Send welcome message
+  ws.send(JSON.stringify({ type: 'CONNECTED', data: { userId: user.id } }));
+}
+
 /**
  * Initializes the WebSocket server for real-time collaboration.
  *
  * @description Sets up the complete WebSocket infrastructure including:
  * - Redis pub/sub subscription for cross-server operation and presence sync
- * - Connection handling with session-based authentication
+ * - Session authentication on the HTTP upgrade (401 before any socket exists)
  * - Message routing to appropriate handlers
  * - Connection lifecycle management (connect, disconnect, error)
  * - Inactive connection cleanup (60 second timeout, checked every 30 seconds)
  *
- * @param {WebSocketServer} wss - The WebSocket server instance to initialize
- * @returns {void}
+ * Authenticating on the upgrade, rather than after 'connection', means the
+ * message handler is attached the moment the socket opens, so a SUBSCRIBE sent
+ * straight from `onopen` cannot arrive before anyone is listening.
+ *
+ * @param {Server} server - The HTTP server whose `/ws` upgrades this handles
+ * @returns {WebSocketServer} The WebSocket server (in noServer mode)
  *
  * @example
- * import { WebSocketServer } from 'ws';
  * import { createServer } from 'http';
  *
  * const server = createServer(app);
- * const wss = new WebSocketServer({ server });
- * initWebSocket(wss);
+ * initWebSocket(server);
  *
  * server.listen(3000, () => {
  *   console.log('Server with WebSocket support started');
  * });
  *
  * @example
- * // Client connection URL with authentication token
- * // ws://localhost:3000?token=session-abc123
+ * // Browsers connect with the session cookie set at login
+ * // ws://localhost:3000/ws
  */
-export function initWebSocket(wss: WebSocketServer): void {
+export function initWebSocket(server: Server): WebSocketServer {
+  const wss = new WebSocketServer({ noServer: true });
   logger.info({ serverId }, 'WebSocket server initialized');
 
   // Subscribe to Redis channels for cross-server communication
@@ -149,68 +230,27 @@ export function initWebSocket(wss: WebSocketServer): void {
     }
   });
 
-  wss.on('connection', async (ws: WebSocket, request: IncomingMessage) => {
-    const connectionId = Math.random().toString(36).substring(7);
-    const connLogger = createChildLogger({ connectionId });
-
-    connLogger.debug('New WebSocket connection attempt');
-
-    // Parse token from query string
-    const url = parseUrl(request.url || '', true);
-    const token = url.query.token as string;
-
-    if (!token) {
-      connLogger.warn('Connection rejected: no token');
-      ws.close(4001, 'Authentication required');
+  server.on('upgrade', (request: IncomingMessage, socket: Duplex, head: Buffer) => {
+    if (parseUrl(request.url || '').pathname !== '/ws') {
+      socket.destroy();
       return;
     }
 
-    // Validate token
-    const sessionData = await redis.get(`session:${token}`);
-
-    if (!sessionData) {
-      recordCacheAccess('session', false);
-      connLogger.warn('Connection rejected: invalid session');
-      ws.close(4001, 'Invalid session');
-      return;
-    }
-
-    recordCacheAccess('session', true);
-    const user = JSON.parse(sessionData) as UserPublic;
-
-    connLogger.info({ userId: user.id, userName: user.name }, 'WebSocket authenticated');
-
-    // Register client
-    clients.set(ws, {
-      ws,
-      user,
-      documentId: null,
-      lastActivity: Date.now(),
-    });
-
-    // Update metrics
-    updateCollaboratorsMetric();
-
-    // Handle messages
-    ws.on('message', (data) => handleMessage(ws, data.toString()));
-
-    ws.on('close', () => {
-      const client = clients.get(ws);
-      if (client?.documentId) {
-        handleLeaveDocument(ws, client.documentId);
-      }
-      clients.delete(ws);
-      updateCollaboratorsMetric();
-
-      connLogger.info({ userId: user.id }, 'WebSocket disconnected');
-    });
-
-    ws.on('error', (error) => {
-      connLogger.error({ error: error.message }, 'WebSocket error');
-    });
-
-    // Send welcome message
-    ws.send(JSON.stringify({ type: 'CONNECTED', data: { userId: user.id } }));
+    authenticateUpgrade(request)
+      .then((user) => {
+        if (!user) {
+          logger.warn('WebSocket upgrade rejected: no valid session');
+          socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+          socket.destroy();
+          return;
+        }
+        wss.handleUpgrade(request, socket, head, (ws) => onConnection(ws, user));
+      })
+      .catch((error) => {
+        logger.error({ error }, 'WebSocket upgrade authentication error');
+        socket.write('HTTP/1.1 500 Internal Server Error\r\n\r\n');
+        socket.destroy();
+      });
   });
 
   // Cleanup inactive connections every 30 seconds
@@ -223,4 +263,6 @@ export function initWebSocket(wss: WebSocketServer): void {
       }
     }
   }, 30000);
+
+  return wss;
 }

@@ -58,7 +58,11 @@ export function OrderHistory({ orders, onCancel }: OrderHistoryProps) {
               : order.quantity.toFixed(4)}
           </div>
           <div className="text-right">
-            {order.price ? `$${formatPrice(typeof order.price === 'string' ? parseFloat(order.price as unknown as string) : order.price, 2)}` : 'Market'}
+            {order.price
+              ? `$${formatPrice(typeof order.price === 'string' ? parseFloat(order.price as unknown as string) : order.price, 2)}`
+              : order.stopPrice
+                ? <span title="Becomes a market order when the price reaches this level">Stop ${formatPrice(parseFloat(order.stopPrice), 2)}</span>
+                : 'Market'}
           </div>
           <div className="text-right">
             {typeof order.filledQuantity === 'string'

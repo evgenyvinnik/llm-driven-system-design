@@ -25,7 +25,11 @@ redis.on('connect', () => {
 /** Establishes the Redis connection, logging errors on failure. */
 export async function connectRedis(): Promise<void> {
   try {
-    await redis.connect();
+    // The rate-limit store issues a command at import time, which already
+    // starts the lazy connection; connect() would then throw "already connecting".
+    if (redis.status === 'wait') {
+      await redis.connect();
+    }
   } catch (err) {
     logger.error({ err }, 'Failed to connect to Redis');
   }

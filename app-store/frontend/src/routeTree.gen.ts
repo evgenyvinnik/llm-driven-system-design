@@ -9,34 +9,19 @@
 // Additionally, you should also exclude this file from your linter and/or formatter to prevent it from being checked or modified.
 
 import { Route as rootRouteImport } from './routes/__root'
-import { Route as SearchRouteImport } from './routes/search'
-import { Route as RegisterRouteImport } from './routes/register'
-import { Route as LoginRouteImport } from './routes/login'
-import { Route as DeveloperRouteImport } from './routes/developer'
-import { Route as CategoriesRouteImport } from './routes/categories'
 import { Route as IndexRouteImport } from './routes/index'
-import { Route as CategorySlugRouteImport } from './routes/category.$slug'
+import { Route as CategoriesRouteImport } from './routes/categories'
+import { Route as LoginRouteImport } from './routes/login'
+import { Route as RegisterRouteImport } from './routes/register'
+import { Route as SearchRouteImport } from './routes/search'
 import { Route as AppIdRouteImport } from './routes/app.$id'
+import { Route as CategorySlugRouteImport } from './routes/category.$slug'
+import { Route as DeveloperIndexRouteImport } from './routes/developer.index'
 import { Route as DeveloperAppIdRouteImport } from './routes/developer.app.$id'
 
-const SearchRoute = SearchRouteImport.update({
-  id: '/search',
-  path: '/search',
-  getParentRoute: () => rootRouteImport,
-} as any)
-const RegisterRoute = RegisterRouteImport.update({
-  id: '/register',
-  path: '/register',
-  getParentRoute: () => rootRouteImport,
-} as any)
-const LoginRoute = LoginRouteImport.update({
-  id: '/login',
-  path: '/login',
-  getParentRoute: () => rootRouteImport,
-} as any)
-const DeveloperRoute = DeveloperRouteImport.update({
-  id: '/developer',
-  path: '/developer',
+const IndexRoute = IndexRouteImport.update({
+  id: '/',
+  path: '/',
   getParentRoute: () => rootRouteImport,
 } as any)
 const CategoriesRoute = CategoriesRouteImport.update({
@@ -44,14 +29,19 @@ const CategoriesRoute = CategoriesRouteImport.update({
   path: '/categories',
   getParentRoute: () => rootRouteImport,
 } as any)
-const IndexRoute = IndexRouteImport.update({
-  id: '/',
-  path: '/',
+const LoginRoute = LoginRouteImport.update({
+  id: '/login',
+  path: '/login',
   getParentRoute: () => rootRouteImport,
 } as any)
-const CategorySlugRoute = CategorySlugRouteImport.update({
-  id: '/category/$slug',
-  path: '/category/$slug',
+const RegisterRoute = RegisterRouteImport.update({
+  id: '/register',
+  path: '/register',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const SearchRoute = SearchRouteImport.update({
+  id: '/search',
+  path: '/search',
   getParentRoute: () => rootRouteImport,
 } as any)
 const AppIdRoute = AppIdRouteImport.update({
@@ -59,44 +49,54 @@ const AppIdRoute = AppIdRouteImport.update({
   path: '/app/$id',
   getParentRoute: () => rootRouteImport,
 } as any)
+const CategorySlugRoute = CategorySlugRouteImport.update({
+  id: '/category/$slug',
+  path: '/category/$slug',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const DeveloperIndexRoute = DeveloperIndexRouteImport.update({
+  id: '/developer/',
+  path: '/developer/',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const DeveloperAppIdRoute = DeveloperAppIdRouteImport.update({
-  id: '/app/$id',
-  path: '/app/$id',
-  getParentRoute: () => DeveloperRoute,
+  id: '/developer/app/$id',
+  path: '/developer/app/$id',
+  getParentRoute: () => rootRouteImport,
 } as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/categories': typeof CategoriesRoute
-  '/developer': typeof DeveloperRouteWithChildren
   '/login': typeof LoginRoute
   '/register': typeof RegisterRoute
   '/search': typeof SearchRoute
   '/app/$id': typeof AppIdRoute
   '/category/$slug': typeof CategorySlugRoute
+  '/developer/': typeof DeveloperIndexRoute
   '/developer/app/$id': typeof DeveloperAppIdRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/categories': typeof CategoriesRoute
-  '/developer': typeof DeveloperRouteWithChildren
   '/login': typeof LoginRoute
   '/register': typeof RegisterRoute
   '/search': typeof SearchRoute
   '/app/$id': typeof AppIdRoute
   '/category/$slug': typeof CategorySlugRoute
+  '/developer': typeof DeveloperIndexRoute
   '/developer/app/$id': typeof DeveloperAppIdRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/categories': typeof CategoriesRoute
-  '/developer': typeof DeveloperRouteWithChildren
   '/login': typeof LoginRoute
   '/register': typeof RegisterRoute
   '/search': typeof SearchRoute
   '/app/$id': typeof AppIdRoute
   '/category/$slug': typeof CategorySlugRoute
+  '/developer/': typeof DeveloperIndexRoute
   '/developer/app/$id': typeof DeveloperAppIdRoute
 }
 export interface FileRouteTypes {
@@ -104,76 +104,56 @@ export interface FileRouteTypes {
   fullPaths:
     | '/'
     | '/categories'
-    | '/developer'
     | '/login'
     | '/register'
     | '/search'
     | '/app/$id'
     | '/category/$slug'
+    | '/developer/'
     | '/developer/app/$id'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
     | '/categories'
-    | '/developer'
     | '/login'
     | '/register'
     | '/search'
     | '/app/$id'
     | '/category/$slug'
+    | '/developer'
     | '/developer/app/$id'
   id:
     | '__root__'
     | '/'
     | '/categories'
-    | '/developer'
     | '/login'
     | '/register'
     | '/search'
     | '/app/$id'
     | '/category/$slug'
+    | '/developer/'
     | '/developer/app/$id'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   CategoriesRoute: typeof CategoriesRoute
-  DeveloperRoute: typeof DeveloperRouteWithChildren
   LoginRoute: typeof LoginRoute
   RegisterRoute: typeof RegisterRoute
   SearchRoute: typeof SearchRoute
   AppIdRoute: typeof AppIdRoute
   CategorySlugRoute: typeof CategorySlugRoute
+  DeveloperIndexRoute: typeof DeveloperIndexRoute
+  DeveloperAppIdRoute: typeof DeveloperAppIdRoute
 }
 
 declare module '@tanstack/react-router' {
   interface FileRoutesByPath {
-    '/search': {
-      id: '/search'
-      path: '/search'
-      fullPath: '/search'
-      preLoaderRoute: typeof SearchRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/register': {
-      id: '/register'
-      path: '/register'
-      fullPath: '/register'
-      preLoaderRoute: typeof RegisterRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/login': {
-      id: '/login'
-      path: '/login'
-      fullPath: '/login'
-      preLoaderRoute: typeof LoginRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/developer': {
-      id: '/developer'
-      path: '/developer'
-      fullPath: '/developer'
-      preLoaderRoute: typeof DeveloperRouteImport
+    '/': {
+      id: '/'
+      path: '/'
+      fullPath: '/'
+      preLoaderRoute: typeof IndexRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/categories': {
@@ -183,18 +163,25 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof CategoriesRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/': {
-      id: '/'
-      path: '/'
-      fullPath: '/'
-      preLoaderRoute: typeof IndexRouteImport
+    '/login': {
+      id: '/login'
+      path: '/login'
+      fullPath: '/login'
+      preLoaderRoute: typeof LoginRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/category/$slug': {
-      id: '/category/$slug'
-      path: '/category/$slug'
-      fullPath: '/category/$slug'
-      preLoaderRoute: typeof CategorySlugRouteImport
+    '/register': {
+      id: '/register'
+      path: '/register'
+      fullPath: '/register'
+      preLoaderRoute: typeof RegisterRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/search': {
+      id: '/search'
+      path: '/search'
+      fullPath: '/search'
+      preLoaderRoute: typeof SearchRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/app/$id': {
@@ -204,37 +191,40 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppIdRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/category/$slug': {
+      id: '/category/$slug'
+      path: '/category/$slug'
+      fullPath: '/category/$slug'
+      preLoaderRoute: typeof CategorySlugRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/developer/': {
+      id: '/developer/'
+      path: '/developer'
+      fullPath: '/developer/'
+      preLoaderRoute: typeof DeveloperIndexRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/developer/app/$id': {
       id: '/developer/app/$id'
-      path: '/app/$id'
+      path: '/developer/app/$id'
       fullPath: '/developer/app/$id'
       preLoaderRoute: typeof DeveloperAppIdRouteImport
-      parentRoute: typeof DeveloperRoute
+      parentRoute: typeof rootRouteImport
     }
   }
 }
 
-interface DeveloperRouteChildren {
-  DeveloperAppIdRoute: typeof DeveloperAppIdRoute
-}
-
-const DeveloperRouteChildren: DeveloperRouteChildren = {
-  DeveloperAppIdRoute: DeveloperAppIdRoute,
-}
-
-const DeveloperRouteWithChildren = DeveloperRoute._addFileChildren(
-  DeveloperRouteChildren,
-)
-
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   CategoriesRoute: CategoriesRoute,
-  DeveloperRoute: DeveloperRouteWithChildren,
   LoginRoute: LoginRoute,
   RegisterRoute: RegisterRoute,
   SearchRoute: SearchRoute,
   AppIdRoute: AppIdRoute,
   CategorySlugRoute: CategorySlugRoute,
+  DeveloperIndexRoute: DeveloperIndexRoute,
+  DeveloperAppIdRoute: DeveloperAppIdRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

@@ -9,42 +9,22 @@
 // Additionally, you should also exclude this file from your linter and/or formatter to prevent it from being checked or modified.
 
 import { Route as rootRouteImport } from './routes/__root'
-import { Route as TripsRouteImport } from './routes/trips'
-import { Route as SearchRouteImport } from './routes/search'
-import { Route as RegisterRouteImport } from './routes/register'
-import { Route as MessagesRouteImport } from './routes/messages'
-import { Route as LoginRouteImport } from './routes/login'
-import { Route as BecomeHostRouteImport } from './routes/become-host'
 import { Route as IndexRouteImport } from './routes/index'
-import { Route as ListingIdRouteImport } from './routes/listing.$id'
-import { Route as HostReservationsRouteImport } from './routes/host/reservations'
-import { Route as HostListingsRouteImport } from './routes/host/listings'
+import { Route as BecomeHostRouteImport } from './routes/become-host'
+import { Route as LoginRouteImport } from './routes/login'
+import { Route as MessagesRouteImport } from './routes/messages'
+import { Route as RegisterRouteImport } from './routes/register'
+import { Route as SearchRouteImport } from './routes/search'
+import { Route as TripsRouteImport } from './routes/trips'
 import { Route as BookingIdRouteImport } from './routes/booking.$id'
+import { Route as HostReservationsRouteImport } from './routes/host/reservations'
+import { Route as ListingIdRouteImport } from './routes/listing.$id'
+import { Route as HostListingsIndexRouteImport } from './routes/host/listings.index'
 import { Route as HostListingsNewRouteImport } from './routes/host/listings.new'
 
-const TripsRoute = TripsRouteImport.update({
-  id: '/trips',
-  path: '/trips',
-  getParentRoute: () => rootRouteImport,
-} as any)
-const SearchRoute = SearchRouteImport.update({
-  id: '/search',
-  path: '/search',
-  getParentRoute: () => rootRouteImport,
-} as any)
-const RegisterRoute = RegisterRouteImport.update({
-  id: '/register',
-  path: '/register',
-  getParentRoute: () => rootRouteImport,
-} as any)
-const MessagesRoute = MessagesRouteImport.update({
-  id: '/messages',
-  path: '/messages',
-  getParentRoute: () => rootRouteImport,
-} as any)
-const LoginRoute = LoginRouteImport.update({
-  id: '/login',
-  path: '/login',
+const IndexRoute = IndexRouteImport.update({
+  id: '/',
+  path: '/',
   getParentRoute: () => rootRouteImport,
 } as any)
 const BecomeHostRoute = BecomeHostRouteImport.update({
@@ -52,24 +32,29 @@ const BecomeHostRoute = BecomeHostRouteImport.update({
   path: '/become-host',
   getParentRoute: () => rootRouteImport,
 } as any)
-const IndexRoute = IndexRouteImport.update({
-  id: '/',
-  path: '/',
+const LoginRoute = LoginRouteImport.update({
+  id: '/login',
+  path: '/login',
   getParentRoute: () => rootRouteImport,
 } as any)
-const ListingIdRoute = ListingIdRouteImport.update({
-  id: '/listing/$id',
-  path: '/listing/$id',
+const MessagesRoute = MessagesRouteImport.update({
+  id: '/messages',
+  path: '/messages',
   getParentRoute: () => rootRouteImport,
 } as any)
-const HostReservationsRoute = HostReservationsRouteImport.update({
-  id: '/host/reservations',
-  path: '/host/reservations',
+const RegisterRoute = RegisterRouteImport.update({
+  id: '/register',
+  path: '/register',
   getParentRoute: () => rootRouteImport,
 } as any)
-const HostListingsRoute = HostListingsRouteImport.update({
-  id: '/host/listings',
-  path: '/host/listings',
+const SearchRoute = SearchRouteImport.update({
+  id: '/search',
+  path: '/search',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const TripsRoute = TripsRouteImport.update({
+  id: '/trips',
+  path: '/trips',
   getParentRoute: () => rootRouteImport,
 } as any)
 const BookingIdRoute = BookingIdRouteImport.update({
@@ -77,10 +62,25 @@ const BookingIdRoute = BookingIdRouteImport.update({
   path: '/booking/$id',
   getParentRoute: () => rootRouteImport,
 } as any)
+const HostReservationsRoute = HostReservationsRouteImport.update({
+  id: '/host/reservations',
+  path: '/host/reservations',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ListingIdRoute = ListingIdRouteImport.update({
+  id: '/listing/$id',
+  path: '/listing/$id',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const HostListingsIndexRoute = HostListingsIndexRouteImport.update({
+  id: '/host/listings/',
+  path: '/host/listings/',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const HostListingsNewRoute = HostListingsNewRouteImport.update({
-  id: '/new',
-  path: '/new',
-  getParentRoute: () => HostListingsRoute,
+  id: '/host/listings/new',
+  path: '/host/listings/new',
+  getParentRoute: () => rootRouteImport,
 } as any)
 
 export interface FileRoutesByFullPath {
@@ -92,10 +92,10 @@ export interface FileRoutesByFullPath {
   '/search': typeof SearchRoute
   '/trips': typeof TripsRoute
   '/booking/$id': typeof BookingIdRoute
-  '/host/listings': typeof HostListingsRouteWithChildren
   '/host/reservations': typeof HostReservationsRoute
   '/listing/$id': typeof ListingIdRoute
   '/host/listings/new': typeof HostListingsNewRoute
+  '/host/listings/': typeof HostListingsIndexRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
@@ -106,10 +106,10 @@ export interface FileRoutesByTo {
   '/search': typeof SearchRoute
   '/trips': typeof TripsRoute
   '/booking/$id': typeof BookingIdRoute
-  '/host/listings': typeof HostListingsRouteWithChildren
   '/host/reservations': typeof HostReservationsRoute
   '/listing/$id': typeof ListingIdRoute
   '/host/listings/new': typeof HostListingsNewRoute
+  '/host/listings': typeof HostListingsIndexRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
@@ -121,10 +121,10 @@ export interface FileRoutesById {
   '/search': typeof SearchRoute
   '/trips': typeof TripsRoute
   '/booking/$id': typeof BookingIdRoute
-  '/host/listings': typeof HostListingsRouteWithChildren
   '/host/reservations': typeof HostReservationsRoute
   '/listing/$id': typeof ListingIdRoute
   '/host/listings/new': typeof HostListingsNewRoute
+  '/host/listings/': typeof HostListingsIndexRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
@@ -137,10 +137,10 @@ export interface FileRouteTypes {
     | '/search'
     | '/trips'
     | '/booking/$id'
-    | '/host/listings'
     | '/host/reservations'
     | '/listing/$id'
     | '/host/listings/new'
+    | '/host/listings/'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
@@ -151,10 +151,10 @@ export interface FileRouteTypes {
     | '/search'
     | '/trips'
     | '/booking/$id'
-    | '/host/listings'
     | '/host/reservations'
     | '/listing/$id'
     | '/host/listings/new'
+    | '/host/listings'
   id:
     | '__root__'
     | '/'
@@ -165,10 +165,10 @@ export interface FileRouteTypes {
     | '/search'
     | '/trips'
     | '/booking/$id'
-    | '/host/listings'
     | '/host/reservations'
     | '/listing/$id'
     | '/host/listings/new'
+    | '/host/listings/'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -180,46 +180,19 @@ export interface RootRouteChildren {
   SearchRoute: typeof SearchRoute
   TripsRoute: typeof TripsRoute
   BookingIdRoute: typeof BookingIdRoute
-  HostListingsRoute: typeof HostListingsRouteWithChildren
   HostReservationsRoute: typeof HostReservationsRoute
   ListingIdRoute: typeof ListingIdRoute
+  HostListingsNewRoute: typeof HostListingsNewRoute
+  HostListingsIndexRoute: typeof HostListingsIndexRoute
 }
 
 declare module '@tanstack/react-router' {
   interface FileRoutesByPath {
-    '/trips': {
-      id: '/trips'
-      path: '/trips'
-      fullPath: '/trips'
-      preLoaderRoute: typeof TripsRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/search': {
-      id: '/search'
-      path: '/search'
-      fullPath: '/search'
-      preLoaderRoute: typeof SearchRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/register': {
-      id: '/register'
-      path: '/register'
-      fullPath: '/register'
-      preLoaderRoute: typeof RegisterRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/messages': {
-      id: '/messages'
-      path: '/messages'
-      fullPath: '/messages'
-      preLoaderRoute: typeof MessagesRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/login': {
-      id: '/login'
-      path: '/login'
-      fullPath: '/login'
-      preLoaderRoute: typeof LoginRouteImport
+    '/': {
+      id: '/'
+      path: '/'
+      fullPath: '/'
+      preLoaderRoute: typeof IndexRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/become-host': {
@@ -229,32 +202,39 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof BecomeHostRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/': {
-      id: '/'
-      path: '/'
-      fullPath: '/'
-      preLoaderRoute: typeof IndexRouteImport
+    '/login': {
+      id: '/login'
+      path: '/login'
+      fullPath: '/login'
+      preLoaderRoute: typeof LoginRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/listing/$id': {
-      id: '/listing/$id'
-      path: '/listing/$id'
-      fullPath: '/listing/$id'
-      preLoaderRoute: typeof ListingIdRouteImport
+    '/messages': {
+      id: '/messages'
+      path: '/messages'
+      fullPath: '/messages'
+      preLoaderRoute: typeof MessagesRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/host/reservations': {
-      id: '/host/reservations'
-      path: '/host/reservations'
-      fullPath: '/host/reservations'
-      preLoaderRoute: typeof HostReservationsRouteImport
+    '/register': {
+      id: '/register'
+      path: '/register'
+      fullPath: '/register'
+      preLoaderRoute: typeof RegisterRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/host/listings': {
-      id: '/host/listings'
-      path: '/host/listings'
-      fullPath: '/host/listings'
-      preLoaderRoute: typeof HostListingsRouteImport
+    '/search': {
+      id: '/search'
+      path: '/search'
+      fullPath: '/search'
+      preLoaderRoute: typeof SearchRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/trips': {
+      id: '/trips'
+      path: '/trips'
+      fullPath: '/trips'
+      preLoaderRoute: typeof TripsRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/booking/$id': {
@@ -264,27 +244,36 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof BookingIdRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/host/reservations': {
+      id: '/host/reservations'
+      path: '/host/reservations'
+      fullPath: '/host/reservations'
+      preLoaderRoute: typeof HostReservationsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/listing/$id': {
+      id: '/listing/$id'
+      path: '/listing/$id'
+      fullPath: '/listing/$id'
+      preLoaderRoute: typeof ListingIdRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/host/listings/': {
+      id: '/host/listings/'
+      path: '/host/listings'
+      fullPath: '/host/listings/'
+      preLoaderRoute: typeof HostListingsIndexRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/host/listings/new': {
       id: '/host/listings/new'
-      path: '/new'
+      path: '/host/listings/new'
       fullPath: '/host/listings/new'
       preLoaderRoute: typeof HostListingsNewRouteImport
-      parentRoute: typeof HostListingsRoute
+      parentRoute: typeof rootRouteImport
     }
   }
 }
-
-interface HostListingsRouteChildren {
-  HostListingsNewRoute: typeof HostListingsNewRoute
-}
-
-const HostListingsRouteChildren: HostListingsRouteChildren = {
-  HostListingsNewRoute: HostListingsNewRoute,
-}
-
-const HostListingsRouteWithChildren = HostListingsRoute._addFileChildren(
-  HostListingsRouteChildren,
-)
 
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
@@ -295,9 +284,10 @@ const rootRouteChildren: RootRouteChildren = {
   SearchRoute: SearchRoute,
   TripsRoute: TripsRoute,
   BookingIdRoute: BookingIdRoute,
-  HostListingsRoute: HostListingsRouteWithChildren,
   HostReservationsRoute: HostReservationsRoute,
   ListingIdRoute: ListingIdRoute,
+  HostListingsNewRoute: HostListingsNewRoute,
+  HostListingsIndexRoute: HostListingsIndexRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

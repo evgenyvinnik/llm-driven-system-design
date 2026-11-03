@@ -6,6 +6,26 @@ import { logger } from '../services/logger.js';
 
 const router = Router();
 
+/**
+ * Issues a fresh session ID before storing the identity, so a session ID that
+ * existed before login (e.g. planted by an attacker) never becomes an
+ * authenticated one.
+ */
+function establishSession(
+  req: Request,
+  user: { id: string; username: string; role: string },
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    req.session.regenerate((err) => {
+      if (err) return reject(err);
+      req.session.userId = user.id;
+      req.session.username = user.username;
+      req.session.role = user.role;
+      req.session.save((saveErr) => (saveErr ? reject(saveErr) : resolve()));
+    });
+  });
+}
+
 // POST /api/auth/register
 router.post('/register', authLimiter, async (req: Request, res: Response) => {
   try {
@@ -38,18 +58,26 @@ router.post('/register', authLimiter, async (req: Request, res: Response) => {
 
     const passwordHash = await bcrypt.hash(password, 10);
 
-    const result = await pool.query(
-      `INSERT INTO users (username, email, password_hash, display_name)
-       VALUES ($1, $2, $3, $4)
-       RETURNING id, username, email, display_name, role, created_at`,
-      [username, email, passwordHash, displayName || username],
-    );
+    let result;
+    try {
+      result = await pool.query(
+        `INSERT INTO users (username, email, password_hash, display_name)
+         VALUES ($1, $2, $3, $4)
+         RETURNING id, username, email, display_name, role, created_at`,
+        [username, email, passwordHash, displayName || username],
+      );
+    } catch (err) {
+      // Two registrations racing past the existence check above.
+      if ((err as { code?: string }).code === '23505') {
+        res.status(409).json({ error: 'Username or email already exists' });
+        return;
+      }
+      throw err;
+    }
 
     const user = result.rows[0];
 
-    req.session.userId = user.id;
-    req.session.username = user.username;
-    req.session.role = user.role;
+    await establishSession(req, user);
 
     res.status(201).json({
       user: {
@@ -94,9 +122,7 @@ router.post('/login', authLimiter, async (req: Request, res: Response) => {
       return;
     }
 
-    req.session.userId = user.id;
-    req.session.username = user.username;
-    req.session.role = user.role;
+    await establishSession(req, user);
 
     res.json({
       user: {

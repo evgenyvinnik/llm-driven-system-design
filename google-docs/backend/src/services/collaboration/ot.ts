@@ -7,7 +7,7 @@
 
 import type { WebSocket } from 'ws';
 import type { ClientConnection } from './types.js';
-import type { WSMessage } from '../../types/index.js';
+import type { WSMessage, Operation } from '../../types/index.js';
 import { transformOperations } from '../ot.js';
 import _logger, { createChildLogger } from '../../shared/logger.js';
 import {
@@ -21,14 +21,106 @@ import {
   setIdempotencyResult,
   generateOperationKey,
 } from '../../shared/idempotency.js';
+import { getDocumentAccess } from '../../shared/rbac.js';
 import { documents, serverId, broadcastToDocument } from './state.js';
 import { debouncedPersist, redisPublishCircuitBreaker } from './persist.js';
+import { handleLeaveDocument } from './presence.js';
+import { canEditDocument } from './permissions.js';
+
+/**
+ * How long a connection's edit right, read at SUBSCRIBE, is trusted before the
+ * next OPERATION re-reads it. Bounds how long a downgrade (re-share as 'view')
+ * or a deleted document goes unnoticed, on every server, without a DB query per keystroke.
+ */
+const ACCESS_RECHECK_MS = 5000;
+
+/** Upper bounds on a single OPERATION message. */
+const MAX_OPS_PER_MESSAGE = 1000;
+const MAX_INSERT_LENGTH = 100_000;
+
+const isCount = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isInteger(value) && value >= 0;
+
+/**
+ * Shape check for one client-supplied operation. Anything that is not a
+ * well-formed insert/delete/retain/format is rejected rather than transformed,
+ * logged, persisted and broadcast.
+ *
+ * @param {unknown} value - A candidate operation from an OPERATION message
+ * @returns {boolean} True if the value is a valid Operation
+ */
+export function isValidOperation(value: unknown): value is Operation {
+  if (!value || typeof value !== 'object') return false;
+  const op = value as Record<string, unknown>;
+  switch (op.type) {
+    case 'insert':
+      return (
+        isCount(op.position) &&
+        typeof op.text === 'string' &&
+        op.text.length <= MAX_INSERT_LENGTH &&
+        (op.attrs === undefined || (typeof op.attrs === 'object' && op.attrs !== null))
+      );
+    case 'delete':
+      return isCount(op.position) && isCount(op.length);
+    case 'retain':
+      return isCount(op.length);
+    case 'format':
+      return (
+        isCount(op.position) &&
+        isCount(op.length) &&
+        typeof op.mark === 'string' &&
+        (typeof op.value === 'boolean' || typeof op.value === 'string')
+      );
+    default:
+      return false;
+  }
+}
+
+/**
+ * Returns whether the client may still edit the document it sent an operation for.
+ *
+ * @description Trusts the right recorded at SUBSCRIBE for ACCESS_RECHECK_MS, then
+ * re-reads it with the REST RBAC query (`getDocumentAccess`). A user who has lost
+ * all access (document deleted) is removed from the document and told so.
+ *
+ * @param {WebSocket} ws - The client's connection
+ * @param {ClientConnection} client - The client metadata
+ * @param {string} documentId - The document the operation targets (the joined one)
+ * @returns {Promise<boolean>} True if the user may edit documentId
+ */
+async function ensureCanEdit(
+  ws: WebSocket,
+  client: ClientConnection,
+  documentId: string
+): Promise<boolean> {
+  if (Date.now() - client.accessCheckedAt < ACCESS_RECHECK_MS) {
+    return client.canEdit;
+  }
+
+  const access = await getDocumentAccess(client.user.id, documentId);
+  const canEdit = canEditDocument(access.isOwner, access.permissionLevel);
+
+  // The client may have switched documents while we were querying.
+  if (client.documentId !== documentId) return false;
+
+  client.canEdit = canEdit;
+  client.accessCheckedAt = Date.now();
+
+  if (!access.effectiveRole) {
+    handleLeaveDocument(ws, documentId);
+    ws.send(JSON.stringify({ type: 'ERROR', code: 'ACCESS_DENIED', error: 'Access denied' }));
+  }
+
+  return canEdit;
+}
 
 /**
  * Handles an edit operation from a client.
  *
  * @description Processes incoming edit operations using Operational Transformation (OT).
  * Key steps:
+ * 0. Refuses the operation unless it targets the subscribed document, the user
+ *    may edit that document (owner or 'edit' grant), and every op is well formed
  * 1. Checks idempotency to prevent duplicate operations on retry
  * 2. Transforms the operation against any concurrent server operations the client hasn't seen
  * 3. Increments document version and stores operation in the log
@@ -59,16 +151,45 @@ export async function handleOperation(
 ): Promise<void> {
   const startTime = Date.now();
   const documentId = client.documentId;
-  if (!documentId || !msg.operation) return;
+  if (!documentId) {
+    ws.send(JSON.stringify({ type: 'ERROR', code: 'NOT_SUBSCRIBED', error: 'Subscribe to a document first' }));
+    return;
+  }
 
-  const docState = documents.get(documentId);
-  if (!docState) return;
+  // An operation may only name the document this connection joined.
+  if (msg.doc_id !== undefined && msg.doc_id !== documentId) {
+    ws.send(JSON.stringify({ type: 'ERROR', code: 'DOC_MISMATCH', error: 'Operation is for a different document' }));
+    return;
+  }
 
   const opLogger = createChildLogger({
     userId: client.user.id,
     documentId,
     action: 'operation',
   });
+
+  if (!(await ensureCanEdit(ws, client, documentId))) {
+    if (client.documentId === documentId) {
+      opLogger.warn('Operation refused: no edit permission');
+      ws.send(JSON.stringify({ type: 'ERROR', code: 'READ_ONLY', error: 'Edit permission required' }));
+    }
+    return;
+  }
+
+  const operation: unknown = msg.operation;
+  if (
+    !Array.isArray(operation) ||
+    operation.length === 0 ||
+    operation.length > MAX_OPS_PER_MESSAGE ||
+    !operation.every(isValidOperation) ||
+    (msg.version !== undefined && !isCount(msg.version))
+  ) {
+    ws.send(JSON.stringify({ type: 'ERROR', code: 'INVALID_OPERATION', error: 'Invalid operation' }));
+    return;
+  }
+
+  const docState = documents.get(documentId);
+  if (!docState) return;
 
   // Check idempotency if operation ID provided
   const operationId = (msg.data as { operationId?: string })?.operationId;
@@ -86,7 +207,7 @@ export async function handleOperation(
   const clientVersion = msg.version || 0;
 
   // Transform operation against any operations the client hasn't seen
-  let transformedOps = msg.operation;
+  let transformedOps: Operation[] = operation;
   let hadConflicts = false;
 
   if (clientVersion < docState.version) {

@@ -12,6 +12,9 @@ import type {
 
 const BASE_URL = '/api';
 
+// Table names and row keys come from the user's database and can contain '/', '?' or spaces.
+const seg = encodeURIComponent;
+
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE_URL}${url}`, {
     ...options,
@@ -82,10 +85,10 @@ export const projectsApi = {
   listMembers: (id: string) =>
     request<{ members: ProjectMember[] }>(`/projects/${id}/members`),
 
-  addMember: (id: string, userId: string, role?: string) =>
+  addMember: (id: string, member: { userId?: string; username?: string }, role?: string) =>
     request<{ member: ProjectMember }>(`/projects/${id}/members`, {
       method: 'POST',
-      body: JSON.stringify({ userId, role }),
+      body: JSON.stringify({ ...member, role }),
     }),
 
   removeMember: (id: string, userId: string) =>
@@ -105,13 +108,13 @@ export const tablesApi = {
     }),
 
   alter: (projectId: string, tableName: string, action: string, data: Record<string, unknown>) =>
-    request<{ message: string; sql: string }>(`/projects/${projectId}/tables/${tableName}`, {
+    request<{ message: string; sql: string }>(`/projects/${projectId}/tables/${seg(tableName)}`, {
       method: 'PUT',
       body: JSON.stringify({ action, ...data }),
     }),
 
   drop: (projectId: string, tableName: string) =>
-    request<{ message: string; sql: string }>(`/projects/${projectId}/tables/${tableName}`, { method: 'DELETE' }),
+    request<{ message: string; sql: string }>(`/projects/${projectId}/tables/${seg(tableName)}`, { method: 'DELETE' }),
 };
 
 // Table Data
@@ -123,25 +126,24 @@ export const tableDataApi = {
     if (limit) params.set('limit', String(limit));
     if (sortBy) params.set('sortBy', sortBy);
     if (sortOrder) params.set('sortOrder', sortOrder);
-    return request<TableDataResponse>(`/projects/${projectId}/tables/${tableName}/rows?${params}`);
+    return request<TableDataResponse>(`/projects/${projectId}/tables/${seg(tableName)}/rows?${params}`);
   },
 
   insertRow: (projectId: string, tableName: string, data: Record<string, unknown>) =>
-    request<{ row: Record<string, unknown> }>(`/projects/${projectId}/tables/${tableName}/rows`, {
+    request<{ row: Record<string, unknown> }>(`/projects/${projectId}/tables/${seg(tableName)}/rows`, {
       method: 'POST',
       body: JSON.stringify({ data }),
     }),
 
-  updateRow: (projectId: string, tableName: string, id: string, data: Record<string, unknown>, primaryKey?: string) =>
-    request<{ row: Record<string, unknown> }>(`/projects/${projectId}/tables/${tableName}/rows/${id}`, {
+  // The server addresses rows by the table's own primary key; it doesn't take one from the client.
+  updateRow: (projectId: string, tableName: string, id: string, data: Record<string, unknown>) =>
+    request<{ row: Record<string, unknown> }>(`/projects/${projectId}/tables/${seg(tableName)}/rows/${seg(id)}`, {
       method: 'PUT',
-      body: JSON.stringify({ data, primaryKey }),
+      body: JSON.stringify({ data }),
     }),
 
-  deleteRow: (projectId: string, tableName: string, id: string, primaryKey?: string) => {
-    const params = primaryKey ? `?primaryKey=${primaryKey}` : '';
-    return request<{ message: string }>(`/projects/${projectId}/tables/${tableName}/rows/${id}${params}`, { method: 'DELETE' });
-  },
+  deleteRow: (projectId: string, tableName: string, id: string) =>
+    request<{ message: string }>(`/projects/${projectId}/tables/${seg(tableName)}/rows/${seg(id)}`, { method: 'DELETE' }),
 };
 
 // SQL
@@ -214,5 +216,5 @@ export const settingsApi = {
 /** Users API client for searching dashboard users by name or email. */
 export const usersApi = {
   search: (q: string) =>
-    request<{ users: { id: string; username: string; email: string; displayName: string }[] }>(`/users/search?q=${encodeURIComponent(q)}`),
+    request<{ users: { id: string; username: string; displayName: string }[] }>(`/users/search?q=${encodeURIComponent(q)}`),
 };

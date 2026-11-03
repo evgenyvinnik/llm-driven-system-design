@@ -24,12 +24,18 @@ ON CONFLICT (id) DO NOTHING;
 -- ---------------------------------------------------------------------------
 -- Organization
 -- ---------------------------------------------------------------------------
+-- Globex is a second tenant that only Carol belongs to. Nobody else should be
+-- able to see it, its team, its channel or its message by ID.
 INSERT INTO organizations (id, name, slug, description, created_by) VALUES
-  ('aaaaaaaa-0000-0000-0000-000000000001', 'Acme Corp', 'acme-corp', 'Acme Corporation workspace', '11111111-1111-1111-1111-111111111111')
+  ('aaaaaaaa-0000-0000-0000-000000000001', 'Acme Corp', 'acme-corp', 'Acme Corporation workspace', '11111111-1111-1111-1111-111111111111'),
+  ('aaaaaaaa-0000-0000-0000-000000000002', 'Globex Inc', 'globex-inc', 'A separate tenant', '33333333-3333-3333-3333-333333333333')
 ON CONFLICT (id) DO NOTHING;
 
+-- Every organization and team keeps at least one owner (the API refuses to
+-- remove or demote the last one), so Alice owns Acme.
 INSERT INTO org_members (org_id, user_id, role) VALUES
-  ('aaaaaaaa-0000-0000-0000-000000000001', '11111111-1111-1111-1111-111111111111', 'admin'),
+  ('aaaaaaaa-0000-0000-0000-000000000001', '11111111-1111-1111-1111-111111111111', 'owner'),
+  ('aaaaaaaa-0000-0000-0000-000000000002', '33333333-3333-3333-3333-333333333333', 'owner'),
   ('aaaaaaaa-0000-0000-0000-000000000001', '22222222-2222-2222-2222-222222222222', 'member'),
   ('aaaaaaaa-0000-0000-0000-000000000001', '33333333-3333-3333-3333-333333333333', 'member'),
   ('aaaaaaaa-0000-0000-0000-000000000001', '44444444-4444-4444-4444-444444444444', 'member')
@@ -40,7 +46,10 @@ ON CONFLICT (org_id, user_id) DO NOTHING;
 -- ---------------------------------------------------------------------------
 INSERT INTO teams (id, org_id, name, description, is_private, created_by) VALUES
   ('bbbbbbbb-0000-0000-0000-000000000001', 'aaaaaaaa-0000-0000-0000-000000000001', 'Engineering', 'Product engineering team', false, '11111111-1111-1111-1111-111111111111'),
-  ('bbbbbbbb-0000-0000-0000-000000000002', 'aaaaaaaa-0000-0000-0000-000000000001', 'Design',      'Product design team',     false, '33333333-3333-3333-3333-333333333333')
+  ('bbbbbbbb-0000-0000-0000-000000000002', 'aaaaaaaa-0000-0000-0000-000000000001', 'Design',      'Product design team',     false, '33333333-3333-3333-3333-333333333333'),
+  -- Private team: invisible to Acme members who aren't on it (Bob, Dave).
+  ('bbbbbbbb-0000-0000-0000-000000000003', 'aaaaaaaa-0000-0000-0000-000000000001', 'Leadership',  'Staff planning',          true,  '11111111-1111-1111-1111-111111111111'),
+  ('bbbbbbbb-0000-0000-0000-000000000004', 'aaaaaaaa-0000-0000-0000-000000000002', 'Research',    'Globex research',         false, '33333333-3333-3333-3333-333333333333')
 ON CONFLICT (id) DO NOTHING;
 
 INSERT INTO team_members (team_id, user_id, role) VALUES
@@ -48,7 +57,10 @@ INSERT INTO team_members (team_id, user_id, role) VALUES
   ('bbbbbbbb-0000-0000-0000-000000000001', '22222222-2222-2222-2222-222222222222', 'member'),
   ('bbbbbbbb-0000-0000-0000-000000000001', '44444444-4444-4444-4444-444444444444', 'member'),
   ('bbbbbbbb-0000-0000-0000-000000000002', '33333333-3333-3333-3333-333333333333', 'owner'),
-  ('bbbbbbbb-0000-0000-0000-000000000002', '11111111-1111-1111-1111-111111111111', 'member')
+  ('bbbbbbbb-0000-0000-0000-000000000002', '11111111-1111-1111-1111-111111111111', 'member'),
+  ('bbbbbbbb-0000-0000-0000-000000000003', '11111111-1111-1111-1111-111111111111', 'owner'),
+  ('bbbbbbbb-0000-0000-0000-000000000003', '33333333-3333-3333-3333-333333333333', 'member'),
+  ('bbbbbbbb-0000-0000-0000-000000000004', '33333333-3333-3333-3333-333333333333', 'owner')
 ON CONFLICT (team_id, user_id) DO NOTHING;
 
 -- ---------------------------------------------------------------------------
@@ -57,7 +69,12 @@ ON CONFLICT (team_id, user_id) DO NOTHING;
 INSERT INTO channels (id, team_id, name, description, is_private, created_by) VALUES
   ('cccccccc-0000-0000-0000-000000000001', 'bbbbbbbb-0000-0000-0000-000000000001', 'general',    'Company-wide announcements and chatter', false, '11111111-1111-1111-1111-111111111111'),
   ('cccccccc-0000-0000-0000-000000000002', 'bbbbbbbb-0000-0000-0000-000000000001', 'deployments','CI/CD and release coordination',         false, '22222222-2222-2222-2222-222222222222'),
-  ('cccccccc-0000-0000-0000-000000000003', 'bbbbbbbb-0000-0000-0000-000000000002', 'design-crit','Weekly design critique',                 false, '33333333-3333-3333-3333-333333333333')
+  ('cccccccc-0000-0000-0000-000000000003', 'bbbbbbbb-0000-0000-0000-000000000002', 'design-crit','Weekly design critique',                 false, '33333333-3333-3333-3333-333333333333'),
+  -- Private channel inside the (public) Engineering team: Alice and Dave only.
+  -- Bob is on the team but must not see it, read it, or stream it.
+  ('cccccccc-0000-0000-0000-000000000004', 'bbbbbbbb-0000-0000-0000-000000000001', 'incident-response','On-call escalations',            true,  '11111111-1111-1111-1111-111111111111'),
+  ('cccccccc-0000-0000-0000-000000000005', 'bbbbbbbb-0000-0000-0000-000000000003', 'General',    'Leadership discussion',                  false, '11111111-1111-1111-1111-111111111111'),
+  ('cccccccc-0000-0000-0000-000000000006', 'bbbbbbbb-0000-0000-0000-000000000004', 'lab-notes',  'Globex research notes',                  false, '33333333-3333-3333-3333-333333333333')
 ON CONFLICT (id) DO NOTHING;
 
 INSERT INTO channel_members (channel_id, user_id) VALUES
@@ -70,8 +87,19 @@ INSERT INTO channel_members (channel_id, user_id) VALUES
   -- a member of it — channel membership is what authorizes reads and writes.
   ('cccccccc-0000-0000-0000-000000000002', '44444444-4444-4444-4444-444444444444'),
   ('cccccccc-0000-0000-0000-000000000003', '33333333-3333-3333-3333-333333333333'),
-  ('cccccccc-0000-0000-0000-000000000003', '11111111-1111-1111-1111-111111111111')
+  ('cccccccc-0000-0000-0000-000000000003', '11111111-1111-1111-1111-111111111111'),
+  ('cccccccc-0000-0000-0000-000000000004', '11111111-1111-1111-1111-111111111111'),
+  ('cccccccc-0000-0000-0000-000000000004', '44444444-4444-4444-4444-444444444444'),
+  ('cccccccc-0000-0000-0000-000000000005', '11111111-1111-1111-1111-111111111111'),
+  ('cccccccc-0000-0000-0000-000000000005', '33333333-3333-3333-3333-333333333333'),
+  ('cccccccc-0000-0000-0000-000000000006', '33333333-3333-3333-3333-333333333333')
 ON CONFLICT (channel_id, user_id) DO NOTHING;
+
+-- Unread state: Alice last read #deployments 30 minutes ago, so Bob's two
+-- deploy updates after that show as an unread badge of 2 in her sidebar.
+UPDATE channel_members SET last_read_at = NOW() - INTERVAL '30 minutes'
+WHERE channel_id = 'cccccccc-0000-0000-0000-000000000002'
+  AND user_id = '11111111-1111-1111-1111-111111111111';
 
 -- ---------------------------------------------------------------------------
 -- Messages (general channel gets a short conversation)
@@ -99,7 +127,15 @@ INSERT INTO messages (id, channel_id, user_id, content, created_at) VALUES
   -- #design-crit: the landing channel for the Design team
   ('dddddddd-0000-0000-0000-00000000000f', 'cccccccc-0000-0000-0000-000000000003', '11111111-1111-1111-1111-111111111111', 'Joining from the eng side - curious how the new empty states landed.', NOW() - INTERVAL '25 minutes'),
   ('dddddddd-0000-0000-0000-000000000010', 'cccccccc-0000-0000-0000-000000000003', '33333333-3333-3333-3333-333333333333', 'Three of them to review today. The tricky one is the "no channels yet" state - it has to teach the hierarchy without a wall of text.', NOW() - INTERVAL '18 minutes'),
-  ('dddddddd-0000-0000-0000-000000000011', 'cccccccc-0000-0000-0000-000000000003', '11111111-1111-1111-1111-111111111111', 'Agreed. If someone lands there confused about org vs team vs channel, the empty state is the only thing that can explain it.', NOW() - INTERVAL '12 minutes')
+  ('dddddddd-0000-0000-0000-000000000011', 'cccccccc-0000-0000-0000-000000000003', '11111111-1111-1111-1111-111111111111', 'Agreed. If someone lands there confused about org vs team vs channel, the empty state is the only thing that can explain it.', NOW() - INTERVAL '12 minutes'),
+
+  -- #incident-response (private): only Alice and Dave can read these
+  ('dddddddd-0000-0000-0000-000000000012', 'cccccccc-0000-0000-0000-000000000004', '44444444-4444-4444-4444-444444444444', 'Paging: payments p99 jumped to 2.4s after the 3pm deploy. Investigating the connection pool.', NOW() - INTERVAL '15 minutes'),
+  ('dddddddd-0000-0000-0000-000000000013', 'cccccccc-0000-0000-0000-000000000004', '11111111-1111-1111-1111-111111111111', 'Thanks Dave. Keep this channel private until we know whether customer data was involved.', NOW() - INTERVAL '10 minutes'),
+
+  -- Leadership (private team) and Globex (other tenant)
+  ('dddddddd-0000-0000-0000-000000000014', 'cccccccc-0000-0000-0000-000000000005', '33333333-3333-3333-3333-333333333333', 'Draft headcount plan for next quarter is in the shared folder.', NOW() - INTERVAL '40 minutes'),
+  ('dddddddd-0000-0000-0000-000000000015', 'cccccccc-0000-0000-0000-000000000006', '33333333-3333-3333-3333-333333333333', 'Globex-only: prototype results attached to the lab notebook.', NOW() - INTERVAL '1 hour')
 ON CONFLICT (id) DO NOTHING;
 
 -- ---------------------------------------------------------------------------

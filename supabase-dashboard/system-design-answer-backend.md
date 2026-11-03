@@ -21,7 +21,7 @@ Questions I would ask up front:
 - **Project management**: CRUD with per-project target-database connection configuration, membership roles
 - **Schema introspection**: discover tables, columns, types, PK/FK constraints, and approximate row counts from any PostgreSQL database at runtime
 - **SQL execution**: run arbitrary user SQL against the target database, return rows or affected counts, surface errors verbatim
-- **DDL generation**: produce create/alter/drop statements from structured column definitions with identifier sanitization
+- **DDL generation**: produce create/alter/drop statements from structured column definitions, with every identifier quoted and every slot validated
 - **Table data CRUD**: paginated, sorted row reads plus insert/update/delete keyed by primary key
 - **Auth user management**: CRUD over simulated auth users scoped per project
 - **Connection testing**: verify target connectivity before use
@@ -125,7 +125,8 @@ GET/PUT         /api/projects/:pid/settings      connection settings
 Design notes on the API surface:
 
 - Everything under a project id is authorized against project_members **before** any target connection is touched — authorization is a metadata-database concern and must not require target connectivity.
-- The row endpoints assume a single-column primary key, whose name the client learns from introspection. Composite keys route to the SQL editor — an honest 90/10 boundary rather than a URL-encoding scheme for compound keys that nobody gets right.
+- The row endpoints address rows by the table's single-column primary key, which the **server** looks up from the catalog on each write — never a key column named by the client, because a non-unique "id" would turn a one-row edit into a mass update. Tables without one, or with a composite key, route to the SQL editor — an honest 90/10 boundary rather than a URL-encoding scheme for compound keys that nobody gets right.
+- Roles are owner / editor / viewer: viewers read and run read-only SQL, editors also write, owners also manage settings and members. Non-members get 404, not 403, so project IDs can't be probed.
 - Row reads accept page, sortBy, and sortOrder; sort columns are validated against the introspected column list before being interpolated into an ORDER BY. An allowlist that comes from the database itself is the only injection-safe way to build dynamic ORDER BY.
 - Settings updates double as a cache-control signal: a successful PUT evicts the project's connection pool, so credential changes take effect on the next query without a restart.
 
@@ -200,7 +201,7 @@ Introspection powers the table editor: discover every table, its columns, constr
 **The pipeline:**
 
 1. Load and decrypt the project's connection config from metadata
-2. Open a **short-lived dedicated connection** to the target (not a pooled one)
+2. Check out a connection from the project's pool — the same pool, breaker and cap as every other target query
 3. Query the standard information_schema views: tables (public base tables), columns (name, type, nullable, default, ordinal position), then the constraint joins for primary and foreign keys
 4. Read approximate row counts from the planner's statistics (reltuples) instead of counting rows
 5. Assemble structured per-table results and return
@@ -209,7 +210,9 @@ Introspection powers the table editor: discover every table, its columns, constr
 
 **Why estimated counts instead of exact ones?** A real count is a full table scan — seconds to minutes on a 100M-row table, holding a connection the whole time, on a database we don't own. Planner estimates are typically within ~10% once autovacuum's analyze has run, which is exactly right for a "~1.2M rows" badge. Exact counting becomes an explicit user-triggered action with a warning, never a default.
 
-**Why a fresh connection instead of the pool?** Pooled sessions can carry cached catalog state and stale search_path settings; a dedicated connection guarantees the introspection reflects DDL that committed a millisecond ago. The ~50ms setup cost lands on a navigation event (opening the table editor), not in a hot loop.
+**Why the pool and not a fresh connection?** I first reached for a dedicated connection "to see fresh DDL", but that reasoning doesn't hold: Postgres invalidates catalog caches on commit, so a pooled session sees a just-committed CREATE TABLE immediately. What *can* go stale on a pooled session is state a user left behind (a SET search_path, an open transaction), and that's solved where it's created: the SQL editor resets every session before returning it to the pool. A dedicated connection would only add a handshake per navigation and a connection outside the 5-per-project cap.
+
+Planner estimates have one trap worth naming: a table that has never been analyzed reports -1, and small tables may never cross autovacuum's threshold. The API returns "not estimated yet" for that case rather than a confident zero.
 
 **The N+1 problem, and when it bites:**
 
@@ -233,7 +236,9 @@ Users run arbitrary SQL. The threat model isn't just malice — it's the innocen
 2. **Statement timeout**: a 30s hard cap set on the session kills runaway queries server-side; a 5s connect timeout makes dead hosts fail fast.
 3. **Rate limiting**: 100 executions/minute per user — an order of magnitude above interactive typing speed, an order of magnitude below scripted abuse. Auth endpoints get a much stricter budget (brute-force protection), the general API a looser one.
 4. **Result caps**: rows beyond a configurable limit are truncated with a warning flag; a billion-row SELECT must not materialize in our heap.
-5. **Circuit breaker** around all target operations: opens at 50% error rate, half-opens after 30s. When a target dies, requests fail in milliseconds with a clear message instead of stacking 30-second timeouts that consume the event loop.
+5. **Circuit breaker** per project around all target operations: opens at 50% error rate, half-opens after 30s, and counts only connection-level failures. When a target dies, requests fail in milliseconds with a clear message instead of stacking 30-second timeouts that consume the event loop.
+6. **One statement per request, and a clean session afterwards.** Statements go through the extended protocol, which Postgres refuses to split, so a batch gets a clear error instead of running fully and failing to report. Before a pooled connection is reused, it is rolled back and reset. Otherwise one user's SET statement_timeout = 0, advisory lock or dangling BEGIN would belong to whoever drew that connection next. Multi-statement work goes in a DO block, which is atomic.
+7. **Role-scoped read-only mode.** Viewers' statements run inside a READ ONLY transaction, pinned with a snapshot so they can't flip it back to READ WRITE. Postgres refuses the write; we never parse the SQL.
 
 **Why not parse SQL and block dangerous statements?**
 
@@ -241,11 +246,12 @@ Users run arbitrary SQL. The threat model isn't just malice — it's the innocen
 |----------|------|------|
 | ✅ Timeouts + privileges + limits | Catches every case incl. dynamic SQL; simple | Destructive-but-authorized statements run |
 | ❌ Statement parsing / blocklists | Feels safe in a demo | Trivially bypassed via DO blocks, functions, CTEs, string-built SQL; permanent cat-and-mouse |
-| ❌ Forced read-only mode | Genuinely safe | Breaks the product — a management console must mutate |
+| ❌ Forced read-only mode for everyone | Genuinely safe | Breaks the product — a management console must mutate |
+| ✅ Read-only transaction for the viewer role | Postgres enforces it, no parsing | Not a privilege boundary if the stored credentials are a superuser's |
 
 > "Parsing user SQL to block scary keywords is security theater against an adversary who has a full programming language on the other end — a DO block or a function call executes anything without the keyword ever appearing in my parser's view. Worse, the blocklist punishes legitimate users who *should* be able to drop their own tables from a database console. The honest boundary is PostgreSQL's privilege system for authorization plus my resource limits for protecting the *service*. What I give up: a user with write credentials can destroy their own data through us. That is the product working as designed — mitigated by confirmation UX upstream and, at production scale, point-in-time backups, not by pretending a regex is a security boundary."
 
-**DDL generation is the one place we construct SQL ourselves** — from structured form inputs, never from user SQL strings. Identifiers are sanitized to alphanumeric-plus-underscore and reserved words are quoted; values never appear in DDL at all, so injection through a table *name* dies in the sanitizer. The generator deliberately supports only the common type-and-constraint set — partial indexes, generated columns, and custom types route to the SQL editor. An 80/20 boundary that keeps the safe path safe and the power path powerful.
+**DDL generation is the one place we construct SQL ourselves** — from structured form inputs, never from user SQL strings. Every identifier is double-quoted with embedded quotes doubled, so reserved words need no keyword list. Names for new objects are validated and *rejected* when invalid. Silently stripping characters means creating an object the user didn't name. The type and default slots are checked against patterns too: a type is the easiest place to smuggle a second statement into otherwise generated DDL. The generator deliberately supports only the common type-and-constraint set — partial indexes, generated columns, and custom types route to the SQL editor. An 80/20 boundary that keeps the safe path safe and the power path powerful.
 
 **Error passthrough**: PostgreSQL errors return to the client verbatim — code, message, position offset. For a developer console the error *is* the product; sanitizing it would be self-sabotage. This is defensible only because callers are authenticated project members querying their own databases, not anonymous internet traffic.
 
@@ -262,7 +268,9 @@ Layered, in order of evaluation:
 
 > "The SSRF surface is the security question I'd spend interview time on, because it falls out of the core feature rather than an implementation bug. Mitigations: resolve and validate the target host against a denylist of private and link-local ranges before connecting (re-validating post-DNS-resolution to beat DNS rebinding), run target-connection workers in an egress-restricted network segment where internal services simply aren't routable, and rate-limit connection tests so failed probes are slow and noisy. The network-segmentation option is the strong one — policy enforced by routing tables can't be bypassed by a clever hostname."
 
-5. **Injection surfaces**: user *values* go through parameterized queries everywhere we build SQL (row CRUD); user *identifiers* go through the sanitizer (DDL generation); user *SQL* is passed through untouched by design, governed by privileges and resource limits as covered in Deep Dive 3.
+5. **Injection surfaces**: user *values* go through parameterized queries everywhere we build SQL (row CRUD); user *identifiers* are always quoted, never stripped (DDL and row CRUD); user *SQL* is passed through untouched by design, governed by privileges and resource limits as covered in Deep Dive 3.
+
+> "One SSRF case deserves its own control even locally: a project pointed back at *our own* metadata database. Separate pools and credentials don't prevent it — the user chooses the host, and default credentials are guessable. A host:port comparison misses aliases (a LAN address, a second hostname, another database on the same server), so I compare server identity instead: on each new pool, the server's start timestamp against the metadata server's. Same server, refused, whatever name was used to reach it."
 
 ## 🛡️ Consistency, Idempotency, and Sessions
 
@@ -336,7 +344,8 @@ The pattern: idempotent-by-nature HTTP verbs (GET, PUT, DELETE) retry safely bec
 
 - **Introspection pipeline tests** run against a real ephemeral PostgreSQL container seeded with a known schema (varied types, composite constraints, self-referencing FKs) — mocking information_schema is pointless when the whole point is faithfully reflecting real catalog behavior.
 - **Pool manager tests** exercise creation, eviction on settings change, and idle timeout with fake timers, plus a chaos test that kills the target mid-query to verify the pool is evicted rather than retried into.
-- **DDL generator tests** are property-based on identifiers: reserved words, embedded quotes, unicode, SQL-injection payloads as table names — asserting the sanitizer always produces a safely quoted identifier and never a syntax error from unescaped input.
+- **DDL generator tests** are property-based on identifiers: reserved words, embedded quotes, unicode, SQL-injection payloads as table names — asserting quoting always yields exactly one identifier, invalid new names are rejected rather than rewritten, and SQL in the type or default slot never reaches a statement.
+- **Authorization tests** are a role matrix (creator, owner, editor, viewer, non-member × view, edit, own), plus route tests proving a non-member gets 404 and never reaches the target database.
 - **Circuit breaker tests** assert the state machine directly (closed → open at threshold → half-open after cooldown → closed on success) rather than only checking end-to-end latency, since the failure mode we care about is *when* it trips, not just *that* it eventually helps.
 - Route-level tests mock the shared DB/cache/pool modules per the repo's standard pattern, keeping unit tests fast while the introspection and pool-manager suites above cover the parts that only fail against a real PostgreSQL wire protocol.
 - **Load testing target operations, not just metadata ones**: the meaningful load test here is hundreds of simulated projects each with their own target database, verifying the pool-eviction and circuit-breaker logic under realistic churn — a load test that only hammers /api/projects would validate the wrong bottleneck entirely, given the scale analysis above.

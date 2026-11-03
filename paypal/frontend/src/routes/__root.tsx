@@ -52,6 +52,15 @@ function Header() {
               >
                 Wallet
               </Link>
+              {user.role === 'admin' && (
+                <Link
+                  to="/admin"
+                  className="px-3 py-2 rounded-md text-sm font-medium hover:bg-white/10 transition-colors"
+                  activeProps={{ className: 'px-3 py-2 rounded-md text-sm font-medium bg-white/20' }}
+                >
+                  Admin
+                </Link>
+              )}
             </nav>
           </div>
           <div className="flex items-center space-x-4">
@@ -79,7 +88,10 @@ function RootComponent() {
   return (
     <div className="min-h-screen bg-paypal-bg">
       <Header />
-      <Outlet />
+      {/* Main landmark for assistive tech; the smoke tests also key on it. */}
+      <main>
+        <Outlet />
+      </main>
     </div>
   );
 }

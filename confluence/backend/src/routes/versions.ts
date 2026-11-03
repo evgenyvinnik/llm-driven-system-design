@@ -1,22 +1,22 @@
 import { Router, Request, Response } from 'express';
 import { requireAuth } from '../middleware/auth.js';
 import { getVersionHistory, computeDiff, restoreVersion } from '../services/versionService.js';
-import { logger } from '../services/logger.js';
+import { callerFrom, requirePage, respondError } from '../services/accessService.js';
 
 const router = Router();
 
-// Get version history for a page
+// Version history for a page (anyone who can see the page)
 router.get('/:pageId', async (req: Request, res: Response) => {
   try {
+    await requirePage(req.params.pageId, callerFrom(req), 'view');
     const versions = await getVersionHistory(req.params.pageId);
     res.json({ versions });
   } catch (err) {
-    logger.error({ err }, 'Failed to get version history');
-    res.status(500).json({ error: 'Failed to get version history' });
+    respondError(res, err, 'Failed to get version history');
   }
 });
 
-// Get diff between two versions
+// Diff between two versions
 router.get('/:pageId/diff', async (req: Request, res: Response) => {
   try {
     const fromVersion = parseInt(req.query.from as string);
@@ -27,29 +27,28 @@ router.get('/:pageId/diff', async (req: Request, res: Response) => {
       return;
     }
 
+    await requirePage(req.params.pageId, callerFrom(req), 'view');
     const diff = await computeDiff(req.params.pageId, fromVersion, toVersion);
     res.json({ diff });
   } catch (err) {
-    logger.error({ err }, 'Failed to compute diff');
-    res.status(500).json({ error: 'Failed to compute diff' });
+    respondError(res, err, 'Failed to compute diff');
   }
 });
 
-// Restore a version
+// Restore a version (editors of the space)
 router.post('/:pageId/restore', requireAuth, async (req: Request, res: Response) => {
   try {
-    const { versionNumber } = req.body;
-
-    if (!versionNumber) {
+    const versionNumber = Number(req.body.versionNumber);
+    if (!Number.isInteger(versionNumber) || versionNumber < 1) {
       res.status(400).json({ error: 'Version number is required' });
       return;
     }
 
-    await restoreVersion(req.params.pageId, versionNumber, req.session.userId!);
-    res.json({ message: 'Version restored' });
+    await requirePage(req.params.pageId, callerFrom(req), 'edit');
+    const restored = await restoreVersion(req.params.pageId, versionNumber, req.session.userId!);
+    res.json({ message: 'Version restored', ...restored });
   } catch (err) {
-    logger.error({ err }, 'Failed to restore version');
-    res.status(500).json({ error: 'Failed to restore version' });
+    respondError(res, err, 'Failed to restore version');
   }
 });
 

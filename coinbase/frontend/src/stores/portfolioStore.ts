@@ -17,10 +17,11 @@ interface PortfolioState {
   placeOrder: (data: {
     tradingPairId: string;
     side: 'buy' | 'sell';
-    orderType: 'market' | 'limit';
+    orderType: 'market' | 'limit' | 'stop';
     quantity: string;
     price?: string;
-  }) => Promise<{ id: string; status: string }>;
+    stopPrice?: string;
+  }) => Promise<{ id: string; status: string; filledQuantity: string; avgFillPrice: string | null }>;
   cancelOrder: (orderId: string) => Promise<void>;
 }
 

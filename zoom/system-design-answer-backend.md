@@ -145,8 +145,8 @@ Client                  Signaling Server              SFU
 
 | Direction | Message | Payload |
 |-----------|---------|---------|
-| C→S | `join-meeting` | meetingCode, displayName |
-| S→C | `joined` | meetingId, participants, rtpCapabilities, transportOptions, existingProducers |
+| C→S | `join-meeting` | meetingCode, displayName, lobby mute/camera state |
+| S→C | `joined` / `waiting` / `join-rejected` | snapshot incl. caller's role / held in waiting room / refused with a reason |
 | C→S | `produce` | kind (audio/video/screen), rtpParameters |
 | S→C | `produced` | producerId, kind |
 | S→C | `new-producer` | userId, producerId, kind |
@@ -158,6 +158,10 @@ Client                  Signaling Server              SFU
 | S→ALL | `participant-update` | userId, isMuted, isVideoOn, isScreenSharing, isHandRaised |
 | C→S | `chat-message` | content, recipientId? |
 | S→ALL/DM | `chat-message` | senderId, senderName, content, recipientId?, createdAt |
+| C→S (host) | `admit-participant`, `mute-participant`, `remove-participant`, `transfer-host`, `lock-meeting`, `end-meeting` | target userId or flag |
+| S→ALL | `role-changed`, `meeting-locked`, `meeting-ended` | results of host actions |
+
+> "The sender's identity is never in the payload. The socket is bound to the session at upgrade time, so `mute-participant` from a participant fails on role, not on trust. Every host action also requires the target to rank below the caller, which is why a co-host can mute a participant but not the host."
 
 ---
 
@@ -275,15 +279,15 @@ The bottlenecks emerge in this order as concurrency grows:
 
 ### Reconnection Strategy
 
-When a participant's WebSocket connection drops, the server does not immediately broadcast a leave event. Instead, a 5-second grace period allows the client to reconnect. The reconnection flow works as follows:
+When a participant's WebSocket connection drops, the server does not immediately broadcast a leave event. Instead, the seat (and the role that comes with it) is held for a 10-second grace period. The reconnection flow works as follows:
 
-1. The client detects the WebSocket close event and begins exponential backoff reconnection (1s, 2s, 4s, 8s, 16s — maximum 5 attempts).
-2. Upon reconnecting, the client sends a `join-meeting` message with its last known sequence number.
-3. The server replays any missed state changes from a Redis buffer (retained 60 seconds after disconnection).
-4. The client's existing media transports may still be alive (ICE connections survive brief network blips). If they are, the client simply re-registers its producers. If transports have timed out, the client performs a full re-negotiation.
-5. Other participants see seamless continuity — no "X left / X joined" notification unless the disconnect exceeds the grace period.
+1. The server finds dead sockets with a 30-second ping/pong heartbeat; otherwise a closed laptop lid would only be noticed when TCP gives up minutes later.
+2. The client detects the close and begins exponential backoff reconnection (1s, 2s, 4s, 8s, 16s, maximum 5 attempts).
+3. On reconnecting it re-sends `join-meeting`. Inside the grace window the server resumes the same seat and returns a fresh `joined` snapshot, so there is no replay buffer to keep. Participant state is last-writer-wins, and a snapshot is always correct.
+4. The client re-registers its producers on the new transports. The old connection's producers are closed so nobody keeps consuming dead tracks.
+5. Other participants see no "X left / X joined" unless the grace period expires.
 
-This approach prioritizes perceived stability. Users on flaky Wi-Fi connections should not see their own meeting state reset every time the network hiccups for 2 seconds.
+> "One seat per user per meeting, matching the unique attendance row, also settles duplicate tabs: the newest connection takes the seat, and the old one is told and closed. The alternative, one seat per tab, avoids kicking anybody, but it doubles the user in everyone's grid. Worse, closing the old tab would look like the user leaving."
 
 ---
 
@@ -321,7 +325,9 @@ All logs are JSON-formatted with correlation fields: meeting_id, user_id, and a 
 
 Session-based authentication with Redis as the session store. Passwords are hashed with bcrypt (cost factor 10). Rate limiting is applied to auth endpoints (20 requests per 15 minutes per IP) and general API endpoints (100 requests per 15 minutes per IP).
 
-Meeting-level authorization is enforced by role: only hosts and co-hosts can start/end meetings, create breakout rooms, or mute other participants. Participants can only control their own media state.
+Meeting-level authorization is enforced by role, and the live role is held by the signaling server, not inferred from who created the meeting. Hosts and co-hosts admit from the waiting room, mute, remove, lock and run breakout rooms. Only the host ends the meeting for everyone or transfers host. When the host leaves, the role passes to the longest-present co-host, else the longest-present participant, so a meeting is never left with nobody able to moderate. Meeting details and chat history are visible only to the organizer and attendees, and anyone else gets a 404, so a leaked meeting id reveals nothing. A DM is visible only to its two parties.
+
+> "The meeting code is a bearer credential: unguessable, but it works for anyone it is forwarded to. So I don't treat the code as access control. It only lets someone *ask* to join. The waiting room puts admission with a person, lock closes the door mid-meeting, and removal is sticky for that meeting. Per-invitee tokens would be stronger, but they kill the 'just send me the code' workflow that makes ad-hoc meetings work."
 
 ### End-to-End Encryption Trade-off
 
@@ -334,7 +340,7 @@ Meeting-level authorization is enforced by role: only hosts and co-hosts can sta
 
 ### WebSocket Security
 
-In production, WebSocket connections should be authenticated using a short-lived token obtained during the REST login flow, rather than passing userId and username as query parameters. The token is verified on connection upgrade and bound to a session. CORS restrictions ensure only the authorized frontend origin can establish WebSocket connections.
+The WebSocket upgrade is authenticated with the same session cookie as REST, and the client never names itself. Because cookies ride along automatically, the upgrade also checks the `Origin` header against an allowlist; otherwise any page the user visits could open a socket as them (cross-site WebSocket hijacking). Once signaling spans several nodes, I would switch to a short-lived signed token issued by the REST API, so signaling nodes never read the session store.
 
 ---
 

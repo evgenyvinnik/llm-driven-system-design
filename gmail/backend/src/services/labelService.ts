@@ -135,13 +135,26 @@ export const assignLabel = async (
   userId: string,
   threadId: string,
   labelId: string
-): Promise<void> => {
-  await query(
+): Promise<boolean> => {
+  // The label must be the caller's own and the thread one they can see;
+  // otherwise this could attach another user's label, or label a stranger's thread.
+  const result = await query(
     `INSERT INTO thread_labels (thread_id, label_id, user_id)
-     VALUES ($1, $2, $3)
-     ON CONFLICT (thread_id, label_id, user_id) DO NOTHING`,
+     SELECT $1, l.id, $3 FROM labels l
+     WHERE l.id = $2 AND l.user_id = $3
+       AND EXISTS (SELECT 1 FROM messages m WHERE m.thread_id = $1 AND (m.sender_id = $3 OR EXISTS (
+             SELECT 1 FROM message_recipients mr WHERE mr.message_id = m.id AND mr.user_id = $3)))
+     ON CONFLICT (thread_id, label_id, user_id) DO NOTHING
+     RETURNING 1`,
     [threadId, labelId, userId]
   );
+  if ((result.rowCount ?? 0) > 0) return true;
+  // Already assigned counts as success; anything else is not found.
+  const existing = await query(
+    'SELECT 1 FROM thread_labels WHERE thread_id = $1 AND label_id = $2 AND user_id = $3',
+    [threadId, labelId, userId]
+  );
+  return (existing.rowCount ?? 0) > 0;
 };
 
 /**

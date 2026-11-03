@@ -1,14 +1,32 @@
 import http from 'http';
-import { app } from './app.js';
+import { app, sessionMiddleware } from './app.js';
 import { config } from './config/index.js';
 import { wsManager } from './websocket.js';
 import { marketService } from './services/marketService.js';
 import { logger } from './services/logger.js';
+import { ensureExchangeAccount } from './services/exchangeAccount.js';
+import {
+  checkStopTriggers,
+  orderEvents,
+  rehydrateOrderBooks,
+  type OrderUpdateEvent,
+} from './services/orderService.js';
 
 const server = http.createServer(app);
 
 // Initialize WebSocket
-wsManager.initialize(server);
+wsManager.initialize(server, sessionMiddleware);
+
+// Order state changes go to the owner's private channel only.
+orderEvents.on('order_update', (event: OrderUpdateEvent) => {
+  wsManager.sendToUser(event.userId, {
+    type: 'order_update',
+    orderId: event.orderId,
+    symbol: event.symbol,
+    status: event.status,
+    timestamp: Date.now(),
+  });
+});
 
 // Price broadcasting on the main server (for WebSocket clients)
 const BROADCAST_INTERVAL = 2000;
@@ -18,6 +36,8 @@ setInterval(() => {
   for (const symbol of symbols) {
     const priceData = marketService.simulatePriceTick(symbol);
     if (priceData) {
+      checkStopTriggers(symbol);
+
       // Broadcast to ticker subscribers
       wsManager.broadcast(`ticker:${symbol}`, {
         type: 'ticker',
@@ -46,11 +66,39 @@ setInterval(() => {
   });
 }, BROADCAST_INTERVAL);
 
-server.listen(config.port, () => {
-  logger.info(`Coinbase API server running on port ${config.port}`);
-  logger.info(`WebSocket server running on ws://localhost:${config.port}/ws`);
-  logger.info(`Health check: http://localhost:${config.port}/api/v1/health`);
-});
+/**
+ * The book must be rebuilt before the first order arrives: a resting order
+ * that is live in Postgres but missing from memory would never match, and a
+ * new order could trade through it. Postgres may still be starting, so retry.
+ */
+async function prepareMatchingEngine(): Promise<void> {
+  const attempts = 15;
+  for (let attempt = 1; ; attempt++) {
+    try {
+      await ensureExchangeAccount();
+      const counts = await rehydrateOrderBooks();
+      logger.info(counts, 'Order books rebuilt from Postgres');
+      return;
+    } catch (error) {
+      if (attempt >= attempts) throw error;
+      logger.warn({ err: error, attempt }, 'Database not ready; retrying engine startup');
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+    }
+  }
+}
+
+prepareMatchingEngine()
+  .then(() => {
+    server.listen(config.port, () => {
+      logger.info(`Coinbase API server running on port ${config.port}`);
+      logger.info(`WebSocket server running on ws://localhost:${config.port}/ws`);
+      logger.info(`Health check: http://localhost:${config.port}/api/v1/health`);
+    });
+  })
+  .catch((error) => {
+    logger.fatal({ err: error }, 'Could not rebuild order books; refusing to serve');
+    process.exit(1);
+  });
 
 // Graceful shutdown
 process.on('SIGTERM', () => {

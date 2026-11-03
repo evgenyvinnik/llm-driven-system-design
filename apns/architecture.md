@@ -146,7 +146,7 @@ Bulk sends create a durable parent job with an audience snapshot or a documented
 
 ## Database Schema
 
-The complete local schema is [backend/src/db/init.sql](./backend/src/db/init.sql). It contains eight tables. The following summarizes the actual constraints; production additions are listed separately.
+The complete local schema is [backend/src/db/init.sql](./backend/src/db/init.sql). It contains nine tables. The following summarizes the actual constraints; production additions are listed separately.
 
 | Table | Key data | Actual constraints and indexes |
 |-------|----------|--------------------------------|
@@ -158,6 +158,7 @@ The complete local schema is [backend/src/db/init.sql](./backend/src/db/init.sql
 | `feedback_queue` | Sequence ID, token hash, bundle, reason, event timestamp | PK and `(app_bundle_id, timestamp)` index |
 | `admin_users` | UUID, unique username, password hash, role, login timestamp | PK and unique username |
 | `sessions` | UUID, admin UUID, token, expiry | PK, admin FK cascades, unique token and expiry indexes; unused at runtime |
+| `provider_keys` | 10-char key ID, team ID, PEM public key, allowed bundle IDs (`TEXT[]`), creator, revocation time | Key ID PK; creator FK sets null. The private key is never stored |
 
 The key local pending-table definition is:
 
@@ -214,9 +215,11 @@ Registration returns `device_id` and `is_new`. A REST device send accepts a wrap
 
 The result contains `notification_id` and `status`. On a successful topic loop, `queued_count` is the number of child calls that completed without throwing, including online sends. Its returned parent UUID is not a persisted notification that can be queried. Broadcast returns counts for valid devices among the first 10,000 registrations it fetched, not a durable job handle.
 
-The `/3/device/:token` variant takes the bare payload and reads `apns-priority`, `apns-expiration`, `apns-collapse-id`, and `apns-id`. It returns a JSON success body and the ID header, or a simplified 410/500 error. It ignores provider authorization, app topic, push type, and most protocol validation. REST sends do not forward an idempotency key.
+The `/3/device/:token` variant takes the bare payload and reads `apns-priority`, `apns-expiration`, `apns-collapse-id`, and `apns-id`. It returns a JSON success body and the ID header, or a simplified 410/500 error. It requires a provider JWT (or console session), answering `403 {reason}` with `MissingProviderToken`, `InvalidProviderToken`, or `ExpiredProviderToken`, and `400 DeviceTokenNotForTopic` when the device's app is outside the key's bundles. It ignores the `apns-topic` header, push type, and most protocol validation. REST sends do not forward an idempotency key.
 
-WebSocket clients send `connect` with `device_id`; notifications contain `type: notification`, `id`, `payload`, and `priority`. Acknowledgements use `type: ack` and `notification_id`. The `connected` response's `pending_delivered` is a publish count, not a receipt count. No console WebSocket endpoint exists.
+Provider routes take `Authorization: bearer <JWT>`. The JWT is ES256 with header `{alg, kid}` and claims `{iss: teamId, iat}`, signed by a key an admin issued through `POST /api/v1/admin/provider-keys`. That call returns the PEM private key once; the server stores only the public key and the key's allowed bundle IDs.
+
+WebSocket clients send `connect` with `device_token`, the raw token; the server resolves its hash and answers `connected` with the device's `device_id`, or an `error` and close code 4401. Notifications contain `type: notification`, `id`, `payload`, and `priority`. Acknowledgements use `type: ack` and `notification_id` and are accepted only for the socket's own device; others get `error: UnknownNotification`. The `connected` response's `pending_delivered` is a publish count, not a receipt count. No console WebSocket endpoint exists.
 
 For the proposed service, use a stable accepted-operation resource, structured retriable/permanent errors, authenticated receipt messages, and a separate bulk-job resource. Do not retrofit these guarantees into the meaning of the current simulator response.
 
@@ -252,9 +255,13 @@ The notification UUID primary key stops a second row with the same UUID, but the
 
 The production service needs provider credentials, app/environment binding, authenticated device transport, scoped operator permissions, per-tenant quotas, and protected payload retention. Hashing a high-entropy token reduces raw-token exposure in one database; it neither authorizes a sender nor prevents access through other identifiers. An APNs provider still needs secure access to raw addressing tokens.
 
-Locally, login verifies an unsalted SHA-256 password and stores a 24-hour random bearer session in Valkey. `/admin/me` reads that session. Other admin routes—including account creation, broadcast, and cleanup—have no authentication middleware. Device, notification, and feedback APIs are public. Role labels do not enforce permissions.
+Locally there are three credentials, all enforced in [shared/auth.ts](./backend/src/shared/auth.ts) and the socket handler:
 
-A WebSocket client can claim any device UUID or acknowledge any notification UUID without proof of ownership. Invalidating a token does not terminate its socket or remove all existing pending work. CORS is unrestricted and HTTP has no TLS. URLs contain raw tokens on token routes; request logging and current HTTP metric labels can expose them. These are concrete local limitations, not implemented production protections.
+- **Console admins.** Login verifies an unsalted SHA-256 password and stores a 24-hour random bearer session in Valkey. `requireAdmin` guards every admin route except login and logout, including account creation, broadcast, cleanup, and key issuance. Role labels do not enforce permissions.
+- **Providers.** `requireProvider` verifies an ES256 JWT against the stored public key, pins the algorithm (no `alg: none` or HS256 confusion), checks `iss` against the key's team, and rejects tokens older than one hour. The key's bundle IDs then scope every send, history read, feedback read/clear, and device-UUID lookup. Topic sends skip other apps' subscribers. An admin session is also accepted, unscoped, so the console can send tests.
+- **Devices.** A socket must send `connect` with its raw token within 10 seconds. The token is looked up by hash through the token registry, so a device UUID (visible in the console) is not a credential. Invalidated tokens are refused. One socket holds one identity, and acks only update the socket's own notifications.
+
+Registration and the token-keyed device routes stay open: possession of the raw token is the device's credential. That also means anyone holding a token can re-register it and reactivate an invalidated token. Invalidating a token does not terminate an already-open socket or remove all existing pending work. There is no environment (sandbox/production) scope, per-operator permission, login rate limit, CSRF protection, or TLS, and CORS is unrestricted. URLs contain raw tokens on token routes; request logging and current HTTP metric labels can expose them. These are concrete local limitations, not implemented production protections.
 
 ## Observability
 
@@ -267,7 +274,7 @@ Interpret them at their measurement boundaries:
 - `apns_pending_notifications` is declared but never updated. Invalid-device paths decrement the in-flight gauge before throwing and again in the catch path.
 - Token timing measures cache access, not the full database lookup. Negative-cache hits are counted even though the caller still queries PostgreSQL.
 - HTTP route labels are captured before route matching and fall back to the raw path, causing per-token/per-ID cardinality and disclosure.
-- Circuit-breaker and auth/admin audit helpers exist but have no business-path call sites. Health gauges update only when `/health` is requested.
+- Circuit-breaker helpers exist but have no business-path call sites. Auth failures, admin account creation, and provider-key issue/revoke go to the audit logger; successful logins do not. Health gauges update only when `/health` is requested.
 
 Production metrics should separate acceptance, handoff, authenticated receipt, expiry, supersession, and terminal failure. Track oldest retained work and retry age, not only counts. Aggregate centrally across instances; do not compute fleet p99 from ten recent console rows. Payloads and raw tokens do not belong in high-cardinality labels.
 
@@ -320,7 +327,19 @@ if (cached) return cached;
 
 Negative entries return the same null as a cache miss, so the caller still queries the database. An invalidation racing an older lookup can repopulate stale positive state. Registration is read-then-insert, not an atomic upsert; concurrent first registrations can conflict. Re-registration reactivates a token without changing its bundle or clearing old invalidation metadata. Hashing the original hex string also treats upper/lowercase spellings differently.
 
-**Request and token logging.** [shared/logger.ts](./backend/src/shared/logger.ts) supplies Pino HTTP logging and token audit records. These make local flows inspectable, but audit hooks for login/admin actions are not called and request IDs are not propagated through every lifecycle operation. URLs still need redaction; storing a token hash alone does not cover log exposure.
+**Request and token logging.** [shared/logger.ts](./backend/src/shared/logger.ts) supplies Pino HTTP logging and token audit records. These make local flows inspectable. Auth failures and admin changes are audited, but successful logins are not, and request IDs are not propagated through every lifecycle operation. URLs still need redaction; storing a token hash alone does not cover log exposure.
+
+**Three-credential auth.** [shared/auth.ts](./backend/src/shared/auth.ts) holds the admin and provider middleware; [shared/providerToken.ts](./backend/src/shared/providerToken.ts) verifies provider JWTs the way APNs token auth does, with the service holding only public keys:
+
+```typescript
+if (header.alg !== "ES256" || typeof header.kid !== "string") return INVALID;
+const key = await resolveKey(header.kid);            // non-revoked key only
+if (!key || key.team_id !== claims.iss) return INVALID;
+// crypto.verify(..., { key: key.public_key, dsaEncoding: "ieee-p1363" }, signature)
+if (nowSeconds - claims.iat > PROVIDER_TOKEN_MAX_AGE_SECONDS) return EXPIRED;
+```
+
+The principal carries the key's bundle IDs into [pushService.ts](./backend/src/services/pushService.ts), which checks the resolved device's bundle before inserting history. Devices authenticate the socket with the raw token. Each request does one primary-key lookup for the signing key, with no verified-token cache, so revocation takes effect on the next request. `npm run verify:auth` exercises all three credentials against a running stack.
 
 **Prometheus and health endpoints.** [shared/metrics.ts](./backend/src/shared/metrics.ts) and [index.ts](./backend/src/index.ts) connect middleware and expose `/metrics` and `/health`. Health sequentially probes PostgreSQL and Valkey and returns 200 or 503. No monitoring server or alert rules ship in Compose. The measurement gaps described above prevent treating these metrics as a delivery SLO implementation.
 
@@ -336,13 +355,13 @@ It is called before validation, is not coupled to durable work, and has no recov
 
 [db/redis.ts](./backend/src/db/redis.ts) stores all routes in one `device:connections` hash. Every connection sets a **one-hour TTL on the whole hash**. There is no per-device lease refresh. With no new registrations of sockets, even live routes disappear together; steady new connections can keep crashed-device entries alive. The separate five-minute `cache:conn:*` helpers are unused.
 
-[index.ts](./backend/src/index.ts) maps a device ID to one socket. Replacing a connection has no ownership generation, so an old socket closing can delete the replacement's local and Redis route. A single socket can also send multiple connect identities without cleaning all older mappings. There is no heartbeat, device credential check, or acknowledgement ownership check.
+[index.ts](./backend/src/index.ts) maps a device ID to one socket. A socket authenticates once with the device token; a second `connect` is refused. On the same server, a newer socket closes the older one (code 4409), and the older socket's close leaves the replacement's route alone. Across servers there is still no ownership generation: an old socket closing on one server deletes the shared Redis route even if the device has since connected elsewhere. There is no heartbeat.
 
 [pushService.ts](./backend/src/services/pushService.ts) inserts history, marks the ID processed, and then routes or stores. Online publication returns `delivered` without updating history; history remains `pending` until ack. Subscriber absence, a closed socket, and lack of receipt have no retained fallback. Initial expiry sets history to `expired`, yet the caller reports `queued` because it tests only the delivered flag.
 
 Offline storage deletes an older collapse row separately from inserting its replacement. Under concurrent inserts, the conflict handler changes payload, priority, and creation time but retains the existing ID and expiration. Old history records are not marked superseded. This can associate new content with an old identity/deadline. Appending the device UUID to topic collapse IDs can also exceed the local 100-character column limit.
 
-Reconnect reads every unexpired pending row ordered by priority descending then age, publishes them sequentially, and deletes **all pending rows for the device**. That deletion precedes ack and can remove a concurrently inserted row that was not in the fetched batch. Ack handling updates history, inserts delivery log, then deletes pending in separate statements; a duplicate-log failure can prevent the final delete. The fixture pending IDs have no matching history to update.
+Reconnect reads every unexpired pending row ordered by priority descending then age, publishes them sequentially, and deletes **all pending rows for the device**. That deletion precedes ack and can remove a concurrently inserted row that was not in the fetched batch. Ack handling updates history only where the notification belongs to the acknowledging device, then inserts the delivery log (ignoring a repeat ack) and deletes pending in separate statements. The fixture pending IDs have no matching history to update.
 
 The expiry task runs every minute in every API process, marks eligible history rows expired, and deletes expired pending rows. Null expiry is never collected. Redis priority lists are only appended; no code calls the dequeue helper or removes entries on delivery/expiry. Priority affects reconnect sorting, not an active battery-aware scheduler.
 
@@ -352,7 +371,7 @@ Topic sends read all valid subscribers, create separate child notifications sequ
 
 The REST helper checks for an object-like `aps` and counts JavaScript string length, not UTF-8 bytes. A payload with 3,000 `é` characters is 3,020 code units but 6,020 bytes and passes that size check. Invalid REST priority values default to 10; the `/3` route bypasses those validators altogether. Local `apns-expiration: 0` is converted to null and can be stored indefinitely. There is no push-type-specific priority validation.
 
-[feedbackService.ts](./backend/src/services/feedbackService.ts) returns at most 1,000 entries after a strict timestamp, without a tie-breaking cursor. If many entries share a timestamp, advancing by timestamp can skip unseen rows. Clearing without a cutoff removes all feedback for the bundle. Reads and deletes have no provider binding. Invalidation, cache deletion, and feedback insertion are separate writes; re-registering a token does not retract old feedback or pending messages.
+[feedbackService.ts](./backend/src/services/feedbackService.ts) returns at most 1,000 entries after a strict timestamp, without a tie-breaking cursor. If many entries share a timestamp, advancing by timestamp can skip unseen rows. Clearing without a cutoff removes all feedback for the bundle. Reads and deletes require a provider key covering the bundle, or an admin session. Invalidation, cache deletion, and feedback insertion are separate writes; re-registering a token does not retract old feedback or pending messages.
 
 ### Frontend and local substitutions
 
@@ -362,6 +381,6 @@ The dashboard polls every 30 seconds, can overlap requests, and lacks a last-suc
 
 The send form disables submit during a request but allows fields/mode/clear to change. Its eventual result can appear beside a different draft. It provides no operation key, uncertain-outcome recovery, expiry/collapse controls, or receipt subscription. Broadcast is a direct submit. Navigation links disappear below the small-screen breakpoint without replacement navigation. Table identifiers are truncated without a detail/copy path.
 
-Compose supplies persistent PostgreSQL and Valkey only. The host runs APIs and Vite; ports 3001–3003 select server IDs for manual multi-process experiments. There is no load balancer, native iOS transport, HTTP/2/TLS provider server, provider JWT/certificate verification, durable message broker, connected circuit breaker, connected rate limiter, sharding, multi-region deployment, or complete delivery-recovery loop.
+Compose supplies persistent PostgreSQL and Valkey only. The host runs APIs and Vite; ports 3001–3003 select server IDs for manual multi-process experiments. There is no load balancer, native iOS transport, HTTP/2/TLS provider server, certificate-based provider auth, sandbox/production environment scoping, durable message broker, connected circuit breaker, connected rate limiter, sharding, multi-region deployment, or complete delivery-recovery loop.
 
-This document reflects a source review. The [five smoke tests](./tests/smoke.spec.ts) check login/page shells and do not establish delivery, authorization, or failure recovery. No application build, database startup, or browser suite was run for this documentation-only revision.
+Apart from the auth behavior, which `npm run verify:auth` checks against a running stack, this document reflects a source review. The [five smoke tests](./tests/smoke.spec.ts) check login/page shells and do not establish delivery, authorization, or failure recovery. No application build, database startup, or browser suite was run for this documentation-only revision.

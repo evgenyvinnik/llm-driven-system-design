@@ -21,6 +21,15 @@ export interface CrdtElement {
 }
 
 /**
+ * True if `incoming` should replace `current`: higher version wins, and a
+ * later updatedAt breaks a version tie. Version-first means a client with a
+ * skewed clock can only win among edits made from the same base version.
+ */
+const wins = (incoming: CrdtElement, current: CrdtElement): boolean =>
+  incoming.version > current.version ||
+  (incoming.version === current.version && incoming.updatedAt > current.updatedAt);
+
+/**
  * Merge two sets of elements using LWW strategy.
  * For each element_id, keep the version with the highest version number.
  * If versions are equal, use updatedAt timestamp as tie-breaker.
@@ -41,14 +50,7 @@ export const mergeElements = (
   for (const element of incoming) {
     const current = elementMap.get(element.id);
 
-    if (!current) {
-      // New element, add it
-      elementMap.set(element.id, element);
-    } else if (element.version > current.version) {
-      // Incoming has higher version, use it
-      elementMap.set(element.id, element);
-    } else if (element.version === current.version && element.updatedAt > current.updatedAt) {
-      // Same version but newer timestamp, use incoming
+    if (!current || wins(element, current)) {
       elementMap.set(element.id, element);
     }
     // Otherwise, keep existing (it has higher version or newer timestamp)
@@ -77,16 +79,14 @@ export const applyOperation = (
   }
 
   switch (operation.type) {
+    // Add and update follow the same rule as a merge. An unconditional add
+    // let a replayed add resurrect a tombstoned element, and `>=` on update
+    // let an equal-version edit win regardless of time.
     case 'add':
-      if (operation.elementData) {
-        elementMap.set(operation.elementId, operation.elementData);
-      }
-      break;
-
     case 'update':
       if (operation.elementData) {
         const existing = elementMap.get(operation.elementId);
-        if (!existing || operation.elementData.version >= existing.version) {
+        if (!existing || wins(operation.elementData, existing)) {
           elementMap.set(operation.elementId, operation.elementData);
         }
       }

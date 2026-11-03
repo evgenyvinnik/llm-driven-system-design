@@ -24,6 +24,8 @@ export interface Message {
   sender: { id: string; displayName: string; email: string };
   to: { displayName: string; email: string }[];
   cc: { displayName: string; email: string }[];
+  /** Only the sender sees the full list; a BCC recipient sees only themself. */
+  bcc: { displayName: string; email: string }[];
   bodyText: string;
   bodyHtml: string | null;
   hasAttachments: boolean;

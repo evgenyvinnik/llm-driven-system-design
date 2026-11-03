@@ -99,27 +99,37 @@ The CRM revolves around five core entities with ownership and association relati
 **Lead Conversion Flow** (the most complex operation):
 
 ```
-┌────────┐     ┌────────────┐     ┌──────────────────────────────────┐
-│ Client │────▶│ POST       │────▶│         Transaction              │
-│        │     │ /leads/:id │     │  1. Validate lead exists         │
-└────────┘     │ /convert   │     │  2. CREATE account               │
-               └────────────┘     │  3. CREATE contact (from lead)   │
-                                  │  4. CREATE opportunity (optional) │
-                                  │  5. UPDATE lead status=Converted │
-                                  │  6. COMMIT                       │
-                                  └──────────────────────────────────┘
+┌────────┐     ┌────────────┐     ┌──────────────────────────────────────┐
+│ Client │────▶│ POST       │────▶│           Transaction                │
+│        │     │ /leads/:id │     │  1. SELECT lead FOR UPDATE           │
+└────────┘     │ /convert   │     │     (404 if not caller's, 409 if     │
+               └────────────┘     │      already converted)              │
+                                  │  2. CREATE account   (lead's owner)  │
+                                  │  3. CREATE contact   (from lead)     │
+                                  │  4. CREATE opportunity (optional,    │
+                                  │     Qualification @ 20%)             │
+                                  │  5. UPDATE lead SET Converted        │
+                                  │     WHERE converted_at IS NULL       │
+                                  │  6. COMMIT                           │
+                                  └──────────────────────────────────────┘
 ```
 
 Lead conversion is the riskiest operation in the system. It creates 2-3 entities in a single database transaction (account, contact, and optionally opportunity), then marks the lead as converted. If any step fails, the entire transaction rolls back -- no partial conversions can exist. The alternative (saga pattern with compensating transactions) adds unnecessary complexity for a single-database operation. At scale, this transaction acquires a dedicated connection from the pool and uses explicit `BEGIN`/`COMMIT`/`ROLLBACK` to guarantee atomicity.
 
+Atomicity alone does not stop a *double* conversion. Two requests (a double-click, a retry) can each read the lead as unconverted and each create an account and contact; the second `UPDATE` then overwrites the first lead's links. Reading the lead with `SELECT ... FOR UPDATE` serializes them: the second transaction waits for the first to commit, re-reads the row, sees `converted_at` set, and returns 409. The final `UPDATE ... WHERE converted_at IS NULL` repeats the guard so the write itself refuses a second conversion.
+
 **Kanban Stage Update Flow:**
 
 ```
-┌────────┐     ┌────────────┐     ┌──────────────────────────────────┐
-│ Client │────▶│ PUT /opps/ │────▶│  1. Validate stage transition    │
-│ (drag) │     │ :id/stage  │     │  2. UPDATE stage + probability   │
-└────────┘     └────────────┘     │  3. Return updated opportunity   │
-                                  └──────────────────────────────────┘
+┌────────┐     ┌────────────┐     ┌──────────────────────────────────────┐
+│ Client │────▶│ PUT /opps/ │────▶│  1. Load row the caller can see      │
+│ (drag, │     │ :id/stage  │     │  2. Validate transition (closed deals│
+│ optim- │     └────────────┘     │     reopen only for admins: 409)     │
+│ istic) │                        │  3. UPDATE stage, probability,       │
+└────────┘                        │     closed_at WHERE stage = <read>   │
+                                  │     (0 rows -> 409, reload)          │
+                                  │  4. Return updated opportunity       │
+                                  └──────────────────────────────────────┘
 ```
 
 ### Pipeline Stages and Probability Mapping
@@ -133,6 +143,8 @@ Lead conversion is the riskiest operation in the system. It creates 2-3 entities
 | Negotiation | 80% | Terms under discussion |
 | Closed Won | 100% | Deal signed |
 | Closed Lost | 0% | Deal lost |
+
+Both write paths plan stage changes through one module (`src/services/opportunityStages.ts`). Open deals may move to any stage. A closed deal (Won or Lost) is final for reps: reopening it, or flipping Won to Lost, needs an admin. Closed stages pin probability at 100 / 0. `closed_at` is stamped when a deal enters a closed stage and cleared when it leaves one, and the revenue report books deals by it.
 
 ## Database Schema
 
@@ -191,8 +203,14 @@ CREATE TABLE IF NOT EXISTS opportunities (
   close_date DATE,
   description TEXT,
   owner_id UUID REFERENCES users(id),
+  closed_at TIMESTAMPTZ,            -- set by the API on entering Closed Won/Lost
   created_at TIMESTAMPTZ DEFAULT NOW(),
-  updated_at TIMESTAMPTZ DEFAULT NOW()
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  CONSTRAINT opportunities_stage_check CHECK (stage IN (
+    'Prospecting', 'Qualification', 'Needs Analysis', 'Proposal',
+    'Negotiation', 'Closed Won', 'Closed Lost')),
+  CONSTRAINT opportunities_probability_check CHECK (probability BETWEEN 0 AND 100),
+  CONSTRAINT opportunities_amount_check CHECK (amount_cents >= 0)
 );
 
 CREATE TABLE IF NOT EXISTS leads (
@@ -205,13 +223,16 @@ CREATE TABLE IF NOT EXISTS leads (
   title VARCHAR(100),
   source VARCHAR(50),
   status VARCHAR(30) DEFAULT 'New',
-  converted_account_id UUID REFERENCES accounts(id),
-  converted_contact_id UUID REFERENCES contacts(id),
-  converted_opportunity_id UUID REFERENCES opportunities(id),
+  converted_account_id UUID REFERENCES accounts(id) ON DELETE SET NULL,
+  converted_contact_id UUID REFERENCES contacts(id) ON DELETE SET NULL,
+  converted_opportunity_id UUID REFERENCES opportunities(id) ON DELETE SET NULL,
   converted_at TIMESTAMPTZ,
   owner_id UUID REFERENCES users(id),
   created_at TIMESTAMPTZ DEFAULT NOW(),
-  updated_at TIMESTAMPTZ DEFAULT NOW()
+  updated_at TIMESTAMPTZ DEFAULT NOW(),
+  CONSTRAINT leads_status_check CHECK (status IN ('New', 'Contacted', 'Qualified', 'Unqualified', 'Converted')),
+  -- only the conversion transaction sets either half
+  CONSTRAINT leads_converted_check CHECK ((status = 'Converted') = (converted_at IS NOT NULL))
 );
 
 CREATE TABLE IF NOT EXISTS activities (
@@ -259,6 +280,8 @@ CREATE INDEX IF NOT EXISTS idx_activities_related ON activities(related_type, re
 CREATE INDEX IF NOT EXISTS idx_activities_owner ON activities(owner_id, due_date);
 CREATE INDEX IF NOT EXISTS idx_custom_field_values_entity ON custom_field_values(entity_id);
 CREATE INDEX IF NOT EXISTS idx_accounts_owner ON accounts(owner_id);
+CREATE INDEX IF NOT EXISTS idx_contacts_owner ON contacts(owner_id);
+CREATE INDEX IF NOT EXISTS idx_opportunities_closed ON opportunities(stage, closed_at);
 ```
 
 Key indexes support the primary access patterns:
@@ -266,12 +289,17 @@ Key indexes support the primary access patterns:
 - `idx_opportunities_owner` -- User-specific deal filtering
 - `idx_activities_related` -- Composite index for polymorphic activity lookups by (type, id)
 - `idx_leads_status` -- Status-based filtering for lead management views
+- `idx_*_owner` -- Every list query a rep makes is filtered by `owner_id` (record-level access)
+
+The CHECK constraints back up the route-level validation: a seed edit or a psql session can no longer create a stage no report counts, or a lead that says "Converted" with no account behind it. `init.sql` ends with an idempotent upgrade block (`ADD COLUMN IF NOT EXISTS`, CHECKs added `NOT VALID`, converted_* FKs re-created with `ON DELETE SET NULL`) so `npm run db:migrate` brings an older database forward without failing on old rows.
 
 ## API Design
 
+Every data endpoint applies the record-level rule below (see Security and Auth): a record the caller can't see returns **404**, not 403, and so does a malformed ID. Invalid input is a 400; a refused state change (reopening a closed deal as a rep, editing a converted lead, a second conversion, a stage that moved underneath you) is a 409. Pagination is clamped (`limit` 1-200).
+
 ### Authentication
 ```
-POST /api/auth/register    Register new user
+POST /api/auth/register    Register new user (always role 'user')
 POST /api/auth/login       Login with credentials
 POST /api/auth/logout      Logout and destroy session
 GET  /api/auth/me          Get current user
@@ -334,11 +362,21 @@ DELETE /api/activities/:id    Delete activity
 ### Reports
 ```
 GET  /api/reports/pipeline   Pipeline by stage (count + amount)
-GET  /api/reports/revenue    Revenue by month
+GET  /api/reports/revenue    Closed-won revenue by month of closed_at (?months=1-60)
 GET  /api/reports/leads      Leads by source
 ```
 
+Each report takes `?all=true`, honoured only for admins. Everyone else gets their own records, and every response carries `scope: 'org' | 'own'` so the UI labels which one it is showing.
+
 ## Key Design Decisions
+
+### Record-Level Access: Private by Owner, Admins See Everything
+
+Every record (account, contact, opportunity, lead, activity) has an `owner_id`. A rep sees and changes only what they own; an admin sees and changes everything. This is Salesforce's "Private" organization-wide default, applied to every object, and it lives in one module (`src/services/accessPolicy.ts`) that every route calls instead of deciding for itself. List queries and aggregates get an `owner_id = $caller` condition; `UPDATE` and `DELETE` carry the same condition in their own `WHERE`, so the check and the write are one statement with no window between them. A rep can't attach a contact, opportunity or activity to a record they can't see either; that's a 400 that says nothing about whether the record exists.
+
+Activities are the exception for reads: a timeline is controlled by its parent, so anyone who can see an opportunity sees every activity on it, including notes an admin logged. Editing or deleting an activity stays with its author or an admin.
+
+The more permissive alternative, Public Read Only (reps read everything and edit their own), is common in real orgs and simpler to build. But it leaks every rep's pipeline and contact list to every other rep, and the reports then have to decide separately what to aggregate. With Private as the baseline, one rule answers both "can I open this record?" and "does this record count in my report?". What we give up is collaboration: there is no role hierarchy (a manager can't see their team's deals) and no sharing rules or manual shares. Those are the next layer, and they would replace the `owner_id = $caller` condition with "owner in the caller's visible set".
 
 ### Polymorphic Activities vs. Separate Tables
 
@@ -356,13 +394,17 @@ At production scale with microservices, if accounts, contacts, and opportunities
 
 ### Stage-Probability Coupling
 
-Opportunity stages automatically set probability percentages when changed via the kanban endpoint (Prospecting=10%, Qualification=20%, etc.). This simplifies pipeline forecasting -- the weighted pipeline value is always consistent. Sales teams can override probability through the full update endpoint, but kanban drag-drop always resets to defaults.
+Opportunity stages automatically set probability percentages when changed via the kanban endpoint (Prospecting=10%, Qualification=20%, etc.). This simplifies pipeline forecasting -- the weighted pipeline value is always consistent. Sales teams can override probability for open deals through the full update endpoint, but kanban drag-drop always resets to defaults, a stage change without an explicit probability applies the new stage's default, and closed stages are pinned at 100% / 0%.
+
+Stage *transitions* are gated too. Closed deals can be reopened (deals genuinely do come back), but only by an admin; for a rep, an accidental drag out of Closed Won would otherwise put booked revenue back into the open pipeline with nothing to flag it.
 
 The alternative (decoupled stage and probability) gives more flexibility but introduces data inconsistency risks where a "Closed Won" deal might show 50% probability, skewing forecasts.
 
 ### Money as Cents (BIGINT)
 
-All monetary values (`amount_cents`, `annual_revenue_cents`) are stored as cents in BIGINT columns. This avoids floating-point arithmetic issues that plague DECIMAL/NUMERIC types in application code and is the standard approach for financial data. The frontend formats cents to dollars for display.
+All monetary values (`amount_cents`, `annual_revenue_cents`) are stored as cents in BIGINT columns. Floats can't represent most decimal fractions, so sums drift; `NUMERIC` would be exact too, but node-postgres returns it as a string the application must parse, and integer cents make a fractional cent impossible to store. The API rejects fractional or negative cents with a 400, and dollars typed into a form are converted to cents exactly once (the conversion modal and the New Opportunity form). The frontend formats cents to dollars for display.
+
+BIGINT has a trap of its own: node-postgres returns int8 as a **string**, because int8 can exceed `Number.MAX_SAFE_INTEGER`. The kanban column total did `sum + o.amount_cents` and concatenated `"0" + "22000000" + "54000000"`. `src/services/db.ts` registers an int8 parser that returns numbers and throws if a value would lose precision; cents and counts here are far below 2^53.
 
 ### Custom Fields via EAV Pattern
 
@@ -372,30 +414,32 @@ The alternative (JSONB column on each entity) is simpler but makes custom fields
 
 ## Consistency and Idempotency
 
-- **Lead conversion** uses PostgreSQL transactions with explicit `BEGIN`/`COMMIT`/`ROLLBACK` to ensure atomic multi-entity creation. A failed conversion leaves the lead unchanged.
-- **Stage updates** are idempotent -- moving an opportunity to its current stage is a no-op that returns the unchanged record.
-- **Optimistic concurrency** is handled through `updated_at` timestamps. At production scale, this would be enforced with a version column and conditional updates (`WHERE version = $expected`).
+- **Lead conversion** uses PostgreSQL transactions with explicit `BEGIN`/`COMMIT`/`ROLLBACK` to ensure atomic multi-entity creation, and locks the lead row (`FOR UPDATE`) so two concurrent conversions serialize: exactly one succeeds, the other gets a 409. A failed conversion leaves the lead unchanged.
+- **Stage updates** are idempotent -- moving an opportunity to its current stage is a no-op that returns the unchanged record without bumping `updated_at`.
+- **Stage writes are compare-and-set.** Both opportunity write paths read the current stage, plan the change, and write `... WHERE id = $1 AND stage = $read`. If another request moved the deal in between, the write matches no row and the caller gets a 409 ("reload and try again") instead of a lost update. This covers the stage, the field that matters for forecasts; other fields are still last-write-wins. At production scale this becomes a version column (`WHERE version = $expected`) covering every field.
+- **Converted leads are read-only** (`UPDATE ... WHERE converted_at IS NULL`; 409 otherwise).
 
 ## Security and Auth
 
-- Session-based authentication with Redis-backed session store (connect-redis)
-- Password hashing with bcrypt (10 rounds)
+- Session-based authentication with Redis-backed session store (connect-redis); the session is regenerated on login and registration (no session fixation)
+- Password hashing with bcrypt (10 rounds); self-registration always creates role `user`
 - CORS configured for frontend origin only
-- Rate limiting: 1000 req/15min for API, 50 req/15min for auth, 30 req/min for reports
-- All data endpoints require authentication via `requireAuth` middleware
-- At production scale: OAuth 2.0 / SAML SSO for enterprise customers, field-level security, sharing rules per organization
+- Rate limiting: 1000 req/15min per IP for the API, 50 req/15min per IP for auth, 60 req/min **per user** for reports. Reports were keyed by IP at 30/min, so everyone behind one NAT shared one budget, and since the dashboard itself calls a report endpoint, a few page switches (doubled by React StrictMode in dev) exhausted it and the charts silently showed "No data". The limiter store is in-memory, so each API instance counts separately.
+- All data endpoints require authentication via `requireAuth` middleware, then apply record-level access (see Key Design Decisions): owner or admin, 404 for anything else
+- Report aggregates follow the same rule: `?all=true` is honoured only for admins
+- At production scale: OAuth 2.0 / SAML SSO for enterprise customers, role hierarchy, sharing rules, field-level security
 
 ## Observability
 
 - **Structured logging** with Pino -- JSON format in production (machine-parseable for log aggregation), pretty-printed in development. Every request is logged with method, path, status, and duration.
-- **Prometheus metrics** via prom-client -- HTTP request duration histograms, request count by status code, and database query timing. Exposed at `/metrics` for Prometheus scraping.
+- **Prometheus metrics** via prom-client -- an app-level middleware records `http_request_duration_seconds` and `http_requests_total` labelled by method, matched route pattern (`/api/accounts/:id`, never the raw URL, to keep label cardinality bounded) and status, plus process defaults. Exposed at `/metrics` for Prometheus scraping. (`db_query_duration_seconds` and `active_opportunities_total` are registered but not yet recorded.)
 - **Health check** endpoint at `/api/health` that verifies database connectivity and returns service status.
 
 At production scale, these metrics feed into Grafana dashboards with alerts on p99 latency breaches, error rate spikes, and database connection pool exhaustion. Distributed tracing (OpenTelemetry) would correlate requests across microservices.
 
 ## Failure Handling
 
-- **Circuit breaker** (Opossum) wraps external service calls with a 50% error threshold -- after half of recent requests fail, the circuit opens and subsequent calls fail fast rather than blocking on timeouts.
+- **Circuit breaker** (Opossum) -- `src/services/circuitBreaker.ts` provides a factory with a 50% error threshold, but nothing calls it: this backend has no external service calls to protect. It is the place to wrap one (an email provider, an enrichment API) when one is added.
 - **Database connection pooling** with 20 max connections and 5-second connection timeout -- prevents connection exhaustion under load.
 - **Redis retry strategy** with exponential backoff (max 2-second delay) -- handles transient Redis failures without crashing the application.
 - **Graceful shutdown** on SIGTERM/SIGINT -- stops accepting new connections, waits for in-flight requests to complete, then closes database and Redis connections.
@@ -420,6 +464,9 @@ At production scale, these metrics feed into Grafana dashboards with alerts on p
 | Decision | Chosen | Alternative | Rationale |
 |----------|--------|-------------|-----------|
 | Session storage | Redis + cookie | JWT | Immediate revocation, simpler for server-rendered views |
+| Record visibility | Private: owner + admin | Public read-only | One rule for records and reports; no cross-rep leaks |
+| Stage transitions | Closed deals reopen only via admin | Free movement | Accidental drags can't silently un-book revenue |
+| Concurrent stage moves | Compare-and-set on stage (409) | Last-write-wins | No silent overwrite, without a version column yet |
 | Activity model | Polymorphic columns | Separate join tables | Simpler queries, single timeline, acceptable FK trade-off |
 | Lead conversion | DB transaction | Saga pattern | Single database, transaction guarantees atomicity |
 | Pipeline stages | Fixed enum | Configurable per org | Simpler implementation, covers 90% of use cases |
@@ -438,8 +485,8 @@ __root.tsx (RootComponent)
 ├── routes/index.tsx (Dashboard)
 │   ├── DashboardMetrics              ← KPI cards (revenue, open opps, leads, activities)
 │   └── PipelineChart                 ← CSS-only bar chart of pipeline by stage
-├── routes/accounts.tsx
-│   └── AccountList                   ← Search, industry filter, paginated table
+├── routes/accounts.index.tsx         ← sibling of the detail route (a parent
+│   └── AccountList                     without <Outlet/> hid the detail page)
 │       └── EntityForm (modal)        ← Shared create/edit form
 ├── routes/accounts.$accountId.tsx
 │   └── AccountDetail                 ← Tabbed detail view
@@ -450,7 +497,7 @@ __root.tsx (RootComponent)
 ├── routes/contacts.tsx
 │   └── ContactList                   ← Search, account filter, paginated table
 │       └── EntityForm (modal)
-├── routes/opportunities.tsx
+├── routes/opportunities.tsx          ← + New Opportunity (dollars → cents)
 │   └── KanbanBoard                   ← @dnd-kit drag-drop pipeline
 │       ├── KanbanColumn              ← Droppable stage column
 │       │   └── OpportunityCard       ← Draggable deal card
@@ -471,11 +518,11 @@ The frontend uses two Zustand stores that separate authentication state from dom
 
 **`useAuthStore`** (`stores/authStore.ts`) manages user session state. It holds the current `User` object (or null if logged out), a `loading` flag, and an `error` string. Actions include `login`, `register`, `logout`, and `checkAuth`. The `checkAuth` action is called once from the root layout on mount to restore the session from the server-side cookie. All auth API calls go through the `authApi` service object, and the store sets `user: null` on any auth failure to force redirect to the login page.
 
-**`useCrmStore`** (`stores/crmStore.ts`) manages all CRM domain data in a single flat store. It holds arrays and loading flags for six entity types (accounts, contacts, opportunities, leads, activities) plus dashboard KPIs and three report types (pipeline, revenue, leads by source). Each entity has a `fetch*` action that calls the corresponding API client, updates the array, and sets the loading flag. The `updateOpportunityStage` action performs an optimistic update by patching the opportunity's stage and probability in the local array immediately after the API responds, without re-fetching the entire list. This keeps the kanban board responsive during drag-drop operations.
+**`useCrmStore`** (`stores/crmStore.ts`) manages all CRM domain data in a single flat store. It holds arrays and loading flags for six entity types (accounts, contacts, opportunities, leads, activities) plus dashboard KPIs, three report types (pipeline, revenue, leads by source) and the report scope the server applied. Each entity has a `fetch*` action that calls the corresponding API client, updates the array, and sets the loading flag. The `updateOpportunityStage` action is genuinely optimistic: it moves the card before the request, replaces the guess with the server's row (probability, `closed_at`) on success, and on failure puts the card back and surfaces the server's reason ("Closed Won opportunities can only be reopened or changed by an admin") in a banner. It used to wait for the response and then re-fetch the whole board, which flashed "Loading pipeline..." after every drag and swallowed refusals. `reset()` clears the store on login and logout so the next user in a tab never sees the last one's records.
 
 ### Routing
 
-The project uses TanStack Router with file-based routing. The root layout (`__root.tsx`) checks authentication on mount via `useAuthStore.checkAuth()` and conditionally renders the `Sidebar` component only when a user is logged in. The main content area has a left margin (`ml-56`) to accommodate the fixed-position sidebar. Routes include `/` (dashboard), `/accounts`, `/accounts/$accountId` (dynamic detail page), `/contacts`, `/opportunities`, `/leads`, `/reports`, `/login`, and `/register`. Each authenticated route checks `useAuthStore.user` and redirects to `/login` if null.
+The project uses TanStack Router with file-based routing. The root layout (`__root.tsx`) checks authentication on mount via `useAuthStore.checkAuth()` and conditionally renders the `Sidebar` component only when a user is logged in. The main content area has a left margin (`ml-56`) to accommodate the fixed-position sidebar. Routes include `/` (dashboard), `/accounts` (`accounts.index.tsx`), `/accounts/$accountId` (dynamic detail page), `/contacts`, `/opportunities`, `/leads`, `/reports`, `/login`, and `/register`. Each authenticated route checks `useAuthStore.user` and redirects to `/login` if null.
 
 ### Data Fetching
 
@@ -487,7 +534,9 @@ All API communication flows through a centralized `services/api.ts` module that 
 
 **Kanban with @dnd-kit**: The opportunity pipeline uses `@dnd-kit/core` for drag-drop. `KanbanBoard` renders a `DndContext` with `KanbanColumn` components (one per stage) as droppable targets and `OpportunityCard` components as draggable items. A `DragOverlay` renders a ghost copy of the card during drag to prevent layout shifts. On drag end, the `onStageChange` callback calls `updateOpportunityStage` in the CRM store, which hits `PUT /api/opportunities/:id/stage` and optimistically patches the local state.
 
-**CSS-only charts**: Dashboard and report visualizations (`PipelineChart`, `ReportChart`) use proportional-width `<div>` elements styled with Tailwind instead of a charting library. This adds zero bundle size and provides sufficient visualization for pipeline and revenue bar charts.
+**CSS-only charts**: Dashboard and report visualizations (`PipelineChart`, `ReportChart`) use proportional `<div>` elements styled with Tailwind instead of a charting library. This adds zero bundle size and provides sufficient visualization for pipeline and revenue bar charts. Vertical bars are sized in pixels: a percentage height resolved against the auto-height flex column around it, so the column charts used to render only their labels.
+
+**Dates**: the API returns DATE columns as `'YYYY-MM-DD'` text (a pg type parser), and `utils/dates.ts` formats them from their parts in local time. pg's default turned them into UTC-midnight timestamps, which display as the previous day west of Greenwich.
 
 **StatusBadge**: A reusable component that maps entity statuses (lead status, opportunity stage, activity type) to color-coded badges with per-entity-type color mappings.
 
@@ -529,7 +578,7 @@ This project uses `prom-client` to expose HTTP request duration histograms (buck
 
 Rate limiting restricts how many requests a client can make within a time window, protecting the server from abuse, accidental loops, and denial-of-service attacks. Without rate limiting, a single misbehaving client could consume all server resources and deny service to legitimate users.
 
-This project uses `express-rate-limit` with three tiers: 1000 requests per 15 minutes for general API access, 50 requests per 15 minutes for authentication endpoints (preventing brute-force password guessing), and 30 requests per minute for report endpoints (which run expensive aggregation queries). When a client exceeds the limit, subsequent requests receive a `429 Too Many Requests` response with a `Retry-After` header indicating when the window resets.
+This project uses `express-rate-limit` with three tiers: 1000 requests per 15 minutes for general API access, 50 requests per 15 minutes for authentication endpoints (preventing brute-force password guessing), and 60 requests per minute per signed-in user for report endpoints (which run expensive aggregation queries). The first two are keyed by client IP; the report tier runs after authentication and keys on the session's user, so colleagues behind one NAT don't share a budget. When a client exceeds the limit, subsequent requests receive a `429 Too Many Requests` response with `RateLimit` headers indicating when the window resets. The counters live in process memory, so each API instance enforces its own limits; a shared Redis store (`rate-limit-redis`) is the step for multi-instance deployments.
 
 Rate limiting algorithms vary in sophistication. **Fixed window** divides time into fixed intervals (e.g., 1-minute blocks) and counts requests per window -- simple but allows burst-then-starve patterns at window boundaries. **Sliding window** (used at production scale) smooths the rate across time by weighting the previous window's count with the current window's count. **Token bucket** allows controlled bursts by accumulating tokens at a steady rate. The choice depends on whether you want strict rate enforcement or tolerance for short bursts.
 
@@ -555,7 +604,7 @@ Cache invalidation is the hardest part of cache-aside. When data changes, the ca
 
 RBAC is an authorization model where permissions are assigned to roles, and roles are assigned to users. Instead of granting individual permissions to each user (which becomes unmanageable with thousands of users), you define roles like "user" and "admin" and assign a set of permissions to each role. A user's effective permissions are determined by their role.
 
-In this project, the `users` table has a `role` column with a default of `'user'`. The `requireAuth` middleware checks that a valid session exists, and specific admin endpoints would additionally check `user.role === 'admin'`. This is a simplified two-tier RBAC. Production CRM systems like Salesforce implement much richer RBAC with object-level permissions (can this role see Opportunities?), field-level security (can this role see the `amount` field?), and sharing rules (can this user see records owned by other users in the same territory?).
+In this project, the `users` table has a `role` column with a default of `'user'`. The `requireAuth` middleware checks that a valid session exists, and `accessPolicy.ts` combines the role with record ownership: a `user` sees and changes the records they own, an `admin` sees and changes all of them and gets org-wide reports, and only an admin can reopen a closed deal. This is a simplified two-tier RBAC over a Private ownership model. Production CRM systems like Salesforce implement much richer RBAC with object-level permissions (can this role see Opportunities?), field-level security (can this role see the `amount` field?), a role hierarchy (a manager sees their team's records), and sharing rules (can this user see records owned by other users in the same territory?).
 
 The key advantage of RBAC over direct permission assignment is scalability of administration: when a new feature is added, you update the role definition once rather than updating every user individually. The trade-off is that roles can become too coarse-grained, leading to role explosion (creating dozens of fine-grained roles to cover every permission combination).
 
@@ -566,7 +615,7 @@ The key advantage of RBAC over direct permission assignment is scalability of ad
 ```
 ┌───────────────────┐       ┌───────────────────────┐
 │  React Frontend   │       │  Express Backend      │
-│  (Vite :5173)     │──────▶│  (Node.js :3000)      │
+│  (Vite :5173)     │──────▶│  (Node.js :3001)      │
 │                   │       │                       │
 │  TanStack Router  │       │  7 route files        │
 │  Zustand stores   │       │  Session auth         │
@@ -582,7 +631,7 @@ The key advantage of RBAC over direct permission assignment is scalability of ad
                             └──────────┘ └───────────┘
 ```
 
-All services run on a single machine via Docker Compose. The frontend proxies API requests to the backend on port 3000.
+Postgres and Valkey run via Docker Compose; the API and Vite run natively. The frontend proxies `/api` to the backend on port 3001 (`npm run dev:server2` / `dev:server3` start more instances on 3002/3003). Seed logins: `alice` / `password123` (admin, sees everything) and `bob` / `password123` (rep, sees only Vertex, Lumen and their deals and leads).
 
 ### Production-Grade Patterns Implemented
 
@@ -593,7 +642,11 @@ All services run on a single machine via Docker Compose. The frontend proxies AP
 | Structured logging | Pino | `src/services/logger.ts` | JSON logs with request correlation for debugging |
 | Rate limiting | express-rate-limit | `src/services/rateLimiter.ts` | Per-endpoint rate limits (API, auth, reports) |
 | Health checks | custom | `src/app.ts` | Database connectivity verification at `/api/health` |
-| Transactional integrity | pg (raw SQL) | `src/services/leadConversionService.ts` | Explicit `BEGIN`/`COMMIT`/`ROLLBACK` for multi-entity operations |
+| Transactional integrity | pg (raw SQL) | `src/services/leadConversionService.ts` | `BEGIN`/`COMMIT`/`ROLLBACK` plus a `FOR UPDATE` row lock: atomic and single-shot |
+| Record-level access | custom | `src/services/accessPolicy.ts` | Owner-or-admin, 404 for invisible records, checks inside the UPDATE/DELETE |
+| Stage state machine | custom | `src/services/opportunityStages.ts` | Probability mapping, gated reopen, `closed_at`, compare-and-set writes |
+| Input hardening | custom | `src/services/queryParams.ts` | Clamped pagination, escaped ILIKE, integer-cents and date validation |
+| DB-level integrity | Postgres CHECK/FK | `src/db/init.sql` | Valid stages/statuses, 0-100 probability, Converted iff converted_at |
 
 ### What Was Simplified
 
@@ -605,6 +658,9 @@ All services run on a single machine via Docker Compose. The frontend proxies AP
 | OAuth 2.0 / SAML SSO | Session auth with bcrypt | No enterprise SSO, no token rotation |
 | Configurable pipeline per org | Fixed stage enum | All users share the same pipeline stages |
 | Microservice per entity | Monolithic Express app | Single process, single deployment |
+| Role hierarchy + sharing rules | Private ownership + admin | Managers can't see their team's records |
+| Version column on every entity | Compare-and-set on stage only | Concurrent edits to other fields are last-write-wins |
+| Shared rate-limit store | In-memory per process | Limits are per API instance |
 
 ### What Was Omitted
 
@@ -613,8 +669,10 @@ All services run on a single machine via Docker Compose. The frontend proxies AP
 - Kubernetes orchestration
 - Full-text search engine (Elasticsearch)
 - Audit trail / change history table
-- Field-level security and sharing rules
+- Field-level security, role hierarchy and sharing rules
+- Custom fields API (the `custom_fields` / `custom_field_values` tables exist; no route uses them)
+- Edit and delete UI (the API supports both; the UI only creates, converts and moves deals)
 - Workflow automation engine
 - Email integration
 - File attachments on entities
-- Optimistic concurrency enforcement (version column)
+- Optimistic concurrency enforcement beyond the stage (version column)

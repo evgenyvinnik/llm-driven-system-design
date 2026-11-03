@@ -9,6 +9,7 @@ interface MeetingLobbyProps {
   onDisplayNameChange: (name: string) => void;
   onJoin: () => void;
   loading?: boolean;
+  waitingRoom?: boolean;
 }
 
 /** Renders the pre-join lobby with camera preview, device selection, and join controls. */
@@ -19,6 +20,7 @@ export function MeetingLobby({
   onDisplayNameChange,
   onJoin,
   loading,
+  waitingRoom,
 }: MeetingLobbyProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const {
@@ -62,6 +64,9 @@ export function MeetingLobby({
         <div className="text-center">
           <h1 className="text-2xl font-bold text-zoom-text mb-1">{meetingTitle}</h1>
           <p className="text-zoom-secondary font-mono">{meetingCode}</p>
+          {waitingRoom && (
+            <p className="text-zoom-secondary text-sm mt-2">This meeting has a waiting room: the host admits each participant.</p>
+          )}
         </div>
 
         {/* Video preview */}

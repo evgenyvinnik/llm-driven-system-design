@@ -14,13 +14,13 @@ What makes this project interesting to build rather than just read about is that
 
 | Component | Port | Why this one |
 |-----------|------|--------------|
-| **API + WebSocket server** (`backend/src/index.ts` → `app.ts`) | **3001** | `createServer(app)` wrapped by a `WebSocketServer` on path `/ws`, so REST and signaling share one process. `app.ts` is exported separately so `app.test.ts` can drive it under vitest without binding a port |
+| **API + WebSocket server** (`backend/src/index.ts` → `app.ts`) | **3001** | `createServer(app)` with a `noServer` `WebSocketServer` handling upgrades on `/ws`, so REST and signaling share one process and one session store. `app.ts` exports the app and `sessionMiddleware` so tests can drive it without binding a port |
 | **PostgreSQL 16** | 5432 | `users`, `meetings`, `meeting_participants`, `breakout_rooms`, `breakout_assignments`, `meeting_chat_messages`, `recordings` |
-| **Valkey (Redis)** | 6379 | Session store via `connect-redis` (prefix `zoom:session:`) — sessions only; the WebSocket layer does not use it |
+| **Valkey (Redis)** | 6379 | Session store via `connect-redis` (prefix `zoom:session:`), read on every HTTP request and every WebSocket upgrade; also meeting-creation idempotency keys |
 
-`services/sfuService.ts` is the heart: a singleton holding `rooms` (meetingId → Router + participants), `producers`, and `consumers` as in-memory maps. `websocket/handler.ts` implements the signaling protocol — `join-meeting`, `leave-meeting`, `produce`, `consume`, `producer-close`, `toggle-mute`, `toggle-video`, `start/stop-screen-share`, `raise-hand`, `chat-message` — over its own `clients` and `meetingClients` maps. Supporting services: `meetingService.ts` (CRUD, code generation, participant roles), `breakoutService.ts`, `chatService.ts`, `metrics.ts` (prom-client gauges for active meetings, participants, and WebSocket connections), `rateLimiter.ts`, `logger.ts` (Pino + pino-http). Schema applies via `npm run db:migrate`.
+`services/sfuService.ts` simulates the media plane: a singleton holding `rooms` (meetingId → Router + participants), `producers`, and `consumers` as in-memory maps. `websocket/meetingRooms.ts` is the heart of the signaling plane: live meetings (participants with role and media state, waiting room, lock, removal list, timers) and every policy decision: who gets in, who may do what, what happens on leave, disconnect and restart. `websocket/handler.ts` is the transport: session auth on upgrade, Origin check, per-connection ordered dispatch, heartbeat. Supporting services: `meetingService.ts` (CRUD, code generation, participant roles), `breakoutService.ts`, `chatService.ts`, `metrics.ts` (prom-client gauges for active meetings, participants, and WebSocket connections), `rateLimiter.ts`, `logger.ts` (Pino + pino-http). Schema applies via `npm run db:migrate`.
 
-Frontend is React 19 + TanStack Router + Zustand + Tailwind in a Zoom-style dark theme. Notable components: `MeetingLobby.tsx` (camera/mic preview and device selection before joining), `VideoGrid.tsx` (layout adapts from 1×1 to 5×5 by participant count), `ControlBar`, `ParticipantList`, `ChatPanel`, `BreakoutRooms`, `ScreenShareView`, plus a `useMediaDevices` hook. Vite proxies `/api` → `localhost:3001` and `/ws` with `ws: true`.
+Frontend is React 19 + TanStack Router + Zustand + Tailwind in a Zoom-style dark theme. Notable components: `MeetingLobby.tsx` (camera/mic preview and device selection before joining), `VideoGrid.tsx` (layout adapts from 1×1 to 5×5 by participant count), `ControlBar` (host lock and End for all), `ParticipantList` with `WaitingRoomList` and `ParticipantActions` (host controls), `ChatPanel`, `BreakoutRooms`, `MeetingMessageScreen` (waiting/ended/removed), plus the `useMediaDevices` hook and `useMeetingConnection`, which registers every signaling handler once per page and drives produce/consume. Vite proxies `/api` → `localhost:3001` and `/ws` with `ws: true`.
 
 ## Key Design Decisions
 
@@ -66,21 +66,47 @@ A meeting code is a bearer credential — anyone holding it can join. Sequential
 
 The 3-4-3 grouping is a usability decision with a real cost/benefit: codes get read aloud on phone calls and typed from memory, and chunking is what makes a ten-character string transferable between humans. Lowercase-only avoids case-confusion when dictating.
 
-What we give up: `Math.random()` is not a CSPRNG, so the codes are not cryptographically unpredictable — fine against enumeration, not fine against an adversary modeling the PRNG state. And the code is the *only* access control on a running meeting; the waiting-room flag is stored but not enforced.
+Codes come from `crypto.randomInt` (a CSPRNG), with a retry on the rare UNIQUE collision. What we give up: the code is still a bearer credential that works for anyone it is forwarded to. That is why the waiting room, lock, capacity and removal list exist (decision 6): the code decides who may *ask* to join; the host decides who gets in.
+
+### 6. Live meeting state is in-process and authoritative; PostgreSQL is the record
+
+`meetingRooms.ts` holds who is in each meeting with which role and media state, and makes every policy check synchronously on the event loop. Two joins cannot both take the last seat, two people cannot both start presenting, and two hosts cannot exist at once. Each change is then written through to PostgreSQL, queued per meeting so writes commit in order.
+
+The obvious alternative, PostgreSQL rows with locks, would survive a restart but puts a round-trip and lock wait on every mute toggle and admit. Redis would allow multiple signaling servers but turns each check into a Lua script. The price of in-process state is one signaling node per meeting and state lost on restart. Boot-time reconciliation closes stale attendance rows and gives active meetings the normal 30s empty-meeting grace, so reconnecting clients continue and abandoned meetings end instead of staying "active" forever.
+
+### 7. One seat per user, held briefly across disconnects
+
+A user has one seat per meeting (matching the `UNIQUE(meeting_id, user_id)` row). A second tab takes the seat and its role; the first gets `session-replaced` and close code 4002. A dropped socket keeps the seat for 10s (`RECONNECT_GRACE_MS`) so a reconnect resumes silently, and a 30s ping/pong heartbeat finds dead sockets. Allowing several seats per user (one per tab) would avoid kicking the old tab, but it breaks the one-row-per-attendee model and doubles the user in everyone's grid. Leaving immediately on a drop would remove the grace window, but every Wi-Fi blip would then flash "left / joined" to the whole room and cost a non-organizer host their role.
 
 ## Current State
 
-Runs end to end: API + WebSocket on 3001, session auth in Redis, meeting scheduling and CRUD, join-by-code, a pre-join lobby with camera/mic preview and device selection, the full signaling protocol over `/ws`, simulated SFU room/transport/producer/consumer lifecycle, participant state (mute, video off, screen share, hand raise) broadcast in real time, in-meeting chat including DMs, breakout room creation/assignment/activation/close, meeting history, an adaptive video grid, Prometheus metrics on `/api/metrics` (active meetings, active participants, WebSocket connections, HTTP duration), rate limiting on `/api/`, structured logging via pino-http, and a vitest + supertest suite in `backend/src/app.test.ts`.
+Runs end to end:
+- API + WebSocket on 3001, with session auth in Redis on both.
+- Meeting scheduling with explicit time zones, idempotent creation, join-by-code, and a pre-join lobby.
+- Waiting room, lock, capacity, mute-on-entry and screen-share permission, all enforced.
+- Host and co-host controls: admit/deny, mute and mute all, remove (no rejoin), lock, transfer host, co-host, end for all. When the host leaves, the role is auto-promoted.
+- One seat per user with tab takeover, a reconnect grace window and a heartbeat.
+- The full signaling protocol, with the client actually producing and consuming against the simulated SFU.
+- In-meeting chat with DMs, and history that hides other people's DMs.
+- Breakout rooms: create, assign, open, close, with each participant told their room.
+- Meeting history covering attended meetings, now that meetings actually end.
+- Prometheus metrics, rate limiting, and pino logging.
 
-Seeded logins (all `password123`): `alice` (Alice Johnson), `bob` (Bob Smith), `charlie` (Charlie Davis).
+Tests: 50 backend tests (`app.test.ts`, `websocket/meetingRooms.test.ts`, `websocket/handler.test.ts`), 9 Playwright smoke tests, and a 72-check live script (see the log below).
+
+Seeded logins (all `password123`): `alice` (Alice Johnson), `bob` (Bob Smith), `charlie` (Charlie Davis). Seeded meetings:
+- `abc-defg-hij`: alice hosts, mute on entry. Re-seeding resets it to scheduled.
+- `bob-wait-rom`: bob hosts, waiting room on, screen sharing off.
+- `xyz-abcd-efg`: an ended review that alice and charlie attended. It includes a charlie→bob DM that alice must never see.
 
 **Known simplifications, all deliberate:**
-- Media is never routed between peers — video tiles render placeholders, and screen share shows a placeholder rather than captured display content.
-- **WebSocket auth reads `userId` and `username` from query parameters** rather than validating the session cookie. Any client can claim any identity on the socket. This is the single largest gap between this codebase and something deployable.
-- The WebSocket layer keeps `clients` and `meetingClients` as in-process maps with no Redis pub/sub, so this is strictly single-server: two API instances would each host meetings the other can't see. Note that `dev:server1/2/3` exist but are misleading here for that reason.
+- Media is never routed between peers. Video tiles render placeholders, and screen share shows a placeholder rather than captured display content.
+- Live meeting state is in one process with no Redis pub/sub, so this is strictly single-server. `dev:server1/2/3` exist but cannot share meetings.
+- Breakout rooms assign and notify. They do not isolate media or chat per room; that would need a Router per room (open question 4).
 - The `recordings` table exists in the schema; nothing reads or writes it.
-- Waiting room is a settings flag with no enforcement.
-- `services/circuitBreaker.ts` exports `createCircuitBreaker` but nothing in production code calls it — it appears only as a mock in `app.test.ts`.
+- `services/circuitBreaker.ts` exports `createCircuitBreaker` but no query is wrapped with it.
+- `/api/health` is liveness only. The rate limiter uses an in-memory store.
+- Chat has no client message ids: a message whose acknowledgment is lost is not retried.
 
 ## Iteration & Repair Log
 
@@ -97,11 +123,56 @@ Seeded logins (all `password123`): `alice` (Alice Johnson), `bob` (Bob Smith), `
   2. **Screenshots 5 → 6, and the two new ones are the point of the project.** The old set was login/register/dashboard/schedule/history — entirely the scheduling shell, with nothing from the meeting itself. Added the **pre-join lobby** (camera/mic preview, device selection, display-name entry) and the **in-meeting view** reached by actually clicking Join: the adaptive video grid with a labeled tile, the full control bar (mute, camera, screen share, raise hand, chat, participant list with count badge, layout toggle), the meeting code, and Leave. Note the device dropdowns read `videoinput (...)` — headless WebKit exposes no real capture devices, so the labels are empty. That is the capture environment, not a defect.
 - **Answer docs verified, not rewritten:** 354/363/427 lines, all inside the 350–550 band, no labeled code fences, and the claims match the implementation — including the honest ones (simulated SFU, query-param WebSocket identity, single-server in-process maps).
 
+- **2026-11-02 — Socket identity, meeting access, host controls and attendance bookkeeping.** The project described a signaling server with RBAC, a waiting room and idempotent creation. The code had a socket that trusted whatever user id the client sent, and none of those features.
+  1. **The WebSocket took `userId`/`username` from the query string.** Anyone could connect as anyone, and because the host role was assigned by comparing that id with `meetings.host_id`, anyone could be any meeting's host. Fix: the upgrade runs through the exported express-session middleware (the coinbase/excalidraw fix), closing unauthenticated sockets with 4001. An `Origin` allowlist (`ALLOWED_ORIGINS`) closes cross-site socket hijacking, which cookie auth would otherwise open.
+  2. **Anyone with the code joined anything.** The waiting room and `maxParticipants` were stored and ignored, there was no lock, and ended meetings could be rejoined. Fix: new `websocket/meetingRooms.ts` enforces them all. The organizer bypasses every gate, since otherwise a host could lock themselves out of their own meeting.
+  3. **Host controls did not exist.** The RBAC section of `architecture.md` described them, but there was no mute-others, remove, end, transfer or co-host. A meeting whose host left had nobody able to moderate. Meetings never ended at all (the frontend never called end), so History never showed a real meeting. Fix:
+     - ranked roles, where every action needs a target ranked strictly below the caller;
+     - auto-promotion when the host leaves, and the organizer reclaims host on return;
+     - End for all;
+     - meetings end 30s after the room empties;
+     - removed users can't rejoin.
+  4. **Bookkeeping broke on duplicate tabs and disconnects.** The client map was keyed by user id, so a second tab replaced the first, and closing the first then evicted the second and announced a leave. Leave followed by the socket close ran twice (double `participant-left`, a negative gauge). The rejoin upsert kept the old role and flags, so a former host rejoined as a second host. A restart left attendance rows open forever. Fix:
+     - one seat per user, with the newest connection taking over;
+     - leave is idempotent;
+     - a 10s reconnect grace and a ping/pong heartbeat;
+     - fresh state on rejoin;
+     - boot-time reconciliation;
+     - messages processed in order per connection (`produce` used to race `join`).
+  5. **Authorization holes elsewhere.**
+     - Chat history returned every message, including other people's DMs, for any meeting, to any user. It now filters DMs in SQL and returns 404 to non-attendees.
+     - REST chat POST let anyone write into any meeting. It now requires a live participant and delivers over WebSocket.
+     - Breakout routes accepted anyone. They now need the organizer or the live host/co-host, assignments are limited to the same meeting, and a unique index on `participant_id` allows one room per participant.
+     - Meeting and participant reads by id now return 404 to strangers.
+     - Any participant could close anyone's producer, and producers could be consumed across meetings.
+  6. **Scheduling was off by the user's UTC offset.** `datetime-local` values have no zone and were stored as UTC. The API now requires an offset, and the form sends `toISOString()` and shows the zone.
+  7. **Smaller fixes:**
+     - CSPRNG meeting codes with collision retry;
+     - `Idempotency-Key` on create (described in `architecture.md`, never built);
+     - session regeneration at login;
+     - camelCase register response;
+     - mute-on-entry and screen-share permission enforced;
+     - one presenter at a time;
+     - lobby mute/camera state carried into the meeting;
+     - the mute button now disables the real track;
+     - a headers-merge bug in `api.ts` that dropped Content-Type;
+     - a breakout panel that couldn't assign anyone;
+     - chat history that returned the oldest messages instead of the newest;
+     - a test suite whose mocks no longer matched the imports, so it didn't load;
+     - a `lint` glob that skipped top-level files.
+  - **Verified:**
+    - 50 backend tests;
+    - a 72-check live script (fetch + ws, alice/bob/charlie plus a registered stranger), run twice from a clean reset, 72/72 both times;
+    - 9 screenshots (new: host controls, breakout rooms, waiting room), captured while a helper script kept bob and charlie connected;
+    - 9/9 smoke tests.
+
+  Runbook note: if port 5173 is taken, run the frontend with `npm run dev -- --port 5199 --strictPort` and start the backend with `ALLOWED_ORIGINS=http://localhost:5199`. The socket's Origin check refuses origins it wasn't told about.
+
 ## Open Questions
 
-1. WebSocket identity comes from query params, so the socket trusts whatever the client claims. The session cookie is already sent on the upgrade request — is validating it in the `verifyClient` hook sufficient, or does this need a short-lived signed token issued by the REST API so the WS layer never touches session storage?
+1. The socket now authenticates by session cookie on the upgrade. With several signaling nodes, should a node hand a client off with a short-lived signed token issued by the REST API, so signaling nodes never read the session store?
 2. All meeting state lives in per-process maps, which caps the system at one server. Is Redis pub/sub enough (broadcast signaling messages across instances), or does an SFU fundamentally need participants of one meeting pinned to one node, making this a routing problem rather than a fan-out problem?
-3. `generateMeetingCode()` uses `Math.random()`. Switching to `crypto.randomBytes` is a one-line change — but is the code alone ever an acceptable access control, or does any meaningful threat model force a waiting room or per-participant invite tokens regardless of entropy?
+3. Codes now come from a CSPRNG, and the waiting room makes admission a host decision. Should meetings with a waiting room off still get a passcode, or are lock plus removal enough for ad-hoc meetings?
 4. Breakout rooms move participants between groups, which in a real SFU means tearing down every Consumer and rebuilding against a different Router. The simulation doesn't exercise that. What's the right unit of isolation — one Router per breakout room, or one Router per meeting with consumer-level filtering?
 
 ## Resources

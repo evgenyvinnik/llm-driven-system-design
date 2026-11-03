@@ -1,147 +1,96 @@
 import { Router, Request, Response } from 'express';
-import { pool } from '../services/db.js';
 import { requireAuth } from '../middleware/auth.js';
 import { introspectTables, introspectIndexes } from '../services/schemaIntrospector.js';
 import { generateCreateTable, generateAddColumn, generateDropColumn, generateRenameColumn, generateDropTable } from '../services/ddlGenerator.js';
-import { executeQuery } from '../services/queryExecutor.js';
-import { logger } from '../services/logger.js';
+import { executeQuery, withTargetClient } from '../services/queryExecutor.js';
+import { ApiError, respondError } from '../services/errors.js';
+import { requireProject } from '../services/projectAccess.js';
 
 const router = Router();
-
-async function getProjectConfig(projectId: string) {
-  const result = await pool.query(
-    'SELECT db_host, db_port, db_name, db_user, db_password FROM projects WHERE id = $1',
-    [projectId],
-  );
-  if (result.rows.length === 0) return null;
-  const r = result.rows[0];
-  return { host: r.db_host, port: r.db_port, database: r.db_name, user: r.db_user, password: r.db_password };
-}
 
 // GET /api/projects/:projectId/tables
 router.get('/:projectId/tables', requireAuth, async (req: Request, res: Response) => {
   try {
-    const config = await getProjectConfig(req.params.projectId);
-    if (!config) {
-      res.status(404).json({ error: 'Project not found' });
-      return;
-    }
-
-    const tables = await introspectTables(config);
+    const access = await requireProject(req, 'view');
+    const tables = await withTargetClient(access.projectId, access.connection(), (client) => introspectTables(client));
     res.json({ tables });
   } catch (err) {
-    logger.error({ err }, 'Failed to introspect tables');
-    res.status(500).json({ error: 'Failed to introspect database schema' });
+    respondError(res, err, 'Failed to introspect database schema');
   }
 });
 
 // GET /api/projects/:projectId/tables/:tableName/indexes
 router.get('/:projectId/tables/:tableName/indexes', requireAuth, async (req: Request, res: Response) => {
   try {
-    const config = await getProjectConfig(req.params.projectId);
-    if (!config) {
-      res.status(404).json({ error: 'Project not found' });
-      return;
-    }
-
-    const indexes = await introspectIndexes(config, req.params.tableName);
+    const access = await requireProject(req, 'view');
+    const indexes = await withTargetClient(access.projectId, access.connection(), (client) =>
+      introspectIndexes(client, req.params.tableName),
+    );
     res.json({ indexes });
   } catch (err) {
-    logger.error({ err }, 'Failed to introspect indexes');
-    res.status(500).json({ error: 'Failed to introspect indexes' });
+    respondError(res, err, 'Failed to introspect indexes');
   }
 });
 
 // POST /api/projects/:projectId/tables
 router.post('/:projectId/tables', requireAuth, async (req: Request, res: Response) => {
   try {
-    const config = await getProjectConfig(req.params.projectId);
-    if (!config) {
-      res.status(404).json({ error: 'Project not found' });
-      return;
+    const access = await requireProject(req, 'edit');
+    const { tableName, columns } = req.body ?? {};
+    if (!tableName || !Array.isArray(columns) || columns.length === 0) {
+      throw new ApiError(400, 'tableName and columns are required');
     }
 
-    const { tableName, columns } = req.body;
-    if (!tableName || !columns || !Array.isArray(columns) || columns.length === 0) {
-      res.status(400).json({ error: 'tableName and columns are required' });
-      return;
-    }
-
+    // Generation validates every slot and throws a 400 before anything reaches the target.
     const ddl = generateCreateTable(tableName, columns);
-    await executeQuery(req.params.projectId, config, ddl);
+    await executeQuery(access.projectId, access.connection(), ddl);
 
     res.status(201).json({ message: `Table ${tableName} created`, sql: ddl });
   } catch (err) {
-    logger.error({ err }, 'Failed to create table');
-    const message = err instanceof Error ? err.message : 'Failed to create table';
-    res.status(500).json({ error: message });
+    respondError(res, err, 'Failed to create table');
   }
 });
 
 // PUT /api/projects/:projectId/tables/:tableName
 router.put('/:projectId/tables/:tableName', requireAuth, async (req: Request, res: Response) => {
   try {
-    const config = await getProjectConfig(req.params.projectId);
-    if (!config) {
-      res.status(404).json({ error: 'Project not found' });
-      return;
-    }
-
-    const { action, column, oldName, newName } = req.body;
+    const access = await requireProject(req, 'edit');
+    const { action, column, oldName, newName } = req.body ?? {};
     let ddl: string;
 
     switch (action) {
       case 'addColumn':
-        if (!column) {
-          res.status(400).json({ error: 'column definition is required' });
-          return;
-        }
+        if (!column) throw new ApiError(400, 'column definition is required');
         ddl = generateAddColumn(req.params.tableName, column);
         break;
       case 'dropColumn':
-        if (!column?.name) {
-          res.status(400).json({ error: 'column.name is required' });
-          return;
-        }
+        if (!column?.name) throw new ApiError(400, 'column.name is required');
         ddl = generateDropColumn(req.params.tableName, column.name);
         break;
       case 'renameColumn':
-        if (!oldName || !newName) {
-          res.status(400).json({ error: 'oldName and newName are required' });
-          return;
-        }
+        if (!oldName || !newName) throw new ApiError(400, 'oldName and newName are required');
         ddl = generateRenameColumn(req.params.tableName, oldName, newName);
         break;
       default:
-        res.status(400).json({ error: 'Invalid action. Use addColumn, dropColumn, or renameColumn' });
-        return;
+        throw new ApiError(400, 'Invalid action. Use addColumn, dropColumn, or renameColumn');
     }
 
-    await executeQuery(req.params.projectId, config, ddl);
+    await executeQuery(access.projectId, access.connection(), ddl);
     res.json({ message: `Table ${req.params.tableName} altered`, sql: ddl });
   } catch (err) {
-    logger.error({ err }, 'Failed to alter table');
-    const message = err instanceof Error ? err.message : 'Failed to alter table';
-    res.status(500).json({ error: message });
+    respondError(res, err, 'Failed to alter table');
   }
 });
 
 // DELETE /api/projects/:projectId/tables/:tableName
 router.delete('/:projectId/tables/:tableName', requireAuth, async (req: Request, res: Response) => {
   try {
-    const config = await getProjectConfig(req.params.projectId);
-    if (!config) {
-      res.status(404).json({ error: 'Project not found' });
-      return;
-    }
-
+    const access = await requireProject(req, 'edit');
     const ddl = generateDropTable(req.params.tableName);
-    await executeQuery(req.params.projectId, config, ddl);
+    await executeQuery(access.projectId, access.connection(), ddl);
     res.json({ message: `Table ${req.params.tableName} dropped`, sql: ddl });
   } catch (err) {
-    logger.error({ err }, 'Failed to drop table');
-    const message = err instanceof Error ? err.message : 'Failed to drop table';
-    res.status(500).json({ error: message });
+    respondError(res, err, 'Failed to drop table');
   }
 });
 

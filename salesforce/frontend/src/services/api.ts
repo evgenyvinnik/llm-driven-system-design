@@ -1,6 +1,6 @@
 import type {
   Account, Contact, Opportunity, Lead, Activity,
-  DashboardKPIs, PipelineStage, RevenueByMonth, LeadsBySource, User,
+  DashboardKPIs, PipelineStage, RevenueByMonth, LeadsBySource, ReportScope, User,
 } from '../types';
 
 const BASE_URL = '/api';
@@ -239,16 +239,16 @@ export const activitiesApi = {
 /** Reports API client for pipeline, revenue, and lead-source aggregation data. */
 export const reportsApi = {
   pipeline: (all?: boolean) =>
-    request<{ pipeline: PipelineStage[] }>(`/reports/pipeline${all ? '?all=true' : ''}`),
+    request<{ pipeline: PipelineStage[]; scope: ReportScope }>(`/reports/pipeline${all ? '?all=true' : ''}`),
 
   revenue: (months?: number, all?: boolean) => {
     const params = new URLSearchParams();
     if (months) params.set('months', String(months));
     if (all) params.set('all', 'true');
     const qs = params.toString();
-    return request<{ revenue: RevenueByMonth[] }>(`/reports/revenue${qs ? `?${qs}` : ''}`);
+    return request<{ revenue: RevenueByMonth[]; scope: ReportScope }>(`/reports/revenue${qs ? `?${qs}` : ''}`);
   },
 
   leads: (all?: boolean) =>
-    request<{ leads: LeadsBySource[] }>(`/reports/leads${all ? '?all=true' : ''}`),
+    request<{ leads: LeadsBySource[]; scope: ReportScope }>(`/reports/leads${all ? '?all=true' : ''}`),
 };

@@ -452,8 +452,8 @@ A page-load test alone does not establish any of these cross-layer invariants.
 
 The local system has an Express/WebSocket process, PostgreSQL, Valkey, and a React console.
 It demonstrates registration, pending records, cross-process publication, and polling views.
-It has no durable outbox, generation-based routing, authenticated device transport,
-or complete operation recovery. Most APIs do not enforce the console session.
+It has no durable outbox, generation-based routing, or complete operation recovery.
+Devices authenticate sockets with their raw token; providers use app-scoped ES256 JWTs.
 
 Its immediate send result treats publication as delivered; reconnect deletes pending
 records before receipt. The console polls overview data every 30 seconds and uses

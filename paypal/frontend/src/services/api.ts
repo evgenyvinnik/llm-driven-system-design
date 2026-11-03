@@ -4,6 +4,7 @@ import type {
   Transaction,
   TransferRequest,
   PaymentMethod,
+  ReconciliationReport,
 } from '../types';
 
 const BASE_URL = '/api';
@@ -54,26 +55,29 @@ export const walletApi = {
   get: () =>
     request<{ wallet: Wallet }>('/wallet'),
 
-  deposit: (amountCents: number, note?: string) =>
+  deposit: (amountCents: number, paymentMethodId: string, idempotencyKey: string) =>
     request<{ transaction: Transaction; wallet: Wallet }>('/wallet/deposit', {
       method: 'POST',
-      body: JSON.stringify({ amountCents, note }),
+      headers: { 'Idempotency-Key': idempotencyKey },
+      body: JSON.stringify({ amountCents, paymentMethodId }),
     }),
 
-  withdraw: (amountCents: number, note?: string) =>
+  withdraw: (amountCents: number, paymentMethodId: string, idempotencyKey: string) =>
     request<{ transaction: Transaction; wallet: Wallet }>('/wallet/withdraw', {
       method: 'POST',
-      body: JSON.stringify({ amountCents, note }),
+      headers: { 'Idempotency-Key': idempotencyKey },
+      body: JSON.stringify({ amountCents, paymentMethodId }),
     }),
 };
 
 // Transfers
 /** Transfers API client for P2P sends and transaction history. */
 export const transfersApi = {
-  send: (recipientId: string, amountCents: number, note?: string, idempotencyKey?: string) =>
+  send: (recipientId: string, amountCents: number, note: string | undefined, idempotencyKey: string) =>
     request<{ transaction: Transaction; senderBalance: number }>('/transfers', {
       method: 'POST',
-      body: JSON.stringify({ recipientId, amountCents, note, idempotencyKey }),
+      headers: { 'Idempotency-Key': idempotencyKey },
+      body: JSON.stringify({ recipientId, amountCents, note }),
     }),
 
   list: (type?: string) => {
@@ -110,6 +114,12 @@ export const requestsApi = {
       `/requests/${id}/decline`,
       { method: 'POST' },
     ),
+
+  cancel: (id: string) =>
+    request<{ request: { id: string; status: string } }>(
+      `/requests/${id}/cancel`,
+      { method: 'POST' },
+    ),
 };
 
 // Payment Methods
@@ -136,4 +146,10 @@ export const paymentMethodsApi = {
 export const usersApi = {
   search: (q: string) =>
     request<{ users: User[] }>(`/users/search?q=${encodeURIComponent(q)}`),
+};
+
+// Admin
+/** Admin API client: ledger reconciliation report. */
+export const adminApi = {
+  reconciliation: () => request<ReconciliationReport>('/admin/reconciliation'),
 };

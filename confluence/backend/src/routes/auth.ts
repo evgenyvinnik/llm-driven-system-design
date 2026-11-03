@@ -47,6 +47,11 @@ router.post('/register', authLimiter, async (req: Request, res: Response) => {
 
     const user = result.rows[0];
 
+    // New session ID on login, so a session ID planted before login (session
+    // fixation) never becomes an authenticated one.
+    await new Promise<void>((resolve, reject) =>
+      req.session.regenerate((err) => (err ? reject(err) : resolve())),
+    );
     req.session.userId = user.id;
     req.session.username = user.username;
     req.session.role = user.role;
@@ -97,7 +102,7 @@ router.post('/login', authLimiter, async (req: Request, res: Response) => {
         id: user.id,
         username: user.username,
         email: user.email,
-        displayName: user.display_name,
+        display_name: user.display_name,
         role: user.role,
       },
     });

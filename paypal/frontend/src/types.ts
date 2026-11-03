@@ -23,6 +23,7 @@ export interface Transaction {
   type: 'transfer' | 'deposit' | 'withdrawal';
   status: string;
   note: string | null;
+  paymentMethodId?: string | null;
   createdAt: string;
   senderUsername?: string;
   senderDisplayName?: string;
@@ -48,6 +49,8 @@ export interface TransferRequest {
   currency: string;
   note: string | null;
   status: 'pending' | 'paid' | 'declined' | 'cancelled';
+  /** The transfer that settled the request, once paid. */
+  transactionId: string | null;
   createdAt: string;
   updatedAt: string;
   requesterUsername?: string;
@@ -63,4 +66,29 @@ export interface PaymentMethod {
   lastFour: string | null;
   isDefault: boolean;
   createdAt: string;
+}
+
+export interface ReconciliationWallet {
+  walletId: string;
+  username: string;
+  displayName: string | null;
+  accountType: 'customer' | 'platform_cash';
+  balanceCents: number;
+  ledgerBalanceCents: number;
+  driftCents: number;
+  entries: number;
+}
+
+export interface ReconciliationReport {
+  balanced: boolean;
+  summary: {
+    totalDebitsCents: number;
+    totalCreditsCents: number;
+    customerTotalCents: number;
+    platformCashCents: number;
+    walletsWithDrift: number;
+    unbalancedTransactions: number;
+    transactionsWithoutEntries: number;
+  };
+  wallets: ReconciliationWallet[];
 }

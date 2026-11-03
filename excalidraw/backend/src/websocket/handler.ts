@@ -1,380 +1,281 @@
+import type { IncomingMessage, Server } from 'http';
+import type { Duplex } from 'stream';
+import type { Request, RequestHandler, Response } from 'express';
 import { WebSocket, WebSocketServer } from 'ws';
-import type { IncomingMessage } from 'http';
+import { v4 as uuidv4 } from 'uuid';
 import logger from '../services/logger.js';
 import { wsConnectionsActive, wsMessagesTotal } from '../services/metrics.js';
-import { updateCursor, removeCursor } from '../services/presenceService.js';
-import { getDrawing, updateDrawing } from '../services/drawingService.js';
-import { mergeElements, applyOperation, type CrdtElement } from '../services/crdtService.js';
-
-interface ClientInfo {
-  ws: WebSocket;
-  userId: string;
-  username: string;
-  drawingId: string | null;
-  color: string;
-}
+import { updateCursor } from '../services/presenceService.js';
+import { applyOperation, mergeElements, type CrdtElement } from '../services/crdtService.js';
+import {
+  broadcast,
+  getOrLoadRoom,
+  getRoom,
+  leaveRoom,
+  markDirty,
+  resolveAccess,
+  send,
+  type ClientInfo,
+} from './rooms.js';
 
 interface WsMessage {
   type: string;
-  drawingId?: string;
-  userId?: string;
-  username?: string;
-  elementId?: string;
-  elementData?: CrdtElement;
-  elements?: CrdtElement[];
-  x?: number;
-  y?: number;
-  color?: string;
+  drawingId?: unknown;
+  elementId?: unknown;
+  elementData?: unknown;
+  elements?: unknown;
+  x?: unknown;
+  y?: unknown;
 }
 
-// Room management: drawingId -> Set of WebSocket clients
-const rooms = new Map<string, Set<ClientInfo>>();
-const clients = new Map<WebSocket, ClientInfo>();
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const ELEMENT_TYPES = new Set(['rectangle', 'ellipse', 'diamond', 'arrow', 'line', 'freehand', 'text']);
+const MAX_SYNC_ELEMENTS = 10000;
+const EDIT_TYPES = new Set(['shape-add', 'shape-update', 'shape-delete', 'shape-move', 'elements-sync']);
 
-// Cursor colors for different users
 const CURSOR_COLORS = [
   '#e03131', '#c2255c', '#9c36b5', '#6741d9', '#3b5bdb',
   '#1971c2', '#0c8599', '#099268', '#2f9e44', '#66a80f',
   '#e8590c', '#d9480f',
 ];
-
 let colorIndex = 0;
-const getNextColor = (): string => {
-  const color = CURSOR_COLORS[colorIndex % CURSOR_COLORS.length];
-  colorIndex++;
-  return color;
-};
+const nextColor = (): string => CURSOR_COLORS[colorIndex++ % CURSOR_COLORS.length];
 
-const broadcastToRoom = (drawingId: string, message: WsMessage, excludeWs?: WebSocket): void => {
-  const room = rooms.get(drawingId);
-  if (!room) return;
-
-  const data = JSON.stringify(message);
-
-  for (const client of room) {
-    if (client.ws !== excludeWs && client.ws.readyState === WebSocket.OPEN) {
-      client.ws.send(data);
-    }
-  }
-};
-
-// Debounce map for saving drawing state to DB
-const saveTimers = new Map<string, NodeJS.Timeout>();
-
-const debouncedSave = (drawingId: string, elements: CrdtElement[]): void => {
-  const existing = saveTimers.get(drawingId);
-  if (existing) clearTimeout(existing);
-
-  saveTimers.set(
-    drawingId,
-    setTimeout(async () => {
-      try {
-        await updateDrawing(drawingId, { elements });
-        logger.debug({ drawingId }, 'Drawing auto-saved');
-      } catch (error) {
-        const err = error as Error;
-        logger.error({ error: err.message, drawingId }, 'Failed to auto-save drawing');
-      }
-      saveTimers.delete(drawingId);
-    }, 2000) // Save after 2 seconds of inactivity
+/** Shape check for client-supplied elements; anything else is rejected, not stored. */
+export const isValidElement = (value: unknown): value is CrdtElement => {
+  if (!value || typeof value !== 'object') return false;
+  const el = value as Record<string, unknown>;
+  return (
+    typeof el.id === 'string' &&
+    el.id.length > 0 &&
+    el.id.length <= 64 &&
+    typeof el.type === 'string' &&
+    ELEMENT_TYPES.has(el.type) &&
+    Number.isFinite(el.version) &&
+    Number.isFinite(el.updatedAt) &&
+    typeof el.isDeleted === 'boolean'
   );
 };
 
-// In-memory element state per room for fast merging
-const roomElements = new Map<string, CrdtElement[]>();
+/** Per-connection message chain: a client's messages are handled strictly in order. */
+const queues = new WeakMap<ClientInfo, Promise<void>>();
 
-const handleMessage = async (ws: WebSocket, data: string): Promise<void> => {
+const handleMessage = async (client: ClientInfo, raw: string): Promise<void> => {
   let message: WsMessage;
   try {
-    message = JSON.parse(data) as WsMessage;
+    message = JSON.parse(raw) as WsMessage;
   } catch {
-    ws.send(JSON.stringify({ type: 'error', message: 'Invalid JSON' }));
+    send(client, { type: 'error', message: 'Invalid JSON' });
+    return;
+  }
+  if (!message || typeof message.type !== 'string') {
+    send(client, { type: 'error', message: 'Message type is required' });
     return;
   }
 
-  const client = clients.get(ws);
-  if (!client) return;
-
   wsMessagesTotal.labels(message.type).inc();
 
+  if (EDIT_TYPES.has(message.type)) {
+    if (!client.drawingId) return;
+    if (!client.canEdit) {
+      send(client, { type: 'error', code: 'read-only', message: 'You have view-only access to this drawing' });
+      return;
+    }
+  }
+
   switch (message.type) {
-    case 'join-room': {
-      const drawingId = message.drawingId;
-      if (!drawingId) {
-        ws.send(JSON.stringify({ type: 'error', message: 'drawingId is required' }));
+    case 'join-room':
+      await joinRoom(client, message.drawingId);
+      return;
+
+    case 'leave-room':
+      leaveRoom(client);
+      return;
+
+    case 'shape-add':
+    case 'shape-update':
+    case 'shape-move': {
+      if (!isValidElement(message.elementData)) {
+        send(client, { type: 'error', message: 'Invalid element' });
         return;
       }
-
-      // Leave previous room if any
-      if (client.drawingId) {
-        leaveRoom(client);
-      }
-
-      // Join new room
-      client.drawingId = drawingId;
-      client.userId = message.userId || client.userId;
-      client.username = message.username || client.username;
-
-      if (!rooms.has(drawingId)) {
-        rooms.set(drawingId, new Set());
-      }
-      rooms.get(drawingId)!.add(client);
-
-      // Load current drawing state if not in memory
-      if (!roomElements.has(drawingId)) {
-        const drawing = await getDrawing(drawingId);
-        if (drawing) {
-          roomElements.set(drawingId, (drawing.elements || []) as CrdtElement[]);
-        } else {
-          roomElements.set(drawingId, []);
-        }
-      }
-
-      // Send current state to joining client
-      ws.send(JSON.stringify({
-        type: 'room-state',
-        drawingId,
-        elements: roomElements.get(drawingId) || [],
-      }));
-
-      // Notify others
-      broadcastToRoom(drawingId, {
-        type: 'user-joined',
-        userId: client.userId,
-        username: client.username,
-        color: client.color,
-      }, ws);
-
-      logger.info({ drawingId, userId: client.userId }, 'User joined room');
-      break;
-    }
-
-    case 'leave-room': {
-      leaveRoom(client);
-      break;
-    }
-
-    case 'shape-add': {
-      if (!client.drawingId || !message.elementData) return;
-
-      const elements = roomElements.get(client.drawingId) || [];
-      const updated = applyOperation(elements, {
-        type: 'add',
-        elementId: message.elementData.id,
-        elementData: message.elementData,
-      });
-      roomElements.set(client.drawingId, updated);
-
-      broadcastToRoom(client.drawingId, {
-        type: 'shape-add',
-        userId: client.userId,
-        elementData: message.elementData,
-      }, ws);
-
-      debouncedSave(client.drawingId, updated);
-      break;
-    }
-
-    case 'shape-update': {
-      if (!client.drawingId || !message.elementData) return;
-
-      const elements = roomElements.get(client.drawingId) || [];
-      const updated = applyOperation(elements, {
-        type: 'update',
-        elementId: message.elementData.id,
-        elementData: message.elementData,
-      });
-      roomElements.set(client.drawingId, updated);
-
-      broadcastToRoom(client.drawingId, {
-        type: 'shape-update',
-        userId: client.userId,
-        elementData: message.elementData,
-      }, ws);
-
-      debouncedSave(client.drawingId, updated);
-      break;
+      const room = getRoom(client.drawingId!);
+      if (!room) return;
+      const element = message.elementData;
+      const operation = message.type === 'shape-add' ? 'add' : message.type === 'shape-update' ? 'update' : 'move';
+      room.elements = applyOperation(room.elements, { type: operation, elementId: element.id, elementData: element });
+      broadcast(room, { type: message.type, clientId: client.clientId, userId: client.userId, elementData: element }, client);
+      markDirty(room);
+      return;
     }
 
     case 'shape-delete': {
-      if (!client.drawingId || !message.elementId) return;
-
-      const elements = roomElements.get(client.drawingId) || [];
-      const updated = applyOperation(elements, {
-        type: 'delete',
-        elementId: message.elementId,
-      });
-      roomElements.set(client.drawingId, updated);
-
-      broadcastToRoom(client.drawingId, {
-        type: 'shape-delete',
-        userId: client.userId,
-        elementId: message.elementId,
-      }, ws);
-
-      debouncedSave(client.drawingId, updated);
-      break;
-    }
-
-    case 'shape-move': {
-      if (!client.drawingId || !message.elementData) return;
-
-      const elements = roomElements.get(client.drawingId) || [];
-      const updated = applyOperation(elements, {
-        type: 'move',
-        elementId: message.elementData.id,
-        elementData: message.elementData,
-      });
-      roomElements.set(client.drawingId, updated);
-
-      broadcastToRoom(client.drawingId, {
-        type: 'shape-move',
-        userId: client.userId,
-        elementData: message.elementData,
-      }, ws);
-
-      debouncedSave(client.drawingId, updated);
-      break;
+      if (typeof message.elementId !== 'string') return;
+      const room = getRoom(client.drawingId!);
+      if (!room) return;
+      room.elements = applyOperation(room.elements, { type: 'delete', elementId: message.elementId });
+      broadcast(room, { type: 'shape-delete', clientId: client.clientId, userId: client.userId, elementId: message.elementId }, client);
+      markDirty(room);
+      return;
     }
 
     case 'elements-sync': {
-      // Full element sync (used for bulk operations)
-      if (!client.drawingId || !message.elements) return;
-
-      const existing = roomElements.get(client.drawingId) || [];
-      const merged = mergeElements(existing, message.elements);
-      roomElements.set(client.drawingId, merged);
-
-      broadcastToRoom(client.drawingId, {
-        type: 'elements-sync',
-        userId: client.userId,
-        elements: merged,
-      }, ws);
-
-      debouncedSave(client.drawingId, merged);
-      break;
+      const elements = message.elements;
+      if (!Array.isArray(elements) || elements.length > MAX_SYNC_ELEMENTS || !elements.every(isValidElement)) {
+        send(client, { type: 'error', message: 'Invalid element list' });
+        return;
+      }
+      const room = getRoom(client.drawingId!);
+      if (!room) return;
+      room.elements = mergeElements(room.elements, elements);
+      broadcast(room, { type: 'elements-sync', clientId: client.clientId, userId: client.userId, elements: room.elements }, client);
+      markDirty(room);
+      return;
     }
 
     case 'cursor-move': {
-      if (!client.drawingId || message.x === undefined || message.y === undefined) return;
+      // Anonymous viewers watch; only signed-in participants have a cursor.
+      if (!client.drawingId || !client.userId) return;
+      const { x, y } = message;
+      if (typeof x !== 'number' || typeof y !== 'number' || !Number.isFinite(x) || !Number.isFinite(y)) return;
+      const room = getRoom(client.drawingId);
+      if (!room) return;
 
-      // Update cursor in Redis for presence
-      updateCursor(
-        client.drawingId,
-        client.userId,
-        client.username,
-        message.x,
-        message.y,
-        client.color
-      ).catch(() => {
-        // Non-critical, ignore errors
+      updateCursor(client.drawingId, client.clientId, client.username, x, y, client.color).catch(() => {
+        // Presence is best effort.
       });
-
-      // Broadcast to room directly (Redis is for persistence, WS is for real-time)
-      broadcastToRoom(client.drawingId, {
+      broadcast(room, {
         type: 'cursor-move',
+        clientId: client.clientId,
         userId: client.userId,
         username: client.username,
-        x: message.x,
-        y: message.y,
+        x,
+        y,
         color: client.color,
-      }, ws);
-      break;
+      }, client);
+      return;
     }
 
     default:
-      ws.send(JSON.stringify({ type: 'error', message: `Unknown message type: ${message.type}` }));
+      send(client, { type: 'error', message: `Unknown message type: ${message.type}` });
   }
 };
 
-const leaveRoom = (client: ClientInfo): void => {
-  if (!client.drawingId) return;
+/**
+ * Joins a drawing after checking access for the session's user (or, for an
+ * anonymous socket, that the drawing is public). The client-supplied user ID
+ * and username of the old protocol are ignored.
+ */
+const joinRoom = async (client: ClientInfo, drawingId: unknown): Promise<void> => {
+  if (typeof drawingId !== 'string' || !UUID_RE.test(drawingId)) {
+    send(client, { type: 'error', message: 'A valid drawingId is required' });
+    return;
+  }
 
-  const room = rooms.get(client.drawingId);
-  if (room) {
-    room.delete(client);
+  const access = await resolveAccess(drawingId, client.userId);
+  if (!access.canView) {
+    send(client, { type: 'error', code: 'forbidden', drawingId, message: 'You do not have access to this drawing' });
+    return;
+  }
 
-    // Remove cursor
-    removeCursor(client.drawingId, client.userId).catch(() => {});
+  if (client.drawingId) leaveRoom(client);
+  const room = await getOrLoadRoom(drawingId);
+  if (client.ws.readyState !== WebSocket.OPEN) return;
 
-    // Notify others
-    broadcastToRoom(client.drawingId, {
-      type: 'user-left',
-      userId: client.userId,
-      username: client.username,
-    });
+  client.drawingId = drawingId;
+  client.canEdit = access.canEdit;
+  const others = [...room.clients].map((c) => ({
+    clientId: c.clientId,
+    userId: c.userId,
+    username: c.username,
+    color: c.color,
+  }));
+  room.clients.add(client);
 
-    // Clean up empty rooms
-    if (room.size === 0) {
-      rooms.delete(client.drawingId);
+  send(client, {
+    type: 'room-state',
+    drawingId,
+    elements: room.elements,
+    canEdit: client.canEdit,
+    clientId: client.clientId,
+    users: others,
+  });
+  broadcast(room, {
+    type: 'user-joined',
+    clientId: client.clientId,
+    userId: client.userId,
+    username: client.username,
+    color: client.color,
+  }, client);
 
-      // Flush in-memory elements to DB before removing
-      const elements = roomElements.get(client.drawingId);
-      if (elements) {
-        updateDrawing(client.drawingId, { elements }).catch((err: Error) => {
-          logger.error({ error: err.message }, 'Failed to flush room elements');
-        });
-        roomElements.delete(client.drawingId);
-      }
+  logger.info({ drawingId, userId: client.userId, canEdit: client.canEdit }, 'User joined room');
+};
 
-      // Clean up save timer
-      const timer = saveTimers.get(client.drawingId);
-      if (timer) {
-        clearTimeout(timer);
-        saveTimers.delete(client.drawingId);
-      }
+const onConnection = (ws: WebSocket, userId: string | null, username: string | null): void => {
+  const client: ClientInfo = {
+    ws,
+    clientId: uuidv4(),
+    userId,
+    username: username ?? 'Guest',
+    color: nextColor(),
+    drawingId: null,
+    canEdit: false,
+  };
+  wsConnectionsActive.inc();
+  logger.debug({ userId }, 'WebSocket client connected');
+
+  ws.on('message', (data: Buffer | string) => {
+    const raw = typeof data === 'string' ? data : data.toString();
+    const previous = queues.get(client) ?? Promise.resolve();
+    const next = previous
+      .then(() => handleMessage(client, raw))
+      .catch((error: unknown) => {
+        logger.error({ error: (error as Error).message }, 'WebSocket message handler error');
+      });
+    queues.set(client, next);
+  });
+
+  ws.on('close', () => {
+    leaveRoom(client);
+    wsConnectionsActive.dec();
+    logger.debug('WebSocket client disconnected');
+  });
+
+  ws.on('error', (error: Error) => {
+    logger.error({ error: error.message }, 'WebSocket error');
+  });
+
+  send(client, {
+    type: 'connected',
+    clientId: client.clientId,
+    color: client.color,
+    userId: client.userId,
+    authenticated: Boolean(client.userId),
+  });
+};
+
+/**
+ * Attaches the collaboration WebSocket to the HTTP server. The upgrade request
+ * runs through the Express session middleware, so a socket's identity is the
+ * session's user, never a value the client puts in a message.
+ */
+export const setupWebSocket = (server: Server, sessionMiddleware: RequestHandler): WebSocketServer => {
+  const wss = new WebSocketServer({ noServer: true, maxPayload: 2 * 1024 * 1024 });
+
+  server.on('upgrade', (req: IncomingMessage, socket: Duplex, head: Buffer) => {
+    if (new URL(req.url ?? '/', 'http://localhost').pathname !== '/ws') {
+      socket.destroy();
+      return;
     }
-
-    logger.info({ drawingId: client.drawingId, userId: client.userId }, 'User left room');
-  }
-
-  client.drawingId = null;
-};
-
-/** Initializes the WebSocket server for real-time drawing collaboration and cursor tracking. */
-export const setupWebSocket = (wss: WebSocketServer): void => {
-  wss.on('connection', (ws: WebSocket, _req: IncomingMessage) => {
-    const clientInfo: ClientInfo = {
-      ws,
-      userId: 'anonymous',
-      username: 'Anonymous',
-      drawingId: null,
-      color: getNextColor(),
-    };
-
-    clients.set(ws, clientInfo);
-    wsConnectionsActive.inc();
-
-    logger.debug('WebSocket client connected');
-
-    ws.on('message', (data: Buffer | string) => {
-      const message = typeof data === 'string' ? data : data.toString();
-      handleMessage(ws, message).catch((error: unknown) => {
-        const err = error as Error;
-        logger.error({ error: err.message }, 'WebSocket message handler error');
+    sessionMiddleware(req as Request, {} as Response, () => {
+      const session = (req as Request & { session?: { userId?: string; username?: string } }).session;
+      wss.handleUpgrade(req, socket, head, (ws) => {
+        onConnection(ws, session?.userId ?? null, session?.username ?? null);
       });
     });
-
-    ws.on('close', () => {
-      const client = clients.get(ws);
-      if (client) {
-        leaveRoom(client);
-        clients.delete(ws);
-      }
-      wsConnectionsActive.dec();
-      logger.debug('WebSocket client disconnected');
-    });
-
-    ws.on('error', (error: Error) => {
-      logger.error({ error: error.message }, 'WebSocket error');
-    });
-
-    // Send welcome message with assigned color
-    ws.send(JSON.stringify({
-      type: 'connected',
-      color: clientInfo.color,
-    }));
   });
+
+  return wss;
 };
 
 export default setupWebSocket;

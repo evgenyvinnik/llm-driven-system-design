@@ -104,7 +104,7 @@ The send money flow is the most critical user journey. A bad UX here means eithe
 
 3. **Note field** -- Optional, with placeholder text "What's it for?" to encourage context. Maximum 200 characters. Helps the recipient identify the payment and provides a conversation-like experience similar to Venmo.
 
-4. **Idempotency key generation** -- The frontend generates a unique key combining recipient ID, amount, and timestamp. If the user accidentally submits twice (double-tap on mobile, network retry), the backend returns the same result without re-executing. The key is generated at submission time, not at form mount, so refreshing the page and submitting again creates a genuinely new transfer.
+4. **Idempotency key generation** -- The form holds one random key per payment *attempt* in a ref and sends it as an `Idempotency-Key` header. A double-tap or a retry after a timeout reuses the key, so the backend replays the first result instead of charging again. Editing the recipient, amount or note, or a successful send, starts a new attempt with a new key. Refreshing the page also starts fresh -- which is why the timeout message points the user at their activity feed first. An earlier version built the key from a timestamp at click time; every retry then carried a new key, and the protection silently did nothing.
 
 5. **Success state** -- After successful send, we show a full-screen success card with a checkmark icon. Two options: "Send More" (resets form) or "Back to Dashboard". We never show the form again with the same data, preventing confusion about whether the payment already went through. This is a deliberate UX pattern -- the success screen acts as a "point of no return" that builds user confidence.
 

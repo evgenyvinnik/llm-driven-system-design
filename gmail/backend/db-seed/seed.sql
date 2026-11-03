@@ -223,3 +223,56 @@ INSERT INTO drafts (id, user_id, subject, body_text, to_recipients, version) VAL
    '["bob@gmail.local", "charlie@gmail.local"]',
    1)
 ON CONFLICT DO NOTHING;
+
+-- Visibility demo: membership in one message does not grant access to the thread.
+-- Thread 6: Alice writes to Bob and Charlie; Bob replies to Alice only. Charlie
+-- sees the first message but never Bob's reply (nor its snippet).
+-- Thread 7: Charlie writes to Bob and BCCs Alice. Bob never sees Alice on it;
+-- Alice sees the message with herself under bcc.
+INSERT INTO threads (id, subject, snippet, message_count, last_message_at, created_at) VALUES
+  ('d6666666-6666-6666-6666-666666666666', 'Q4 offsite planning', 'Between us: the venue budget is tight.', 2, NOW() - INTERVAL '20 minutes', NOW() - INTERVAL '50 minutes'),
+  ('d7777777-7777-7777-7777-777777777777', 'Interview loop feedback', 'Strong systems answers; weaker on testing.', 1, NOW() - INTERVAL '30 minutes', NOW() - INTERVAL '30 minutes')
+ON CONFLICT DO NOTHING;
+
+INSERT INTO messages (id, thread_id, sender_id, body_text, body_html, created_at) VALUES
+  ('66666666-6666-6666-6666-111111111111', 'd6666666-6666-6666-6666-666666666666', 'a1111111-1111-1111-1111-111111111111',
+   'Let''s plan the Q4 offsite. Please send venue ideas and the dates that work for you by Friday.',
+   '<p>Let''s plan the Q4 offsite. Please send venue ideas and the dates that work for you by Friday.</p>',
+   NOW() - INTERVAL '50 minutes'),
+  ('66666666-6666-6666-6666-222222222222', 'd6666666-6666-6666-6666-666666666666', 'b2222222-2222-2222-2222-222222222222',
+   'Between us: the venue budget is tight. I would skip the boat tour and keep the second day remote.',
+   '<p>Between us: the venue budget is tight. I would skip the boat tour and keep the second day remote.</p>',
+   NOW() - INTERVAL '20 minutes'),
+  ('77777777-7777-7777-7777-111111111111', 'd7777777-7777-7777-7777-777777777777', 'c3333333-3333-3333-3333-333333333333',
+   'Strong systems answers; weaker on testing. I lean hire. Alice, BCCing you for the panel record.',
+   '<p>Strong systems answers; weaker on testing. I lean hire. Alice, BCCing you for the panel record.</p>',
+   NOW() - INTERVAL '30 minutes')
+ON CONFLICT DO NOTHING;
+
+INSERT INTO message_recipients (message_id, user_id, recipient_type) VALUES
+  ('66666666-6666-6666-6666-111111111111', 'b2222222-2222-2222-2222-222222222222', 'to'),
+  ('66666666-6666-6666-6666-111111111111', 'c3333333-3333-3333-3333-333333333333', 'to'),
+  ('66666666-6666-6666-6666-222222222222', 'a1111111-1111-1111-1111-111111111111', 'to'),
+  ('77777777-7777-7777-7777-111111111111', 'b2222222-2222-2222-2222-222222222222', 'to'),
+  ('77777777-7777-7777-7777-111111111111', 'a1111111-1111-1111-1111-111111111111', 'bcc')
+ON CONFLICT DO NOTHING;
+
+INSERT INTO thread_user_state (thread_id, user_id, is_read, is_starred) VALUES
+  ('d6666666-6666-6666-6666-666666666666', 'a1111111-1111-1111-1111-111111111111', false, false),
+  ('d6666666-6666-6666-6666-666666666666', 'b2222222-2222-2222-2222-222222222222', true, false),
+  ('d6666666-6666-6666-6666-666666666666', 'c3333333-3333-3333-3333-333333333333', false, false),
+  ('d7777777-7777-7777-7777-777777777777', 'c3333333-3333-3333-3333-333333333333', true, false),
+  ('d7777777-7777-7777-7777-777777777777', 'b2222222-2222-2222-2222-222222222222', false, false),
+  ('d7777777-7777-7777-7777-777777777777', 'a1111111-1111-1111-1111-111111111111', false, false)
+ON CONFLICT DO NOTHING;
+
+INSERT INTO thread_labels (thread_id, label_id, user_id) VALUES
+  ('d6666666-6666-6666-6666-666666666666', '8c9b2064-80c2-4188-88c6-ef65e07585c3', 'a1111111-1111-1111-1111-111111111111'),
+  ('d6666666-6666-6666-6666-666666666666', '6c4821fd-d428-48bc-85db-3e435c9a0af9', 'a1111111-1111-1111-1111-111111111111'),
+  ('d6666666-6666-6666-6666-666666666666', '64316f50-dac6-49be-8bfa-13069a9282c8', 'b2222222-2222-2222-2222-222222222222'),
+  ('d6666666-6666-6666-6666-666666666666', '9e8a4fe2-998a-4dd8-8b77-26462330111e', 'b2222222-2222-2222-2222-222222222222'),
+  ('d6666666-6666-6666-6666-666666666666', '60c94afa-ca95-4fd8-8155-b10ae3eb2243', 'c3333333-3333-3333-3333-333333333333'),
+  ('d7777777-7777-7777-7777-777777777777', '14588cb2-43ca-4f4d-8de1-f95be6592634', 'c3333333-3333-3333-3333-333333333333'),
+  ('d7777777-7777-7777-7777-777777777777', '64316f50-dac6-49be-8bfa-13069a9282c8', 'b2222222-2222-2222-2222-222222222222'),
+  ('d7777777-7777-7777-7777-777777777777', '6c4821fd-d428-48bc-85db-3e435c9a0af9', 'a1111111-1111-1111-1111-111111111111')
+ON CONFLICT DO NOTHING;

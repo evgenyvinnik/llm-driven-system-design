@@ -335,9 +335,10 @@ All paths below are local APIs. Authentication uses the `session` cookie; there 
 
 | Method | Path | Behavior |
 |--------|------|----------|
-| POST | `/api/auth/register`, `/api/auth/login`, `/api/auth/logout` | Account/session lifecycle |
+| POST | `/api/auth/register`, `/api/auth/login`, `/api/auth/logout` | Account/session lifecycle; registration always creates a `customer` |
 | GET | `/api/auth/me` | Current user; driver profile included only for role `driver` |
-| POST | `/api/auth/become-driver` | Create a driver profile; does not change user role |
+| POST | `/api/auth/become-driver` | Customer → driver: creates the driver profile and sets role `driver` in one transaction |
+| POST | `/api/auth/become-restaurant-owner` | Customer → restaurant owner |
 | GET | `/api/restaurants` | Open restaurants; optional cuisine/search/lat/lon/radius |
 | GET | `/api/restaurants/meta/cuisines` | Cached cuisine list |
 | GET | `/api/restaurants/owner/my-restaurants` | Restaurants owned by this user, including for admins |
@@ -406,7 +407,7 @@ The local implementation has a Redis response cache only for checkout. A 60-seco
 
 Production must restrict privileged account provisioning, authorize all HTTP commands and socket subscriptions, validate money/coordinates/quantities, and rate-limit authentication and location ingestion. Use secure cookies and origin/CSRF protections appropriate to the deployment. Minimize delivery address, phone, and precise location data in events; authorization should end when a participant's access ends.
 
-Locally, bcrypt uses cost 10. Sessions are UUIDs stored in PostgreSQL and Redis with a seven-day expiry, plus an HTTP-only SameSite=Lax cookie that is not marked Secure. Authentication checks Redis first and SQL on a miss; a Redis error does not fall back successfully, and the middleware treats the user as unauthenticated. Logout deletes SQL before Redis, so a failed Redis deletion may leave a cached session usable. Registration accepts the supplied role, including `admin`; the UI's limited role buttons are not a server restriction.
+Locally, bcrypt uses cost 10. Sessions are UUIDs stored in PostgreSQL and Redis with a seven-day expiry, plus an HTTP-only SameSite=Lax cookie that is not marked Secure. Authentication checks Redis first and SQL on a miss; a Redis error does not fall back successfully, and the middleware treats the user as unauthenticated. Logout deletes SQL before Redis, so a failed Redis deletion may leave a cached session usable. Registration always creates a `customer` and ignores any supplied role. A customer can self-onboard as a driver or restaurant owner through `become-driver` / `become-restaurant-owner`. Neither path is open to any other role, so no HTTP path creates an admin. Driver vetting (background checks, approval) is not modelled.
 
 ## Observability
 

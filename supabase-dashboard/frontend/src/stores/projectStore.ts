@@ -1,20 +1,24 @@
 import { create } from 'zustand';
-import type { Project, TableInfo, QueryResult, SavedQuery, AuthUser, TableDataResponse, ProjectSettings } from '../types';
+import type { Project, ProjectMember, TableInfo, QueryResult, SavedQuery, AuthUser, TableDataResponse, ProjectSettings } from '../types';
 import { projectsApi, tablesApi, tableDataApi, sqlApi, authUsersApi, settingsApi } from '../services/api';
 
 interface ProjectState {
   // Projects
   projects: Project[];
   currentProject: Project | null;
+  /** Set when the current project can't be loaded (missing, or the caller has no role in it). */
+  projectError: string | null;
   projectsLoading: boolean;
 
   // Tables
   tables: TableInfo[];
   tablesLoading: boolean;
+  tablesError: string | null;
 
   // Table Data
   tableData: TableDataResponse | null;
   tableDataLoading: boolean;
+  tableDataError: string | null;
 
   // SQL
   queryResult: QueryResult | null;
@@ -30,6 +34,9 @@ interface ProjectState {
   settings: ProjectSettings | null;
   settingsLoading: boolean;
 
+  // Members
+  members: ProjectMember[];
+
   // Actions - Projects
   loadProjects: () => Promise<void>;
   loadProject: (id: string) => Promise<void>;
@@ -44,8 +51,8 @@ interface ProjectState {
   // Actions - Table Data
   loadTableData: (projectId: string, tableName: string, page?: number, limit?: number, sortBy?: string, sortOrder?: string) => Promise<void>;
   insertRow: (projectId: string, tableName: string, data: Record<string, unknown>) => Promise<void>;
-  updateRow: (projectId: string, tableName: string, id: string, data: Record<string, unknown>, primaryKey?: string) => Promise<void>;
-  deleteRow: (projectId: string, tableName: string, id: string, primaryKey?: string) => Promise<void>;
+  updateRow: (projectId: string, tableName: string, id: string, data: Record<string, unknown>) => Promise<void>;
+  deleteRow: (projectId: string, tableName: string, id: string) => Promise<void>;
 
   // Actions - SQL
   executeQuery: (projectId: string, sql: string) => Promise<void>;
@@ -63,17 +70,27 @@ interface ProjectState {
   // Actions - Settings
   loadSettings: (projectId: string) => Promise<void>;
   updateSettings: (projectId: string, data: Partial<ProjectSettings & { dbPassword?: string }>) => Promise<void>;
+
+  // Actions - Members
+  loadMembers: (projectId: string) => Promise<void>;
+  addMember: (projectId: string, username: string, role: string) => Promise<void>;
+  removeMember: (projectId: string, userId: string) => Promise<void>;
 }
+
+const message = (err: unknown, fallback: string) => (err instanceof Error ? err.message : fallback);
 
 /** Central project state managing projects, tables, table data, SQL queries, auth users, and settings. */
 export const useProjectStore = create<ProjectState>((set, get) => ({
   projects: [],
   currentProject: null,
+  projectError: null,
   projectsLoading: false,
   tables: [],
   tablesLoading: false,
+  tablesError: null,
   tableData: null,
   tableDataLoading: false,
+  tableDataError: null,
   queryResult: null,
   queryError: null,
   queryLoading: false,
@@ -82,6 +99,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
   authUsersLoading: false,
   settings: null,
   settingsLoading: false,
+  members: [],
 
   // Projects
   loadProjects: async () => {
@@ -95,11 +113,15 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
   },
 
   loadProject: async (id) => {
+    // Don't keep showing (and acting on) the previous project while the next one loads.
+    if (get().currentProject?.id !== id) {
+      set({ currentProject: null, projectError: null, tables: [], tableData: null, savedQueries: [], authUsers: [], members: [] });
+    }
     try {
       const { project } = await projectsApi.get(id);
-      set({ currentProject: project });
-    } catch {
-      set({ currentProject: null });
+      set({ currentProject: project, projectError: null });
+    } catch (err) {
+      set({ currentProject: null, projectError: message(err, 'Project not found') });
     }
   },
 
@@ -118,12 +140,13 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 
   // Tables
   loadTables: async (projectId) => {
-    set({ tablesLoading: true });
+    set({ tablesLoading: true, tablesError: null });
     try {
       const { tables } = await tablesApi.list(projectId);
       set({ tables, tablesLoading: false });
-    } catch {
-      set({ tables: [], tablesLoading: false });
+    } catch (err) {
+      // e.g. 503 when the target is down: say so rather than showing "No tables found".
+      set({ tables: [], tablesLoading: false, tablesError: message(err, 'Failed to load tables') });
     }
   },
 
@@ -139,12 +162,12 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 
   // Table Data
   loadTableData: async (projectId, tableName, page, limit, sortBy, sortOrder) => {
-    set({ tableDataLoading: true });
+    set({ tableDataLoading: true, tableDataError: null });
     try {
       const data = await tableDataApi.getRows(projectId, tableName, page, limit, sortBy, sortOrder);
       set({ tableData: data, tableDataLoading: false });
-    } catch {
-      set({ tableData: null, tableDataLoading: false });
+    } catch (err) {
+      set({ tableData: null, tableDataLoading: false, tableDataError: message(err, 'Failed to load rows') });
     }
   },
 
@@ -152,12 +175,12 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
     await tableDataApi.insertRow(projectId, tableName, data);
   },
 
-  updateRow: async (projectId, tableName, id, data, primaryKey) => {
-    await tableDataApi.updateRow(projectId, tableName, id, data, primaryKey);
+  updateRow: async (projectId, tableName, id, data) => {
+    await tableDataApi.updateRow(projectId, tableName, id, data);
   },
 
-  deleteRow: async (projectId, tableName, id, primaryKey) => {
-    await tableDataApi.deleteRow(projectId, tableName, id, primaryKey);
+  deleteRow: async (projectId, tableName, id) => {
+    await tableDataApi.deleteRow(projectId, tableName, id);
   },
 
   // SQL
@@ -236,4 +259,37 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
     const { settings } = await settingsApi.update(projectId, data);
     set({ settings });
   },
+
+  // Members
+  loadMembers: async (projectId) => {
+    try {
+      const { members } = await projectsApi.listMembers(projectId);
+      set({ members });
+    } catch {
+      set({ members: [] });
+    }
+  },
+
+  addMember: async (projectId, username, role) => {
+    await projectsApi.addMember(projectId, { username }, role);
+    await get().loadMembers(projectId);
+  },
+
+  removeMember: async (projectId, userId) => {
+    await projectsApi.removeMember(projectId, userId);
+    await get().loadMembers(projectId);
+  },
 }));
+
+/**
+ * The caller's role in the current project, for hiding controls they can't use.
+ * Purely cosmetic: every write is authorized again on the server.
+ */
+export function useProjectRole() {
+  const role = useProjectStore((s) => s.currentProject?.memberRole ?? null);
+  return {
+    role,
+    canEdit: role === 'owner' || role === 'editor',
+    isOwner: role === 'owner',
+  };
+}

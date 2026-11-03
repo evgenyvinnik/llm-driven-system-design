@@ -6,13 +6,45 @@ import { logger } from '../services/logger.js';
 
 const router = Router();
 
+/**
+ * Issues a fresh session ID before storing the identity, so a session ID planted
+ * in the browser before login (session fixation) never becomes authenticated.
+ */
+function startSession(req: Request, user: { id: string; username: string; role: string }): Promise<void> {
+  return new Promise((resolve, reject) => {
+    req.session.regenerate((err) => {
+      if (err) return reject(err);
+      req.session.userId = user.id;
+      req.session.username = user.username;
+      req.session.role = user.role;
+      resolve();
+    });
+  });
+}
+
 // POST /api/auth/register
 router.post('/register', authLimiter, async (req: Request, res: Response) => {
   try {
     const { username, email, password, displayName } = req.body;
 
-    if (!username || !email || !password) {
+    if (typeof username !== 'string' || typeof email !== 'string' || typeof password !== 'string' ||
+        !username || !email || !password) {
       res.status(400).json({ error: 'Username, email, and password are required' });
+      return;
+    }
+
+    if (displayName !== undefined && (typeof displayName !== 'string' || displayName.length > 100)) {
+      res.status(400).json({ error: 'Display name must be at most 100 characters' });
+      return;
+    }
+
+    if (!/^[a-zA-Z0-9_.-]+$/.test(username)) {
+      res.status(400).json({ error: 'Username may contain only letters, digits, and . _ -' });
+      return;
+    }
+
+    if (email.length > 255 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      res.status(400).json({ error: 'A valid email is required' });
       return;
     }
 
@@ -60,9 +92,7 @@ router.post('/register', authLimiter, async (req: Request, res: Response) => {
 
       await client.query('COMMIT');
 
-      req.session.userId = user.id;
-      req.session.username = user.username;
-      req.session.role = user.role;
+      await startSession(req, user);
 
       res.status(201).json({
         user: {
@@ -80,6 +110,11 @@ router.post('/register', authLimiter, async (req: Request, res: Response) => {
       client.release();
     }
   } catch (err) {
+    // Two registrations racing past the existence check hit the unique index.
+    if ((err as { code?: string })?.code === '23505') {
+      res.status(409).json({ error: 'Username or email already exists' });
+      return;
+    }
     logger.error({ err }, 'Registration failed');
     res.status(500).json({ error: 'Internal server error' });
   }
@@ -90,7 +125,7 @@ router.post('/login', authLimiter, async (req: Request, res: Response) => {
   try {
     const { username, password } = req.body;
 
-    if (!username || !password) {
+    if (typeof username !== 'string' || typeof password !== 'string' || !username || !password) {
       res.status(400).json({ error: 'Username and password are required' });
       return;
     }
@@ -113,9 +148,7 @@ router.post('/login', authLimiter, async (req: Request, res: Response) => {
       return;
     }
 
-    req.session.userId = user.id;
-    req.session.username = user.username;
-    req.session.role = user.role;
+    await startSession(req, user);
 
     res.json({
       user: {

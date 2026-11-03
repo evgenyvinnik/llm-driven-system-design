@@ -119,6 +119,10 @@ My data-flow rule instead:
 
 I give up request deduplication and automatic retries — cheap to add by hand at this scale (dozens of components, not thousands), and I'll return to the freshness argument in a deep dive because it shapes everything.
 
+**Roles shape the UI; the server decides.** Each project carries the caller's role (owner, editor or viewer), returned with the project itself. A small derived hook turns it into "can edit" and "is owner", and components use those to hide what the caller can't do: viewers see no insert, edit, drop or save controls, a read-only badge in the SQL editor, and settings they can read but not change. Owners also get the members panel.
+
+> "Hiding a button is a courtesy, not a control. The backend authorizes every request again, so a stale role in the store can only ever produce a refused request, never a permitted one. Two details make this honest rather than cosmetic. First, the project layout renders its children only once the project and its role have loaded, so a viewer never sees a flash of edit controls. Second, a refused write shows the server's message in place instead of failing silently. And a project the caller isn't a member of comes back as 404, which the layout renders as 'Project not found' rather than an empty table list that looks like a broken database."
+
 ## 🔌 API Layer
 
 All fetching goes through one request helper (JSON handling, credentials inclusion, error extraction) organized into domain modules — auth, projects, tables, table data, SQL, auth users, settings.
@@ -267,7 +271,7 @@ What I give up: fluid scroll-through-everything browsing. For scanning large ran
 - Mutations render an "N rows affected" success banner — an empty grid after an UPDATE reads as failure
 - Errors render PostgreSQL's message **verbatim**: line numbers and position offsets are exactly what a developer debugs with, and "something went wrong" sanitization would destroy the tool's core value
 
-**Result sets are truncated, not streamed.** An unbounded SELECT over a million-row table would OOM the tab long before the network finished delivering it. The backend caps returned rows; the UI shows the cap plus a hint to add LIMIT. A console is for inspecting data, not exporting it — export is a separate server-side streaming feature.
+**Result sets are truncated, not streamed.** An unbounded SELECT over a million-row table would OOM the tab long before the network finished delivering it. The backend reads at most 1000 rows through a cursor and flags the result as truncated; the UI shows the cap plus a hint to add LIMIT. The editor runs one statement per execution; a pasted script gets the server's explanation (use a DO block) rather than a half-run batch. A console is for inspecting data, not exporting it — export is a separate server-side streaming feature.
 
 **Saved queries** load into the editor on click as a replace operation. Replacing unsaved editor text is a real data-loss edge; the production fix is a dirty-state confirmation, which I'd prioritize *ahead of* syntax highlighting — losing a user's half-written query costs more trust than plain text ever will.
 
@@ -313,6 +317,7 @@ The flow after any DDL action from the UI (create/alter/drop via the structured 
 ## 📉 Failure Handling in the UI
 
 - **Target database down**: the backend's circuit breaker returns a fast, explicit "target database unavailable" error instead of a hung request. The UI renders it as a persistent banner in the content area with a retry action, while metadata screens (project list, saved queries, settings) keep working — the failure is scoped to the data-path sections, mirroring the backend's isolation.
+- **Not a member / write refused**: a 404 on the project renders a "Project not found" panel with a way back; a 403 or a 400 on a write shows the server's message as a banner where the action happened, never a silent no-op.
 - **Connection test failures** show the raw driver error (host unreachable, authentication failed) in the settings panel — verbatim beats sanitized for this audience, and the error text is the debugging clue.
 - **Session expiry mid-use**: any 401 from the request helper clears auth state and redirects to login with a return-to path, so re-login lands the user back on the screen they lost.
 - **Slow introspection**: the loading row persists with no timeout on the client; the server owns timeouts. The client's job is to stay interactive — the user can still navigate to settings and fix a bad connection while a doomed request drains.

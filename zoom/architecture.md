@@ -124,32 +124,37 @@ This is O(N) work on the server vs O(N^2) connections in P2P mesh.
 
 ### 2. Signaling Service (WebSocket)
 
-The signaling server handles the WebRTC negotiation handshake between clients and the SFU:
+The signaling server handles the WebRTC negotiation handshake between clients and the SFU, plus everything that changes who is in a meeting and what they may do. The socket's identity is the session resolved on the HTTP upgrade request; nothing in a message names the sender.
 
 **Message Protocol:**
 
 | Direction | Message | Purpose |
 |-----------|---------|---------|
-| Client → Server | `join-meeting` | Join with meeting code + display name |
-| Server → Client | `joined` | Meeting state, participants, RTP capabilities, transport options |
-| Client → Server | `produce` | Register audio/video/screen track |
-| Server → Client | `produced` | Confirm producer creation |
-| Server → Client | `new-producer` | Notify others about new media track |
-| Client → Server | `consume` | Request to receive a producer's media |
+| Client → Server | `join-meeting` | Join with meeting code, display name, and lobby mute/camera state |
+| Server → Client | `joined` | Snapshot: role, settings, lock state, participants, waiting list (hosts only), RTP capabilities, transport options, existing producers |
+| Server → Client | `waiting` / `join-rejected` | Held in the waiting room, or refused (`not-found`, `meeting-ended`, `meeting-locked`, `meeting-full`, `removed`) |
+| Client → Server | `produce` | Register audio/video/screen track (one per kind; screen only while sharing is granted) |
+| Server → Client | `produced` / `new-producer` | Confirm producer creation / notify others about the new track |
+| Client → Server | `consume` | Request a producer's media (same meeting only, never one's own) |
 | Server → Client | `consume-response` | Consumer parameters for playback |
-| Client → Server | `producer-close` | Stop sending a track |
+| Client → Server | `producer-close` | Stop sending a track (owner only) |
 | Server → Client | `producer-closed` | Notify track removal |
-| Bidirectional | `participant-update` | Mute, video, screen share, hand raise state |
-| Bidirectional | `chat-message` | In-call chat (broadcast or DM) |
+| Client → Server | `toggle-mute`, `toggle-video`, `raise-hand`, `start/stop-screen-share` | Change the caller's own state |
+| Server → Client | `participant-joined` / `participant-left` / `participant-update` | Presence and media state |
+| Client → Server | `admit-participant`, `deny-participant`, `mute-participant`, `mute-all`, `remove-participant`, `lock-meeting` | Host and co-host controls |
+| Client → Server | `transfer-host`, `set-role`, `end-meeting` | Host-only controls |
+| Server → Client | `role-changed`, `waiting-room-update`, `meeting-locked`, `muted-by-host`, `removed`, `denied`, `session-replaced`, `meeting-ended` | Results of host actions and lifecycle events |
+| Bidirectional | `chat-message` | In-call chat (broadcast or DM to someone in the meeting) |
 
 ### 3. Meeting Service (Lifecycle)
 
 Manages meeting CRUD operations and participant state:
 
 - **Meeting codes**: Generated as `abc-defg-hij` (3-4-3 lowercase letters), stored as VARCHAR(12) with UNIQUE constraint
-- **Meeting lifecycle**: scheduled → active → ended (with cancelled as terminal state)
-- **Participant tracking**: Join/leave timestamps, role (host/co-host/participant), media states
-- **Settings**: JSONB field with waitingRoom, muteOnEntry, allowScreenShare, maxParticipants
+- **Meeting lifecycle**: scheduled → active → ended (with cancelled as terminal state). The first admitted participant moves a scheduled meeting to active; it ends when the host ends it for everyone, or a grace period (30s) after the last participant leaves. Ended is terminal: joins are refused and REST start cannot reopen it
+- **Participant tracking**: Join/leave timestamps, role (host/co-host/participant), media states. One row per user per meeting; a rejoin reopens it with fresh role and state
+- **Settings**: JSONB field with waitingRoom, muteOnEntry, allowScreenShare, maxParticipants, all enforced at join or on the relevant action
+- **Roles**: the organizer (`meetings.host_id`) is admitted as host and reclaims host whenever they rejoin. The live host can transfer the role or name co-hosts; when the host leaves, the role passes to the longest-present co-host, else the longest-present participant
 
 ### 4. Breakout Room Service
 
@@ -178,8 +183,9 @@ Each breakout room gets its own Router. When breakout rooms close, participants 
 In-meeting chat with persistence:
 - Messages stored in PostgreSQL for meeting history
 - Real-time delivery via WebSocket (same connection used for signaling)
-- Support for broadcast (to everyone) and direct messages (to specific participant)
+- Support for broadcast (to everyone) and direct messages (to a participant currently in the meeting)
 - Messages include sender display name, content, timestamp, and optional recipient
+- History is visible to the organizer and attendees only, and a DM only to its sender and recipient
 
 ## Database Schema
 
@@ -250,6 +256,8 @@ CREATE TABLE breakout_assignments (
   assigned_at TIMESTAMPTZ DEFAULT NOW(),
   UNIQUE(breakout_room_id, participant_id)
 );
+-- One breakout room per participant (participant rows are already per meeting)
+CREATE UNIQUE INDEX idx_breakout_assignments_participant ON breakout_assignments(participant_id);
 
 -- In-meeting chat with optional DM targeting
 CREATE TABLE meeting_chat_messages (
@@ -291,6 +299,7 @@ CREATE INDEX idx_recordings_meeting ON recordings(meeting_id);
 - `idx_meetings_host` with `created_at DESC` — User's meetings ordered by recency for dashboard
 - `idx_participants_meeting` — Participant list retrieval for meeting view
 - `idx_chat_messages_meeting` with `created_at` — Ordered chat history pagination
+- `idx_breakout_assignments_participant` (unique) — Re-assigning a participant is an upsert that moves them, never a second room
 
 ## API Design
 
@@ -298,28 +307,33 @@ CREATE INDEX idx_recordings_meeting ON recordings(meeting_id);
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| POST | `/api/auth/register` | Create account |
-| POST | `/api/auth/login` | Sign in |
+| POST | `/api/auth/register` | Create account (session id issued) |
+| POST | `/api/auth/login` | Sign in (session id regenerated) |
 | POST | `/api/auth/logout` | Sign out |
 | GET | `/api/auth/me` | Current user |
-| POST | `/api/meetings` | Create meeting |
-| GET | `/api/meetings` | List user's meetings |
-| GET | `/api/meetings/code/:code` | Get meeting by code |
-| POST | `/api/meetings/:id/start` | Start meeting |
-| POST | `/api/meetings/:id/end` | End meeting |
-| GET | `/api/meetings/:id/participants` | Get participants |
-| POST | `/api/rooms/:meetingId/breakout-rooms` | Create breakout rooms |
-| POST | `/api/rooms/:meetingId/breakout-rooms/activate` | Open breakout rooms |
+| POST | `/api/meetings` | Create meeting; optional `Idempotency-Key`; scheduled times must carry a UTC offset |
+| GET | `/api/meetings` | Meetings the user organized or attended |
+| GET | `/api/meetings/code/:code` | Get meeting by code (the code is the join credential) |
+| GET | `/api/meetings/:id` | Get meeting (organizer and attendees; 404 otherwise) |
+| POST | `/api/meetings/:id/start` | Start meeting (organizer; scheduled → active only) |
+| POST | `/api/meetings/:id/end` | End meeting (organizer); also ends the live session |
+| GET | `/api/meetings/:id/participants` | Current participants (organizer and attendees) |
+| GET/POST | `/api/rooms/:meetingId/breakout-rooms` | List (attendees) / create (host or co-host) breakout rooms |
+| POST | `/api/rooms/breakout-rooms/:roomId/assign` | Assign a participant by `userId` (host or co-host) |
+| POST | `/api/rooms/:meetingId/breakout-rooms/activate` | Open breakout rooms; participants are told their room |
 | POST | `/api/rooms/:meetingId/breakout-rooms/close` | Close breakout rooms |
-| GET | `/api/chat/:meetingId/messages` | Get chat history |
+| GET | `/api/chat/:meetingId/messages` | Chat history as the caller may see it |
+| POST | `/api/chat/:meetingId/messages` | Send chat as a live participant (delivered over WebSocket) |
 | GET | `/api/health` | Health check |
-| GET | `/metrics` | Prometheus metrics |
+| GET | `/api/metrics` | Prometheus metrics |
+
+Resources the caller cannot see return 404 rather than 403, so a meeting id reveals nothing to outsiders; actions on a visible meeting that need a higher role return 403.
 
 ### WebSocket Protocol
 
-Connection: `ws://host/ws?userId=<id>&username=<name>`
+Connection: `ws://host/ws`. The browser sends its session cookie on the upgrade; the server runs the Express session middleware on that request and closes unauthenticated sockets with code 4001. Upgrades from an `Origin` outside `ALLOWED_ORIGINS` are refused (cookie-authenticated sockets are otherwise open to cross-site hijacking).
 
-All messages are JSON with a `type` field. See the Signaling Service section for the full protocol.
+All messages are JSON with a `type` field. See the Signaling Service section for the full protocol. Close codes 4001 (not signed in), 4002 (replaced by another window) and 4003 (removed by host) are final; the client does not reconnect after them.
 
 ## Key Design Decisions
 
@@ -355,42 +369,51 @@ The trade-off: we lose the ability to query "all meetings with waiting room enab
 
 mediasoup was chosen because it runs as a Node.js native addon, sharing the same process and event loop as the signaling server. This eliminates IPC latency between signaling and media routing. Janus would require a separate C process with JSON-RPC communication, adding ~2ms per signaling message. At 40M messages/minute, that overhead is measurable.
 
+### Meeting Access: Code, Waiting Room, Lock
+
+The meeting code is a bearer credential: 26^10 combinations make it unguessable, but anyone it is forwarded to can use it. So the code alone decides only who may *ask* to join. The waiting room puts the decision with a person: non-hosts are held in memory, invisible to the meeting, until a host or co-host admits or denies them. Lock closes the meeting to everyone new, removal adds the user to a per-meeting block list, and `maxParticipants` caps the room. The organizer bypasses all of these, because a host locked out of their own meeting by its own settings has no way to fix it.
+
+The alternative, per-participant invite tokens, would make the code useless to an eavesdropper, but every invitee then needs an account-bound link and ad-hoc "send me the code" stops working. A waiting room keeps the code shareable and adds friction only for the host. The cost is that admission waits on a human, and a waiting room with no host present holds people indefinitely.
+
+### Live Meeting State Is In-Process; PostgreSQL Is the Record
+
+Who is in a meeting right now, with which role, mute and screen-share state, lives in one process (`websocket/meetingRooms.ts`). Every policy check (capacity, one host, one presenter, rank-based host actions) is a synchronous read-modify-write on the event loop, so two joins cannot both take the last seat and two people cannot both start presenting. Each change is written through to PostgreSQL afterwards, queued per meeting so writes land in order.
+
+Keeping this state in PostgreSQL with row locks would survive a restart, but it would put a database round-trip and lock wait on every mute toggle and admit, on the path that has a 50ms latency budget. Keeping it in Redis would allow several signaling servers, but every check would become a Lua script or WATCH/MULTI transaction. The cost of the in-process choice is a single signaling server per meeting, and state lost on restart. Startup reconciliation closes stale attendance rows and gives active meetings the empty-meeting grace, so clients that reconnect carry on and abandoned meetings end instead of staying "active" forever. At scale, meetings would be pinned to a signaling node by consistent hashing on the meeting id, which is also what an SFU needs.
+
 ## Consistency and Idempotency
 
 ### Idempotent Meeting Creation
 
-Meeting creation requests include a client-generated idempotency key (UUID) sent in the `Idempotency-Key` header. The server stores completed request outcomes keyed by this value in Redis with a 24-hour TTL. If a duplicate request arrives — due to a network retry or the user double-clicking the "New Meeting" button — the server returns the previously created meeting rather than generating a second one. This prevents orphaned meetings that no one joins, which would pollute the user's meeting history and consume meeting codes unnecessarily.
+Meeting creation accepts a client-generated `Idempotency-Key` header. The server claims `zoom:idempotency:create-meeting:{userId}:{key}` in Redis with `SET NX` (value `pending`, 60s TTL), creates the meeting, then stores the meeting id with a 24-hour TTL. A duplicate request returns the first meeting with 200 and `replayed: true`; one that arrives while the first is still running gets 409. The short pending TTL means a request that died mid-flight does not block that key for a day. If Redis is unreachable the claim fails open: losing dedup for one request is better than refusing to create meetings. The dashboard's New Meeting button and the schedule form both send a key and disable themselves while in flight.
 
-The meeting code itself provides a secondary uniqueness constraint. Because codes are generated server-side with a UNIQUE database constraint, even without an idempotency key, a duplicate insert would fail at the database level. However, relying on database errors for flow control is fragile — the idempotency key approach catches duplicates before they reach the database.
+Meeting codes are drawn from a CSPRNG; a code collision on the UNIQUE constraint is retried with a new code rather than surfacing as an error.
 
-### WebSocket Message Delivery Semantics
+### WebSocket Message Ordering and Reconnection
 
-Signaling messages use at-least-once delivery with client-side deduplication. Each WebSocket message includes a monotonically increasing sequence number per connection. When a client reconnects after a brief disconnection, it sends its last received sequence number in the `join-meeting` message, and the server replays any missed state changes from a short-lived buffer stored in Redis (retained for 60 seconds after disconnection).
+Each connection's messages are handled strictly in arrival order (a per-connection promise chain), so a `produce` sent right after `join-meeting` cannot run before the join completes, and a leave cannot interleave with a join. There is no replay buffer: a client that reconnects re-sends `join-meeting` and receives a fresh `joined` snapshot of the current state, which is simpler than sequence numbers and replay, and correct because participant state is last-writer-wins. Receiving "user X is muted" twice produces the same state as receiving it once.
 
-For participant state updates (mute, video toggle, hand raise), the system uses last-writer-wins semantics. These are inherently idempotent — receiving "user X is muted" twice produces the same state as receiving it once. The server maintains the authoritative participant state in Redis, and any conflicting updates resolve to the most recent timestamp.
+### Chat Message Delivery
 
-### Exactly-Once Chat Message Guarantees
+Each chat message gets a server-side UUID when it is persisted, before it is broadcast. The client merges live messages and REST history by that id, so history loaded after a (re)join never duplicates messages that already arrived live. A message is sent at most once by the client; there is no client-generated message id or server-side dedup set, so a message whose acknowledgment is lost is not retried. For in-meeting chat that trade is acceptable; a messaging product would add client ids.
 
-Chat messages require stronger guarantees than signaling messages because users expect every message to appear exactly once in the correct order. Each chat message is assigned a server-side UUID before being persisted to PostgreSQL and broadcast via WebSocket. The client tracks received message IDs in a local Set. If a duplicate arrives during reconnection replay, the client silently drops it.
+### Duplicate Joins, Tabs and Disconnects
 
-On the write path, the client includes a client-generated message ID with each chat submission. The server checks for this ID in a Redis set (scoped to the meeting, TTL of 1 hour) before inserting into PostgreSQL. If the ID already exists, the server returns the existing message without creating a duplicate row. This handles the case where the client sends a message, the server persists it, but the acknowledgment is lost — prompting the client to retry.
+There is one seat per user per meeting, backed by the `UNIQUE(meeting_id, user_id)` participant row. A rejoin reopens that row and resets role, hand and screen-share flags, so a former host cannot come back as a second host. If the same user joins from a second tab, the newer connection takes the seat and its role. The older one receives `session-replaced` and is closed with code 4002, and nobody sees a leave/join flicker. When the old tab later closes, it does not evict the new one.
 
-### Handling Duplicate Join and Leave Events
-
-Join and leave events are idempotent by design. The `meeting_participants` table has a UNIQUE constraint on `(meeting_id, user_id)`, so a duplicate join attempt results in an upsert that updates the `joined_at` timestamp and clears the `left_at` field rather than creating a second row. Similarly, a duplicate leave event sets `left_at` to the current timestamp regardless of whether it was already set.
-
-During network instability, a participant may appear to leave and rejoin rapidly. The server applies a grace period of 5 seconds before broadcasting a `participant-left` event to other participants. If the user reconnects within that window, the departure is never announced, avoiding the disruptive "X left / X joined" notification flicker that degrades the meeting experience. The reconnecting client re-establishes its WebSocket connection, re-registers its producers, and other participants see seamless continuity.
+When a socket drops without a leave, the seat is held for a reconnect grace window (10s by default, `RECONNECT_GRACE_MS`). A reconnect inside the window resumes the same seat and role silently. Otherwise `participant-left` is broadcast with reason `disconnected`. Dead connections are found by a 30s ping/pong heartbeat rather than waiting minutes for TCP to give up. An explicit leave frees the seat immediately, and a leave followed by the socket closing counts as one departure.
 
 ## Security / Auth
 
-- **Session-based authentication** with Redis session store
+- **Session-based authentication** with Redis session store; the session id is regenerated on login and registration (no session fixation)
+- **WebSocket identity from the session**: the upgrade request runs through the same express-session middleware; a client-supplied user id is never trusted. Browser upgrades from origins outside `ALLOWED_ORIGINS` get 403
+- **Meeting authorization**: meeting details, participants and chat history are visible to the organizer and attendees (404 for anyone else); breakout rooms are managed by the organizer or the live host/co-host (403 for other attendees); in-meeting host actions require a role strictly above the target's
 - **bcrypt** password hashing (cost factor 10)
-- **Rate limiting** on auth endpoints (20 requests / 15 minutes)
-- **API rate limiting** (100 requests / 15 minutes per IP)
-- **CORS** restricted to frontend origin
-- **HttpOnly cookies** for session tokens
+- **Rate limiting**: 20 *failed* auth attempts / 15 minutes per IP; 100 API requests / 15 minutes per IP (both configurable)
+- **CORS** restricted to the configured frontend origins
+- **HttpOnly cookies** for session tokens; chat and names are rendered as text, never HTML
 
-In production: OAuth 2.0 (Google, SSO), JWT with refresh tokens, end-to-end encryption for media streams (Insertable Streams API for E2EE through SFU).
+In production: OAuth 2.0 (Google, SSO), short-lived signed tokens for socket handoff between nodes, end-to-end encryption for media streams (Insertable Streams API for E2EE through SFU).
 
 ## Observability
 
@@ -415,34 +438,30 @@ Default Node.js metrics (CPU, memory, event loop lag) collected automatically.
 
 ### Health Check
 
-- `GET /api/health` — Returns server status, timestamp, PostgreSQL pool health, Redis connectivity
+- `GET /api/health` — Returns server status and timestamp. It does not probe PostgreSQL or Redis; in production it would, so a load balancer could drain an instance that lost its database
 
 ## Failure Handling
 
 ### Circuit Breaker (Opossum)
 
-Applied to database queries to prevent cascade failures when PostgreSQL is unavailable:
-- Error threshold: 50%
-- Timeout: 5 seconds per query
-- Reset timeout: 30 seconds before half-open probe
-
-When the circuit opens, meeting creation and history queries fail fast with a 503 status code rather than hanging for the full database timeout. This preserves WebSocket signaling (which uses Redis) even when PostgreSQL is down — active meetings continue functioning, but new meetings cannot be created.
+`services/circuitBreaker.ts` provides an Opossum factory (50% error threshold, 5s timeout, 30s reset), but no database call is wrapped with it yet. In production it would wrap meeting creation and history queries so a slow PostgreSQL fails fast with 503 instead of tying up the event loop the signaling socket shares. Live meetings would keep working regardless, because their state is in memory and database writes are queued per meeting.
 
 ### WebSocket Reconnection
 
 Client implements exponential backoff reconnection:
 - Max 5 attempts
 - Delay: 1s, 2s, 4s, 8s, 16s
-- On reconnect: rejoin meeting with current state, re-register producers
+- On reconnect: re-sends `join-meeting`; inside the server's 10s grace window this resumes the same seat and role, and the client re-registers its producers from the fresh `joined` snapshot
+- No reconnect after a final close code (4001 not signed in, 4002 replaced, 4003 removed) or after `meeting-ended`
 
 ### Graceful Shutdown
 
-Server handles SIGTERM/SIGINT:
-1. Stop accepting new connections
-2. Close WebSocket server (sends close frame to all clients)
-3. Wait for ongoing requests to complete
-4. Close database pool
-5. Exit process
+Server handles SIGTERM/SIGINT (once, even if the signal arrives twice):
+1. Close every WebSocket with 1001 and stop the WebSocket server
+2. Stop accepting HTTP connections and let in-flight requests finish
+3. Exit, or force exit after 3 seconds if connections linger
+
+On the next start, reconciliation closes the attendance rows the old process left open.
 
 ## Scalability Considerations
 
@@ -492,7 +511,13 @@ Server handles SIGTERM/SIGINT:
 | Meeting settings | JSONB | Normalized table | Co-read/co-written, evolving schema |
 | Video codec | VP8 / H264 | VP9 / AV1 | Widest browser support, hardware acceleration |
 | Chat delivery | WebSocket (shared) | Separate chat service | Already connected for signaling, minimal overhead |
-| Meeting code | 3-4-3 alpha | UUID / numeric | Human-readable, typeable, memorable |
+| Meeting code | 3-4-3 alpha (CSPRNG) | UUID / numeric | Human-readable, typeable, memorable |
+| Socket identity | Session cookie on upgrade | Client-sent user id / signed token | No trust in client claims; reuses existing session store |
+| Join control | Code + waiting room + lock | Per-invitee tokens | Code stays shareable; host decides admission |
+| Live meeting state | In-process, write-through to PG | Redis / PG row locks | Synchronous policy checks; single node per meeting |
+| Duplicate tabs | Newest connection takes the seat | Multiple seats per user | One row per user per meeting; no leave/join flicker |
+| Dropped sockets | 10s seat hold + heartbeat | Immediate leave | Reconnects resume silently; ghosts clear in seconds |
+| Host leaves | Auto-promote co-host, then longest present | Meeting stays hostless | Someone can always admit, mute and end |
 
 ## Frontend Architecture
 
@@ -511,7 +536,7 @@ frontend/src/routes/
 
 The root component checks authentication on mount via `checkAuth()`. If the user is not authenticated and is not on `/login` or `/register`, they are redirected to `/login`. The `Header` component is always visible with the app logo, navigation links, and user menu.
 
-The meeting route (`meeting.$code.tsx`) is the most complex -- it implements a two-phase flow within a single route: the meeting lobby (camera/mic preview, display name entry, join button) transitions to the in-meeting view (video grid, control bar, side panels) once the WebSocket join handshake completes.
+The meeting route (`meeting.$code.tsx`) is the most complex. Its phases come from the `useMeetingConnection` hook: lobby (camera/mic preview, display name, join button), joining, waiting (held in the waiting room), in-meeting (video grid, control bar, side panels), and closed (refused, denied, removed, replaced by another window, or meeting ended), each with its own screen. An ended or cancelled meeting shows a message instead of a Join button.
 
 ### Component Hierarchy
 
@@ -537,10 +562,13 @@ RootComponent (__root.tsx)
             │   ├── VideoTile[]  (individual participant: video/avatar, name, status icons)
             │   └── ScreenShareView  (full-width placeholder when someone shares screen)
             ├── ChatPanel        (in-meeting text chat with broadcast/DM support)
-            ├── ParticipantList  (sidebar list with mute/video/hand status indicators)
-            ├── BreakoutRooms    (host-only: create, assign, activate, close breakout rooms)
-            ├── ControlBar       (bottom bar: mute, camera, screen share, hand raise, chat, leave)
-            └── HandRaiseIndicator (animated hand icon overlay)
+            ├── ParticipantList  (sidebar list with status indicators, Mute all)
+            │   ├── WaitingRoomList    (host/co-host: Admit / Deny)
+            │   └── ParticipantActions (Mute, Make co-host, Make host, Remove)
+            ├── BreakoutRooms    (host/co-host: create, assign, open, close)
+            ├── ControlBar       (mute, camera, share, hand, chat, participants, lock, End for all, leave)
+            └── MeetingNotice    (transient banner: muted by host, role changes, refusals)
+        MeetingMessageScreen     (waiting room, ended, removed, refused)
 ```
 
 ### Zustand Stores
@@ -567,7 +595,7 @@ Actions: `login()`, `register()`, `logout()`, `checkAuth()`, `clearError()`. Ses
 | `isHandRaised` | Whether local user has raised hand |
 | `selectedCamera`, `selectedMic` | Device IDs for selected camera and microphone |
 
-Actions: Setters for each field, plus `reset()` which stops all media tracks and returns to initial state. The `reset()` is called on meeting leave to release camera/mic permissions.
+Actions: Setters for each field (`setIsMuted`/`setIsVideoOn` also enable or disable the real tracks, so "muted" means the microphone is off), plus `reset()` which stops all media tracks and returns to initial state. The `reset()` is called on meeting leave to release camera/mic permissions.
 
 **`meetingStore`** -- Meeting room state:
 
@@ -580,8 +608,12 @@ Actions: Setters for each field, plus `reset()` which stops all media tracks and
 | `isInMeeting` | True after WebSocket join handshake completes |
 | `isChatOpen`, `isParticipantListOpen`, `isBreakoutOpen` | Side panel toggle states (mutually exclusive) |
 | `screenSharingUserId` | User ID of the participant currently sharing screen (null if none) |
+| `myRole` | The local user's live role from the server (drives host controls; not "am I the organizer") |
+| `locked`, `waiting` | Meeting lock state and the waiting-room list (hosts and co-hosts) |
+| `breakoutOpen` | Whether breakout rooms are currently open |
+| `notice` | Transient banner text |
 
-Actions: `setParticipants()`, `addParticipant()`, `removeParticipant()`, `updateParticipant()` (for media state changes), `addChatMessage()`, panel toggles (opening one closes the others), `reset()`. Participant updates automatically track screen sharing state -- when `isScreenSharing` is set to true, the store records that user's ID as `screenSharingUserId`.
+Actions: `setParticipants()`, `addParticipant()` (idempotent by userId), `removeParticipant()`, `updateParticipant()` (for media state changes), `addChatMessage()` and `mergeChatHistory()` (deduplicated by message id), `setMyRole()`, `setLocked()`, `setWaiting()`, `setNotice()`, panel toggles (opening one closes the others), `reset()`. Participant updates automatically track screen sharing state -- when `isScreenSharing` is set to true, the store records that user's ID as `screenSharingUserId`.
 
 ### WebSocket Client (`services/websocket.ts`)
 
@@ -589,11 +621,11 @@ A singleton `WebSocketClient` class manages the real-time connection for meeting
 
 - **Event-based dispatch:** The client uses a `Map<string, MessageHandler[]>` to register handlers by message type. Components register handlers via `wsClient.on('joined', handler)` and unregister via `wsClient.off()`. A wildcard handler (`'*'`) catches all messages for debugging.
 
-- **Reconnection with exponential backoff:** On unexpected close (code !== 4001), the client attempts up to 5 reconnections with delays of 1s, 2s, 4s, 8s, 16s. On intentional disconnect, reconnection is suppressed by setting `reconnectAttempts = maxReconnectAttempts`.
+- **Reconnection with exponential backoff:** On an unexpected close the client attempts up to 5 reconnections with delays of 1s, 2s, 4s, 8s, 16s, and re-sends the last `join-meeting` on each reconnect so the server's grace window resumes the same seat. Close codes ≥ 4000 are final (not signed in, replaced, removed); an intentional disconnect or leave clears the remembered join.
 
-- **Signaling methods:** The client exposes typed methods for the WebRTC signaling protocol: `joinMeeting()`, `leaveMeeting()`, `produce()`, `consume()`, `closeProducer()`, `toggleMute()`, `toggleVideo()`, `startScreenShare()`, `stopScreenShare()`, `raiseHand()`, `sendChatMessage()`. Each method wraps `ws.send(JSON.stringify({...}))` with the appropriate message type.
+- **Signaling methods:** The client exposes typed methods for the WebRTC signaling protocol (`joinMeeting()`, `leaveMeeting()`, `produce()`, `consume()`, `closeProducer()`, `toggleMute()`, `toggleVideo()`, `startScreenShare()`, `stopScreenShare()`, `raiseHand()`, `sendChatMessage()`) and for host controls (`admitParticipant()`, `denyParticipant()`, `muteParticipant()`, `muteAll()`, `removeParticipant()`, `transferHost()`, `setRole()`, `lockMeeting()`, `endMeeting()`). The server checks the caller's role for each.
 
-- **Auth via query parameters:** The connection URL includes `userId` and `username` as query parameters. This is a development simplification -- production would validate the session cookie during the WebSocket upgrade handshake.
+- **Auth via the session cookie:** The connection URL carries no identity; the browser sends the session cookie on the upgrade, and the Vite dev proxy forwards it to the backend.
 
 ### Data Fetching
 
@@ -603,19 +635,21 @@ A singleton `WebSocketClient` class manages the real-time connection for meeting
 
 ### Real-Time Update Patterns
 
-**WebSocket message handling in MeetingPage:** The `setupWsHandlers()` callback registers handlers for all meeting events:
+**WebSocket message handling (`hooks/useMeetingConnection.ts`):** The hook registers every handler once when the meeting page mounts and removes them on unmount, so re-joining never stacks duplicate handlers. Closing the tab sends `leave-meeting` from `pagehide` so the seat is not held for the grace window.
 
 | Server Message | Store Action | Effect |
 |----------------|-------------|--------|
-| `joined` | `setParticipants()`, `setIsInMeeting(true)` | Transitions from lobby to meeting view |
-| `participant-joined` | `addParticipant()` | New tile appears in video grid |
-| `participant-left` | `removeParticipant()` | Tile removed, screen share cleared if they were sharing |
-| `participant-update` | `updateParticipant()` | Mute/video/screen share/hand raise icons update |
-| `chat-message` | `addChatMessage()` | New message appears in chat panel |
-| `new-producer` | (no-op in simulation) | Would create a consumer to receive media in production |
-| `producer-closed` | (no-op in simulation) | Would clean up consumer in production |
-| `left` | `setIsInMeeting(false)` | Returns to lobby state |
-| `error` | Console error | Logged for debugging |
+| `joined` | `setParticipants()`, `setMyRole()`, `setLocked()`, `setWaiting()`, media flags from `self` | Lobby → meeting; produces audio/video, consumes existing producers, loads chat history and breakout rooms |
+| `waiting` | phase `waiting` | Waiting-room screen |
+| `join-rejected`, `denied`, `removed`, `session-replaced`, `meeting-ended` | phase `closed` | Explanatory screen; no auto-rejoin |
+| `participant-joined` / `participant-left` | `addParticipant()` / `removeParticipant()` | Tile appears / disappears |
+| `participant-update` | `updateParticipant()`; own updates also sync `mediaStore` | Icons update; own screen share produces or drops the screen track |
+| `role-changed` | `updateParticipant()`, `setMyRole()` | Badges and host controls follow the live role |
+| `waiting-room-update`, `meeting-locked`, `muted-by-host` | `setWaiting()`, `setLocked()`, `setIsMuted(true)` + notice | Host panels and banners |
+| `chat-message` | `addChatMessage()` | New message in chat (deduplicated by id) |
+| `new-producer` | `wsClient.consume()` | Subscribes to the new track (no media flows in the simulation) |
+| `breakout-rooms-updated/opened/closed` | `setBreakoutRooms()` + notice | Room list; participants learn their room |
+| `error` | notice | Refused actions (e.g. someone else is presenting) are shown |
 
 ### Key UI Patterns
 
@@ -639,7 +673,7 @@ This section explains each production-grade pattern implemented in this project.
 
 **Why it matters:** The Zoom backend depends on PostgreSQL for meeting creation, participant tracking, and chat persistence. If PostgreSQL becomes unresponsive (connection pool exhausted, disk full, network partition), every API request would block for the full database timeout (5 seconds). With 100 participants in a meeting, each toggling mute or sending chat messages, the Express request handler pool fills up. More critically, the WebSocket signaling server shares the Node.js event loop with the Express server. Blocked database calls would stall WebSocket message processing, causing all participants to experience frozen video grids and unresponsive controls. The circuit breaker prevents this cascade by failing database calls instantly when PostgreSQL is known to be unhealthy, preserving WebSocket signaling (which uses Redis for state) even during database outages.
 
-**How it works here:** Opossum wraps database queries with a 50% error threshold, 5-second timeout per query, and 30-second reset before half-open probe. When the circuit opens, meeting creation and history queries fail fast with a 503 status code. Active meetings continue functioning because participant state is managed in memory and via Redis -- only meeting persistence is affected. The `circuit_breaker_state` Prometheus metric tracks state transitions for alerting.
+**How it works here:** `createCircuitBreaker` builds an Opossum breaker (50% error threshold, 5-second timeout, 30-second reset, state transitions logged), but no query is wrapped with it yet, so today a slow database slows requests rather than failing them fast. Live meetings are already insulated: their state is in memory and database writes are queued per meeting, so a slow write delays the record, not the signaling.
 
 **File:** `backend/src/services/circuitBreaker.ts`
 
@@ -649,7 +683,7 @@ This section explains each production-grade pattern implemented in this project.
 
 **Why it matters:** Video conferencing endpoints are attractive targets for abuse. A brute-force attack against the login endpoint could try thousands of passwords per minute. A bot could create hundreds of meetings, consuming meeting codes and database resources. Rate limiting caps the damage any single source can cause and provides time for detection and response.
 
-**How it works here:** Two tiers of rate limiting are implemented. Auth endpoints (login, register) have a strict limit of 20 requests per 15 minutes per IP address -- aggressive enough to prevent brute-force attacks while lenient enough for users who mistype their password a few times. General API endpoints have a broader limit of 100 requests per 15 minutes per IP. Both use `express-rate-limit` with `rate-limit-redis` as the store, which ensures rate limits are enforced consistently across multiple server instances (all instances share the same Redis counter). When the limit is exceeded, the server returns HTTP 429 (Too Many Requests).
+**How it works here:** Two tiers of rate limiting are implemented. Auth endpoints (login, register) have a strict limit of 20 requests per 15 minutes per IP address -- aggressive enough to prevent brute-force attacks while lenient enough for users who mistype their password a few times. General API endpoints have a broader limit of 100 requests per 15 minutes per IP. The auth limiter counts only failed attempts (`skipSuccessfulRequests`), so signing in and out normally never locks anyone out. Both use `express-rate-limit` with its in-memory store, which matches the single-server signaling design; several API instances would share counters through `rate-limit-redis` (already a dependency). Limits are configurable with `API_RATE_LIMIT` and `AUTH_RATE_LIMIT`. When the limit is exceeded, the server returns HTTP 429 (Too Many Requests).
 
 **File:** `backend/src/services/rateLimiter.ts`
 
@@ -669,7 +703,7 @@ This section explains each production-grade pattern implemented in this project.
 
 **Why it matters:** Video conferencing has specific operational metrics that are critical for capacity planning and incident response. "How many meetings are active right now?" determines whether to scale up SFU workers. "How many participants are connected?" determines WebSocket server load. "What is the API latency by route?" identifies slow endpoints before users complain. Without metrics, these questions require manual investigation during incidents, when response time is most critical.
 
-**How it works here:** Four custom metrics are defined. `active_meetings_total` (Gauge) tracks the number of meetings in "active" status -- used for SFU worker capacity planning. `active_participants_total` (Gauge) tracks the total connected participant count. `websocket_connections_total` (Gauge) tracks active WebSocket connections for load balancer tuning. `http_request_duration_seconds` (Histogram with method, route, and status labels) records API latency for SLI dashboards. Default Node.js metrics (CPU, memory, event loop lag, GC pause duration) are collected automatically via `collectDefaultMetrics()`.
+**How it works here:** Four custom metrics are defined. `active_meetings_total` (Gauge) tracks live meetings in this process, used for SFU worker capacity planning. `active_participants_total` (Gauge) tracks admitted participants, counted once per seat; a second tab or a leave followed by a socket close does not double-count. `websocket_connections_total` (Gauge) tracks active WebSocket connections for load balancer tuning. `http_request_duration_seconds` (Histogram with method, route, and status labels) records API latency for SLI dashboards. Default Node.js metrics (CPU, memory, event loop lag, GC pause duration) are collected automatically via `collectDefaultMetrics()`.
 
 **File:** `backend/src/services/metrics.ts`
 
@@ -679,7 +713,7 @@ This section explains each production-grade pattern implemented in this project.
 
 **Why it matters:** A video conferencing server depends on PostgreSQL (meeting persistence) and Redis (sessions, participant state). If PostgreSQL fails, the server cannot create new meetings but active meetings continue. If Redis fails, sessions are lost but in-memory meeting state is preserved. Health checks enable automated systems to make nuanced decisions: remove an instance from the load balancer when PostgreSQL is down (cannot serve new meeting requests) but do not restart it (active meetings are still functional).
 
-**How it works here:** A single comprehensive endpoint `GET /api/health` returns server status, current timestamp, PostgreSQL pool health (active, idle, and waiting connection counts), and Redis connectivity (ping response). This endpoint is used both by external monitoring and by the frontend to display server status.
+**How it works here:** `GET /api/health` returns status and timestamp only; it is a liveness probe. A readiness probe that pings PostgreSQL and Redis is the obvious next step and is not implemented.
 
 ### Idempotency
 
@@ -687,7 +721,7 @@ This section explains each production-grade pattern implemented in this project.
 
 **Why it matters:** Meeting creation is the most important idempotent operation. If a user clicks "New Meeting" and the network drops the response, their client retries. Without idempotency, two meetings are created with different codes, and the user sees a confusing duplicate in their meeting list. Similarly, the meeting code UNIQUE constraint in PostgreSQL provides a secondary safeguard -- but relying on database errors for flow control is fragile and produces poor error messages.
 
-**How it works here:** Meeting creation requests include an `Idempotency-Key` header (a client-generated UUID). The server stores the completed request outcome in Redis keyed by this value with a 24-hour TTL. If a duplicate request arrives, the server returns the previously created meeting without executing any database operations. The meeting code itself provides a secondary deduplication layer via the UNIQUE database constraint. For WebSocket signaling, participant state updates (mute, video toggle, hand raise) use last-writer-wins semantics and are inherently idempotent -- receiving "user X is muted" twice produces the same state as receiving it once. Chat messages use client-generated message IDs checked against a Redis set to prevent duplicate insertion.
+**How it works here:** Meeting creation accepts an `Idempotency-Key` header. The server claims the key in Redis with `SET NX` (pending, 60s), creates the meeting, then stores its id for 24 hours; a repeat returns the same meeting with 200 and `replayed: true` (409 while the first is still running). Breakout assignment is an upsert on a unique `participant_id` index, so repeating it is harmless. Participant state updates are last-writer-wins and idempotent, and `consume` returns the existing Consumer for a repeated (subscriber, producer) pair. Chat has no client message id: the server assigns the id, and clients deduplicate by it when merging history.
 
 ### RBAC (Role-Based Access Control)
 
@@ -695,7 +729,7 @@ This section explains each production-grade pattern implemented in this project.
 
 **Why it matters:** In a video conferencing system, different participants have different capabilities within the same meeting. The host can end the meeting, mute other participants, create breakout rooms, and manage settings. Co-hosts share some of these capabilities. Regular participants can only control their own media state. Without RBAC, these permission checks would be ad-hoc conditional statements throughout the WebSocket handler, making them difficult to audit and easy to bypass.
 
-**How it works here:** Three meeting roles are defined: `host` (full control: end meeting, mute all, create/manage breakout rooms, change settings), `co-host` (can mute others and manage breakout rooms but cannot end the meeting), and `participant` (can only control own audio, video, screen share, hand raise, and send chat messages). The role is stored in the `meeting_participants.role` column and checked in the WebSocket message handler before executing privileged operations. The meeting creator is automatically assigned the `host` role. Role checks also gate the breakout room UI in the frontend -- only hosts see the breakout room management panel.
+**How it works here:** Three meeting roles are ranked: `host` (end meeting for all, transfer host, name co-hosts), `co-host` (admit/deny, mute, mute all, remove, lock, manage breakout rooms), and `participant` (own audio, video, hand, chat, and screen share unless the host disabled it). Every host action also requires the target to rank strictly below the caller, so a co-host cannot remove the host or another co-host. The live role is held in memory by `websocket/meetingRooms.ts`, checked there for every privileged message, and written through to `meeting_participants.role`. The organizer is admitted as host and reclaims host on rejoining (the interim host becomes co-host); when the host leaves, the role passes to the longest-present co-host, else the longest-present participant. The frontend shows controls from the live role (`myRole`); the server enforces them regardless.
 
 ### Redis Cache-Aside
 
@@ -703,7 +737,7 @@ This section explains each production-grade pattern implemented in this project.
 
 **Why it matters:** In a video conferencing system, session validation happens on every HTTP request and every WebSocket connection upgrade. With 800,000 concurrent participants, each making signaling requests, validating sessions against PostgreSQL would require hundreds of thousands of queries per second. Redis serves session lookups in sub-millisecond time from memory, reducing database load by orders of magnitude.
 
-**How it works here:** Redis is used as both the session store (via `connect-redis` with `ioredis`) and the primary store for transient meeting state. Sessions are stored in Redis with automatic expiration, and PostgreSQL is not involved in session validation at all. For the WebSocket reconnection buffer, the server stores the last 60 seconds of state changes per meeting in Redis. When a participant reconnects, the server replays missed events from this buffer rather than recomputing state from PostgreSQL.
+**How it works here:** Redis is the session store (via `connect-redis` with `ioredis`) and holds idempotency keys for meeting creation. Sessions expire automatically, and PostgreSQL is not involved in session validation, including the validation of every WebSocket upgrade. Transient meeting state is not in Redis: it lives in the signaling process, and a reconnecting client receives a fresh snapshot instead of a replay of missed events.
 
 ## Implementation Notes
 
@@ -725,7 +759,7 @@ This section explains each production-grade pattern implemented in this project.
 ┌───────────────┐                     │
 │  Express +    │─────────────────────┘
 │  WebSocket    │
-│  :3000        │
+│  :3001        │
 │               │
 │  ┌──────────┐ │
 │  │Simulated │ │
@@ -737,25 +771,36 @@ This section explains each production-grade pattern implemented in this project.
 
 ### Production-Grade Patterns Implemented
 
-**Simulated SFU service** (`backend/src/services/sfuService.ts`): Models the complete mediasoup architecture (Workers, Routers, WebRtcTransports, Producers, Consumers) in memory without requiring the native C++ mediasoup module. The signaling protocol is implemented correctly — the same WebSocket messages a real mediasoup application would exchange. Router creation per meeting room, send/recv transport per participant, producer registration on media share, consumer creation for each subscriber, and cleanup on leave/disconnect are all functional. Only the actual SRTP packet forwarding is simulated (logged but not executed).
+**Session-authenticated signaling socket** (`backend/src/websocket/handler.ts`): The upgrade request runs through the exported express-session middleware, so a socket belongs to the logged-in user; the old handler took `userId` from the query string, letting anyone connect as anyone, including as a meeting's host. Origins outside `ALLOWED_ORIGINS` are refused. Each connection's messages run in order through a promise chain, a 30s ping/pong heartbeat terminates dead sockets, and payloads are capped at 64KB.
 
-**Full WebSocket signaling protocol** (`backend/src/websocket/handler.ts`): Complete message protocol for WebRTC negotiation with 11 message types. Handles join-meeting, produce, consume, producer-close, participant-update, and chat-message flows. Participant state (mute, video, screen share, hand raise) is synchronized to all meeting participants in real-time.
+```typescript
+server.on('upgrade', (req, socket, head) => {
+  sessionMiddleware(req, {} as Response, () => {
+    wss.handleUpgrade(req, socket, head, (ws) =>
+      onConnection(ws, req.session?.userId ?? null, req.session?.username ?? null));
+  });
+});
+```
 
-**Structured logging** (`backend/src/services/logger.ts`): Pino with JSON output, request-level correlation via pino-http. Meeting lifecycle events, SFU operations, and participant state changes are logged with structured metadata for debugging.
+**Live meeting state and policy** (`backend/src/websocket/meetingRooms.ts`): One module owns who is in each meeting and enforces the waiting room, lock, capacity, removal list, mute-on-entry, screen-share permission and single presenter, the host/co-host ranks, host promotion and the organizer reclaiming host, one seat per user (newest tab wins, close 4002), the 10s reconnect grace, ending 30s after the room empties, and startup reconciliation. Checks are synchronous on the event loop; database writes are queued per meeting so they commit in order. Covered by `meetingRooms.test.ts` (28 tests) and `handler.test.ts` (socket auth over a real upgrade).
 
-**Prometheus metrics** (`backend/src/services/metrics.ts`): Four custom metrics — active meetings gauge, active participants gauge, WebSocket connections gauge, and HTTP request duration histogram with method/route/status labels. Default Node.js metrics collected automatically.
+**Simulated SFU service** (`backend/src/services/sfuService.ts`): Models the mediasoup architecture (Routers, WebRtcTransports, Producers, Consumers) in memory. Router per meeting, send/recv transport per participant, one producer per kind, consumers only for producers of the same meeting (never one's own, idempotent per pair), close only by the producer's owner, cascade cleanup on close and leave. The frontend now drives it: it produces audio and video after joining, consumes every advertised producer, and produces a screen track only after the server grants the share. Only SRTP forwarding is simulated.
 
-**Circuit breaker** (`backend/src/services/circuitBreaker.ts`): Opossum wrapping database calls with 50% error threshold and 30-second reset. Prevents cascade failures when PostgreSQL is unavailable while keeping WebSocket signaling operational.
+**Authorization on REST** (`backend/src/routes/*.ts`, `meetingService.getMeetingForViewer`): Meeting details, participants and chat history are visible to the organizer and attendees, and 404 otherwise; DMs are filtered to their two parties in SQL. Breakout management needs the organizer or the live host/co-host (403 for other attendees); assignments must be participants of the same meeting, enforced by a unique index on `participant_id`. Malformed ids return 404 instead of a database error.
 
-**Rate limiting** (`backend/src/services/rateLimiter.ts`): Two tiers — auth endpoints (20/15min) and general API (100/15min). Uses express-rate-limit with Redis store via rate-limit-redis for cross-instance consistency.
+**Idempotent meeting creation** (`backend/src/routes/meetings.ts`): `Idempotency-Key` claimed with `SET NX` in Redis; repeats return the first meeting. Meeting codes come from `crypto.randomInt` with collision retry.
 
-**Session auth** (`backend/src/middleware/auth.ts`): Redis-backed sessions via connect-redis with ioredis client. HttpOnly cookies, bcrypt password hashing, middleware guards for authenticated routes.
+**Time zones** (`meetingService.parseCreateMeetingInput`, `ScheduleForm.tsx`): The API accepts only ISO-8601 timestamps with an offset; the form converts the browser's local `datetime-local` value with `toISOString()` and shows the user's zone. Before, the naive value was stored as UTC, moving meetings by the user's offset.
 
-**Breakout rooms** (`backend/src/services/breakoutService.ts`): Full CRUD for breakout rooms with participant assignment, activation, and closure. Creates separate SFU routers per breakout room.
+**Structured logging** (`backend/src/services/logger.ts`): Pino with request logging via pino-http; joins, admissions, leaves, meeting ends and SFU operations carry meeting and user ids.
 
-**Meeting service** (`backend/src/services/meetingService.ts`): Meeting CRUD with code generation (`abc-defg-hij` format), lifecycle management (scheduled → active → ended), and participant tracking.
+**Prometheus metrics** (`backend/src/services/metrics.ts`): active meetings (now actually set), active participants (counted once per seat), WebSocket connections, HTTP duration histogram, default Node.js metrics.
 
-**Chat service** (`backend/src/services/chatService.ts`): PostgreSQL-backed chat with broadcast and DM support, retrieved as paginated history.
+**Rate limiting** (`backend/src/services/rateLimiter.ts`): 100 API requests and 20 failed auth attempts per 15 minutes per IP, in memory, configurable.
+
+**Session auth** (`backend/src/middleware/auth.ts`, `routes/auth.ts`): Redis-backed sessions, HttpOnly cookies, bcrypt, session id regenerated at login and registration.
+
+**Breakout rooms** (`backend/src/services/breakoutService.ts`, `frontend/src/components/BreakoutRooms.tsx`): Create, assign by user id (re-assigning moves), open, close, delete; open/close and changes are pushed to everyone in the meeting, and each participant is told their room.
 
 ### What Was Simplified or Substituted
 
@@ -766,17 +811,19 @@ This section explains each production-grade pattern implemented in this project.
 | STUN/TURN servers | None | WebRTC connections not established |
 | OAuth 2.0 / SSO | Session auth with bcrypt | Functional but not production-grade |
 | Redis Cluster | Single Valkey instance | No failover, no sharding |
-| L7 load balancer | Direct connection | Single server only |
-| Waiting room enforcement | Settings flag only | Join is always allowed |
-| Recording pipeline | Database schema only | No capture, transcode, or storage |
-| WebSocket auth | Query parameters (userId, username) | No session validation on WS connect |
+| Signaling cluster with meeting pinning | One process holds all live meetings | `dev:server2/3` cannot share meetings; restart drops live state (reconciled at boot) |
+| Breakout Routers | Assignment + notification only | Participants learn their room; media and chat are not isolated per room |
+| Circuit breaker on DB calls | Factory exists, not wired | Slow database slows requests instead of failing fast |
+| Readiness health check | Liveness only | `/api/health` does not probe PostgreSQL or Redis |
+| Rate limits across instances | In-memory store | Correct for a single instance only |
 
 ### What Was Omitted
 
 - **CDN** for static assets
 - **End-to-end encryption (E2EE)** for media via Insertable Streams
 - **Kubernetes orchestration** for SFU worker scaling
-- **Recording pipeline** (capture, transcode, store to object storage)
+- **Recording pipeline** (capture, transcode, store to object storage); the `recordings` table is unused
+- **Meeting passcodes and per-invitee links** (the code plus waiting room and lock are the access controls)
 - **Virtual backgrounds / noise cancellation** (ML processing)
 - **TURN/STUN server infrastructure**
 - **Multi-region deployment** with geo-routing for lowest-latency SFU selection

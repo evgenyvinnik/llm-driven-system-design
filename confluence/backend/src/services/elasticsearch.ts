@@ -31,6 +31,8 @@ export async function ensureIndex(): Promise<void> {
           mappings: {
             properties: {
               page_id: { type: 'keyword' },
+              slug: { type: 'keyword' },
+              version: { type: 'integer' },
               space_id: { type: 'keyword' },
               space_key: { type: 'keyword' },
               title: {

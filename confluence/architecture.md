@@ -103,7 +103,7 @@ Resolve the stable page ID and evaluate current read permission and publication 
 
 Cache keys include the immutable revision and rendering format version. A cache hit never bypasses authorization. If the access authority is unavailable, private reads fail closed. A page whose latest authoring revision differs from its published revision still presents the approved published content to ordinary readers.
 
-The local implementation instead resolves mutable, non-unique slugs, caches entire current page rows for 120 seconds, and does not enforce space read permissions.
+The local implementation checks space access on every page-derived read before serving it, resolves slugs that are unique within a space but change on rename (no redirect history), and caches current page rows for 120 seconds.
 
 ### Save an edit
 
@@ -116,7 +116,7 @@ The local implementation instead resolves mutable, non-unique slugs, caches enti
 
 A receipt is needed for create and restore as well as edit. A timeout after commit is an unknown result, not evidence that no revision exists. A client retries the same immutable request or queries its receipt before submitting a new mutation.
 
-The local transaction inserts a page revision, but it has neither the expected-base condition nor a receipt/outbox. Its cache invalidation can fail after commit and turn a successful database write into an HTTP error.
+The local update locks the row and accepts an optional expected `version`; a save on a stale base gets a 409 with the current version instead of overwriting. There is no mutation receipt or transactional outbox: the index message is published after commit through a confirm channel, buffered in memory while the broker is unavailable, and backstopped by a periodic reconciliation. A cache invalidation failure after commit is logged, not returned as an error.
 
 ### Publish or approve
 
@@ -124,7 +124,7 @@ Keep an authoring head and a published revision pointer. A direct publication, w
 
 An approval can remain a useful historical decision even when the author has moved on. Product policy determines whether an older approved revision can be published; the UI must name it explicitly. Publication changes are searchable state changes even when the content revision number stays the same.
 
-The prototype defaults new pages to `published`. Approval records name only a page, and approval publishes whatever content that page currently contains.
+The prototype defaults new pages to `published`; drafts are opt-in. An approval request records the page version under review. Approving requires a space admin who is not the requester and refuses if the page has moved past that version, so it publishes exactly what was reviewed. There is still no separate published-revision pointer: publication flips the page's status, so a later edit to a published page is live immediately.
 
 ### Index and search
 
@@ -259,9 +259,14 @@ CREATE TABLE IF NOT EXISTS page_approvals (
   reviewed_by UUID REFERENCES users(id),
   status VARCHAR(20) DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected')),
   comment TEXT,
+  page_version INT,          -- the version under review; approval refuses if the page moved on
   created_at TIMESTAMPTZ DEFAULT NOW(),
   reviewed_at TIMESTAMPTZ
 );
+
+-- One pending approval per page
+CREATE UNIQUE INDEX IF NOT EXISTS idx_page_approvals_one_pending
+  ON page_approvals(page_id) WHERE status = 'pending';
 
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_pages_space ON pages(space_id, parent_id, position);
@@ -291,41 +296,41 @@ CREATE INDEX IF NOT EXISTS idx_page_approvals_page ON page_approvals(page_id, st
 | Canonical document schema and rendering version | Reproduce safe HTML and text from one authoritative representation |
 | Comment same-page parent and bounded reply depth | Make stored discussion topology match the API's supported shape |
 
-The current slug index is non-unique. Parent and homepage foreign keys do not establish same-space membership. Page version uniqueness prevents duplicate version numbers, but it is not a stale-editor check. There is no mutation receipt, outbox, search-generation, or approval-version column today.
+The slug index is non-unique; uniqueness within a space is enforced by the service (`title`, `title-2`, ...). Parent foreign keys do not establish same-space membership in the schema; the service rejects cross-space parents and cycles. The stale-editor check is the optional expected `version` on update, not a constraint. There is no mutation receipt, outbox, or search-generation column.
 
 ## API Design
 
 ### Current routes
 
-Business routes below use `/api/v1`; health and metrics use the absolute paths shown. Unless stated otherwise, reads are public and mutations check login only. These are existing endpoints, not a claim that their authorization is sufficient.
+Business routes below use `/api/v1`; health and metrics use the absolute paths shown. Every page-derived route checks space access through [accessService.ts](./backend/src/services/accessService.ts). Reads need view access (membership, or a public space; drafts need member access), writes need member access, and space settings and membership need admin. A caller who cannot view the space gets 404.
 
 | Method | Path | Actual purpose |
 |--------|------|----------------|
 | POST | `/auth/register`, `/auth/login` | Create an account or establish a session |
 | POST / GET | `/auth/logout`, `/auth/me` | End session / return authenticated user |
-| GET / POST | `/spaces` | List public spaces / create space and creator membership |
-| GET / PUT / DELETE | `/spaces/:key` | Read, update, or delete a space |
-| GET / POST | `/spaces/:key/members` | Read members including email / upsert membership |
-| GET | `/pages/recent` | Twenty recently updated published pages |
-| GET | `/pages/space/:spaceKey/tree` | Server-built nested tree containing complete page rows |
-| GET | `/pages/space/:spaceKey/slug/:slug`, `/pages/:id` | Page with original author, labels, and breadcrumbs |
-| POST / PUT / DELETE | `/pages`, `/pages/:id`, `/pages/:id` | Create, save a new revision, or hard-delete |
-| POST | `/pages/:id/move` | Change parent and sibling positions; root cases currently fail |
+| GET / POST | `/spaces` | List spaces the caller can view / create a space (creator becomes admin) |
+| GET / PUT / DELETE | `/spaces/:key` | Read with the caller's `access` / update or delete (space admins) |
+| GET / POST / DELETE | `/spaces/:key/members`, `/spaces/:key/members/:userId` | Read members / add or change a role / remove (admins; last admin protected) |
+| GET | `/pages/recent` | Twenty recent pages the caller can see |
+| GET | `/pages/space/:spaceKey/tree` | Server-built tree of page metadata; drafts only for members |
+| GET | `/pages/space/:spaceKey/slug/:slug`, `/pages/:id` | Page with author, labels, breadcrumbs, and the caller's `access` |
+| POST / PUT / DELETE | `/pages`, `/pages/:id`, `/pages/:id` | Create, save a new revision (optional expected `version`), or hard-delete |
+| POST | `/pages/:id/move` | Change parent and sibling positions within the space; cycles refused |
 | GET / POST / DELETE | `/pages/:id/labels`, `/pages/:id/labels`, `/pages/:id/labels/:label` | List, add, or remove labels |
 | GET | `/versions/:pageId` | Entire snapshot history without pagination |
 | GET | `/versions/:pageId/diff?from=1&to=2` | Line-based difference between stored HTML strings |
 | POST | `/versions/:pageId/restore` | Copy an old snapshot into a new revision |
 | GET / POST | `/comments/page/:pageId`, `/comments/page/:pageId` | Read roots/direct replies / add a comment |
 | PUT / DELETE | `/comments/:id` | Author-only edit or deletion |
-| POST | `/comments/:id/resolve` | Toggle resolution for any logged-in caller |
+| POST | `/comments/:id/resolve` | Toggle resolution (comment author or a space member) |
 | GET / POST | `/templates`, `/templates` | List global/space templates / create a template |
-| GET / DELETE | `/templates/:id` | Read / delete a template |
+| GET / DELETE | `/templates/:id` | Read / delete (creator, space admin, or global admin) |
 | POST | `/approvals/request`, `/approvals/:id/review` | Request review / approve or reject |
-| GET | `/approvals/page/:pageId`, `/approvals/pending` | Public page review records / all pending records for a logged-in user |
-| GET | `/search?q=...&space=ENG&page=1&pageSize=20` | Published-content search; no membership filter |
+| GET | `/approvals/page/:pageId`, `/approvals/pending` | Page review records plus `canReview` / requests the caller can review or made |
+| GET | `/search?q=...&space=ENG&page=1&pageSize=20` | Published pages in viewable spaces, with `slug` and a `degraded` flag |
 | GET | `/api/health`, `/api/metrics` | Constant process status / Prometheus exposition |
 
-For example, the current page update takes `title`, `contentJson`, `contentHtml`, `contentText`, and optional `changeMessage`, returning `{ page }`. It accepts neither an expected revision nor a mutation ID. Restore takes `versionNumber` and returns a message, so clients must fetch the new page themselves.
+For example, the page update takes `title`, `contentJson`, `contentHtml`, `contentText`, optional `changeMessage`, and optional `version` (the base it was edited from), returning `{ page }` or 409 `{ error, currentVersion }`. It accepts no mutation ID. Restore takes `versionNumber` and returns `{ version, slug }`.
 
 ### Proposed contract changes
 
@@ -369,7 +374,7 @@ Production authorization belongs in shared server policies applied to every page
 
 Use secure session cookies over HTTPS, regenerate session identity on login, validate request origin/CSRF protections for mutations, and limit login attempts and expensive reads. Canonical content validation and a safe renderer prevent stored markup from becoming arbitrary browser code. Search highlighting should be escaped text plus controlled mark segments, not trusted HTML from indexed fields.
 
-The local project implements password hashing, session cookies, login checks, and Redis-backed rate limiting. It does not implement this full authorization or rendering boundary. `requireAdmin` is defined but unused; global and space role fields are not evidence that access is enforced.
+The local project implements password hashing, session cookies (regenerated on login), Redis-backed rate limiting, space-level authorization in one shared policy module, and server-side HTML sanitization of page bodies. Search highlights are HTML-escaped by Elasticsearch, with only `<mark>` added. It does not implement page-level ACLs, origin/CSRF validation, or secure cookies outside production.
 
 ## Observability
 
@@ -383,15 +388,15 @@ Locally, [metrics.ts](./backend/src/services/metrics.ts) exports HTTP duration/c
 
 | Failure | Proposed behavior | Current implementation |
 |---------|-------------------|------------------------|
-| Two editors save an old base | One accepted revision; other author receives a conflict with draft retained | Sequential stale saves overwrite; overlapping saves can hit version uniqueness and return 500 |
+| Two editors save an old base | One accepted revision; other author receives a conflict with draft retained | With the expected `version` (the editor sends it), the second save gets 409 and keeps its draft on screen |
 | Response lost after commit | Resolve/retry the same durable mutation | No receipt; retry may create another revision |
-| Cache invalidation fails | Save remains accepted; repair derived state | Failure after commit can propagate as HTTP failure |
-| Broker unavailable | Outbox accumulates; publisher resumes with confirms | Publication skipped or errors logged and swallowed |
-| Index write fails | Retry transient failures; retain permanent failures for repair | Helper swallows errors and worker acknowledges |
-| Delayed old index job | Reject lower generation; preserve tombstone ordering | Unversioned writes can regress or resurrect content |
-| Search unavailable | Bounded authorized fallback or explicit unavailability | Unbounded-cost SQL substring fallback on ES exception; may also fail |
-| Permission authority unavailable | Deny protected reads and writes | Space authorization is absent |
-| Client changes page during a request | Discard obsolete response; preserve the correct page's draft | Shared state permits stale responses to replace current context |
+| Cache invalidation fails | Save remains accepted; repair derived state | Logged; the save is reported as successful and the 120 s TTL bounds staleness |
+| Broker unavailable | Outbox accumulates; publisher resumes with confirms | Messages buffer in memory (bounded) and flush in order on reconnect; reconciliation repairs a crash |
+| Index write fails | Retry transient failures; retain permanent failures for repair | Retried with backoff (8 attempts, ~90 s), then parked on `page-index.dlq` |
+| Delayed old index job | Reject lower generation; preserve tombstone ordering | Index writes carry the page version (`external_gte`); an older write is rejected |
+| Search unavailable | Bounded authorized fallback or explicit unavailability | Authorized SQL substring fallback with escaped wildcards and `degraded: true`; still unindexed cost |
+| Permission authority unavailable | Deny protected reads and writes | Access checks query Postgres; if it fails the request fails (closed) |
+| Client changes page during a request | Discard obsolete response; preserve the correct page's draft | Each store load has a ticket; a response for a superseded load is dropped |
 
 ## Scalability Considerations
 
@@ -419,63 +424,74 @@ Search may use independent shards and replicas in production, but shard counts f
 
 [Compose](./docker-compose.yml) contains PostgreSQL 16, Valkey 7 with AOF, Elasticsearch 8.11.0, and RabbitMQ 3 with management and persistent volumes. It contains no app or monitoring containers. [Configuration](./backend/src/config/index.ts) reads `.env` from the process working directory and individual database/Redis fields, fixes the index and queue names, and defaults the API to 3001. The README gives both Compose and native setup with matching credentials.
 
-The API awaits queue connection and index setup before listening; helpers catch failures, but their network attempts can still delay startup. There is no API shutdown handler. The worker connects separately, uses prefetch 10, and has a SIGINT queue-close path, not a complete drain of all resources. Queue reconnect/resubscription is absent. The `dev:server2` and `dev:server3` wrappers are overridden by `dev`'s hardcoded port 3001; the README supplies direct commands. Compilation emits `dist/src/index.js`, while the package's `main` names `dist/index.js` and there is no `start` script.
+`npm run dev` starts the API (`dev:api`, port 3001) and the search indexer together with `concurrently`, so search works out of the box. The API tries the queue connection and index setup before listening and keeps reconnecting to RabbitMQ in the background. The worker waits for Elasticsearch and RabbitMQ, uses prefetch 10, and closes its channel on SIGINT/SIGTERM. There is no API shutdown handler. `dev:server2`/`dev:server3` now bind 3002/3003 (they used to call `dev`, which reset the port to 3001). Compilation emits `dist/src/index.js`, while the package's `main` names `dist/index.js` and there is no `start` script.
 
-The seed is partly guarded and partly append/fail, so it is for one fresh application. Its users' bcrypt hash was checked with the installed library against `password123`; it has cost 10, while registration uses cost 12. No seed event or automatic index rebuild exists. The README's direct one-time population command addresses a fresh local index only.
+The seed is partly guarded and partly append/fail, so it is for one fresh application. Its users (alice, a global admin; bob; carol, an Engineering viewer) share the `password123` hash. It includes a private `SEC` space and a draft with a pending approval, so the access rules are visible. Seeded rows are indexed by the indexer's startup reconciliation; no manual index population is needed.
 
-### Transaction and history patterns actually implemented
+### Authorization (implemented)
 
-[pageService.ts](./backend/src/services/pageService.ts) stores current page content and a full historical snapshot in the same SQL transaction. This is a useful durability pattern: the current revision and its history record commit together. The core sequence is:
+[accessService.ts](./backend/src/services/accessService.ts) is the only place that decides what a caller may do. Routes ask it `requireSpace(key|id, caller, 'view'|'edit'|'admin')` or `requirePage(id, caller, need)` and turn its `AccessError` into the response:
 
-```text
-BEGIN → read current row → update current content/version
-      → insert snapshot → COMMIT → invalidate cache → publish index message
-```
+| Role in space | View published | View drafts | Edit pages, labels, restore, move | Space settings, members, review approvals |
+|---------------|----------------|-------------|-----------------------------------|-------------------------------------------|
+| none (public space) | yes | no | no | no |
+| none (private space) | 404 | 404 | 404 | 404 |
+| viewer | yes | no | no | no |
+| member | yes | yes | yes | no |
+| admin | yes | yes | yes | yes |
 
-The initial read is not locked and the update has no expected-version condition. Two transactions that both read version 3 can attempt version 4; one may fail the unique history constraint and roll back. A later request with old content can instead read version 4 and successfully overwrite it as version 5. Neither behavior implements an intentional conflict response. Cache errors after `COMMIT` enter the catch block; `ROLLBACK` cannot undo the already committed write. There is no request receipt to disambiguate that HTTP failure.
+A global admin (`users.role = 'admin'`) is admin of every space. An invisible space or page is a 404, not a 403, so private keys and IDs cannot be probed for existence. The checks cover every page-derived read: trees (drafts filtered per caller from one cached flat list), breadcrumbs (unpublished ancestors hidden from non-editors), history, diffs, comments, labels, approvals, templates and search. Previously any signed-in user could rename or delete any space and add themselves to it as admin, and every page, comment and version was readable by ID.
 
-[versionService.ts](./backend/src/services/versionService.ts) restores an old snapshot into a new numbered revision and computes `diffLines` over HTML. Restore does not invalidate page/tree caches, publish an indexing message, or record the page-operation metric. Its slug normalization also differs from normal saves. History downloads all complete snapshots. This is neither a compact metadata endpoint nor a semantic rich-text diff.
+Comments are open to anyone who can view the page (viewers included). Resolving needs the comment's author or a space member; it used to be open to any signed-in user, for any comment in any space. Replies must target a comment on the same page and attach to the thread root. Global templates are created only by global admins. Login regenerates the session ID and returns `display_name`, the key the frontend reads.
 
-### Hierarchy, labels, and deletion
+### Revisions, slugs, hierarchy, and content
 
-The tree query retrieves all page columns and statuses, then builds nested nodes on the server. Redis caches that full result. Breadcrumbs use recursive SQL without a visited-node or depth guard. Parents can cross spaces, and cycles can disappear from root-based trees or cause unbounded breadcrumb recursion.
+[pageService.ts](./backend/src/services/pageService.ts) writes the current row and its history snapshot in one transaction, as before. Updates now lock the row (`FOR UPDATE`) and honour an optional expected `version`. The editor sends the version it loaded, so a stale save is a 409 carrying the current version rather than a silent overwrite (or a 500 on the version-uniqueness constraint). Restore ([versionService.ts](./backend/src/services/versionService.ts)) goes through the same post-write path as an edit: cache invalidation, an index message and the metric. It used to leave search and cached reads on the replaced content.
 
-For moves involving a root parent, SQL still references `$3` while the argument array has only two entries. Other move paths have no cycle/same-space validation or shared hierarchy lock and can update many sibling positions. The page lookup inside the move uses the pool/cache outside the transaction client. The frontend has no move request or drag interface.
+Slugs are unique per space (`title`, `title-2`, ...). Titles with no ASCII letters fall back to `page` instead of an empty slug, and a rename returns the new slug, which the editor navigates to. Slugs still change on rename with no redirect history. Moves validate that the new parent is in the same space and is neither the page nor one of its descendants: a cycle has no path to the root, so the pages in it disappeared from the tree. Moves to and from the root now work; the old `IS NULL` branch referenced a missing SQL parameter. Breadcrumb recursion is capped at depth 50.
 
-Deleting a page sets children's parent references to null and cascades dependent records, but does not invalidate each child's cached row. Deleting a space bypasses page cache and search deletion publication entirely. Slugs are non-unique, strip non-ASCII characters, change on rename, and have no redirect history. Label changes invalidate a page-ID cache but do not enqueue reindexing.
+Page HTML is sanitized on every write and restore ([htmlSanitizer.ts](./backend/src/services/htmlSanitizer.ts), `sanitize-html`). It keeps headings, lists, tables, code, links, images and the inline styles the macros use, and drops scripts, event handlers, iframes and non-http(s) URLs. Any member could previously store markup that ran in every reader's session, admins included. Rows seeded directly into SQL are not re-sanitized on read.
 
-### Queue and search behavior
+### Search pipeline
 
-[queue.ts](./backend/src/services/queue.ts) declares a durable queue and marks messages persistent. This demonstrates broker persistence settings, but uses an ordinary channel without publisher confirms and ignores the backpressure return value. Missing-channel and publish errors are swallowed. No outbox, reconnection loop, delayed retry queue, or dead-letter route is configured.
+Every committed change ends in `afterPageWrite(spaceId, pageId)`: create, update, delete, restore, approval, and label add or remove (labels are searchable). Space deletion publishes one `delete-space` message, handled with delete-by-query.
 
-[search-indexer.ts](./backend/src/workers/search-indexer.ts) may process up to ten outstanding deliveries. [searchService.ts](./backend/src/services/searchService.ts) fetches current page data and labels, then sends an unversioned index write. Fetching current data does not enforce order: an earlier read can finish its index write after a later one. The helpers catch database/index errors and return normally, so the worker acknowledges failed effects. Unexpected handler errors are negatively acknowledged without requeue; no configured dead-letter destination retains them. A missing source page during indexing does not remove an older search document.
+[queue.ts](./backend/src/services/queue.ts) publishes on a **confirm channel**, so a message counts as published only once the broker acknowledges it. If the broker is unavailable, or does not confirm, messages are buffered in memory (bounded at 10,000) and flushed in order on reconnect (reconnect retries every 5 s). This was found live: for the first seconds after boot, RabbitMQ was still starting and every index message was dropped. The buffer does not survive a process crash, so it is not an outbox.
 
-Create/update/delete attempt queue events; restore, approval, label changes, and space deletion omit relevant events. The index can therefore remain wrong indefinitely. Search boosts title and labels, requests HTML highlights, filters `published`, and optionally filters space. It does not check membership or current publication state. Unknown space keys become global searches. Page and size inputs lack positive bounds. The response has page IDs but no slug, while the UI treats the ID as a slug.
+[search-indexer.ts](./backend/src/workers/search-indexer.ts) now runs alongside the API (`npm run dev` starts both). It waits for Elasticsearch and RabbitMQ at boot and reconciles the whole index with Postgres at startup and every 10 minutes (`reindexAll`, bulk writes plus deletion of documents for missing pages); that pass is the backstop for anything the queue lost. Per message:
+- Failures propagate and are retried with backoff (1, 2, 4, 8, 16, 30, 30 s), then parked on `page-index.dlq` after 8 attempts. The helpers used to swallow errors, so the worker acknowledged failed writes.
+- Writes carry the page's version as an external version (`external_gte`), so an older read that finishes late cannot overwrite a newer document. Equal versions are accepted because label changes do not bump the version.
+- A page missing from Postgres is removed from the index.
 
-SQL fallback runs only after an Elasticsearch exception. It matches the entire supplied string as an `ILIKE` substring, retains wildcard semantics for `%` and `_`, orders by update time, and reports the returned page's row count as `total`. It is not PostgreSQL full-text search, an exact total, or equivalent relevance. The search timer ends before fallback; a healthy empty index does not cause fallback. The UI receives no degraded-mode flag.
+[searchService.ts](./backend/src/services/searchService.ts) searches only published pages in the caller's viewable spaces (a `terms` filter on `space_id`). A `space=` filter narrows that set and never widens it: an unknown or invisible space is a 404, where it used to fall through to a global search. Hits are re-checked against Postgres, so a document whose page was since deleted, unpublished or made unreachable is dropped. Results carry the real `slug` (the UI had been linking with the page ID, so every result opened "Page not found"). Highlights use the `html` encoder, and `page`/`pageSize` are bounded (≤ 50). The SQL fallback (Elasticsearch exception only) applies the same space and status filters, escapes `%`, `_` and `\`, returns an exact `COUNT(*)` total, and sets `degraded: true`. It is still unranked substring matching.
 
-### Authentication, caching, and instrumentation actually wired
+### Caching and instrumentation
 
-[auth.ts](./backend/src/middleware/auth.ts) requires a session for protected mutation routes, and comment edits/deletes check author identity. Space roles and global admin role are otherwise largely unused; direct reads expose private/draft material, and logged-in callers can mutate other spaces or review their own requests through the API. Session cookies are HttpOnly and SameSite=Lax but always `secure: false`; login does not regenerate the session. Login returns `displayName` while the frontend expects `display_name`.
+[redis.ts](./backend/src/services/redis.ts) supplies 120-second page and slug caches plus one cached flat page list per space; the tree is built per request after filtering. Authorization reads go to Postgres, never the cache, so a status or membership change cannot be judged against a stale row. Invalidation still uses `KEYS` patterns, and concurrent fills can repopulate old content within the TTL. Rate limiting is Redis-backed fixed windows: 500 API requests and 20 authentication attempts per 15 minutes per IP. Health is a constant response; metrics and logs are as before, and the circuit-breaker helper still has no callers.
 
-[redis.ts](./backend/src/services/redis.ts) supplies 120-second page/slug/tree caches. Cache failures propagate rather than providing a general fail-open cache layer. Invalidation uses `KEYS` patterns, and concurrent fills can repopulate old content. [rateLimiter.ts](./backend/src/services/rateLimiter.ts) uses Redis-backed fixed windows: 500 API requests and 20 authentication attempts per 15 minutes per IP key. Store errors fail through the error path; this is not a sliding-window or fail-open limiter.
+### Browser implementation
 
-In [app.ts](./backend/src/app.ts), session and API limiter middleware run before HTTP metric collection, including on health/metrics paths. Health returns constant status, not dependency checks. HTTP labels can merge router-local paths or retain unmatched request paths. Page-operation metrics cover only instrumented service paths. Pino provides request/service logs, but does not establish full asynchronous mutation tracing. [circuitBreaker.ts](./backend/src/services/circuitBreaker.ts) defines a factory that has no callers; it does not protect database or search operations.
+**Routing.** The page and editor routes were unreachable. In TanStack flat routing, `space.$spaceKey.tsx` was the parent of the page route, which was in turn the parent of `/edit`, and neither parent rendered an `<Outlet/>`. Every page URL therefore showed the space overview, confirmed in a browser screenshot. The parents are now `space.$spaceKey.index.tsx` and `space.$spaceKey.page.$slug.index.tsx`, so all three are siblings.
 
-### Browser implementation and incomplete features
+**Store.** [wikiStore.ts](./frontend/src/stores/wikiStore.ts) gives each space, tree and page load a ticket and drops responses for superseded loads; a failed load clears the stale space or page.
 
-The generated [route tree](./frontend/src/routeTree.gen.ts) makes the page route a child of the space route and the editor a child of the page route. The two parent components lack an `Outlet`. Nested children need an outlet to render, so the current structure blocks page viewing/editing through normal URLs. This finding is based on source and generated routing, not a browser reproduction. [TanStack Router outlets](https://tanstack.com/router/latest/docs/guide/outlets)
+**Access-aware UI.** The UI uses the `access` the server returns: Create page, Edit and Request approval appear only for members, viewers see a view-only note, drafts carry a badge, and Approve/Reject appear only when the server says `canReview` and the user is not the requester. Cancelling the review-comment prompt no longer submits a decision.
 
-[wikiStore.ts](./frontend/src/stores/wikiStore.ts) has one shared loading/error/current-page context. Fetches lack cancellation or context checks; old responses can overwrite another page or space, and failures can retain old content or an indefinite loading view. Logout does not clear wiki state. Editor initialization can copy stale shared content. Rename saves navigate to the previous slug, and in-flight save completion can navigate away from later typing.
+**Editor and search page.** The editor sends the base `version` and follows the slug the server returns. Search results link by slug and HTML-escape plain-text fallbacks.
 
-[PageEditor.tsx](./frontend/src/components/PageEditor.tsx) uses `contentEditable`, `execCommand`, and HTML replacement during renders, with no explicit selection/IME preservation. Saves are manual and send empty structured JSON alongside HTML/text. There is no dirty-navigation guard, autosave, local draft recovery, or server HTML sanitization. [PageViewer.tsx](./frontend/src/components/PageViewer.tsx) and search results insert raw HTML. These are source-level rendering risks, not browser exploit tests.
-
-[TemplatePicker.tsx](./frontend/src/components/TemplatePicker.tsx) is not wired into a route. [MacroRenderer.tsx](./frontend/src/components/MacroRenderer.tsx) supports simple JSON callouts/code and a table-of-contents placeholder; the editor emits separate HTML callouts. The backend macro helper has no route callers. There is no generated, linked table of contents or syntax-highlighting pipeline.
-
-Version comparison is a unified colored display of HTML-line changes, not side-by-side semantic comparison. Restore refreshes history without refreshing the current page/tree. Comments and approval components have unguarded asynchronous state updates and limited pending-state protection; only roots and direct replies are returned, although the schema permits deeper/cross-page parents. Approval requests can race into duplicates; a conditional pending-state update prevents two successful decisions on one row, but does not authorize the reviewer or bind a version. Approving can publish a current draft or archived page without history, cache, or index updates. Cancelling the review comment prompt still submits a decision in the browser component.
+**Unchanged.** The editor is still `contentEditable` with no draft recovery, and there is no dirty-navigation guard.
 
 ### Simplifications, omissions, and verification limits
 
-The local system uses one database and shared services rather than tenant sharding, replicas, a CDN, multi-region operation, or orchestration. Production outbox/receipts, enforced permissions, canonical safe rendering, revision-bound publication, reliable reindexing, co-editing, and draft recovery are not implemented. They are design proposals in the earlier sections.
+The local system uses one database and shared services rather than tenant sharding, replicas, a CDN, multi-region operation, or orchestration. The following remain design proposals in the earlier sections:
+- a transactional outbox and mutation receipts;
+- a published-revision pointer separate from the authoring head;
+- a canonical document model (pages store sanitized HTML);
+- page-level ACLs;
+- co-editing and draft recovery.
 
-The mocked backend tests cover basic health/auth/space/recent-page routes. Existing browser smoke tests depend on `main` selectors absent from current layouts. This documentation review inspected source, configuration, generated routes, and tests, and checked the seed hash in isolation. It did not run builds, the Docker stack, browser interactions, real SQL races, or queue recovery tests. Application code remains unchanged.
+Tests:
+- **Mocked backend tests** (30) cover routes, the role matrix and draft visibility ([accessService.test.ts](./backend/src/services/accessService.test.ts)), HTML sanitization, and ordered delivery of buffered queue messages.
+- **Live run.** A scripted run against the full stack checks 63 behaviours across four identities (anonymous, the viewer carol, the member bob, the admin alice): visibility of spaces, pages, drafts, versions, comments and approvals; that search never leaks a private space and returns working slugs; role-gated writes, membership changes, revocation and the last-admin guard; version conflicts; sanitization; unique slugs; moves and cycle refusal; self-review, version-bound approval and reindex on publish; reindex on restore and label changes; comment permissions; and index cleanup on space deletion.
+- **Outage run.** A second run stops Elasticsearch and confirms the authorized, escaped SQL fallback and that an edit made during the outage reaches the index after recovery.
+- **Screenshots** were regenerated, including the formerly unreachable page view, a draft under review, search results, and a viewer's space.

@@ -27,6 +27,22 @@ import {
 } from "../shared/metrics.js";
 import { logger, logDelivery } from "../shared/logger.js";
 
+/** Thrown when a provider addresses a device of an app its key does not cover. */
+export const DEVICE_NOT_IN_SCOPE = "Device not in provider scope";
+
+/**
+ * Rejects a send to a device outside the sender's app bundles.
+ *
+ * @param appBundleId - Bundle that registered the target device
+ * @param allowedBundleIds - Sender's bundles; undefined means unscoped (admin)
+ * @throws Error(DEVICE_NOT_IN_SCOPE) if the bundle is not allowed
+ */
+function assertBundleAllowed(appBundleId: string, allowedBundleIds?: string[]): void {
+  if (allowedBundleIds && !allowedBundleIds.includes(appBundleId)) {
+    throw new Error(DEVICE_NOT_IN_SCOPE);
+  }
+}
+
 /**
  * Push Notification Service.
  *
@@ -53,9 +69,11 @@ export class PushService {
    *
    * @param deviceToken - Raw 64-character hex device token
    * @param payload - APNs notification payload
-   * @param options - Delivery options (priority, expiration, collapse ID, idempotency key)
+   * @param options - Delivery options (priority, expiration, collapse ID,
+   *   idempotency key) and the sender's allowed app bundles (omit for admins)
    * @returns Notification ID and delivery status
-   * @throws Error if device token is not registered
+   * @throws Error if device token is not registered, or belongs to an app
+   *   outside allowedBundleIds
    */
   async sendToDevice(
     deviceToken: string,
@@ -65,6 +83,7 @@ export class PushService {
       expiration?: number;
       collapseId?: string;
       idempotencyKey?: string;
+      allowedBundleIds?: string[];
     } = {}
   ): Promise<SendNotificationResponse> {
     const startTime = Date.now();
@@ -82,7 +101,10 @@ export class PushService {
           device_token_prefix: deviceToken.substring(0, 8),
         });
         // Return existing notification status without reprocessing
-        const existing = await this.getNotification(notificationId);
+        const existing = await this.getNotification(
+          notificationId,
+          options.allowedBundleIds
+        );
         return {
           notification_id: notificationId,
           status: existing?.status || "duplicate",
@@ -100,6 +122,8 @@ export class PushService {
         notificationsInFlight.dec();
         throw new Error("Unregistered device token");
       }
+
+      assertBundleAllowed(device.app_bundle_id, options.allowedBundleIds);
 
       const expiration = parseExpiration(options.expiration);
 
@@ -163,9 +187,11 @@ export class PushService {
    *
    * @param deviceId - Server-assigned device UUID
    * @param payload - APNs notification payload
-   * @param options - Delivery options (priority, expiration, collapse ID)
+   * @param options - Delivery options (priority, expiration, collapse ID) and
+   *   the sender's allowed app bundles (omit for admins)
    * @returns Notification ID and delivery status
-   * @throws Error if device ID is invalid
+   * @throws Error if device ID is invalid, or belongs to an app outside
+   *   allowedBundleIds
    */
   async sendToDeviceById(
     deviceId: string,
@@ -174,6 +200,7 @@ export class PushService {
       priority?: NotificationPriority;
       expiration?: number;
       collapseId?: string;
+      allowedBundleIds?: string[];
     } = {}
   ): Promise<SendNotificationResponse> {
     const startTime = Date.now();
@@ -189,6 +216,8 @@ export class PushService {
         notificationsInFlight.dec();
         throw new Error("Invalid device ID");
       }
+
+      assertBundleAllowed(device.app_bundle_id, options.allowedBundleIds);
 
       const expiration = parseExpiration(options.expiration);
 
@@ -251,7 +280,8 @@ export class PushService {
    *
    * @param topic - Topic name to broadcast to
    * @param payload - APNs notification payload
-   * @param options - Delivery options (priority, expiration, collapse ID)
+   * @param options - Delivery options (priority, expiration, collapse ID) and
+   *   the sender's allowed app bundles; subscribers of other apps are skipped
    * @returns Notification ID, status, and count of queued devices
    */
   async sendToTopic(
@@ -261,9 +291,15 @@ export class PushService {
       priority?: NotificationPriority;
       expiration?: number;
       collapseId?: string;
+      allowedBundleIds?: string[];
     } = {}
   ): Promise<SendNotificationResponse> {
-    const devices = await tokenRegistry.getDevicesForTopic(topic);
+    // Topic names are global, so a provider only reaches its own apps' subscribers
+    const devices = (await tokenRegistry.getDevicesForTopic(topic)).filter(
+      (device) =>
+        !options.allowedBundleIds ||
+        options.allowedBundleIds.includes(device.app_bundle_id)
+    );
 
     if (devices.length === 0) {
       return {
@@ -399,25 +435,39 @@ export class PushService {
    * Creates a delivery log entry and removes from pending queue.
    * Called when device acknowledges receipt via WebSocket.
    *
+   * Only the addressed device can acknowledge: an ack naming another device's
+   * notification changes nothing.
+   *
    * @param notificationId - Notification UUID
+   * @param deviceId - Authenticated device sending the ack
+   * @returns True if the notification exists and belongs to deviceId
    */
-  async markDelivered(notificationId: string): Promise<void> {
-    await db.query(
-      `UPDATE notifications SET status = 'delivered', updated_at = NOW() WHERE id = $1`,
-      [notificationId]
+  async markDelivered(notificationId: string, deviceId: string): Promise<boolean> {
+    const updated = await db.query(
+      `UPDATE notifications SET status = 'delivered', updated_at = NOW()
+       WHERE id = $1 AND device_id = $2`,
+      [notificationId, deviceId]
     );
 
+    if (updated.rowCount === 0) {
+      return false;
+    }
+
+    // A repeated ack must not fail here, or the pending row below survives
     await db.query(
       `INSERT INTO delivery_log (notification_id, device_id, status, delivered_at, created_at)
-       SELECT id, device_id, 'delivered', NOW(), NOW()
-       FROM notifications WHERE id = $1`,
-      [notificationId]
+       VALUES ($1, $2, 'delivered', NOW(), NOW())
+       ON CONFLICT (notification_id) DO NOTHING`,
+      [notificationId, deviceId]
     );
 
     // Remove from pending if exists
-    await db.query(`DELETE FROM pending_notifications WHERE id = $1`, [
-      notificationId,
-    ]);
+    await db.query(
+      `DELETE FROM pending_notifications WHERE id = $1 AND device_id = $2`,
+      [notificationId, deviceId]
+    );
+
+    return true;
   }
 
   /**
@@ -473,13 +523,24 @@ export class PushService {
    * Retrieves a notification by its ID.
    *
    * @param notificationId - Notification UUID
-   * @returns Notification record or null if not found
+   * @param bundleIds - If given, only match notifications for devices of these apps
+   * @returns Notification record or null if not found (or out of scope)
    */
-  async getNotification(notificationId: string): Promise<Notification | null> {
-    const result = await db.query<Notification>(
-      `SELECT * FROM notifications WHERE id = $1`,
-      [notificationId]
-    );
+  async getNotification(
+    notificationId: string,
+    bundleIds?: string[]
+  ): Promise<Notification | null> {
+    const result = bundleIds
+      ? await db.query<Notification>(
+          `SELECT n.* FROM notifications n
+           JOIN device_tokens d ON d.device_id = n.device_id
+           WHERE n.id = $1 AND d.app_bundle_id = ANY($2)`,
+          [notificationId, bundleIds]
+        )
+      : await db.query<Notification>(
+          `SELECT * FROM notifications WHERE id = $1`,
+          [notificationId]
+        );
 
     if (result.rows.length === 0) {
       return null;
@@ -492,7 +553,8 @@ export class PushService {
    * Lists notifications with optional filters and pagination.
    * Used for admin dashboard notification list.
    *
-   * @param options - Filter options (deviceId, status, limit, offset)
+   * @param options - Filter options (deviceId, status, limit, offset) and
+   *   bundleIds, which limits results to devices of those apps
    * @returns Object with notifications array and total count
    */
   async getNotifications(
@@ -501,12 +563,18 @@ export class PushService {
       status?: NotificationStatus;
       limit?: number;
       offset?: number;
+      bundleIds?: string[];
     } = {}
   ): Promise<{ notifications: Notification[]; total: number }> {
-    const { deviceId, status, limit = 100, offset = 0 } = options;
+    const { deviceId, status, limit = 100, offset = 0, bundleIds } = options;
 
     let whereClause = "WHERE 1=1";
     const params: unknown[] = [];
+
+    if (bundleIds) {
+      params.push(bundleIds);
+      whereClause += ` AND device_id IN (SELECT device_id FROM device_tokens WHERE app_bundle_id = ANY($${params.length}))`;
+    }
 
     if (deviceId) {
       params.push(deviceId);

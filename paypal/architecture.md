@@ -95,7 +95,7 @@ A peer-to-peer payment platform enabling users to send money, request payments, 
 
 ### 1. Transfer Engine (Double-Entry Bookkeeping)
 
-Every balance change creates exactly two ledger entries -- a debit and a credit. For P2P transfers, the sender's wallet is debited and the recipient's wallet is credited within a single database transaction. This ensures the total money in the system is always conserved.
+Every balance change creates exactly two ledger entries -- a debit and a credit. For P2P transfers, the sender's wallet is debited and the recipient's wallet is credited within a single database transaction. Deposits and withdrawals have no internal counterparty, so they post against the platform's own **cash account** (see below). This ensures the total money in the system is always conserved.
 
 ```
 Transfer Flow:
@@ -121,19 +121,41 @@ For a $50 transfer from Alice to Bob:
 
 This invariant enables reconciliation: `SUM(credits) - SUM(debits)` per wallet should equal `wallet.balance_cents`. Any discrepancy indicates a bug or data corruption.
 
+**Deposits and withdrawals: the platform cash account.** A single `wallets` row with `account_type = 'platform_cash'` represents the money the platform holds at its bank:
+
+```
+Deposit $100:     debit  platform cash   +100   credit customer wallet +100
+Withdrawal $40:   debit  customer wallet  -40   credit platform cash    -40
+```
+
+Customer wallets are liabilities and credit-normal (balance = credits - debits). Platform cash is an asset and debit-normal (balance = debits - credits), so its balance stays non-negative and the existing `CHECK (balance_cents >= 0)` applies to it too. Three invariants follow, and `GET /api/admin/reconciliation` checks them in one REPEATABLE READ snapshot:
+
+1. Every transaction's entries net to zero.
+2. Every wallet's stored balance equals its ledger balance.
+3. The sum of customer balances equals platform cash -- the figure reconciled against the bank statement.
+
+An earlier version posted deposits as a lone credit and only checked invariant 2, which cannot detect a bug that credits a wallet out of thin air.
+
 ### 2. Wallet Service (Optimistic Locking)
 
-Wallet balances use optimistic locking via a `version` column. Each update includes `WHERE version = $expectedVersion` in the UPDATE statement. If another transaction has modified the wallet between our read and write, the update affects zero rows and we detect the conflict immediately. This prevents double-spending without holding long-lived locks.
+Deposits and withdrawals use optimistic locking via a `version` column. Each update includes `WHERE version = $expectedVersion` in the UPDATE statement. If another transaction has modified the wallet between our read and write, the update affects zero rows; the whole attempt (including its idempotency claim) rolls back and is retried up to three times, then the API returns 409. This prevents lost updates without holding long-lived locks. The platform cash row is updated last with an atomic increment (`balance_cents = balance_cents + $1`): every deposit touches it, so taking its lock at the end keeps the hold short, and since transfers never lock it, the lock order cannot form a cycle.
 
-For P2P transfers specifically, both wallets are locked using `SELECT ... FOR UPDATE` with consistent lock ordering by `user_id` to prevent deadlocks. The lock ordering is critical: without it, Transfer A (Alice to Bob) and Transfer B (Bob to Alice) executing simultaneously could each hold one lock and wait for the other indefinitely.
+For P2P transfers specifically, both wallets are locked by one `SELECT ... WHERE user_id IN (a, b) ORDER BY user_id FOR UPDATE` (Postgres sorts before it locks, so the lower user_id is always locked first) to prevent deadlocks. Balance arithmetic happens in SQL on BIGINT; the application only validates that amounts are positive integers. The lock ordering is critical: without it, Transfer A (Alice to Bob) and Transfer B (Bob to Alice) executing simultaneously could each hold one lock and wait for the other indefinitely.
 
 ### 3. Idempotency Service
 
-Payment operations accept an `idempotency_key`. Before executing a transfer, the system checks the `idempotency_keys` table. If the key exists and has not expired, the cached response is returned without re-executing the payment. The key is stored within the same database transaction as the transfer, ensuring atomicity between the payment and the idempotency record.
+Transfers, deposits and withdrawals accept an `Idempotency-Key` header. Keys are scoped per user: the primary key is `(user_id, key)`, so one user's key can never replay another user's response. The first statement of the payment's transaction *claims* the key by inserting `(user_id, key, request_hash)`:
+
+- New key: the insert succeeds and holds the primary-key slot until commit. A concurrent request with the same key blocks on that slot instead of executing a second payment.
+- Committed key, same request hash: the stored response is replayed (with an `Idempotent-Replayed: true` header) and nothing executes.
+- Committed key, different request hash (another amount, recipient or operation): 422.
+- Expired key: overwritten and reused.
+
+The response is written onto the claimed row before COMMIT, so the key and the payment commit or roll back together. An earlier version checked the key before opening the transaction and stored it at the end; two simultaneous retries then both executed, and the second failed on a unique index with a 500.
 
 This design choice -- storing idempotency keys in PostgreSQL rather than Redis -- guarantees that the idempotency record and the payment are always consistent. If the transaction rolls back, the idempotency key is also rolled back, allowing a clean retry.
 
-Keys expire after 24 hours to prevent unbounded table growth.
+Keys expire after 24 hours; each API instance deletes expired keys hourly.
 
 ### 4. Request Flow
 
@@ -145,12 +167,12 @@ pending ──▶ declined   (payer declines)
 pending ──▶ cancelled  (requester cancels)
 ```
 
-Authorization checks ensure only the payer can pay/decline and only the requester can cancel.
+Authorization checks ensure only the payer can pay/decline and only the requester can cancel; anyone who is neither party gets 404, so request IDs reveal nothing. Each action locks the request row with `SELECT ... FOR UPDATE` and runs in one transaction. Paying runs the transfer on the same connection and records its `transaction_id` on the request, so a double-click (or Pay racing Decline) resolves to exactly one outcome: the second request waits on the row lock, then sees a non-pending status and gets 409 without touching any wallet.
 
 ## Database Schema
 
 ```sql
--- Users table with role-based access
+-- Users table with role-based access ('user', 'admin', or 'system')
 CREATE TABLE users (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   username VARCHAR(30) UNIQUE NOT NULL,
@@ -162,28 +184,45 @@ CREATE TABLE users (
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- Wallets with optimistic locking (version column)
+-- Wallets with optimistic locking (version column). One 'platform_cash'
+-- wallet is the counterparty of every deposit and withdrawal.
 CREATE TABLE wallets (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id UUID REFERENCES users(id) NOT NULL UNIQUE,
-  balance_cents BIGINT DEFAULT 0 CHECK (balance_cents >= 0),
+  balance_cents BIGINT NOT NULL DEFAULT 0 CHECK (balance_cents >= 0),
   currency VARCHAR(3) DEFAULT 'USD',
-  version INTEGER DEFAULT 1,
+  account_type VARCHAR(20) NOT NULL DEFAULT 'customer'
+    CHECK (account_type IN ('customer', 'platform_cash')),
+  version INTEGER NOT NULL DEFAULT 1,
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE UNIQUE INDEX idx_wallets_one_platform_cash
+  ON wallets(account_type) WHERE account_type = 'platform_cash';
+
+-- Linked funding sources (bank accounts and cards)
+CREATE TABLE payment_methods (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID REFERENCES users(id) NOT NULL,
+  type VARCHAR(20) NOT NULL,  -- 'bank' or 'card'
+  label VARCHAR(100) NOT NULL,
+  last_four VARCHAR(4),
+  is_default BOOLEAN DEFAULT false,
+  created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 -- Transactions (the business event)
 CREATE TABLE transactions (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  idempotency_key VARCHAR(255) UNIQUE,
-  sender_id UUID REFERENCES users(id),
+  idempotency_key VARCHAR(255),          -- audit only; uniqueness lives in idempotency_keys
+  sender_id UUID REFERENCES users(id),   -- NULL for deposits
   recipient_id UUID REFERENCES users(id) NOT NULL,
   amount_cents BIGINT NOT NULL CHECK (amount_cents > 0),
   currency VARCHAR(3) DEFAULT 'USD',
-  type VARCHAR(20) NOT NULL,  -- 'transfer', 'deposit', 'withdrawal'
+  type VARCHAR(20) NOT NULL,             -- 'transfer', 'deposit', 'withdrawal'
   status VARCHAR(20) DEFAULT 'completed',
   note TEXT,
+  payment_method_id UUID REFERENCES payment_methods(id) ON DELETE SET NULL,
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
@@ -192,8 +231,8 @@ CREATE TABLE ledger_entries (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   transaction_id UUID REFERENCES transactions(id) NOT NULL,
   wallet_id UUID REFERENCES wallets(id) NOT NULL,
-  entry_type VARCHAR(10) NOT NULL,  -- 'debit' or 'credit'
-  amount_cents BIGINT NOT NULL,
+  entry_type VARCHAR(10) NOT NULL CHECK (entry_type IN ('debit', 'credit')),
+  amount_cents BIGINT NOT NULL CHECK (amount_cents > 0),
   balance_after_cents BIGINT NOT NULL,
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
@@ -207,20 +246,28 @@ CREATE TABLE transfer_requests (
   currency VARCHAR(3) DEFAULT 'USD',
   note TEXT,
   status VARCHAR(20) DEFAULT 'pending',
+  transaction_id UUID REFERENCES transactions(id),  -- the transfer that paid it
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- Idempotency key storage (same DB as transfers for atomic consistency)
+-- Idempotency keys, scoped per user, in the same DB as the payments
 CREATE TABLE idempotency_keys (
-  key VARCHAR(255) PRIMARY KEY,
-  response JSONB NOT NULL,
+  user_id UUID NOT NULL REFERENCES users(id),
+  key VARCHAR(255) NOT NULL,
+  request_hash CHAR(64) NOT NULL,  -- SHA-256 of operation + parameters
+  response JSONB,                  -- written before the claiming transaction commits
   created_at TIMESTAMPTZ DEFAULT NOW(),
-  expires_at TIMESTAMPTZ DEFAULT NOW() + INTERVAL '24 hours'
+  expires_at TIMESTAMPTZ DEFAULT NOW() + INTERVAL '24 hours',
+  PRIMARY KEY (user_id, key)
 );
+
+-- At most one default payment method per user
+CREATE UNIQUE INDEX idx_payment_methods_one_default
+  ON payment_methods(user_id) WHERE is_default;
 ```
 
-Key indexes: `(sender_id, created_at DESC)`, `(recipient_id, created_at DESC)`, `(wallet_id, created_at DESC)` for efficient history queries.
+Key indexes: `(sender_id, created_at DESC)`, `(recipient_id, created_at DESC)`, `(wallet_id, created_at DESC)` for efficient history queries, and `ledger_entries(transaction_id)` for the per-transaction balance check. The full schema, including the `ALTER ... IF NOT EXISTS` upgrades for older volumes and the platform account rows, is `backend/src/db/init.sql`.
 
 ## API Design
 
@@ -228,7 +275,7 @@ Key indexes: `(sender_id, created_at DESC)`, `(recipient_id, created_at DESC)`, 
 
 ```
 POST /api/auth/register     Register new user + create wallet
-POST /api/auth/login        Login with session
+POST /api/auth/login        Login with session (session ID regenerated)
 POST /api/auth/logout       Destroy session
 GET  /api/auth/me           Current user info
 ```
@@ -237,25 +284,41 @@ GET  /api/auth/me           Current user info
 
 ```
 GET  /api/wallet             Get balance and wallet info
-POST /api/wallet/deposit     Deposit funds (creates credit entry)
-POST /api/wallet/withdraw    Withdraw funds (creates debit entry)
+POST /api/wallet/deposit     Deposit from a linked method (debit platform cash, credit wallet)
+POST /api/wallet/withdraw    Withdraw to a linked method (debit wallet, credit platform cash)
+```
+
+Deposit and withdrawal take `{ amountCents, paymentMethodId, note? }` and an optional `Idempotency-Key` header. `amountCents` must be a JSON integer from 1 to 1,000,000 ($10,000); a string such as `"100"` is rejected with 400 rather than coerced. A payment method that isn't the caller's returns 404, the same as a missing one.
+
+```
+POST /api/wallet/deposit
+Idempotency-Key: 6f1c...            (optional)
+{ "amountCents": 2500, "paymentMethodId": "b000...0001" }
+
+200 { "transaction": { "id": "...", "type": "deposit", "amountCents": 2500, ... },
+      "wallet": { "balanceCents": 263250, "version": 12, ... } }
 ```
 
 ### Transfers
 
 ```
-POST /api/transfers          Send money (P2P transfer with idempotency key)
-GET  /api/transfers          Transaction history with type filter
+POST /api/transfers          Send money (P2P transfer, Idempotency-Key header)
+GET  /api/transfers          Caller's transaction history (type filter, limit 1-100, offset)
 ```
+
+Transfers take `{ recipientId, amountCents, note? }` with `amountCents` from 1 to 5,000,000 ($50,000). Errors: 400 `INVALID_AMOUNT` / `AMOUNT_OVER_LIMIT` / `SELF_TRANSFER` / `INSUFFICIENT_FUNDS`, 404 `RECIPIENT_NOT_FOUND` (also for malformed IDs and the platform account), 422 `IDEMPOTENCY_KEY_REUSED`, 429 over the per-user money limit. A replay returns the original body with `Idempotent-Replayed: true`.
 
 ### Requests
 
 ```
 POST /api/requests           Request money from another user
 GET  /api/requests           List incoming/outgoing requests
-POST /api/requests/:id/pay   Pay a pending request
-POST /api/requests/:id/decline  Decline or cancel a request
+POST /api/requests/:id/pay      Payer pays (one transaction: lock request, transfer, mark paid)
+POST /api/requests/:id/decline  Payer declines
+POST /api/requests/:id/cancel   Requester cancels
 ```
+
+Outsiders get 404 on all three actions; the wrong party gets 403; a request that is no longer pending gets 409. Request amounts share the $50,000 transfer cap.
 
 ### Payment Methods
 
@@ -269,7 +332,13 @@ PUT    /api/payment-methods/:id/default  Set as default
 ### Users
 
 ```
-GET /api/users/search?q=    Search users by name/email
+GET /api/users/search?q=    Search by username/display name (substring) or exact email; emails never returned
+```
+
+### Admin
+
+```
+GET /api/admin/reconciliation   Ledger invariants + per-wallet stored vs ledger balance (admin only)
 ```
 
 ## Key Design Decisions
@@ -281,6 +350,12 @@ GET /api/users/search?q=    Search users by name/email
 The alternative -- directly updating a balance column without ledger entries -- is simpler but loses auditability and makes reconciliation impossible. In a payment system handling real money, the ability to trace every cent through the ledger is non-negotiable. When regulators ask "where did this $10,000 go?", the ledger provides a complete, verifiable answer. A single balance column can only say "the balance is now X."
 
 The write amplification cost (2 ledger entries per transfer instead of 1 balance update) is justified by the reconciliation capability and audit trail.
+
+### Platform Cash Account vs. Single-Sided Deposits
+
+**Chosen: post deposits and withdrawals against a platform cash account.** The alternative -- a deposit is a lone credit because the counterparty is an outside bank -- is simpler, but it forces the reconciliation check down to "each wallet matches its own entries". That check passes for a bug that credits a wallet with no money behind it, because a lone credit is a legal shape. With a cash account every posting is balanced, and "sum of customer balances = platform cash" catches money created or destroyed anywhere inside the system. It is also the number that gets reconciled against the bank statement.
+
+The cost is a hot row: every deposit and withdrawal updates platform cash. Locally it is one row, locked last with an atomic increment so the hold covers only the end of the transaction. At production volume it would be split into N cash sub-accounts chosen at random (summed for reporting), or the cash leg would be posted in batches.
 
 ### Optimistic Locking vs. Pessimistic Locking
 
@@ -296,6 +371,8 @@ The trade-off: optimistic locking requires retry logic when version conflicts oc
 
 Redis-based idempotency is faster (sub-ms vs. 1-5ms for PostgreSQL) but introduces a consistency gap: if the payment commits but the Redis write fails, the next retry will re-execute the payment because the key was not stored. For a financial system, this consistency guarantee outweighs the latency difference.
 
+Two details make the Postgres approach actually hold under retries. First, the key is *claimed* (inserted) as the transaction's first statement rather than looked up beforehand, so the primary key serializes concurrent duplicates. Second, the key is scoped per user and bound to a hash of the request, so a key can only ever replay its own request for its own owner.
+
 ### Integer Cents vs. Decimal
 
 **Chosen: BIGINT cents.** Storing amounts as integer cents avoids floating-point rounding errors. `$10.50` is stored as `1050`. The database enforces `CHECK (balance_cents >= 0)` to prevent negative balances at the schema level. Application code never performs decimal arithmetic on monetary values.
@@ -304,12 +381,12 @@ Redis-based idempotency is faster (sub-ms vs. 1-5ms for PostgreSQL) but introduc
 
 ### Idempotency Pattern
 
-Clients generate an idempotency key for each transfer attempt. The backend:
-1. Checks `idempotency_keys` table for existing key
-2. If found and not expired, returns the cached response (no re-execution)
-3. If not found, executes the transfer within a database transaction
-4. Stores the idempotency key and response in the same transaction
-5. Returns the result
+Clients generate an idempotency key per payment attempt and reuse it on every retry of that attempt. The backend, inside one database transaction:
+1. Claims `(user_id, key)` with the request hash (`INSERT ... ON CONFLICT DO UPDATE ... WHERE expired`)
+2. If the key was already committed: replays the stored response (same hash) or returns 422 (different hash); a concurrent duplicate waits on the primary key and then takes this branch
+3. Otherwise executes the payment
+4. Writes the response onto the claimed key
+5. Commits, so the key and the payment become visible together
 
 This guarantees exactly-once semantics even if the client retries due to network timeouts.
 
@@ -319,12 +396,14 @@ The `CHECK (balance_cents >= 0)` constraint ensures the database rejects any upd
 
 ## Security
 
-- **Session-based auth** with Redis-backed sessions (express-session + connect-redis)
+- **Session-based auth** with Redis-backed sessions (express-session + connect-redis); the session ID is regenerated on login and registration (no session fixation)
 - **bcrypt** password hashing (10 rounds)
-- **Rate limiting** on auth endpoints (50/15min) and transfer endpoints (30/min)
+- **Rate limiting** in Redis, shared by all instances: auth endpoints 50/15 min per IP; one budget of 30/min **per user** across every money endpoint (transfers, request payments, deposits, withdrawals)
 - **CSRF protection** via sameSite cookie attribute
-- **Input validation** on all amounts (positive integers, maximum limits)
-- **Authorization checks** on request pay/decline (only payer or requester)
+- **Input validation**: amounts must be JSON integers within the caps (strings are rejected, never coerced); IDs are UUID-checked before they reach SQL; notes capped at 200 characters
+- **Authorization**: users only touch their own wallets, payment methods and history; request actions return 404 to outsiders and 403 to the wrong party; deposits and withdrawals require a payment method the caller owns
+- **Privacy**: user search never returns emails and matches email only exactly
+- **No internal errors leak**: expected failures carry a code (`INSUFFICIENT_FUNDS`, ...), everything else is a generic 500
 
 ### Why Session Auth Over JWT
 
@@ -334,7 +413,8 @@ Redis session store enables immediate revocation: when a user logs out, the sess
 
 ## Observability
 
-- **Prometheus metrics**: HTTP request duration/count, transfer duration/count, wallet operations, idempotency cache hits. Exposed at `GET /metrics`.
+- **Prometheus metrics**: HTTP request duration/count (labelled by route pattern, not raw URL), transfer duration/count, wallet operations, idempotency cache hits. Exposed at `GET /metrics`.
+- **Reconciliation report**: `GET /api/admin/reconciliation` (admin page at `/admin`) checks the three ledger invariants in one snapshot
 - **Structured logging**: Pino JSON logger with request context (userId, transferId, amount)
 - **Health check**: `GET /api/health` tests database connectivity and returns status
 - **Metrics endpoint**: `GET /metrics` for Prometheus scraping
@@ -351,7 +431,8 @@ Redis session store enables immediate revocation: when a user logs out, the sess
 
 ## Failure Handling
 
-- **Circuit breaker** (Opossum) for external service calls with 50% error threshold and 30-second recovery timeout
+- **Circuit breaker** (Opossum) helper for external service calls with 50% error threshold and 30-second recovery timeout. Locally there are no external calls (deposits and withdrawals are simulated), so nothing is wrapped yet; a real bank or card processor call would be.
+- **Optimistic-lock conflicts** on deposits/withdrawals are retried three times with jitter, then reported as 409
 - **Database transaction rollback** on any error during transfer -- ensures no partial state
 - **Graceful shutdown** with SIGTERM/SIGINT handlers
 - **Connection pool** with configurable timeouts and max connections
@@ -362,8 +443,9 @@ Redis session store enables immediate revocation: when a user logs out, the sess
 | Failure | Impact | Mitigation |
 |---------|--------|-----------|
 | PostgreSQL down | All transfers fail | Circuit breaker fails fast; health check reports unhealthy |
-| Redis down | Sessions lost | Users must re-login; rate limiting degrades to no-limit |
-| Version conflict | Single transfer retries | Client generates new idempotency key and retries |
+| Redis down | Sessions lost | Users must re-login; rate limiting fails open (`passOnStoreError`) |
+| Version conflict | Deposit/withdrawal retried server-side | 409 after 3 attempts; client retries with the same key |
+| Duplicate pay click | Second request waits on the request row lock | 409 "already paid"; payer charged once |
 | Network partition | Timeout on transfer | Idempotency key ensures retry safety |
 
 ## Scalability Considerations
@@ -371,8 +453,9 @@ Redis session store enables immediate revocation: when a user logs out, the sess
 ### What Breaks First
 
 1. **Single PostgreSQL** -- partition transactions and ledger by date range; read replicas for balance queries
-2. **Hot wallet contention** -- users with high transaction volume (merchants). Solution: queue-based processing or wallet sharding (multiple sub-wallets per user)
-3. **Idempotency table growth** -- periodic cleanup of expired keys (24-hour TTL). A background job runs `DELETE FROM idempotency_keys WHERE expires_at < NOW()`
+2. **Platform cash row** -- every deposit and withdrawal updates it. Split into N sub-accounts or batch the cash leg
+3. **Hot wallet contention** -- users with high transaction volume (merchants). Solution: queue-based processing or wallet sharding (multiple sub-wallets per user)
+4. **Idempotency table growth** -- periodic cleanup of expired keys (24-hour TTL). Each API instance runs `DELETE FROM idempotency_keys WHERE expires_at < NOW()` hourly
 
 ### Scaling Strategy
 
@@ -395,6 +478,10 @@ Each API server maintains a pool of 20 PostgreSQL connections. With 3 servers, t
 | Amount storage | BIGINT cents | DECIMAL | No floating-point errors in app code |
 | Session storage | Redis + cookie | JWT | Immediate revocation, XSS-safe |
 | Idempotency | DB-stored keys | Redis-stored keys | Atomicity with transfer in same txn |
+| Idempotency scope | Per user + request hash, claimed first | Global key, checked up front | No cross-user replay; duplicates can't both execute |
+| Deposit counterparty | Platform cash account | Single-sided credit | Every posting nets to zero; customers = cash |
+| Request payment | Row lock + transfer in one txn | Check, transfer, update separately | Double click can't pay twice |
+| Rate-limit key | Per user, Redis store | Per IP, in-memory | Shared across instances; NAT-friendly |
 | Auth | Session-based | OAuth/JWT | Simpler for learning, immediate revocation |
 
 ---
@@ -407,13 +494,13 @@ The frontend is a React SPA built with Vite, TypeScript, and Tailwind CSS, style
 
 ```
 __root.tsx (RootComponent)
-├── Header (PayPal-branded nav: Dashboard, Send, Request, Activity, Wallet)
+├── Header (PayPal-branded nav: Dashboard, Send, Request, Activity, Wallet, Admin for admins)
 ├── checkAuth() on mount to restore session
 └── <Outlet /> renders child routes:
     ├── /login ──────────── Login (username + password)
     ├── /register ────────── Register (username, email, password)
     ├── / ──────────────── Dashboard
-    │   ├── WalletCard (gradient card showing balance, currency)
+    │   ├── WalletCard (balance + Add money / Withdraw → WalletActionModal)
     │   ├── QuickActions (Send/Request shortcut buttons)
     │   ├── RequestCard (pending incoming/outgoing requests with Pay/Decline actions)
     │   └── TransactionList → TransactionItem (recent activity)
@@ -422,13 +509,15 @@ __root.tsx (RootComponent)
     │   └── SendMoneyForm (amount, note, idempotency key generation)
     ├── /request ────────── Request Money
     │   ├── UserSearch
-    │   └── RequestMoneyForm (amount, note)
+    │   ├── RequestMoneyForm (amount, note)
+    │   └── OutgoingRequests (your requests: status badges, Cancel while pending)
     ├── /activity ────────── Activity
     │   ├── ActivityFilters (type filter: all/transfer/deposit/withdrawal)
     │   └── TransactionList → TransactionItem
-    └── /payment-methods ─── Payment Methods
-        ├── PaymentMethodCard (card/bank display with delete + set default)
-        └── AddPaymentMethodModal (modal form for adding new methods)
+    ├── /payment-methods ─── Payment Methods
+    │   ├── PaymentMethodCard (card/bank display with delete + set default)
+    │   └── AddPaymentMethodModal (modal form for adding new methods)
+    └── /admin ──────────── Ledger Reconciliation (admin only)
 ```
 
 ### Zustand Store
@@ -437,19 +526,19 @@ __root.tsx (RootComponent)
 
 ### Routing
 
-Uses TanStack Router with file-based routing. Routes: `/` (dashboard), `/send`, `/request`, `/activity`, `/payment-methods`, `/login`, `/register`. The root component calls `checkAuth()` on mount to verify the session. Individual routes check `user` from the auth store and redirect to login if null.
+Uses TanStack Router with file-based routing. Routes: `/` (dashboard), `/send`, `/request`, `/activity`, `/payment-methods`, `/admin`, `/login`, `/register`. All routes are flat siblings under `__root.tsx`, which renders `<Outlet />` inside a `<main>` landmark. The root component calls `checkAuth()` on mount to verify the session. Individual routes check `user` from the auth store and redirect to login if null.
 
 ### Data Fetching
 
 API calls use a centralized `request<T>()` function in `frontend/src/services/api.ts` that sets `credentials: 'include'` (for cookie-based session auth), adds JSON content type, and throws errors with the server message. The API service is organized into domain-specific objects: `authApi`, `walletApi`, `transfersApi`, `requestsApi`, `paymentMethodsApi`, and `usersApi`.
 
-Data fetching is done with `useEffect` + `useState` in route components. The send flow generates client-side idempotency keys (`Date.now()` + random string) before calling `transfersApi.send()`.
+Data fetching is done with `useEffect` + `useState` in route components. The send form and the deposit/withdraw modal keep one random idempotency key per payment attempt in a ref and send it as an `Idempotency-Key` header. A retry after a timeout reuses it, so the server replays instead of charging twice; editing the payment or a successful send starts a new attempt. (The old key was built from `Date.now()` at click time, so every retry got a new key.) Dollar amounts are parsed from the input string into integer cents (`utils/money.ts`), never through floating point, and more than two decimals is rejected.
 
 ### Key UI Patterns
 
-- **Wallet card**: Gradient card (PayPal brand colors) displaying balance in cents converted to dollars, currency label, and user info
+- **Wallet card**: Gradient card (PayPal brand colors) displaying balance in cents converted to dollars, with Add money / Withdraw buttons that open a modal to pick a linked payment method
 - **User search with debounce**: The `UserSearch` component debounces input and calls `usersApi.search()` to find recipients by name, username, or email. Results are displayed as selectable cards.
-- **Request flow with inline actions**: Pending requests appear on the dashboard with Pay and Decline buttons. Paying triggers a transfer; declining updates the request status. Each action refreshes the request list.
+- **Request flow with inline actions**: Pending requests appear on the dashboard with Pay and Decline buttons; the request page lists your own requests with Cancel. Server errors ("Insufficient funds", "Request is already paid") are shown on the card. Each action refreshes the list.
 - **Activity type filters**: Tab-style filter buttons (All, Transfers, Deposits, Withdrawals) that pass the type parameter to the API and re-fetch the transaction list
 - **Status badges**: `StatusBadge` component renders colored pills for request statuses (pending, paid, declined, cancelled)
 - **Modal for payment methods**: `AddPaymentMethodModal` overlays the page for adding a new card or bank account without navigating away
@@ -477,7 +566,7 @@ The trade-off is that cache-aside introduces staleness risk. For financial balan
 
 A circuit breaker is a stability pattern that wraps calls to external or unreliable services. It tracks success and failure rates. When failures exceed a threshold, the circuit "opens" and all subsequent calls fail immediately without attempting the request. After a cooldown period, the circuit enters "half-open" state, allowing one test request. If it succeeds, the circuit closes and normal traffic resumes.
 
-In this project, Opossum circuit breakers protect external service calls. Configuration: 50% error threshold across 5+ requests opens the circuit; 30-second recovery timeout before half-open test. The purpose is preventing cascading failures. If the database becomes slow (responding in 10 seconds instead of 5 milliseconds), without a circuit breaker every incoming request would pile up waiting for database responses. Within seconds, the connection pool is exhausted, the event loop blocks, and the entire service becomes unresponsive -- even for endpoints that do not need the database. The circuit breaker detects the slowdown, opens, and fails fast, preserving the service for healthy operations.
+In this project, `createCircuitBreaker()` wraps a function in an Opossum breaker. It is not wired to anything yet: the only external dependency would be a bank or card processor, and deposits and withdrawals are simulated locally. Configuration: 50% error threshold across 5+ requests opens the circuit; 30-second recovery timeout before half-open test. The purpose is preventing cascading failures. If the database becomes slow (responding in 10 seconds instead of 5 milliseconds), without a circuit breaker every incoming request would pile up waiting for database responses. Within seconds, the connection pool is exhausted, the event loop blocks, and the entire service becomes unresponsive -- even for endpoints that do not need the database. The circuit breaker detects the slowdown, opens, and fails fast, preserving the service for healthy operations.
 
 File: `backend/src/services/circuitBreaker.ts`
 
@@ -505,7 +594,7 @@ File: `backend/src/services/metrics.ts`
 
 Rate limiting restricts how many requests a client can make within a time window. Without rate limiting, a single user (or attacker) could send thousands of requests per second, overwhelming the server and degrading performance for everyone else.
 
-The implementation uses `express-rate-limit` with a Redis store. Two separate rate limits are configured: auth endpoints (50 requests per 15 minutes, preventing brute-force login attempts) and transfer endpoints (30 requests per minute, preventing automated fund draining). When a client exceeds the limit, the server returns HTTP 429 (Too Many Requests) with a `Retry-After` header indicating when the client can try again.
+The implementation uses `express-rate-limit` with a Redis store (`rate-limit-redis` over the shared ioredis client). Three limits are configured: all API calls (1000 per 15 minutes per IP), auth endpoints (50 per 15 minutes per IP, against password guessing) and money movement (30 per minute **per user**, one budget shared by transfers, request payments, deposits and withdrawals, against automated fund draining). Limits are configurable through `RATE_LIMIT_*` environment variables. If Redis is unavailable the limiter fails open rather than blocking payments. When a client exceeds the limit, the server returns HTTP 429 (Too Many Requests) with a `Retry-After` header indicating when the client can try again.
 
 The Redis store ensures rate limits work correctly across multiple API server instances. If the limit were stored in-memory, each server would track its own count, and a client could circumvent the limit by hitting different servers. Redis provides a shared counter that all servers increment.
 
@@ -515,11 +604,11 @@ File: `backend/src/services/rateLimiter.ts`
 
 Idempotency means that performing the same operation multiple times produces the same result as performing it once. For a P2P payment system, this prevents the nightmare scenario: Alice sends $50 to Bob, the network drops before the response arrives, Alice retries, and Bob receives $100.
 
-The client generates a unique idempotency key (UUID) for each transfer and sends it with the request. Before processing, the server checks the `idempotency_keys` table in PostgreSQL. If the key exists, the cached response is returned without re-executing the transfer. If not, the transfer executes, and the key + response are stored in the same database transaction.
+The client generates a unique idempotency key (UUID) for each payment attempt and sends it in the `Idempotency-Key` header. The server claims `(user_id, key)` as the first statement of the payment's transaction. If the key was already used for the same request, the stored response is replayed; if it was used for a different request, the server answers 422; if another request with the key is still running, this one waits for it. The key and the response commit with the payment.
 
 This project stores idempotency keys in PostgreSQL (not Redis) for a critical reason: atomicity. The key and the payment are committed in the same transaction. If the transaction rolls back (e.g., insufficient funds), the key is also rolled back, allowing a clean retry. With Redis, a crash between the Redis write and the database commit would leave the key stored without the payment completed -- the client would think the payment succeeded but the money never moved.
 
-Keys expire after 24 hours via a TTL column. A background cleanup job deletes expired keys to prevent unbounded table growth.
+Keys expire after 24 hours via a TTL column. A cleanup timer in each API instance deletes expired keys hourly to prevent unbounded table growth.
 
 File: `backend/src/services/idempotencyService.ts`
 
@@ -551,13 +640,14 @@ This section maps the production architecture above to the actual local implemen
 │  /request       Request money
 │  /activity      Transaction history with filters
 │  /payment-methods  Manage cards/banks
+│  /admin         Ledger reconciliation
 │  /login, /register
 └──────────┬───────────┘
-           │ HTTP (proxy to :3000)
+           │ HTTP (Vite proxy to :3001)
            ▼
 ┌──────────────────────┐
 │    Express API       │
-│    (:3000)           │
+│    (:3001)           │
 │    or 3 instances    │
 │    (:3001-3003)      │
 ├──────────────────────┤
@@ -567,6 +657,7 @@ This section maps the production architecture above to the actual local implemen
 │  /api/requests/*     │
 │  /api/payment-methods│
 │  /api/users/search   │
+│  /api/admin/*        │
 │  /api/health         │
 │  /metrics            │
 └──┬───────────────┬───┘
@@ -587,46 +678,62 @@ This section maps the production architecture above to the actual local implemen
 
 ### Production-Grade Patterns Actually Implemented
 
-**1. Double-Entry Bookkeeping** -- Every balance change creates paired debit/credit ledger entries within a single database transaction. Deposits create a credit entry; withdrawals create a debit entry; transfers create one of each. The `balance_after_cents` column provides a running balance snapshot for each entry.
+**1. Double-Entry Bookkeeping** -- Every balance change writes a balanced debit/credit pair in the same transaction as the wallet update. Transfers pair two customer wallets; deposits and withdrawals pair a customer wallet with the platform cash account. `balance_after_cents` gives each entry a running balance.
 
-File: `backend/src/services/transferService.ts`
+File: `backend/src/services/transferService.ts`, `backend/src/services/walletService.ts`, `backend/src/services/ledger.ts`
 
-**2. Idempotency** -- Transfer endpoint accepts idempotency keys. The key and response are stored atomically with the payment in the same PostgreSQL transaction. Subsequent requests with the same key return the cached response without re-executing.
+**2. Reconciliation** -- `GET /api/admin/reconciliation` checks, in one REPEATABLE READ snapshot, that every transaction nets to zero, every wallet matches its ledger, and customer balances equal platform cash. The seed satisfies all three (it includes opening-balance deposits), and the live test suite asserts them after 50 concurrent opposite transfers.
+
+File: `backend/src/routes/admin.ts`, `frontend/src/routes/admin.tsx`
+
+**3. Idempotency** -- Transfers, deposits and withdrawals take an `Idempotency-Key` header. The key is claimed per user with a request hash as the transaction's first statement, the response is stored before commit, and a replay is flagged with `Idempotent-Replayed: true`.
+
+```
+INSERT INTO idempotency_keys (user_id, key, request_hash) VALUES ($1, $2, $3)
+ON CONFLICT (user_id, key) DO UPDATE SET ... WHERE idempotency_keys.expires_at <= NOW()
+RETURNING key            -- row: we own the key; no row: replay or 422
+```
 
 File: `backend/src/services/idempotencyService.ts`
 
-**3. Optimistic Locking** -- Wallet updates use `WHERE version = $expected` to detect concurrent modifications. For P2P transfers, wallets are locked with `SELECT ... FOR UPDATE` in consistent `user_id` order to prevent deadlocks.
+**4. Locking** -- Transfers lock both wallets with one ordered `SELECT ... FOR UPDATE` (deadlock-free) and keep a version check as a tripwire. Deposits and withdrawals use optimistic `WHERE version = $read` with three jittered retries, then 409. Paying a request locks the request row first, so a double click can't pay twice.
 
-File: `backend/src/services/transferService.ts` (lock ordering), `backend/src/services/walletService.ts` (version checks)
+File: `backend/src/services/transferService.ts` (lock ordering), `backend/src/services/walletService.ts` (version checks), `backend/src/routes/requests.ts` (request row lock)
 
-**4. Circuit Breaker** -- Opossum-based circuit breaker wraps external service calls with automatic failure detection. Opens at 50% error rate across 5+ requests; recovers after 30-second timeout.
+**5. Strict money input** -- Amounts must be JSON integers within the caps. JavaScript `balance + "100"` is string concatenation, which once let a $1 deposit inflate a balance by millions; strings are now rejected and arithmetic runs in SQL. The frontend parses dollars to cents from the string, not via floats.
 
-File: `backend/src/services/circuitBreaker.ts`
+File: `backend/src/services/validation.ts`, `frontend/src/utils/money.ts`
 
-**5. Prometheus Metrics** -- Custom metrics for transfer duration, transfer count by status, wallet operations, idempotency cache hits, and HTTP request duration. Exposed at `GET /metrics`.
+**6. Prometheus Metrics** -- Transfer duration and count by status, wallet operations, idempotency hits, and HTTP duration/count labelled by route pattern. Exposed at `GET /metrics`.
 
-File: `backend/src/services/metrics.ts`
+File: `backend/src/services/metrics.ts`, `backend/src/app.ts`
 
-**6. Structured Logging** -- Pino JSON logger with request context via pino-http middleware.
+**7. Structured Logging** -- Pino JSON logger with request context via pino-http middleware.
 
 File: `backend/src/services/logger.ts`
 
-**7. Rate Limiting** -- Express-rate-limit with Redis store. Separate limits for auth (50/15min) and transfers (30/min).
+**8. Rate Limiting** -- Redis store shared by all instances; per-IP limits for the API and auth, a per-user budget across money endpoints; fails open if Redis is down. Verified live: 20 requests on :3001 plus 11 on :3002 trip the limit on the 31st.
 
 File: `backend/src/services/rateLimiter.ts`
 
-**8. Health Check** -- `GET /api/health` tests PostgreSQL connectivity.
+**9. Health Check and Cleanup** -- `GET /api/health` tests PostgreSQL connectivity; each instance purges expired idempotency keys hourly.
 
-File: `backend/src/app.ts`
+File: `backend/src/app.ts`, `backend/src/index.ts`
+
+**Not wired:** the Opossum circuit breaker (`backend/src/services/circuitBreaker.ts`) has no caller, because there is no external dependency to protect locally.
+
+**Testing:** vitest unit tests with a scripted fake `pg` client (`backend/src/test/fakeDb.ts`) cover validation, lock and posting order, idempotency claim/replay/mismatch, optimistic retries, payment-method ownership, request authorization and session regeneration. Playwright smoke tests cover each screen.
 
 ### What Was Simplified or Substituted
 
 | Production Component | Local Substitute | Reason |
 |---------------------|-----------------|--------|
-| API Gateway (Kong, AWS) | Direct Express access on :3000 | No managed gateway needed locally |
+| API Gateway (Kong, AWS) | Direct Express access on :3001 (Vite proxy) | No managed gateway needed locally |
 | PostgreSQL sharding (Citus) | Single PostgreSQL instance | Sufficient for dev scale |
 | Read replicas | Single instance handles reads/writes | No replication needed |
-| Real payment gateway (Stripe, Plaid) | Simulated deposits/withdrawals | No real bank integration |
+| Real payment gateway (Stripe, Plaid) | Simulated deposits/withdrawals that complete immediately | No real bank integration |
+| Sharded platform cash sub-accounts | One platform cash wallet row | Contention is irrelevant at local scale |
+| Scheduled reconciliation job with alerting | On-demand admin report | Same queries, no scheduler or pager locally |
 | Multi-currency support | Single currency (USD only) | Simplifies wallet logic |
 | OAuth2 with MFA | Session cookies with bcrypt | Simpler for learning project |
 | Kafka for event streaming | No event bus | Events not needed at dev scale |
@@ -643,4 +750,4 @@ File: `backend/src/app.ts`
 - **Compliance/KYC** verification (identity documents, OFAC screening)
 - **Dispute resolution** and refund flows
 - **Grafana dashboards** (Prometheus metrics collected but not visualized)
-- **Background job scheduler** for idempotency key cleanup
+- **Withdrawal settlement lifecycle** (pending → settled/returned); withdrawals debit and complete at once. The seed's one `pending` withdrawal is already debited

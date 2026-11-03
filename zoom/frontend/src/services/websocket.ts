@@ -1,49 +1,74 @@
 type MessageHandler = (message: Record<string, unknown>) => void;
 
+interface JoinRequest {
+  meetingCode: string;
+  displayName: string;
+  muted: boolean;
+  videoOn: boolean;
+}
+
+/**
+ * Close codes >= 4000 are deliberate server decisions (not signed in, replaced by
+ * another window, removed by the host); reconnecting would only repeat them.
+ */
+const isFinalClose = (code: number) => code >= 4000 || code === 1000;
+
 class WebSocketClient {
   private ws: WebSocket | null = null;
   private handlers: Map<string, MessageHandler[]> = new Map();
   private reconnectAttempts = 0;
   private maxReconnectAttempts = 5;
   private reconnectDelay = 1000;
-  private userId: string | null = null;
-  private username: string | null = null;
+  private shouldReconnect = false;
+  /** The meeting to re-enter after a reconnect; cleared on leave or a final close. */
+  private currentJoin: JoinRequest | null = null;
 
-  connect(userId: string, username: string): Promise<void> {
-    this.userId = userId;
-    this.username = username;
+  /**
+   * Opens the signaling socket. Identity comes from the session cookie the
+   * browser sends on the upgrade; the client no longer names itself.
+   */
+  connect(): Promise<void> {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) return Promise.resolve();
+    this.shouldReconnect = true;
 
     return new Promise((resolve, reject) => {
       const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
-      const host = window.location.host;
-      const url = `${protocol}://${host}/ws?userId=${encodeURIComponent(userId)}&username=${encodeURIComponent(username)}`;
+      const ws = new WebSocket(`${protocol}://${window.location.host}/ws`);
+      this.ws = ws;
 
-      this.ws = new WebSocket(url);
-
-      this.ws.onopen = () => {
+      ws.onopen = () => {
+        if (this.ws !== ws) return;
         this.reconnectAttempts = 0;
+        // The server freed nothing yet if we are back inside its grace window:
+        // re-sending the join resumes the same seat and role.
+        if (this.currentJoin) this.send({ type: 'join-meeting', ...this.currentJoin });
         resolve();
       };
 
-      this.ws.onerror = (err) => {
+      ws.onerror = (err) => {
+        if (this.ws !== ws) return;
         console.error('WebSocket error:', err);
         reject(err);
       };
 
-      this.ws.onmessage = (event) => {
+      ws.onmessage = (event) => {
+        if (this.ws !== ws) return;
         try {
-          const message = JSON.parse(event.data);
-          this.dispatch(message);
+          this.dispatch(JSON.parse(event.data));
         } catch (err) {
           console.error('Failed to parse WebSocket message:', err);
         }
       };
 
-      this.ws.onclose = (event) => {
-        console.log('WebSocket closed:', event.code, event.reason);
+      ws.onclose = (event) => {
+        if (this.ws !== ws) return;
+        this.ws = null;
         this.dispatch({ type: 'connection-closed', code: event.code, reason: event.reason });
-
-        if (event.code !== 4001 && this.reconnectAttempts < this.maxReconnectAttempts) {
+        if (isFinalClose(event.code)) {
+          this.currentJoin = null;
+          return;
+        }
+        if (this.shouldReconnect && this.reconnectAttempts < this.maxReconnectAttempts) {
           this.attemptReconnect();
         }
       };
@@ -56,22 +81,24 @@ class WebSocketClient {
     console.log(`Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})`);
 
     setTimeout(() => {
-      if (this.userId && this.username) {
-        this.connect(this.userId, this.username).catch((err) => {
-          console.error('Reconnection failed:', err);
-        });
-      }
+      if (!this.shouldReconnect) return;
+      this.connect().catch((err) => {
+        console.error('Reconnection failed:', err);
+      });
     }, delay);
   }
 
   disconnect() {
-    if (this.ws) {
-      this.ws.close(1000, 'Client disconnect');
-      this.ws = null;
-    }
-    this.userId = null;
-    this.username = null;
-    this.reconnectAttempts = this.maxReconnectAttempts; // prevent reconnect
+    this.shouldReconnect = false;
+    this.currentJoin = null;
+    const ws = this.ws;
+    this.ws = null;
+    if (ws) ws.close(1000, 'Client disconnect');
+  }
+
+  /** Stops re-joining on reconnect (meeting ended, denied, removed). */
+  forgetMeeting() {
+    this.currentJoin = null;
   }
 
   send(message: Record<string, unknown>) {
@@ -101,28 +128,19 @@ class WebSocketClient {
 
   private dispatch(message: Record<string, unknown>) {
     const type = message.type as string;
-    const handlers = this.handlers.get(type);
-    if (handlers) {
-      for (const handler of handlers) {
-        handler(message);
-      }
-    }
-
-    // Also dispatch to '*' handlers (catch-all)
-    const wildcardHandlers = this.handlers.get('*');
-    if (wildcardHandlers) {
-      for (const handler of wildcardHandlers) {
-        handler(message);
-      }
+    for (const handler of [...(this.handlers.get(type) ?? []), ...(this.handlers.get('*') ?? [])]) {
+      handler(message);
     }
   }
 
   // Signaling methods
-  joinMeeting(meetingCode: string, displayName: string) {
-    this.send({ type: 'join-meeting', meetingCode, displayName });
+  joinMeeting(meetingCode: string, displayName: string, muted: boolean, videoOn: boolean) {
+    this.currentJoin = { meetingCode, displayName, muted, videoOn };
+    this.send({ type: 'join-meeting', ...this.currentJoin });
   }
 
   leaveMeeting() {
+    this.currentJoin = null;
     this.send({ type: 'leave-meeting' });
   }
 
@@ -160,6 +178,43 @@ class WebSocketClient {
 
   sendChatMessage(content: string, recipientId?: string) {
     this.send({ type: 'chat-message', content, recipientId });
+  }
+
+  // Host controls (the server checks the caller's role for each)
+  admitParticipant(userId: string) {
+    this.send({ type: 'admit-participant', userId });
+  }
+
+  denyParticipant(userId: string) {
+    this.send({ type: 'deny-participant', userId });
+  }
+
+  muteParticipant(userId: string) {
+    this.send({ type: 'mute-participant', userId });
+  }
+
+  muteAll() {
+    this.send({ type: 'mute-all' });
+  }
+
+  removeParticipant(userId: string) {
+    this.send({ type: 'remove-participant', userId });
+  }
+
+  transferHost(userId: string) {
+    this.send({ type: 'transfer-host', userId });
+  }
+
+  setRole(userId: string, role: 'co-host' | 'participant') {
+    this.send({ type: 'set-role', userId, role });
+  }
+
+  lockMeeting(locked: boolean) {
+    this.send({ type: 'lock-meeting', locked });
+  }
+
+  endMeeting() {
+    this.send({ type: 'end-meeting' });
   }
 
   get isConnected(): boolean {

@@ -1,7 +1,15 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
-import type { User } from '../types';
+import type { Driver, User } from '../types';
 import { authAPI } from '../services/api';
+
+/**
+ * Optional onboarding step run right after sign-up. Registration itself always
+ * creates a customer; this upgrades the new account to a driver or restaurant owner.
+ */
+export type Onboarding =
+  | { as: 'driver'; vehicleType: Driver['vehicle_type']; licensePlate?: string }
+  | { as: 'restaurant_owner' };
 
 /**
  * Authentication state interface.
@@ -23,10 +31,14 @@ interface AuthState {
    */
   login: (email: string, password: string) => Promise<void>;
   /**
-   * Registers a new user account.
+   * Registers a new customer account, then runs the optional onboarding step.
    * @param data - Registration data
+   * @param onboarding - Driver or restaurant owner onboarding to run after sign-up
    */
-  register: (data: { email: string; password: string; name: string; phone?: string; role?: string }) => Promise<void>;
+  register: (
+    data: { email: string; password: string; name: string; phone?: string },
+    onboarding?: Onboarding
+  ) => Promise<void>;
   /** Logs out the current user */
   logout: () => Promise<void>;
   /** Fetches and restores the current session from the server */
@@ -62,13 +74,29 @@ export const useAuthStore = create<AuthState>()(
         }
       },
 
-      register: async (data) => {
+      register: async (data, onboarding) => {
         set({ isLoading: true, error: null });
         try {
           const { user } = await authAPI.register(data);
-          set({ user, isLoading: false });
+          set({ user, isLoading: Boolean(onboarding) });
         } catch (err) {
           set({ error: (err as Error).message, isLoading: false });
+          throw err;
+        }
+        if (!onboarding) return;
+
+        // The account and session exist now, so a failure here leaves a signed-in customer
+        try {
+          const { user } =
+            onboarding.as === 'driver'
+              ? await authAPI.becomeDriver(onboarding.vehicleType, onboarding.licensePlate)
+              : await authAPI.becomeRestaurantOwner();
+          set({ user, isLoading: false });
+        } catch (err) {
+          set({
+            error: `Account created as a customer, but setup failed: ${(err as Error).message}`,
+            isLoading: false,
+          });
           throw err;
         }
       },

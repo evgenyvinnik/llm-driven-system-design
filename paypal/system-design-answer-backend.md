@@ -60,11 +60,11 @@ Before diving in, I'd confirm scope with the interviewer:
 | Table | Key Columns | Indexes | Notes |
 |-------|-------------|---------|-------|
 | users | id (UUID PK), username (unique), email (unique), password_hash, role | email, username | One wallet per user |
-| wallets | id (UUID PK), user_id (FK unique), balance_cents (BIGINT), currency, version | user_id | Optimistic locking via version column |
-| transactions | id (UUID PK), idempotency_key (unique), sender_id (FK), recipient_id (FK), amount_cents, type, status | (sender_id, created_at DESC), (recipient_id, created_at DESC) | Type: transfer/deposit/withdrawal |
+| wallets | id (UUID PK), user_id (FK unique), balance_cents (BIGINT), account_type, version | user_id | Optimistic locking via version; one 'platform_cash' account |
+| transactions | id (UUID PK), sender_id (FK), recipient_id (FK), amount_cents, type, status, payment_method_id | (sender_id, created_at DESC), (recipient_id, created_at DESC) | Type: transfer/deposit/withdrawal |
 | ledger_entries | id (UUID PK), transaction_id (FK), wallet_id (FK), entry_type, amount_cents, balance_after_cents | (wallet_id, created_at DESC) | entry_type: debit or credit |
-| transfer_requests | id (UUID PK), requester_id (FK), payer_id (FK), amount_cents, status | (payer_id, status), requester_id | Status: pending/paid/declined/cancelled |
-| idempotency_keys | key (PK), response (JSONB), expires_at | expires_at | 24-hour TTL, cleaned periodically |
+| transfer_requests | id (UUID PK), requester_id (FK), payer_id (FK), amount_cents, status, transaction_id | (payer_id, status), requester_id | Paid requests point at the transfer that settled them |
+| idempotency_keys | (user_id, key) PK, request_hash, response (JSONB), expires_at | expires_at | Scoped per user, 24-hour TTL, cleaned hourly |
 | payment_methods | id (UUID PK), user_id (FK), type, label, last_four, is_default | user_id | Type: bank or card |
 
 > "I store amounts as BIGINT cents, not DECIMAL. This eliminates floating-point rounding errors in application code -- $10.50 is stored as 1050. The CHECK constraint `balance_cents >= 0` prevents negative balances at the database level, which is our last line of defense against bugs in application logic."
@@ -110,19 +110,21 @@ When locking both sender and recipient wallets, we always lock in user_id order.
 
 **The complete transfer algorithm:**
 
-1. Check idempotency key -- if cached and not expired, return stored response
-2. BEGIN transaction
+1. BEGIN transaction
+2. Claim the idempotency key: insert (sender, key, hash of the request). If the row already exists, replay its stored response when the hash matches, or reject with 422 when it doesn't
 3. Lock both wallets (ordered by user_id) with SELECT ... FOR UPDATE
 4. Verify sender balance >= amount
-5. UPDATE sender wallet: decrement balance, increment version (with optimistic lock check)
-6. UPDATE recipient wallet: increment balance, increment version (with optimistic lock check)
-7. INSERT transaction record with idempotency key
+5. UPDATE sender wallet: decrement balance in SQL, increment version
+6. UPDATE recipient wallet: increment balance in SQL, increment version
+7. INSERT transaction record
 8. INSERT debit ledger entry (sender wallet, amount, new balance after)
 9. INSERT credit ledger entry (recipient wallet, amount, new balance after)
-10. INSERT idempotency key with serialized response (within same transaction)
+10. Write the serialized response onto the claimed key
 11. COMMIT
 
-If any step fails, ROLLBACK undoes everything. The idempotency key is stored in the same transaction, so it's impossible to have the key stored without the transfer completing (or vice versa).
+If any step fails, ROLLBACK undoes everything, the key included, so a failed payment can be retried cleanly.
+
+> "The order of steps 1 and 2 is the subtle part. An earlier version checked for the key *before* opening the transaction and stored it at the end. Two retries arriving together both saw 'no key', both moved money, and the second only failed afterwards on a unique index -- with a 500 instead of the original response. Claiming the key first, inside the transaction, turns the primary key into a lock: the duplicate blocks on it until the first commits, then reads and replays the stored result. Keys are scoped per user, so one customer's key can never return another customer's receipt."
 
 **Why not use database triggers?**
 
@@ -219,7 +221,7 @@ DELETE /api/payment-methods/:id Unlink method
 GET /api/users/search?q=        Find users by name/email
 ```
 
-> "The transfer endpoint requires an idempotency key in the request body. If a client retries the same key, we return the cached result without re-executing. This is critical for mobile clients that may retry on network timeouts -- without it, a user could accidentally send $50 twice."
+> "Every money endpoint -- transfer, deposit, withdrawal -- takes an `Idempotency-Key` header. A retry with the same key and the same body gets the original response back, marked as a replay; the same key with a different amount gets a 422 rather than an unrelated receipt. This is critical for mobile clients that retry on network timeouts -- without it, a user could accidentally send $50 twice."
 
 **Registration creates a wallet atomically:**
 
@@ -237,17 +239,18 @@ pending ──▶ cancelled  (requester cancels)
 
 **Transfer request paying flow:**
 
-When a payer pays a request, the backend:
-1. Loads the request and validates it's still 'pending'
-2. Validates the payer is the correct user
-3. Calls the transfer engine to execute the payment
-4. Updates the request status to 'paid'
+When a payer pays a request, the backend runs one database transaction:
+1. Locks the request row with SELECT ... FOR UPDATE
+2. Returns 404 if the caller is neither party (outsiders can't learn the request exists), 403 if they're the requester, 409 if it's no longer 'pending'
+3. Runs the transfer engine on the same connection
+4. Marks the request 'paid' and records the transfer's ID on it
+5. COMMIT
 
-Steps 3 and 4 happen within the same request handler but in sequence. The transfer itself is atomic. If the status update fails after the transfer succeeds, the money has moved but the request shows stale status -- an inconsistency we'd need to reconcile. At production scale, we'd wrap both in a saga pattern.
+> "The row lock is what makes a double-tap safe. Without it, two Pay requests both read 'pending' and both run a transfer -- the payer is charged twice. With it, the second request waits, then sees 'paid' and gets a 409 without touching any wallet. Decline and cancel take the same lock, so Pay racing Decline also resolves to exactly one outcome. Because the status change and the money move commit together, there's no window where money moved but the request still says pending."
 
 **User search for send/request:**
 
-The search endpoint uses ILIKE queries against username, display_name, and email with a minimum query length of 2 characters. Results are limited to 10 and exclude the current user. This prevents sending money to yourself and keeps the dropdown manageable.
+The search endpoint matches username and display name by substring (with LIKE wildcards escaped), but email only by the exact address, and it never returns emails. Substring email search would let any signed-in user page through everyone's address. Results are limited to 10 and exclude the current user and the platform's own bookkeeping account.
 
 ## 📈 Observability
 
@@ -327,13 +330,19 @@ When sender and recipient are on different database shards, we need a two-phase 
 - PostgreSQL default max_connections is 100, sufficient for Phase 1-2
 - Phase 3+ uses PgBouncer for connection pooling across multiple API servers
 
-## 💰 Deposits and Withdrawals Break the Pairing
+## 💰 Deposits and Withdrawals Need a Counterparty
 
-Worth stating explicitly, because it changes what the reconciliation check can assert: **transfers are two-sided, deposits and withdrawals are not.**
+A transfer debits one wallet and credits another, so its entries sum to zero. A deposit has no internal counterparty -- money arrives from a bank we don't control. Posting it as a lone credit is tempting, and an earlier version did exactly that, but then "every transaction nets to zero" is false and the books can't prove that money only enters through real deposits.
 
-A transfer debits one wallet and credits another inside one transaction, so its entries sum to zero. A deposit has no internal counterparty — money arrives from a bank we don't control — so it produces a credit with nothing to pair against. A withdrawal is the mirror.
+So the platform has its own **cash account**: a wallet row that represents the money we hold at our bank. A deposit debits platform cash and credits the customer; a withdrawal does the reverse. Customer wallets are credit-normal (balance = credits − debits) because they are what we owe; platform cash is debit-normal (balance = debits − credits) because it is what we hold. That gives three invariants an admin reconciliation report checks in one snapshot:
 
-This is why the invariant is written **per wallet** rather than per transaction: `SUM(credits) − SUM(debits)` for a wallet must equal its `balance_cents`. That holds for all three shapes. Had it been "every transaction's entries must sum to zero," deposits would fail it, and the natural workaround is to invent an internal account representing the bank so the books balance. That's a legitimate design — it's what you'd do if you needed to reconcile against bank statements — but it adds an account and a reconciliation surface to solve a problem this system doesn't have yet.
+| Invariant | What a violation means |
+|-----------|------------------------|
+| Every transaction's entries net to zero | A code path wrote half a posting |
+| Each wallet's balance equals its ledger | A balance was updated without an entry |
+| Sum of customer balances = platform cash | Money was created or destroyed inside the system |
+
+> "The third invariant is the one that matters to finance: it's the number you reconcile against the bank statement. The cost is a hot row -- every deposit and withdrawal updates platform cash. I take that lock last, with an atomic increment, so it's held only for the tail of the transaction, and transfers never touch it. At production volume I'd split it into N sub-accounts chosen at random and sum them in the report."
 
 The status field matters more here too. An internal transfer is atomic: it committed or it didn't. A withdrawal sits `pending` until an external system confirms, so the API has to expose a state that isn't yet final, and the client has to render it as such rather than optimistically showing the money as gone.
 

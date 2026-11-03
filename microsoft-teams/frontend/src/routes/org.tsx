@@ -24,9 +24,9 @@ function OrgLayout() {
   return (
     <div className="h-screen flex overflow-hidden">
       <Sidebar organizations={organizations} />
-      <div className="flex-1 flex overflow-hidden">
+      <main className="flex-1 flex overflow-hidden">
         <Outlet />
-      </div>
+      </main>
     </div>
   );
 }

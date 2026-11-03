@@ -2,8 +2,13 @@ import { Client } from '@elastic/elasticsearch';
 import config from '../config/index.js';
 import logger from './logger.js';
 
+// Short timeout and one retry: search falls back to SQL when Elasticsearch
+// fails, and with the client defaults (30 s timeout, three retries) a user's
+// search hung for 10 s or more during an outage before the fallback ran.
 const esClient = new Client({
   node: config.elasticsearch.node,
+  requestTimeout: 5000,
+  maxRetries: 1,
 });
 
 const EMAIL_INDEX = 'emails';
@@ -81,11 +86,13 @@ export const indexMessage = async (doc: {
   created_at: string;
   visible_to: string[];
 }): Promise<void> => {
+  // Errors propagate: the worker records the failure and retries, instead of
+  // marking a message indexed that never reached the index.
   try {
     await esClient.index({
       index: EMAIL_INDEX,
       id: doc.message_id,
-      body: doc,
+      document: doc,
     });
   } catch (error) {
     const err = error as Error;
@@ -197,7 +204,11 @@ export const searchEmails = async (
           'created_at',
           'has_attachments',
         ],
+        track_total_hits: true,
         highlight: {
+          // Escape message text so the only markup in a snippet is <em>;
+          // fragments used to carry raw message HTML into the browser.
+          encoder: 'html',
           fields: {
             body: { fragment_size: 150, number_of_fragments: 1 },
             subject: { fragment_size: 150, number_of_fragments: 1 },
@@ -215,16 +226,16 @@ export const searchEmails = async (
     const results: SearchResult[] = hits.map((hit) => {
       const source = hit._source as Record<string, unknown>;
       const highlight = hit.highlight as Record<string, string[]> | undefined;
+      // Plain fallbacks are escaped too, so every snippet is safe HTML.
       const bodySnippet =
         highlight?.body?.[0] ||
-        (source.body as string)?.substring(0, 150) ||
-        '';
+        escapeHtml((source.body as string)?.substring(0, 150) || '');
 
       return {
         threadId: source.thread_id as string,
         messageId: source.message_id as string,
         subject:
-          highlight?.subject?.[0] || (source.subject as string),
+          highlight?.subject?.[0] || escapeHtml((source.subject as string) || ''),
         snippet: bodySnippet,
         senderName: source.sender_name as string,
         senderEmail: source.sender_email as string,
@@ -237,10 +248,20 @@ export const searchEmails = async (
     return { results, total };
   } catch (error) {
     const err = error as Error;
-    logger.error({ error: err.message }, 'Search failed');
-    return { results: [], total: 0 };
+    logger.error({ error: err.message }, 'Elasticsearch search failed');
+    // Rethrown so the caller can fall back instead of reporting "no results".
+    throw error;
   }
 };
+
+/** Escapes text for safe insertion as HTML. */
+export const escapeHtml = (text: string): string =>
+  text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 
 export const isElasticsearchConnected = async (): Promise<boolean> => {
   try {

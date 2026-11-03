@@ -8,8 +8,8 @@ async function login(page: Page) {
   await page.locator("input[name='username'], input[type='text']").first().fill('alice');
   await page.locator("input[name='password'], input[type='password']").first().fill('password123');
   await page.locator("button[type='submit']").first().click();
-  // Wait for navigation after login
-  await page.waitForURL(/(?!.*login).*/);
+  // Wait until the app leaves the login page, i.e. the sign-in request completed
+  await page.waitForURL((url) => url.pathname !== '/login', { timeout: 15000 });
 }
 
 test.describe('gmail Smoke Tests', () => {
@@ -97,6 +97,45 @@ test.describe('gmail Smoke Tests', () => {
 
     // Verify page content loads
     await expect(page.locator('main')).toBeVisible({ timeout: 10000 });
+
+    // Verify no React error boundary
+    await expect(page.locator('text=Something went wrong')).not.toBeVisible();
+    await expect(page.locator('text=Error boundary')).not.toBeVisible();
+  });
+
+  test('08 thread full view loads correctly', async ({ page }) => {
+    await login(page);
+    await page.goto('/thread/d6666666-6666-6666-6666-666666666666');
+    await page.waitForTimeout(1500);
+
+    // Verify page content loads
+    await expect(page.locator('main')).toBeVisible({ timeout: 10000 });
+
+    // Verify no React error boundary
+    await expect(page.locator('text=Something went wrong')).not.toBeVisible();
+    await expect(page.locator('text=Error boundary')).not.toBeVisible();
+  });
+
+  test('09 thread partial view loads correctly', async ({ page }) => {
+    await login(page);
+    await page.goto('/thread/d6666666-6666-6666-6666-666666666666');
+    await page.waitForTimeout(1500);
+
+    // Verify page content loads
+    await expect(page.locator('main')).toBeVisible({ timeout: 10000 });
+
+    // Verify no React error boundary
+    await expect(page.locator('text=Something went wrong')).not.toBeVisible();
+    await expect(page.locator('text=Error boundary')).not.toBeVisible();
+  });
+
+  test('10 thread bcc recipient loads correctly', async ({ page }) => {
+    await login(page);
+    await page.goto('/thread/d7777777-7777-7777-7777-777777777777');
+    await page.waitForTimeout(1500);
+
+    // Verify page content loads
+    await expect(page.locator('[data-testid=\'bcc-line\']')).toBeVisible({ timeout: 10000 });
 
     // Verify no React error boundary
     await expect(page.locator('text=Something went wrong')).not.toBeVisible();

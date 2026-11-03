@@ -56,11 +56,12 @@ export const authAPI = {
     }),
 
   /**
-   * Registers a new user account.
-   * @param data - Registration data including email, password, name, optional phone, and role
+   * Registers a new user account. The server always creates a customer;
+   * drivers and restaurant owners then onboard with becomeDriver/becomeRestaurantOwner.
+   * @param data - Registration data including email, password, name, and optional phone
    * @returns Promise with the newly created user object
    */
-  register: (data: { email: string; password: string; name: string; phone?: string; role?: string }) =>
+  register: (data: { email: string; password: string; name: string; phone?: string }) =>
     fetchAPI<{ user: import('../types').User }>('/auth/register', {
       method: 'POST',
       body: JSON.stringify(data),
@@ -84,15 +85,24 @@ export const authAPI = {
     fetchAPI<{ user: import('../types').User }>('/auth/me'),
 
   /**
-   * Upgrades a customer account to also be a driver.
+   * Turns the current customer account into a driver account.
    * @param vehicleType - Type of vehicle the driver will use
    * @param licensePlate - Optional license plate number
-   * @returns Promise with the new driver profile
+   * @returns Promise with the updated user and the new driver profile
    */
   becomeDriver: (vehicleType: string, licensePlate?: string) =>
-    fetchAPI<{ driver: import('../types').Driver }>('/auth/become-driver', {
+    fetchAPI<{ user: import('../types').User; driver: import('../types').Driver }>('/auth/become-driver', {
       method: 'POST',
       body: JSON.stringify({ vehicleType, licensePlate }),
+    }),
+
+  /**
+   * Turns the current customer account into a restaurant owner account.
+   * @returns Promise with the updated user
+   */
+  becomeRestaurantOwner: () =>
+    fetchAPI<{ user: import('../types').User }>('/auth/become-restaurant-owner', {
+      method: 'POST',
     }),
 };
 

@@ -435,14 +435,15 @@ storage, and WebSocket collaboration in one Node process. PostgreSQL stores full
 Redis provides sessions, cached drawing rows, and cursor records. It is useful for tracing
 the interaction path, but it does not implement the stronger protocol described here.
 
-Current socket joins and edits lack authentication and permission enforcement. Room
-initialization and later HTTP scene responses can overwrite newer state, remote versions are
-rewritten by clients, and debounced writes have no durable acknowledgment or recovery log.
-The operations table is unused.
+Socket joins use the HTTP session and check view access, edits check edit access, and
+sharing changes reach open sockets. HTTP saves and socket edits share one merge rule, and
+room saves are capped at ten seconds, retried, and flushed on shutdown. What is missing is
+the durable part: no acknowledgment, operation log, or replay, and one process owns every
+room. The operations table is unused.
 
-On the frontend, there is no live gesture preview consumer, selected styling changes stay
-local until an HTTP save, and the scene transform replaces the fixed backing-scale
-transform. Resize handles do not implement resizing. Export endpoints are placeholders. The
+On the frontend, gestures preview live, style changes broadcast immediately, and rendering
+folds the device pixel ratio into the viewport transform. Resize handles do not implement
+resizing. Export endpoints are placeholders. The
 [architecture document](architecture.md) records these and the remaining local limitations
 alongside the actual schema.
 

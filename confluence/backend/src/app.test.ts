@@ -167,6 +167,8 @@ describe('Confluence API', () => {
 
   describe('GET /api/v1/spaces', () => {
     it('should return spaces list', async () => {
+      // 1st query: the caller's visible space IDs; 2nd: the spaces themselves
+      mockPool.query.mockResolvedValueOnce({ rows: [{ id: 's1' }], rowCount: 1 } as never);
       mockPool.query.mockResolvedValueOnce({
         rows: [
           { id: 's1', key: 'ENG', name: 'Engineering', page_count: '5' },
@@ -184,6 +186,11 @@ describe('Confluence API', () => {
 
   describe('GET /api/v1/pages/recent', () => {
     it('should return recent pages', async () => {
+      // 1st query: visible space IDs (anonymous callers have no editable spaces)
+      mockPool.query.mockResolvedValueOnce({
+        rows: [{ id: '00000000-0000-4000-8000-000000000001' }],
+        rowCount: 1,
+      } as never);
       mockPool.query.mockResolvedValueOnce({
         rows: [
           { id: 'p1', title: 'Test Page', space_key: 'ENG' },
@@ -195,6 +202,37 @@ describe('Confluence API', () => {
 
       expect(res.status).toBe(200);
       expect(res.body.pages).toHaveLength(1);
+    });
+  });
+
+  describe('access control on unauthenticated requests', () => {
+    it('hides a private space (404, not 403) from anonymous callers', async () => {
+      mockPool.query.mockResolvedValueOnce({
+        rows: [{ id: '00000000-0000-4000-8000-000000000003', key: 'SEC', is_public: false }],
+        rowCount: 1,
+      } as never);
+      const res = await request(app).get('/api/v1/spaces/SEC');
+      expect(res.status).toBe(404);
+    });
+
+    it('requires sign-in to change a space or its members', async () => {
+      expect((await request(app).put('/api/v1/spaces/ENG').send({ name: 'x' })).status).toBe(401);
+      expect((await request(app).delete('/api/v1/spaces/ENG')).status).toBe(401);
+      expect(
+        (await request(app).post('/api/v1/spaces/ENG/members').send({ username: 'bob', role: 'admin' })).status,
+      ).toBe(401);
+    });
+
+    it('treats a malformed page id as not found instead of a database error', async () => {
+      const res = await request(app).get('/api/v1/pages/not-a-uuid');
+      expect(res.status).toBe(404);
+      expect(mockPool.query).not.toHaveBeenCalled();
+    });
+
+    it('returns 404 for a search scoped to an unknown space instead of searching everywhere', async () => {
+      mockPool.query.mockResolvedValueOnce({ rows: [], rowCount: 0 } as never);
+      const res = await request(app).get('/api/v1/search?q=keys&space=NOPE');
+      expect(res.status).toBe(404);
     });
   });
 });

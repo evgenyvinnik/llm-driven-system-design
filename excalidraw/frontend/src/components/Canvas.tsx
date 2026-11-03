@@ -11,7 +11,12 @@ import type { ExcalidrawElement, Point } from '../types';
 export function Canvas() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  // CSS size of the canvas; the backing store is this times the pixel ratio.
   const [canvasSize, setCanvasSize] = useState({ width: 800, height: 600 });
+  const [pixelRatio, setPixelRatio] = useState(() => window.devicePixelRatio || 1);
+  // Pointer position (world space) while a shape is being drawn, for the live preview.
+  const [draftPoint, setDraftPoint] = useState<Point | null>(null);
+  const dragMoved = useRef(false);
   const isPanning = useRef(false);
   const panStart = useRef<Point>({ x: 0, y: 0 });
   const spacePressed = useRef(false);
@@ -29,7 +34,6 @@ export function Canvas() {
     strokeWidth,
     opacity,
     fontSize,
-    setElements,
     addElement,
     updateElement,
     setSelectedElementId,
@@ -39,6 +43,7 @@ export function Canvas() {
     setDrawingStartPoint,
     setCurrentPoints,
     addCurrentPoint,
+    canEdit,
   } = useCanvasStore();
 
   const { user } = useAuthStore();
@@ -48,7 +53,8 @@ export function Canvas() {
     const resizeObserver = new ResizeObserver((entries) => {
       for (const entry of entries) {
         const { width, height } = entry.contentRect;
-        setCanvasSize({ width: width * 2, height: height * 2 }); // 2x for retina
+        setCanvasSize({ width, height });
+        setPixelRatio(window.devicePixelRatio || 1);
       }
     });
 
@@ -59,6 +65,40 @@ export function Canvas() {
     return () => resizeObserver.disconnect();
   }, []);
 
+  // The shape under construction, rendered live instead of only on mouseup.
+  const draft: ExcalidrawElement | null = (() => {
+    if (!isDrawing || !drawingStartPoint || !draftPoint || activeTool === 'select' || activeTool === 'text') {
+      return null;
+    }
+    const base = {
+      id: 'draft',
+      type: activeTool,
+      strokeColor,
+      fillColor,
+      strokeWidth,
+      opacity,
+      version: 0,
+      isDeleted: false,
+      createdBy: user?.id || 'anonymous',
+      updatedAt: 0,
+    } as const;
+    if (activeTool === 'freehand') {
+      return { ...base, x: drawingStartPoint.x, y: drawingStartPoint.y, width: 0, height: 0, points: currentPoints };
+    }
+    const dx = draftPoint.x - drawingStartPoint.x;
+    const dy = draftPoint.y - drawingStartPoint.y;
+    if (activeTool === 'line' || activeTool === 'arrow') {
+      return { ...base, x: drawingStartPoint.x, y: drawingStartPoint.y, width: dx, height: dy, points: [{ x: 0, y: 0 }, { x: dx, y: dy }] };
+    }
+    return {
+      ...base,
+      x: Math.min(drawingStartPoint.x, draftPoint.x),
+      y: Math.min(drawingStartPoint.y, draftPoint.y),
+      width: Math.abs(dx),
+      height: Math.abs(dy),
+    };
+  })();
+
   // Re-render canvas on state changes
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -67,12 +107,9 @@ export function Canvas() {
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    // Scale for retina
-    ctx.setTransform(2, 0, 0, 2, 0, 0);
-
     const visibleElements = elements.filter((el) => !el.isDeleted);
-    renderCanvas(ctx, visibleElements, viewState, selectedElementId, canvasSize.width / 2, canvasSize.height / 2);
-  }, [elements, viewState, selectedElementId, canvasSize]);
+    renderCanvas(ctx, visibleElements, viewState, selectedElementId, canvasSize.width, canvasSize.height, pixelRatio, draft);
+  });
 
   // Convert screen coordinates to canvas coordinates
   const screenToCanvas = useCallback(
@@ -118,6 +155,7 @@ export function Canvas() {
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+      if (!canEdit && e.key !== ' ') return;
 
       if (e.key === ' ') {
         e.preventDefault();
@@ -184,15 +222,15 @@ export function Canvas() {
       window.removeEventListener('keydown', handleKeyDown);
       window.removeEventListener('keyup', handleKeyUp);
     };
-  }, [selectedElementId, setActiveTool, setSelectedElementId, updateElement]);
+  }, [selectedElementId, setActiveTool, setSelectedElementId, updateElement, canEdit]);
 
   // Mouse event handlers
   const handleMouseDown = useCallback(
     (e: React.MouseEvent<HTMLCanvasElement>) => {
       const point = screenToCanvas(e.clientX, e.clientY);
 
-      // Middle mouse button or space+left click for panning
-      if (e.button === 1 || (e.button === 0 && spacePressed.current)) {
+      // Middle mouse button or space+left click for panning; view-only users pan with any drag
+      if (e.button === 1 || (e.button === 0 && (spacePressed.current || !canEdit))) {
         isPanning.current = true;
         panStart.current = { x: e.clientX - viewState.scrollX, y: e.clientY - viewState.scrollY };
         return;
@@ -208,6 +246,7 @@ export function Canvas() {
 
         if (hit) {
           // Start dragging
+          dragMoved.current = false;
           setIsDrawing(true);
           setDrawingStartPoint({ x: point.x - hit.x, y: point.y - hit.y });
         }
@@ -228,10 +267,11 @@ export function Canvas() {
         // Start drawing a shape
         setIsDrawing(true);
         setDrawingStartPoint(point);
+        setDraftPoint(point);
         setCurrentPoints([{ x: 0, y: 0 }]);
       }
     },
-    [activeTool, elements, viewState, screenToCanvas, createElement, fontSize, addElement, setActiveTool, setIsDrawing, setDrawingStartPoint, setCurrentPoints, setSelectedElementId]
+    [activeTool, elements, viewState, canEdit, screenToCanvas, createElement, fontSize, addElement, setActiveTool, setIsDrawing, setDrawingStartPoint, setCurrentPoints, setSelectedElementId]
   );
 
   const handleMouseMove = useCallback(
@@ -256,8 +296,10 @@ export function Canvas() {
         // Dragging selected element
         const newX = point.x - drawingStartPoint.x;
         const newY = point.y - drawingStartPoint.y;
+        dragMoved.current = true;
         updateElement(selectedElementId, { x: newX, y: newY });
       } else if (activeTool === 'freehand') {
+        setDraftPoint(point);
         // Add point to freehand path
         addCurrentPoint({
           x: point.x - drawingStartPoint.x,
@@ -271,8 +313,7 @@ export function Canvas() {
         if (activeTool === 'line' || activeTool === 'arrow') {
           setCurrentPoints([{ x: 0, y: 0 }, { x: dx, y: dy }]);
         }
-
-        // Preview is handled in render
+        setDraftPoint(point);
       }
     },
     [isDrawing, drawingStartPoint, activeTool, selectedElementId, screenToCanvas, viewState, setViewState, updateElement, addCurrentPoint, setCurrentPoints]
@@ -291,25 +332,31 @@ export function Canvas() {
       const point = screenToCanvas(e.clientX, e.clientY);
 
       if (activeTool === 'select' && selectedElementId) {
-        // Finish dragging - send update via WebSocket
-        const el = elements.find((e) => e.id === selectedElementId);
-        if (el) {
-          wsClient.sendShapeMove({ ...el, version: el.version + 1, updatedAt: Date.now() });
+        // Finish dragging: send the element as it is now. Each drag step already
+        // bumped its version locally; the render-time `elements` closure is stale.
+        const el = useCanvasStore.getState().elements.find((e) => e.id === selectedElementId);
+        if (el && dragMoved.current) {
+          wsClient.sendShapeMove(el);
         }
       } else if (activeTool !== 'select' && activeTool !== 'text') {
         // Finalize the shape
         const el = createElement(drawingStartPoint.x, drawingStartPoint.y);
 
         if (activeTool === 'freehand') {
-          el.points = simplifyPath(currentPoints, 2);
+          const simplified = simplifyPath(currentPoints, 2);
           // Calculate bounding box
           let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-          for (const p of el.points) {
+          for (const p of simplified) {
             minX = Math.min(minX, p.x);
             minY = Math.min(minY, p.y);
             maxX = Math.max(maxX, p.x);
             maxY = Math.max(maxY, p.y);
           }
+          // Re-anchor so the element's (x, y) is the bounding box's corner;
+          // otherwise selection bounds ignore strokes that went up or left.
+          el.x += minX;
+          el.y += minY;
+          el.points = simplified.map((p) => ({ x: p.x - minX, y: p.y - minY }));
           el.width = maxX - minX;
           el.height = maxY - minY;
         } else if (activeTool === 'line' || activeTool === 'arrow') {
@@ -319,8 +366,14 @@ export function Canvas() {
           el.width = dx;
           el.height = dy;
         } else {
-          el.width = point.x - drawingStartPoint.x;
-          el.height = point.y - drawingStartPoint.y;
+          // Store boxes with positive size whichever way the user dragged, so
+          // hit testing never divides by a negative dimension.
+          const width = point.x - drawingStartPoint.x;
+          const height = point.y - drawingStartPoint.y;
+          el.x = Math.min(drawingStartPoint.x, point.x);
+          el.y = Math.min(drawingStartPoint.y, point.y);
+          el.width = Math.abs(width);
+          el.height = Math.abs(height);
         }
 
         // Only add if shape has meaningful size
@@ -332,6 +385,7 @@ export function Canvas() {
 
       setIsDrawing(false);
       setDrawingStartPoint(null);
+      setDraftPoint(null);
       setCurrentPoints([]);
     },
     [isDrawing, drawingStartPoint, activeTool, selectedElementId, elements, currentPoints, screenToCanvas, createElement, addElement, setIsDrawing, setDrawingStartPoint, setCurrentPoints]
@@ -377,8 +431,8 @@ export function Canvas() {
     <div ref={containerRef} className="flex-1 relative overflow-hidden bg-canvas-bg">
       <canvas
         ref={canvasRef}
-        width={canvasSize.width}
-        height={canvasSize.height}
+        width={Math.round(canvasSize.width * pixelRatio)}
+        height={Math.round(canvasSize.height * pixelRatio)}
         className={`w-full h-full ${getCursorClass()}`}
         onMouseDown={handleMouseDown}
         onMouseMove={handleMouseMove}

@@ -6,7 +6,8 @@ import {
   createUser,
   verifyPassword,
   getDriverByUserId,
-  createDriverProfile,
+  onboardDriver,
+  onboardRestaurantOwner,
   User,
   Driver,
 } from '../services/auth.js';
@@ -14,14 +15,17 @@ import { requireAuth } from '../middleware/auth.js';
 
 const router = Router();
 
+const VEHICLE_TYPES = ['car', 'bike', 'scooter', 'walk'];
+
 interface UserWithDriverProfile extends User {
   driverProfile?: Driver | null;
 }
 
-// Register
+// Register. Always creates a customer: any `role` in the body is ignored, and
+// drivers/restaurant owners onboard through the endpoints at the bottom.
 router.post('/register', async (req: Request, res: Response): Promise<void> => {
   try {
-    const { email, password, name, phone, role = 'customer' } = req.body;
+    const { email, password, name, phone } = req.body;
 
     if (!email || !password || !name) {
       res.status(400).json({ error: 'Email, password, and name are required' });
@@ -36,7 +40,7 @@ router.post('/register', async (req: Request, res: Response): Promise<void> => {
     }
 
     // Create user
-    const user = await createUser(email, password, name, phone, role);
+    const user = await createUser(email, password, name, phone);
 
     // Create session
     const sessionId = await createSession(user.id);
@@ -128,13 +132,13 @@ router.get('/me', requireAuth, async (req: Request, res: Response): Promise<void
   }
 });
 
-// Register as driver (for existing users)
+// Customer onboarding as a driver: creates the driver profile and sets role `driver`
 router.post('/become-driver', requireAuth, async (req: Request, res: Response): Promise<void> => {
   try {
     const { vehicleType, licensePlate } = req.body;
 
-    if (!vehicleType) {
-      res.status(400).json({ error: 'Vehicle type is required' });
+    if (!VEHICLE_TYPES.includes(vehicleType)) {
+      res.status(400).json({ error: `Vehicle type must be one of: ${VEHICLE_TYPES.join(', ')}` });
       return;
     }
 
@@ -145,13 +149,41 @@ router.post('/become-driver', requireAuth, async (req: Request, res: Response): 
       return;
     }
 
-    const driver = await createDriverProfile(req.user!.id, vehicleType, licensePlate);
+    const result = await onboardDriver(req.user!.id, vehicleType, licensePlate);
+    if (!result) {
+      res.status(403).json({ error: 'Only customer accounts can sign up to deliver' });
+      return;
+    }
 
-    res.json({ driver });
+    res.json(result);
   } catch (err) {
+    if ((err as { code?: string }).code === '23505') {
+      res.status(400).json({ error: 'Already registered as driver' });
+      return;
+    }
     console.error('Become driver error:', err);
     res.status(500).json({ error: 'Failed to register as driver' });
   }
 });
+
+// Customer onboarding as a restaurant owner: sets role `restaurant_owner`
+router.post(
+  '/become-restaurant-owner',
+  requireAuth,
+  async (req: Request, res: Response): Promise<void> => {
+    try {
+      const user = await onboardRestaurantOwner(req.user!.id);
+      if (!user) {
+        res.status(403).json({ error: 'Only customer accounts can sign up as restaurant owners' });
+        return;
+      }
+
+      res.json({ user });
+    } catch (err) {
+      console.error('Become restaurant owner error:', err);
+      res.status(500).json({ error: 'Failed to register as restaurant owner' });
+    }
+  }
+);
 
 export default router;

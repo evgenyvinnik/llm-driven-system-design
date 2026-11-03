@@ -1,5 +1,6 @@
 import { useDraggable } from '@dnd-kit/core';
 import type { Opportunity } from '../types';
+import { formatCalendarDate } from '../utils/dates';
 
 interface OpportunityCardProps {
   opportunity: Opportunity;
@@ -45,7 +46,7 @@ export function OpportunityCard({ opportunity }: OpportunityCardProps) {
       </div>
       {opportunity.close_date && (
         <p className="text-xs text-salesforce-secondary mt-1">
-          Close: {new Date(opportunity.close_date).toLocaleDateString()}
+          Close: {formatCalendarDate(opportunity.close_date)}
         </p>
       )}
     </div>

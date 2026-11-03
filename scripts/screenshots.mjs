@@ -90,6 +90,11 @@ function loadConfigs() {
     .map(file => {
       const configPath = path.join(configDir, file);
       const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+      // SCREENSHOT_FRONTEND_PORT moves the frontend off its configured port, for
+      // when another app already holds it: --start mode kills whatever listens
+      // on the frontend port, and would otherwise kill that unrelated app.
+      const portOverride = Number(process.env.SCREENSHOT_FRONTEND_PORT);
+      if (portOverride > 0) config.frontendPort = portOverride;
       return { ...config, _file: file };
     });
 }
@@ -675,7 +680,10 @@ async function startFrontend(projectDir, config) {
 
   logStep('START', `Starting frontend on port ${config.frontendPort}...`);
 
-  const child = spawn('npm', ['run', 'dev'], {
+  const devArgs = process.env.SCREENSHOT_FRONTEND_PORT
+    ? ['run', 'dev', '--', '--port', String(config.frontendPort), '--strictPort']
+    : ['run', 'dev'];
+  const child = spawn('npm', devArgs, {
     cwd: frontendDir,
     stdio: 'pipe',
     detached: false,

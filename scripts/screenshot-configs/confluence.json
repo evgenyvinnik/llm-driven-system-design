@@ -35,6 +35,34 @@
       "path": "/space/ENG",
       "waitFor": "main, h1",
       "delay": 1000
+    },
+    {
+      "name": "04-page-view",
+      "path": "/space/ENG/page/getting-started",
+      "waitFor": "main, h1",
+      "delay": 1500
+    },
+    {
+      "name": "05-draft-under-review",
+      "path": "/space/ENG/page/q3-platform-migration-plan",
+      "waitFor": "[data-testid='draft-badge']",
+      "delay": 1500
+    },
+    {
+      "name": "06-search-results",
+      "path": "/?q=signing%20keys",
+      "waitFor": "main h1",
+      "delay": 2500
+    },
+    {
+      "name": "07-viewer-space",
+      "path": "/space/ENG",
+      "waitFor": "[data-testid='view-only-space']",
+      "delay": 1500,
+      "loginAs": {
+        "username": "carol",
+        "password": "password123"
+      }
     }
   ],
   "viewport": {

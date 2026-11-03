@@ -9,42 +9,22 @@
 // Additionally, you should also exclude this file from your linter and/or formatter to prevent it from being checked or modified.
 
 import { Route as rootRouteImport } from './routes/__root'
-import { Route as UploadRouteImport } from './routes/upload'
-import { Route as StatsRouteImport } from './routes/stats'
-import { Route as SegmentsRouteImport } from './routes/segments'
-import { Route as RegisterRouteImport } from './routes/register'
-import { Route as LoginRouteImport } from './routes/login'
-import { Route as ExploreRouteImport } from './routes/explore'
 import { Route as IndexRouteImport } from './routes/index'
-import { Route as SegmentIdRouteImport } from './routes/segment.$id'
-import { Route as ProfileIdRouteImport } from './routes/profile.$id'
+import { Route as ExploreRouteImport } from './routes/explore'
+import { Route as LoginRouteImport } from './routes/login'
+import { Route as RegisterRouteImport } from './routes/register'
+import { Route as SegmentsRouteImport } from './routes/segments'
+import { Route as StatsRouteImport } from './routes/stats'
+import { Route as UploadRouteImport } from './routes/upload'
 import { Route as ActivityIdRouteImport } from './routes/activity.$id'
-import { Route as ProfileIdFollowingRouteImport } from './routes/profile.$id.following'
+import { Route as SegmentIdRouteImport } from './routes/segment.$id'
+import { Route as ProfileIdIndexRouteImport } from './routes/profile.$id.index'
 import { Route as ProfileIdFollowersRouteImport } from './routes/profile.$id.followers'
+import { Route as ProfileIdFollowingRouteImport } from './routes/profile.$id.following'
 
-const UploadRoute = UploadRouteImport.update({
-  id: '/upload',
-  path: '/upload',
-  getParentRoute: () => rootRouteImport,
-} as any)
-const StatsRoute = StatsRouteImport.update({
-  id: '/stats',
-  path: '/stats',
-  getParentRoute: () => rootRouteImport,
-} as any)
-const SegmentsRoute = SegmentsRouteImport.update({
-  id: '/segments',
-  path: '/segments',
-  getParentRoute: () => rootRouteImport,
-} as any)
-const RegisterRoute = RegisterRouteImport.update({
-  id: '/register',
-  path: '/register',
-  getParentRoute: () => rootRouteImport,
-} as any)
-const LoginRoute = LoginRouteImport.update({
-  id: '/login',
-  path: '/login',
+const IndexRoute = IndexRouteImport.update({
+  id: '/',
+  path: '/',
   getParentRoute: () => rootRouteImport,
 } as any)
 const ExploreRoute = ExploreRouteImport.update({
@@ -52,19 +32,29 @@ const ExploreRoute = ExploreRouteImport.update({
   path: '/explore',
   getParentRoute: () => rootRouteImport,
 } as any)
-const IndexRoute = IndexRouteImport.update({
-  id: '/',
-  path: '/',
+const LoginRoute = LoginRouteImport.update({
+  id: '/login',
+  path: '/login',
   getParentRoute: () => rootRouteImport,
 } as any)
-const SegmentIdRoute = SegmentIdRouteImport.update({
-  id: '/segment/$id',
-  path: '/segment/$id',
+const RegisterRoute = RegisterRouteImport.update({
+  id: '/register',
+  path: '/register',
   getParentRoute: () => rootRouteImport,
 } as any)
-const ProfileIdRoute = ProfileIdRouteImport.update({
-  id: '/profile/$id',
-  path: '/profile/$id',
+const SegmentsRoute = SegmentsRouteImport.update({
+  id: '/segments',
+  path: '/segments',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const StatsRoute = StatsRouteImport.update({
+  id: '/stats',
+  path: '/stats',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const UploadRoute = UploadRouteImport.update({
+  id: '/upload',
+  path: '/upload',
   getParentRoute: () => rootRouteImport,
 } as any)
 const ActivityIdRoute = ActivityIdRouteImport.update({
@@ -72,15 +62,25 @@ const ActivityIdRoute = ActivityIdRouteImport.update({
   path: '/activity/$id',
   getParentRoute: () => rootRouteImport,
 } as any)
-const ProfileIdFollowingRoute = ProfileIdFollowingRouteImport.update({
-  id: '/following',
-  path: '/following',
-  getParentRoute: () => ProfileIdRoute,
+const SegmentIdRoute = SegmentIdRouteImport.update({
+  id: '/segment/$id',
+  path: '/segment/$id',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ProfileIdIndexRoute = ProfileIdIndexRouteImport.update({
+  id: '/profile/$id/',
+  path: '/profile/$id/',
+  getParentRoute: () => rootRouteImport,
 } as any)
 const ProfileIdFollowersRoute = ProfileIdFollowersRouteImport.update({
-  id: '/followers',
-  path: '/followers',
-  getParentRoute: () => ProfileIdRoute,
+  id: '/profile/$id/followers',
+  path: '/profile/$id/followers',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ProfileIdFollowingRoute = ProfileIdFollowingRouteImport.update({
+  id: '/profile/$id/following',
+  path: '/profile/$id/following',
+  getParentRoute: () => rootRouteImport,
 } as any)
 
 export interface FileRoutesByFullPath {
@@ -92,10 +92,10 @@ export interface FileRoutesByFullPath {
   '/stats': typeof StatsRoute
   '/upload': typeof UploadRoute
   '/activity/$id': typeof ActivityIdRoute
-  '/profile/$id': typeof ProfileIdRouteWithChildren
   '/segment/$id': typeof SegmentIdRoute
   '/profile/$id/followers': typeof ProfileIdFollowersRoute
   '/profile/$id/following': typeof ProfileIdFollowingRoute
+  '/profile/$id/': typeof ProfileIdIndexRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
@@ -106,10 +106,10 @@ export interface FileRoutesByTo {
   '/stats': typeof StatsRoute
   '/upload': typeof UploadRoute
   '/activity/$id': typeof ActivityIdRoute
-  '/profile/$id': typeof ProfileIdRouteWithChildren
   '/segment/$id': typeof SegmentIdRoute
   '/profile/$id/followers': typeof ProfileIdFollowersRoute
   '/profile/$id/following': typeof ProfileIdFollowingRoute
+  '/profile/$id': typeof ProfileIdIndexRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
@@ -121,10 +121,10 @@ export interface FileRoutesById {
   '/stats': typeof StatsRoute
   '/upload': typeof UploadRoute
   '/activity/$id': typeof ActivityIdRoute
-  '/profile/$id': typeof ProfileIdRouteWithChildren
   '/segment/$id': typeof SegmentIdRoute
   '/profile/$id/followers': typeof ProfileIdFollowersRoute
   '/profile/$id/following': typeof ProfileIdFollowingRoute
+  '/profile/$id/': typeof ProfileIdIndexRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
@@ -137,10 +137,10 @@ export interface FileRouteTypes {
     | '/stats'
     | '/upload'
     | '/activity/$id'
-    | '/profile/$id'
     | '/segment/$id'
     | '/profile/$id/followers'
     | '/profile/$id/following'
+    | '/profile/$id/'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
@@ -151,10 +151,10 @@ export interface FileRouteTypes {
     | '/stats'
     | '/upload'
     | '/activity/$id'
-    | '/profile/$id'
     | '/segment/$id'
     | '/profile/$id/followers'
     | '/profile/$id/following'
+    | '/profile/$id'
   id:
     | '__root__'
     | '/'
@@ -165,10 +165,10 @@ export interface FileRouteTypes {
     | '/stats'
     | '/upload'
     | '/activity/$id'
-    | '/profile/$id'
     | '/segment/$id'
     | '/profile/$id/followers'
     | '/profile/$id/following'
+    | '/profile/$id/'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -180,45 +180,19 @@ export interface RootRouteChildren {
   StatsRoute: typeof StatsRoute
   UploadRoute: typeof UploadRoute
   ActivityIdRoute: typeof ActivityIdRoute
-  ProfileIdRoute: typeof ProfileIdRouteWithChildren
   SegmentIdRoute: typeof SegmentIdRoute
+  ProfileIdFollowersRoute: typeof ProfileIdFollowersRoute
+  ProfileIdFollowingRoute: typeof ProfileIdFollowingRoute
+  ProfileIdIndexRoute: typeof ProfileIdIndexRoute
 }
 
 declare module '@tanstack/react-router' {
   interface FileRoutesByPath {
-    '/upload': {
-      id: '/upload'
-      path: '/upload'
-      fullPath: '/upload'
-      preLoaderRoute: typeof UploadRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/stats': {
-      id: '/stats'
-      path: '/stats'
-      fullPath: '/stats'
-      preLoaderRoute: typeof StatsRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/segments': {
-      id: '/segments'
-      path: '/segments'
-      fullPath: '/segments'
-      preLoaderRoute: typeof SegmentsRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/register': {
-      id: '/register'
-      path: '/register'
-      fullPath: '/register'
-      preLoaderRoute: typeof RegisterRouteImport
-      parentRoute: typeof rootRouteImport
-    }
-    '/login': {
-      id: '/login'
-      path: '/login'
-      fullPath: '/login'
-      preLoaderRoute: typeof LoginRouteImport
+    '/': {
+      id: '/'
+      path: '/'
+      fullPath: '/'
+      preLoaderRoute: typeof IndexRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/explore': {
@@ -228,25 +202,39 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ExploreRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/': {
-      id: '/'
-      path: '/'
-      fullPath: '/'
-      preLoaderRoute: typeof IndexRouteImport
+    '/login': {
+      id: '/login'
+      path: '/login'
+      fullPath: '/login'
+      preLoaderRoute: typeof LoginRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/segment/$id': {
-      id: '/segment/$id'
-      path: '/segment/$id'
-      fullPath: '/segment/$id'
-      preLoaderRoute: typeof SegmentIdRouteImport
+    '/register': {
+      id: '/register'
+      path: '/register'
+      fullPath: '/register'
+      preLoaderRoute: typeof RegisterRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/profile/$id': {
-      id: '/profile/$id'
-      path: '/profile/$id'
-      fullPath: '/profile/$id'
-      preLoaderRoute: typeof ProfileIdRouteImport
+    '/segments': {
+      id: '/segments'
+      path: '/segments'
+      fullPath: '/segments'
+      preLoaderRoute: typeof SegmentsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/stats': {
+      id: '/stats'
+      path: '/stats'
+      fullPath: '/stats'
+      preLoaderRoute: typeof StatsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/upload': {
+      id: '/upload'
+      path: '/upload'
+      fullPath: '/upload'
+      preLoaderRoute: typeof UploadRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/activity/$id': {
@@ -256,36 +244,36 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ActivityIdRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/profile/$id/following': {
-      id: '/profile/$id/following'
-      path: '/following'
-      fullPath: '/profile/$id/following'
-      preLoaderRoute: typeof ProfileIdFollowingRouteImport
-      parentRoute: typeof ProfileIdRoute
+    '/segment/$id': {
+      id: '/segment/$id'
+      path: '/segment/$id'
+      fullPath: '/segment/$id'
+      preLoaderRoute: typeof SegmentIdRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/profile/$id/': {
+      id: '/profile/$id/'
+      path: '/profile/$id'
+      fullPath: '/profile/$id/'
+      preLoaderRoute: typeof ProfileIdIndexRouteImport
+      parentRoute: typeof rootRouteImport
     }
     '/profile/$id/followers': {
       id: '/profile/$id/followers'
-      path: '/followers'
+      path: '/profile/$id/followers'
       fullPath: '/profile/$id/followers'
       preLoaderRoute: typeof ProfileIdFollowersRouteImport
-      parentRoute: typeof ProfileIdRoute
+      parentRoute: typeof rootRouteImport
+    }
+    '/profile/$id/following': {
+      id: '/profile/$id/following'
+      path: '/profile/$id/following'
+      fullPath: '/profile/$id/following'
+      preLoaderRoute: typeof ProfileIdFollowingRouteImport
+      parentRoute: typeof rootRouteImport
     }
   }
 }
-
-interface ProfileIdRouteChildren {
-  ProfileIdFollowersRoute: typeof ProfileIdFollowersRoute
-  ProfileIdFollowingRoute: typeof ProfileIdFollowingRoute
-}
-
-const ProfileIdRouteChildren: ProfileIdRouteChildren = {
-  ProfileIdFollowersRoute: ProfileIdFollowersRoute,
-  ProfileIdFollowingRoute: ProfileIdFollowingRoute,
-}
-
-const ProfileIdRouteWithChildren = ProfileIdRoute._addFileChildren(
-  ProfileIdRouteChildren,
-)
 
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
@@ -296,8 +284,10 @@ const rootRouteChildren: RootRouteChildren = {
   StatsRoute: StatsRoute,
   UploadRoute: UploadRoute,
   ActivityIdRoute: ActivityIdRoute,
-  ProfileIdRoute: ProfileIdRouteWithChildren,
   SegmentIdRoute: SegmentIdRoute,
+  ProfileIdFollowersRoute: ProfileIdFollowersRoute,
+  ProfileIdFollowingRoute: ProfileIdFollowingRoute,
+  ProfileIdIndexRoute: ProfileIdIndexRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

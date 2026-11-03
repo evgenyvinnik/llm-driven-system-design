@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import { useMailStore } from './mailStore';
 import { persist } from 'zustand/middleware';
 import type { User } from '../types';
 import { authApi } from '../services/api';
@@ -45,8 +46,13 @@ export const useAuthStore = create<AuthState>()(
       },
 
       logout: async () => {
-        await authApi.logout();
-        set({ user: null, isAuthenticated: false });
+        try {
+          await authApi.logout();
+        } finally {
+          // Mail from the previous account must not stay on screen or in memory.
+          useMailStore.getState().reset();
+          set({ user: null, isAuthenticated: false });
+        }
       },
 
       checkAuth: async () => {

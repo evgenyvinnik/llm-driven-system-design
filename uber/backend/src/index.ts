@@ -26,6 +26,8 @@ wss.on('connection', async (ws: WebSocket, req: IncomingMessage): Promise<void> 
   appLogger.debug({ remoteAddress: req.socket.remoteAddress }, 'WebSocket connection established');
 
   let userId: string | null = null;
+  // Role from the session user's DB row, never from the message
+  let userType: string | null = null;
 
   ws.on('message', async (message: Buffer): Promise<void> => {
     try {
@@ -38,6 +40,7 @@ wss.on('connection', async (ws: WebSocket, req: IncomingMessage): Promise<void> 
             const user = await authService.validateSession(data.token);
             if (user) {
               userId = user.id;
+              userType = user.userType;
               matchingService.registerClient(userId, ws);
               ws.send(JSON.stringify({ type: 'auth_success', userId }));
               appLogger.info({ userId }, 'User authenticated via WebSocket');
@@ -48,9 +51,15 @@ wss.on('connection', async (ws: WebSocket, req: IncomingMessage): Promise<void> 
           break;
 
         case 'location_update':
-          // Driver location update
-          if (userId && data.lat !== undefined && data.lng !== undefined) {
-            await locationService.updateDriverLocation(userId, data.lat, data.lng);
+          // Driver location update. Same rule as POST /api/driver/location
+          // (requireDriver): a rider's id must never enter the drivers geo index.
+          if (!userId) break;
+          if (userType !== 'driver') {
+            ws.send(JSON.stringify({ type: 'error', error: 'Driver access required' }));
+            break;
+          }
+          if (Number.isFinite(data.lat) && Number.isFinite(data.lng)) {
+            await locationService.updateDriverLocation(userId, data.lat!, data.lng!);
           }
           break;
 

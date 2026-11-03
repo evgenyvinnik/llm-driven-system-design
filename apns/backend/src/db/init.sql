@@ -107,4 +107,17 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE INDEX IF NOT EXISTS idx_sessions_token ON sessions(token);
 CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
 
+-- Provider signing keys (APNs token-based auth). Providers sign ES256 JWTs with
+-- the private key, which is returned once at creation and never stored; only
+-- the public key is kept. A key may send only to devices of app_bundle_ids.
+CREATE TABLE IF NOT EXISTS provider_keys (
+  key_id VARCHAR(10) PRIMARY KEY,
+  team_id VARCHAR(10) NOT NULL,
+  public_key TEXT NOT NULL,
+  app_bundle_ids TEXT[] NOT NULL,
+  created_by UUID REFERENCES admin_users(id) ON DELETE SET NULL,
+  created_at TIMESTAMP DEFAULT NOW(),
+  revoked_at TIMESTAMP
+);
+
 -- Seed data is in db-seed/seed.sql
