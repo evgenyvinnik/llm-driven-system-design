@@ -9,6 +9,7 @@ Each planned project uses the standard layout described in [CLAUDE.md](./CLAUDE.
 - [About the Sources](#about-the-sources)
 - [Summary](#summary)
 - [Already Covered by Existing Projects](#already-covered-by-existing-projects)
+- [Frontend Round Map](#frontend-round-map)
 - [Shared Decisions for the LLM Projects](#shared-decisions-for-the-llm-projects)
 - [Design Review Checklist](#design-review-checklist)
 - [Tier 1: Product-Facing Core](#tier-1-product-facing-core)
@@ -27,19 +28,19 @@ The **Signal** column says how strong the evidence is that a question appears in
 | Guide-reported | A preparation guide summarizes a candidate's experience. The underlying account was not inspected |
 | Practice extension | A recommended exercise. Not known to have been asked |
 
-Sources surveyed: Glassdoor, Aced (formerly Exponent) and Hello Interview. Project 16 also draws on Lodely, PracHub and 1point3acres.
+Sources surveyed: Glassdoor, Aced (formerly Exponent) and Hello Interview. Project 16 also draws on Lodely, PracHub and 1point3acres. The [frontend round map](#frontend-round-map) also draws on PracHub, AceOffer and interviewing.io.
 
 ## Summary
 
 | # | Project | Folder | Tier | Signal | Builds on |
 |---|---------|--------|------|--------|-----------|
 | 1 | [Prompt Playground](#1-prompt-playground) ✅ Built | [`prompt-playground/`](./prompt-playground/) | 1 | OpenAI (candidate report); OpenAI, Anthropic (community) | mcplator |
-| 2 | [ChatGPT](#2-chatgpt) | `chatgpt/` | 1 | OpenAI (community) | imessage, mcplator |
+| 2 | [AI Chat Client](#2-ai-chat-client) | `ai-chat/` | 1 | Anthropic (candidate report: desktop chat frontend); OpenAI, Anthropic (community) | prompt-playground, imessage, mcplator |
 | 3 | [Settings Service](#3-settings-service) | `settings-service/` | 1 | OpenAI (candidate report) | — |
-| 4 | [LLM Chat Analytics](#4-llm-chat-analytics) | `llm-chat-analytics/` | 1 | Anthropic (community) | ad-click-aggregator, dashboarding |
+| 4 | [LLM Chat Analytics](#4-llm-chat-analytics) | `llm-chat-analytics/` | 1 | Anthropic (community; guide-reported) | ad-click-aggregator, dashboarding |
 | 5 | [LLM Inference API](#5-llm-inference-api) | `llm-inference-api/` | 1 | Anthropic (candidate reports, including batching and routing variants) | rate-limiter, scalable-api |
 | 6 | [Webhook Platform](#6-webhook-platform) | `webhook-platform/` | 1 | OpenAI (community) | payment-system, stripe |
-| 7 | [Workspace Permissions](#7-workspace-permissions) | `workspace-permissions/` | 2 | Practice extension | notion, google-docs |
+| 7 | [Multi-Org Dashboard](#7-multi-org-dashboard) | `multi-org-dashboard/` | 2 | Practice extension (frontend practice sheet); Anthropic (candidate report of a prompt-sharing variant) | prompt-playground, slack, notion |
 | 8 | [Document Q&A](#8-document-qa) | `document-qa/` | 2 | Practice extension | dropbox, fb-post-search |
 | 9 | [Experimentation Platform](#9-experimentation-platform) | `experimentation-platform/` | 2 | Practice extension | — |
 | 10 | [LLM Eval Dashboard](#10-llm-eval-dashboard) | `llm-eval-dashboard/` | 2 | Practice extension | prompt-playground, job-scheduler |
@@ -48,8 +49,9 @@ Sources surveyed: Glassdoor, Aced (formerly Exponent) and Hello Interview. Proje
 | 13 | [File Cache](#13-file-cache) | `file-cache/` | 3 | Anthropic (candidate report) | distributed-cache |
 | 14 | [Model Distribution](#14-model-distribution) | `model-distribution/` | 3 | Anthropic (candidate report) | — |
 | 15 | [Online Chess](#15-online-chess) | `online-chess/` | 3 | OpenAI (community) | r-place, online-auction |
-| 16 | [File System](#16-file-system) | `file-system/` | 3 | Anthropic (community, online assessment; candidate report for the dedup variant) | dropbox |
+| 16 | [File System](#16-file-system) ✅ Built | [`file-system/`](./file-system/) | 3 | Anthropic (community, online assessment; candidate report for the dedup variant) | dropbox |
 | 17 | [Console Growth Take-Home](#17-console-growth-take-home) ✅ Built | [`console-growth/`](./console-growth/) | 3 | Anthropic (candidate report: growth engineering take-home) | experimentation-platform |
+| 18 | [In-App Assistant](#18-in-app-assistant) ✅ Built | [`in-app-assistant/`](./in-app-assistant/) | 2 | Practice extension (the sidebar variant of #2, built out) | ai-chat (#2), document-qa (#8), prompt-playground |
 
 - **Tier 1** covers the core product-facing work for AI and full-stack roles. Build these first, in the order listed.
 - **Tier 2** covers variations on tier-1 designs. Each reuses a tier-1 data model or an existing project's patterns.
@@ -67,10 +69,26 @@ These reported questions already have an implementation here, so they don't need
 | Large-scale web crawler (OpenAI candidate report) | [web-crawler](./web-crawler/) | Priority frontier, per-host politeness, robots.txt, URL and content dedup, crawler traps | Recrawl policy: deciding what to revisit first |
 | Payment system with external authorization and batch processing (OpenAI community) | [payment-system](./payment-system/), [stripe](./stripe/), [paypal](./paypal/) | Idempotency keys, double-entry ledger, settlement, reconciliation | An explicit "outcome unknown" state for when the processor times out after receiving a request. Retrying only the unresolved items of a partially failed batch |
 | Notification system (OpenAI, from a technical program manager report) | [notification-system](./notification-system/), [apns](./apns/) | Preferences, quiet hours, dedup, multi-channel delivery | — |
+| A general product app such as banking (Anthropic community attribution) | [paypal](./paypal/), [venmo](./venmo/), [robinhood](./robinhood/) | Idempotent payment submission, optimistic locking on balances, activity feeds, live quotes with stale-data indicators | — |
+
+## Frontend Round Map
+
+Public reports don't say which prompts a frontend-focused design round uses. This map collects the prompts reported for Anthropic design rounds that have a substantial frontend side, plus one widely shared frontend practice sheet. For each it says what to study here now and what is still missing. Signals use the labels in [About the Sources](#about-the-sources).
+
+| Prompt (signal) | Study now | Still missing | Plan |
+|-----------------|-----------|---------------|------|
+| AI chat client: web, desktop, or an assistant sidebar added to an existing app (Anthropic candidate report for the desktop version; community attribution for chat rounds in general) | [prompt-playground](./prompt-playground/system-design-answer-frontend.md) deep dives 1 and 2: a run store that outlives navigation, resumable SSE and the cancel race. [mcplator](./mcplator/system-design-answer-frontend.md): streamed tokens and IndexedDB persistence. [imessage](./imessage/system-design-answer-frontend.md) and [slack](./slack/system-design-answer-frontend.md): offline reading and long histories | A message tree for edit and regenerate, and the desktop shell. The sidebar variant (assistant actions that change the host app, confirmations, safe rendering with citations) is built: [in-app-assistant](./in-app-assistant/system-design-answer-frontend.md) | [#2](#2-ai-chat-client), [#18](#18-in-app-assistant) |
+| Prompt playground (Anthropic community attribution, the most frequently reported prompt) | [prompt-playground](./prompt-playground/) ✅ Built | A version diff view and a grid that compares several models | Extend prompt-playground |
+| Prompt-sharing platform (Anthropic candidate report, mostly backend) | prompt-playground: revocable share links and fork into a workspace. [google-docs](./google-docs/) and [collaborative-editor](./collaborative-editor/): concurrent editing | Roles per prompt, a team library, and revoking access from someone who has the page open | [#7](#7-multi-org-dashboard) |
+| Analytics dashboard for an AI chat product (Anthropic guide-reported) | [dashboarding](./dashboarding/system-design-answer-frontend.md) and [ad-click-aggregator](./ad-click-aggregator/system-design-answer-frontend.md): query keys derived from URL state, honest freshness, downsampling, metrics that can't be summed | Definitions for chat metrics, comparison periods, drill-down to raw records, daily buckets in each organization's time zone, cost metrics hidden by role | [#4](#4-llm-chat-analytics) |
+| Multi-org dashboard with roles and feature flags (practice sheet; no company attribution) | [slack](./slack/system-design-answer-frontend.md): switching workspaces. [supabase-dashboard](./supabase-dashboard/): a console over many projects | Caches scoped by organization, routes and sidebar driven by one permission source, permission changes mid-session, exports as background jobs | [#7](#7-multi-org-dashboard) |
+| General product app such as banking (Anthropic community attribution) | [paypal](./paypal/system-design-answer-frontend.md), [venmo](./venmo/system-design-answer-frontend.md), [robinhood](./robinhood/system-design-answer-frontend.md) | — | — |
+
+**Build order for frontend rounds:** #2, then #7, then #4. Each covers a different family of follow-ups: long-lived streaming state in the client, access control in the client, and numbers a user can trust. Draft each project's `system-design-answer-frontend.md` early, since that file is what gets rehearsed, and revise it once the running implementation has exposed the real defects.
 
 ## Shared Decisions for the LLM Projects
 
-Projects 1, 2, 4, 5, 8, 10 and 12 call a model. Every project in this repository must run locally and stand on its own, so they share these decisions:
+Projects 1, 2, 4, 5, 8, 10, 12 and 18 call a model. Every project in this repository must run locally and stand on its own, so they share these decisions:
 
 - **Each project ships its own mock model service.** It streams deterministic tokens with a configurable time to first token, tokens per second, failure rate and number of concurrent slots. Failure paths such as a mid-stream disconnect, overload or timeout can then be triggered on demand, which a real provider API cannot do reliably.
 - **A real provider adapter is optional.** It is enabled by an environment variable such as an API key, and it is never required for setup, smoke tests or screenshots.
@@ -126,11 +144,11 @@ Each answer should also walk through **one successful and one failed execution t
 
 **Local scope.** A React editor and run panel, an Express API, PostgreSQL, Valkey sessions and a mock model streaming over SSE.
 
-### 2. ChatGPT
+### 2. AI Chat Client
 
-**Folder:** `chatgpt/` · **Signal:** OpenAI (community attribution)
+**Folder:** `ai-chat/` · **Signal:** Anthropic (candidate report: a desktop AI chat frontend); OpenAI and Anthropic (community attribution)
 
-**Problem.** A multi-user assistant with conversation history, streamed responses, cancellation, regeneration and sync across devices.
+**Problem.** A multi-user assistant in the shape of ChatGPT or Claude.ai, with conversation history, streamed responses, cancellation, regeneration and sync across devices. The prompt is reported in three forms, and the answers must be able to move between them: a web app, a desktop app, and an assistant sidebar added to an existing product.
 
 **Core entities.**
 - `conversation`.
@@ -145,16 +163,29 @@ Each answer should also walk through **one successful and one failed execution t
 - **Stop cancels backend work** by aborting the upstream request, not just by stopping rendering.
 - **Very long conversations.** Paginate older messages, virtualize the list with `@tanstack/react-virtual`, and truncate model context on the server.
 
+**Hard problems in the client.**
+- **A stream belongs to its generation, not to the screen.** Live state sits in a store keyed by generation ID. Switching from conversation A to B while A is streaming neither cancels A nor writes A's tokens into B, and a finished generation lands in history whatever is on screen. prompt-playground solved the same problem for runs.
+- **Rendering markdown that is still arriving.** Tokens split code fences and tables. Parse incrementally, re-render only the last block, and apply updates at most once per animation frame. Model output is untrusted: sanitize it, never render raw HTML, and decide which links and images from the model may load.
+- **Scroll and focus.** Follow the stream only while the reader is at the bottom, and keep their place when they scroll up. Announce a finished response to screen readers instead of reading out every token.
+- **Offline reading.** Cache recent conversations in IndexedDB and show them read-only when offline. Nothing that needs the model is queued, and the interface says so.
+
+**Variants the answers must handle.**
+- **Desktop.** A main process and sandboxed renderers with context isolation. A local cache that is encrypted, or wiped on sign-out. Several windows open on one conversation. Deep links. An auto-update that arrives while a generation is running.
+- **An assistant inside an existing app.** The host app keeps ownership of its data. The assistant proposes actions as structured tool calls, such as archiving twelve emails. The user reviews a preview and confirms, and the host executes the change through its own APIs and permission checks. The assistant never writes host state directly.
+
 **Follow-ups the answers must handle.**
 - The connection drops halfway through a response. Can the client reconnect without creating another generation?
 - What distinguishes retrying a request from asking for a new answer?
 - A user opens the same conversation on two devices and submits on both at once. What happens?
 - Does pressing Stop only stop rendering, or does it also cancel backend work?
 - How do very long conversations change fetching and rendering?
+- The user switches conversations while one is still streaming. What keeps the first conversation's tokens out of the second?
+- Markdown arrives half-finished. How is it rendered, and what stops model output from running script?
+- In the sidebar variant, the assistant wants to change data in the host app. Who performs the change, and what does the user confirm?
 
 **Trap.** Treating the whole system as a React message array plus a single `POST /chat` endpoint.
 
-**Local scope.** Express, PostgreSQL, Valkey streams and pub/sub for fan-out across devices, and a mock model.
+**Local scope.** Express, PostgreSQL, Valkey streams and pub/sub for fan-out across devices, a mock model, and a React client with an IndexedDB cache. The desktop variant is covered in the answers, not built. The sidebar variant is built as its own project, [In-App Assistant](#18-in-app-assistant).
 
 ### 3. Settings Service
 
@@ -189,7 +220,7 @@ Each answer should also walk through **one successful and one failed execution t
 
 ### 4. LLM Chat Analytics
 
-**Folder:** `llm-chat-analytics/` · **Signal:** Anthropic (community attribution)
+**Folder:** `llm-chat-analytics/` · **Signal:** Anthropic (community attribution; guide-reported as a dashboard for an AI chat app)
 
 **Problem.** Near-real-time dashboards for an AI chat product: active users, conversation activity, response latency, error rates, token usage and adoption of product features.
 
@@ -205,6 +236,10 @@ Each answer should also walk through **one successful and one failed execution t
 - **Time zones.** Store UTC buckets and compute daily buckets in the organization's time zone.
 - **Privacy.** Conversation content never enters the pipeline. Suppress breakdowns for very small cohorts.
 - **Frontend.** Filters live in URL state, cache keys derive from the filters, charts cross-filter, and a freshness label tells the truth about lag.
+- **Comparison periods and drill-down.** Week over week compares aligned buckets in the same time zone, and a period that is still open is marked partial. Selecting a bar opens the conversations behind it with exactly the same query, showing metadata only.
+- **Rapid filter changes.** A request is keyed by its full query, superseded requests are aborted, and a late response for an old key never paints over a newer one.
+- **Metrics gated by role.** The API leaves out cost and other sensitive columns for roles that can't see them. Hiding them in the chart is not enough.
+- **Exports** of large ranges run as background jobs with progress, not in the browser.
 
 **Follow-ups the answers must handle.**
 - Events arrive late or twice. How do the charts change?
@@ -213,6 +248,8 @@ Each answer should also walk through **one successful and one failed execution t
 - Can you add up hourly unique-user counts, or average several p95 values, to get the daily result?
 - How do you keep analytics from exposing private conversation content?
 - What freshness guarantee can the interface honestly display?
+- The user changes filters several times a second. What reaches the server, and what reaches the screen?
+- A new metric needs a backfill. What do the charts show for the period before it existed?
 
 **Trap.** Producing an excellent chart-component architecture without explaining where trustworthy, consistently defined numbers come from.
 
@@ -289,11 +326,11 @@ Each answer should also walk through **one successful and one failed execution t
 
 ## Tier 2: Variations and Extensions
 
-### 7. Workspace Permissions
+### 7. Multi-Org Dashboard
 
-**Folder:** `workspace-permissions/` · **Signal:** Practice extension. It is a variation on the playground and chat projects.
+**Folder:** `multi-org-dashboard/` · **Signal:** Practice extension, from a widely shared frontend practice sheet; Anthropic (candidate report) for the prompt-sharing variant. This entry replaces the earlier Workspace Permissions plan and keeps its scope.
 
-**Problem.** Organizations, projects, memberships, roles, invitations, shared resources and share links.
+**Problem.** The console of a multi-tenant AI product, such as a platform for building support agents. Each organization has modules for agents, a knowledge base, conversation history, analytics, billing and settings. A user can belong to several organizations with a different role in each, and features are switched on per organization and per role. In the prompt-sharing variant the modules become a prompt library, where each prompt is private, shared with named roles or shared by link.
 
 **Core entities.**
 - `org` and `project`.
@@ -301,17 +338,33 @@ Each answer should also walk through **one successful and one failed execution t
 - `invitation` holds a token, an expiry and a role.
 - `resource` has an owner and belongs to a project.
 - `share_link` holds a token, permission, expiry and `revoked_at`.
+- `feature_flag` holds a key and rules by organization and role.
+- `audit_event` records the actor, action, target and the values before and after.
+- `export_job` records the query, status, progress and the resulting file.
 - Plan entitlements control which features are available. They are separate from permissions.
 
 **Hard problems to implement.**
 - **Authorization is enforced in the API and inside queries**, by filtering on the projects a user can access. Hiding buttons in the interface is not enforcement.
 - **Revocation and caches.** Cache permission sets with a short TTL and a version that bumps when membership changes. Writes always check authoritatively.
-- **Switching organizations in the client.** Scope all cached data by organization and clear it on switch.
+- **Switching organizations in the client.** The organization ID is part of the URL and of every cache key. Switching aborts requests still in flight for the old organization and drops any response that arrives anyway.
 - **Removing a member.** Handle their sessions, their open SSE or WebSocket streams, invitations still outstanding and the share links they created.
+- **One permission source for routes, sidebar and buttons.** The server returns one manifest of effective permissions and flags for the current organization. Route guards, the sidebar and action buttons all read it, so they cannot disagree.
+- **Access changing mid-session.** A `403`, or a version bump pushed over SSE, refetches the manifest. A view the user can no longer open closes with an explanation, not a blank screen.
+- **`401`, `403` and `404`.** An expired session signs in again and returns to the same URL. A forbidden page explains why and offers to switch organization or request access. A resource from another organization answers `404`, so the response doesn't reveal that it exists.
+- **History at scale.** Conversation history uses cursor pagination, filters kept in the URL and a virtualized table. A deep link opens the detail pane over the filtered list.
+- **Exports** run as background jobs with progress and a notification when they finish.
+
+**Follow-ups the answers must handle.**
+- A user switches organizations while a request is in flight. What happens to its response?
+- Where are role checks enforced, and why are they in both the client and the server?
+- A user opens a deep link to a page their role can't see. What do they get?
+- An administrator removes access while the user has the page open. What does the user see, and when?
+- How are client caches scoped so that data from two organizations never mixes?
+- How do you test combinations of roles and flags without testing every permutation?
 
 **Key question.** What cached state must be invalidated when access changes, and which server checks stay authoritative before that invalidation completes?
 
-**Local scope.** Express, PostgreSQL and a Valkey permission cache, with a React admin for members, roles and links.
+**Local scope.** Express, PostgreSQL and a Valkey permission cache. A React console seeded with two organizations, three roles and one feature flag, plus admin screens for members, roles, invitations and links.
 
 ### 8. Document Q&A
 
@@ -440,6 +493,35 @@ Each answer should also walk through **one successful and one failed execution t
 
 ---
 
+### 18. In-App Assistant
+
+**Folder:** [`in-app-assistant/`](./in-app-assistant/) · **Signal:** Practice extension (the "assistant sidebar added to an existing app" variant of [#2](#2-ai-chat-client), built out from a design discussion of how Gmail, Docs, Maps and Word add LLM chat) · ✅ Built
+
+**Problem.** An established web tool adds an LLM chat that does things in the app from natural language. The model is wired into operations the app already has (search, drafts, a document command API); the new part is the layer that turns a request into calls to those operations and the results back into text and UI. The project builds it for a mail, docs and calendar suite.
+
+**Core entities.**
+- `turn`: one user message and everything done to answer it, saved as a state machine (`running → waiting_client | waiting_confirmation → running → completed | failed | cancelled`), with the turn's slice of the model conversation and the in-flight tool batch.
+- `turn_step`: the audit trail (model calls, tool calls, policy decisions, notices).
+- `pending_action`: a confirmation card; `tool_execution`: the idempotency record of a tool write.
+- `chunk`: an indexed passage with its ACL, keyword vector and embedding; `index_event`: the outbox, with priority lanes.
+
+**Hard problems implemented.**
+- **A bounded, resilient agent loop**: budgets with a tools-off wrap-up, retries and a fallback model, mid-stream failure, max_tokens on text or tool calls, invented tools and invalid arguments returned as fixable errors, loop detection, context trimming, cancellation.
+- **Waiting without blocking**: confirmations and browser-executed tools suspend the turn; any instance resumes it; a sweeper gives every waiting state a defined timeout and takes over turns from crashed instances.
+- **Safety in code**: a policy engine on effect, reversibility, settings and taint from untrusted content; drafts-first and tracked suggestions keep actions reversible.
+- **Permission-correct grounding**: hybrid search with the ACL filter inside the query, fusion, rerank, a freshness tail for unindexed mail, a re-check against source tables, citations verified against retrieved items.
+- **Prompt layout for caching** and a mock model that speaks the Messages API format, so the same code runs against Claude.
+
+**Follow-ups the answers must handle.**
+- The assistant wants to change data in the host app. Who performs the change, and what does the user confirm?
+- An email tells the assistant to forward invoices to an outside address. What stops it?
+- The user confirms ten minutes later, on another server. How does the turn continue?
+- The server crashes after a write but before saving progress. Is the write done twice?
+- How is the document shown to the model so edits survive concurrent typing?
+- Which requests should not use the agent loop at all?
+
+**Local scope.** Express, PostgreSQL with pgvector, Valkey streams for turn events, an outbox-driven indexer, a mock model with failure switches, an eval runner, and a React suite with the assistant panel and an operations dashboard.
+
 ## Tier 3: Infrastructure Specialties
 
 ### 13. File Cache
@@ -512,13 +594,14 @@ Each answer should also walk through **one successful and one failed execution t
 
 ### 16. File System
 
-**Folder:** `file-system/` · **Signal:** Anthropic (community attribution: a 2026 preparation guide lists a cloud storage or file system simulation among the online assessment's problems, though most reports describe an in-memory database variant of the same format. A separate candidate report describes an onsite coding round on finding duplicate files)
+**Folder:** [`file-system/`](./file-system/) · **Signal:** Anthropic (community attribution: a 2026 preparation guide lists a cloud storage or file system simulation among the online assessment's problems, though most reports describe an in-memory database variant of the same format. A separate candidate report describes an onsite coding round on finding duplicate files) · ✅ Built
 
 **Problem.** Build an in-memory file storage system in four levels, each extending the last, then scale the same model into a service. The online assessment is reported as a timed CodeSignal test of about 90 minutes. It has one problem with four levels and hidden tests, and the next level unlocks only after the current one passes. Later levels can't be read in advance, so the skill being tested is choosing a data model that survives requirements you haven't seen yet. If that assessment is coming up, build this before the other tier-3 projects.
 
 **Different deliverables.** The core of this project is a library, not a service. In addition to the standard files, it ships:
 - `levels.md`: the practice spec, written for this repository, with the operations and edge cases for each level. It is not a copy of any real assessment.
-- `backend/src/fs/`: the library, with one vitest suite per level, so a practice attempt can be checked one level at a time.
+- `levels-db.md`: a second spec in the same format for the in-memory database variant, also written for this repository. `npm run practice -- start --problem db` runs it.
+- `backend/src/fs/` and `backend/src/kv/`: the two worked answers, each with one vitest suite per level, so a practice attempt can be checked one level at a time.
 - Practice notes in the project `CLAUDE.md`: the time each level took, and what the data model had to change to fit the next level.
 
 **Practice levels.**
@@ -526,6 +609,12 @@ Each answer should also walk through **one successful and one failed execution t
 2. **Queries.** List a directory, and return the N largest files under a prefix, sorted by size descending and then by name.
 3. **Users and quotas.** Every file has an owner, and every user has a byte capacity. A write that would exceed it fails with no partial effect. Merging two users moves the files and combines the capacities.
 4. **History.** Two alternative tracks, to cover both reported variants. *Backup:* back up a user's files and restore them later, skipping paths another user now owns. *Time:* every operation carries a timestamp, files can have a time to live, and reads can ask for the state as of a past time.
+
+**Second variant: an in-memory database.** Most reports describe this one, so it gets its own four levels in the same format:
+1. **Records.** Set, read and delete fields within records. A record exists while it holds a field, and an empty value is still a value.
+2. **Scans.** List a record's fields, all or by name prefix, and the records with the most fields under a key prefix, each with exact ordering and output-format rules.
+3. **Timestamps and expiry.** Every method gains a timestamped twin, values can have a time to live, and every write starts a new lifetime.
+4. **History.** Two alternative tracks. *History:* read a field or a record as of a past time. *Backup:* back up the whole store at a timestamp and restore it later, with each field's remaining lifetime restarting at the restore.
 
 **Hard problems to implement.**
 - **A data model that survives level 4.** Store each file once, with its owner, size and timestamps, in one map keyed by full path. Update per-user usage in the same operation that changes the file map. Two copies of a fact that must stay in sync are where hidden tests catch you.
@@ -543,7 +632,7 @@ Each answer should also walk through **one successful and one failed execution t
 
 **Trap.** Writing level 1 so cleverly that it eats the time levels 3 and 4 need, or so narrowly that level 3 forces a rewrite. Pass each level first, then refactor before opening the next one.
 
-**Local scope.** The library and its per-level tests, with a script that resets the library to stubs for a timed practice attempt. A thin Express API over it, with PostgreSQL for the persistent variant, and a React file browser that shows the tree, each user's quota and their backups.
+**Local scope.** The library and its per-level tests, with a script that resets the library to stubs for a timed practice attempt, for either variant. A thin Express API over the file store, with PostgreSQL for the persistent variant, and a React file browser that shows the tree, each user's quota and their backups.
 
 ### 17. Console Growth Take-Home
 

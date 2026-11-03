@@ -1,0 +1,35 @@
+{
+  "name": "file-system",
+  "frontendPort": 5173,
+  "backendRequired": true,
+  "dbName": "file_system",
+  "dbUser": "user",
+  "auth": { "enabled": false },
+  "screens": [
+    { "name": "01-root", "path": "/?path=/", "waitFor": "table", "delay": 800 },
+    { "name": "02-home-alice", "path": "/?path=/home/alice", "waitFor": "table", "delay": 800 },
+    {
+      "name": "03-quota-refused",
+      "path": "/?path=/home/dmitri",
+      "waitFor": "table",
+      "steps": [
+        { "fill": "#new-file-name", "value": "iso/installer.iso" },
+        { "fill": "#new-file-size", "value": "2" },
+        { "select": "select[aria-label='Unit']", "value": "MB" },
+        { "click": "button:has-text('Create file')", "delay": 800 }
+      ]
+    },
+    { "name": "04-users", "path": "/users", "waitFor": "table", "delay": 800 },
+    {
+      "name": "05-restore-skipped",
+      "path": "/users",
+      "waitFor": "table",
+      "steps": [
+        { "click": "tr[data-user='alice'] button:has-text('Restore')", "delay": 300 },
+        { "click": "tr[data-user='alice'] button:has-text('Confirm restore')", "delay": 1000 }
+      ]
+    },
+    { "name": "06-shared", "path": "/?path=/shared", "waitFor": "table", "delay": 800 }
+  ],
+  "viewport": { "width": 1440, "height": 900 }
+}

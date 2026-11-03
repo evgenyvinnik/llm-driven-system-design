@@ -1,0 +1,7 @@
+node_modules/
+dist/
+.screenshot-logs/
+test-results/
+playwright-report/
+# Timed practice attempts (npm run practice -- start)
+backend/practice-attempt/
