@@ -82,7 +82,8 @@ export default defineConfig({
   workers: process.env.CI ? 1 : undefined,
   reporter: 'html',
   use: {
-    baseURL: 'http://localhost:${config.frontendPort || 5173}',
+    // SMOKE_BASE_URL points the tests at a frontend on another port (e.g. when 5173 is taken).
+    baseURL: process.env.SMOKE_BASE_URL || 'http://localhost:${config.frontendPort || 5173}',
     trace: 'on-first-retry',
     headless: true,
     viewport: { width: ${viewport.width}, height: ${viewport.height} },
@@ -123,10 +124,11 @@ function generateSmokeTests(config) {
     lines.push(`/**`);
     lines.push(` * Login helper function`);
     lines.push(` */`);
-    lines.push(`async function login(page: Page) {`);
+    // A screen's `loginAs` (e.g. an admin page) signs in with its own credentials.
+    lines.push(`async function login(page: Page, username = '${usernameValue}', password = '${creds.password || 'password123'}') {`);
     lines.push(`  await page.goto('${config.auth.loginUrl || '/login'}');`);
-    lines.push(`  await page.locator("${usernameSelector}").first().fill('${usernameValue}');`);
-    lines.push(`  await page.locator("${passwordSelector}").first().fill('${creds.password || 'password123'}');`);
+    lines.push(`  await page.locator("${usernameSelector}").first().fill(username);`);
+    lines.push(`  await page.locator("${passwordSelector}").first().fill(password);`);
     lines.push(`  await page.locator("${submitSelector}").first().click();`);
     // The old /(?!.*login).*/ pattern is unanchored, so it matches /login itself and
     // resolves immediately; tests then navigated away and aborted the sign-in request.
@@ -155,7 +157,10 @@ function generateSmokeTests(config) {
     lines.push('');
     lines.push(`  test('${testName} loads correctly', async ({ page }) => {`);
 
-    if (needsAuth) {
+    if (needsAuth && screen.loginAs) {
+      const as = screen.loginAs;
+      lines.push(`    await login(page, '${as.username || as.email}', '${as.password || 'password123'}');`);
+    } else if (needsAuth) {
       lines.push(`    await login(page);`);
     }
 

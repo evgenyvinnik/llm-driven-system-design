@@ -34,7 +34,7 @@ Sources surveyed: Glassdoor, Aced (formerly Exponent) and Hello Interview.
 | # | Project | Folder | Tier | Signal | Builds on |
 |---|---------|--------|------|--------|-----------|
 | 1 | [Prompt Playground](#1-prompt-playground) ✅ Built | [`prompt-playground/`](./prompt-playground/) | 1 | OpenAI (candidate report); OpenAI, Anthropic (community) | mcplator |
-| 2 | [ChatGPT](#2-chatgpt) | `chatgpt/` | 1 | OpenAI (community) | imessage, mcplator |
+| 2 | [AI Chat Client](#2-ai-chat-client) ✅ Built | [`ai-chat/`](./ai-chat/) | 1 | OpenAI (community); Anthropic (candidate reports of frontend design rounds, including a desktop variant) | prompt-playground, imessage, mcplator |
 | 3 | [Settings Service](#3-settings-service) | `settings-service/` | 1 | OpenAI (candidate report) | — |
 | 4 | [LLM Chat Analytics](#4-llm-chat-analytics) | `llm-chat-analytics/` | 1 | Anthropic (community) | ad-click-aggregator, dashboarding |
 | 5 | [LLM Inference API](#5-llm-inference-api) | `llm-inference-api/` | 1 | Anthropic (candidate reports, including batching and routing variants) | rate-limiter, scalable-api |
@@ -124,11 +124,13 @@ Each answer should also walk through **one successful and one failed execution t
 
 **Local scope.** A React editor and run panel, an Express API, PostgreSQL, Valkey sessions and a mock model streaming over SSE.
 
-### 2. ChatGPT
+### 2. AI Chat Client
 
-**Folder:** `chatgpt/` · **Signal:** OpenAI (community attribution)
+**Folder:** `ai-chat/` · **Signal:** OpenAI (community attribution); Anthropic (candidate reports of frontend design rounds, including a desktop app variant). Formerly listed here as "ChatGPT" (`chatgpt/`).
 
-**Problem.** A multi-user assistant with conversation history, streamed responses, cancellation, regeneration and sync across devices.
+**Status:** ✅ Built. See [ai-chat/](./ai-chat/), its [architecture.md](./ai-chat/architecture.md) and the [frontend answer](./ai-chat/system-design-answer-frontend.md). The entry below is kept as the brief.
+
+**Problem.** A multi-user AI chat client in the shape of ChatGPT or Claude.ai: conversation history, streamed responses, cancellation, regeneration, edits that branch the conversation, sync across devices and offline reading. The interview version is often frontend-led and discussion-only, so the client architecture matters as much as the server.
 
 **Core entities.**
 - `conversation`.
@@ -142,6 +144,13 @@ Each answer should also walk through **one successful and one failed execution t
 - **Edit, regenerate and retry are different.** Editing a message creates a new branch. Regenerating creates a new generation for the same user message. Retrying with the same idempotency key returns the existing generation and does not ask for a new answer.
 - **Stop cancels backend work** by aborting the upstream request, not just by stopping rendering.
 - **Very long conversations.** Paginate older messages, virtualize the list with `@tanstack/react-virtual`, and truncate model context on the server.
+- **Client live state keyed by generation ID.** Switching from conversation A to B mid-stream neither cancels A nor leaks A's tokens into B, and a finished generation lands in history wherever the user is.
+- **Streaming markdown and output safety.** Render incrementally (re-render only the last block, batch per animation frame), never as raw HTML, and treat model output as untrusted. Follow-scroll only while the user is at the bottom; announce completion to screen readers instead of every token.
+- **Branch navigation** (‹ 2/3 ›) for edits and regenerations, and recent conversations cached in IndexedDB, readable offline (read-only, clearly labelled).
+
+**Variants the frontend answer must cover.**
+- **Desktop app.** Main process versus sandboxed renderers, context isolation, an encrypted or wiped local cache, multiple windows, deep links, and auto-update in the middle of a generation.
+- **Assistant sidebar inside an existing app.** The assistant proposes structured actions, the user previews and confirms, and the host app executes them through its own APIs and permission checks.
 
 **Follow-ups the answers must handle.**
 - The connection drops halfway through a response. Can the client reconnect without creating another generation?
@@ -152,7 +161,7 @@ Each answer should also walk through **one successful and one failed execution t
 
 **Trap.** Treating the whole system as a React message array plus a single `POST /chat` endpoint.
 
-**Local scope.** Express, PostgreSQL, Valkey streams and pub/sub for fan-out across devices, and a mock model.
+**Local scope.** A React client, Express, PostgreSQL, Valkey streams and pub/sub for fan-out across devices, and a mock model with knobs for time to first token, tokens per second, failure rate and mid-stream disconnects.
 
 ### 3. Settings Service
 
