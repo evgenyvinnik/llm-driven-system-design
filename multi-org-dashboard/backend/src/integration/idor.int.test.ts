@@ -31,9 +31,16 @@ async function insert(sql: string, params: unknown[]): Promise<string> {
   return rows[0].id
 }
 
+// The login rate limit is per client IP; each run signs in from its own address so reruns don't hit it.
+const clientIp = `10.77.${randomBytes(1)[0]}.${randomBytes(1)[0]}`
+
 async function signIn(name: string): Promise<Agent> {
   const agent = request.agent(app)
-  await agent.post('/api/v1/auth/login').send({ email: `${name}-${run}@itest.example`, password: PASSWORD }).expect(200)
+  await agent
+    .post('/api/v1/auth/login')
+    .set('X-Forwarded-For', clientIp)
+    .send({ email: `${name}-${run}@itest.example`, password: PASSWORD })
+    .expect(200)
   return agent
 }
 
@@ -99,8 +106,10 @@ beforeAll(async () => {
      VALUES ($1, 'friend-${run}@itest.example', 'viewer', $2, $3, now() + interval '1 day')`,
     [A, hashToken(`itest-invite-${run}-0123456789`), ids.cal],
   )
+  // Already running under a lease held by a fake worker, so a real worker on this database can't claim it first.
   await pool.query(
-    `INSERT INTO export_jobs (org_id, created_by, kind, query, idempotency_key) VALUES ($1, $2, 'conversations', '{}', 'itest-key')`,
+    `INSERT INTO export_jobs (org_id, created_by, kind, query, idempotency_key, status, worker_id, attempts, leased_until)
+     VALUES ($1, $2, 'conversations', '{}', 'itest-key', 'running', 'itest-worker', 1, now() + interval '10 minutes')`,
     [A, ids.cal],
   )
 
@@ -205,8 +214,9 @@ describe('access changes take effect on the next request', () => {
     await agents.cal.get(`/api/v1/orgs/${A}/manifest`).expect(401) // last org: session is gone
     const link = await request(app).get(`/api/v1/shared/${linkToken}`).expect(410)
     expect(link.body.error.code).toBe('LINK_REVOKED')
-    const { rows } = await pool.query('SELECT status FROM export_jobs WHERE org_id = $1 AND created_by = $2', [A, ids.cal])
-    expect(rows[0].status).toBe('cancelled')
+    // A running export is flagged; its worker sees the flag at the next batch and stops without publishing a file.
+    const { rows } = await pool.query('SELECT cancel_requested_at FROM export_jobs WHERE org_id = $1 AND created_by = $2', [A, ids.cal])
+    expect(rows[0].cancel_requested_at).not.toBeNull()
     const audit = await pool.query(`SELECT action, after FROM audit_events WHERE org_id = $1 AND action = 'member.removed'`, [A])
     expect(audit.rows[0].after).toMatchObject({ linksRevoked: 1 })
   })

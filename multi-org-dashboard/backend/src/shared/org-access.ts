@@ -69,6 +69,8 @@ export function requireOrg(rule: AccessRule) {
     // The client refetches its manifest when it sees a newer version, even with no event stream.
     res.setHeader('X-Org-Id', access.orgId)
     res.setHeader('X-Authz-Version', String(access.version))
+    // Tenant data must never be served from a shared or browser cache to the next person at this desk.
+    res.setHeader('Cache-Control', 'private, no-store')
 
     const details = { role: access.role, version: access.version }
     if (isWrite && access.readOnly && !rule.allowInPreview) {

@@ -162,6 +162,7 @@ Each folder contains an independent implementation of a system design problem.
 | [Scale AI](./scale-ai/) | Data labeling with crowdsourced drawing collection | ✅ Implemented |
 | [Health Data Pipeline](./health-data-pipeline/) | Multi-device health data aggregation | ✅ Implemented |
 | [Prompt Playground](./prompt-playground/) | Versioned prompts, streamed runs, side-by-side comparisons, and share links over a model API | ✅ Implemented |
+| [Multi-Org Dashboard](./multi-org-dashboard/) | Multi-tenant AI console: per-org roles, feature flags, org switching, revocation on open pages, revocable share links, and background exports | ✅ Implemented |
 
 ### Infrastructure & System Components
 
@@ -204,7 +205,6 @@ The next round, focused on AI products and developer platforms. See [ROADMAP.md]
 | [LLM Chat Analytics](./ROADMAP.md#4-llm-chat-analytics) | Near-real-time usage, latency, and token dashboards with late-data handling | 📋 Planned |
 | [LLM Inference API](./ROADMAP.md#5-llm-inference-api) | Multi-tenant model API with admission control, batching, and backend routing | 📋 Planned |
 | [Webhook Platform](./ROADMAP.md#6-webhook-platform) | Signed, retried, replayable HTTP event delivery with per-endpoint isolation | 📋 Planned |
-| [Multi-Org Dashboard](./ROADMAP.md#7-multi-org-dashboard) | Multi-tenant console with per-org roles, feature flags, org switching, and revocable share links | 📋 Planned |
 | [Document Q&A](./ROADMAP.md#8-document-qa) | Upload, process, index, retrieve, and delete documents for an assistant | 📋 Planned |
 | [Experimentation Platform](./ROADMAP.md#9-experimentation-platform) | Feature flags, A/B assignment, exposure logging, and kill switches | 📋 Planned |
 | [LLM Eval Dashboard](./ROADMAP.md#10-llm-eval-dashboard) | Versioned datasets, async eval runs, and provenance-aware comparisons | 📋 Planned |
