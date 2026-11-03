@@ -1,0 +1,59 @@
+{
+  "name": "multi-org-dashboard",
+  "frontendPort": 5173,
+  "backendRequired": true,
+  "dbName": "multi_org_dashboard",
+  "dbUser": "console",
+  "auth": {
+    "enabled": true,
+    "loginUrl": "/login",
+    "credentials": { "username": "alice@example.com", "password": "password123" },
+    "usernameSelector": "input[name='email']",
+    "passwordSelector": "input[name='password']",
+    "submitSelector": "button[type='submit']",
+    "successIndicator": "main"
+  },
+  "screens": [
+    { "name": "01-login", "path": "/login", "waitFor": "form", "skipAuth": true, "delay": 500 },
+    { "name": "02-overview", "path": "/orgs/org_lumen", "waitFor": "text=Latest conversations", "delay": 800 },
+    { "name": "03-conversations", "path": "/orgs/org_lumen/conversations?status=escalated", "waitFor": "[data-conversation] >> nth=0", "delay": 800 },
+    {
+      "name": "04-conversation-detail",
+      "path": "/orgs/org_lumen/conversations?status=escalated",
+      "waitFor": "[data-conversation] >> nth=0",
+      "click": "[data-conversation]",
+      "clickDelay": 1200
+    },
+    {
+      "name": "05-org-switcher",
+      "path": "/orgs/org_lumen/agents",
+      "waitFor": "table",
+      "click": "[data-testid='org-switcher']",
+      "clickDelay": 500
+    },
+    { "name": "06-viewer-in-other-org", "path": "/orgs/org_harbor/conversations", "waitFor": "[data-conversation] >> nth=0", "delay": 800 },
+    { "name": "07-forbidden-deep-link", "path": "/orgs/org_harbor/billing", "waitFor": "[data-testid='forbidden']", "delay": 500 },
+    {
+      "name": "08-prompt-library",
+      "path": "/orgs/org_lumen/prompts",
+      "waitFor": "text=Return policy tone",
+      "click": "button:has-text('Return policy tone')",
+      "clickDelay": 1000
+    },
+    { "name": "09-members", "path": "/orgs/org_lumen/settings/members", "waitFor": "table", "delay": 600 },
+    { "name": "10-audit-log", "path": "/orgs/org_lumen/settings/audit", "waitFor": "[data-testid='audit-table']", "delay": 600 },
+    { "name": "11-feature-flags", "path": "/orgs/org_lumen/settings/features", "waitFor": "[data-flag]", "delay": 500 },
+    { "name": "12-analytics", "path": "/orgs/org_lumen/analytics", "waitFor": "text=Conversations per day", "delay": 800 },
+    {
+      "name": "13-export-in-progress",
+      "path": "/orgs/org_lumen/conversations",
+      "waitFor": "[data-conversation] >> nth=0",
+      "click": "[data-testid='export-button']",
+      "clickDelay": 900
+    },
+    { "name": "14-exports", "path": "/orgs/org_lumen/exports", "waitFor": "table", "delay": 4000 },
+    { "name": "15-shared-link", "path": "/share/demo-lumen-return-policy-link", "waitFor": "pre", "skipAuth": true, "delay": 500 },
+    { "name": "16-org-not-found", "path": "/orgs/org_unknown", "waitFor": "[data-testid='org-not-found']", "delay": 500 }
+  ],
+  "viewport": { "width": 1440, "height": 900 }
+}

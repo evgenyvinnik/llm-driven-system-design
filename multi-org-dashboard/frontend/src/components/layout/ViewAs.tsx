@@ -53,7 +53,9 @@ export function PreviewBanner() {
   }
   return (
     <div className="flex items-center justify-center gap-3 bg-amber-100 px-4 py-1.5 text-sm text-amber-900" role="status">
-      Previewing {manifest.org.name} as <strong>{ROLE_LABEL[manifest.role]}</strong>. Read-only: nothing you do here is saved.
+      <span>
+        Previewing {manifest.org.name} as <strong>{ROLE_LABEL[manifest.role]}</strong>. Read-only: nothing you do here is saved.
+      </span>
       <button className="underline" onClick={() => void exit()}>
         Exit preview
       </button>
