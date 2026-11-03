@@ -201,12 +201,12 @@ The next round, focused on AI products and developer platforms. See [ROADMAP.md]
 
 | Project | Description | Status |
 |---------|-------------|--------|
-| [ChatGPT](./ROADMAP.md#2-chatgpt) | Streaming assistant with branching history, cancellation, and multi-device sync | 📋 Planned |
+| [AI Chat Client](./ROADMAP.md#2-ai-chat-client) | Streaming assistant with branching history, cancellation, and multi-device sync; desktop and in-app sidebar variants | 📋 Planned |
 | [Settings Service](./ROADMAP.md#3-settings-service) | Backend for an existing preferences UI: precise APIs, concurrency, and org policies | 📋 Planned |
 | [LLM Chat Analytics](./ROADMAP.md#4-llm-chat-analytics) | Near-real-time usage, latency, and token dashboards with late-data handling | 📋 Planned |
 | [LLM Inference API](./ROADMAP.md#5-llm-inference-api) | Multi-tenant model API with admission control, batching, and backend routing | 📋 Planned |
 | [Webhook Platform](./ROADMAP.md#6-webhook-platform) | Signed, retried, replayable HTTP event delivery with per-endpoint isolation | 📋 Planned |
-| [Workspace Permissions](./ROADMAP.md#7-workspace-permissions) | Organizations, roles, invitations, and revocable share links | 📋 Planned |
+| [Multi-Org Dashboard](./ROADMAP.md#7-multi-org-dashboard) | Multi-tenant console with per-org roles, feature flags, org switching, and revocable share links | 📋 Planned |
 | [Document Q&A](./ROADMAP.md#8-document-qa) | Upload, process, index, retrieve, and delete documents for an assistant | 📋 Planned |
 | [Experimentation Platform](./ROADMAP.md#9-experimentation-platform) | Feature flags, A/B assignment, exposure logging, and kill switches | 📋 Planned |
 | [LLM Eval Dashboard](./ROADMAP.md#10-llm-eval-dashboard) | Versioned datasets, async eval runs, and provenance-aware comparisons | 📋 Planned |

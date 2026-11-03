@@ -45,7 +45,7 @@ The sections before **Implementation Notes** describe the production design. Imp
 | Availability | 99.99% reads, 99.95% writes |
 | Restore | Atomic per user; never touches another user's files |
 
-**Out of scope:** file contents and sync (see [dropbox](../dropbox/)), sharing permissions beyond ownership (see [Workspace Permissions](../ROADMAP.md#7-workspace-permissions)), and full-text search.
+**Out of scope:** file contents and sync (see [dropbox](../dropbox/)), sharing permissions beyond ownership (see [Multi-Org Dashboard](../ROADMAP.md#7-multi-org-dashboard)), and full-text search.
 
 ## Capacity Estimation
 
