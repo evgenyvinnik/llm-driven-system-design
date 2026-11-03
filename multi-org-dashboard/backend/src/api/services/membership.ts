@@ -131,8 +131,9 @@ export async function removeMember(orgId: string, orgName: string, userId: strin
   if (!result) return null
 
   await announceAuthzChange(orgId, result.version, 'member_removed')
-  await publishUserEvent(userId, { type: 'access.revoked', orgId, orgName, reason: 'removed' })
 
+  // Last org: end the sessions and say so *before* access.revoked, so the user's tab
+  // signs out with that reason instead of tripping over a 401 while refreshing its org list.
   let sessionsEnded = 0
   const remaining = await pool.query('SELECT 1 FROM org_memberships WHERE user_id = $1 LIMIT 1', [userId])
   if (!remaining.rowCount) {
@@ -144,6 +145,7 @@ export async function removeMember(orgId: string, orgName: string, userId: strin
       logger.warn({ err: (err as Error).message, userId }, 'ending sessions failed')
     }
   }
+  await publishUserEvent(userId, { type: 'access.revoked', orgId, orgName, reason: 'removed' })
   const { version: _version, ...counts } = result
   return { ...counts, sessionsEnded } satisfies RemovalResult
 }

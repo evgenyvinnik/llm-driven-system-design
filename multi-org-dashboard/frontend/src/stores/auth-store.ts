@@ -16,8 +16,11 @@ interface AuthState {
   login: (email: string, password: string) => Promise<void>
   logout: () => Promise<void>
   refreshOrgs: () => Promise<void>
-  /** The server said 401, or the event stream said the session was revoked. */
-  expire: (reason: string) => void
+  /**
+   * The server said 401, or the event stream said the session was revoked.
+   * `specific` lets a known cause replace a generic message set a moment earlier.
+   */
+  expire: (reason: string, specific?: boolean) => void
 }
 
 function clearClientState() {
@@ -59,7 +62,11 @@ export const useAuth = create<AuthState>((set, get) => ({
     set({ orgs })
   },
 
-  expire: (reason) => {
+  expire: (reason, specific = false) => {
+    if (get().status === 'unauthenticated' && specific) {
+      set({ endedReason: reason })
+      return
+    }
     if (get().status !== 'authenticated') return
     // Cached data stays until the next sign-in decides whose it is; nothing renders it meanwhile.
     set({ status: 'unauthenticated', endedReason: reason })

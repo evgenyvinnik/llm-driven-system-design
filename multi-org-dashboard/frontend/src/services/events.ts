@@ -90,7 +90,7 @@ export function handleStreamEvent(event: StreamEvent): void {
       })
       return
     case 'session.revoked':
-      useAuth.getState().expire('Your access was removed, so you were signed out.')
+      useAuth.getState().expire('Your access was removed, so you were signed out.', true)
       return
   }
 }

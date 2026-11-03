@@ -22,6 +22,9 @@ const BASE = process.argv[2] || process.env.BASE_URL || 'http://localhost:5173'
 const PASSWORD = 'password123'
 const LUMEN_SUBJECTS = ['Where is my order?', 'Return a tent', 'hiking boots', 'Promo code', 'camp stove', 'sleeping bag', 'Gift card']
 const results = []
+// Sign-ins are rate limited per client IP (20 a minute). Each run presents its own forwarded
+// address, so running the check several times in a row doesn't trip the limiter.
+const HEADERS = { 'X-Forwarded-For': `10.88.${Math.floor(Math.random() * 250)}.${Math.floor(Math.random() * 250)}` }
 
 function check(name, ok, detail = '') {
   results.push({ name, ok, detail })
@@ -29,14 +32,14 @@ function check(name, ok, detail = '') {
 }
 
 async function api(email) {
-  const ctx = await playwrightRequest.newContext({ baseURL: BASE })
+  const ctx = await playwrightRequest.newContext({ baseURL: BASE, extraHTTPHeaders: HEADERS })
   const res = await ctx.post('/api/v1/auth/login', { data: { email, password: PASSWORD } })
   if (!res.ok()) throw new Error(`login ${email}: ${res.status()}`)
   return ctx
 }
 
 async function signIn(browser, email, path) {
-  const context = await browser.newContext({ viewport: { width: 1440, height: 900 } })
+  const context = await browser.newContext({ viewport: { width: 1440, height: 900 }, extraHTTPHeaders: HEADERS })
   const page = await context.newPage()
   page.on('console', (msg) => {
     if (msg.text().startsWith('[org-scope]')) page.__orgScope = [...(page.__orgScope ?? []), msg.text()]
