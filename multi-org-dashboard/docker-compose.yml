@@ -1,0 +1,40 @@
+# Host ports default to the repo conventions (5432, 6379). Override them when
+# another project already uses those ports, e.g.:
+#   POSTGRES_PORT=5442 VALKEY_PORT=6389 docker-compose up -d
+# and point the backend at them with DATABASE_URL / REDIS_URL.
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: multi-org-dashboard-postgres
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    environment:
+      POSTGRES_USER: console
+      POSTGRES_PASSWORD: console_password
+      POSTGRES_DB: multi_org_dashboard
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U console -d multi_org_dashboard"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Service name "redis" is what the repo's screenshot/triage scripts look for.
+  redis:
+    image: valkey/valkey:7.2-alpine
+    container_name: multi-org-dashboard-valkey
+    ports:
+      - "${VALKEY_PORT:-6379}:6379"
+    command: valkey-server --appendonly yes
+    volumes:
+      - valkey_data:/data
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  postgres_data:
+  valkey_data:
