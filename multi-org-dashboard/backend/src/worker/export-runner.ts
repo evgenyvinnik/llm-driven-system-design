@@ -99,8 +99,10 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
 export async function runExport(job: ClaimedJob, workerId: string): Promise<void> {
   const log = logger.child({ exportId: job.id, orgId: job.org_id })
-  const tmpPath = join(config.exportDir, `${job.id}.csv.part`)
-  const finalPath = join(config.exportDir, `${job.id}.csv`)
+  // Per attempt: a stalled worker that wakes after a takeover writes only its own files,
+  // and cleaning up after being fenced out can't delete the new owner's file.
+  const tmpPath = join(config.exportDir, `${job.id}-${job.attempts}.csv.part`)
+  const finalPath = join(config.exportDir, `${job.id}-${job.attempts}.csv`)
 
   /** Renews the lease and records progress; throws if this worker no longer owns the job. */
   const heartbeat = async (processed: number, total: number | null) => {
@@ -189,12 +191,14 @@ export async function runExport(job: ClaimedJob, workerId: string): Promise<void
       log.warn('lost the lease; another worker owns this export now')
       return
     }
-    const [status, code, message] =
-      err instanceof Cancelled
+    // A cancel flag also comes from removing the member; say which it was.
+    const accessLost =
+      err instanceof AccessLost || (err instanceof Cancelled && (await checkAccess(job).then(() => false, () => true)))
+    const [status, code, message] = accessLost
+      ? ['failed', 'ACCESS_REVOKED', 'You no longer have permission to export from this organization']
+      : err instanceof Cancelled
         ? ['cancelled', 'CANCELLED', 'The export was cancelled']
-        : err instanceof AccessLost
-          ? ['failed', 'ACCESS_REVOKED', 'You no longer have permission to export from this organization']
-          : ['failed', 'EXPORT_FAILED', 'The export failed; try again']
+        : ['failed', 'EXPORT_FAILED', 'The export failed; try again']
     if (status === 'failed' && code === 'EXPORT_FAILED') log.error({ err }, 'export failed')
     const { rowCount } = await pool.query(
       `UPDATE export_jobs SET status = $3, error_code = $4, error_message = $5, finished_at = now(), leased_until = NULL
@@ -203,7 +207,10 @@ export async function runExport(job: ClaimedJob, workerId: string): Promise<void
     )
     if (rowCount) {
       exportsFinished.inc({ status })
-      await publishUserEvent(job.created_by, { type: 'export.failed', orgId: job.org_id, exportId: job.id, error: code })
+      // The user cancelled it themselves: their exports list already shows it, no failure toast.
+      if (status === 'failed') {
+        await publishUserEvent(job.created_by, { type: 'export.failed', orgId: job.org_id, exportId: job.id, error: code })
+      }
     }
   }
 }

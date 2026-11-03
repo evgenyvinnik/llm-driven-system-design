@@ -233,6 +233,15 @@ describe('access changes take effect on the next request', () => {
     const accepted = await agents.vic.post(`/api/v1/invitations/${token}/accept`).expect(200)
     expect(accepted.body).toMatchObject({ orgId: B, role: 'viewer' })
     await agents.vic.get(`/api/v1/orgs/${B}/manifest`).expect(200)
-    await agents.vic.post(`/api/v1/invitations/${token}/accept`).expect(410) // single use
+    // Retrying after a lost response succeeds; anyone else finds it used.
+    const retried = await agents.vic.post(`/api/v1/invitations/${token}/accept`).expect(200)
+    expect(retried.body.alreadyMember).toBe(true)
+    await agents.alone.post(`/api/v1/invitations/${token}/accept`).expect(410)
+  })
+
+  it('refuses a second pending invitation to the same address', async () => {
+    await agents.bea.post(`/api/v1/orgs/${B}/invitations`).send({ email: `pending-${run}@itest.example`, role: 'viewer' }).expect(201)
+    const again = await agents.bea.post(`/api/v1/orgs/${B}/invitations`).send({ email: `pending-${run}@itest.example`, role: 'editor' }).expect(409)
+    expect(again.body.error.code).toBe('INVITATION_PENDING')
   })
 })

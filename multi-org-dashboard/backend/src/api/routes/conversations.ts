@@ -103,7 +103,8 @@ conversationsRouter.get(
     res.json({
       conversation: {
         ...conversation,
-        costCents: access.permissions.includes('analytics.cost') ? rows[0].cost_cents : undefined,
+        costCents:
+          access.permissions.includes('analytics.cost') && access.entitlements.costAnalytics ? rows[0].cost_cents : undefined,
         messages: messages.rows.map((m) => ({ id: String(m.id), author: m.author, body: m.body, createdAt: m.created_at })),
       },
     })

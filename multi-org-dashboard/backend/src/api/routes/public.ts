@@ -11,6 +11,7 @@ import { pool, withTransaction } from '../../shared/db.js'
 import { asyncHandler, HttpError } from '../../shared/errors.js'
 import { publishUserEvent } from '../../shared/events.js'
 import { hashToken, tokenParam } from '../../shared/ids.js'
+import { enforceRateLimit } from '../../shared/rate-limit.js'
 import type { Role } from '../../shared/permissions.js'
 
 export const publicRouter = Router()
@@ -55,7 +56,7 @@ publicRouter.post(
     const user = req.user!
     const result = await withTransaction(async (client) => {
       const { rows } = await client.query(
-        `SELECT i.id, i.org_id, i.email, i.role, i.expires_at, i.accepted_at, i.revoked_at, o.name AS org_name
+        `SELECT i.id, i.org_id, i.email, i.role, i.expires_at, i.accepted_at, i.accepted_by, i.revoked_at, o.name AS org_name
            FROM invitations i JOIN orgs o ON o.id = i.org_id
           WHERE i.token_hash = $1 FOR UPDATE OF i`,
         [hashToken(token)],
@@ -63,6 +64,10 @@ publicRouter.post(
       const inv = rows[0]
       if (!inv) throw new HttpError(404, 'NOT_FOUND', 'Invitation not found')
       const state = invitationState(inv)
+      // A retry by the person who already accepted (lost response) is a success, not a 410.
+      if (state === 'accepted' && inv.accepted_by === user.id) {
+        return { orgId: inv.org_id as string, orgName: inv.org_name as string, role: inv.role as Role, version: null }
+      }
       if (state !== 'pending') throw new HttpError(410, `INVITATION_${state.toUpperCase()}`, `This invitation is ${state}`)
       // The token alone isn't enough: a forwarded invitation must not let someone else in.
       if (inv.email.toLowerCase() !== user.email.toLowerCase()) {
@@ -107,6 +112,8 @@ publicRouter.post(
 publicRouter.get(
   '/shared/:token',
   asyncHandler(async (req, res) => {
+    // Tokens are 192-bit, so this isn't about guessing; it caps scraping of a leaked link.
+    await enforceRateLimit(`shared:${req.ip}`, 120, 60)
     const token = tokenParam(req.params.token, 'Link')
     const { rows } = await pool.query(
       `SELECT l.id, l.expires_at, l.revoked_at, p.title, p.body, p.updated_at, o.name AS org_name,

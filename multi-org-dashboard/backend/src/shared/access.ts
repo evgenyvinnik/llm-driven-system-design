@@ -86,7 +86,7 @@ export async function computeFromDatabase(
 
   const role = org.role as Role
   // Preview narrows what an admin sees to another role's view of the projects too.
-  const projectRole = previewRole ?? role
+  const projectRole = role === 'admin' && previewRole ? previewRole : role
   const [projects, flags] = await Promise.all([
     db.query(
       `SELECT p.id, p.name, p.restricted

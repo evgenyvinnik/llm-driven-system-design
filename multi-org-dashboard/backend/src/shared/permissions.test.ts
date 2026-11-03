@@ -72,6 +72,15 @@ describe('preview (view as role)', () => {
   })
 })
 
+describe('a preview that outlived the admin role', () => {
+  it('is ignored: a demoted viewer previewing as editor gets viewer access, not editor', () => {
+    const access = computeAccess({ role: 'viewer', previewRole: 'editor', plan: 'pro', flagDefinitions: FLAG, flagRules: [] })
+    expect(access.role).toBe('viewer')
+    expect(access.readOnly).toBe(false)
+    expect(access.permissions).not.toContain('members.read')
+  })
+})
+
 describe('evaluateFlags', () => {
   it('falls back to the default when the org has no rule', () => {
     expect(evaluateFlags([{ key: 'beta', defaultEnabled: true }], [], 'viewer')).toEqual({ beta: true })

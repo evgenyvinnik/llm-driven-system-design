@@ -4,7 +4,13 @@
 
 | Metric | Value |
 |--------|-------|
-| Total SLOC | — |
+| Total SLOC | 11,429 |
+| Source Files | 172 |
+| .ts | 6,214 |
+| .tsx | 2,634 |
+| .md | 1,838 |
+| .sql | 202 |
+| .json | 178 |
 
 ## Overview
 
@@ -138,7 +144,7 @@ All have local defaults; set them only to override.
 | `PORT` | `3000` | API port |
 | `PERMISSION_CACHE_TTL_SECONDS` | `60` | Upper bound on staleness if a version bump fails to reach Valkey |
 | `SSE_HEARTBEAT_MS` | `20000` | Stream heartbeat; each one re-checks the session and memberships |
-| `WORKER_ID` / `WORKER_POLL_MS` | `worker-<pid>` / `1000` | Export worker identity and polling interval |
+| `WORKER_ID` / `WORKER_POLL_MS` / `WORKER_PORT` | `worker-<pid>` / `1000` / `3300` | Export worker identity, polling interval, and its own `/health` + `/metrics` port |
 | `EXPORT_LEASE_SECONDS` / `EXPORT_MAX_ATTEMPTS` | `30` / `3` | Job lease and retries after a worker dies |
 | `EXPORT_BATCH_SIZE` / `EXPORT_BATCH_DELAY_MS` | `250` / `120` | Rows per batch; the delay makes progress visible with seed-sized data |
 | `EXPORT_DIR` | `backend/exports` | Where finished CSV files are written |
@@ -152,7 +158,7 @@ cd backend
 npm run dev:server1      # extra API instances on :3001, :3002, :3003
 npm run dev:server2
 npm run dev:server3
-npm run dev:worker2      # a second export worker: SKIP LOCKED keeps them apart
+npm run dev:worker2      # a second export worker (metrics on :3302): SKIP LOCKED keeps them apart
 ```
 
 Every instance holds one Valkey subscription and routes events to its own open streams, so a change made through one instance reaches tabs connected to another.
@@ -208,7 +214,7 @@ cd backend
 npm run type-check
 npm run lint
 npm test                   # vitest: access model over every role x plan x flag, org gate, cache, route inventory, event hub
-npm run test:integration   # against the running PostgreSQL + Valkey: cross-org IDOR attempts, revocation, invitations
+npm run test:integration   # against the running PostgreSQL + Valkey: cross-org IDOR attempts, revocation, invitations (14 tests)
 
 # Frontend
 cd frontend
@@ -223,7 +229,7 @@ npm run screenshots multi-org-dashboard
 npm run generate-tests multi-org-dashboard
 ```
 
-Observability: `GET /metrics` (permission cache hits/misses, authorization denials by code, open streams, exports by outcome), `GET /health` and `GET /ready` on the API.
+Observability: `GET /metrics` on the API (permission cache hits/misses, authorization denials by code, open streams) and on the worker at :3300 (exports by outcome); `GET /health` on both and `GET /ready` on the API.
 
 ## Architecture Documentation
 

@@ -119,11 +119,14 @@ export interface ComputedAccess {
 }
 
 export function computeAccess(input: AccessInput): ComputedAccess {
-  const role = input.previewRole ?? input.role
+  // A preview stored on the session outlives the admin role that created it, so it only
+  // applies while the user is still an admin; otherwise it could widen a demoted user's reads.
+  const previewing = input.previewRole !== undefined && input.role === 'admin'
+  const role = previewing ? input.previewRole! : input.role
   return {
     role,
     actualRole: input.role,
-    readOnly: input.previewRole !== undefined,
+    readOnly: previewing,
     permissions: [...ROLE_PERMISSIONS[role]],
     entitlements: { ...PLAN_ENTITLEMENTS[input.plan] },
     flags: evaluateFlags(input.flagDefinitions, input.flagRules, role),

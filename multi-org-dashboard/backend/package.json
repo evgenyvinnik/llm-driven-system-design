@@ -11,7 +11,7 @@
     "dev:server1": "PORT=3001 tsx watch src/api/index.ts",
     "dev:server2": "PORT=3002 tsx watch src/api/index.ts",
     "dev:server3": "PORT=3003 tsx watch src/api/index.ts",
-    "dev:worker2": "WORKER_ID=worker-2 tsx watch src/worker/index.ts",
+    "dev:worker2": "WORKER_ID=worker-2 WORKER_PORT=3302 tsx watch src/worker/index.ts",
     "start": "concurrently -k -n api,worker \"tsx src/api/index.ts\" \"tsx src/worker/index.ts\"",
     "db:migrate": "tsx src/db/migrate.ts",
     "db:seed": "tsx src/db/seed.ts",

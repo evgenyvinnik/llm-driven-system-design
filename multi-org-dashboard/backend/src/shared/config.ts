@@ -34,6 +34,8 @@ export const config = {
   sseHeartbeatMs: int('SSE_HEARTBEAT_MS', 20_000),
 
   workerId: process.env.WORKER_ID || `worker-${process.pid}`,
+  /** The worker's own /health and /metrics. */
+  workerPort: int('WORKER_PORT', 3300),
   workerPollMs: int('WORKER_POLL_MS', 1000),
   /** A running export whose worker stops renewing its lease is picked up again after this. */
   exportLeaseSeconds: int('EXPORT_LEASE_SECONDS', 30),

@@ -132,6 +132,15 @@ adminRouter.post(
         [access.orgId, email],
       )
       if (existing.rowCount) throw new HttpError(409, 'ALREADY_MEMBER', `${email} is already a member`)
+      // One pending invitation per address: a double-click or a retry can't mint two live tokens.
+      const pending = await client.query(
+        `SELECT 1 FROM invitations WHERE org_id = $1 AND lower(email) = lower($2)
+            AND accepted_at IS NULL AND revoked_at IS NULL AND expires_at > now()`,
+        [access.orgId, email],
+      )
+      if (pending.rowCount) {
+        throw new HttpError(409, 'INVITATION_PENDING', `An invitation to ${email} is already pending. Revoke it to send a new one.`)
+      }
       const { rows } = await client.query(
         `INSERT INTO invitations (org_id, email, role, token_hash, invited_by, expires_at)
          VALUES ($1, $2, $3, $4, $5, now() + make_interval(days => $6))
@@ -221,13 +230,14 @@ adminRouter.get(
 )
 
 /**
- * Revoking a link: its creator, or anyone who manages links. No feature flag
- * here, on purpose: turning the prompt library off must not stop anyone
- * from revoking what was already shared.
+ * Revoking a link: its creator, or anyone who manages links. Any member may
+ * call it, and there is no feature flag, on purpose: revoking only ever
+ * narrows access, so neither a demotion nor turning the prompt library off
+ * may stop someone from revoking what they shared.
  */
 adminRouter.delete(
   '/links/:linkId',
-  { permission: 'prompts.share' },
+  { permission: 'member' },
   asyncHandler(async (req, res) => {
     const access = accessOf(req)
     const id = uuidParam(req.params.linkId, 'Link')
