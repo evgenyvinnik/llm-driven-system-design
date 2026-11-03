@@ -35,7 +35,7 @@ Sources surveyed: Glassdoor, Aced (formerly Exponent) and Hello Interview. Proje
 | # | Project | Folder | Tier | Signal | Builds on |
 |---|---------|--------|------|--------|-----------|
 | 1 | [Prompt Playground](#1-prompt-playground) ✅ Built | [`prompt-playground/`](./prompt-playground/) | 1 | OpenAI (candidate report); OpenAI, Anthropic (community) | mcplator |
-| 2 | [AI Chat Client](#2-ai-chat-client) | `ai-chat/` | 1 | Anthropic (candidate report: desktop chat frontend); OpenAI, Anthropic (community) | prompt-playground, imessage, mcplator |
+| 2 | [AI Chat Client](#2-ai-chat-client) ✅ Built | [`ai-chat/`](./ai-chat/) | 1 | OpenAI (community); Anthropic (candidate reports of frontend design rounds, including a desktop variant) | prompt-playground, imessage, mcplator |
 | 3 | [Settings Service](#3-settings-service) | `settings-service/` | 1 | OpenAI (candidate report) | — |
 | 4 | [LLM Chat Analytics](#4-llm-chat-analytics) | `llm-chat-analytics/` | 1 | Anthropic (community; guide-reported) | ad-click-aggregator, dashboarding |
 | 5 | [LLM Inference API](#5-llm-inference-api) | `llm-inference-api/` | 1 | Anthropic (candidate reports, including batching and routing variants) | rate-limiter, scalable-api |
@@ -146,9 +146,11 @@ Each answer should also walk through **one successful and one failed execution t
 
 ### 2. AI Chat Client
 
-**Folder:** `ai-chat/` · **Signal:** Anthropic (candidate report: a desktop AI chat frontend); OpenAI and Anthropic (community attribution)
+**Folder:** `ai-chat/` · **Signal:** OpenAI (community attribution); Anthropic (candidate reports of frontend design rounds, including a desktop app variant). Formerly listed here as "ChatGPT" (`chatgpt/`).
 
-**Problem.** A multi-user assistant in the shape of ChatGPT or Claude.ai, with conversation history, streamed responses, cancellation, regeneration and sync across devices. The prompt is reported in three forms, and the answers must be able to move between them: a web app, a desktop app, and an assistant sidebar added to an existing product.
+**Status:** ✅ Built. See [ai-chat/](./ai-chat/), its [architecture.md](./ai-chat/architecture.md) and the [frontend answer](./ai-chat/system-design-answer-frontend.md). The entry below is kept as the brief.
+
+**Problem.** A multi-user AI chat client in the shape of ChatGPT or Claude.ai: conversation history, streamed responses, cancellation, regeneration, edits that branch the conversation, sync across devices and offline reading. The prompt is reported in three forms, and the answers must be able to move between them: a web app, a desktop app, and an assistant sidebar added to an existing product.
 
 **Core entities.**
 - `conversation`.
@@ -168,6 +170,7 @@ Each answer should also walk through **one successful and one failed execution t
 - **Rendering markdown that is still arriving.** Tokens split code fences and tables. Parse incrementally, re-render only the last block, and apply updates at most once per animation frame. Model output is untrusted: sanitize it, never render raw HTML, and decide which links and images from the model may load.
 - **Scroll and focus.** Follow the stream only while the reader is at the bottom, and keep their place when they scroll up. Announce a finished response to screen readers instead of reading out every token.
 - **Offline reading.** Cache recent conversations in IndexedDB and show them read-only when offline. Nothing that needs the model is queued, and the interface says so.
+- **Branch navigation** (‹ 2/3 ›) between the versions that edits and regenerations create.
 
 **Variants the answers must handle.**
 - **Desktop.** A main process and sandboxed renderers with context isolation. A local cache that is encrypted, or wiped on sign-out. Several windows open on one conversation. Deep links. An auto-update that arrives while a generation is running.
@@ -185,7 +188,7 @@ Each answer should also walk through **one successful and one failed execution t
 
 **Trap.** Treating the whole system as a React message array plus a single `POST /chat` endpoint.
 
-**Local scope.** Express, PostgreSQL, Valkey streams and pub/sub for fan-out across devices, a mock model, and a React client with an IndexedDB cache. The desktop variant is covered in the answers, not built. The sidebar variant is built as its own project, [In-App Assistant](#18-in-app-assistant).
+**Local scope.** A React client, Express, PostgreSQL, Valkey streams and pub/sub for fan-out across devices, and a mock model with knobs for time to first token, tokens per second, failure rate and mid-stream disconnects. The desktop variant is covered in the answers, not built. The sidebar variant is built as its own project, [In-App Assistant](#18-in-app-assistant).
 
 ### 3. Settings Service
 

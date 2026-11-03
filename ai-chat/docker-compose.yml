@@ -1,0 +1,37 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: ai-chat-postgres
+    ports:
+      # Host port can be moved (AI_CHAT_PG_PORT=5433) when another project already holds 5432.
+      - "${AI_CHAT_PG_PORT:-5432}:5432"
+    environment:
+      POSTGRES_USER: aichat
+      POSTGRES_PASSWORD: aichat_password
+      POSTGRES_DB: ai_chat
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aichat -d ai_chat"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Service name "redis" is what the repo's screenshot/triage scripts look for.
+  redis:
+    image: valkey/valkey:7.2-alpine
+    container_name: ai-chat-valkey
+    ports:
+      - "${AI_CHAT_VALKEY_PORT:-6379}:6379"
+    command: valkey-server --appendonly yes
+    volumes:
+      - valkey_data:/data
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  postgres_data:
+  valkey_data:

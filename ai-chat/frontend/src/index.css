@@ -1,0 +1,99 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  color: #0f172a;
+  background-color: #ffffff;
+  -webkit-font-smoothing: antialiased;
+}
+
+body {
+  margin: 0;
+}
+
+@layer components {
+  .btn {
+    @apply inline-flex items-center justify-center gap-1.5 rounded-md px-3 py-1.5 text-sm font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50;
+  }
+  .btn-primary {
+    @apply btn bg-accent-600 text-white hover:bg-accent-700;
+  }
+  .btn-secondary {
+    @apply btn border border-slate-300 bg-white text-slate-700 hover:bg-slate-50;
+  }
+  .btn-ghost {
+    @apply btn text-slate-600 hover:bg-slate-100 hover:text-slate-900;
+  }
+  .btn-icon {
+    @apply inline-flex h-7 w-7 items-center justify-center rounded-md text-slate-500 hover:bg-slate-100 hover:text-slate-800 disabled:cursor-not-allowed disabled:opacity-40;
+  }
+  .input {
+    @apply w-full rounded-md border border-slate-300 bg-white px-2.5 py-1.5 text-sm text-slate-900 placeholder:text-slate-400 focus:border-accent-500 focus:outline-none focus:ring-2 focus:ring-accent-100;
+  }
+  .label {
+    @apply mb-1 block text-xs font-semibold uppercase tracking-wide text-slate-500;
+  }
+  .card {
+    @apply rounded-lg border border-slate-200 bg-white;
+  }
+  .chip {
+    @apply inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium;
+  }
+  .sr-only-live {
+    @apply sr-only;
+  }
+}
+
+/* Model output. Styled here rather than with a typography plugin so the renderer stays dependency-free. */
+.md {
+  @apply text-[15px] leading-7 text-slate-800;
+}
+.md > * + * {
+  @apply mt-3;
+}
+.md h1 {
+  @apply text-xl font-semibold;
+}
+.md h2 {
+  @apply text-lg font-semibold;
+}
+.md h3,
+.md h4 {
+  @apply font-semibold;
+}
+.md ul {
+  @apply list-disc pl-6;
+}
+.md ol {
+  @apply list-decimal pl-6;
+}
+.md li + li {
+  @apply mt-1;
+}
+.md blockquote {
+  @apply border-l-4 border-slate-200 pl-3 text-slate-600;
+}
+.md code:not(pre code) {
+  @apply rounded bg-slate-100 px-1 py-0.5 font-mono text-[13px] text-slate-800;
+}
+.md pre {
+  @apply overflow-x-auto rounded-md bg-slate-900 p-3 font-mono text-[13px] leading-6 text-slate-100;
+}
+.md table {
+  @apply w-full border-collapse text-sm;
+}
+.md th,
+.md td {
+  @apply border border-slate-200 px-2 py-1 text-left align-top;
+}
+.md th {
+  @apply bg-slate-50 font-semibold;
+}
+.md a {
+  @apply text-accent-700 underline underline-offset-2;
+}
+.md hr {
+  @apply border-slate-200;
+}

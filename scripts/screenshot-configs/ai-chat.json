@@ -1,0 +1,121 @@
+{
+  "name": "ai-chat",
+  "frontendPort": 5173,
+  "backendRequired": true,
+  "dbName": "ai_chat",
+  "dbUser": "aichat",
+  "auth": {
+    "enabled": true,
+    "loginUrl": "/login",
+    "credentials": {
+      "username": "alice",
+      "password": "password123"
+    },
+    "usernameSelector": "input[name='username']",
+    "passwordSelector": "input[name='password']",
+    "submitSelector": "button[type='submit']",
+    "successIndicator": "main"
+  },
+  "screens": [
+    {
+      "name": "01-login",
+      "path": "/login",
+      "waitFor": "form",
+      "skipAuth": true,
+      "delay": 500
+    },
+    {
+      "name": "02-new-chat",
+      "path": "/",
+      "waitFor": "text=What can I help with?",
+      "delay": 800
+    },
+    {
+      "name": "03-branches",
+      "path": "/",
+      "waitFor": "aside nav",
+      "steps": [
+        {
+          "click": "aside a:has-text('Weekend trip to Lisbon')",
+          "delay": 1500
+        }
+      ]
+    },
+    {
+      "name": "04-code-and-tables",
+      "path": "/",
+      "waitFor": "aside nav",
+      "steps": [
+        {
+          "click": "aside a:has-text('Debounce helper in TypeScript')",
+          "delay": 1500
+        }
+      ]
+    },
+    {
+      "name": "05-untrusted-html-inert",
+      "path": "/",
+      "waitFor": "aside nav",
+      "steps": [
+        {
+          "click": "aside a:has-text('Rendering untrusted HTML safely')",
+          "delay": 1500
+        }
+      ]
+    },
+    {
+      "name": "06-streaming",
+      "path": "/",
+      "waitFor": "text=What can I help with?",
+      "steps": [
+        {
+          "fill": "#composer",
+          "value": "Plan a detailed three day trip to Kyoto with a list of steps and a table comparing neighborhoods",
+          "delay": 200
+        },
+        {
+          "press": "#composer",
+          "key": "Enter",
+          "delay": 2800
+        }
+      ]
+    },
+    {
+      "name": "07-failed-partial-answer",
+      "path": "/",
+      "waitFor": "aside nav",
+      "steps": [
+        {
+          "click": "aside a:has-text('Sourdough starter troubleshooting')",
+          "delay": 1500
+        }
+      ]
+    },
+    {
+      "name": "08-long-thread-virtualized",
+      "path": "/",
+      "waitFor": "aside nav",
+      "steps": [
+        {
+          "click": "aside a:has-text('Quarterly OKR planning log')",
+          "delay": 1800
+        }
+      ]
+    },
+    {
+      "name": "09-operator-dashboard",
+      "path": "/admin",
+      "waitFor": "text=Operator dashboard",
+      "delay": 1500,
+      "fullPage": true,
+      "loginAs": {
+        "username": "admin",
+        "password": "password123"
+      }
+    }
+  ],
+  "viewport": {
+    "width": 1440,
+    "height": 900
+  }
+}

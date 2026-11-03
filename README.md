@@ -165,6 +165,7 @@ Each folder contains an independent implementation of a system design problem.
 | [Prompt Playground](./prompt-playground/) | Versioned prompts, streamed runs, side-by-side comparisons, and share links over a model API | ✅ Implemented |
 | [In-App Assistant](./in-app-assistant/) | An LLM assistant inside a mail, docs and calendar suite: a durable agent loop, policy-checked tools, permission-aware hybrid retrieval and confirmations | ✅ Implemented |
 | [Console Growth](./console-growth/) | Growth engineering take-home practice: an LLM API developer console with two instrumented A/B experiments | ✅ Implemented |
+| [AI Chat Client](./ai-chat/) | Streaming chat with branching history, resumable answers, Stop, multi-device sync, and offline reading | ✅ Implemented |
 
 ### Infrastructure & System Components
 
@@ -202,7 +203,6 @@ The next round, focused on AI products and developer platforms. See [ROADMAP.md]
 
 | Project | Description | Status |
 |---------|-------------|--------|
-| [AI Chat Client](./ROADMAP.md#2-ai-chat-client) | Streaming assistant with branching history, cancellation, and multi-device sync; desktop and in-app sidebar variants | 📋 Planned |
 | [Settings Service](./ROADMAP.md#3-settings-service) | Backend for an existing preferences UI: precise APIs, concurrency, and org policies | 📋 Planned |
 | [LLM Chat Analytics](./ROADMAP.md#4-llm-chat-analytics) | Near-real-time usage, latency, and token dashboards with late-data handling | 📋 Planned |
 | [LLM Inference API](./ROADMAP.md#5-llm-inference-api) | Multi-tenant model API with admission control, batching, and backend routing | 📋 Planned |
