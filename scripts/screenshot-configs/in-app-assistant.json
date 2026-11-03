@@ -1,0 +1,47 @@
+{
+  "name": "in-app-assistant",
+  "frontendPort": 5173,
+  "backendRequired": true,
+  "dbName": "in_app_assistant",
+  "dbUser": "assistant",
+  "auth": {
+    "enabled": true,
+    "loginUrl": "/login",
+    "credentials": { "username": "alice", "password": "password123" },
+    "usernameSelector": "input[name='username']",
+    "passwordSelector": "input[name='password']",
+    "submitSelector": "button[type='submit']",
+    "successIndicator": "main"
+  },
+  "screens": [
+    { "name": "01-login", "path": "/login", "waitFor": "form", "skipAuth": true, "delay": 500 },
+    { "name": "02-mail", "path": "/mail", "waitFor": "ul[aria-label='Messages']", "delay": 800 },
+    {
+      "name": "03-thread-summary",
+      "path": "/mail?m=m_off1",
+      "waitFor": "h2",
+      "steps": [{ "click": "button:has-text('Summarize thread')", "delay": 2500 }]
+    },
+    {
+      "name": "04-doc-assistant",
+      "path": "/docs/doc_offsite",
+      "waitFor": "[data-paragraph='p_3']",
+      "steps": [{ "click": "aside button:has-text('Add a short summary')", "delay": 7000 }]
+    },
+    {
+      "name": "05-injection-confirmation",
+      "path": "/mail",
+      "waitFor": "ul[aria-label='Messages']",
+      "steps": [{ "click": "aside button:has-text('Summarize the latest email from Northwind')", "delay": 8000 }]
+    },
+    {
+      "name": "06-calendar",
+      "path": "/calendar",
+      "waitFor": "h1",
+      "steps": [{ "click": "aside button:has-text('Schedule a 30 minute call')", "delay": 6000 }]
+    },
+    { "name": "07-settings", "path": "/settings", "waitFor": "h1", "delay": 600 },
+    { "name": "08-ops", "path": "/admin", "waitFor": "text=Recent turns", "delay": 1500, "fullPage": true }
+  ],
+  "viewport": { "width": 1440, "height": 900 }
+}

@@ -51,6 +51,7 @@ Sources surveyed: Glassdoor, Aced (formerly Exponent) and Hello Interview. Proje
 | 15 | [Online Chess](#15-online-chess) | `online-chess/` | 3 | OpenAI (community) | r-place, online-auction |
 | 16 | [File System](#16-file-system) ✅ Built | [`file-system/`](./file-system/) | 3 | Anthropic (community, online assessment; candidate report for the dedup variant) | dropbox |
 | 17 | [Console Growth Take-Home](#17-console-growth-take-home) ✅ Built | [`console-growth/`](./console-growth/) | 3 | Anthropic (candidate report: growth engineering take-home) | experimentation-platform |
+| 18 | [In-App Assistant](#18-in-app-assistant) ✅ Built | [`in-app-assistant/`](./in-app-assistant/) | 2 | Practice extension (the sidebar variant of #2, built out) | ai-chat (#2), document-qa (#8), prompt-playground |
 
 - **Tier 1** covers the core product-facing work for AI and full-stack roles. Build these first, in the order listed.
 - **Tier 2** covers variations on tier-1 designs. Each reuses a tier-1 data model or an existing project's patterns.
@@ -76,7 +77,7 @@ Public reports don't say which prompts a frontend-focused design round uses. Thi
 
 | Prompt (signal) | Study now | Still missing | Plan |
 |-----------------|-----------|---------------|------|
-| AI chat client: web, desktop, or an assistant sidebar added to an existing app (Anthropic candidate report for the desktop version; community attribution for chat rounds in general) | [prompt-playground](./prompt-playground/system-design-answer-frontend.md) deep dives 1 and 2: a run store that outlives navigation, resumable SSE and the cancel race. [mcplator](./mcplator/system-design-answer-frontend.md): streamed tokens and IndexedDB persistence. [imessage](./imessage/system-design-answer-frontend.md) and [slack](./slack/system-design-answer-frontend.md): offline reading and long histories | A message tree for edit and regenerate, safe rendering of streamed markdown, the desktop shell, and assistant actions that change the host app | [#2](#2-ai-chat-client) |
+| AI chat client: web, desktop, or an assistant sidebar added to an existing app (Anthropic candidate report for the desktop version; community attribution for chat rounds in general) | [prompt-playground](./prompt-playground/system-design-answer-frontend.md) deep dives 1 and 2: a run store that outlives navigation, resumable SSE and the cancel race. [mcplator](./mcplator/system-design-answer-frontend.md): streamed tokens and IndexedDB persistence. [imessage](./imessage/system-design-answer-frontend.md) and [slack](./slack/system-design-answer-frontend.md): offline reading and long histories | A message tree for edit and regenerate, and the desktop shell. The sidebar variant (assistant actions that change the host app, confirmations, safe rendering with citations) is built: [in-app-assistant](./in-app-assistant/system-design-answer-frontend.md) | [#2](#2-ai-chat-client), [#18](#18-in-app-assistant) |
 | Prompt playground (Anthropic community attribution, the most frequently reported prompt) | [prompt-playground](./prompt-playground/) ✅ Built | A version diff view and a grid that compares several models | Extend prompt-playground |
 | Prompt-sharing platform (Anthropic candidate report, mostly backend) | prompt-playground: revocable share links and fork into a workspace. [google-docs](./google-docs/) and [collaborative-editor](./collaborative-editor/): concurrent editing | Roles per prompt, a team library, and revoking access from someone who has the page open | [#7](#7-multi-org-dashboard) |
 | Analytics dashboard for an AI chat product (Anthropic guide-reported) | [dashboarding](./dashboarding/system-design-answer-frontend.md) and [ad-click-aggregator](./ad-click-aggregator/system-design-answer-frontend.md): query keys derived from URL state, honest freshness, downsampling, metrics that can't be summed | Definitions for chat metrics, comparison periods, drill-down to raw records, daily buckets in each organization's time zone, cost metrics hidden by role | [#4](#4-llm-chat-analytics) |
@@ -87,7 +88,7 @@ Public reports don't say which prompts a frontend-focused design round uses. Thi
 
 ## Shared Decisions for the LLM Projects
 
-Projects 1, 2, 4, 5, 8, 10 and 12 call a model. Every project in this repository must run locally and stand on its own, so they share these decisions:
+Projects 1, 2, 4, 5, 8, 10, 12 and 18 call a model. Every project in this repository must run locally and stand on its own, so they share these decisions:
 
 - **Each project ships its own mock model service.** It streams deterministic tokens with a configurable time to first token, tokens per second, failure rate and number of concurrent slots. Failure paths such as a mid-stream disconnect, overload or timeout can then be triggered on demand, which a real provider API cannot do reliably.
 - **A real provider adapter is optional.** It is enabled by an environment variable such as an API key, and it is never required for setup, smoke tests or screenshots.
@@ -184,7 +185,7 @@ Each answer should also walk through **one successful and one failed execution t
 
 **Trap.** Treating the whole system as a React message array plus a single `POST /chat` endpoint.
 
-**Local scope.** Express, PostgreSQL, Valkey streams and pub/sub for fan-out across devices, a mock model, and a React client with an IndexedDB cache. The desktop and sidebar variants are covered in the answers, not built.
+**Local scope.** Express, PostgreSQL, Valkey streams and pub/sub for fan-out across devices, a mock model, and a React client with an IndexedDB cache. The desktop variant is covered in the answers, not built. The sidebar variant is built as its own project, [In-App Assistant](#18-in-app-assistant).
 
 ### 3. Settings Service
 
@@ -491,6 +492,35 @@ Each answer should also walk through **one successful and one failed execution t
 **Local scope.** A webhook receiver, a policy engine, a mock model reviewer and an audit UI. It can consume events from the [github](./github/) project or a set of fixture pull requests.
 
 ---
+
+### 18. In-App Assistant
+
+**Folder:** [`in-app-assistant/`](./in-app-assistant/) · **Signal:** Practice extension (the "assistant sidebar added to an existing app" variant of [#2](#2-ai-chat-client), built out from a design discussion of how Gmail, Docs, Maps and Word add LLM chat) · ✅ Built
+
+**Problem.** An established web tool adds an LLM chat that does things in the app from natural language. The model is wired into operations the app already has (search, drafts, a document command API); the new part is the layer that turns a request into calls to those operations and the results back into text and UI. The project builds it for a mail, docs and calendar suite.
+
+**Core entities.**
+- `turn`: one user message and everything done to answer it, saved as a state machine (`running → waiting_client | waiting_confirmation → running → completed | failed | cancelled`), with the turn's slice of the model conversation and the in-flight tool batch.
+- `turn_step`: the audit trail (model calls, tool calls, policy decisions, notices).
+- `pending_action`: a confirmation card; `tool_execution`: the idempotency record of a tool write.
+- `chunk`: an indexed passage with its ACL, keyword vector and embedding; `index_event`: the outbox, with priority lanes.
+
+**Hard problems implemented.**
+- **A bounded, resilient agent loop**: budgets with a tools-off wrap-up, retries and a fallback model, mid-stream failure, max_tokens on text or tool calls, invented tools and invalid arguments returned as fixable errors, loop detection, context trimming, cancellation.
+- **Waiting without blocking**: confirmations and browser-executed tools suspend the turn; any instance resumes it; a sweeper gives every waiting state a defined timeout and takes over turns from crashed instances.
+- **Safety in code**: a policy engine on effect, reversibility, settings and taint from untrusted content; drafts-first and tracked suggestions keep actions reversible.
+- **Permission-correct grounding**: hybrid search with the ACL filter inside the query, fusion, rerank, a freshness tail for unindexed mail, a re-check against source tables, citations verified against retrieved items.
+- **Prompt layout for caching** and a mock model that speaks the Messages API format, so the same code runs against Claude.
+
+**Follow-ups the answers must handle.**
+- The assistant wants to change data in the host app. Who performs the change, and what does the user confirm?
+- An email tells the assistant to forward invoices to an outside address. What stops it?
+- The user confirms ten minutes later, on another server. How does the turn continue?
+- The server crashes after a write but before saving progress. Is the write done twice?
+- How is the document shown to the model so edits survive concurrent typing?
+- Which requests should not use the agent loop at all?
+
+**Local scope.** Express, PostgreSQL with pgvector, Valkey streams for turn events, an outbox-driven indexer, a mock model with failure switches, an eval runner, and a React suite with the assistant panel and an operations dashboard.
 
 ## Tier 3: Infrastructure Specialties
 

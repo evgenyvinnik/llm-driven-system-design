@@ -163,6 +163,7 @@ Each folder contains an independent implementation of a system design problem.
 | [Scale AI](./scale-ai/) | Data labeling with crowdsourced drawing collection | ✅ Implemented |
 | [Health Data Pipeline](./health-data-pipeline/) | Multi-device health data aggregation | ✅ Implemented |
 | [Prompt Playground](./prompt-playground/) | Versioned prompts, streamed runs, side-by-side comparisons, and share links over a model API | ✅ Implemented |
+| [In-App Assistant](./in-app-assistant/) | An LLM assistant inside a mail, docs and calendar suite: a durable agent loop, policy-checked tools, permission-aware hybrid retrieval and confirmations | ✅ Implemented |
 | [Console Growth](./console-growth/) | Growth engineering take-home practice: an LLM API developer console with two instrumented A/B experiments | ✅ Implemented |
 
 ### Infrastructure & System Components
