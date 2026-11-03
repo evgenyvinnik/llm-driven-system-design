@@ -37,7 +37,7 @@ Sources surveyed: Glassdoor, Aced (formerly Exponent) and Hello Interview. Proje
 | 1 | [Prompt Playground](#1-prompt-playground) ✅ Built | [`prompt-playground/`](./prompt-playground/) | 1 | OpenAI (candidate report); OpenAI, Anthropic (community) | mcplator |
 | 2 | [AI Chat Client](#2-ai-chat-client) ✅ Built | [`ai-chat/`](./ai-chat/) | 1 | OpenAI (community); Anthropic (candidate reports of frontend design rounds, including a desktop variant) | prompt-playground, imessage, mcplator |
 | 3 | [Settings Service](#3-settings-service) | `settings-service/` | 1 | OpenAI (candidate report) | — |
-| 4 | [LLM Chat Analytics](#4-llm-chat-analytics) | `llm-chat-analytics/` | 1 | Anthropic (community; guide-reported) | ad-click-aggregator, dashboarding |
+| 4 | [LLM Chat Analytics](#4-llm-chat-analytics) ✅ Built | [`llm-chat-analytics/`](./llm-chat-analytics/) | 1 | Anthropic (community; guide-reported) | ad-click-aggregator, dashboarding |
 | 5 | [LLM Inference API](#5-llm-inference-api) | `llm-inference-api/` | 1 | Anthropic (candidate reports, including batching and routing variants) | rate-limiter, scalable-api |
 | 6 | [Webhook Platform](#6-webhook-platform) | `webhook-platform/` | 1 | OpenAI (community) | payment-system, stripe |
 | 7 | [Multi-Org Dashboard](#7-multi-org-dashboard) ✅ Built | [`multi-org-dashboard/`](./multi-org-dashboard/) | 2 | Practice extension (frontend practice sheet); Anthropic (candidate report of a prompt-sharing variant) | prompt-playground, slack, notion |
@@ -77,14 +77,14 @@ Public reports don't say which prompts a frontend-focused design round uses. Thi
 
 | Prompt (signal) | Study now | Still missing | Plan |
 |-----------------|-----------|---------------|------|
-| AI chat client: web, desktop, or an assistant sidebar added to an existing app (Anthropic candidate report for the desktop version; community attribution for chat rounds in general) | [prompt-playground](./prompt-playground/system-design-answer-frontend.md) deep dives 1 and 2: a run store that outlives navigation, resumable SSE and the cancel race. [mcplator](./mcplator/system-design-answer-frontend.md): streamed tokens and IndexedDB persistence. [imessage](./imessage/system-design-answer-frontend.md) and [slack](./slack/system-design-answer-frontend.md): offline reading and long histories | A message tree for edit and regenerate, and the desktop shell. The sidebar variant (assistant actions that change the host app, confirmations, safe rendering with citations) is built: [in-app-assistant](./in-app-assistant/system-design-answer-frontend.md) | [#2](#2-ai-chat-client), [#18](#18-in-app-assistant) |
+| AI chat client: web, desktop, or an assistant sidebar added to an existing app (Anthropic candidate report for the desktop version; community attribution for chat rounds in general) | [ai-chat](./ai-chat/system-design-answer-frontend.md) ✅ Built: the message tree, stream state keyed by generation, resume and Stop, streamed markdown, offline reading. [in-app-assistant](./in-app-assistant/system-design-answer-frontend.md) ✅ Built: the sidebar variant, with assistant actions the user confirms. Also [prompt-playground](./prompt-playground/system-design-answer-frontend.md) deep dives 1 and 2 | The desktop shell, which the answers cover but nothing builds | — |
 | Prompt playground (Anthropic community attribution, the most frequently reported prompt) | [prompt-playground](./prompt-playground/) ✅ Built | A version diff view and a grid that compares several models | Extend prompt-playground |
 | Prompt-sharing platform (Anthropic candidate report, mostly backend) | [multi-org-dashboard](./multi-org-dashboard/) ✅ Built: its prompt library shares by role or revocable link, and removal revokes a member's links. prompt-playground: fork into a workspace. [google-docs](./google-docs/) and [collaborative-editor](./collaborative-editor/): concurrent editing | Real-time co-editing of a shared prompt, and closing an open prompt the instant its sharing changes | [#7](#7-multi-org-dashboard) |
-| Analytics dashboard for an AI chat product (Anthropic guide-reported) | [dashboarding](./dashboarding/system-design-answer-frontend.md) and [ad-click-aggregator](./ad-click-aggregator/system-design-answer-frontend.md): query keys derived from URL state, honest freshness, downsampling, metrics that can't be summed | Definitions for chat metrics, comparison periods, drill-down to raw records, daily buckets in each organization's time zone, cost metrics hidden by role | [#4](#4-llm-chat-analytics) |
+| Analytics dashboard for an AI chat product (Anthropic guide-reported) | [llm-chat-analytics](./llm-chat-analytics/system-design-answer-frontend.md) ✅ Built: chat metric definitions, comparison periods, drill-down to raw records, daily buckets in each organization's time zone, cost metrics hidden by role. Also [dashboarding](./dashboarding/system-design-answer-frontend.md) and [ad-click-aggregator](./ad-click-aggregator/system-design-answer-frontend.md): downsampling and honest freshness | — | — |
 | Multi-org dashboard with roles and feature flags (practice sheet; no company attribution) | [multi-org-dashboard](./multi-org-dashboard/system-design-answer-frontend.md) ✅ Built. Also [slack](./slack/system-design-answer-frontend.md): switching workspaces; [supabase-dashboard](./supabase-dashboard/): a console over many projects | — | — |
 | General product app such as banking (Anthropic community attribution) | [paypal](./paypal/system-design-answer-frontend.md), [venmo](./venmo/system-design-answer-frontend.md), [robinhood](./robinhood/system-design-answer-frontend.md) | — | — |
 
-**Build order for frontend rounds:** #2, then #7, then #4. Each covers a different family of follow-ups: long-lived streaming state in the client, access control in the client, and numbers a user can trust. Draft each project's `system-design-answer-frontend.md` early, since that file is what gets rehearsed, and revise it once the running implementation has exposed the real defects.
+**Rehearsal order for frontend rounds:** #2 (with #18 for the sidebar variant), then #7, then #4. All of them are built. Each covers a different family of follow-ups: long-lived streaming state in the client, access control in the client, and numbers a user can trust. Each project's `system-design-answer-frontend.md` is the file to rehearse.
 
 ## Shared Decisions for the LLM Projects
 
@@ -224,6 +224,8 @@ Each answer should also walk through **one successful and one failed execution t
 ### 4. LLM Chat Analytics
 
 **Folder:** `llm-chat-analytics/` · **Signal:** Anthropic (community attribution; guide-reported as a dashboard for an AI chat app)
+
+**Status:** ✅ Built. See [llm-chat-analytics/](./llm-chat-analytics/) and its [architecture.md](./llm-chat-analytics/architecture.md). The entry below is kept as the brief.
 
 **Problem.** Near-real-time dashboards for an AI chat product: active users, conversation activity, response latency, error rates, token usage and adoption of product features.
 
