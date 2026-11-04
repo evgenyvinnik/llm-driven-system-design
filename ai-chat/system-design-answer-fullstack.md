@@ -7,10 +7,11 @@
 | Phase | Time | What the interviewer should leave with |
 |-------|------|----------------------------------------|
 | Requirements and scope | ~5 min | What's in, what's out (inference, sharing), production targets |
-| Workflow, entities, client state | ~9 min | Why a generation is its own record; where every piece of state lives |
+| Workflow, entities, client state | ~7 min | Why a generation is its own record; where every piece of state lives |
 | API contracts | ~4 min | How each request behaves when retried or raced |
-| Architecture and traces | ~8 min | One successful and one failed answer, step by step |
-| Deep dives | ~13 min | Resume/stop/retry, the generation-keyed store, the branching tree |
+| Architecture and traces | ~7 min | One successful and one failed answer, step by step |
+| Deep dives | ~12 min | Resume/stop/retry, the generation-keyed store, the branching tree |
+| Transport, tabs and devices | ~5 min | Why REST + SSE and not WebSockets; what a second tab and a second device cost |
 | Scale, checklist, wrap-up | ~5 min | What breaks first at 10× and 100×, and what I'd add next |
 
 ---
@@ -64,7 +65,7 @@
 
 ---
 
-## 💾 Entities (~4 min)
+## 💾 Entities (~3 min)
 
 ```
 conversation ── title, model, current_leaf_id
@@ -87,7 +88,7 @@ conversation ── title, model, current_leaf_id
 
 ---
 
-## 🖥️ Client State: What Lives Where (~3 min)
+## 🖥️ Client State: What Lives Where (~2 min)
 
 | State | Lives in | Survives refresh? | Why there |
 |-------|----------|-------------------|-----------|
@@ -132,7 +133,7 @@ GET    /api/v1/events                               → SSE: this user's changes
 
 ---
 
-## 🏗️ Architecture and the Generation Path (~8 min)
+## 🏗️ Architecture and the Generation Path (~7 min)
 
 ```
 ┌──────────────────────────────────────────┐
@@ -192,7 +193,7 @@ GET    /api/v1/events                               → SSE: this user's changes
 
 ---
 
-## 🔧 Deep Dives (~13 min)
+## 🔧 Deep Dives (~12 min)
 
 ### Deep dive 1: Resume, Stop and retry, end to end
 
@@ -274,7 +275,43 @@ Deltas are coalesced in a per-frame batcher: tokens append to a plain buffer and
 
 ---
 
-## 📡 Multi-Device Sync (~2 min)
+## 📡 Transport, Tabs and Devices (~5 min)
+
+### REST for commands, SSE for streams, no WebSocket
+
+> "I pick the transport from the traffic, not from which protocol sounds more real-time. Upstream is a few commands a minute, and each needs an outcome: `202`, the `409` that names the winning generation, `422`, `429`. That's request/response, so it's REST. Downstream is a one-way ordered log per generation, up to 100 events a second, that must resume from a cursor. That's SSE with event IDs."
+
+| Concern | ✅ REST + SSE over fetch | ❌ WebSocket |
+|---------|--------------------------|--------------|
+| Command outcomes | HTTP status codes; idempotency key in a header | Correlation IDs, acks and error codes rebuilt inside messages |
+| Resume | `Last-Event-ID` against the per-generation log | The same log, plus a custom "resume from" message |
+| Which instance serves it | Any; the log is in Valkey, so nothing is sticky | Any, but each socket holds memory and a file descriptor for hours |
+| Deploys | Streams drop and resume by cursor, like any network blip | Every socket drops at once: the same resume logic, plus a reconnect herd |
+| Session revocation | Cookie checked on every (re)connect; long streams re-check | Checked once at the upgrade; the server must re-check and close |
+| Edge | Plain HTTP; HTTP/2 multiplexes streams | Upgrade support at every proxy; one TCP connection each |
+| Two-way, high-rate traffic | No | Yes |
+
+The costs of SSE are operational, and I pay them on the server. Nothing on the path may buffer the response, so streams send `X-Accel-Buffering: no` and skip compression, and each 50 ms batch is flushed. A reasoning model can stay silent for 30 s before its first token, longer than some load balancers' idle timeouts, so streams write a comment ping every 15 s, and the client reconnects with its cursor after 45 s without a byte. And each open stream holds a dedicated blocking Valkey reader today, rank 2 below. That last one is a server problem whatever the transport; a multiplexed reader per instance fixes it.
+
+> "When would I use a WebSocket? A voice mode with audio both ways, tools that run in the browser many times per answer, or multiplayer presence. Even then I'd keep REST for commands and make the socket one more cursor-based reader of the same log. The log is the hard part, and both transports need it."
+
+### Multiple tabs
+
+The server is the sync point, so tabs exchange no data with each other.
+
+- **Same conversation, two tabs.** Both follow the same generation ID, so they show the same answer. One in-flight generation per conversation turns a send from the second tab into a deterministic `409` + attach.
+- **Connections are a per-browser budget.** Each tab holds one device stream plus one per in-flight generation. Under HTTP/1.1, browsers allow six connections per origin across all tabs, so six idle device streams starve the seventh tab's REST calls. HTTP/2 end to end is a requirement, not an optimization.
+- **Side effects are coordinated in the browser.** A BroadcastChannel carries sign-out to every tab: abort readers, clear stores. Only a visible tab raises the completion toast; with none visible, the holder of a Web Lock posts the native notification, tagged with the generation ID so duplicates collapse.
+- **The server backs the broadcast up.** Sign-out deletes the session. Open streams re-check it periodically and close with `401`, so a tab the broadcast missed (another browser profile, another device) stops within seconds.
+- **The next step at scale is one leader tab per browser.** It holds the lock and every stream and rebroadcasts events with their IDs. On handoff, the new leader resumes with `Last-Event-ID`, and followers drop IDs they've already applied. That takes device streams from one per tab to one per browser, which is rank 3 below.
+
+| Approach | Streams per user | Cost |
+|----------|------------------|------|
+| ✅ Independent tabs + HTTP/2 + coordinated side effects | One set per tab | More idle streams |
+| Next: leader tab (Web Locks + BroadcastChannel) | One set per browser | Handoff logic; a hidden leader gets throttled |
+| ❌ Uncoordinated tabs | One set per tab | Duplicate notifications; sign-out doesn't reach other tabs |
+
+### Multiple devices
 
 Each tab holds one device stream, `GET /api/v1/events`, carrying this user's changes from every device: answers created and finished, renames, deletions. The server publishes them on a per-user Valkey channel; each API instance holds one subscriber connection and subscribes only to the channels of users connected to it.
 
@@ -312,7 +349,7 @@ Assume a production peak of ≈ 3,500 answers/s, ≈ 35K concurrent generations,
 |------|-----------|---------------|-----|
 | 1 | PostgreSQL writes (10×: ≈ 500K/s) | ≈ 15 statements per answer, most of them checkpoints and lease renewals | Shard by user; checkpoint every 5 s under load; renew leases less often |
 | 2 | Generation streams (10×: ≈ 450K open) | Each open stream holds a dedicated blocking Valkey connection | One multiplexed reader per stream-service instance |
-| 3 | Device streams (10×: ≈ 15M) | One idle stream per tab; classic pub/sub broadcasts to every cluster node | Sharded pub/sub by user; one leader tab per browser via BroadcastChannel |
+| 3 | Device streams (10×: ≈ 15M) | One idle stream per tab; classic pub/sub broadcasts to every cluster node | Sharded pub/sub by user; one leader tab per browser (Web Locks + BroadcastChannel) |
 | 4 | Client memory on huge threads (100×: 10K-message threads) | Threads accumulate pages in memory | Evict pages far from the viewport; keep the virtualizer's window |
 | — | The model provider | The real ceiling | Admission control, fair share per user, `429` with Retry-After |
 
@@ -325,7 +362,8 @@ Assume a production peak of ≈ 3,500 answers/s, ≈ 35K concurrent generations,
 | Decision | ✅ Chosen | ❌ Alternative | Why |
 |----------|-----------|----------------|-----|
 | Generation ownership | Executor + lease + fencing | Stream from the POST | Answers outlive connections and devices |
-| Transport | SSE over fetch with `Last-Event-ID` | WebSocket / EventSource | One-way data, explicit resume from a checkpoint |
+| Transport | REST commands + SSE over fetch with `Last-Event-ID` | WebSocket / EventSource | Commands need status codes; the stream is one-way and resumes from a checkpoint |
+| Multiple tabs | Independent tabs, server as the sync point, side effects coordinated | Leader tab from day one | HTTP/2 makes extra streams cheap; leader election waits for evidence |
 | Partial output | Log + checkpoints paired with entry IDs | Completed messages only | Cheap exact refresh; survives crashes |
 | Live client state | Store keyed by generation ID | Component state | No cancel or leak on navigation |
 | Delta commits | One per animation frame | One per token | Paint at screen rate, not network rate |
@@ -339,7 +377,7 @@ Assume a production peak of ≈ 3,500 answers/s, ≈ 35K concurrent generations,
 ## 🚀 With More Time
 
 - **Summarize dropped context** instead of discarding it, so very long conversations keep their early decisions.
-- **One device stream per browser** rather than per tab, elected with BroadcastChannel, with other tabs fed over the channel.
+- **The leader tab**, so a browser holds one device stream instead of one per tab.
 - **A multiplexed stream reader** per API instance, removing one Valkey connection per viewer.
 - **A real provider adapter** behind an environment variable; the mock stays the default so setup, tests and screenshots work offline.
 - **Shared conversations**, which would turn the owner check into a membership check and make the current-leaf pointer per viewer rather than per conversation.
@@ -352,4 +390,4 @@ Assume a production peak of ≈ 3,500 answers/s, ≈ 35K concurrent generations,
 
 ### How the local implementation compares
 
-The repo runs all of this locally: a Vite, React 19, TanStack Router and Zustand frontend with `@tanstack/react-virtual`, marked as a lexer only, and `idb` for the offline cache; an Express API serving REST and both SSE streams; a separate executor process with leases, checkpoints and the sweeper; PostgreSQL, Valkey, and a mock model service whose admin knobs set time to first token, tokens per second, mid-stream errors, silent disconnects and concurrency, plus an API knob that cuts browser streams after N events. I verified it in a browser: streaming, refresh mid-answer, Stop, switching conversations mid-answer, edit and regenerate branches, two tabs showing the same live answer, and offline reading. Compared with this answer, there's one database and one Valkey, each stream holds its own Valkey connection, device fan-out uses classic pub/sub, auth is a session cookie, there's no real provider adapter, and old context is dropped rather than summarized.
+The repo runs all of this locally: a Vite, React 19, TanStack Router and Zustand frontend with `@tanstack/react-virtual`, marked as a lexer only, and `idb` for the offline cache; an Express API serving REST and both SSE streams; a separate executor process with leases, checkpoints and the sweeper; PostgreSQL, Valkey, and a mock model service whose admin knobs set time to first token, tokens per second, mid-stream errors, silent disconnects and concurrency, plus an API knob that cuts browser streams after N events. I verified it in a browser: streaming, refresh mid-answer, Stop, switching conversations mid-answer, edit and regenerate branches, two tabs showing the same live answer, and offline reading. Streams send 15 s comment pings and `X-Accel-Buffering: no`; cross-tab coordination (the sign-out broadcast, notification dedupe, the leader tab) and the client's silence watchdog are not built. Compared with this answer, there's one database and one Valkey, each stream holds its own Valkey connection, device fan-out uses classic pub/sub, auth is a session cookie, there's no real provider adapter, and old context is dropped rather than summarized.

@@ -8,9 +8,9 @@
 |-------|------|----------------------------------------|
 | Requirements and the range | ~4 min | "Find and answer" vs "act", and why products ship read-only first |
 | The blueprint and the panel | ~7 min | What's new vs existing; what the browser contributes |
-| The loop and two traces | ~8 min | One request end to end, and one where the model is fooled |
-| Key decisions, data model, API | ~10 min | Template vs agent, tool shape, answers as IDs, resumable streaming |
-| Deep dives | ~11 min | The durable turn, safety in code, permission-correct grounding |
+| The loop and two traces | ~7 min | One request end to end, and one where the model is fooled |
+| Key decisions, data model, API | ~8 min | Template vs agent, tool shape, answers as IDs, resumable streaming |
+| Deep dives | ~14 min | The durable turn, safety in code, permission-correct grounding, WebSockets or SSE and multiple tabs |
 | Scale, checklist, wrap-up | ~5 min | Model cost breaks first; prompt caching is the main lever |
 
 ---
@@ -163,7 +163,7 @@ The model keeps no memory between calls, so each pass sends the whole conversati
 
 ---
 
-## 🧭 One Request End to End (~5 min)
+## 🧭 One Request End to End (~4 min)
 
 ### ✅ Successful trace: "Add a short summary of Dana's thread from last week under the intro"
 
@@ -191,7 +191,7 @@ Without prefetch the model would have called `search_mail` first: 4 calls instea
 
 ---
 
-## 🧰 Key Decisions (~5 min)
+## 🧰 Key Decisions (~4 min)
 
 ### Template or agent?
 
@@ -255,7 +255,7 @@ Host tables that matter: mailbox entries decide mail visibility per message, not
 
 ---
 
-## 🔌 API and Streaming (~3 min)
+## 🔌 API and Streaming (~2 min)
 
 ```
 POST /api/v1/assistant/turns                 → 202 turn (Idempotency-Key required)
@@ -282,14 +282,11 @@ Events on the stream: turn status, text deltas (batched every 40 ms), text disca
 
 **Resume without duplicates.** A reconnect sends `Last-Event-ID` and replays from the per-turn log, so no text is lost or repeated and no new turn starts. A Lua append script refuses events after `turn.end`, so a turn never ends twice. If Valkey is down, turns still complete in PostgreSQL and the stream falls back to a snapshot once the turn ends.
 
-| Transport | Pros | Cons |
-|-----------|------|------|
-| ✅ SSE read with fetch | One-way data, resume built into the protocol, cookie auth | One connection per followed turn |
-| ❌ WebSocket | Bidirectional | Resume is hand-built; the client's few messages are ordinary POSTs anyway |
+Why SSE plus POSTs rather than a WebSocket, given that the server asks the browser for things mid-turn, is deep dive 4.
 
 ---
 
-## 🔧 Deep Dives (~11 min)
+## 🔧 Deep Dives (~14 min)
 
 ### Deep dive 1: The turn is a saved state machine, not a held request
 
@@ -370,6 +367,31 @@ running ──▶ completed | failed | cancelled
 | ❌ Vector-only with a post-filter | Misses exact IDs; empty pages | One filter bug leaks | Indexer lag |
 | ❌ No index, only host search APIs | Keyword only | Low | Instant, but no semantic match |
 
+### Deep dive 4: The server talks back: WebSockets or SSE, and which tab answers
+
+**Decision.** SSE over fetch for everything the server says, REST for everything the browser says, including its answers to the server's own questions. A turn records the tab that started it, and browser tool requests are addressed to that tab.
+
+**Why not a WebSocket, when the traffic is two-way?** The browser's side is a handful of messages per turn: a submit, up to three tool results, at most one decision. Each needs an exact outcome, and the server already defines them as status codes: a replayed `200`, a `409` for a conflicting decision, a no-op for a late tool result. As POSTs, any instance can take an answer, claim the turn with a conditional update and continue it, which is what lets a waiting turn cost one row (deep dive 1). Socket RPC, where the server sends the tool request and awaits the reply on the same connection, would pin each waiting turn to one connection on one instance. A deploy or a reconnect then loses the call, and avoiding that means rebuilding the replay log and answer-by-call-ID, which is what SSE plus POST already is. The extra round trip is tens of milliseconds next to model calls of one to five seconds.
+
+| Concern | ✅ SSE + POST answers | ❌ WebSocket |
+|---------|-----------------------|--------------|
+| A waiting turn's footprint | One row; any instance resumes it | A live socket per waiting turn, or a rebuilt resume |
+| Answers applied exactly once | Status codes + "applied only while waiting" | Acks and dedupe built by hand |
+| Deploys and reconnects | Replay by `Last-Event-ID`; POSTs land anywhere | Every socket drops; in-flight calls are lost |
+| Host infrastructure | The host app's HTTP stack, cookies, CSP and logs | Upgrade support through the host's proxies |
+
+The costs of SSE I accept are operational. Nothing on the path may buffer the stream. A comment ping every 15 s keeps a load balancer from cutting a turn that waits minutes for a confirmation, and the client reconnects with its cursor after 45 s of silence. And there's one Valkey reader per open stream, rank 3 in scale, which a multiplexed reader fixes whatever the transport. I'd change transports for a co-editing editor, where assistant edits should join the editor's own collaboration channel as one more participant, or for browser tools called dozens of times per turn.
+
+**Multiple tabs.** Conversations are per user and app, so two tabs on Docs share one, and the one-active-turn rule makes a second submit a `409` the tab attaches to. Three problems remain:
+
+1. **The wrong tab answers a browser tool.** Every tab following the turn receives `tool.request`, and the server applies the first result, possibly from another document. So the submit carries a tab ID, stored on the turn and stamped on each request, and only that tab runs the tool. If it's gone, the 30 s timeout applies, or another tab re-targets the call with a conditional update that succeeds only while the call is unanswered.
+2. **Decisions from two tabs.** Already safe: the decision is row-locked, the same decision twice is a no-op, a conflicting one is `409`, and `action.resolved` updates the other tab's card.
+3. **Connections.** Each tab follows up to three turns, and under HTTP/1.1 those share six connections per origin with the host app's own requests across all tabs, so the assistant could break Mail. HTTP/2 end to end is required. One leader tab per browser (a Web Lock plus a BroadcastChannel) cuts streams to one set per browser, while tool execution stays with the target tab.
+
+Same-browser hints, such as a document's new version, a turn started in another tab, or sign-out, travel over the BroadcastChannel; other devices pick up state on their next load.
+
+**What I give up.** A tab ID in the turn's API, and up to 30 s of stall when the starting tab closes. Re-targeting is a click, never automatic, because answering from a different document than the one the user asked about is worse than a short wait.
+
 ---
 
 ## ✅ Design Review Checklist (~1 min)
@@ -416,7 +438,8 @@ running ──▶ completed | failed | cancelled
 | Grounding | Prefetch when obvious + search tools | Prefetch only / tools only | Saves a round trip without capping recall |
 | Citations | IDs verified against retrieved sources | Free-text references | No invented items rendered as links |
 | Prompt layout | Fixed prefix, volatile data last | Date in system prompt | Cache hit rate above 60% |
-| Transport | SSE over fetch with Last-Event-ID | WebSocket | One-way, resumable, cookie auth |
+| Transport | SSE for the turn, POSTs for every answer to it | WebSocket RPC | Any instance takes an answer; waiting stays one row |
+| Multiple tabs | Browser tool requests addressed to the starting tab | Every tab answers | No answer from the wrong document |
 
 ---
 
@@ -426,4 +449,4 @@ running ──▶ completed | failed | cancelled
 
 ### How the local implementation compares
 
-The repo runs this design on one machine: a Vite and React 19 suite with the assistant panel; an Express API on :3000 that also runs the agent loop for turns it starts or resumes (a second instance on :3001 proves cross-instance resume); PostgreSQL 16 with pgvector for host data, turns and the index; Valkey for event streams, sessions and cancel; and an outbox-polling indexer. A mock model service speaks the provider's streaming wire format with a deterministic planner and on-demand failures (overload, mid-stream disconnect, max tokens, invented tools, loops, refusals, the gullible mode), and setting an API key switches to Claude with no code change. Simplifications: mock embeddings from hashed concept groups, HMAC-signed OBO tokens instead of an OAuth token exchange, server-applied suggestions instead of client-applied editor commands, and one org instead of per-tenant shards. Co-editing, sub-agents, MCP exposure, routing by complexity and maps-style structured results are not built. The eval runner replays 10 scenarios through the real orchestrator: 10/10 pass against the mock, right first tool 90%, about 2.1 calls and 7.9K tokens per task.
+The repo runs this design on one machine: a Vite and React 19 suite with the assistant panel; an Express API on :3000 that also runs the agent loop for turns it starts or resumes (a second instance on :3001 proves cross-instance resume); PostgreSQL 16 with pgvector for host data, turns and the index; Valkey for event streams, sessions and cancel; and an outbox-polling indexer. A mock model service speaks the provider's streaming wire format with a deterministic planner and on-demand failures (overload, mid-stream disconnect, max tokens, invented tools, loops, refusals, the gullible mode), and setting an API key switches to Claude with no code change. Simplifications: mock embeddings from hashed concept groups, HMAC-signed OBO tokens instead of an OAuth token exchange, server-applied suggestions instead of client-applied editor commands, and one org instead of per-tenant shards. Co-editing, sub-agents, MCP exposure, routing by complexity, maps-style structured results and tab-addressed browser tools are not built. The eval runner replays 10 scenarios through the real orchestrator: 10/10 pass against the mock, right first tool 90%, about 2.1 calls and 7.9K tokens per task.
