@@ -6,16 +6,16 @@
 
 | Phase | Time | What the interviewer should leave with |
 |-------|------|----------------------------------------|
-| R — Requirements | ~5 min | The user's workflow, client-facing targets, the trap |
-| A — Architecture | ~8 min | Panel layout, client layers, the server as one diagram |
-| D — Data model | ~6 min | Client context, the turn as a timeline, where state lives |
+| R — Requirements | ~4 min | The user's workflow, client-facing targets, the trap |
+| A — Architecture | ~7 min | Panel layout, client layers, the server as one diagram |
+| D — Data model | ~5 min | Client context, the turn as a timeline, where state lives |
 | I — Interface | ~4 min | Endpoints, events, the codes the UI branches on |
-| O — Optimizations | ~20 min | Three deep dives, plus rendering, templates, settings, accessibility, traces |
+| O — Optimizations | ~23 min | Four deep dives (the fourth: WebSockets or SSE when the server talks back, and multiple tabs), plus rendering, templates, settings, accessibility, traces |
 | Wrap-up | ~2 min | Trade-offs, what breaks first |
 
 ---
 
-## 🎯 R — Requirements Exploration (~5 min)
+## 🎯 R — Requirements Exploration (~4 min)
 
 ### Clarifying questions (and the answers I'll assume)
 
@@ -59,7 +59,7 @@
 
 ---
 
-## 🏗️ A — Architecture (~8 min)
+## 🏗️ A — Architecture (~7 min)
 
 ### Screen layout
 
@@ -151,7 +151,7 @@ Panel ◀─│ GET events (SSE, Last-Event-ID) ◀── per-turn event log ◀
 
 ---
 
-## 💾 D — Data Model (~6 min)
+## 💾 D — Data Model (~5 min)
 
 ### What the panel sends, and why
 
@@ -248,9 +248,9 @@ Every event's SSE `id` is its position in the turn's log, and that id is the res
 
 ---
 
-## 🔧 O — Optimizations and Deep Dives (~20 min)
+## 🔧 O — Optimizations and Deep Dives (~23 min)
 
-> "Three decisions carry this design: who owns a turn's stream, how the UI renders the moments a turn waits for the browser or the user, and how the assistant's edits reach the document. Each has an obvious alternative that breaks in a specific way."
+> "Three decisions carry this design: who owns a turn's stream, how the UI renders the moments a turn waits for the browser or the user, and how the assistant's edits reach the document. Each has an obvious alternative that breaks in a specific way. A fourth comes up in every interview: why not WebSockets, when the server talks back, and what happens with two tabs."
 
 ### Deep dive 1: A turn belongs to the store, not to the panel (~7 min)
 
@@ -285,7 +285,7 @@ Submitting is protected the same way. The composer mints one idempotency key per
 | ❌ Array for the visible conversation | Corrupts | One | No | Text lands in the wrong app |
 | ❌ Re-POST on reconnect | Yes | One | Yes | Double model cost, duplicate drafts |
 
-**What I give up.** Global state now has a lifecycle: logout must abort every stream, and finished turns that aren't in any visible slot need eviction. A turn has two sources, the stream and REST loads, so I need the "live copy wins" rule. And each active turn holds an HTTP connection. With one active turn per conversation and three apps, that's up to three streams per tab. Under HTTP/1.1 the browser allows six connections per origin across all tabs, so two tabs could starve the confirm POST. Production serves streams over HTTP/2.
+**What I give up.** Global state now has a lifecycle: logout must abort every stream, and finished turns that aren't in any visible slot need eviction. A turn has two sources, the stream and REST loads, so I need the "live copy wins" rule. And each active turn holds an HTTP connection, up to three per tab, which is where multiple tabs bite (deep dive 4).
 
 ### Deep dive 2: Client tools and confirmations are suspension points the UI must render (~7 min)
 
@@ -337,6 +337,42 @@ The revision bump is how host views stay true. The store knows which tools write
 | ✅ (with co-editing) Client-applied commands | No if tracked | Ctrl+Z | Native | Yes |
 
 **What I give up.** Suggestions clutter the document until someone decides. The revision bump is coarse: one write refetches every open view, which is fine for three apps but wasteful at scale, where I'd invalidate by resource instead. Ctrl+Z doesn't undo a server-applied suggestion; the Undo button does. With client-applied commands, an edit can't complete if the tab closes mid-turn: the call times out after 30 seconds and the model reports that it couldn't apply it.
+
+### Deep dive 4: WebSockets or SSE when the server talks back, and which tab answers (~6 min)
+
+> "This product is the strongest case for WebSockets I know, because the server asks the browser for things mid-turn. I still don't use one, and the reason is the same property that makes multiple tabs and refreshes safe."
+
+**Decision.** The panel uses REST for everything it says (submit, tool results, confirm, decline, cancel) and SSE over fetch for everything it hears, one stream per active turn. A browser tool request is an event on the stream, and its answer is a POST any instance can receive. Each tab has an ID, and a turn's browser tools run only in the tab that started it.
+
+**Why the back-channel doesn't need a socket.** Count the panel's messages per turn: one submit, zero to three tool results, at most one confirmation. Each needs exactly-once handling and a precise outcome: a repeated confirm is a no-op `202`, a conflicting one is `409`, a tool result after the wait ended is a no-op. Those are status codes on ordinary POSTs. With a socket, the tempting design is RPC: the server sends `get_selection` and awaits the reply on the same connection. That ties the turn to one connection on one instance, which is the held request deep dive 1 rejected: a reconnect, a deploy or a refresh loses the call. Avoiding that means rebuilding a replayable log and answer-by-call-ID, which is what SSE plus POST already is. The cost of a POST over a socket frame is tens of milliseconds, next to model calls of one to five seconds.
+
+| Criterion | ✅ SSE events + REST answers | ❌ WebSocket RPC |
+|-----------|------------------------------|------------------|
+| Turn survives reconnect or refresh | Yes: the request replays, the answer is a POST to any instance | Only with a rebuilt replay log and answer-by-ID |
+| Exactly-once answers | Status codes + server checks | Acks and dedupe built by hand |
+| Host-app infrastructure | The host's HTTP stack, cookies, CSP and logs | An upgrade path through the host's proxies |
+| Round trip per browser tool call | One extra HTTP request | One frame |
+
+The stream has the usual operational rules: nothing on the path may buffer it (`X-Accel-Buffering: no`, no compression), a comment ping every 15 s keeps load balancers from cutting a turn that waits ten minutes for a confirmation, and the client reconnects with its cursor after 45 s without a byte.
+
+> "I'd revisit it if the editor gets real-time co-editing. Then the assistant's edits should travel the editor's existing collaboration channel as one more participant, while the panel's turn stays on SSE. The other trigger is browser tools called dozens of times per turn."
+
+**What a second tab changes.** Alice has Docs open in two tabs, or Docs in one and Mail in another. The server keeps one current conversation per app, so tabs on the same app share it.
+
+1. **Which tab runs a browser tool?** `get_selection` means the selection in the document Alice was looking at when she asked. If two tabs follow the turn (the second attached after a `409`, or reloaded), both receive `tool.request`. A per-tab replay guard alone lets both answer, the server keeps the first, and that may be the other tab's document; `open_item` could navigate the wrong tab. So the submit carries a tab ID (minted at load, kept in sessionStorage so a reload keeps it), the turn records it, and every tool request names its target tab. Other tabs show "Waiting for your other tab (Q3 Offsite Plan)". If the target tab is gone, the call fails after 30 s as before, or Alice clicks "Answer from this tab", which re-targets the call with a conditional update that succeeds only while it is unanswered.
+2. **Confirmation cards appear in every tab following the turn.** Approve in one, and `action.resolved` turns the other tab's card into "Approved in another tab". If both click, the second gets `409` and shows the same line. The server rules already exist; the UI needs the copy.
+3. **Host views go stale across tabs.** The revision bump refreshes the tab that ran the turn. A second tab on the same document would save over an old version and hit `409 VERSION_CONFLICT`. So the writing tab broadcasts `revision {docId, version}` on a BroadcastChannel, and other tabs showing that document refetch.
+4. **A turn started in another tab** is otherwise invisible until a submit (`409`) or a reload. The starting tab broadcasts `turn.started {app, turnId}`, and same-browser tabs follow it. Another device sees it on its next load.
+5. **Connections can break the host app.** Each tab follows up to three turns, and under HTTP/1.1 the six connections per origin are shared with Mail, Docs and Calendar's own requests in every tab. Assistant streams starving the host would break the first non-functional requirement. HTTP/2 end to end is mandatory. The next step is a leader tab per browser that holds a Web Lock, owns the streams and rebroadcasts events with their IDs; tool requests still run only in their target tab, so leading and answering are separate roles.
+6. **Sign-out** is broadcast to every tab: abort streams, drop pending tool runs, clear the stores.
+
+| Approach | Wrong-tab tool answers | Stale views | Connections | Cost |
+|----------|------------------------|-------------|-------------|------|
+| ✅ Target tab per turn + BroadcastChannel hints | Impossible | Refetched | One set per tab, on HTTP/2 | A tab ID in the API; three message types |
+| Next: plus a leader tab owning the streams | Impossible | Refetched | One set per browser | Handoff logic |
+| ❌ Every tab acts on every event | First answer wins, maybe from the wrong document | Version conflicts | One set per tab | None up front |
+
+**What I give up.** The tab ID becomes part of the turn's API, and a closed tab can stall a turn for up to 30 seconds. Re-targeting is a click, never automatic, because answering from a different document than the one Alice asked about is worse than a short wait.
 
 ### Rendering untrusted output, and citations from the app's own data
 
@@ -404,7 +440,8 @@ The settings page has toggles: let the assistant send email, let it edit documen
 |----------|--------|-------------|-----------|
 | Live turn state | Store keyed by turn ID, slots per app | Component state / one visible array | Turns outlive views; no cross-app text |
 | Stream ownership | Module map outside React | Effect in the panel | One connection per turn; survives close and switch |
-| Transport | fetch + SSE parser, Last-Event-ID | EventSource / WebSocket | Explicit cursor, status codes, cookie auth, one-way data |
+| Transport | SSE for the turn, REST for every answer to it | EventSource / WebSocket RPC | Explicit cursor, status codes, any instance takes an answer |
+| Multiple tabs | Tool requests addressed to the starting tab; hints over BroadcastChannel | Every tab acts on every event | No answer from the wrong document; no stale saves |
 | Reconnect | Re-read from cursor | Re-POST | No second turn, no duplicate writes |
 | Redone steps | Text keyed by step, `text.discard` | One string per turn | Remove exactly the redone text |
 | Document context | Outline with stable paragraph IDs | Editor model / char offsets | Robust to concurrent typing; cheap in tokens |
@@ -421,7 +458,7 @@ The settings page has toggles: let the assistant send email, let it edit documen
 
 **What breaks first at scale.**
 
-- **Connections.** One SSE stream per active turn per tab. HTTP/2 is mandatory. With many tabs, a BroadcastChannel with one leader tab owning the streams would dedupe connections and announcements. On the server, one blocking reader per open stream becomes a connection-count problem; one multiplexed reader per instance fixes it.
+- **Connections.** Up to three streams per tab, sharing the origin with the host app. HTTP/2 first, then the leader tab (deep dive 4). On the server, one blocking reader per open stream becomes a connection-count problem; one multiplexed reader per instance fixes it.
 - **Long conversations.** The turns map only grows and every turn is in the DOM. I'd evict finished turns outside the visible slot, page older turns from the server, and virtualize.
 - **Streaming cost on the main thread.** Re-parsing a long answer on every delta shows up as long tasks. Memoized blocks plus a live tail, and one commit per animation frame if several turns stream at once.
 - **Coarse refresh.** The revision bump refetches every open view on any write. With more apps I'd make write results carry the resource they changed and invalidate only that.
@@ -441,5 +478,6 @@ The repo's `frontend/` implements this design. The assistant store keeps turns k
 - The panel subscribes to the whole turns map rather than per-turn slices, so every delta re-renders the visible conversation.
 - Markdown re-parses the full text on each delta instead of only the last block, and updates aren't coalesced per animation frame.
 - There's no "Jump to latest" control when the reader has scrolled up.
+- Browser tools aren't addressed to a tab, and there's no cross-tab coordination, so a second tab following the same turn could answer `get_selection` from its own document. The streams do send 15 s pings and `X-Accel-Buffering: no`.
 
 Writing this answer against the code found two real defects, since fixed: a refresh mid-turn seeded the timeline from the REST copy and then replayed the stream from the start, so rows and the confirmation card appeared twice (active turns now start empty and the replay rebuilds them); and a `409` attached to a turn the tab hadn't loaded, so its events were dropped (the tab now fetches the turn first). The submit now retries a lost POST once with the same key, the panel shows when it is reconnecting, pending confirmations are announced, and the caret respects reduced motion.

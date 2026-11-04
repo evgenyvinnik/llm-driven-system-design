@@ -8,10 +8,10 @@
 |-------|------|----------------------------------------|
 | R — Requirements | ~5 min | Workflows, numeric targets, the trap I'm avoiding |
 | A — Architecture | ~6 min | Layout, client layers, the server contract the client relies on |
-| D — Data model | ~6 min | The message tree, where each kind of state lives |
-| I — Interface | ~4 min | Endpoints, stream events, the errors the UI branches on |
-| O — Optimizations | ~20 min | Three deep dives, then branching, long histories, offline, accessibility |
-| Variants | ~5 min | Desktop app; assistant sidebar inside an existing app |
+| D — Data model | ~5 min | The message tree, where each kind of state lives |
+| I — Interface | ~3 min | Endpoints, stream events, the errors the UI branches on |
+| O — Optimizations | ~24 min | Four deep dives (the fourth: WebSockets or SSE, and multiple tabs), then branching, long histories, offline, accessibility |
+| Variants | ~4 min | Desktop app; assistant sidebar inside an existing app |
 | Wrap-up | ~2 min | Traces, trade-offs, what breaks first |
 
 ---
@@ -112,7 +112,7 @@ Streams are opened by the generations store, never by a component. Components on
 
 ---
 
-## 💾 D — Data Model (~6 min)
+## 💾 D — Data Model (~5 min)
 
 ### Entities as the client sees them
 
@@ -159,7 +159,7 @@ The visible thread is the path from the root to the conversation's current leaf.
 
 ---
 
-## 🔌 I — Interface (~4 min)
+## 🔌 I — Interface (~3 min)
 
 ```
 POST   /api/v1/conversations                         first message → conversation + generation
@@ -193,7 +193,7 @@ GET    /api/v1/events                                device sync SSE (this user'
 
 ---
 
-## 🔧 O — Optimizations and Deep Dives (~20 min)
+## 🔧 O — Optimizations and Deep Dives (~24 min)
 
 ### Deep dive 1: A generation-keyed stream store, and the A → B switch (~7 min)
 
@@ -265,6 +265,79 @@ The rule is simple: **reuse the key while the outcome is unknown; mint a new one
 
 **What I give up.** Explicit state machines on both sides, a merge rule that must be tested (a store test covers it), and a pending bubble that can sit in "failed" until the user acts. I prefer that to a duplicated, billed answer.
 
+### Deep dive 4: WebSockets or SSE, and what a second tab changes (~7 min)
+
+> "Two questions always come up here: why not WebSockets, and what happens when the user has the app open in three tabs. They're one question underneath, because the transport decides what each tab costs."
+
+**Decision.** Commands are plain REST calls: send, edit, regenerate, Stop, switch branch. Everything the server pushes arrives over SSE read with fetch: one stream per in-flight generation, plus one device stream per tab. There is no WebSocket. Tabs stay independent for data, with the server as the sync point, and coordinate only side effects (notifications, sign-out) through a BroadcastChannel and the Web Locks API.
+
+**Start from the shape of the traffic.**
+
+| Direction | What flows | Rate | What it needs |
+|-----------|------------|------|---------------|
+| Client → server | Send, edit, regenerate, Stop, switch branch | A few per minute | An outcome the UI branches on (202, 409, 422, 429), an idempotency key, auth, rate limits |
+| Server → client | One generation's tokens | 20–100 events/s for 5–60 s | Order, and a cursor to resume from |
+| Server → client | Device hints | A few per minute | Nothing durable: a hint, then REST |
+
+The upstream is request/response with outcomes, which is what HTTP is. The downstream is a one-way ordered log, which is what SSE with event IDs is. A WebSocket is a bidirectional pipe that gives me neither.
+
+**What a WebSocket would cost here.**
+
+- **I'd rebuild request/response inside it.** Every command needs a correlation ID, an acknowledgement, a timeout and an error vocabulary. The `409 GENERATION_IN_PROGRESS` with the winner's ID, which deep dive 3 depends on, becomes a message type I invent and that no proxy log understands.
+- **Resume isn't included.** A dropped socket loses whatever was in flight. I'd still need event IDs, the replayable log and a "resume from 41" message. The durable part, the log, is the same work for both transports, so the socket buys nothing on the hard problem.
+- **Auth goes stale.** The cookie is checked once, at the upgrade. A socket open for hours outlives a sign-out or a revoked session unless the server re-checks and closes it. An SSE reconnect is an ordinary request that carries the cookie every time.
+- **Infrastructure friction.** Some corporate proxies break the upgrade, load balancers need their own idle settings, and rate limits and logs move from per endpoint to per message. A classic WebSocket is also its own TCP connection, while SSE streams share one HTTP/2 connection.
+
+**What SSE costs, and how I pay it.**
+
+- **One-way, text only.** Fine for tokens and JSON hints. Voice would change this.
+- **The EventSource API is too limited**: no headers, no `Last-Event-ID` on the first request, opaque errors, a fixed retry. Hence fetch plus a small parser (deep dive 3).
+- **Buffering.** A proxy or compression middleware that buffers the response turns a stream into one lump at the end. The server sends `X-Accel-Buffering: no`, skips compression on event streams, and flushes each 50 ms batch.
+- **Idle timeouts.** A reasoning model can be silent for 30 s before its first token, and load balancers cut idle connections at 60 s or less. The server writes a comment line every 15 s. The client treats 45 s without a byte as a dead connection and reconnects with its cursor, because a half-open TCP connection never reports an error.
+- **Connections per origin**, which is the tab problem below.
+
+| Criterion | ✅ REST + SSE over fetch | ❌ WebSocket | ❌ Long polling |
+|-----------|--------------------------|--------------|-----------------|
+| Commands with outcomes | Status codes | Hand-built acks and errors | Status codes |
+| Token stream | Ordered events with IDs | Ordered frames, no IDs | Lumps, one response per batch |
+| Resume after a drop | `Last-Event-ID`, any instance | Custom resume message | Cursor in the URL |
+| Session expiry | Checked on every (re)connect | Checked at the upgrade only | Every request |
+| Proxies, CDNs, load balancers | Plain HTTP; disable buffering | Upgrade support, separate config | Plain HTTP |
+| Connections | Multiplexed on HTTP/2 | One TCP connection each | A new request per batch |
+| High-rate two-way traffic | No | Yes | No |
+
+> "I'd switch for three things: a voice mode with audio frames both ways (WebRTC, or a socket for that session), tools that run in the browser dozens of times per answer, or a multiplayer chat with typing presence. Even then commands stay REST and the generation log stays the record; the socket becomes one more reader with a cursor. The hard part is the replayable log. Once it exists, the pipe is a detail, and I pick the one with the least to rebuild."
+
+**What a second tab changes.** People keep the app open in several tabs, often the same chat twice.
+
+1. **Two tabs on one chat** must show the same streaming answer and the same branch. That already holds: both follow the same generation ID, following is idempotent, and branch changes arrive as device hints. If tab B sends while tab A's answer streams, the one-in-flight rule answers `409` and B attaches (deep dive 3).
+2. **The connection budget is per browser, not per tab.** Under HTTP/1.1, browsers allow six connections per origin across all tabs. Six tabs each holding a device stream use all six, and the seventh tab's REST calls queue behind idle streams: it looks frozen, not slow. HTTP/2 carries every tab's streams on one TCP connection (typically 100 or more concurrent streams), so production must serve HTTP/2 end to end.
+3. **Side effects multiply.** Three tabs mean three "Answer finished" notifications and three screen-reader announcements.
+4. **Identity.** Signing out in one tab leaves another showing chats from memory. Signing in as someone else in one tab must never mix that user's data into another tab's store.
+5. **Background tabs.** Hidden tabs get no animation frames and throttled timers, and mobile browsers freeze or discard them. Network reads still arrive, so the 500 ms fallback keeps the store current. A frozen tab's stream dies; on `visibilitychange` or `pageshow` the tab reconnects with its cursors and reconciles from REST.
+
+**How each is handled.** Only a visible tab shows the in-app toast and announces. If no tab is visible, whichever tab holds a `notifier` Web Lock posts the native notification, tagged with the generation ID so the operating system collapses any duplicate. Sign-out broadcasts `signed-out` on a BroadcastChannel: every tab aborts its readers, clears its stores and returns to the login page, and any `401`, or a session for a different user ID, does the same. Drafts stay per tab, in sessionStorage keyed by conversation, because two tabs typing into one shared box surprises people. Offline-cache writes are idempotent puts keyed by message ID, so duplicates cost nothing.
+
+**When connections become the problem: one leader tab.** Every tab requests an exclusive Web Lock named for the user. The holder opens the device stream and every generation stream, and rebroadcasts each event with its ID on a BroadcastChannel. Other tabs ask the leader to follow a generation instead of opening a stream. When the leader closes, the browser releases the lock and the next tab in line takes over, reconnecting with its own cursors. Followers drop any event whose ID they've already applied, so the handoff neither loses nor repeats text.
+
+```
+Tab 1 (holds the lock) ──SSE──▶ device stream, g7
+   │ BroadcastChannel: g7 · id 412 · delta
+   ├────────▶ Tab 2: applies it only if 412 > its cursor for g7
+   └────────▶ Tab 3: same
+Tab 1 closes ─▶ lock released ─▶ Tab 2 acquires it ─▶ reconnects g7 with Last-Event-ID 412
+```
+
+| Approach | Connections | Duplicate notifications | Failure mode | Complexity |
+|----------|-------------|-------------------------|--------------|------------|
+| ✅ Independent tabs on HTTP/2, side effects coordinated | One set per tab, multiplexed | None (lock + tag) | Nothing new | Low |
+| Next: leader tab via Web Locks + BroadcastChannel | One set per browser | None | A frozen or closing leader; the cursor covers the handoff | Medium |
+| ❌ SharedWorker owns the streams | One set per browser | None | Patchy mobile support, so the lock fallback is needed anyway | Medium, twice |
+| ❌ Service worker owns the streams | One set | None | The browser stops idle workers, and the streams die with them | High |
+| ❌ Independent tabs, no coordination | One set per tab | One per tab | Sign-out doesn't propagate | Lowest |
+
+**What I give up.** Independent tabs hold more connections than strictly needed. HTTP/2 makes that cheap and the server is already the sync point, so I'd measure open streams per browser before building leader election. Leader election has its own trap: a leader in a hidden tab is throttled and slows every follower, so leadership should move to the visible tab when visibility changes.
+
 ### Branch navigation
 
 ‹ 2/3 › appears on any message whose parent has more than one child. Edit opens an inline editor. Sending it creates a user sibling under the *same parent* and the thread re-renders as "path to the parent + new messages". Regenerate creates an assistant sibling under the same user message. Both are disabled while an answer is in flight in that conversation (the server would answer 409 anyway). When another device branches somewhere else in the open conversation, I don't yank the view. I only add the new sibling ID, so the counter becomes ‹ 1/2 ›.
@@ -291,7 +364,7 @@ The message list is an ARIA `feed` of `article`s ("You said" / "Assistant said")
 
 ---
 
-## 🖥️ Variant: a desktop app (~3 min)
+## 🖥️ Variant: a desktop app (~2 min)
 
 > "Same stores, same renderer, but the trust boundary moves. In a browser, XSS steals a session. In a desktop shell with Node access, XSS runs code on the user's machine, and model output is attacker-influenced text."
 
@@ -308,7 +381,7 @@ The message list is an ARIA `feed` of `article`s ("You said" / "Assistant said")
 
 ---
 
-## 🧩 Variant: an assistant sidebar inside an existing app (~3 min)
+## 🧩 Variant: an assistant sidebar inside an existing app (~2 min)
 
 > "Here the assistant doesn't just talk, it acts on the host app's data, so the rule is: the model proposes, the user confirms, the host executes."
 
@@ -328,6 +401,8 @@ The message list is an ARIA `feed` of `article`s ("You said" / "Assistant said")
 | Connection drops mid-answer: reconnect without a new generation? | Yes. The reader resumes with `Last-Event-ID`; a refresh resumes from the checkpoint's event ID. Neither re-POSTs |
 | Retry versus a new answer? | Same key while the outcome is unknown returns the same generation. Regenerate is a new key and a new sibling |
 | Same chat, two devices, submit at once? | One wins (one in-flight generation per conversation); the other gets 409 with the winner's ID, attaches, and keeps its text for Retry |
+| Why not WebSockets? | The traffic is commands with outcomes plus a one-way ordered log. REST and SSE give status codes and cursor resume for free; a socket rebuilds both (deep dive 4) |
+| Same chat open in two tabs? | Both follow the same generation ID; a send from the second gets `409` and attaches. Sign-out and notifications are coordinated over BroadcastChannel and a Web Lock |
 | Does Stop cancel backend work? | Yes. The worker aborts the model request and keeps the partial output, marked as partial |
 | Very long conversations? | Path pagination (40 per page), virtualization, prepend anchoring; the server truncates context |
 | Source of truth; when is a write successful? | PostgreSQL. A send succeeds at 202/200; an answer succeeds at `end: completed`, emitted after the commit |
@@ -350,7 +425,8 @@ The message list is an ARIA `feed` of `article`s ("You said" / "Assistant said")
 | Decision | Chosen | Alternative | Rationale |
 |----------|--------|-------------|-----------|
 | Live answer state | Store keyed by generation ID, readers outside React | Component state / per-conversation slot | Survives A→B with no leak or cancel |
-| Transport | SSE over fetch with an explicit cursor | EventSource / WebSocket | One-way data; resume from a REST checkpoint |
+| Transport | REST commands + SSE over fetch with an explicit cursor | EventSource / WebSocket | Commands need status codes; the stream is one-way and resumes from a REST checkpoint |
+| Multiple tabs | Independent tabs on HTTP/2, side effects coordinated | Leader tab now / SharedWorker | Server is the sync point; extra streams are cheap until measured otherwise |
 | Reconnect | Re-read from Last-Event-ID | Re-POST | Never a duplicate, billed answer |
 | Merge rule | Status only moves forward | Last response wins | Closes the Stop race |
 | Rendering | Lexer → React elements, memoized blocks, rAF batching | HTML string + sanitizer | No HTML path; cost bounded by the last block |
@@ -365,7 +441,7 @@ The message list is an ARIA `feed` of `article`s ("You said" / "Assistant said")
 
 ## 📈 What breaks first, and what I'd do next (~2 min)
 
-- **Connections per tab.** The device stream plus one stream per in-flight generation, times tabs, hits the HTTP/1.1 limit of six connections per origin. The fixes are HTTP/2 in production, then a `BroadcastChannel` with one leader tab owning the streams for all tabs, then one multiplexed stream per tab with a cursor per generation. Evidence: count open EventStreams in field telemetry against tab counts.
+- **Connections per browser.** The device stream plus one stream per in-flight generation, times tabs. HTTP/2 first, then the leader tab from deep dive 4, then one multiplexed stream per browser with a cursor per generation. Evidence: open streams per browser in field telemetry against tab counts.
 - **Main-thread cost on huge answers.** Re-lexing a 50 KB answer every frame starts to show up as long tasks. The fixes are tail-only lexing with a periodic full re-lex, or lexing in a worker. Evidence: long-task entries and input delay measured while streaming.
 - **Memory.** Threads and generation entries accumulate over a long session. I'd evict unpinned threads beyond about 30 and terminal entries off screen.
 
@@ -379,4 +455,4 @@ The message list is an ARIA `feed` of `article`s ("You said" / "Assistant said")
 
 ### How the local implementation compares
 
-`frontend/` implements this design: `stores/generations-store.ts` (keyed by generation ID, rAF batching via `lib/frame-batcher.ts`, forward-only merge, completion landing and announcements), `lib/markdown.tsx` (lexer to React, memoized blocks, link allowlist, no images), `services/sse-follow.ts` (fetch SSE with `Last-Event-ID` and backoff), `services/chat-actions.ts` (key rules, 409 attach), `components/chat/MessageList.tsx` (virtualization, follow-at-bottom, prepend anchoring) and `services/offline-cache.ts` (per-user IndexedDB). Store tests cover the A→B switch, landing, resume-from-checkpoint and the Stop race. Renderer tests cover hostile markup. The desktop and sidebar variants are design only. Not built yet: tail-only lexing, the leader-tab connection sharing, queued offline sends, syntax highlighting, and reduced-motion handling for the caret.
+`frontend/` implements this design: `stores/generations-store.ts` (keyed by generation ID, rAF batching via `lib/frame-batcher.ts`, forward-only merge, completion landing and announcements), `lib/markdown.tsx` (lexer to React, memoized blocks, link allowlist, no images), `services/sse-follow.ts` (fetch SSE with `Last-Event-ID` and backoff), `services/chat-actions.ts` (key rules, 409 attach), `components/chat/MessageList.tsx` (virtualization, follow-at-bottom, prepend anchoring) and `services/offline-cache.ts` (per-user IndexedDB). Store tests cover the A→B switch, landing, resume-from-checkpoint and the Stop race. Renderer tests cover hostile markup. The desktop and sidebar variants are design only. The server side of deep dive 4 is built: every stream sends a comment ping every 15 s and `X-Accel-Buffering: no`. Not built yet: tail-only lexing, the client's 45 s silence watchdog, cross-tab coordination (the sign-out broadcast, notification dedupe and the leader tab), queued offline sends, syntax highlighting, and reduced-motion handling for the caret.
