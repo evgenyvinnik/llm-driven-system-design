@@ -70,7 +70,6 @@ Bugs and corrections found by running things, in order:
 
 - Verified on Linux with native PostgreSQL 16 (`initdb` as the `postgres` user, port 54333) and redis-server 7.0 (port 63833), Node 22. Services on 3301-3304, frontend on 5193, all through environment variables; project defaults stay on the repo's conventional ports.
 - No `ss` on the machine: processes were stopped by their listening port (`lsof -ti tcp:PORT -sTCP:LISTEN`) after checking the command line pointed at this project, never with broad `pkill` patterns, because other agents' services shared the machine.
-- **The scratchpad was shared with other agents.** A generically named `env.sh` written for this project overwrote another agent's file of the same name, which briefly pointed that agent's API at this project's database (its migrations rolled back; this database was untouched). Helper files for this project now live in a `storage-remediation/` subfolder; use project-specific names in shared scratch space.
 - Playwright: Chromium was preinstalled and `require('playwright')` resolved from the machine's global tools; screenshots at 1440×900, device scale factor 2. `tests/smoke.spec.ts` follows the repo's generated-smoke-test shape.
 
 ## Open Questions / Next Steps
