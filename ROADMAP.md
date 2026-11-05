@@ -1,6 +1,6 @@
 # Roadmap: Planned Projects
 
-The next round of projects for this repository, focused on AI products and developer platforms: prompt tooling, LLM chat, token streaming, multi-tenant APIs and reliable asynchronous work. The list started as a survey of publicly reported system design questions and question banks (compiled October 2026), and was then checked against the projects that already exist here. Topics this repository already covers are listed separately with the gaps worth closing.
+The next round of projects for this repository, focused on AI products and developer platforms: prompt tooling, LLM chat, token streaming, multi-tenant APIs and reliable asynchronous work. The list started as a survey of publicly reported system design questions and question banks (compiled October 2026), and was then checked against the projects that already exist here. Topics this repository already covers are listed separately with the gaps worth closing. A second survey, in November 2026, added a [rail operations track](#rail-operations-track-bnsf) for BNSF Railway loops: predictive asset health from wayside sensors, locomotive fueling, and the existing system review round.
 
 Each planned project uses the standard layout described in [CLAUDE.md](./CLAUDE.md): `architecture.md`, the three `system-design-answer-*.md` files, a project `CLAUDE.md`, `frontend/`, `backend/` and `docker-compose.yml`. Each entry below is a starting point for that project's `architecture.md`. It gives the scope, core entities, the hard problems worth implementing and the follow-up questions the interview answers must cover.
 
@@ -15,6 +15,7 @@ Each planned project uses the standard layout described in [CLAUDE.md](./CLAUDE.
 - [Tier 1: Product-Facing Core](#tier-1-product-facing-core)
 - [Tier 2: Variations and Extensions](#tier-2-variations-and-extensions)
 - [Tier 3: Infrastructure Specialties](#tier-3-infrastructure-specialties)
+- [Rail Operations Track (BNSF)](#rail-operations-track-bnsf)
 - [Starting a Planned Project](#starting-a-planned-project)
 
 ## About the Sources
@@ -28,7 +29,7 @@ The **Signal** column says how strong the evidence is that a question appears in
 | Guide-reported | A preparation guide summarizes a candidate's experience. The underlying account was not inspected |
 | Practice extension | A recommended exercise. Not known to have been asked |
 
-Sources surveyed: Glassdoor, Aced (formerly Exponent) and Hello Interview. Project 16 also draws on Lodely, PracHub and 1point3acres. The [frontend round map](#frontend-round-map) also draws on PracHub, AceOffer and interviewing.io.
+Sources surveyed: Glassdoor, Aced (formerly Exponent) and Hello Interview. Project 16 also draws on Lodely, PracHub and 1point3acres. The [frontend round map](#frontend-round-map) also draws on PracHub, AceOffer and interviewing.io. Projects 19–24 (the [rail operations track](#rail-operations-track-bnsf)) draw on Glassdoor, Dataford, Interview Query, PracHub and Medium reports of BNSF Railway loops, surveyed in November 2026.
 
 ## Summary
 
@@ -52,10 +53,17 @@ Sources surveyed: Glassdoor, Aced (formerly Exponent) and Hello Interview. Proje
 | 16 | [File System](#16-file-system) ✅ Built | [`file-system/`](./file-system/) | 3 | Anthropic (community, online assessment; candidate report for the dedup variant) | dropbox |
 | 17 | [Console Growth Take-Home](#17-console-growth-take-home) ✅ Built | [`console-growth/`](./console-growth/) | 3 | Anthropic (candidate report: growth engineering take-home) | experimentation-platform |
 | 18 | [In-App Assistant](#18-in-app-assistant) ✅ Built | [`in-app-assistant/`](./in-app-assistant/) | 2 | Practice extension (the sidebar variant of #2, built out) | ai-chat (#2), document-qa (#8), prompt-playground |
+| 19 | [Railcar Health Monitoring](#19-railcar-health-monitoring) ✅ Built | [`railcar-health/`](./railcar-health/) | Rail | BNSF (candidate report: phone screen) | ad-click-aggregator, notification-system |
+| 20 | [Locomotive Fueling](#20-locomotive-fueling) ✅ Built | [`locomotive-fueling/`](./locomotive-fueling/) | Rail | BNSF (candidate report; telemetry variants guide-listed) | uber, job-scheduler |
+| 21 | [Storage Remediation](#21-storage-remediation) ✅ Built | [`storage-remediation/`](./storage-remediation/) | Rail | BNSF (guide-reported existing system review round); practice extension for the design | job-scheduler, rate-limiter |
+| 22 | [Freight Quote Service](#22-freight-quote-service) | `freight-quote/` | Rail | BNSF (candidate report) | scalable-api, rate-limiter, distributed-cache |
+| 23 | [Railcar Trip Plans and ETAs](#23-railcar-trip-plans-and-etas) | `railcar-trip-plans/` | Rail | Practice extension | local-delivery, notification-system |
+| 24 | [Yard Switch Lists](#24-yard-switch-lists) | `yard-switch-lists/` | Rail | Practice extension (BNSF describes the system publicly) | job-scheduler, railcar-health |
 
 - **Tier 1** covers the core product-facing work for AI and full-stack roles. Build these first, in the order listed.
 - **Tier 2** covers variations on tier-1 designs. Each reuses a tier-1 data model or an existing project's patterns.
 - **Tier 3** covers infrastructure specialties and lower-relevance topics. Build these when a target role calls for them.
+- **Rail** covers prompts reported for BNSF Railway loops and the domain around them. See the [rail operations track](#rail-operations-track-bnsf) for the rehearsal order.
 - **Builds on** lists existing projects whose patterns can be reused. Read their `architecture.md` before starting.
 
 ## Already Covered by Existing Projects
@@ -669,6 +677,193 @@ You find the highest-leverage growth opportunities and propose one large and one
 **Traps.** Building past the time box instead of shipping a scoped slice and writing down the cut. Ideas without sizing. Logging exposure only in the treatment. Pasting AI-generated ideas: the brief forbids it, and the transcript is reviewed.
 
 **Local scope.** An in-memory Express API (port 3001) and a React app on Vite (port 3000), following the brief's stack: plain JS, mocha + supertest, plus vitest for components. A Dev toolbar to force variants, stream events, reset the seed and simulate API traffic. `npm run readout` computes each experiment's metrics from the event log. [Experimentation Platform](#9-experimentation-platform) is the system design counterpart.
+
+---
+
+## Rail Operations Track (BNSF)
+
+A second survey (November 2026) covered system design questions reported for BNSF Railway's software, data and platform engineering loops. In early 2025 BNSF created an in-house technology division, bnsf | tech, to build more of its own software. Its public material emphasizes three areas: predictive asset health from wayside sensors, yard and network optimization, and AI. Candidate reports describe a final loop of about four to five hours, with separate rounds for coding, software design, system design, an **existing system review** (presenting a system you built) and behavioral questions. Design prompts in these reports usually have a railroad setting.
+
+Signals use the labels in [About the Sources](#about-the-sources). The interview reports come from Glassdoor, Dataford, Interview Query, PracHub and a Medium write-up. The domain context comes from BNSF's "Eyes on AI" page, its FY2025 10-K, Progressive Railroading, Railway Age, the AAR and Railinc.
+
+**Format notes from the reports.**
+- No drawing tool is provided. Bring your own whiteboard link and share your screen.
+- Several reports say interviewers give little help during technical rounds, so practice driving a whole design without prompts.
+- One report says some design questions matched common question banks, so the classic projects in this repository still apply. The rail-themed prompts are the ones worth rehearsing specifically.
+
+**Rehearsal order for a BNSF loop:**
+1. [#19 Railcar Health Monitoring](#19-railcar-health-monitoring)
+2. [#20 Locomotive Fueling](#20-locomotive-fueling)
+3. [#21 Storage Remediation](#21-storage-remediation): read its `existing-system-review.md` as a template for presenting your own system
+4. [#22 Freight Quote Service](#22-freight-quote-service): a generic reliability question in a rail setting
+
+**Public figures worth knowing for estimates.**
+
+| Fact | Value | Source |
+|------|-------|--------|
+| Network | 32,500+ route miles in 28 states | BNSF FY2025 10-K |
+| Fleet owned or leased | ~6,700 locomotives and ~70,700 freight cars | BNSF FY2025 10-K |
+| Wayside data | AI processes 35M+ readings a day; 1.5M+ wheels monitored; machine vision handles 2M+ images a day | BNSF "Eyes on AI" |
+| Hot bearing detector spacing | Average of 15 miles on key routes, at most 20 with acoustic detection, plus a standard for trend analysis | AAR Class I commitments, March 2023 |
+| Industry detector network | ~10,000 wayside detectors and 36M train passes a year feed Railinc's EHMS | Railinc |
+
+Most railcars on a Class I network belong to lessors and shippers, not to the railroad. A prompt about "200,000 railcars" therefore also means alerting the cars' owners.
+
+### 19. Railcar Health Monitoring
+
+**Folder:** [`railcar-health/`](./railcar-health/) · **Signal:** BNSF (candidate report: a phone screen asked for hot-wheel monitoring of 200,000 railcars, with risk alerts and the yard response; prep guides list real-time sensor systems as a topic) · ✅ Built
+
+**Problem.** Wayside detectors measure every passing train: bearing and wheel temperatures, wheel impact loads, acoustic bearing signatures and machine vision images. RFID (AEI) readers identify each car. The platform turns those readings into a maintenance decision for each car: stop the train, set the car out, inspect it at the next yard, or schedule it for the shop. It routes each decision to the right people and learns from what inspectors find.
+
+**Hard problems.**
+- **Two safety tiers.** The detector's own alarm stops the train over the radio and never depends on the cloud. The platform adds trending, fusion and the workflow on top.
+- **Trending before thresholds.** Compare each bearing with its own train, and with the same bearing at earlier detectors. A rising bearing is then caught before any single reading crosses an absolute threshold.
+- **Identity.** Map axle readings to car, axle and side using AEI reads and consists. This includes cars turned around on a wye, which swaps left and right.
+- **Late, duplicated and out-of-order data** from detector sites that store and forward. An alert computed late is routed to wherever the train is now.
+- **Detector health.** Detect a biased or silent detector instead of trusting it.
+- **Alert lifecycle.** One alert per bearing per trip, escalated in place. A car hold stops the yard from sending the car out before inspection. Inspection findings become labels.
+
+**Follow-ups the answers must handle.**
+- The cloud is down for two hours. What happens to a train with a burning bearing?
+- How do you catch a bearing that is heating up but hasn't yet crossed the alarm threshold?
+- Should the stream be partitioned by train trip or by car, and why?
+- Dispatchers ignore most alerts. What do you change?
+- Most of the cars aren't yours. Who gets told?
+- How do you roll out a new threshold or model safely?
+
+**Trap.** Putting the cloud in the path that stops trains, or treating every reading as live.
+
+### 20. Locomotive Fueling
+
+**Folder:** [`locomotive-fueling/`](./locomotive-fueling/) · **Signal:** BNSF (candidate report: "design a backend system for BNSF locomotives that uses real-time fuel level, GPS location, route information, fuel consumption rate, and fuel prices to recommend where the locomotive should stop for fuel and how much fuel it should purchase"). Two related telemetry prompts are also covered: a candidate report (sensor ingestion from 3,000+ trains) and a prep-guide listing (a location ping receiver for thousands of locomotives) · ✅ Built
+
+**Problem.** Locomotives report position, speed, throttle and fuel level. For each train, recommend where its locomotives should fuel and how much, across fixed fuel pads at terminals and truck fueling at sidings. Prices differ by location and change daily.
+
+**Hard problems.**
+- **Noisy fuel sensors.** Fuel sloshes on grades and in curves. Smooth the readings, and flag a drop while stationary (a leak or theft).
+- **The optimizer.** The greedy "gas station" rule is optimal for a fixed route with prices only. Dwell time, truck fees and lead times push you to dynamic programming over (stop, fuel level), with a safety reserve at every point.
+- **Plan stability.** Re-plan when actual burn drifts from the forecast, with hysteresis so the recommendation doesn't flip-flop. A stop with a truck already ordered is committed.
+- **Vendor orders with unknown outcomes.** Order trucks idempotently, handle timeouts, and reconcile against fuel tickets.
+- **The low-fuel alarm** comes from telemetry and works even when the planner is down.
+
+**Follow-ups the answers must handle.**
+- A train turns out heavier than planned and burns 20% more fuel. What changes, and when?
+- The truck vendor times out on an order. Did you just order two trucks?
+- How do you keep recommendations from changing every few minutes?
+- Telemetry from a region arrives two hours late in one burst. What happens downstream?
+
+**Trap.** Treating the question as greedy shortest-path and ignoring dwell, truck lead times and plan stability. Or spending the whole round on telemetry ingestion, which is the easy part at about a thousand messages a second.
+
+### 21. Storage Remediation
+
+**Folder:** [`storage-remediation/`](./storage-remediation/) · **Signal:** BNSF (guide-reported, plus candidate reports of an existing system review round in which the candidate presents a system they built and defends its architecture, trade-offs, scale, production issues, monitoring and improvements). The design question itself is a practice extension · ✅ Built
+
+**Problem.** Find and fix security misconfigurations across tens of thousands of cloud storage accounts without breaking the applications that use them. Examples: anonymous blob access, shared-key authentication, old TLS versions, open network access, and missing soft delete or diagnostics.
+
+**Different deliverable.** In addition to the standard files, `existing-system-review.md` presents this system the way the review round expects. It has a ten-minute walkthrough script, the three key decisions with their alternatives, an incident and what changed afterwards, and a bank of likely probes. Use it as a template for presenting your own system.
+
+**Hard problems.**
+- **Impact analysis before change.** Access logs show who still uses shared keys, SAS or anonymous reads. Classify each account as safe to fix now, needing owner migration first, or an exception.
+- **Safe rollout.** Waves, a bake period, rollback on authentication-failure signals, and a kill switch per campaign.
+- **Fleet-scale execution.** Per-subscription rate limits that honor `Retry-After`, idempotent applies with etags, crash-safe resume without double-applying a change, and reads that lag writes.
+- **Prevention after remediation.** Switch policy from audit to deny once a control is burned down, so new resources can't regress.
+
+**Follow-ups the answers must handle.**
+- Why not just flip the setting everywhere on a Friday night?
+- The executor crashes halfway through a wave. What happens on restart?
+- An application breaks after its account is fixed. How fast do you notice, and what rolls back?
+- How do owners get an exception, and what makes it expire?
+
+**Trap.** Presenting remediation as a script that loops over accounts, with no evidence, waves, verification or rollback.
+
+### 22. Freight Quote Service
+
+**Folder:** `freight-quote/` · **Signal:** BNSF (candidate report: a high-traffic quote endpoint whose dependent services are slow, and what architecture would improve service quality) · **Builds on:** scalable-api, rate-limiter, distributed-cache
+
+**Problem.** Shippers request price quotes for moving freight: origin, destination, commodity, car type and volume. A quote depends on several slow internal services: tariff and contract pricing, network capacity, fuel surcharge and car availability. Traffic is heavy, from customer portals and from API integrations that re-quote often. Design the endpoint so it stays fast and correct while dependencies are slow.
+
+**Core entities.**
+- `quote_request`: idempotency key, customer, lane (origin to destination), commodity, equipment type and quantity.
+- `quote`: priced lines, `firm` or `indicative`, a validity window, and the versions of the inputs it used (tariff version, fuel surcharge date).
+- `price_component`: one per dependency, with its source and freshness.
+
+**Hard problems to implement.**
+- **A latency budget per dependency.** Propagate deadlines, set timeouts, and hedge requests to the slowest service.
+- **Firm and indicative quotes.** When capacity or car availability is slow, return an indicative quote built from cached components, with explicit staleness. Upgrade it to firm asynchronously, with `202` and a callback or polling.
+- **Caching by lane.** Cache tariff and surcharge components by lane and commodity, and invalidate them when a tariff is published. Never share a customer's contract price with another customer through the cache.
+- **Circuit breakers and load shedding.** Shed API re-quote traffic before portal traffic, and rate-limit per customer.
+- **Request coalescing.** Collapse identical concurrent requests into one (single-flight).
+- **Honoring a quote.** A firm quote is a commitment. Store exactly what it was based on, so booking can honor it.
+
+**Follow-ups the answers must handle.**
+- The capacity service's p99 jumps to eight seconds. What does a customer see?
+- How stale may a cached price be, and who decides?
+- A customer integration re-quotes the same lane 50 times a minute. What happens?
+- A customer books against a quote whose tariff has since changed. Which price applies?
+
+**Trap.** Putting a cache in front of everything without saying which prices may be stale and how a stale price is labeled.
+
+**Local scope.** An Express quote API, mock dependency services with latency and failure knobs, Valkey for cache and rate limits, PostgreSQL for quotes, a customer portal, and an operations page showing per-dependency latency and breaker state.
+
+### 23. Railcar Trip Plans and ETAs
+
+**Folder:** `railcar-trip-plans/` · **Signal:** Practice extension (car visibility and trip plans are central to rail service, but the question is not known to have been asked) · **Builds on:** local-delivery, notification-system, #19
+
+**Problem.** Each loaded car moves through a trip plan: an origin, a sequence of yards and trains, and a destination. AEI readers and yard systems report where cars actually are. Track every car against its plan, detect missed connections early, predict ETAs, and show shippers where their cars are.
+
+**Core entities.**
+- `car`.
+- `trip_plan`: versioned, with ordered legs, each giving the train, the yard, and planned departure and arrival.
+- `car_event`: an AEI read, arrival, departure or placement, with its source and timestamp.
+- `eta_prediction`.
+- `exception`: a missed connection, a bad-ordered car, or dwell exceeded.
+
+**Hard problems to implement.**
+- **Events arrive out of order and duplicated.** A car's state machine must tolerate missing events.
+- **Replanning.** When a car misses its connection, create a new trip plan version and notify the customer, with the ETA shift.
+- **ETA from dwell, not distance.** Use historical dwell distributions per yard and the train schedules, and show a confidence range.
+- **Fan-out.** One delayed train affects thousands of cars and hundreds of customers, so batch the notifications.
+- **Access.** A shipper sees only its own cars, including cars moving on other railroads after interchange.
+
+**Follow-ups the answers must handle.**
+- A train carrying 100 cars for 40 customers is six hours late. What notifications go out?
+- An AEI reader misses a car. How do you know where the car is?
+- How accurate is your ETA, and how do you show its uncertainty?
+
+**Trap.** Treating ETA as distance divided by speed. Most of a car's transit time is spent waiting in yards.
+
+**Local scope.** A simulator of trains and yards that emits car events, an Express API, PostgreSQL, Valkey streams, an ETA model built from historical dwell, a shipper portal and an operations exceptions board.
+
+### 24. Yard Switch Lists
+
+**Folder:** `yard-switch-lists/` · **Signal:** Practice extension (BNSF publicly describes generating optimized switch lists with AI at its Alliance yard; not known to have been asked in interviews) · **Builds on:** job-scheduler, #19
+
+**Problem.** A classification yard receives inbound trains, sorts their cars into blocks on classification tracks, and assembles outbound trains. Design the service that produces each shift's switch list (the ordered moves), and replans it when trains run late.
+
+**Core entities.**
+- `inbound_train`.
+- `car`, with its destination block.
+- `track`, with capacity in feet.
+- `block`.
+- `outbound_train`: schedule, block sequence, and maximum length and tonnage.
+- `switch_list`: versioned ordered moves.
+- `move`.
+
+**Hard problems to implement.**
+- **Optimization under constraints.** Track capacity, block standing orders, departure times and hazardous-materials placement rules. Compare heuristics with a solver, and set a time limit per solve.
+- **Replanning.** A late inbound train invalidates part of the plan. Minimize changes to work already in progress.
+- **Human override.** The yardmaster edits the list, and the planner respects their locks.
+- **Holds from other systems.** A car hold from #19 must keep that car off outbound trains.
+- **Execution feedback.** Crews report completed moves from handhelds, and the plan follows what actually happened.
+
+**Follow-ups the answers must handle.**
+- A train arrives three hours late. What does the planner change, and what does it leave alone?
+- The yardmaster disagrees with the plan. How do overrides work?
+- How do you measure whether the planner beats the yardmaster?
+
+**Trap.** Spending the round on the optimization algorithm and ignoring replanning, overrides and execution feedback.
+
+**Local scope.** An Express API with a heuristic planner, PostgreSQL, a yard simulator, a yardmaster board with drag-to-override, and a crew handheld view.
 
 ---
 
