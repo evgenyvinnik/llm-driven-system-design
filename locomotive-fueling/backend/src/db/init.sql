@@ -189,6 +189,7 @@ CREATE TABLE IF NOT EXISTS plan_stops (
   fee           NUMERIC(8,2) NOT NULL,
   delay_cost    NUMERIC(10,2) NOT NULL,
   dwell_minutes DOUBLE PRECISION NOT NULL,
+  queue_minutes DOUBLE PRECISION NOT NULL DEFAULT 0,   -- expected wait for a bay (other trains' reservations)
   committed     BOOLEAN NOT NULL DEFAULT false,
   PRIMARY KEY (plan_id, seq)
 );
@@ -229,6 +230,8 @@ CREATE TABLE IF NOT EXISTS plan_evaluations (
   candidate_stops   TEXT NOT NULL,
   explanation       TEXT NOT NULL,
   projection        JSONB NOT NULL,           -- expected fuel profile of the plan in force
+  source            TEXT NOT NULL DEFAULT 'dp',
+  confidence        TEXT NOT NULL DEFAULT 'high',
   duration_ms       DOUBLE PRECISION NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_plan_evals_train ON plan_evaluations(train_id, id DESC);
@@ -319,3 +322,15 @@ CREATE TABLE IF NOT EXISTS model_params (
   updated_by TEXT NOT NULL,
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- ── Upgrades for databases created before the acceptance lifecycle ─────────
+ALTER TABLE fuel_options ADD COLUMN IF NOT EXISTS bays INTEGER NOT NULL DEFAULT 2;
+ALTER TABLE fuel_plans ADD COLUMN IF NOT EXISTS lifecycle TEXT NOT NULL DEFAULT 'recommended';
+ALTER TABLE fuel_plans ADD COLUMN IF NOT EXISTS accepted_by TEXT;
+ALTER TABLE fuel_plans ADD COLUMN IF NOT EXISTS accepted_at TIMESTAMPTZ;
+ALTER TABLE fuel_plans ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'dp';
+ALTER TABLE fuel_plans ADD COLUMN IF NOT EXISTS confidence TEXT NOT NULL DEFAULT 'high';
+ALTER TABLE fuel_plans ADD COLUMN IF NOT EXISTS assumptions JSONB NOT NULL DEFAULT '[]';
+ALTER TABLE plan_stops ADD COLUMN IF NOT EXISTS queue_minutes DOUBLE PRECISION NOT NULL DEFAULT 0;
+ALTER TABLE plan_evaluations ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'dp';
+ALTER TABLE plan_evaluations ADD COLUMN IF NOT EXISTS confidence TEXT NOT NULL DEFAULT 'high';

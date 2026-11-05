@@ -23,10 +23,14 @@ export type PlanTrigger =
   | 'param_change'
   | 'manual'
   | 'periodic'
+  | 'accepted'
+  | 'slot_conflict'
+  | 'reservation_expired'
+  | 'station_down'
 
 export async function enqueuePlan(trainId: string, trigger: PlanTrigger, detail = ''): Promise<boolean> {
   // Manual and safety triggers bypass coalescing: the person pressing the button expects a run.
-  const bypass = trigger === 'manual' || trigger === 'reroute'
+  const bypass = trigger === 'manual' || trigger === 'reroute' || trigger === 'accepted' || trigger === 'station_down'
   if (!bypass) {
     const fresh = await redis.set(keys.planPending(trainId), trigger, 'EX', config.planner.coalesceSeconds, 'NX')
     if (!fresh) {

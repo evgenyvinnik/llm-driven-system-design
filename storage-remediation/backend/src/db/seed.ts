@@ -144,7 +144,7 @@ async function seed(): Promise<void> {
 
   // Scan the same fleet in-process, with platform limits relaxed so seeding is quick.
   const scanFleet = new Fleet(structuredClone(state))
-  scanFleet.setFaults({ readCapacity: 100_000, readRefillPerSec: 100_000, graphCapacity: 1000, graphRefillPerSec: 1000 })
+  scanFleet.setFaults({ readCapacity: 100_000, readRefillPerSec: 100_000, graphCapacity: 1000, graphRefillPerSec: 1000, logQueryCapacity: 1000, logQueryRefillPerSec: 1000 })
   const deps = {
     db: pool,
     arm: new InProcessControlPlane(scanFleet, 'seed'),

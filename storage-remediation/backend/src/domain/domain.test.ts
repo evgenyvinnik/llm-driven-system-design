@@ -4,6 +4,7 @@ import { CONTROLS, evaluateAccount, getControl } from './controls.js'
 import { classifyEvidence, evidenceWindow, summarizeUsage, trafficPerMinute } from './evidence.js'
 import { canDecide, findExpired, isExceptionActive, isExpiringSoon, validateExceptionRequest } from './exceptions.js'
 import { planFindings } from './findings.js'
+import { decideAfterRead, errorBackoffMs, revalidatePlan, throttleBackoffMs } from './revalidate.js'
 import { riskScore } from './risk.js'
 import type { AccountSnapshot, UsageCaller, UsageSummary } from './types.js'
 
@@ -205,5 +206,42 @@ describe('exceptions', () => {
     expect(canDecide('u_carol', 'owner', { status: 'pending', requestedBy: 'u_bob' })).toMatch(/Only approvers/)
     expect(canDecide('u_carol', 'approver', { status: 'approved', requestedBy: 'u_bob' })).toMatch(/already approved/)
     expect(canDecide('u_carol', 'approver', { status: 'pending', requestedBy: 'u_bob' })).toBeNull()
+  })
+})
+
+describe('revalidation before a write (resource changed after discovery)', () => {
+  const base = { compliant: false, current: true, recordedBefore: null, intentFromEarlierAttempt: false, afterConflict: false, conflicts: 0, maxConflicts: 3 }
+
+  it('writes when nothing relevant changed', () => {
+    expect(decideAfterRead(base)).toEqual({ action: 'write' })
+    expect(decideAfterRead({ ...base, recordedBefore: true, afterConflict: true, conflicts: 1 })).toEqual({ action: 'write' })
+  })
+
+  it('tells "someone else fixed it" apart from "our earlier write landed"', () => {
+    expect(decideAfterRead({ ...base, compliant: true, current: false })).toMatchObject({ action: 'skip', reason: expect.stringMatching(/outside this campaign/) })
+    expect(decideAfterRead({ ...base, compliant: true, current: false, recordedBefore: true, intentFromEarlierAttempt: true })).toEqual({ action: 'recovered' })
+    expect(decideAfterRead({ ...base, compliant: true, current: false, recordedBefore: true, afterConflict: true })).toMatchObject({ action: 'skip', reason: expect.stringMatching(/concurrently/) })
+  })
+
+  it('escalates when another writer changed the same property, or keeps changing the resource', () => {
+    expect(decideAfterRead({ ...base, current: 'TLS1_1', recordedBefore: 'TLS1_0', afterConflict: true, conflicts: 1 }).action).toBe('escalate')
+    expect(decideAfterRead({ ...base, recordedBefore: true, afterConflict: true, conflicts: 3 }).action).toBe('escalate')
+  })
+
+  it('re-checks the plan: ring moves escalate, evidence changes skip', () => {
+    const plan = { breaking: true, plannedRing: 'nonprod' as const, currentRing: 'nonprod' as const, evidenceClass: 'safe_to_fix' as const, includeClasses: ['safe_to_fix' as const] }
+    expect(revalidatePlan(plan)).toBeNull()
+    expect(revalidatePlan({ ...plan, currentRing: 'prod' })?.action).toBe('escalate')
+    expect(revalidatePlan({ ...plan, evidenceClass: 'needs_owner_migration' })?.action).toBe('skip')
+    expect(revalidatePlan({ ...plan, breaking: false, evidenceClass: 'needs_owner_migration' })).toBeNull()
+  })
+
+  it('backs off longer for errors while also throttled, and never below Retry-After', () => {
+    expect([1, 2, 3].map((a) => errorBackoffMs(a, 0))).toEqual([1000, 2000, 4000])
+    expect(errorBackoffMs(1, 2)).toBe(4000)
+    expect(errorBackoffMs(10, 3)).toBe(60_000)
+    expect(throttleBackoffMs(7000, 0, 0)).toBe(7000)
+    expect(throttleBackoffMs(1000, 4, 0)).toBe(8000)
+    expect(throttleBackoffMs(1000, 4, 1)).toBe(8500)
   })
 })

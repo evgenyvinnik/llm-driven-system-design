@@ -67,6 +67,7 @@ export const config = {
     verifierMs: int('VERIFIER_INTERVAL_MS', 2_000),
     requeueAfterMs: int('REQUEUE_AFTER_MS', 20_000),
     maxAttempts: int('EXECUTOR_MAX_ATTEMPTS', 5),
+    maxThrottles: int('EXECUTOR_MAX_THROTTLES', 12),
     /** Our own per-subscription write budget, kept below the platform limit. */
     bucketCapacity: num('SUB_BUCKET_CAPACITY', 3),
     bucketRefillPerSec: num('SUB_BUCKET_REFILL_PER_SEC', 1),

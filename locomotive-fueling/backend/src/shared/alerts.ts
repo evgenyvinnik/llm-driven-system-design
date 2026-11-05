@@ -18,6 +18,9 @@ export type AlertType =
   | 'plan_infeasible'
   | 'missed_stop'
   | 'ticket_discrepancy'
+  | 'plan_voided'
+  | 'plan_proposal'
+  | 'slot_conflict'
 
 export interface AlertIntent {
   type: AlertType

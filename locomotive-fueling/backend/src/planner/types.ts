@@ -29,6 +29,8 @@ export interface FuelChoice {
   /** False when the option can't be used (inactive, too late to order a truck, vendor refused). */
   available: boolean
   unavailableReason?: string
+  /** Expected wait for a free bay at the ETA, from other trains' accepted reservations. */
+  queueMinutes?: number
 }
 
 /** A node on the remaining path. The last point is the destination. */
@@ -91,6 +93,7 @@ export interface SimStop {
   fee: number
   delayCost: number
   dwellMinutes: number
+  queueMinutes: number
   committed: boolean
 }
 

@@ -10,6 +10,8 @@ import { createRedisConnection, keys, redis } from '../shared/cache.js'
 import { config } from '../shared/config.js'
 import { pool } from '../shared/db.js'
 import { logger } from '../shared/logger.js'
+import { loadParams } from '../shared/repo.js'
+import { simNow } from '../shared/sim-clock.js'
 import { enqueuePlan, type PlanTrigger } from '../shared/triggers.js'
 import { planTrain } from './plan-service.js'
 
@@ -51,6 +53,18 @@ export class PlannerWorker {
     for (const r of rows) await enqueuePlan(r.id, 'initial')
   }
 
+  /** Accepted DTL stops that have entered the ordering window but have no order yet get a planner run. */
+  async orderWindowSweep(): Promise<void> {
+    const [params, now] = await Promise.all([loadParams(), simNow()])
+    const { rows } = await pool.query<{ trainId: string; optionId: string }>(
+      `SELECT c.train_id AS "trainId", c.option_id AS "optionId" FROM stop_commitments c JOIN fuel_options f ON f.id = c.option_id
+        WHERE c.state = 'accepted' AND f.kind = 'dtl' AND c.slot_start <= $1::timestamptz + make_interval(hours => $2)
+          AND NOT EXISTS (SELECT 1 FROM dtl_orders o WHERE o.stop_key = c.stop_key)`,
+      [now, params.orderWindowHours],
+    )
+    for (const r of rows) await enqueuePlan(r.trainId, 'periodic', `DTL order window opened for ${r.optionId}`)
+  }
+
   private async loop(): Promise<void> {
     let lastSweep = Date.now()
     while (this.running) {
@@ -60,6 +74,7 @@ export class PlannerWorker {
           lastSweep = Date.now()
           await redis.xautoclaim(keys.planRequests, GROUP, this.consumer, 30_000, '0', 'COUNT', 20)
           await this.planUnplanned()
+          await this.orderWindowSweep()
         }
         const res = (await this.reader.xreadgroup('GROUP', GROUP, this.consumer, 'COUNT', 10, 'BLOCK', 2000, 'STREAMS', keys.planRequests, '>')) as
           | [string, [string, string[]][]][]

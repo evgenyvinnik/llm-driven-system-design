@@ -6,9 +6,10 @@
  * @module executor/pg-store
  */
 import type { MetricWindow } from '../domain/bake.js'
+import type { EvidenceClass, Ring } from '../domain/types.js'
 import { pool, withTransaction } from '../shared/db.js'
 import { audit, notify } from '../store/audit.js'
-import type { CampaignInfo, TargetRow, TargetStore, WriteOutcome } from './types.js'
+import type { CampaignInfo, DeferKind, FinishState, TargetRow, TargetStore, WriteOutcome } from './types.js'
 
 interface Row {
   id: number
@@ -18,6 +19,9 @@ interface Row {
   wave_no: number
   state: TargetRow['state']
   attempts: number
+  throttle_count: number
+  planned_ring: Ring | null
+  operation_id: string | null
   fence: number
   before_value: unknown
   etag_before: string | null
@@ -39,6 +43,9 @@ function toTarget(r: Row): TargetRow {
     waveNo: r.wave_no,
     state: r.state,
     attempts: r.attempts,
+    throttleCount: r.throttle_count,
+    plannedRing: r.planned_ring ?? null,
+    operationId: r.operation_id,
     fence: r.fence,
     beforeValue: r.before_value,
     etagBefore: r.etag_before,
@@ -54,24 +61,33 @@ function toTarget(r: Row): TargetRow {
 
 const json = (v: unknown) => (v === undefined ? null : JSON.stringify(v))
 
+/** RETURNING list for claims: the row plus the ring of the wave it was planned in. */
+const RETURNING = `RETURNING campaign_targets.*, (SELECT w.ring FROM campaign_waves w WHERE w.campaign_id = campaign_targets.campaign_id AND w.wave_no = campaign_targets.wave_no) AS planned_ring`
+
 export class PgTargetStore implements TargetStore {
   async claim(id: number, owner: string, leaseMs: number): Promise<TargetRow | null> {
     const { rows } = await pool.query<Row>(
       `UPDATE campaign_targets SET state = 'applying', claimed_by = $2, lease_until = now() + make_interval(secs => $3),
               fence = fence + 1, enqueued_at = NULL, updated_at = now()
         WHERE id = $1 AND ((state = 'queued' AND (not_before IS NULL OR not_before <= now())) OR (state = 'applying' AND lease_until < now()))
-        RETURNING *`,
+        ${RETURNING}`,
       [id, owner, leaseMs / 1000],
     )
     return rows[0] ? toTarget(rows[0]) : null
   }
 
   async campaign(id: string): Promise<CampaignInfo | null> {
-    const { rows } = await pool.query<{ id: string; control_id: string; status: CampaignInfo['status']; bake: number }>(
-      `SELECT id, control_id, status, (config->>'bakeSeconds')::int AS bake FROM campaigns WHERE id = $1`,
+    const { rows } = await pool.query<{ id: string; control_id: string; status: CampaignInfo['status']; bake: number; include: EvidenceClass[] | null }>(
+      `SELECT id, control_id, status, (config->>'bakeSeconds')::int AS bake, config->'includeClasses' AS include FROM campaigns WHERE id = $1`,
       [id],
     )
-    return rows[0] ? { id: rows[0].id, controlId: rows[0].control_id, status: rows[0].status, bakeSeconds: rows[0].bake } : null
+    const r = rows[0]
+    return r ? { id: r.id, controlId: r.control_id, status: r.status, bakeSeconds: r.bake, includeClasses: r.include ?? ['safe_to_fix'] } : null
+  }
+
+  async currentEvidence(accountId: string, controlId: string): Promise<EvidenceClass | null> {
+    const { rows } = await pool.query<{ evidence_class: EvidenceClass | null }>('SELECT evidence_class FROM findings WHERE account_id = $1 AND control_id = $2', [accountId, controlId])
+    return rows[0]?.evidence_class ?? null
   }
 
   async exceptionActive(accountId: string, controlId: string): Promise<boolean> {
@@ -79,11 +95,11 @@ export class PgTargetStore implements TargetStore {
     return (rowCount ?? 0) > 0
   }
 
-  async recordIntent(t: TargetRow, intent: { beforeValue: unknown; etagBefore: string | null; baseline: MetricWindow }): Promise<boolean> {
+  async recordIntent(t: TargetRow, intent: { beforeValue: unknown; etagBefore: string | null; baseline: MetricWindow; operationId: string }): Promise<boolean> {
     const { rowCount } = await pool.query(
-      `UPDATE campaign_targets SET before_value = $3, etag_before = $4, baseline = $5, updated_at = now()
+      `UPDATE campaign_targets SET before_value = $3, etag_before = $4, baseline = $5, operation_id = $6, updated_at = now()
         WHERE id = $1 AND fence = $2 AND state = 'applying' AND before_value IS NULL`,
-      [t.id, t.fence, json(intent.beforeValue), intent.etagBefore, json(intent.baseline)],
+      [t.id, t.fence, json(intent.beforeValue), intent.etagBefore, json(intent.baseline), intent.operationId],
     )
     return (rowCount ?? 0) > 0
   }
@@ -105,18 +121,20 @@ export class PgTargetStore implements TargetStore {
         campaignId: t.campaignId,
         before: t.beforeValue,
         after: r.afterValue,
-        details: { etagBefore: t.etagBefore, etagAfter: r.etagAfter, wave: t.waveNo, outcome: r.outcome },
+        details: { etagBefore: t.etagBefore, etagAfter: r.etagAfter, wave: t.waveNo, outcome: r.outcome, operationId: t.operationId },
       })
       return true
     })
   }
 
-  async defer(t: TargetRow, notBefore: Date, reason: string, countAttempt: boolean): Promise<boolean> {
+  async defer(t: TargetRow, notBefore: Date, reason: string, kind: DeferKind): Promise<boolean> {
     const { rowCount } = await pool.query(
-      `UPDATE campaign_targets SET state = 'queued', not_before = $3, last_error = $4, attempts = attempts + CASE WHEN $5 THEN 1 ELSE 0 END,
+      `UPDATE campaign_targets SET state = 'queued', not_before = $3, last_error = $4,
+              attempts = attempts + CASE WHEN $5 = 'error' THEN 1 ELSE 0 END,
+              throttle_count = throttle_count + CASE WHEN $5 = 'throttle' THEN 1 ELSE 0 END,
               claimed_by = NULL, lease_until = NULL, enqueued_at = NULL, updated_at = now()
         WHERE id = $1 AND fence = $2 AND state = 'applying'`,
-      [t.id, t.fence, notBefore, reason, countAttempt],
+      [t.id, t.fence, notBefore, reason, kind],
     )
     return (rowCount ?? 0) > 0
   }
@@ -130,7 +148,7 @@ export class PgTargetStore implements TargetStore {
     return (rowCount ?? 0) > 0
   }
 
-  async finish(t: TargetRow, state: 'skipped' | 'failed' | 'cancelled', reason: string, actor: string, controlId: string): Promise<boolean> {
+  async finish(t: TargetRow, state: FinishState, reason: string, actor: string, controlId: string): Promise<boolean> {
     return withTransaction(async (c) => {
       const { rowCount } = await c.query(
         `UPDATE campaign_targets SET state = $3, last_error = $4, finished_at = now(), claimed_by = NULL, lease_until = NULL, updated_at = now()
@@ -139,7 +157,10 @@ export class PgTargetStore implements TargetStore {
       )
       if (!rowCount) return false
       if (state !== 'cancelled') {
-        await audit(c, { actor, action: `remediation.${state}`, accountId: t.accountId, controlId, campaignId: t.campaignId, details: { reason, wave: t.waveNo } })
+        await audit(c, { actor, action: `remediation.${state}`, accountId: t.accountId, controlId, campaignId: t.campaignId, details: { reason, wave: t.waveNo, operationId: t.operationId } })
+      }
+      if (state === 'escalated' || reason.startsWith('ROLLBACK')) {
+        await notify(c, { audience: 'security', kind: state === 'escalated' ? 'escalated_target' : 'rollback_failed', accountId: t.accountId, controlId, message: `${controlId} on ${t.accountId.split('/').pop()}: ${reason}`, dedupeKey: `${state}:${t.id}` })
       }
       return true
     })
@@ -152,14 +173,14 @@ export class PgTargetStore implements TargetStore {
           WHERE state IN ('baking', 'rolling_back') AND (lease_until IS NULL OR lease_until < now())
           ORDER BY state DESC, updated_at LIMIT $3 FOR UPDATE SKIP LOCKED)
        UPDATE campaign_targets t SET claimed_by = $1, lease_until = now() + make_interval(secs => $2), fence = t.fence + 1
-         FROM due WHERE t.id = due.id RETURNING t.*`,
+         FROM due WHERE t.id = due.id RETURNING t.*, NULL::text AS planned_ring`,
       [owner, leaseMs / 1000, limit],
     )
     return rows.map(toTarget)
   }
 
-  async releaseBaking(t: TargetRow): Promise<void> {
-    await pool.query(`UPDATE campaign_targets SET claimed_by = NULL, lease_until = NULL WHERE id = $1 AND fence = $2`, [t.id, t.fence])
+  async releaseBaking(t: TargetRow, countAttempt = false): Promise<void> {
+    await pool.query(`UPDATE campaign_targets SET claimed_by = NULL, lease_until = NULL, attempts = attempts + CASE WHEN $3 THEN 1 ELSE 0 END WHERE id = $1 AND fence = $2`, [t.id, t.fence, countAttempt])
   }
 
   async startRollback(t: TargetRow, reason: string, actor: string, controlId: string): Promise<boolean> {

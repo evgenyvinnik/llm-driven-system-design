@@ -12,12 +12,14 @@ const { PlannerWorker } = await import('./worker.js')
 const { startOrderWorker } = await import('../orders/order-worker.js')
 const { httpVendor } = await import('../orders/vendor-client.js')
 const { reconcileTickets } = await import('../orders/reconcile.js')
+const { expireReservations } = await import('./acceptance.js')
 
 const planner = new PlannerWorker()
 await planner.start()
 const stopOrders = startOrderWorker(httpVendor)
 const reconcileTimer = setInterval(() => {
   reconcileTickets().catch((err) => logger.error({ err }, 'reconcile failed'))
+  expireReservations().catch((err) => logger.error({ err }, 'reservation expiry failed'))
 }, 2000)
 const server = startWorkerHttp(config.plannerPort, 'planner', async () => {
   await Promise.all([pool.query('SELECT 1'), redis.ping()])

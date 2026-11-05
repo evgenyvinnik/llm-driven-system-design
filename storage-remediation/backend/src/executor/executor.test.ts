@@ -36,7 +36,7 @@ function setup(): Harness {
   // One well-behaved OAuth caller: turning shared key off breaks nothing (unless a test adds a dependency).
   account.clients = [{ id: 'oauth', app: 'api', authType: 'OAuth', callerIp: '10.0.0.5', userAgent: 'sdk', tlsVersion: 'TLS 1.2', protocol: 'HTTPS', perMinute: 60, schedule: 'continuous', lastRunDaysAgo: 0, brokenIntervals: [] }]
   const store = new MemoryTargetStore(clock)
-  store.campaigns.set('c1', { id: 'c1', controlId: 'SA-02', status: 'running', bakeSeconds: 60 })
+  store.campaigns.set('c1', { id: 'c1', controlId: 'SA-02', status: 'running', bakeSeconds: 60, includeClasses: ['safe_to_fix'] })
   store.addTarget({ id: 1, campaignId: 'c1', accountId: account.id, subscriptionId: account.subscriptionId })
   const buckets = new MemoryBuckets({ capacity: 10, refillPerSec: 10 }, clock)
   const events: CampaignEvent[] = []
@@ -54,7 +54,9 @@ function setup(): Harness {
     instanceId: 'test-executor',
     leaseMs: 15_000,
     maxAttempts: 3,
+    maxThrottles: 4,
     maxInlineWaitMs: 2000,
+    random: () => 0,
     baselineWindowMs: 60_000,
     thresholds: { minErrors: 5, baselineMultiplier: 3, minErrorRate: 0.02 },
   }
@@ -115,6 +117,8 @@ describe('idempotent apply', () => {
     expect(await processTarget(h.deps, 1)).toBe('applied')
     expect(h.store.get(1).writeOutcome).toBe('confirmed_after_5xx')
     expect(h.writes()).toBe(1)
+    // The activity log agrees: the operation that got a 500 did apply.
+    expect(h.fleet.operation(h.store.get(1).operationId!)).toMatchObject({ status: 500, applied: true })
   })
 
   it('defers after a 5xx that was not applied, counting the attempt, then succeeds later', async () => {
@@ -150,6 +154,109 @@ describe('idempotent apply', () => {
     h.store.exceptions.add(`${h.account.id}|SA-02`)
     expect(await processTarget(h.deps, 1)).toBe('skipped')
     expect(h.writes()).toBe(0)
+  })
+})
+
+describe('the resource changed after discovery', () => {
+  it('escalates instead of writing when the account moved to production after planning', async () => {
+    h.store.get(1).plannedRing = 'nonprod'
+    h.account.tags.env = 'prod'
+    expect(await processTarget(h.deps, 1)).toBe('escalated')
+    expect(h.store.get(1).lastError).toMatch(/planned in nonprod, now prod/)
+    expect(h.writes()).toBe(0)
+  })
+
+  it('skips when the evidence changed since planning (a caller appeared)', async () => {
+    h.store.evidence.set(`${h.account.id}|SA-02`, 'needs_owner_migration')
+    expect(await processTarget(h.deps, 1)).toBe('skipped')
+    expect(h.store.get(1).lastError).toMatch(/Evidence changed since planning/)
+    expect(h.writes()).toBe(0)
+  })
+
+  it('skips after a 412 when someone else fixed the property in the meantime', async () => {
+    const realWrite = h.deps.arm.write.bind(h.deps.arm)
+    h.deps.arm.write = async (...args) => {
+      h.fleet.writeResource(h.account.id, { properties: { allowSharedKeyAccess: false } }, undefined)
+      return realWrite(...args)
+    }
+    expect(await processTarget(h.deps, 1)).toBe('skipped')
+    expect(h.store.get(1).lastError).toMatch(/Fixed concurrently/)
+    expect(h.writes()).toBe(1) // theirs, not ours
+  })
+
+  it('escalates after a 412 when the same property was changed to a different insecure value', async () => {
+    h.store.campaigns.set('c2', { id: 'c2', controlId: 'SA-03', status: 'running', bakeSeconds: 60, includeClasses: ['safe_to_fix'] })
+    h.fleet.writeResource(h.account.id, { properties: { minimumTlsVersion: 'TLS1_0' } }, undefined)
+    h.store.addTarget({ id: 2, campaignId: 'c2', accountId: h.account.id, subscriptionId: h.account.subscriptionId })
+    const realWrite = h.deps.arm.write.bind(h.deps.arm)
+    h.deps.arm.write = async (...args) => {
+      h.fleet.writeResource(h.account.id, { properties: { minimumTlsVersion: 'TLS1_1' } }, undefined)
+      return realWrite(...args)
+    }
+    expect(await processTarget(h.deps, 2)).toBe('escalated')
+    expect(h.store.get(2).lastError).toMatch(/from "TLS1_0" to "TLS1_1"/)
+    expect(h.account.account.props.minimumTlsVersion).toBe('TLS1_1')
+  })
+})
+
+describe('lost responses and bounded retries', () => {
+  it('gives each write an identity, recorded before the call and visible in the activity log', async () => {
+    expect(await processTarget(h.deps, 1)).toBe('applied')
+    const opId = h.store.get(1).operationId!
+    expect(opId).toMatch(/^rem-c1-1-f1-a0$/)
+    expect(h.fleet.operation(opId)).toMatchObject({ resourceId: h.account.id, status: 200, applied: true })
+  })
+
+  it('reconciles a timed-out write against actual state instead of retrying it', async () => {
+    const realWrite = h.deps.arm.write.bind(h.deps.arm)
+    h.deps.arm.write = async (...args) => {
+      await realWrite(...args)
+      throw new Error('socket hang up')
+    }
+    expect(await processTarget(h.deps, 1)).toBe('applied')
+    expect(h.store.get(1).writeOutcome).toBe('confirmed_after_timeout')
+    expect(h.writes()).toBe(1)
+  })
+
+  it('retries a write that never landed a bounded number of times, backing off each time', async () => {
+    h.deps.arm.write = async () => {
+      throw new Error('ETIMEDOUT')
+    }
+    const delays: number[] = []
+    let outcome = ''
+    for (let i = 0; i < 5 && outcome !== 'failed'; i++) {
+      outcome = await processTarget(h.deps, 1)
+      const t = h.store.get(1)
+      if (outcome === 'deferred') {
+        delays.push(t.notBefore! - now)
+        now = t.notBefore!
+      }
+    }
+    expect(outcome).toBe('failed')
+    expect(delays).toEqual([1000, 2000])
+    expect(h.store.get(1).lastError).toMatch(/Gave up after 3 attempts/)
+    expect(h.writes()).toBe(0)
+  })
+
+  it('bounds retries under persistent throttling and backs off further on each 429', async () => {
+    // Other automation keeps the subscription's budget exhausted: every write gets 429, Retry-After 2s.
+    h.deps.arm.write = async () => ({ status: 429, retryAfterMs: 2000, body: { id: '', name: '', properties: {}, error: { code: 'TooManyRequests', message: 'throttled' } } })
+    const delays: number[] = []
+    let outcome = ''
+    for (let i = 0; i < 12 && outcome !== 'failed'; i++) {
+      outcome = await processTarget(h.deps, 1)
+      if (outcome === 'deferred') {
+        delays.push(h.store.get(1).notBefore! - now)
+        now = h.store.get(1).notBefore! + 1
+      }
+    }
+    expect(outcome).toBe('failed')
+    expect(h.store.get(1).throttleCount).toBe(4)
+    expect(delays.filter((d) => d >= 2000)).toHaveLength(4)
+    expect(delays[delays.length - 1]).toBeGreaterThan(delays[0])
+    expect(h.store.get(1).lastError).toMatch(/Gave up after 5 throttled attempts/)
+    // Our own bucket slowed down too (AIMD), so the herd doesn't come back at full speed.
+    expect(h.buckets.rateOf(h.account.subscriptionId)).toBeLessThan(10)
   })
 })
 

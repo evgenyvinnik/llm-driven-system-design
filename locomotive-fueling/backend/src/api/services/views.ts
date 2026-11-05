@@ -52,7 +52,19 @@ export interface TrainSummary {
   nextLocation: { id: string; name: string; milepost: number } | null
   calibration: number
   units: UnitView[]
-  plan: { version: number; status: string; costTotal: number; stops: number; nextStop: NextStopView | null; createdAt: string } | null
+  plan: {
+    version: number
+    status: string
+    lifecycle: string
+    source: string
+    confidence: string
+    costTotal: number
+    stops: number
+    nextStop: NextStopView | null
+    createdAt: string
+    proposalVersion: number | null
+    purchaseCost: number
+  } | null
   alerts: { critical: number; warning: number }
 }
 
@@ -87,8 +99,22 @@ export async function fleetSummaries(trainIds: string[] | null, includeArrived =
   const states = await readStates(trains.flatMap((t) => t.units.map((u) => u.locomotiveId)))
   const ids = trains.map((t) => t.id)
   const [plans, alerts] = await Promise.all([
-    pool.query<{ trainId: string; version: number; status: string; costTotal: number; createdAt: string; stops: NextStopView[] | null }>(
-      `SELECT p.train_id AS "trainId", p.version, p.status, p.cost_total::float AS "costTotal", p.created_at AS "createdAt",
+    pool.query<{
+      trainId: string
+      version: number
+      status: string
+      lifecycle: string
+      source: string
+      confidence: string
+      proposalVersion: number | null
+      purchaseCost: number
+      costTotal: number
+      createdAt: string
+      stops: NextStopView[] | null
+    }>(
+      `SELECT p.train_id AS "trainId", p.version, p.status, p.lifecycle, p.source, p.confidence, p.cost_total::float AS "costTotal", p.created_at AS "createdAt",
+              (SELECT q.version FROM fuel_plans q WHERE q.train_id = p.train_id AND q.lifecycle = 'proposed') AS "proposalVersion",
+              (SELECT COALESCE(sum(s.fuel_cost + s.fee), 0)::float FROM plan_stops s WHERE s.plan_id = p.id AND s.milepost >= p.milepost) AS "purchaseCost",
               (SELECT json_agg(json_build_object('locationId', s.location_id, 'name', l.name, 'kind', s.kind, 'etaMs', extract(epoch from s.eta) * 1000,
                        'gallons', round(s.gallons), 'orderStatus', o.status, 'milepost', s.milepost) ORDER BY s.seq)
                  FROM plan_stops s JOIN locations l ON l.id = s.location_id LEFT JOIN dtl_orders o ON o.stop_key = s.stop_key
@@ -136,6 +162,11 @@ export async function fleetSummaries(trainIds: string[] | null, includeArrived =
         ? {
             version: plan.version,
             status: plan.status,
+            lifecycle: plan.lifecycle,
+            source: plan.source,
+            confidence: plan.confidence,
+            proposalVersion: plan.proposalVersion,
+            purchaseCost: plan.purchaseCost,
             costTotal: plan.costTotal,
             stops: stopsAhead.length,
             nextStop: stopsAhead[0] ? { ...stopsAhead[0], etaMs: Number(stopsAhead[0].etaMs) } : null,
@@ -165,20 +196,24 @@ export async function trainDetail(trainId: string) {
 
   const [plan, versions, evaluations, orders, alerts, tickets] = await Promise.all([
     pool.query(
-      `SELECT p.id, p.version, p.status, p.trigger, p.reason, p.created_at AS "createdAt", p.milepost, p.cost_total::float AS "costTotal",
+      `SELECT p.id, p.version, p.status, p.lifecycle, p.accepted_by AS "acceptedBy", p.accepted_at AS "acceptedAt", p.source, p.confidence, p.assumptions,
+              p.trigger, p.reason, p.created_at AS "createdAt", p.milepost, p.cost_total::float AS "costTotal",
               p.cost_breakdown AS "costBreakdown", p.greedy_cost::float AS "greedyCost", p.greedy_stops AS "greedyStops", p.inputs, p.profile, p.calibration,
               COALESCE((SELECT json_agg(json_build_object(
                  'seq', s.seq, 'stopKey', s.stop_key, 'locationId', s.location_id, 'name', l.name, 'optionId', s.option_id, 'kind', s.kind,
                  'milepost', s.milepost, 'etaMs', extract(epoch from s.eta) * 1000, 'gallons', s.gallons, 'perUnit', s.per_unit,
                  'pricePerGal', s.price_per_gal::float, 'fuelCost', s.fuel_cost::float, 'fee', s.fee::float, 'delayCost', s.delay_cost::float,
-                 'dwellMinutes', s.dwell_minutes, 'committed', s.committed, 'orderStatus', o.status, 'orderId', o.id) ORDER BY s.seq)
+                 'dwellMinutes', s.dwell_minutes, 'queueMinutes', s.queue_minutes, 'committed', s.committed, 'orderStatus', o.status, 'orderId', o.id,
+                 'commitment', c.state, 'slotStart', c.slot_start, 'slotEnd', c.slot_end, 'expiresAt', c.expires_at) ORDER BY s.seq)
                  FROM plan_stops s JOIN locations l ON l.id = s.location_id LEFT JOIN dtl_orders o ON o.stop_key = s.stop_key
+                 LEFT JOIN stop_commitments c ON c.stop_key = s.stop_key
                 WHERE s.plan_id = p.id), '[]') AS stops
          FROM fuel_plans p WHERE p.train_id = $1 AND p.is_current`,
       [trainId],
     ),
     pool.query(
-      `SELECT p.version, p.status, p.trigger, p.reason, p.created_at AS "createdAt", p.cost_total::float AS "costTotal", p.milepost,
+      `SELECT p.version, p.status, p.lifecycle, p.source, p.accepted_by AS "acceptedBy", p.trigger, p.reason, p.created_at AS "createdAt",
+              p.cost_total::float AS "costTotal", p.milepost,
               COALESCE((SELECT string_agg(s.option_id, ' → ' ORDER BY s.seq) FROM plan_stops s WHERE s.plan_id = p.id), 'no stops') AS signature
          FROM fuel_plans p WHERE p.train_id = $1 ORDER BY p.version DESC LIMIT 30`,
       [trainId],
@@ -186,7 +221,7 @@ export async function trainDetail(trainId: string) {
     pool.query(
       `SELECT id, evaluated_at AS "evaluatedAt", trigger, trigger_detail AS "triggerDetail", decision, current_version AS "currentVersion",
               resulting_version AS "resultingVersion", incumbent_cost::float AS "incumbentCost", candidate_cost::float AS "candidateCost",
-              candidate_stops AS "candidateStops", explanation, duration_ms AS "durationMs"
+              candidate_stops AS "candidateStops", explanation, source, confidence, duration_ms AS "durationMs"
          FROM plan_evaluations WHERE train_id = $1 ORDER BY id DESC LIMIT 20`,
       [trainId],
     ),
@@ -208,6 +243,14 @@ export async function trainDetail(trainId: string) {
       [trainId],
     ),
   ])
+  const proposal = await pool.query(
+    `SELECT p.version, p.reason, p.cost_total::float AS "costTotal", p.cost_breakdown AS "costBreakdown", p.created_at AS "createdAt", p.profile,
+            COALESCE((SELECT json_agg(json_build_object('seq', s.seq, 'name', l.name, 'optionId', s.option_id, 'kind', s.kind, 'gallons', s.gallons,
+                       'etaMs', extract(epoch from s.eta) * 1000, 'fuelCost', s.fuel_cost::float) ORDER BY s.seq)
+               FROM plan_stops s JOIN locations l ON l.id = s.location_id WHERE s.plan_id = p.id), '[]') AS stops
+       FROM fuel_plans p WHERE p.train_id = $1 AND p.lifecycle = 'proposed'`,
+    [trainId],
+  )
   const latest = await pool.query(
     `SELECT evaluated_at AS "evaluatedAt", trigger, decision, explanation, projection FROM plan_evaluations WHERE train_id = $1 ORDER BY id DESC LIMIT 1`,
     [trainId],
@@ -215,6 +258,7 @@ export async function trainDetail(trainId: string) {
   return {
     train: { ...summary, path: nodes },
     plan: plan.rows[0] ?? null,
+    proposal: proposal.rows[0] ?? null,
     projection: latest.rows[0] ?? null,
     versions: versions.rows,
     evaluations: evaluations.rows,

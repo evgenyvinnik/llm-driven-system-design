@@ -37,7 +37,8 @@ export async function rollbackTarget(deps: VerifyDeps, t: TargetRow, control: Co
       await deps.sleep(Math.min(wait, 5000))
       wait = await deps.buckets.take(t.subscriptionId)
     }
-    const current = await deps.arm.get(t.accountId, control.kind)
+    const current = await deps.arm.get(t.accountId, control.kind).catch(() => null)
+    if (!current) continue
     if (current.status === 429 || current.status === 503) {
       await deps.sleep(current.retryAfterMs ?? 1000)
       continue
@@ -48,7 +49,8 @@ export async function rollbackTarget(deps: VerifyDeps, t: TargetRow, control: Co
       const ok = await deps.store.markRolledBack(t, { restoredValue: value, etagAfter: current.etag ?? null, outcome: 'already_restored' }, actor, control.id)
       return ok ? 'rolled_back' : 'lost_lease'
     }
-    const res = await deps.arm.write(t.accountId, control.kind, control.restore(t.beforeValue), current.etag)
+    const res = await deps.arm.write(t.accountId, control.kind, control.restore(t.beforeValue), current.etag, `${t.operationId ?? `rem-${t.id}`}-rollback-${attempt}`).catch(() => null)
+    if (!res) continue // no response: the next round re-reads and sees whether it landed
     if (res.status === 200) {
       const ok = await deps.store.markRolledBack(t, { restoredValue: control.read(res.body.properties as never), etagAfter: res.etag ?? null, outcome: 'written' }, actor, control.id)
       if (!ok) return 'lost_lease'
@@ -69,7 +71,14 @@ export async function rollbackTarget(deps: VerifyDeps, t: TargetRow, control: Co
     }
     // 412 or 5xx: loop re-reads; a 5xx that was applied shows up as already restored.
   }
-  await deps.store.releaseBaking(t)
+  // Bounded: after three failed rounds a human takes over (the account is still in the remediated state).
+  if (t.attempts + 1 >= 3) {
+    rollbacks.inc({ control: control.id, outcome: 'gave_up' })
+    await deps.store.finish(t, 'failed', `ROLLBACK FAILED after ${t.attempts + 1} rounds; restore ${JSON.stringify(t.beforeValue)} manually`, actor, control.id)
+    await deps.events(t.campaignId, { type: 'target.rollback_failed', accountId: t.accountId, waveNo: t.waveNo })
+    return 'rollback_failed'
+  }
+  await deps.store.releaseBaking(t, true)
   return 'rollback_pending'
 }
 
@@ -78,8 +87,8 @@ export async function checkBakingTarget(deps: VerifyDeps, t: TargetRow, controlI
   const actor = `service:${deps.instanceId}`
   if (t.state === 'rolling_back') return rollbackTarget(deps, t, control)
 
-  const current = await deps.arm.get(t.accountId, control.kind)
-  if (current.status === 429 || current.status === 503) {
+  const current = await deps.arm.get(t.accountId, control.kind).catch(() => null)
+  if (!current || current.status === 429 || current.status === 503) {
     await deps.store.releaseBaking(t)
     return 'baking'
   }

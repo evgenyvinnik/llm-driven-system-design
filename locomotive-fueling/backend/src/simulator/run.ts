@@ -45,6 +45,7 @@ let simMs = Date.now()
 const trains = new Map<string, SimTrain>()
 const scenarioLog: { at: number; name: string; note: string }[] = []
 const firedScenarios = new Set<string>()
+let downStation: string | null = null
 let startSimMs = simMs
 let paused = false
 let tickCount = 0
@@ -120,11 +121,27 @@ async function bootstrap(): Promise<void> {
 }
 
 // ── Crew behaviour ─────────────────────────────────────────────────────────
+const ACCEPT_WITHIN_HOURS = 8
+
+/**
+ * Reads the plan in force. Like a crew acknowledging on the cab tablet, it
+ * accepts a recommendation once the first stop is within a few hours; a
+ * proposed change after acceptance is left for the fuel desk to confirm.
+ */
 async function refreshInstructions(t: SimTrain): Promise<void> {
-  const res = await call<{ stops: Instruction[] }>('GET', `/api/v1/integrations/trains/${t.id}/instructions`)
-  if (res.status === 200 && res.data) {
-    t.instructions = res.data.stops
-    t.instructionsAt = simMs
+  const res = await call<{ stops: Instruction[]; lifecycle: string | null; version: number | null }>('GET', `/api/v1/integrations/trains/${t.id}/instructions`)
+  if (res.status !== 200 || !res.data) return
+  t.instructions = res.data.stops
+  t.planLifecycle = res.data.lifecycle
+  t.planVersion = res.data.version
+  t.instructionsAt = simMs
+  const first = t.instructions[0]
+  if (t.planLifecycle === 'recommended' && t.planVersion && first && first.etaMs - simMs < ACCEPT_WITHIN_HOURS * 3_600_000) {
+    const accepted = await call('POST', `/api/v1/integrations/trains/${t.id}/plans/${t.planVersion}/accept`, { actor: `crew of ${t.symbol} (cab tablet)` })
+    if (accepted.status === 200) {
+      t.planLifecycle = 'accepted'
+      logger.info({ train: t.symbol, version: t.planVersion }, 'crew accepted plan')
+    }
   }
 }
 
@@ -136,6 +153,7 @@ function startFuelStop(t: SimTrain, ins: Instruction): void {
   }
   t.state = 'dwelling'
   t.speed = 0
+  void call('PUT', `/api/v1/integrations/stops/${encodeURIComponent(ins.stopKey)}/state`, { state: 'executing' })
   t.dwell = { kind: 'fuel', instruction: ins, phase: 'setup', until: simMs + ins.setupMinutes * 60_000, remaining, delivered: {}, requested: { ...remaining } }
   logger.info({ train: t.symbol, at: ins.locationId, kind: ins.kind, gallons: Object.values(remaining).reduce((a, b) => a + b, 0) }, 'stopping to fuel')
 }
@@ -284,10 +302,12 @@ async function moveTrain(t: SimTrain, minutes: number): Promise<number> {
   const nextIdx = t.nodes.findIndex((n, i) => n.milepost > t.milepost + 1e-6 && !t.handledNodes.has(i))
   if (nextIdx >= 0) {
     const node = t.nodes[nextIdx]
-    if (node.milepost - t.milepost < 25 && simMs - t.instructionsAt > 6 * 60_000) await refreshInstructions(t)
+    const near = node.milepost - t.milepost < 25
+    if (simMs - t.instructionsAt > (near ? 6 : 30) * 60_000) await refreshInstructions(t)
     if (t.milepost + miles >= node.milepost) {
       const isDestination = nextIdx === t.nodes.length - 1
-      const stop = t.instructions.find((s) => s.locationId === node.locationId)
+      // Only accepted stops are real: a bay and (for DTL) a truck are reserved for them.
+      const stop = t.planLifecycle === 'accepted' ? t.instructions.find((s) => s.locationId === node.locationId) : undefined
       if (isDestination || stop) {
         miles = node.milepost - t.milepost
         burn(t, hours, miles)
@@ -398,6 +418,22 @@ const SCENARIOS: Record<string, () => Promise<void>> = {
     await call('POST', '/api/v1/integrations/prices', { optionId: 'GAL-DTL', pricePerGal: 2.42, note: 'Mesa Fuel Logistics spot discount at Gallup' })
     note('dtl_discount', 'Gallup DTL spot price cut from $2.97 to $2.42')
   },
+  async station_down() {
+    // Pick a pad that some train has accepted and has not reached yet, and take it out of service.
+    for (const t of trains.values()) {
+      const stop = t.planLifecycle === 'accepted' ? t.instructions.find((s) => s.kind === 'pad' && s.etaMs > simMs + 2 * 3_600_000) : undefined
+      if (!stop) continue
+      await call('POST', '/api/v1/integrations/prices', { optionId: stop.optionId, active: false, note: 'Pumps out of service' })
+      downStation = stop.optionId
+      return note('station_down', `${stop.optionId} out of service after ${t.symbol} accepted a stop there`)
+    }
+    note('station_down', 'No accepted pad stop ahead; skipped')
+  },
+  async station_up() {
+    if (!downStation) return note('station_up', 'Nothing to reopen')
+    await call('POST', '/api/v1/integrations/prices', { optionId: downStation, active: true, note: 'Pumps repaired' })
+    note('station_up', `${downStation} back in service`)
+  },
   async vendor_reject() {
     await vendor('PUT', '/vendor/v1/admin/settings', { rejectNext: 1 })
     note('vendor_reject', 'Mock vendor will refuse the next DTL order (no truck available)')
@@ -420,6 +456,8 @@ const SCHEDULE: { name: string; afterHours: number; when?: () => boolean }[] = [
     return Boolean(t && t.milepost > 112 && t.milepost < 205)
   } },
   { name: 'vendor_reject', afterHours: 4 },
+  { name: 'station_down', afterHours: 4.5 },
+  { name: 'station_up', afterHours: 7.5 },
   { name: 'short_fill', afterHours: 6 },
 ]
 
@@ -506,13 +544,14 @@ async function main(): Promise<void> {
     if (!stopped) setTimeout(() => void loop(), Math.max(0, config.simulator.tickMs - (Date.now() - started)))
   }
   void loop()
-  const shutdown = () => {
+  const shutdown = (signal: string) => {
+    logger.warn({ signal }, 'simulator stopping')
     stopped = true
     server.close()
     process.exit(0)
   }
-  process.on('SIGTERM', shutdown)
-  process.on('SIGINT', shutdown)
+  process.on('SIGTERM', () => shutdown('SIGTERM'))
+  process.on('SIGINT', () => shutdown('SIGINT'))
 }
 
 await main()

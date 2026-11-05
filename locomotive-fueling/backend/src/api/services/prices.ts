@@ -49,7 +49,8 @@ export async function changePrice(optionId: string, patch: PricePatch, by: strin
     patch.pricePerGal !== undefined
       ? `${optionId} $${before.price.toFixed(2)} → $${patch.pricePerGal.toFixed(2)}`
       : `${optionId} ${patch.active ? 'reopened' : 'closed'}`
-  for (const r of rows) await enqueuePlan(r.id, 'price_change', delta)
+  const trigger = patch.active === false ? 'station_down' : 'price_change'
+  for (const r of rows) await enqueuePlan(r.id, trigger, delta)
   await publishEvent({ type: 'price', id: optionId, note: delta })
   return { affectedTrains: rows.map((r) => r.id) }
 }

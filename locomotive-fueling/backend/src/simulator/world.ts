@@ -31,6 +31,7 @@ export interface Instruction {
   pricePerGal: number
   vendorOrderId: string | null
   orderStatus: string | null
+  etaMs: number
 }
 
 export type Dwell =
@@ -56,6 +57,9 @@ export interface SimTrain {
   dwell: Dwell | null
   arrivedAt: number | null
   instructions: Instruction[]
+  /** Lifecycle and version of the plan in force: the crew only stops for an accepted plan. */
+  planLifecycle: string | null
+  planVersion: number | null
   instructionsAt: number
   /** Nodes already handled (stopped at or deliberately passed), so a node isn't re-evaluated. */
   handledNodes: Set<number>
@@ -111,6 +115,8 @@ export function makeTrain(args: { id: string; symbol: string; routeId: string; p
     dwell: null,
     arrivedAt: null,
     instructions: [],
+    planLifecycle: null,
+    planVersion: null,
     instructionsAt: 0,
     handledNodes: new Set(nodeMileposts(legs).map((n, i) => (n.milepost <= args.milepost + 0.01 ? i : -1)).filter((i) => i >= 0)),
     darkBuffer: [],

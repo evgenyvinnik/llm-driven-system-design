@@ -16,6 +16,7 @@ import { loadTracks, loadTrain, loadTrains } from '../../shared/repo.js'
 import { readClock, simNow, writeClock } from '../../shared/sim-clock.js'
 import { readStates } from '../../shared/state.js'
 import { enqueuePlan } from '../../shared/triggers.js'
+import { acceptPlan } from '../../planner/acceptance.js'
 import { ingestBatch } from '../services/ingest.js'
 import { changePrice } from '../services/prices.js'
 
@@ -64,16 +65,45 @@ integrationsRouter.get(
 integrationsRouter.get(
   '/trains/:id/instructions',
   asyncHandler(async (req, res) => {
+    const plan = await pool.query<{ version: number; lifecycle: string }>(`SELECT version, lifecycle FROM fuel_plans WHERE train_id = $1 AND is_current`, [req.params.id])
     const { rows } = await pool.query(
-      `SELECT p.version, s.stop_key AS "stopKey", s.location_id AS "locationId", s.option_id AS "optionId", s.kind, s.milepost, s.per_unit AS "perUnit",
-              f.setup_minutes AS "setupMinutes", f.pump_gpm AS "pumpGpm", f.price_per_gal::float AS "pricePerGal",
-              o.vendor_order_id AS "vendorOrderId", o.status AS "orderStatus"
+      `SELECT s.stop_key AS "stopKey", s.location_id AS "locationId", s.option_id AS "optionId", s.kind, s.milepost, s.per_unit AS "perUnit",
+              extract(epoch from s.eta) * 1000 AS "etaMs", f.setup_minutes AS "setupMinutes", f.pump_gpm AS "pumpGpm", f.price_per_gal::float AS "pricePerGal",
+              o.vendor_order_id AS "vendorOrderId", o.status AS "orderStatus", c.state AS "commitment"
          FROM fuel_plans p JOIN plan_stops s ON s.plan_id = p.id JOIN fuel_options f ON f.id = s.option_id
-         LEFT JOIN dtl_orders o ON o.stop_key = s.stop_key
+         LEFT JOIN dtl_orders o ON o.stop_key = s.stop_key LEFT JOIN stop_commitments c ON c.stop_key = s.stop_key
         WHERE p.train_id = $1 AND p.is_current ORDER BY s.seq`,
       [req.params.id],
     )
-    res.json({ trainId: req.params.id, version: rows[0]?.version ?? null, stops: rows })
+    res.json({
+      trainId: req.params.id,
+      version: plan.rows[0]?.version ?? null,
+      lifecycle: plan.rows[0]?.lifecycle ?? null,
+      stops: rows.map((r) => ({ ...r, etaMs: Number(r.etaMs) })),
+    })
+  }),
+)
+
+/** The crew acknowledging the plan on the cab tablet (the simulator plays the crew locally). */
+integrationsRouter.post(
+  '/trains/:id/plans/:version/accept',
+  asyncHandler(async (req, res) => {
+    const actor = z.object({ actor: z.string().min(1).max(60) }).parse(req.body).actor
+    res.json(await acceptPlan(String(req.params.id), z.coerce.number().int().positive().parse(req.params.version), actor, 'accept'))
+  }),
+)
+
+/** The train is on site at an accepted stop: its commitment is now executing. */
+integrationsRouter.put(
+  '/stops/:stopKey/state',
+  asyncHandler(async (req, res) => {
+    const { state } = z.object({ state: z.enum(['executing']) }).parse(req.body)
+    const r = await pool.query<{ train_id: string }>(
+      `UPDATE stop_commitments SET state = $2, updated_at = now() WHERE stop_key = $1 AND state = 'accepted' RETURNING train_id`,
+      [req.params.stopKey, state],
+    )
+    if (r.rowCount) await publishEvent({ type: 'plan', trainId: r.rows[0].train_id, note: 'executing' })
+    res.json({ updated: Boolean(r.rowCount) })
   }),
 )
 
@@ -133,6 +163,7 @@ integrationsRouter.post(
         [req.params.id],
       )
       await pool.query(`UPDATE alerts SET status = 'resolved', resolved_at = $2 WHERE train_id = $1 AND locomotive_id IS NULL AND status <> 'resolved'`, [req.params.id, at])
+      await pool.query(`UPDATE stop_commitments SET state = 'cancelled', note = 'Train arrived', updated_at = now() WHERE train_id = $1 AND state = 'accepted'`, [req.params.id])
       await publishEvent({ type: 'train', trainId: req.params.id, note: 'arrived' })
     }
     res.json({ arrived: Boolean(r.rowCount) })
@@ -195,6 +226,9 @@ integrationsRouter.post(
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) ON CONFLICT (id) DO NOTHING`,
         [t.ticketId, t.source, order.rows[0]?.id ?? null, t.stopKey ?? null, t.trainId, t.locationId, t.optionId, t.deliveredAt, total, JSON.stringify(t.perUnit), t.pricePerGal, order.rows[0]?.fee ?? 0],
       )
+      if (ins.rowCount && t.stopKey) {
+        await db.query(`UPDATE stop_commitments SET state = 'fueled', updated_at = now() WHERE stop_key = $1 AND state IN ('accepted', 'executing')`, [t.stopKey])
+      }
       if (ins.rowCount && order.rows[0]) {
         await db.query(`UPDATE dtl_orders SET status = 'delivered', gallons_delivered = $2, updated_at = now() WHERE id = $1 AND status IN ('confirmed', 'cancel_requested', 'unknown')`, [
           order.rows[0].id,
@@ -220,8 +254,11 @@ integrationsRouter.post(
 integrationsRouter.post(
   '/prices',
   asyncHandler(async (req, res) => {
-    const body = z.object({ optionId: z.string(), pricePerGal: z.number().positive().max(20), note: z.string().max(200).optional() }).parse(req.body)
-    const result = await changePrice(body.optionId, { pricePerGal: body.pricePerGal }, 'price-feed', body.note ?? null, await simNow())
+    const body = z
+      .object({ optionId: z.string(), pricePerGal: z.number().positive().max(20).optional(), active: z.boolean().optional(), note: z.string().max(200).optional() })
+      .refine((b) => b.pricePerGal !== undefined || b.active !== undefined, 'pricePerGal or active required')
+      .parse(req.body)
+    const result = await changePrice(body.optionId, { pricePerGal: body.pricePerGal, active: body.active }, 'price-feed', body.note ?? null, await simNow())
     res.json(result)
   }),
 )

@@ -10,6 +10,12 @@ export interface ModelParams {
   reserveMinGal: number
   /** Forecast burn is inflated by this much when checking the reserve (planning against roughly p90 burn). */
   safetyMarginPct: number
+  /**
+   * Hysteresis on the safety check itself: the plan in force is declared unsafe only if it fails
+   * the reserve at (margin − this slack). Plans land on the boundary by design (buy just enough),
+   * so without slack every small burn update would flip them.
+   */
+  safetyKeepSlackPct: number
   /** Cost of one train-hour of delay (crew, locomotive time, network knock-on). */
   delayCostPerHour: number
   /** Fixed cost of stopping a train at all (braking, restart fuel, risk). */
@@ -47,6 +53,7 @@ export const DEFAULT_PARAMS: ModelParams = {
   reservePct: 0.1,
   reserveMinGal: 500,
   safetyMarginPct: 0.1,
+  safetyKeepSlackPct: 0.05,
   delayCostPerHour: 600,
   stopPenalty: 250,
   hysteresisAbs: 150,

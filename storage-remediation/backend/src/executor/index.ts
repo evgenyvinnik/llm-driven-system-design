@@ -42,6 +42,7 @@ const deps = {
   instanceId,
   leaseMs: config.executor.leaseMs,
   maxAttempts: config.executor.maxAttempts,
+  maxThrottles: config.executor.maxThrottles,
   maxInlineWaitMs: 2000,
   baselineWindowMs: 60_000,
   thresholds: config.executor.rollback,

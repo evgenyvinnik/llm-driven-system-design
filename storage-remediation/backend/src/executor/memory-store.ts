@@ -4,7 +4,8 @@
  * @module executor/memory-store
  */
 import type { MetricWindow } from '../domain/bake.js'
-import type { CampaignInfo, TargetRow, TargetState, TargetStore, WriteOutcome } from './types.js'
+import type { EvidenceClass } from '../domain/types.js'
+import type { CampaignInfo, DeferKind, FinishState, TargetRow, TargetState, TargetStore, WriteOutcome } from './types.js'
 
 export interface MemoryAudit {
   action: string
@@ -23,6 +24,7 @@ export class MemoryTargetStore implements TargetStore {
   targets = new Map<number, Stored>()
   campaigns = new Map<string, CampaignInfo>()
   exceptions = new Set<string>()
+  evidence = new Map<string, EvidenceClass>()
   auditLog: MemoryAudit[] = []
 
   constructor(private clock: () => number = Date.now) {}
@@ -32,6 +34,9 @@ export class MemoryTargetStore implements TargetStore {
       waveNo: 1,
       state: 'queued',
       attempts: 0,
+      throttleCount: 0,
+      plannedRing: null,
+      operationId: null,
       fence: 0,
       beforeValue: null,
       etagBefore: null,
@@ -90,12 +95,17 @@ export class MemoryTargetStore implements TargetStore {
     return this.exceptions.has(`${accountId}|${controlId}`)
   }
 
-  async recordIntent(t: TargetRow, intent: { beforeValue: unknown; etagBefore: string | null; baseline: MetricWindow }): Promise<boolean> {
+  async currentEvidence(accountId: string, controlId: string): Promise<EvidenceClass | null> {
+    return this.evidence.get(`${accountId}|${controlId}`) ?? 'safe_to_fix'
+  }
+
+  async recordIntent(t: TargetRow, intent: { beforeValue: unknown; etagBefore: string | null; baseline: MetricWindow; operationId: string }): Promise<boolean> {
     const s = this.guard(t, ['applying'])
     if (!s || s.beforeValue !== null) return false
     s.beforeValue = structuredClone(intent.beforeValue)
     s.etagBefore = intent.etagBefore
     s.baseline = intent.baseline
+    s.operationId = intent.operationId
     return true
   }
 
@@ -107,10 +117,17 @@ export class MemoryTargetStore implements TargetStore {
     return true
   }
 
-  async defer(t: TargetRow, notBefore: Date, reason: string, countAttempt: boolean): Promise<boolean> {
+  async defer(t: TargetRow, notBefore: Date, reason: string, kind: DeferKind): Promise<boolean> {
     const s = this.guard(t, ['applying'])
     if (!s) return false
-    Object.assign(s, { state: 'queued', notBefore: notBefore.getTime(), lastError: reason, leaseUntil: null, attempts: s.attempts + (countAttempt ? 1 : 0) })
+    Object.assign(s, {
+      state: 'queued',
+      notBefore: notBefore.getTime(),
+      lastError: reason,
+      leaseUntil: null,
+      attempts: s.attempts + (kind === 'error' ? 1 : 0),
+      throttleCount: s.throttleCount + (kind === 'throttle' ? 1 : 0),
+    })
     return true
   }
 
@@ -121,7 +138,7 @@ export class MemoryTargetStore implements TargetStore {
     return true
   }
 
-  async finish(t: TargetRow, state: 'skipped' | 'failed' | 'cancelled', reason: string, _actor?: string, _controlId?: string): Promise<boolean> {
+  async finish(t: TargetRow, state: FinishState, reason: string, _actor?: string, _controlId?: string): Promise<boolean> {
     const s = this.guard(t, ['applying', 'baking', 'rolling_back'])
     if (!s) return false
     Object.assign(s, { state, lastError: reason, leaseUntil: null })
@@ -143,9 +160,12 @@ export class MemoryTargetStore implements TargetStore {
     return out
   }
 
-  async releaseBaking(t: TargetRow): Promise<void> {
+  async releaseBaking(t: TargetRow, countAttempt = false): Promise<void> {
     const s = this.targets.get(t.id)
-    if (s && s.fence === t.fence) s.leaseUntil = null
+    if (s && s.fence === t.fence) {
+      s.leaseUntil = null
+      if (countAttempt) s.attempts += 1
+    }
   }
 
   async startRollback(t: TargetRow, reason: string, _actor?: string, _controlId?: string): Promise<boolean> {

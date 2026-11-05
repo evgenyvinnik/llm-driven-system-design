@@ -60,11 +60,18 @@ export interface OptimizeResult {
   stops: StopSpec[]
   /** DP objective (inflated burn), for diagnostics. */
   objective: number
+  /** The time budget ran out before the DP finished. */
+  timedOut?: boolean
+}
+
+export interface OptimizeOptions {
+  /** performance.now() value after which the DP gives up. */
+  deadline?: number
 }
 
 const EPS = 1e-9
 
-export function optimize(inputs: PlanInputs): OptimizeResult {
+export function optimize(inputs: PlanInputs, opts: OptimizeOptions = {}): OptimizeResult {
   const { units, points, params } = inputs
   const m = consistMetrics(units)
   const grid = params.gridGal
@@ -92,6 +99,9 @@ export function optimize(inputs: PlanInputs): OptimizeResult {
   V[n - 1] = last
 
   for (let j = n - 2; j >= 0; j--) {
+    if (opts.deadline !== undefined && performance.now() > opts.deadline) {
+      return { feasible: false, timedOut: true, reason: 'optimizer time budget exceeded', stops: [], objective: Infinity }
+    }
     const next = V[j + 1]
     const b = burnIdx[j]
     const p = points[j]
@@ -111,7 +121,11 @@ export function optimize(inputs: PlanInputs): OptimizeResult {
       if (!o.available) return
       const perStep = grid * m.S * (o.pricePerGal + params.delayCostPerHour / (60 * o.pumpGpm))
       const fixed =
-        o.fee + params.stopPenalty + (params.delayCostPerHour * o.setupMinutes) / 60 + committedCancel - (o.committed ? o.cancelFee : 0)
+        o.fee +
+        params.stopPenalty +
+        (params.delayCostPerHour * (o.setupMinutes + (o.queueMinutes ?? 0))) / 60 +
+        committedCancel -
+        (o.committed ? o.cancelFee : 0)
       // sufMin[L] = min over L' >= L of perStep·L' + next[L' - b]
       const sufMin = new Float64Array(M + 2).fill(Infinity)
       const sufArg = new Int32Array(M + 2).fill(-1)
@@ -250,7 +264,8 @@ export function simulate(inputs: PlanInputs, stops: StopSpec[], burnFactor: numb
       })
       const gallons = perUnit.reduce((s, x) => s + x.gallons, 0)
       if (gallons >= 1) {
-        const dwellMinutes = option.setupMinutes + gallons / option.pumpGpm
+        const queueMinutes = option.queueMinutes ?? 0
+        const dwellMinutes = queueMinutes + option.setupMinutes + gallons / option.pumpGpm
         const stop: SimStop = {
           seq: simStops.length + 1,
           locationId: p.locationId,
@@ -266,6 +281,7 @@ export function simulate(inputs: PlanInputs, stops: StopSpec[], burnFactor: numb
           fee: option.fee,
           delayCost: (params.delayCostPerHour * dwellMinutes) / 60,
           dwellMinutes,
+          queueMinutes,
           committed: option.committed,
         }
         simStops.push(stop)

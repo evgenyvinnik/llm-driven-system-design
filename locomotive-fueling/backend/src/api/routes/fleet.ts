@@ -10,6 +10,7 @@ import { pool } from '../../shared/db.js'
 import { asyncHandler, HttpError, notFound } from '../../shared/errors.js'
 import { simNow } from '../../shared/sim-clock.js'
 import { enqueuePlan } from '../../shared/triggers.js'
+import { acceptPlan, rejectProposal } from '../../planner/acceptance.js'
 import { fleetSummaries, trainDetail } from '../services/views.js'
 
 export const fleetRouter = Router()
@@ -36,7 +37,7 @@ fleetRouter.get(
         running: running.length,
         openAlerts: alerts.rows[0].n,
         activeOrders: orders.rows[0].n,
-        plannedFuelCost: Math.round(running.reduce((s, t) => s + (t.plan?.costTotal ?? 0), 0)),
+        plannedFuelCost: Math.round(running.reduce((s, t) => s + (t.plan?.purchaseCost ?? 0), 0)),
         lowestFuelPct: Math.min(...running.flatMap((t) => t.units.map((u) => u.fuelPct ?? 100)), 100),
       },
     })
@@ -99,5 +100,36 @@ fleetRouter.post(
   asyncHandler(async (req, res) => {
     await enqueuePlan(req.params.id, 'manual', `requested by ${req.user!.username}`)
     res.status(202).json({ queued: true })
+  }),
+)
+
+/** Accept the current recommendation: fuel desk for any train, crew for their own. */
+fleetRouter.post(
+  '/trains/:id/plans/:version/accept',
+  requireRole('fuel_desk', 'crew'),
+  asyncHandler(async (req, res) => {
+    checkTrain(req)
+    const version = z.coerce.number().int().positive().parse(req.params.version)
+    res.json(await acceptPlan(String(req.params.id), version, `${req.user!.username} (${req.user!.role.replace('_', ' ')})`, 'accept'))
+  }),
+)
+
+/** Confirm a change proposed after acceptance. Fuel desk only: it changes what the crew was told. */
+fleetRouter.post(
+  '/trains/:id/plans/:version/confirm',
+  requireRole('fuel_desk'),
+  asyncHandler(async (req, res) => {
+    const version = z.coerce.number().int().positive().parse(req.params.version)
+    res.json(await acceptPlan(String(req.params.id), version, `${req.user!.username} (fuel desk)`, 'confirm'))
+  }),
+)
+
+fleetRouter.post(
+  '/trains/:id/plans/:version/reject',
+  requireRole('fuel_desk'),
+  asyncHandler(async (req, res) => {
+    const version = z.coerce.number().int().positive().parse(req.params.version)
+    await rejectProposal(String(req.params.id), version, req.user!.username)
+    res.json({ rejected: version })
   }),
 )

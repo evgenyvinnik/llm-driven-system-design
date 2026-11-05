@@ -24,10 +24,13 @@ const COUNT_COLUMNS = `count(*)::int AS total,
   count(*) FILTER (WHERE t.state = 'verified')::int AS verified,
   count(*) FILTER (WHERE t.state = 'rolled_back')::int AS rolled_back,
   count(*) FILTER (WHERE t.state = 'skipped')::int AS skipped,
+  count(*) FILTER (WHERE t.state = 'escalated')::int AS escalated,
   count(*) FILTER (WHERE t.state = 'failed')::int AS failed,
   count(*) FILTER (WHERE t.state = 'cancelled')::int AS cancelled,
   count(*) FILTER (WHERE t.state = 'queued' AND t.not_before > now())::int AS deferred,
-  count(*) FILTER (WHERE t.write_outcome = 'recovered')::int AS recovered`
+  count(*) FILTER (WHERE t.write_outcome = 'recovered')::int AS recovered,
+  count(*) FILTER (WHERE t.write_outcome IN ('confirmed_after_5xx', 'confirmed_after_timeout'))::int AS reconciled,
+  COALESCE(sum(t.throttle_count), 0)::int AS throttles`
 
 function campaignDto(r: Record<string, unknown>) {
   return {
@@ -95,7 +98,8 @@ export async function campaignSnapshot(id: string, req: Request) {
       `SELECT t.id, t.account_id, a.name AS account_name, a.environment, t.wave_no, t.state, t.attempts, t.write_outcome, t.applied_at, t.bake_until,
               t.rollback_reason, t.last_error, t.not_before, t.updated_at, t.before_value, t.after_value
          FROM campaign_targets t JOIN storage_accounts a ON a.id = t.account_id
-        WHERE t.campaign_id = $1 AND t.state <> 'pending' AND ${scope} ORDER BY t.updated_at DESC LIMIT 40`,
+        WHERE t.campaign_id = $1 AND t.state <> 'pending' AND ${scope}
+        ORDER BY (t.state IN ('rolling_back', 'rolled_back', 'failed', 'escalated')) DESC, t.updated_at DESC LIMIT 40`,
       params,
     ),
   ])

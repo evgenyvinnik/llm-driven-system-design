@@ -8,6 +8,8 @@ import { forecastBurn, nodeMileposts, reserveGallons, unitShares, type Leg } fro
 import type { ModelParams } from '../domain/params.js'
 import type { FuelOptionRow, LocationRow, TrainRow } from '../shared/repo.js'
 import type { LocoState } from '../shared/state.js'
+import { queueWaitMinutes, type Slot } from './capacity.js'
+import { assessConfidence, type Confidence } from './confidence.js'
 import type { FuelChoice, PlanInputs, PlanUnit, RoutePoint } from './types.js'
 
 export interface OrderLite {
@@ -28,6 +30,8 @@ export interface AssembleArgs {
   params: ModelParams
   locations: Map<string, LocationRow>
   nowMs: number
+  /** Other trains' accepted pad/DTL reservations, by option. */
+  reservations?: Map<string, Slot[]>
   /** Plan against zero reserve (emergency mode, after the normal plan proved infeasible). */
   zeroReserve?: boolean
 }
@@ -36,6 +40,8 @@ export interface Assembled {
   inputs: PlanInputs
   currentMilepost: number
   trainCalibration: number
+  confidence: Confidence
+  dataAgeHours: number
 }
 
 export function assembleInputs(a: AssembleArgs): Assembled {
@@ -63,6 +69,17 @@ export function assembleInputs(a: AssembleArgs): Assembled {
     return s && !s.sensorSuspect && !s.leakSuspect
   })
   const trainCalibration = healthy.length ? healthy.reduce((s, u) => s + (states.get(u.locomotiveId)?.calibration ?? 1), 0) / healthy.length : 1
+  const dataAgeHours = leadState ? Math.max(0, (a.nowMs - leadState.recordedAt) / 3_600_000) : 0
+  const confidence = assessConfidence({
+    baseMarginPct: params.safetyMarginPct,
+    dataAgeHours,
+    trainCalibration,
+    sensorSuspectUnits: train.units.filter((u) => states.get(u.locomotiveId)?.sensorSuspect).map((u) => u.locomotiveId),
+    leakSuspectUnits: train.units.filter((u) => states.get(u.locomotiveId)?.leakSuspect).map((u) => u.locomotiveId),
+    stalenessMarginPerHour: params.stalenessMarginPerHour,
+    maxExtraMargin: params.maxExtraMargin,
+  })
+  const consistCapacity = train.units.reduce((s, u) => s + u.tankGal, 0)
 
   const nodes = nodeMileposts(legs)
   const ahead = nodes.filter((n) => (stopped ? n.milepost >= currentMilepost - 0.5 : n.milepost > currentMilepost + 0.05))
@@ -85,6 +102,8 @@ export function assembleInputs(a: AssembleArgs): Assembled {
             const live = order && (order.status === 'unknown' || order.status === 'confirmed' || (order.status === 'pending' && order.attempts > 0))
             const dead = order && ['rejected', 'failed', 'cancelled', 'cancel_requested'].includes(order.status)
             const hoursAway = (etaMs - a.nowMs) / 3_600_000
+            const typicalDwell = o.setupMinutes + (consistCapacity * 0.4) / o.pumpGpm
+            const queueMinutes = queueWaitMinutes(a.reservations?.get(o.id) ?? [], etaMs, typicalDwell, o.bays)
             let unavailableReason: string | undefined
             if (!o.active) unavailableReason = 'facility inactive'
             else if (dead) unavailableReason = `DTL order ${order!.status} earlier this trip`
@@ -102,6 +121,7 @@ export function assembleInputs(a: AssembleArgs): Assembled {
               committed: Boolean(live),
               available: !unavailableReason,
               unavailableReason,
+              queueMinutes,
             }
           })
     return {
@@ -125,7 +145,7 @@ export function assembleInputs(a: AssembleArgs): Assembled {
       points,
       params: {
         gridGal: params.gridGal,
-        safetyMarginPct: params.safetyMarginPct,
+        safetyMarginPct: confidence.marginPct,
         delayCostPerHour: params.delayCostPerHour,
         stopPenalty: params.stopPenalty,
         valueRemainingFuel: params.valueRemainingFuel,
@@ -134,5 +154,7 @@ export function assembleInputs(a: AssembleArgs): Assembled {
     },
     currentMilepost,
     trainCalibration,
+    confidence,
+    dataAgeHours,
   }
 }

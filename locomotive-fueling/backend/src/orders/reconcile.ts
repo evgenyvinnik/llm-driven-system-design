@@ -59,7 +59,10 @@ export async function reconcileTickets(): Promise<number> {
       continue
     }
     const observed = events.reduce((s, e) => s + e.observed, 0)
-    const ok = withinTolerance(t.gallonsTotal, observed)
+    // Compare where telemetry can see: units that took enough fuel to register a fueling event.
+    const billedVisible = t.perUnit.filter((u) => needEvidence.includes(u.locomotiveId)).reduce((s, u) => s + u.gallons, 0)
+    const observedVisible = events.filter((e) => needEvidence.includes(e.locomotiveId)).reduce((s, e) => s + e.observed, 0)
+    const ok = needEvidence.length === 0 || withinTolerance(billedVisible, observedVisible)
     const status = ok ? 'matched' : 'discrepancy'
     await pool.query(`UPDATE fuel_tickets SET status = $2, telemetry_gallons = $3, discrepancy_gal = $4 WHERE id = $1`, [t.id, status, observed, t.gallonsTotal - observed])
     await pool.query(`UPDATE fueling_events SET ticket_id = $1 WHERE id = ANY($2)`, [t.id, events.map((e) => e.id)])
@@ -79,7 +82,7 @@ export async function reconcileTickets(): Promise<number> {
           trainId: t.trainId,
           locomotiveId: null,
           dedupKey: `ticket_discrepancy:${t.id}`,
-          message: `Ticket ${t.id} bills ${Math.round(t.gallonsTotal)} gal at ${t.locationId}, telemetry saw ${Math.round(observed)} gal (${Math.round(t.gallonsTotal - observed)} gal short). Dispute with vendor.`,
+          message: `Ticket ${t.id} bills ${Math.round(billedVisible)} gal at ${t.locationId} for units telemetry can verify; telemetry saw ${Math.round(observedVisible)} gal (${Math.round(billedVisible - observedVisible)} gal short). Dispute with the supplier.`,
         },
         now,
       )

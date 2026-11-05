@@ -25,4 +25,9 @@ export default tseslint.config(
       ],
     },
   },
+  {
+    // Route files export `Route` next to their component by design (TanStack Router file routes).
+    files: ['src/routes/**/*.tsx'],
+    rules: { 'react-refresh/only-export-components': 'off' },
+  },
 )
