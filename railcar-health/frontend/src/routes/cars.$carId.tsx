@@ -7,7 +7,7 @@ import { HoldBadge } from '@/components/shared/Badges'
 import { ErrorNote, Loading } from '@/components/shared/Loading'
 import { PageHeader } from '@/components/shared/PageHeader'
 import { TierBadge } from '@/components/shared/TierBadge'
-import { positionText } from '@/lib/format'
+import { dateTimeText, positionText } from '@/lib/format'
 import { useFetch } from '@/lib/hooks'
 import { api } from '@/services/api'
 import { useLiveStore } from '@/stores/live-store'
@@ -30,7 +30,7 @@ export function CarPage() {
 
   if (car.error) return <div className="page"><ErrorNote message={car.error} /></div>
   if (!car.data) return <Loading />
-  const { car: info, holds, alerts, trips, bearings } = car.data
+  const { car: info, holds, alerts, trips, bearings, components } = car.data
   const alerted = new Set(alerts.filter((a) => a.status !== 'closed' && a.kind === 'hot_bearing').map((a) => a.position))
   const activeHolds = holds.filter((h) => h.status !== 'released')
   return (
@@ -71,10 +71,25 @@ export function CarPage() {
           </section>
         </div>
       </div>
-      <section className="card overflow-hidden">
-        <h2 className="border-b border-slate-100 px-4 py-2.5 text-sm font-semibold text-slate-900">Trips and orientation</h2>
-        <CarTrips trips={trips} />
-      </section>
+      <div className="grid grid-cols-3 gap-4">
+        <section className="card col-span-2 overflow-hidden">
+          <h2 className="border-b border-slate-100 px-4 py-2.5 text-sm font-semibold text-slate-900">Trips and orientation</h2>
+          <CarTrips trips={trips} />
+        </section>
+        <section className="card p-4">
+          <h2 className="mb-1 text-sm font-semibold text-slate-900">Wheelsets (component history)</h2>
+          <p className="mb-2 text-xs text-slate-500">The car outlives its wheelsets. Readings taken before an install belong to the old wheelset and never count against the new one.</p>
+          <ul className="space-y-1 text-sm">
+            {components.map((c) => (
+              <li key={`${c.axle}${c.installedAt}`}>
+                <span className="font-mono">{c.componentId}</span> <span className="text-slate-500">axle {c.axle} · installed {dateTimeText(c.installedAt)}{c.removedAt ? ` · removed ${dateTimeText(c.removedAt)}` : ' · current'}</span>
+                <div className="text-xs text-slate-400">recorded {dateTimeText(c.recordedAt)} by {c.recordedBy}</div>
+              </li>
+            ))}
+            {components.length === 0 && <li className="text-slate-500">No replacements recorded; original wheelsets.</li>}
+          </ul>
+        </section>
+      </div>
     </div>
   )
 }

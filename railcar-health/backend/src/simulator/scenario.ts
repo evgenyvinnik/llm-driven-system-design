@@ -9,8 +9,11 @@
  *                 history once the first AEI read corrects the orientation.
  *   Q-HARCDJ  EB  SVTX 961204 L1 jumps at HBD-112, whose gateway is offline; the
  *                 data arrives after the train reached Cedar Junction.
- *   G-RIDHAR  WB  a stuck brake on PLNR 504433 (hot wheels).
- *   Z-HARRID  EB  control train with one warm-but-healthy bearing (TCLX 118840 R2).
+ *   G-RIDHAR  WB  a stuck brake on PLNR 504433 (hot wheels). Rebuilt at Cedar Junction:
+ *                 the last four cars are set out, so passes after CDJ resolve against
+ *                 consist revision 2 and earlier ones against revision 1.
+ *   Z-HARRID  EB  one warm-but-healthy bearing (TCLX 118840 R2) and an inoperative
+ *                 brake on HPRX 377120 (cold wheels in both braking zones).
  *
  * Detector faults: HBD-140 reads 20°F low (calibration drift), HBD-170 is
  * silent (heartbeats fine, records nothing), HBD-112's gateway loses its link
@@ -34,6 +37,9 @@ export interface TrainSpec {
   special: Array<{ index: number; carId: string; leadingEnd: CarEnd; consistLeadingEnd?: CarEnd }>
   defects: DefectSpec[]
   stuckBrakeCars: string[]
+  inoperativeBrakeCars?: string[]
+  /** Cars set out at an intermediate yard: a new consist revision from departure there. */
+  setOutAt?: { yardId: string; lastCars: number }
 }
 
 export interface Faults {
@@ -76,13 +82,15 @@ export const TRAINS: TrainSpec[] = [
     special: [{ index: 60, carId: 'PLNR 504433', leadingEnd: 'A' }],
     defects: [],
     stuckBrakeCars: ['PLNR 504433'],
+    setOutAt: { yardId: 'CDJ', lastCars: 4 },
   },
   {
     symbol: 'Z-HARRID', direction: 'EB', originYardId: 'HAR', destinationYardId: 'RDG', stops: ['RDG'], departMinutes: 125, speedMph: 55,
     locomotives: 2, cars: 65, seed: 55,
-    special: [{ index: 30, carId: 'TCLX 118840', leadingEnd: 'B' }],
+    special: [{ index: 30, carId: 'TCLX 118840', leadingEnd: 'B' }, { index: 44, carId: 'HPRX 377120', leadingEnd: 'A' }],
     defects: [{ carId: 'TCLX 118840', position: 'R2', bearingDelta: () => 18 }],
     stuckBrakeCars: [],
+    inoperativeBrakeCars: ['HPRX 377120'],
   },
 ]
 

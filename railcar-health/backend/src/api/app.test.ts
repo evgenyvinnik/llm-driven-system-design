@@ -67,9 +67,23 @@ describe('health and auth', () => {
 })
 
 describe('role checks', () => {
-  it('only dispatchers (and admins) acknowledge alerts', async () => {
+  it('lets only the alert’s owner acknowledge it: a yard cannot acknowledge a dispatcher’s alert', async () => {
+    handler = (sql) => (sql.includes('SELECT owner_role, owner_id') ? { rows: [{ owner_role: 'dispatcher', owner_id: 'WEST' }] } : undefined)
     const res = await request(app).post('/api/v1/alerts/a1/acknowledge').set('Cookie', as('bob')).send({ version: 1, action: 'monitor' })
     expect(res.status).toBe(403)
+    expect(res.body.error.code).toBe('NOT_OWNER')
+  })
+
+  it('lets the owning yard acknowledge its own alert', async () => {
+    handler = (sql) => {
+      if (sql.includes('SELECT owner_role, owner_id')) return { rows: [{ owner_role: 'yard', owner_id: 'CDJ' }] }
+      if (sql.startsWith('UPDATE alerts'))
+        return { rows: [{ id: 'a1', trip_id: 't', car_id: 'c', kind: 'hot_bearing', position: 'L1', tier: 2, status: 'acknowledged', version: 2, reasons: [], features: {}, opened_at: new Date(), updated_at: new Date(), yard_id: 'CDJ' }], rowCount: 1 }
+      return undefined
+    }
+    const res = await request(app).post('/api/v1/alerts/a1/acknowledge').set('Cookie', as('bob')).send({ version: 1, action: 'will_inspect_on_arrival' })
+    expect(res.status).toBe(200)
+    expect(res.body.alert).toMatchObject({ status: 'acknowledged', version: 2 })
   })
 
   it('keeps thresholds and metrics for reliability engineers', async () => {
@@ -92,6 +106,7 @@ describe('role checks', () => {
 describe('acknowledging an alert', () => {
   it('returns 409 with the current alert when the version is stale (it escalated meanwhile)', async () => {
     handler = (sql) => {
+      if (sql.includes('SELECT owner_role, owner_id')) return { rows: [{ owner_role: 'dispatcher', owner_id: 'WEST' }] }
       if (sql.startsWith('UPDATE alerts')) return { rows: [], rowCount: 0 }
       if (sql.includes('WHERE a.id = $1'))
         return { rows: [{ id: 'a1', trip_id: 't', car_id: 'c', kind: 'hot_bearing', position: 'R3', tier: 4, status: 'open', version: 3, reasons: [], features: {}, opened_at: new Date(), updated_at: new Date() }] }
@@ -123,6 +138,12 @@ describe('inspection findings', () => {
     expect(res.body.error.details[0].path).toBe('disposition')
   })
 
+  it('requires the replacement wheelset when the car is repaired on the spot', async () => {
+    const res = await submit({ finding: 'confirmed_bearing_defect', disposition: 'repaired' })
+    expect(res.status).toBe(422)
+    expect(res.body.error.details[0].path).toBe('replacement')
+  })
+
   it('returns the stored finding when the tablet resends the same submission', async () => {
     handler = (sql) =>
       sql.includes('FROM findings WHERE client_submission_id')
@@ -152,9 +173,11 @@ describe('inspection findings', () => {
     expect(res.status).toBe(201)
     const sqls = query.mock.calls.map(([sql]) => String(sql))
     expect(sqls.some((s) => s.startsWith('UPDATE work_orders SET status = \'completed\''))).toBe(true)
-    expect(sqls.some((s) => s.startsWith('UPDATE car_holds'))).toBe(true)
     const hold = query.mock.calls.find(([sql]) => String(sql).startsWith('UPDATE car_holds'))!
     expect(hold[1]).toContain('bad_ordered')
+    // Inspected is not closed: a bad-ordered car's alert stays inspected until the repair is recorded.
+    const alert = query.mock.calls.find(([sql]) => String(sql).startsWith('UPDATE alerts'))!
+    expect(alert[1]).toContain('inspected')
   })
 })
 

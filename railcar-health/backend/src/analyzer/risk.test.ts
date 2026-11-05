@@ -1,12 +1,13 @@
 import { describe, expect, it } from 'vitest'
 import { DEFAULT_THRESHOLDS as T, TIER } from '../shared/domain.js'
-import { scoreBearing, scoreWheel } from './risk.js'
+import { scoreBearing, scoreColdWheel, scoreHotWheel, scoreOverHistory } from './risk.js'
+import type { Observation } from './trend.js'
 import type { BearingFeatures } from './trend.js'
 
 function features(o: Partial<BearingFeatures>): BearingFeatures {
   return {
     observations: 5, aboveAmbient: 45, sideDelta: 2, maxSideDelta: 2, medianSideDelta: 2, risePer15mi: 0, consecutiveElevated: 0, percentile: 60,
-    maxGapMiles: 15, coverageGap: false, biasCorrected: false, historyElevatedTrips: 0, wheelDelta: 0, wheelConsecutiveHot: 0, edgeAlarm: false,
+    maxGapMiles: 15, coverageGap: false, biasCorrected: false, historyElevatedTrips: 0, wheelDelta: 0, wheelConsecutiveHot: 0, brakingZoneReadings: 0, coldWheelReadings: 0, edgeAlarm: false,
     lastDetectorId: 'HBD-055', lastPassId: 'p', lastPassedAtMs: 0, lastLagSeconds: 0, lastMilepost: 55, ...o,
   }
 }
@@ -56,10 +57,40 @@ describe('scoreBearing', () => {
   })
 })
 
-describe('scoreWheel', () => {
-  it('needs two consecutive hot readings; very hot is HIGH', () => {
-    expect(scoreWheel(features({ wheelDelta: 220, wheelConsecutiveHot: 1 }), T).tier).toBe(TIER.NONE)
-    expect(scoreWheel(features({ wheelDelta: 220, wheelConsecutiveHot: 2 }), T).tier).toBe(TIER.MEDIUM)
-    expect(scoreWheel(features({ wheelDelta: 260, wheelConsecutiveHot: 3 }), T).tier).toBe(TIER.HIGH)
+describe('brake (wheel) scoring, kept apart from bearings', () => {
+  it('hot wheels need two consecutive hot readings; very hot is HIGH (stuck brake)', () => {
+    expect(scoreHotWheel(features({ wheelDelta: 220, wheelConsecutiveHot: 1 }), T).tier).toBe(TIER.NONE)
+    expect(scoreHotWheel(features({ wheelDelta: 220, wheelConsecutiveHot: 2 }), T).tier).toBe(TIER.MEDIUM)
+    expect(scoreHotWheel(features({ wheelDelta: 260, wheelConsecutiveHot: 3 }), T).tier).toBe(TIER.HIGH)
+  })
+
+  it('cold wheels count only in braking zones, and must be cold in every one (inoperative brake)', () => {
+    expect(scoreColdWheel(features({ brakingZoneReadings: 2, coldWheelReadings: 2 }), T).tier).toBe(TIER.MEDIUM)
+    expect(scoreColdWheel(features({ brakingZoneReadings: 2, coldWheelReadings: 1 }), T).tier).toBe(TIER.NONE)
+    expect(scoreColdWheel(features({ brakingZoneReadings: 1, coldWheelReadings: 1 }), T).tier).toBe(TIER.NONE)
+  })
+
+  it('a hot bearing does not raise a brake alert, and a stuck brake does not raise a bearing alert', () => {
+    expect(scoreHotWheel(features({ sideDelta: 80, aboveAmbient: 160, risePer15mi: 10 }), T).tier).toBe(TIER.NONE)
+    expect(scoreBearing(features({ wheelDelta: 230, wheelConsecutiveHot: 4 }), T).tier).toBe(TIER.NONE)
+  })
+})
+
+describe('arrival-order independence of the decision', () => {
+  const o = (distance: number, sideDelta: number): Observation => ({
+    detectorId: `HBD-${distance}`, passId: `p${distance}`, milepost: distance, distance, passedAtMs: distance * 80_000, rawAboveAmbient: 40 + sideDelta,
+    aboveAmbient: 40 + sideDelta, sideDelta, percentile: 99, wheelDelta: 0, lagSeconds: 0, edgeAlarm: false, biasCorrected: false, brakingZone: false,
+  })
+  const opts = { elevatedSideDelta: 20, hotWheelDelta: 150, coldWheelDelta: 50, maxSpacingMiles: 20, historyElevatedTrips: 0 }
+
+  it('scores an old hot reading that arrives after a newer normal one exactly as if it had arrived on time', () => {
+    // On time: the +56 reading at MP 10 opens MEDIUM, and an alert never de-escalates.
+    const onTime = scoreOverHistory([o(10, 56)], opts, T, scoreBearing).score.tier
+    // Late: the normal MP 25 reading was processed first; the MP 10 reading arrives 90 minutes later.
+    const late = scoreOverHistory([o(25, 1), o(10, 56)], opts, T, scoreBearing)
+    expect(onTime).toBe(TIER.MEDIUM)
+    expect(late.score.tier).toBe(TIER.MEDIUM)
+    expect(late.score.reasons.at(-1)).toMatch(/Latest reading at HBD-25/)
+    expect(late.latest.sideDelta).toBe(1)
   })
 })

@@ -1,13 +1,13 @@
 import { describe, expect, it } from 'vitest'
 import { buildObservations, computeFeatures, median, percentileRank, slope, type Observation, type PassContext, type ReadingRow } from './trend.js'
 
-const opts = { elevatedSideDelta: 20, hotWheelDelta: 150, maxSpacingMiles: 20, historyElevatedTrips: 0 }
+const opts = { elevatedSideDelta: 20, hotWheelDelta: 150, coldWheelDelta: 50, maxSpacingMiles: 20, historyElevatedTrips: 0 }
 
 function obs(distance: number, sideDelta: number, extra: Partial<Observation> = {}): Observation {
   return {
     detectorId: `HBD-${distance}`, passId: `p${distance}`, milepost: distance, distance, passedAtMs: distance * 80_000,
     rawAboveAmbient: 40 + sideDelta, aboveAmbient: 40 + sideDelta, sideDelta, percentile: 99, wheelDelta: 0, lagSeconds: 0,
-    edgeAlarm: false, biasCorrected: false, ...extra,
+    edgeAlarm: false, biasCorrected: false, brakingZone: false, ...extra,
   }
 }
 
@@ -57,12 +57,12 @@ describe('computeFeatures', () => {
 
 describe('buildObservations', () => {
   it('normalizes against the median of the same rail in the same pass and corrects known detector bias', () => {
-    const ctx: PassContext = { detectorId: 'HBD-140', passId: 'p1', milepost: 140, passedAtMs: 0, ambientF: 60, biasOffsetF: -20, lagSeconds: 0, edgeAlarmKeys: new Set() }
+    const ctx: PassContext = { detectorId: 'HBD-140', passId: 'p1', milepost: 140, passedAtMs: 0, ambientF: 60, biasOffsetF: -20, lagSeconds: 0, edgeAlarmKeys: new Set(), brakingZone: false }
     const rows: ReadingRow[] = []
     // Ten cars' axle-1 bearings on each rail; the south rail reads 6°F warmer (sun) for everyone.
     for (let i = 0; i < 10; i++) {
-      rows.push({ detectorId: 'HBD-140', passId: 'p1', axleSeq: i * 4 + 1, rail: 'N', bearingF: 100, wheelF: 70, carId: `C${i}`, carSide: 'R', carAxle: 1 })
-      rows.push({ detectorId: 'HBD-140', passId: 'p1', axleSeq: i * 4 + 1, rail: 'S', bearingF: i === 3 ? 146 : 106, wheelF: 70, carId: `C${i}`, carSide: 'L', carAxle: 1 })
+      rows.push({ detectorId: 'HBD-140', passId: 'p1', axleSeq: i * 4 + 1, rail: 'N', bearingF: 100, wheelF: 70, carId: `C${i}`, carSide: 'R', carAxle: 1, passedAtMs: 0 })
+      rows.push({ detectorId: 'HBD-140', passId: 'p1', axleSeq: i * 4 + 1, rail: 'S', bearingF: i === 3 ? 146 : 106, wheelF: 70, carId: `C${i}`, carSide: 'L', carAxle: 1, passedAtMs: 0 })
     }
     const out = buildObservations(rows, new Map([['HBD-140|p1', ctx]]), 0)
     const hot = out.get('C3|L1')![0]
@@ -70,5 +70,16 @@ describe('buildObservations', () => {
     expect(hot.rawAboveAmbient).toBe(86)
     expect(hot.aboveAmbient).toBe(106) // the detector reads 20°F low; corrected
     expect(out.get('C1|R1')![0].sideDelta).toBe(0)
+  })
+})
+
+describe('cold wheel features', () => {
+  it('counts braking-zone readings where the wheel stayed well below the train-side median', () => {
+    const f = computeFeatures(
+      [obs(10, 0, { wheelDelta: 2 }), obs(55, 0, { brakingZone: true, wheelDelta: -88 }), obs(185, 0, { brakingZone: true, wheelDelta: -92 })],
+      opts,
+    )
+    expect(f.brakingZoneReadings).toBe(2)
+    expect(f.coldWheelReadings).toBe(2)
   })
 })

@@ -4,7 +4,7 @@
  * current ones. Inspection findings are the labels.
  * @module api/services/backtest
  */
-import { scoreBearing, scoreWheel } from '../../analyzer/risk.js'
+import { scoreBearing, scoreColdWheel, scoreHotWheel } from '../../analyzer/risk.js'
 import type { BearingFeatures } from '../../analyzer/trend.js'
 import { TIER, TIER_NAMES, type Thresholds } from '../../shared/domain.js'
 
@@ -38,6 +38,8 @@ function toFeatures(f: Partial<BearingFeatures>): BearingFeatures {
     historyElevatedTrips: f.historyElevatedTrips ?? 0,
     wheelDelta: f.wheelDelta ?? 0,
     wheelConsecutiveHot: f.wheelConsecutiveHot ?? 0,
+    brakingZoneReadings: f.brakingZoneReadings ?? 0,
+    coldWheelReadings: f.coldWheelReadings ?? 0,
     edgeAlarm: f.edgeAlarm ?? false,
     lastDetectorId: f.lastDetectorId ?? '',
     lastPassId: '',
@@ -49,7 +51,9 @@ function toFeatures(f: Partial<BearingFeatures>): BearingFeatures {
 
 export function rescore(alert: LabeledAlert, t: Thresholds): number {
   const f = toFeatures(alert.features)
-  return alert.kind === 'hot_wheel' ? scoreWheel(f, t).tier : scoreBearing(f, t).tier
+  if (alert.kind === 'hot_wheel') return scoreHotWheel(f, t).tier
+  if (alert.kind === 'cold_wheel') return scoreColdWheel(f, t).tier
+  return scoreBearing(f, t).tier
 }
 
 function stats(rows: Array<{ tier: number; defect: boolean }>): TierStats[] {

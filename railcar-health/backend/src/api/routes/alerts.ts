@@ -102,16 +102,22 @@ alertsRouter.get(
 
 const ackSchema = z.object({
   version: z.number().int().min(1),
-  action: z.enum(['stop_ordered', 'setout_planned', 'restricted_speed', 'inspect_at_terminal', 'monitor']),
+  action: z.enum(['stop_ordered', 'setout_planned', 'restricted_speed', 'inspect_at_terminal', 'brake_inspection', 'monitor', 'will_inspect_on_arrival']),
   note: z.string().max(500).optional(),
 })
 
 alertsRouter.post(
   '/:id/acknowledge',
-  requireRole('dispatcher'),
+  requireRole('dispatcher', 'yard'),
   asyncHandler(async (req, res) => {
     const body = ackSchema.parse(req.body)
     const at = now()
+    // The owner acknowledges: a dispatcher for train-handling alerts, the yard's inspectors for car-inspection ones.
+    const owner = (await pool.query<{ owner_role: string | null; owner_id: string | null }>('SELECT owner_role, owner_id FROM alerts WHERE id = $1', [req.params.id]).catch(() => ({ rows: [] }))).rows[0]
+    if (!owner) throw notFound('Alert')
+    const u = req.user!
+    const allowed = u.role === 'admin' || (u.role === 'dispatcher' && owner.owner_role === 'dispatcher') || (u.role === 'yard' && owner.owner_role === 'yard' && owner.owner_id === u.yardId)
+    if (!allowed) throw new HttpError(403, 'NOT_OWNER', `This alert is owned by the ${owner.owner_role ?? 'unknown'} ${owner.owner_id ?? ''}`.trim())
     const updated = await pool.query<AlertRow>(
       `UPDATE alerts SET status = 'acknowledged', acknowledged_by = $3, acknowledged_at = $4, ack_action = $5, ack_note = $6,
               updated_at = $4, version = version + 1

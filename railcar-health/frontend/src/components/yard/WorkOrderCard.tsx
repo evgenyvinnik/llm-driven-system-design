@@ -2,7 +2,7 @@ import { Link } from '@tanstack/react-router'
 import { useState } from 'react'
 import { HoldBadge, LateBadge } from '@/components/shared/Badges'
 import { TierBadge } from '@/components/shared/TierBadge'
-import { ageText, humanize, positionText, timeText } from '@/lib/format'
+import { ageText, humanize, kindText, positionText, timeText } from '@/lib/format'
 import { api } from '@/services/api'
 import type { WorkOrder } from '@/types'
 import { FindingForm } from './FindingForm'
@@ -20,9 +20,9 @@ export function WorkOrderCard({ workOrder: w, nowMs, onChanged }: Props) {
   return (
     <li className="card p-4" data-work-order={w.id}>
       <div className="flex flex-wrap items-center gap-2">
-        <TierBadge tier={w.priority} />
+        {w.kind === 'audit' ? <span className="chip bg-sky-50 font-semibold text-sky-800 ring-1 ring-sky-200">AUDIT</span> : <TierBadge tier={w.priority} />}
         <Link to="/cars/$carId" params={{ carId: w.carId }} search={{ position: w.kind === 'hot_bearing' ? w.position : undefined }} className="font-mono text-base font-semibold text-slate-900 hover:underline">{w.carId}</Link>
-        <span className="text-sm text-slate-600">{positionText(w.kind, w.position)}</span>
+        <span className="text-sm text-slate-600">{w.kind === 'audit' ? 'random audit, whole car' : `${kindText(w.kind)}${w.kind === 'hot_bearing' ? ` · ${positionText(w.kind, w.position)}` : ''}`}</span>
         <span className="text-sm text-slate-400">·</span>
         <span className="font-mono text-sm text-slate-600">{w.symbol}</span>
         {w.late && <LateBadge lagSeconds={w.dataLagSeconds} />}

@@ -12,7 +12,7 @@ export function LateBadge({ lagSeconds }: { lagSeconds: number }) {
 export function HoldBadge({ status }: { status: string | null }) {
   if (!status || status === 'released') return null
   return (
-    <span className="chip bg-slate-800 text-white">
+    <span className="chip whitespace-nowrap bg-slate-800 text-white">
       <LockIcon className="h-3 w-3" /> {status === 'bad_ordered' ? 'bad-ordered' : 'car held'}
     </span>
   )

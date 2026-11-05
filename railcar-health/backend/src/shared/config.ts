@@ -31,8 +31,11 @@ export const config = {
   ingestToken: process.env.INGEST_TOKEN || 'local-dev-ingest-token',
 
   stream: {
-    key: process.env.PASS_STREAM || 'rh:passes',
+    liveKey: 'rh:passes:live',
+    backfillKey: 'rh:passes:backfill',
     deadLetterKey: 'rh:passes:dlq',
+    /** Backfill messages handled per loop iteration before the live lane is checked again. */
+    backfillBatch: int('BACKFILL_BATCH', 2),
     group: 'analyzer',
     consumer: process.env.ANALYZER_CONSUMER || `analyzer-${process.pid}`,
     /** Pending messages idle this long are claimed by another consumer. */
@@ -53,5 +56,9 @@ export const config = {
     /** Detectors with no heartbeat for this long (simulated minutes) are offline. */
     offlineAfterMinutes: int('OFFLINE_AFTER_MINUTES', 25),
     healthIntervalMs: int('HEALTH_INTERVAL_MS', 5_000),
+    /** Ack-deadline sweeper and simulated notification delivery. */
+    sweepIntervalMs: int('SWEEP_INTERVAL_MS', 3_000),
+    /** An unacknowledged alert whose train is this close to the yard escalates (simulated minutes). */
+    approachWindowMinutes: int('APPROACH_WINDOW_MINUTES', 30),
   },
 }

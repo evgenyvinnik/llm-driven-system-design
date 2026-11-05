@@ -35,6 +35,12 @@ export interface AlertRow {
   closed_at: Date | null
   outcome: string | null
   version: number
+  owner_role: string | null
+  owner_id: string | null
+  escalation_level: number
+  ack_due_at: Date | null
+  delivered_at: Date | null
+  inspected_at: Date | null
   symbol?: string
   direction?: string
   trip_status?: string
@@ -80,6 +86,12 @@ export function alertDto(r: AlertRow) {
     closedAt: iso(r.closed_at),
     outcome: r.outcome,
     version: r.version,
+    ownerRole: r.owner_role,
+    ownerId: r.owner_id,
+    escalationLevel: r.escalation_level,
+    ackDueAt: iso(r.ack_due_at),
+    deliveredAt: iso(r.delivered_at),
+    inspectedAt: iso(r.inspected_at),
     workOrderId: r.work_order_id ?? null,
     workOrderStatus: r.work_order_status ?? null,
     holdStatus: r.hold_status ?? null,
@@ -136,7 +148,7 @@ export function tripDto(r: TripRow) {
 
 export interface WorkOrderRow {
   id: string
-  alert_id: string
+  alert_id: string | null
   car_id: string
   position: string
   kind: string
@@ -183,7 +195,7 @@ export function workOrderDto(r: WorkOrderRow) {
     tripStatus: r.trip_status ?? null,
     nextYardEta: iso(r.next_yard_eta),
     arrivedAt: iso(r.arrived_at),
-    reasons: r.reasons ?? [],
+    reasons: r.alert_id === null ? ['Random audit inspection of a car with no alert: measures what the alerts miss (label-bias guard)'] : (r.reasons ?? []),
     routeNote: r.route_note ?? null,
     late: r.late ?? false,
     dataLagSeconds: r.data_lag_seconds ?? 0,

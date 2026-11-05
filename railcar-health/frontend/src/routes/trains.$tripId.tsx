@@ -19,7 +19,7 @@ export const Route = createFileRoute('/trains/$tripId')({ component: TrainPage }
 export function TrainPage() {
   const { tripId } = Route.useParams()
   const revision = useLiveStore((s) => s.revisions.trips)
-  const [mode, setMode] = useState<HeatMode>('ambient')
+  const [mode, setMode] = useState<HeatMode>('median')
   const detail = useFetch(() => api.trip(tripId), [tripId, revision])
   const heat = useFetch(() => api.heatmap(tripId), [tripId, revision])
   const alerts = useFetch(() => api.alerts({ status: 'all' }).then((r) => r.alerts.filter((a) => a.tripId === tripId)), [tripId, revision])
@@ -45,7 +45,7 @@ export function TrainPage() {
             <h2 className="text-sm font-semibold text-slate-900">Bearing temperatures by detector</h2>
             <p className="text-xs text-slate-500">Rows: detectors in the order the train passed them (north and south rail). Columns: car axles from the head end.</p>
           </div>
-          <div className="flex gap-1.5">{toggle('ambient', 'Above ambient')}{toggle('median', 'vs rail median')}</div>
+          <div className="flex gap-1.5">{toggle('median', 'vs rail median')}{toggle('ambient', 'Above ambient')}</div>
         </div>
         {heat.data ? <Heatmap data={heat.data} mode={mode} /> : <Loading />}
         <div className="mt-3"><HeatLegend mode={mode} /></div>

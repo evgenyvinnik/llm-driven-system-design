@@ -33,14 +33,15 @@ export const ingestLagMinutes = new client.Histogram({
 
 export const passesProcessed = new client.Counter({
   name: 'rh_passes_processed_total',
-  help: 'Passes handled by the analyzer, by outcome (processed, already_processed, awaiting_consist, unresolved, failed)',
-  labelNames: ['outcome'],
+  help: 'Passes handled by the analyzer, by outcome (processed, already_processed, awaiting_consist, unresolved, failed) and lane',
+  labelNames: ['outcome', 'lane'],
   registers: [registry],
 })
 
 export const processSeconds = new client.Histogram({
   name: 'rh_pass_process_seconds',
-  help: 'Analyzer time to resolve, trend and score one pass',
+  help: 'Analyzer time to resolve, trend and score one pass, by lane',
+  labelNames: ['lane'],
   buckets: [0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5],
   registers: [registry],
 })
@@ -49,6 +50,13 @@ export const alertTransitions = new client.Counter({
   name: 'rh_alert_transitions_total',
   help: 'Alerts opened or escalated, by tier and lateness',
   labelNames: ['transition', 'tier', 'late'],
+  registers: [registry],
+})
+
+export const ackEscalations = new client.Counter({
+  name: 'rh_ack_escalations_total',
+  help: 'Alerts escalated to the next role, by reason (ack_overdue, approaching_yard)',
+  labelNames: ['reason'],
   registers: [registry],
 })
 

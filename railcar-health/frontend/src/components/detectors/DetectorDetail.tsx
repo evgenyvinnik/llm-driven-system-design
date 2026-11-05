@@ -14,7 +14,7 @@ export function DetectorDetail({ id, revision }: { id: string; revision: number 
         <ul className="space-y-1">
           {data.recentPasses.map((p) => (
             <li key={p.passId} className="flex items-center gap-2">
-              <span className="font-mono">{p.symbol ?? '—'}</span>
+              <span className="whitespace-nowrap font-mono">{p.symbol ?? '—'}</span>
               <span className="text-xs text-slate-500">{timeText(p.passedAt)} · train median {p.medianAboveAmbient ?? '—'}°F above ambient</span>
               {p.late && <LateBadge lagSeconds={p.lagSeconds} />}
             </li>

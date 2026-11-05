@@ -29,6 +29,8 @@ export interface PassSpec {
   biasF: number
   defects: DefectSpec[]
   stuckBrakeCars: Set<string>
+  /** Cars whose brakes don't apply: their wheels stay cool in braking zones. */
+  inoperativeBrakeCars: Set<string>
   /** The site's own absolute alarm (illustrative), °F above ambient. */
   siteAlarmAboveAmbient: number
 }
@@ -65,8 +67,9 @@ export function generateReadings(spec: PassSpec, rng: Rng): { axles: SimReading[
           const individual = stableGaussian(`${unit.unitId}:${pos}`, 3.5)
           const defect = spec.defects.filter((d) => d.carId === unit.unitId && d.position === pos).reduce((s, d) => s + d.bearingDelta(spec.distance, spec.milepost), 0)
           const stuck = spec.stuckBrakeCars.has(unit.unitId)
+          const braked = spec.brakingZone && !spec.inoperativeBrakeCars.has(unit.unitId)
           bearing = spec.ambientF + running + sun + braking + individual + gaussian(rng) * 3 + defect + (stuck ? 10 : 0)
-          wheel = spec.ambientF + 12 + (spec.brakingZone ? 90 + gaussian(rng) * 15 : gaussian(rng) * 6) + (stuck ? 200 + gaussian(rng) * 12 : 0)
+          wheel = spec.ambientF + 12 + (braked ? 90 + gaussian(rng) * 15 : gaussian(rng) * 6) + (stuck ? 200 + gaussian(rng) * 12 : 0)
         }
         const measuredBearing = bearing + spec.biasF
         if (measuredBearing - spec.ambientF >= spec.siteAlarmAboveAmbient) edgeAlarms.push({ axleSeq: seq, rail, kind: 'hot_bearing' })

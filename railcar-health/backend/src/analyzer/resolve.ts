@@ -6,22 +6,34 @@
  */
 import type pg from 'pg'
 import type { CarEnd, Direction, Rail } from '../shared/domain.js'
-import { buildAxleMap, resolveAxle, type ConsistUnit, type Correction } from './identity.js'
+import { buildAxleMap, consistRevisionAt, resolveAxle, type ConsistUnit, type Correction } from './identity.js'
 
-export async function loadUnits(client: pg.PoolClient, tripId: string): Promise<ConsistUnit[]> {
+/** The consist revision in force at `passedAt` (consists can be rebuilt at an intermediate yard). */
+export async function revisionAt(client: pg.PoolClient, tripId: string, passedAt: Date): Promise<number> {
+  const { rows } = await client.query<{ revision: number; effective_at: Date }>('SELECT revision, effective_at FROM trip_consist_versions WHERE trip_id = $1', [tripId])
+  return consistRevisionAt(rows.map((r) => ({ revision: r.revision, effectiveAtMs: r.effective_at.getTime() })), passedAt.getTime())
+}
+
+export async function loadUnits(client: pg.PoolClient, tripId: string, revision: number): Promise<ConsistUnit[]> {
   const { rows } = await client.query<{ position: number; unit_id: string; unit_type: 'locomotive' | 'car'; axle_count: number; leading_end: CarEnd }>(
-    'SELECT position, unit_id, unit_type, axle_count, leading_end FROM trip_units WHERE trip_id = $1 ORDER BY position',
-    [tripId],
+    'SELECT position, unit_id, unit_type, axle_count, leading_end FROM trip_units WHERE trip_id = $1 AND revision = $2 ORDER BY position',
+    [tripId, revision],
   )
   return rows.map((r) => ({ position: r.position, unitId: r.unit_id, unitType: r.unit_type, axleCount: r.axle_count, leadingEnd: r.leading_end }))
 }
 
-export async function persistCorrections(client: pg.PoolClient, tripId: string, detectorId: string, corrections: Correction[]): Promise<void> {
+/** Applies AEI corrections to this revision and to later revisions that carry the same car. */
+export async function persistCorrections(client: pg.PoolClient, tripId: string, revision: number, detectorId: string, corrections: Correction[]): Promise<void> {
   for (const c of corrections) {
     await client.query(
-      `UPDATE trip_units SET unit_id = $3, leading_end = $4, orientation_source = 'aei', corrected_by_detector = $5
-       WHERE trip_id = $1 AND position = $2`,
-      [tripId, c.position, c.unitId, c.leadingEnd, detectorId],
+      `UPDATE trip_units SET unit_id = $4, leading_end = $5, orientation_source = 'aei', corrected_by_detector = $6
+       WHERE trip_id = $1 AND revision = $2 AND position = $3`,
+      [tripId, revision, c.position, c.unitId, c.leadingEnd, detectorId],
+    )
+    await client.query(
+      `UPDATE trip_units SET leading_end = $4, orientation_source = 'aei', corrected_by_detector = $5
+       WHERE trip_id = $1 AND revision > $2 AND unit_id = $3`,
+      [tripId, revision, c.unitId, c.leadingEnd, detectorId],
     )
   }
 }
@@ -73,15 +85,18 @@ export async function resolvePassReadings(
   )
 }
 
-/** After an AEI correction, earlier passes of the trip were mapped with the stale consist: redo them. */
-export async function reresolveTrip(client: pg.PoolClient, tripId: string, exceptPass: { detectorId: string; passId: string }, units: ConsistUnit[]): Promise<number> {
-  const { rows } = await client.query<{ detector_id: string; pass_id: string; direction: Direction; axle_count: number }>(
-    `SELECT detector_id, pass_id, direction, axle_count FROM detector_passes
+/** After an AEI correction, other passes of the trip were mapped with the stale consist: redo each with its own revision. */
+export async function reresolveTrip(client: pg.PoolClient, tripId: string, exceptPass: { detectorId: string; passId: string }): Promise<number> {
+  const { rows } = await client.query<{ detector_id: string; pass_id: string; direction: Direction; axle_count: number; passed_at: Date }>(
+    `SELECT detector_id, pass_id, direction, axle_count, passed_at FROM detector_passes
       WHERE trip_id = $1 AND identity_status = 'resolved' AND NOT (detector_id = $2 AND pass_id = $3)`,
     [tripId, exceptPass.detectorId, exceptPass.passId],
   )
+  const byRevision = new Map<number, ConsistUnit[]>()
   for (const row of rows) {
-    await resolvePassReadings(client, { detectorId: row.detector_id, passId: row.pass_id, direction: row.direction, axleCount: row.axle_count }, units)
+    const revision = await revisionAt(client, tripId, row.passed_at)
+    if (!byRevision.has(revision)) byRevision.set(revision, await loadUnits(client, tripId, revision))
+    await resolvePassReadings(client, { detectorId: row.detector_id, passId: row.pass_id, direction: row.direction, axleCount: row.axle_count }, byRevision.get(revision)!)
   }
   return rows.length
 }

@@ -21,11 +21,12 @@ import { nowMs as clockNow } from '../shared/clock.js'
 import { subdivisionAt, yardById, YARDS } from '../shared/network.js'
 import { loadThresholds } from '../shared/thresholds.js'
 import { alertKey, applyCandidates, closeOrphans, type Candidate, type ExistingRow, type Transition } from './alert-manager.js'
+import { axleKey, currentInstalls, splitByInstall, type InstallCutoffs } from './components.js'
 import { decideIdentity } from './identity.js'
-import { loadUnits, persistCorrections, reresolveTrip, resolvePassReadings } from './resolve.js'
-import { scoreBearing, scoreWheel, type Score } from './risk.js'
+import { loadUnits, persistCorrections, reresolveTrip, resolvePassReadings, revisionAt } from './resolve.js'
+import { scoreBearing, scoreColdWheel, scoreHotWheel, scoreOverHistory, type Score } from './risk.js'
 import { estimateMilepost, predictNextYard, type TripState } from './routing.js'
-import { buildObservations, computeFeatures, edgeAlarmKey, type BearingFeatures, type PassContext, type ReadingRow } from './trend.js'
+import { buildObservations, edgeAlarmKey, passMedians, type BearingFeatures, type PassContext, type PassMedians, type ReadingRow } from './trend.js'
 import { updateDetectorInputs } from './health-inputs.js'
 
 /** Wheel alerts cover the whole car. */
@@ -38,6 +39,8 @@ export interface ProcessResult {
   events: LiveEvent[]
   transitions: Transition[]
   corrections: number
+  /** Readings measured before the current wheelset was installed: kept, but not used as evidence. */
+  excludedPreInstall: number
 }
 
 interface PassRow {
@@ -68,7 +71,7 @@ interface TripRow {
   last_pass_at: Date | null
 }
 
-const empty = (outcome: Outcome): ProcessResult => ({ outcome, events: [], transitions: [], corrections: 0 })
+const empty = (outcome: Outcome): ProcessResult => ({ outcome, events: [], transitions: [], corrections: 0, excludedPreInstall: 0 })
 
 export async function processPass(detectorId: string, passId: string): Promise<ProcessResult> {
   const { config: thresholds } = await loadThresholds()
@@ -93,9 +96,10 @@ export async function processPass(detectorId: string, passId: string): Promise<P
       return empty('awaiting_consist')
     }
 
-    // ── 2. Identity ──
-    const decision = decideIdentity(await loadUnits(client, trip.trip_id), pass.axle_count, pass.aei)
-    if (decision.corrections.length > 0) await persistCorrections(client, trip.trip_id, detectorId, decision.corrections)
+    // ── 2. Identity: the consist revision in force when the pass was measured, corrected by any AEI read ──
+    const revision = await revisionAt(client, trip.trip_id, pass.passed_at)
+    const decision = decideIdentity(await loadUnits(client, trip.trip_id, revision), pass.axle_count, pass.aei)
+    if (decision.corrections.length > 0) await persistCorrections(client, trip.trip_id, revision, detectorId, decision.corrections)
     if (decision.status === 'unresolved') {
       await client.query(
         `UPDATE detector_passes SET identity_status = 'unresolved', processed_at = now() WHERE detector_id = $1 AND pass_id = $2`,
@@ -106,18 +110,18 @@ export async function processPass(detectorId: string, passId: string): Promise<P
     const passInfo = { detectorId, passId, direction: pass.direction, axleCount: pass.axle_count }
     await resolvePassReadings(client, passInfo, decision.units)
     await client.query(`UPDATE detector_passes SET identity_status = 'resolved' WHERE detector_id = $1 AND pass_id = $2`, [detectorId, passId])
-    if (decision.corrections.length > 0) await reresolveTrip(client, trip.trip_id, { detectorId, passId }, decision.units)
+    if (decision.corrections.length > 0) await reresolveTrip(client, trip.trip_id, { detectorId, passId })
 
     // ── 5a. Trip position (newest pass by measurement time wins, not newest by arrival) ──
-    const { state: tripState, nextYardId } = await updateTripPosition(client, trip, pass, nowMs)
+    const { state: tripState, nextYardId, deskId } = await updateTripPosition(client, trip, pass, nowMs)
 
     // ── 3. Trend + score ──
-    const candidates = await scoreTrip(client, trip, thresholds)
+    const { candidates, excludedPreInstall, replacedKeys } = await scoreTrip(client, trip, thresholds)
 
     // ── 4. Alerts ──
     const existing = (
       await client.query<ExistingRow>(
-        `SELECT id, car_id, kind, position, tier, status, yard_id FROM alerts WHERE trip_id = $1 AND status <> 'closed' FOR UPDATE`,
+        `SELECT id, car_id, kind, position, tier, status, yard_id, owner_role, owner_id FROM alerts WHERE trip_id = $1 AND status <> 'closed' FOR UPDATE`,
         [trip.trip_id],
       )
     ).rows
@@ -132,21 +136,27 @@ export async function processPass(detectorId: string, passId: string): Promise<P
       lateAfterMinutes: config.analysis.lateAfterMinutes,
       ownerByCar,
       nextYardId,
+      deskId,
     }
     const { events, transitions } = await applyCandidates(ctx, candidates, existing)
     const observedKeys = new Set(candidates.map((c) => alertKey(c.carId, c.kind, c.position)))
-    events.push(...(await closeOrphans(ctx, existing, observedKeys)))
+    events.push(...(await closeOrphans(ctx, existing, observedKeys, replacedKeys)))
 
     // ── 5b. Detector health inputs (expected passes, bias samples) ──
     await updateDetectorInputs(client, trip, pass, nowMs, thresholds)
 
     await client.query(`UPDATE detector_passes SET processed_at = now() WHERE detector_id = $1 AND pass_id = $2`, [detectorId, passId])
     events.push({ type: 'trip.updated', tripId: trip.trip_id })
-    return { outcome: 'processed', events, transitions, corrections: decision.corrections.length }
+    return { outcome: 'processed', events, transitions, corrections: decision.corrections.length, excludedPreInstall }
   })
 }
 
-async function updateTripPosition(client: pg.PoolClient, trip: TripRow, pass: PassRow, nowMs: number): Promise<{ state: TripState; nextYardId: string | null }> {
+async function updateTripPosition(
+  client: pg.PoolClient,
+  trip: TripRow,
+  pass: PassRow,
+  nowMs: number,
+): Promise<{ state: TripState; nextYardId: string | null; deskId: string | null }> {
   const newer = !trip.last_pass_at || pass.passed_at.getTime() > trip.last_pass_at.getTime()
   const lastMilepost = newer ? pass.milepost : trip.last_milepost
   const lastPassAt = newer ? pass.passed_at : trip.last_pass_at
@@ -174,15 +184,15 @@ async function updateTripPosition(client: pg.PoolClient, trip: TripRow, pass: Pa
     [trip.trip_id, newer, pass.detector_id, lastMilepost, lastPassAt, speed, subdivisionAt(position).id, next?.yard.id ?? null,
       next ? new Date(nowMs + next.etaMinutes * 60_000) : null],
   )
-  return { state, nextYardId: next?.yard.id ?? null }
+  return { state, nextYardId: next?.yard.id ?? null, deskId: trip.status === 'arrived' ? null : subdivisionAt(position).deskId }
 }
 
-async function scoreTrip(client: pg.PoolClient, trip: TripRow, t: Thresholds): Promise<Candidate[]> {
+async function scoreTrip(client: pg.PoolClient, trip: TripRow, t: Thresholds): Promise<{ candidates: Candidate[]; excludedPreInstall: number; replacedKeys: Set<string> }> {
   const passRows = await client.query<{
     detector_id: string; pass_id: string; passed_at: Date; ambient_f: number; lag_seconds: number
-    edge_alarms: Array<{ axleSeq: number; rail: Rail }> | null; milepost: number; bias_offset_f: number | null; bias_samples: number
+    edge_alarms: Array<{ axleSeq: number; rail: Rail }> | null; milepost: number; bias_offset_f: number | null; bias_samples: number; braking_zone: boolean
   }>(
-    `SELECT p.detector_id, p.pass_id, p.passed_at, p.ambient_f, p.lag_seconds, p.edge_alarms, d.milepost, d.bias_offset_f, d.bias_samples
+    `SELECT p.detector_id, p.pass_id, p.passed_at, p.ambient_f, p.lag_seconds, p.edge_alarms, d.milepost, d.bias_offset_f, d.bias_samples, d.braking_zone
        FROM detector_passes p JOIN detectors d ON d.id = p.detector_id
       WHERE p.trip_id = $1 AND p.identity_status = 'resolved'`,
     [trip.trip_id],
@@ -199,6 +209,7 @@ async function scoreTrip(client: pg.PoolClient, trip: TripRow, t: Thresholds): P
       biasOffsetF: flagged ? p.bias_offset_f! : 0,
       lagSeconds: p.lag_seconds,
       edgeAlarmKeys: new Set((p.edge_alarms ?? []).map((a) => edgeAlarmKey(a.axleSeq, a.rail))),
+      brakingZone: p.braking_zone,
     })
   }
   const readings = await client.query<{
@@ -209,29 +220,42 @@ async function scoreTrip(client: pg.PoolClient, trip: TripRow, t: Thresholds): P
       WHERE p.trip_id = $1 AND p.identity_status = 'resolved' AND r.car_id IS NOT NULL`,
     [trip.trip_id],
   )
-  const rows: ReadingRow[] = readings.rows.map((r) => ({
+  const allRows: ReadingRow[] = readings.rows.map((r) => ({
     detectorId: r.detector_id, passId: r.pass_id, axleSeq: r.axle_seq, rail: r.rail, bearingF: r.bearing_f, wheelF: r.wheel_f,
-    carId: r.car_id, carSide: r.car_side, carAxle: r.car_axle,
+    carId: r.car_id, carSide: r.car_side, carAxle: r.car_axle, passedAtMs: passes.get(`${r.detector_id}|${r.pass_id}`)?.passedAtMs ?? 0,
   }))
+  // Event time, not processing time: a reading taken before the current wheelset went on is history of the old one.
+  const carIds = [...new Set(allRows.map((r) => r.carId))]
+  const cutoffs = await installCutoffs(client, carIds)
+  const { current: rows, previous } = splitByInstall(allRows, cutoffs)
+  const replacedKeys = new Set(previous.map((r) => `${r.carId}|${r.carSide}${r.carAxle}`))
   const originMp = yardById(trip.origin_yard_id)!.milepost
-  const observations = buildObservations(rows, passes, originMp)
-  const carIds = [...new Set(rows.map((r) => r.carId))]
-  const history = await historyFor(client, trip.trip_id, carIds)
+  // Medians come from every car in the pass (the train-side baseline); only the evidence is filtered.
+  const observations = buildObservations(rows, passes, originMp, passMedianMap(allRows))
+  const history = await historyFor(client, trip.trip_id, carIds, cutoffs)
 
   const candidates: Candidate[] = []
   const summaries: Array<[string, string, number, number, number, number, boolean, Date]> = []
-  // A stuck brake heats every wheel on the car, so wheel alerts are per car: the hottest wheel speaks for it.
+  // Brakes act on the whole car, so brake (wheel) alerts are per car: the hottest or coldest wheel speaks for it.
   const wheelByCar = new Map<string, { features: BearingFeatures; score: Score; hotWheels: number }>()
+  const coldByCar = new Map<string, { features: BearingFeatures; score: Score }>()
   for (const [key, obs] of observations) {
     const [carId, position] = key.split('|')
-    const features = computeFeatures(obs, {
+    const opts = {
       elevatedSideDelta: t.elevatedSideDelta,
       hotWheelDelta: t.hotWheelDelta,
       maxSpacingMiles: t.maxDetectorSpacingMiles,
       historyElevatedTrips: history.get(key) ?? 0,
-    })
-    candidates.push({ carId, kind: 'hot_bearing', position, score: scoreBearing(features, t), features })
-    const wheel = scoreWheel(features, t)
+      coldWheelDelta: t.coldWheelDelta,
+    }
+    // Each score is the maximum over every event-time prefix, so arrival order can't change the decision.
+    const bearing = scoreOverHistory(obs, opts, t, scoreBearing)
+    const features = bearing.latest
+    candidates.push({ carId, kind: 'hot_bearing', position, score: bearing.score, features })
+    const cold = scoreOverHistory(obs, opts, t, scoreColdWheel).score
+    const priorCold = coldByCar.get(carId)
+    if (!priorCold || cold.tier > priorCold.score.tier) coldByCar.set(carId, { features, score: cold })
+    const wheel = scoreOverHistory(obs, opts, t, scoreHotWheel).score
     const prior = wheelByCar.get(carId)
     const hot = (prior?.hotWheels ?? 0) + (wheel.tier > 0 ? 1 : 0)
     if (!prior || features.wheelDelta > prior.features.wheelDelta) wheelByCar.set(carId, { features, score: wheel, hotWheels: hot })
@@ -246,6 +270,7 @@ async function scoreTrip(client: pg.PoolClient, trip: TripRow, t: Thresholds): P
     const reasons = w.score.tier > 0 ? [...w.score.reasons, `${w.hotWheels} of 8 wheels hot`] : w.score.reasons
     candidates.push({ carId, kind: 'hot_wheel' as AlertKind, position: WHEEL_POSITION, score: { tier: w.score.tier, reasons }, features: w.features })
   }
+  for (const [carId, c] of coldByCar) candidates.push({ carId, kind: 'cold_wheel' as AlertKind, position: WHEEL_POSITION, score: c.score, features: c.features })
   // The trip's summaries are recomputed wholesale, so a corrected identity leaves no stale row behind.
   await client.query('DELETE FROM bearing_trip_summary WHERE trip_id = $1', [trip.trip_id])
   if (summaries.length > 0) {
@@ -257,7 +282,28 @@ async function scoreTrip(client: pg.PoolClient, trip: TripRow, t: Thresholds): P
       [trip.trip_id, ...transpose(summaries)],
     )
   }
-  return candidates
+  return { candidates, excludedPreInstall: previous.length, replacedKeys }
+}
+
+/** Per-pass medians over every car (before install filtering), so the baseline doesn't move when one axle's evidence is dropped. */
+function passMedianMap(rows: ReadingRow[]): Map<string, PassMedians> {
+  const byPass = new Map<string, ReadingRow[]>()
+  for (const r of rows) {
+    const key = `${r.detectorId}|${r.passId}`
+    const list = byPass.get(key)
+    if (list) list.push(r)
+    else byPass.set(key, [r])
+  }
+  return new Map([...byPass].map(([k, v]) => [k, passMedians(v)]))
+}
+
+async function installCutoffs(client: pg.PoolClient, carIds: string[]): Promise<InstallCutoffs> {
+  if (carIds.length === 0) return new Map()
+  const { rows } = await client.query<{ car_id: string; axle: number; installed_at: Date; removed_at: Date | null }>(
+    'SELECT car_id, axle, installed_at, removed_at FROM component_installs WHERE car_id = ANY($1)',
+    [carIds],
+  )
+  return currentInstalls(rows.map((r) => ({ carId: r.car_id, axle: r.axle, installedAtMs: r.installed_at.getTime(), removedAtMs: r.removed_at?.getTime() ?? null })))
 }
 
 function transpose<T extends unknown[]>(rows: T[]): unknown[][] {
@@ -265,17 +311,24 @@ function transpose<T extends unknown[]>(rows: T[]): unknown[][] {
   return rows[0].map((_, i) => rows.map((r) => (typeof r[i] === 'number' ? Math.round((r[i] as number) * 10) / 10 : r[i])))
 }
 
-/** How many of each bearing's last 5 other trips it ran elevated on. */
-async function historyFor(client: pg.PoolClient, tripId: string, carIds: string[]): Promise<Map<string, number>> {
+/** How many of each bearing's last 5 other trips it ran elevated on, counting only trips on the current wheelset. */
+async function historyFor(client: pg.PoolClient, tripId: string, carIds: string[], cutoffs: InstallCutoffs): Promise<Map<string, number>> {
   if (carIds.length === 0) return new Map()
-  const { rows } = await client.query<{ car_id: string; position: string; elevated: number }>(
-    `SELECT car_id, position, count(*) FILTER (WHERE elevated)::int AS elevated
+  const { rows } = await client.query<{ car_id: string; position: string; elevated: boolean; last_seen_at: Date }>(
+    `SELECT car_id, position, elevated, last_seen_at
        FROM (SELECT *, row_number() OVER (PARTITION BY car_id, position ORDER BY last_seen_at DESC) AS rn
                FROM bearing_trip_summary WHERE car_id = ANY($1) AND trip_id <> $2 AND kind = 'hot_bearing') s
-      WHERE rn <= 5 GROUP BY car_id, position`,
+      WHERE rn <= 5`,
     [carIds, tripId],
   )
-  return new Map(rows.map((r) => [`${r.car_id}|${r.position}`, r.elevated]))
+  const out = new Map<string, number>()
+  for (const r of rows) {
+    const cutoff = cutoffs.get(axleKey(r.car_id, Number(r.position.slice(1))))
+    if (!r.elevated || (cutoff !== undefined && r.last_seen_at.getTime() < cutoff)) continue
+    const key = `${r.car_id}|${r.position}`
+    out.set(key, (out.get(key) ?? 0) + 1)
+  }
+  return out
 }
 
 async function ownersFor(client: pg.PoolClient, carIds: string[]): Promise<Map<string, string>> {

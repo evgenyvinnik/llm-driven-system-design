@@ -78,7 +78,7 @@ adminRouter.post(
 adminRouter.get(
   '/metrics',
   asyncHandler(async (_req, res) => {
-    const [byTier, recall, volume, ingest, carPasses, open, outcomes] = await Promise.all([
+    const [byTier, recall, volume, ingest, carPasses, open, outcomes, byKind, audits, lifecycle] = await Promise.all([
       pool.query<{ tier: number; inspected: number; defects: number; ndf: number }>(
         `SELECT a.tier, count(*)::int AS inspected, count(*) FILTER (WHERE f.finding <> 'no_defect_found')::int AS defects,
                 count(*) FILTER (WHERE f.finding = 'no_defect_found')::int AS ndf
@@ -106,6 +106,23 @@ adminRouter.get(
                 (SELECT count(*)::int FROM alerts WHERE status <> 'closed') AS alerts`,
       ),
       pool.query<{ finding: string; n: number }>(`SELECT finding, count(*)::int AS n FROM findings GROUP BY finding`),
+      // Bearings and brakes are different failure modes; their precision is tracked apart.
+      pool.query<{ kind: string; inspected: number; defects: number }>(
+        `SELECT a.kind, count(*)::int AS inspected, count(*) FILTER (WHERE f.finding <> 'no_defect_found')::int AS defects
+           FROM findings f JOIN alerts a ON a.id = f.alert_id WHERE f.source = 'alert' GROUP BY a.kind`,
+      ),
+      // Label bias: only flagged cars get inspected. Random audits of unflagged cars estimate what is missed.
+      pool.query<{ audits: number; audit_defects: number; open_audits: number }>(
+        `SELECT count(*) FILTER (WHERE source = 'audit')::int AS audits,
+                count(*) FILTER (WHERE source = 'audit' AND finding <> 'no_defect_found')::int AS audit_defects,
+                (SELECT count(*)::int FROM work_orders WHERE kind = 'audit' AND status IN ('open', 'in_progress')) AS open_audits
+           FROM findings`,
+      ),
+      pool.query<{ status: string; n: number; escalated: number; median_ack_min: number | null }>(
+        `SELECT a.status, count(*)::int AS n, count(*) FILTER (WHERE a.escalation_level > 0)::int AS escalated,
+                percentile_cont(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (a.acknowledged_at - a.opened_at)) / 60) AS median_ack_min
+           FROM alerts a WHERE a.trip_id NOT LIKE 'HIST-%' GROUP BY a.status`,
+      ),
     ])
     const r = recall.rows[0]
     const liveAlerts = volume.rows.reduce((s, v) => s + v.n, 0)
@@ -123,6 +140,9 @@ adminRouter.get(
       ingest: { ...ingest.rows[0], lateAfterMinutes: config.analysis.lateAfterMinutes },
       open: open.rows[0],
       outcomes: outcomes.rows,
+      precisionByKind: byKind.rows.map((k) => ({ kind: k.kind, inspected: k.inspected, defects: k.defects, precision: k.inspected ? k.defects / k.inspected : null })),
+      audits: { ...audits.rows[0], defectRate: audits.rows[0].audits ? audits.rows[0].audit_defects / audits.rows[0].audits : null },
+      lifecycle: lifecycle.rows,
     })
   }),
 )

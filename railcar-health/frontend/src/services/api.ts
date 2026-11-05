@@ -54,10 +54,11 @@ export interface AlertQuery {
 
 export interface FindingInput {
   clientSubmissionId: string
-  finding: 'confirmed_bearing_defect' | 'wheel_defect' | 'no_defect_found'
-  disposition: 'bad_order' | 'release'
+  finding: 'confirmed_bearing_defect' | 'brake_defect' | 'wheel_defect' | 'no_defect_found'
+  disposition: 'bad_order' | 'release' | 'repaired'
   notes?: string
   observedAt?: string
+  replacement?: { componentId: string; installedAt: string; axle?: number }
 }
 
 export const api = {

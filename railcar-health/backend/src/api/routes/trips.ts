@@ -20,7 +20,7 @@ tripsRouter.get(
   asyncHandler(async (_req, res) => {
     const { rows } = await pool.query<TripRow>(
       `SELECT t.*,
-              (SELECT count(*)::int FROM trip_units u WHERE u.trip_id = t.trip_id AND u.unit_type = 'car') AS car_count,
+              (SELECT count(*)::int FROM current_trip_units u WHERE u.trip_id = t.trip_id AND u.unit_type = 'car') AS car_count,
               (SELECT count(*)::int FROM alerts a WHERE a.trip_id = t.trip_id AND a.status <> 'closed') AS open_alerts,
               (SELECT max(tier) FROM alerts a WHERE a.trip_id = t.trip_id AND a.status <> 'closed') AS max_tier
          FROM trips t
@@ -33,7 +33,7 @@ tripsRouter.get(
 
 async function loadTrip(tripId: string): Promise<TripRow> {
   const { rows } = await pool.query<TripRow>(
-    `SELECT t.*, (SELECT count(*)::int FROM trip_units u WHERE u.trip_id = t.trip_id AND u.unit_type = 'car') AS car_count
+    `SELECT t.*, (SELECT count(*)::int FROM current_trip_units u WHERE u.trip_id = t.trip_id AND u.unit_type = 'car') AS car_count
        FROM trips t WHERE t.trip_id = $1`,
     [tripId],
   )
@@ -48,7 +48,7 @@ tripsRouter.get(
     const [units, passes] = await Promise.all([
       pool.query(
         `SELECT u.position, u.unit_id, u.unit_type, u.axle_count, u.leading_end, u.orientation_source, u.corrected_by_detector, c.owner_mark, c.car_type
-           FROM trip_units u LEFT JOIN railcars c ON c.car_id = u.unit_id WHERE u.trip_id = $1 ORDER BY u.position`,
+           FROM current_trip_units u LEFT JOIN railcars c ON c.car_id = u.unit_id WHERE u.trip_id = $1 ORDER BY u.position`,
         [trip.trip_id],
       ),
       pool.query(
@@ -86,7 +86,7 @@ tripsRouter.get(
     const { config: t } = await loadThresholds()
     const units = (
       await pool.query<{ position: number; unit_id: string; unit_type: string; axle_count: number; leading_end: CarEnd }>(
-        'SELECT position, unit_id, unit_type, axle_count, leading_end FROM trip_units WHERE trip_id = $1 ORDER BY position',
+        'SELECT position, unit_id, unit_type, axle_count, leading_end FROM current_trip_units WHERE trip_id = $1 ORDER BY position',
         [trip.trip_id],
       )
     ).rows
@@ -116,8 +116,8 @@ tripsRouter.get(
       )
     ).rows
     const readings = (
-      await pool.query<{ detector_id: string; pass_id: string; axle_seq: number; rail: 'N' | 'S'; bearing_f: number }>(
-        `SELECT r.detector_id, r.pass_id, r.axle_seq, r.rail, r.bearing_f FROM axle_readings r
+      await pool.query<{ detector_id: string; pass_id: string; rail: 'N' | 'S'; bearing_f: number; car_id: string; car_side: 'L' | 'R'; car_axle: number }>(
+        `SELECT r.detector_id, r.pass_id, r.rail, r.bearing_f, r.car_id, r.car_side, r.car_axle FROM axle_readings r
            JOIN detector_passes p ON p.detector_id = r.detector_id AND p.pass_id = r.pass_id
           WHERE p.trip_id = $1 AND p.identity_status = 'resolved' AND r.car_id IS NOT NULL`,
         [trip.trip_id],
@@ -125,10 +125,17 @@ tripsRouter.get(
     ).rows
     const values = new Map<string, { N: Array<number | null>; S: Array<number | null> }>()
     for (const p of passes) values.set(`${p.detector_id}|${p.pass_id}`, { N: columns.map(() => null), S: columns.map(() => null) })
+    // Place each reading by car and car-relative position, not raw axle number, so passes measured under an
+    // earlier consist revision (before cars were set out at a yard) line up with the current layout.
+    const unitById = new Map(units.map((u) => [u.unit_id, u]))
     for (const r of readings) {
-      const idx = colIndex.get(r.axle_seq)
+      const unit = unitById.get(r.car_id)
+      const start = firstSeq.get(r.car_id)
       const row = values.get(`${r.detector_id}|${r.pass_id}`)
-      if (idx !== undefined && row) row[r.rail][idx] = r.bearing_f
+      if (!unit || start === undefined || !row) continue
+      const view = detectorViewOf(r.car_side, r.car_axle, trip.direction as Direction, unit.leading_end, unit.axle_count)
+      const idx = colIndex.get(start + view.seqInCar - 1)
+      if (idx !== undefined) row[r.rail][idx] = r.bearing_f
     }
     // Where each open alert's bearing shows up in the grid, given the car's (corrected) orientation.
     const alerts = (

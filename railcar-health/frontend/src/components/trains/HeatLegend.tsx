@@ -10,7 +10,7 @@ export function HeatLegend({ mode }: { mode: HeatMode }) {
         {HEAT_RAMP.map((c) => <span key={c} className="h-3 w-5" style={{ background: c }} />)}
       </div>
       <span>≥{max}°F</span>
-      <span className="ml-3 inline-block h-3 w-3 border-[1.5px] border-slate-900" /> alerted bearing
+      <span className="ml-3 inline-block h-3 w-2 border-x-[1.5px] border-slate-900" /> alerted bearing
       <span className="ml-2 inline-block h-3 w-3 bg-slate-200" /> no reading
     </div>
   )

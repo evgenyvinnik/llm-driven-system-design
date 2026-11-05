@@ -23,6 +23,8 @@ export interface PassContext {
   biasOffsetF: number
   lagSeconds: number
   edgeAlarmKeys: Set<string>
+  /** Bottom of a grade where every car is braking: the only place a cold (inoperative) brake shows. */
+  brakingZone: boolean
 }
 
 export interface ReadingRow {
@@ -35,6 +37,7 @@ export interface ReadingRow {
   carId: string
   carSide: 'L' | 'R'
   carAxle: number
+  passedAtMs: number
 }
 
 export interface Observation {
@@ -51,11 +54,13 @@ export interface Observation {
   lagSeconds: number
   edgeAlarm: boolean
   biasCorrected: boolean
+  brakingZone: boolean
 }
 
 export interface FeatureOptions {
   elevatedSideDelta: number
   hotWheelDelta: number
+  coldWheelDelta: number
   maxSpacingMiles: number
   historyElevatedTrips: number
 }
@@ -75,6 +80,9 @@ export interface BearingFeatures {
   historyElevatedTrips: number
   wheelDelta: number
   wheelConsecutiveHot: number
+  /** Braking-zone readings, and how many of them had this wheel well below the train-side median. */
+  brakingZoneReadings: number
+  coldWheelReadings: number
   edgeAlarm: boolean
   lastDetectorId: string
   lastPassId: string
@@ -136,7 +144,12 @@ export function passMedians(rows: Array<Pick<ReadingRow, 'rail' | 'bearingF' | '
 }
 
 /** Groups a trip's resolved readings into ordered observations per bearing. */
-export function buildObservations(rows: ReadingRow[], passes: Map<string, PassContext>, originMp: number): Map<string, Observation[]> {
+export function buildObservations(
+  rows: ReadingRow[],
+  passes: Map<string, PassContext>,
+  originMp: number,
+  mediansByPass?: Map<string, PassMedians>,
+): Map<string, Observation[]> {
   const byPass = new Map<string, ReadingRow[]>()
   for (const row of rows) {
     const key = passKey(row.detectorId, row.passId)
@@ -148,7 +161,7 @@ export function buildObservations(rows: ReadingRow[], passes: Map<string, PassCo
   for (const [key, passRows] of byPass) {
     const ctx = passes.get(key)
     if (!ctx) continue
-    const medians = passMedians(passRows)
+    const medians = mediansByPass?.get(key) ?? passMedians(passRows)
     const sorted: Record<Rail, number[]> = {
       N: passRows.filter((r) => r.rail === 'N').map((r) => r.bearingF).sort((a, b) => a - b),
       S: passRows.filter((r) => r.rail === 'S').map((r) => r.bearingF).sort((a, b) => a - b),
@@ -169,6 +182,7 @@ export function buildObservations(rows: ReadingRow[], passes: Map<string, PassCo
         lagSeconds: ctx.lagSeconds,
         edgeAlarm: ctx.edgeAlarmKeys.has(edgeAlarmKey(row.axleSeq, row.rail)),
         biasCorrected: ctx.biasOffsetF !== 0,
+        brakingZone: ctx.brakingZone,
       }
       const bKey = bearingKey(row.carId, row.carSide, row.carAxle)
       const list = out.get(bKey)
@@ -213,6 +227,8 @@ export function computeFeatures(observations: Observation[], opts: FeatureOption
     historyElevatedTrips: opts.historyElevatedTrips,
     wheelDelta: last.wheelDelta,
     wheelConsecutiveHot: trailingCount(obs.map((o) => o.wheelDelta), opts.hotWheelDelta),
+    brakingZoneReadings: obs.filter((o) => o.brakingZone).length,
+    coldWheelReadings: obs.filter((o) => o.brakingZone && o.wheelDelta <= -opts.coldWheelDelta).length,
     edgeAlarm: obs.some((o) => o.edgeAlarm),
     lastDetectorId: last.detectorId,
     lastPassId: last.passId,

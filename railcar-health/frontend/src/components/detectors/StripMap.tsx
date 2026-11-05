@@ -5,7 +5,7 @@
  */
 import type { Network } from '@/types'
 
-const W = 1100
+const W = 860
 const X0 = 30
 const X1 = W - 30
 const STATUS_FILL: Record<string, string> = { ok: '#0ca30c', offline: '#7c3aed', silent: '#d03b3b', biased: '#fab219' }
@@ -13,7 +13,7 @@ const STATUS_FILL: Record<string, string> = { ok: '#0ca30c', offline: '#7c3aed',
 export function StripMap({ network, selected, onSelect }: { network: Network; selected: string | null; onSelect: (id: string) => void }) {
   const sx = (mp: number) => X0 + (mp / 240) * (X1 - X0)
   return (
-    <svg width={W} height={150} role="img" aria-label="Detector coverage along the line">
+    <svg viewBox={`0 0 ${W} 150`} width="100%" style={{ maxWidth: W, minWidth: 640 }} role="img" aria-label="Detector coverage along the line">
       {network.subdivisions.map((s, i) => (
         <g key={s.id}>
           <rect x={sx(s.startMp)} y={14} width={sx(s.endMp) - sx(s.startMp)} height={100} fill={i % 2 ? '#f8fafc' : '#f1f5f9'} />

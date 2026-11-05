@@ -53,7 +53,9 @@ function simLabel(): string {
 interface LiveTrain {
   spec: TrainSpec
   tripId: string
+  /** The physical train right now (cars set out en route disappear from it). */
   units: SimUnit[]
+  revision: number
 }
 const usedIds = new Set<string>()
 const trains = new Map<string, LiveTrain>()
@@ -61,7 +63,7 @@ for (const spec of TRAINS) {
   const departed = new Date(simMs(spec.departMinutes))
   const stamp = departed.toISOString().replace(/[-:]/g, '').slice(0, 13).replace('T', '-')
   const units = buildConsist({ seed: spec.seed, locomotives: spec.locomotives, cars: spec.cars, usedIds, special: spec.special })
-  trains.set(spec.symbol, { spec, tripId: `${spec.symbol}-${stamp}`, units })
+  trains.set(spec.symbol, { spec, tripId: `${spec.symbol}-${stamp}`, units, revision: 1 })
 }
 
 // ── Gateways (store-and-forward) ──
@@ -114,17 +116,28 @@ function ambientAt(ms: number, detectorId: string): number {
   return Math.round((58 + 10 * Math.sin(((hour - 9) / 24) * 2 * Math.PI) + stableGaussian(detectorId, 1.5)) * 10) / 10
 }
 
-async function postConsist(train: LiveTrain): Promise<void> {
+async function postConsist(train: LiveTrain, effectiveMinute?: number): Promise<void> {
   const res = await post(apiUrl, '/consists', {
     tripId: train.tripId, symbol: train.spec.symbol, direction: train.spec.direction, originYardId: train.spec.originYardId,
     destinationYardId: train.spec.destinationYardId, stops: train.spec.stops, departedAt: new Date(simMs(train.spec.departMinutes)).toISOString(),
-    revision: 1,
+    revision: train.revision,
+    ...(effectiveMinute !== undefined ? { effectiveAt: new Date(simMs(effectiveMinute)).toISOString() } : {}),
     units: train.units.map((u) => ({
       position: u.position, unitId: u.unitId, unitType: u.unitType, axleCount: u.axleCount, leadingEnd: u.consistLeadingEnd, loaded: u.loaded,
       ownerMark: u.owner?.mark, ownerName: u.owner?.name, carType: u.owner?.carType,
     })),
   })
-  log(`consist ${train.tripId}`, { status: res.status, units: train.units.length })
+  log(`consist ${train.tripId} rev ${train.revision}`, { status: res.status, units: train.units.length })
+}
+
+/** Cars set out at an intermediate yard: the train is shorter from here, and the yard system sends consist revision 2. */
+async function rebuild(train: LiveTrain, yardId: string, minute: number): Promise<void> {
+  const n = train.spec.setOutAt?.lastCars ?? 0
+  const setOut = train.units.slice(-n).map((u) => u.unitId)
+  train.units = train.units.slice(0, -n)
+  train.revision += 1
+  log(`${train.spec.symbol} set out ${n} cars at ${yardId}`, { cars: setOut })
+  await postConsist(train, minute)
 }
 
 async function postTripEvent(train: LiveTrain, kind: 'departed' | 'arrived', yardId: string, minute: number): Promise<void> {
@@ -144,7 +157,8 @@ async function handlePass(train: LiveTrain, detector: DetectorSite, distance: nu
     {
       units: train.units, direction: train.spec.direction, distance, milepost: detector.milepost, speedMph, ambientF,
       hourOfDay: new Date(passedAtMs).getUTCHours(), brakingZone: detector.brakingZone, biasF: FAULTS.biasedDetectors[detector.id] ?? 0,
-      defects: train.spec.defects, stuckBrakeCars: new Set(train.spec.stuckBrakeCars), siteAlarmAboveAmbient: SITE_ALARM_ABOVE_AMBIENT,
+      defects: train.spec.defects, stuckBrakeCars: new Set(train.spec.stuckBrakeCars), inoperativeBrakeCars: new Set(train.spec.inoperativeBrakeCars ?? []),
+      siteAlarmAboveAmbient: SITE_ALARM_ABOVE_AMBIENT,
     },
     rng,
   )
@@ -185,6 +199,8 @@ const ticks: Tick[] = timeline.map((e) => {
       return { at: e.at, run: () => postTripEvent(train, 'arrived', e.yardId, e.at) }
     case 'pass':
       return { at: e.at, run: () => handlePass(train, e.detector, e.distance, e.at) }
+    case 'rebuilt':
+      return { at: e.at, run: () => rebuild(train, e.yardId, e.at) }
   }
 })
 for (let m = 0; m <= durationMin; m += 10) ticks.push({ at: m, run: () => heartbeats(m) })

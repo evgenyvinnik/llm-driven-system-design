@@ -2,7 +2,7 @@
 -- Domain timestamps (passed_at, received_at, opened_at...) are in the domain clock, which the
 -- simulator compresses; operational timestamps (inserted_at, processed_at) are database now().
 
-CREATE EXTENSION IF NOT EXISTS pgcrypto;
+-- gen_random_uuid() is built into PostgreSQL 13+; no extension needed.
 
 -- ── Reference data ────────────────────────────────────────────────────────────
 

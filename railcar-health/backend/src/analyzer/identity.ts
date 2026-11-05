@@ -112,3 +112,20 @@ export function decideIdentity(units: ConsistUnit[], detectorAxleCount: number, 
   }
   return { status: 'resolved', units: corrected, corrections }
 }
+
+export interface ConsistVersion {
+  revision: number
+  effectiveAtMs: number
+}
+
+/**
+ * The consist revision in force when a pass was measured. A train rebuilt at a
+ * yard has a new revision from its departure; a late pass from before that is
+ * resolved against the old one. Falls back to the first revision.
+ */
+export function consistRevisionAt(versions: ConsistVersion[], passedAtMs: number): number {
+  const sorted = [...versions].sort((a, b) => a.effectiveAtMs - b.effectiveAtMs)
+  let chosen = sorted[0]?.revision ?? 1
+  for (const v of sorted) if (v.effectiveAtMs <= passedAtMs) chosen = v.revision
+  return chosen
+}

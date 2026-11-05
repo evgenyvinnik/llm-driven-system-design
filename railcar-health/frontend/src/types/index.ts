@@ -29,6 +29,8 @@ export interface AlertFeatures {
   biasCorrected?: boolean
   historyElevatedTrips?: number
   wheelDelta?: number
+  brakingZoneReadings?: number
+  coldWheelReadings?: number
   edgeAlarm?: boolean
   lastDetectorId?: string
   lastMilepost?: number
@@ -42,11 +44,17 @@ export interface Alert {
   tripStatus: string | null
   carId: string
   ownerMark: string | null
-  kind: 'hot_bearing' | 'hot_wheel'
+  kind: 'hot_bearing' | 'hot_wheel' | 'cold_wheel'
   position: string
   tier: number
   tierName: string
-  status: 'open' | 'acknowledged' | 'closed'
+  status: 'open' | 'acknowledged' | 'inspected' | 'closed'
+  ownerRole: 'dispatcher' | 'yard' | 'owner' | null
+  ownerId: string | null
+  escalationLevel: number
+  ackDueAt: string | null
+  deliveredAt: string | null
+  inspectedAt: string | null
   action: string
   routing: string
   deskId: string | null
@@ -172,6 +180,7 @@ export interface CarDetail {
   alerts: Alert[]
   trips: Array<{ tripId: string; symbol: string; direction: string; departedAt: string; status: string; position: number; leadingEnd: string; orientationSource: string; correctedByDetector: string | null }>
   bearings: Array<{ position: string; observations: number; maxSideDelta: number; lastSideDelta: number }>
+  components: Array<{ axle: number; componentId: string; installedAt: string; removedAt: string | null; recordedAt: string; recordedBy: string }>
 }
 
 export interface TrendPoint {
@@ -182,6 +191,8 @@ export interface TrendPoint {
   lagSeconds: number
   aboveAmbient: number
   sideDelta: number | null
+  componentId: string | null
+  superseded: boolean
 }
 
 export interface TrendSeries {
@@ -194,7 +205,7 @@ export interface TrendSeries {
 
 export interface WorkOrder {
   id: string
-  alertId: string
+  alertId: string | null
   carId: string
   position: string
   kind: string
@@ -263,6 +274,9 @@ export interface Detector {
   biasOffsetF: number | null
   biasSamples: number
   missedPasses: number
+  pendingPasses: number
+  lastReceivedAt: string | null
+  coverage: 'live' | 'delayed' | 'catching_up' | 'gap'
 }
 
 export interface Subdivision {
@@ -280,6 +294,7 @@ export interface Network {
   detectors: Detector[]
   coverageGaps: Array<{ fromMp: number; toMp: number; miles: number; causes: string[] }>
   maxSpacingMiles: number
+  lanes: { live: number | null; backfill: number | null }
   clock: Clock
 }
 
@@ -306,4 +321,7 @@ export interface Metrics {
   alertVolume: { byTier: Array<{ tier: number; tierName: string; alerts: number }>; carPasses: number; per1000CarPasses: number | null }
   ingest: { passes: number; late: number; unresolved: number; awaiting: number; median_lag: number | null; lateAfterMinutes: number }
   open: { work: number; holds: number; alerts: number }
+  precisionByKind: Array<{ kind: string; inspected: number; defects: number; precision: number | null }>
+  audits: { audits: number; audit_defects: number; open_audits: number; defectRate: number | null }
+  lifecycle: Array<{ status: string; n: number; escalated: number; median_ack_min: number | null }>
 }

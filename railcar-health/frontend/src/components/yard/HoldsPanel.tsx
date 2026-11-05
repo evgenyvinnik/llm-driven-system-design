@@ -9,16 +9,15 @@ export function HoldsPanel({ holds, nowMs }: { holds: Hold[]; nowMs: number }) {
   return (
     <table className="w-full" aria-label="Car holds">
       <thead className="border-b border-slate-100">
-        <tr><th className="th">Car</th><th className="th">Status</th><th className="th">Alert</th><th className="th">Reason</th><th className="th">Since</th></tr>
+        <tr><th className="th">Car</th><th className="th">Status</th><th className="th">Alert</th><th className="th">Since</th></tr>
       </thead>
       <tbody className="divide-y divide-slate-50">
         {holds.map((h) => (
-          <tr key={h.id} className={h.status === 'released' ? 'opacity-60' : ''}>
-            <td className="td font-mono">{h.carId}</td>
+          <tr key={h.id} className={h.status === 'released' ? 'opacity-60' : ''} title={h.reason}>
+            <td className="td whitespace-nowrap font-mono">{h.carId}</td>
             <td className="td">{h.status === 'released' ? <span className="text-xs text-slate-500">released{h.releasedBy ? ` by ${h.releasedBy}` : ''}</span> : <HoldBadge status={h.status} />}</td>
-            <td className="td"><TierBadge tier={h.tier} /> <span className="text-xs text-slate-500">{h.kind === 'hot_wheel' ? 'wheels' : h.position}</span></td>
-            <td className="td text-xs">{h.reason}</td>
-            <td className="td text-xs">{ageText(h.createdAt, nowMs)}</td>
+            <td className="td whitespace-nowrap"><TierBadge tier={h.tier} /> <span className="text-xs text-slate-500">{h.kind === 'hot_bearing' ? h.position : 'brakes'}</span></td>
+            <td className="td whitespace-nowrap text-xs">{ageText(h.createdAt, nowMs)}</td>
           </tr>
         ))}
       </tbody>

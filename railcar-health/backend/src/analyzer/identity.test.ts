@@ -78,3 +78,13 @@ describe('AEI corrections', () => {
     expect(decideIdentity(units, 14, null).status).toBe('resolved')
   })
 })
+
+describe('consist revision by time', () => {
+  it('resolves a pass against the consist in force when it was measured, even if it arrives after a rebuild', async () => {
+    const { consistRevisionAt } = await import('./identity.js')
+    const versions = [{ revision: 1, effectiveAtMs: 0 }, { revision: 2, effectiveAtMs: 1000 }]
+    expect(consistRevisionAt(versions, 500)).toBe(1) // a late pass from before the train was rebuilt
+    expect(consistRevisionAt(versions, 1500)).toBe(2)
+    expect(consistRevisionAt(versions, -10)).toBe(1) // clock skew before departure: first revision
+  })
+})

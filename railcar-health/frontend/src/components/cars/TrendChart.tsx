@@ -21,11 +21,14 @@ export function TrendChart({ series, mode }: { series: TrendSeries[]; mode: Tren
   const value = (p: TrendSeries['points'][number]) => (mode === 'median' ? p.sideDelta : p.aboveAmbient)
   const all = series.flatMap((s) => s.points.map(value)).filter((v): v is number => v !== null)
   const refs = REFS[mode]
-  const yMax = Math.max(...all, ...refs.map((r) => r[0])) + 10
-  const yMin = Math.min(0, ...all) - 5
+  const rawMax = Math.max(...all, ...refs.map((r) => r[0])) + 10
+  const rawMin = Math.min(0, ...all) - 5
+  const step = [5, 10, 20, 25, 50, 100].find((s) => (rawMax - rawMin) / s <= 6) ?? 100
+  const yMin = Math.floor(rawMin / step) * step
+  const yMax = Math.ceil(rawMax / step) * step
   const sx = (d: number) => M.l + (d / 240) * (W - M.l - M.r)
   const sy = (v: number) => M.t + (1 - (v - yMin) / (yMax - yMin)) * (H - M.t - M.b)
-  const ticks = Array.from({ length: 6 }, (_, i) => Math.round(yMin + ((yMax - yMin) * i) / 5))
+  const ticks = Array.from({ length: Math.round((yMax - yMin) / step) + 1 }, (_, i) => yMin + i * step)
   return (
     <div className="relative">
       <svg width={W} height={H} role="img" aria-label="Bearing temperature trend across detectors and trips">
@@ -53,8 +56,8 @@ export function TrendChart({ series, mode }: { series: TrendSeries[]; mode: Tren
             <g key={s.tripId}>
               <polyline fill="none" stroke={color} strokeWidth={2} points={pts.map((p) => `${sx(p.distance)},${sy(value(p)!)}`).join(' ')} />
               {pts.map((p) => (
-                <circle key={p.detectorId + p.passedAt} cx={sx(p.distance)} cy={sy(value(p)!)} r={4} fill={color} stroke="#fff" strokeWidth={2}
-                  onMouseEnter={() => setHover({ x: sx(p.distance), y: sy(value(p)!), text: `${s.symbol} · ${p.detectorId} (MP ${p.milepost}) · ${Math.round(value(p)!)}°F${p.lagSeconds > 900 ? ' · arrived late' : ''}` })}
+                <circle key={p.detectorId + p.passedAt} cx={sx(p.distance)} cy={sy(value(p)!)} r={4} fill={p.superseded ? '#fff' : color} stroke={p.superseded ? color : '#fff'} strokeWidth={2}
+                  onMouseEnter={() => setHover({ x: sx(p.distance), y: sy(value(p)!), text: `${s.symbol} · ${p.detectorId} (MP ${p.milepost}) · ${Math.round(value(p)!)}°F${p.lagSeconds > 900 ? ' · arrived late' : ''}${p.superseded ? ' · previous wheelset (not evidence)' : ''}` })}
                   onMouseLeave={() => setHover(null)} />
               ))}
               {last && i < 4 && <text x={sx(last.distance) + 7} y={sy(value(last)!) + 4} fontSize={10} fill="#334155">{s.symbol}</text>}
@@ -63,6 +66,9 @@ export function TrendChart({ series, mode }: { series: TrendSeries[]; mode: Tren
         })}
       </svg>
       <div className="mt-1 flex flex-wrap gap-3 text-xs text-slate-600">
+        {series.some((s) => s.points.some((p) => p.superseded)) && (
+          <span className="flex items-center gap-1.5"><span className="inline-block h-2.5 w-2.5 rounded-full border-2 border-slate-500 bg-white" /> measured on a wheelset since replaced</span>
+        )}
         {series.map((s, i) => (
           <span key={s.tripId} className="flex items-center gap-1.5">
             <span className="inline-block h-0.5 w-4" style={{ background: COLORS[i % COLORS.length] }} />

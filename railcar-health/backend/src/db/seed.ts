@@ -33,8 +33,8 @@ const USERS = [
 ] as const
 
 async function reset(client: { query: typeof pool.query }): Promise<void> {
-  await client.query(`TRUNCATE notifications, findings, work_orders, car_holds, alert_events, alerts, threshold_changes, thresholds,
-    bearing_trip_summary, detector_bias_samples, expected_passes, axle_readings, detector_passes, trip_events, trip_units, trips,
+  await client.query(`TRUNCATE component_installs, notifications, findings, work_orders, car_holds, alert_events, alerts, threshold_changes, thresholds,
+    bearing_trip_summary, detector_bias_samples, expected_passes, axle_readings, detector_passes, trip_events, trip_units, trip_consist_versions, trips,
     railcars, users, detectors, yards, subdivisions, dispatcher_desks RESTART IDENTITY CASCADE`)
 }
 
@@ -74,6 +74,7 @@ async function insertTrip(
      VALUES ($1, $2, $3, $4, $5, $6, 'arrived', $7, $8, $5, 45, (SELECT subdivision_id FROM yards WHERE id = $5))`,
     [t.tripId, t.symbol, t.direction, t.origin, t.destination, [t.destination], t.departedAt, t.arrivedAt],
   )
+  await client.query('INSERT INTO trip_consist_versions (trip_id, revision, effective_at) VALUES ($1, 1, $2)', [t.tripId, t.departedAt])
 }
 
 /** Two earlier trips of NRLX 220187 with readings for its eight bearings; L2 runs ~17°F warm. */
@@ -174,7 +175,7 @@ async function seedLabeledHistory(client: { query: typeof pool.query }): Promise
     const position = `${i % 3 === 0 ? 'L' : 'R'}${(i % 4) + 1}`
     const openedAt = new Date(departedAt.getTime() + 2 * 3_600_000)
     const closedAt = new Date(openedAt.getTime() + 3 * 3_600_000)
-    const finding = a.defect ? (a.kind === 'hot_wheel' ? 'wheel_defect' : 'confirmed_bearing_defect') : 'no_defect_found'
+    const finding = a.defect ? (a.kind === 'hot_wheel' ? 'brake_defect' : 'confirmed_bearing_defect') : 'no_defect_found'
     const disposition = a.defect ? 'bad_order' : 'release'
     const { rows } = await client.query<{ id: string }>(
       `INSERT INTO alerts (trip_id, car_id, kind, position, tier, status, action, routing, yard_id, reasons, features, route_note, data_lag_seconds,
@@ -201,6 +202,26 @@ async function seedLabeledHistory(client: { query: typeof pool.query }): Promise
       alertId, a.tier, openedAt, finding, closedAt,
     ])
   }
+  // Random audit inspections of cars with no alert (the label-bias guard): mostly healthy, one bearing defect found.
+  const audits = 36
+  for (let i = 0; i < audits; i++) {
+    const tripId = `HIST-${String((i % alerts.length) + 1).padStart(3, '0')}`
+    const carId = `HPRX ${(820000 + i * 53).toString()}`
+    await insertCar(client, carId)
+    const at = new Date(now - (3 + i * 1.4) * DAY)
+    const defect = i === 17
+    const wo = await client.query<{ id: string }>(
+      `INSERT INTO work_orders (alert_id, trip_id, audit_key, car_id, position, kind, yard_id, priority, status, assigned_to, created_at, completed_at)
+       VALUES (NULL, $1, $2, $3, 'ALL', 'audit', $4, 0, 'completed', 'seed', $5, $5) RETURNING id`,
+      [tripId, `seed-audit-${i}`, carId, yards[i % yards.length], at],
+    )
+    await client.query(
+      `INSERT INTO findings (client_submission_id, work_order_id, car_id, position, source, finding, disposition, notes, recorded_by, observed_at, recorded_at)
+       VALUES ($1, $2, $3, 'ALL', 'audit', $4, $5, $6, 'seed', $7, $7)`,
+      [`seed-audit-${i}`, wo.rows[0].id, carId, defect ? 'confirmed_bearing_defect' : 'no_defect_found', defect ? 'bad_order' : 'release',
+        defect ? 'Audit found a bearing with a damaged seal that had not alerted' : null, at],
+    )
+  }
   // Defects found on routine inspection with no prior alert: the misses that make recall < 100%.
   const routine = 3
   for (let i = 0; i < routine; i++) {
@@ -225,7 +246,7 @@ async function main(): Promise<void> {
       return seedLabeledHistory(client)
     })
     // Old stream pointers and the old simulation clock refer to data that no longer exists.
-    await redis.del(config.stream.key, config.stream.deadLetterKey, config.clockKey)
+    await redis.del(config.stream.liveKey, config.stream.backfillKey, config.stream.deadLetterKey, config.clockKey)
     console.log(`Seeded ${DETECTORS.length} detectors, ${YARDS.length} yards, ${USERS.length} users, NRLX 220187 history, ${counts.alerts} labeled alerts, ${counts.routine} routine findings`)
     console.log('Users (password "password123"): alice, dan (dispatchers), bob (Cedar Jct yard), erin (Ridgeway yard), carol (reliability admin)')
   } catch (err) {

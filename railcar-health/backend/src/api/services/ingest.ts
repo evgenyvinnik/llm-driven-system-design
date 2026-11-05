@@ -9,6 +9,9 @@
  * between, the gateway never got a 2xx and retries: the retry finds the pass
  * stored but unpublished and publishes it. The republisher sweep covers a
  * gateway that gave up.
+ *
+ * Each pass goes to the live or backfill lane by how late it is, so a
+ * reconnecting site's backlog never queues ahead of fresh readings.
  * @module api/services/ingest
  */
 import { createHash } from 'node:crypto'
@@ -19,7 +22,7 @@ import { pool, withTransaction } from '../../shared/db.js'
 import { HttpError } from '../../shared/errors.js'
 import { logger } from '../../shared/logger.js'
 import { ingestLagMinutes, passesIngested } from '../../shared/metrics.js'
-import { publishPass } from '../../shared/stream.js'
+import { laneFor, publishPass, type Lane } from '../../shared/stream.js'
 
 const isoDate = z.string().datetime({ offset: true })
 
@@ -57,6 +60,13 @@ export interface PassResult {
   status: 'accepted' | 'duplicate' | 'conflict'
   lagMinutes: number
   late: boolean
+  lane: Lane
+}
+
+export interface Publishable {
+  detectorId: string
+  passId: string
+  lagSeconds: number
 }
 
 export function payloadSha(pass: PassInput): string {
@@ -83,11 +93,12 @@ export async function ingestBatch(batch: BatchInput, receivedAt: Date, streamCli
   if (unknown.length > 0) throw new HttpError(422, 'UNKNOWN_DETECTOR', `Unknown detector(s): ${unknown.join(', ')}`)
 
   const results: PassResult[] = []
-  const toPublish: Array<{ detectorId: string; passId: string }> = []
+  const toPublish: Publishable[] = []
   await withTransaction(async (client) => {
     for (const pass of batch.passes) {
       const lagMinutes = lagMinutesOf(pass.passedAt, receivedAt)
       const late = lagMinutes > config.analysis.lateAfterMinutes
+      const lane = laneFor(lagMinutes * 60)
       const sha = payloadSha(pass)
       const inserted = await client.query(
         `INSERT INTO detector_passes (detector_id, pass_id, trip_id, gateway_id, direction, passed_at, sent_at, received_at, speed_mph,
@@ -99,8 +110,8 @@ export async function ingestBatch(batch: BatchInput, receivedAt: Date, streamCli
       )
       if (inserted.rowCount === 1) {
         await insertReadings(client, pass)
-        toPublish.push({ detectorId: pass.detectorId, passId: pass.passId })
-        results.push({ detectorId: pass.detectorId, passId: pass.passId, status: 'accepted', lagMinutes: Math.round(lagMinutes), late })
+        toPublish.push({ detectorId: pass.detectorId, passId: pass.passId, lagSeconds: lagMinutes * 60 })
+        results.push({ detectorId: pass.detectorId, passId: pass.passId, status: 'accepted', lagMinutes: Math.round(lagMinutes), late, lane })
         ingestLagMinutes.observe(lagMinutes)
         continue
       }
@@ -112,8 +123,8 @@ export async function ingestBatch(batch: BatchInput, receivedAt: Date, streamCli
       const conflict = row.payload_sha !== sha
       if (conflict) logger.warn({ detectorId: pass.detectorId, passId: pass.passId }, 'pass retried with different readings; keeping the first copy')
       // A retry after a crash between commit and publish: publish now.
-      if (row.published_at === null) toPublish.push({ detectorId: pass.detectorId, passId: pass.passId })
-      results.push({ detectorId: pass.detectorId, passId: pass.passId, status: conflict ? 'conflict' : 'duplicate', lagMinutes: Math.round(lagMinutes), late })
+      if (row.published_at === null) toPublish.push({ detectorId: pass.detectorId, passId: pass.passId, lagSeconds: lagMinutes * 60 })
+      results.push({ detectorId: pass.detectorId, passId: pass.passId, status: conflict ? 'conflict' : 'duplicate', lagMinutes: Math.round(lagMinutes), late, lane })
     }
   })
 
@@ -126,21 +137,21 @@ export async function ingestBatch(batch: BatchInput, receivedAt: Date, streamCli
   return { accepted, duplicates, conflicts, results }
 }
 
-export async function publishAll(streamClient: Redis, passes: Array<{ detectorId: string; passId: string }>): Promise<void> {
+export async function publishAll(streamClient: Redis, passes: Publishable[]): Promise<void> {
   for (const p of passes) {
-    await publishPass(streamClient, p.detectorId, p.passId)
+    await publishPass(streamClient, laneFor(p.lagSeconds), p.detectorId, p.passId)
     await pool.query('UPDATE detector_passes SET published_at = now() WHERE detector_id = $1 AND pass_id = $2', [p.detectorId, p.passId])
   }
 }
 
 /** Publishes committed passes that never reached the stream (the process died before publishing). */
 export async function republishStale(streamClient: Redis): Promise<number> {
-  const { rows } = await pool.query<{ detector_id: string; pass_id: string }>(
-    `SELECT detector_id, pass_id FROM detector_passes
+  const { rows } = await pool.query<{ detector_id: string; pass_id: string; lag_seconds: number }>(
+    `SELECT detector_id, pass_id, lag_seconds FROM detector_passes
       WHERE published_at IS NULL AND inserted_at < now() - ($1 || ' milliseconds')::interval
       ORDER BY inserted_at LIMIT 200`,
     [String(config.stream.republishAfterMs)],
   )
-  await publishAll(streamClient, rows.map((r) => ({ detectorId: r.detector_id, passId: r.pass_id })))
+  await publishAll(streamClient, rows.map((r) => ({ detectorId: r.detector_id, passId: r.pass_id, lagSeconds: r.lag_seconds })))
   return rows.length
 }

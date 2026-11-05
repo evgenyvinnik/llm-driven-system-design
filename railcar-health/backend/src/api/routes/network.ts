@@ -3,6 +3,8 @@
  */
 import { Router } from 'express'
 import { requireAuth } from '../../shared/auth.js'
+import { redis } from '../../shared/cache.js'
+import { laneKey, type Lane } from '../../shared/stream.js'
 import { config } from '../../shared/config.js'
 import { clockInfo } from '../../shared/clock.js'
 import { pool } from '../../shared/db.js'
@@ -14,17 +16,54 @@ import { coverageGaps } from '../services/coverage.js'
 export const networkRouter = Router()
 networkRouter.use(requireAuth)
 
+/**
+ * What operators should assume about a detector's data right now:
+ *  live         data is arriving and processed promptly
+ *  delayed      the gateway is offline; passes are buffered at the site and will arrive late
+ *  catching_up  a backlog arrived and is being processed in the backfill lane
+ *  gap          the detector is silent; nothing is coming, so this stretch is uncovered
+ */
+export function coverageState(status: string, pendingPasses: number): 'live' | 'delayed' | 'catching_up' | 'gap' {
+  if (status === 'silent') return 'gap'
+  if (status === 'offline') return 'delayed'
+  if (pendingPasses > 0) return 'catching_up'
+  return 'live'
+}
+
 const detectorDto = (d: Record<string, unknown>) => ({
   id: d.id, name: d.name, milepost: d.milepost, subdivisionId: d.subdivision_id, hasAei: d.has_aei, brakingZone: d.braking_zone, gatewayId: d.gateway_id,
   status: d.status, statusReason: d.status_reason, statusSince: d.status_since, lastHeardAt: d.last_heard_at, lastPassAt: d.last_pass_at,
   bufferedPasses: d.buffered_passes, selfTest: d.self_test, biasOffsetF: d.bias_offset_f, biasSamples: d.bias_samples, missedPasses: d.missed_passes,
+  pendingPasses: d.pending_passes ?? 0, lastReceivedAt: d.last_received_at ?? null,
+  coverage: coverageState(String(d.status), Number(d.pending_passes ?? 0)),
 })
+
+/** Unprocessed messages per lane (Valkey 7 reports consumer-group lag). */
+async function laneBacklog(): Promise<Record<Lane, number | null>> {
+  const out: Record<Lane, number | null> = { live: null, backfill: null }
+  for (const lane of ['live', 'backfill'] as Lane[]) {
+    try {
+      const groups = (await redis.xinfo('GROUPS', laneKey(lane))) as unknown[][]
+      const fields = groups[0] ?? []
+      const get = (name: string) => Number(fields[fields.indexOf(name) + 1] ?? 0)
+      out[lane] = get('lag') + get('pending')
+    } catch {
+      out[lane] = null
+    }
+  }
+  return out
+}
 
 networkRouter.get(
   '/',
   asyncHandler(async (_req, res) => {
     const { config: t } = await loadThresholds()
-    const { rows } = await pool.query('SELECT * FROM detectors ORDER BY milepost')
+    const { rows } = await pool.query(
+      `SELECT d.*,
+              (SELECT count(*)::int FROM detector_passes p WHERE p.detector_id = d.id AND p.processed_at IS NULL AND p.identity_status <> 'awaiting_consist') AS pending_passes,
+              (SELECT max(received_at) FROM detector_passes p WHERE p.detector_id = d.id) AS last_received_at
+         FROM detectors d ORDER BY milepost`,
+    )
     const detectors = rows.map(detectorDto)
     res.json({
       desks: DESKS,
@@ -33,6 +72,7 @@ networkRouter.get(
       detectors,
       coverageGaps: coverageGaps(rows.map((d) => ({ id: d.id, milepost: d.milepost, status: d.status })), 0, 240, t.maxDetectorSpacingMiles),
       maxSpacingMiles: t.maxDetectorSpacingMiles,
+      lanes: await laneBacklog(),
       clock: clockInfo(),
     })
   }),

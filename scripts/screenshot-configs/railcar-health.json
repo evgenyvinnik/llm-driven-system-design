@@ -1,0 +1,24 @@
+{
+  "name": "railcar-health",
+  "frontendPort": 5173,
+  "backendRequired": true,
+  "dbName": "railcar_health",
+  "dbUser": "railcar",
+  "auth": {
+    "enabled": true,
+    "loginUrl": "/login",
+    "credentials": { "username": "carol", "password": "password123" },
+    "usernameSelector": "input[name='username']",
+    "passwordSelector": "input[name='password']",
+    "submitSelector": "button[type='submit']",
+    "successIndicator": "main"
+  },
+  "screens": [
+    { "name": "01-login", "path": "/login", "waitFor": "form", "skipAuth": true, "delay": 500 },
+    { "name": "02-alerts", "path": "/alerts", "waitFor": "ul[aria-label='Alerts']", "delay": 800 },
+    { "name": "03-trains", "path": "/trains", "waitFor": "table[aria-label='Trains']", "delay": 600 },
+    { "name": "04-detectors", "path": "/detectors", "waitFor": "table[aria-label='Detectors']", "delay": 800 },
+    { "name": "05-reliability", "path": "/admin", "waitFor": "text=Precision by tier", "delay": 1000, "fullPage": true }
+  ],
+  "viewport": { "width": 1440, "height": 900 }
+}

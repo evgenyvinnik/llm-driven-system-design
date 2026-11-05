@@ -33,9 +33,12 @@ vi.mock('../../shared/db.js', () => ({
   pool: { query: (sql: string, params?: unknown[]) => fakeQuery(sql, params) },
   withTransaction: async (fn: (c: unknown) => Promise<unknown>) => fn({ query: (sql: string, params?: unknown[]) => fakeQuery(sql, params) }),
 }))
+const lanes: string[] = []
 vi.mock('../../shared/stream.js', () => ({
-  publishPass: async (_client: unknown, detectorId: string, passId: string) => {
+  laneFor: (lagSeconds: number) => (lagSeconds > 15 * 60 ? 'backfill' : 'live'),
+  publishPass: async (_client: unknown, lane: string, detectorId: string, passId: string) => {
     published.push(`${detectorId}|${passId}`)
+    lanes.push(`${passId}:${lane}`)
     return '1-0'
   },
 }))
@@ -61,6 +64,7 @@ beforeEach(() => {
   passes.clear()
   readings.clear()
   published.length = 0
+  lanes.length = 0
 })
 
 describe('ingestBatch', () => {
@@ -79,6 +83,8 @@ describe('ingestBatch', () => {
       ['P3', false, 5],
       ['P2', true, 70],
     ])
+    // The buffered pass goes to the backfill lane so it can't delay fresh readings.
+    expect(lanes).toEqual(['P3:live', 'P2:backfill'])
   })
 
   it('publishes on retry if the first attempt committed but crashed before publishing', async () => {

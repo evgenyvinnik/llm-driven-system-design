@@ -9,6 +9,7 @@ export type SimEvent =
   | { at: number; kind: 'departed'; train: TrainSpec }
   | { at: number; kind: 'pass'; train: TrainSpec; detector: DetectorSite; distance: number }
   | { at: number; kind: 'arrived'; train: TrainSpec; yardId: string }
+  | { at: number; kind: 'rebuilt'; train: TrainSpec; yardId: string }
 
 /** Minutes after departure at which the train reaches a milepost, including dwell at intermediate stops passed. */
 export function minutesTo(train: TrainSpec, milepost: number): number {
@@ -34,6 +35,11 @@ export function buildTimeline(trains: TrainSpec[]): SimEvent[] {
       events.push({ at: train.departMinutes + minutesTo(train, detector.milepost), kind: 'pass', train, detector, distance: Math.abs(detector.milepost - origin) })
     }
     events.push({ at: train.departMinutes + minutesTo(train, destination), kind: 'arrived', train, yardId: train.destinationYardId })
+    if (train.setOutAt) {
+      // Departure from the intermediate yard: arrival there plus the dwell.
+      const yard = yardById(train.setOutAt.yardId)!
+      events.push({ at: train.departMinutes + minutesTo(train, yard.milepost) + DWELL_MINUTES, kind: 'rebuilt', train, yardId: yard.id })
+    }
   }
   return events.sort((a, b) => a.at - b.at)
 }

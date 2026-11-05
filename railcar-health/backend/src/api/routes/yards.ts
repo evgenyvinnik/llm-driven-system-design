@@ -5,7 +5,7 @@
 import { Router } from 'express'
 import { z } from 'zod'
 import { canActOnYard, requireAuth, requireRole } from '../../shared/auth.js'
-import { clockInfo } from '../../shared/clock.js'
+import { clockInfo, now } from '../../shared/clock.js'
 import { pool } from '../../shared/db.js'
 import { asyncHandler, HttpError, notFound } from '../../shared/errors.js'
 import { publishEvents } from '../../shared/events.js'
@@ -43,8 +43,9 @@ yardsRouter.get(
     const status = req.query.status === 'completed' ? ['completed', 'cancelled'] : ['open', 'in_progress']
     const { rows } = await pool.query<WorkOrderRow>(
       `SELECT w.*, t.symbol, t.trip_id, t.status AS trip_status, t.next_yard_eta, t.arrived_at, a.reasons, a.route_note, a.late, a.data_lag_seconds,
+              a.status AS alert_status, a.ack_due_at, a.escalation_level,
               f.finding, f.disposition, f.notes AS finding_notes, f.recorded_by, h.status AS hold_status
-         FROM work_orders w JOIN alerts a ON a.id = w.alert_id JOIN trips t ON t.trip_id = a.trip_id
+         FROM work_orders w LEFT JOIN alerts a ON a.id = w.alert_id JOIN trips t ON t.trip_id = COALESCE(a.trip_id, w.trip_id)
          LEFT JOIN findings f ON f.work_order_id = w.id LEFT JOIN car_holds h ON h.alert_id = w.alert_id
         WHERE w.yard_id = $1 AND w.status = ANY($2)
         ORDER BY w.priority DESC, w.created_at ${status[0] === 'completed' ? 'DESC' : 'ASC'} LIMIT 100`,
@@ -95,7 +96,7 @@ workOrdersRouter.post(
   '/:id/start',
   requireRole('yard'),
   asyncHandler(async (req, res) => {
-    const wo = (await pool.query('SELECT yard_id, status FROM work_orders WHERE id = $1', [req.params.id]).catch(() => ({ rows: [] }))).rows[0]
+    const wo = (await pool.query('SELECT yard_id, status, alert_id FROM work_orders WHERE id = $1', [req.params.id]).catch(() => ({ rows: [] }))).rows[0]
     if (!wo) throw notFound('Work order')
     if (!canActOnYard(req.user!, wo.yard_id)) throw new HttpError(403, 'FORBIDDEN', 'This work order belongs to another yard')
     const updated = await pool.query<WorkOrderRow>(
@@ -103,7 +104,21 @@ workOrdersRouter.post(
       [req.params.id, req.user!.username],
     )
     if (updated.rowCount === 0) throw new HttpError(409, 'NOT_OPEN', 'Work order is not open')
-    await publishEvents([{ type: 'workorder.updated', yardId: wo.yard_id }])
+    // Starting the inspection is the yard's acknowledgment: a person now owns it.
+    if (wo.alert_id) {
+      const at = now()
+      const acked = await pool.query(
+        `UPDATE alerts SET status = 'acknowledged', acknowledged_by = $2, acknowledged_at = $3, ack_action = 'inspection_started', updated_at = $3, version = version + 1
+          WHERE id = $1 AND status = 'open' AND owner_role = 'yard' RETURNING tier`,
+        [wo.alert_id, req.user!.username, at],
+      )
+      if (acked.rows[0]) {
+        await pool.query(`INSERT INTO alert_events (alert_id, kind, tier, note, actor, at) VALUES ($1, 'acknowledged', $2, 'Inspection started', $3, $4) ON CONFLICT DO NOTHING`, [
+          wo.alert_id, acked.rows[0].tier, req.user!.username, at,
+        ])
+      }
+    }
+    await publishEvents([{ type: 'workorder.updated', yardId: wo.yard_id }, ...(wo.alert_id ? [{ type: 'alert.updated' as const, alertId: wo.alert_id, yardId: wo.yard_id }] : [])])
     res.json({ workOrder: workOrderDto(updated.rows[0]) })
   }),
 )

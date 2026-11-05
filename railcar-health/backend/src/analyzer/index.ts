@@ -1,7 +1,8 @@
 /**
  * Analyzer worker entry point. Consumes the pass stream, keeps per-bearing
  * trend state (derived from PostgreSQL), scores risk, manages alerts, holds and
- * work orders, and runs the detector-health check. Run several with different
+ * work orders, and runs the detector-health check and the alert lifecycle
+ * sweeper (notification delivery, acknowledgment deadlines, escalation). Run several with different
  * ANALYZER_CONSUMER names (dev:worker1/2): the consumer group splits the stream
  * and the per-trip advisory lock keeps one writer per trip.
  */
@@ -15,11 +16,13 @@ const { startClockSync } = await import('../shared/clock.js')
 const { metricsHandler } = await import('../shared/metrics.js')
 const { runConsumer } = await import('./consumer.js')
 const { startHealthJob } = await import('./health-job.js')
+const { startLifecycleJob } = await import('./lifecycle-job.js')
 
 let stopping = false
 const streamClient = createRedisConnection('analyzer-stream')
 const stopClock = startClockSync(redis)
 const stopHealth = startHealthJob()
+const stopLifecycle = startLifecycleJob()
 
 const app = express()
 app.get('/health', (_req, res) => res.json({ status: 'ok', consumer: config.stream.consumer }))
@@ -32,6 +35,7 @@ async function shutdown(signal: string) {
   logger.info({ signal }, 'shutting down')
   stopping = true
   stopHealth()
+  stopLifecycle()
   stopClock()
   server.close()
   // Let the in-flight message finish; unacked messages are reclaimed by another consumer.
