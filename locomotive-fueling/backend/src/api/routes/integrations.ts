@@ -164,6 +164,7 @@ integrationsRouter.post(
       )
       await pool.query(`UPDATE alerts SET status = 'resolved', resolved_at = $2 WHERE train_id = $1 AND locomotive_id IS NULL AND status <> 'resolved'`, [req.params.id, at])
       await pool.query(`UPDATE stop_commitments SET state = 'cancelled', note = 'Train arrived', updated_at = now() WHERE train_id = $1 AND state = 'accepted'`, [req.params.id])
+      await pool.query(`UPDATE fuel_plans SET lifecycle = 'superseded' WHERE train_id = $1 AND lifecycle = 'proposed'`, [req.params.id])
       await publishEvent({ type: 'train', trainId: req.params.id, note: 'arrived' })
     }
     res.json({ arrived: Boolean(r.rowCount) })
