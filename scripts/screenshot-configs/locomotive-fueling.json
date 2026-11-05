@@ -1,0 +1,26 @@
+{
+  "name": "locomotive-fueling",
+  "frontendPort": 5173,
+  "backendRequired": true,
+  "dbName": "locomotive_fueling",
+  "dbUser": "fueling",
+  "auth": {
+    "enabled": true,
+    "loginUrl": "/login",
+    "credentials": { "username": "alice", "password": "password123" },
+    "usernameSelector": "input[name='username']",
+    "passwordSelector": "input[name='password']",
+    "submitSelector": "button[type='submit']",
+    "successIndicator": "main"
+  },
+  "screens": [
+    { "name": "01-login", "path": "/login", "waitFor": "form", "skipAuth": true, "delay": 500 },
+    { "name": "02-fleet", "path": "/fleet", "waitFor": "table[aria-label='Trains'] tbody tr", "delay": 1500 },
+    { "name": "03-train-plan", "path": "/trains/T01", "waitFor": "text=Fuel plan v", "delay": 2000, "fullPage": true },
+    { "name": "04-proposal", "path": "/trains/T07", "waitFor": "text=Fuel plan v", "delay": 2000 },
+    { "name": "05-orders", "path": "/orders", "waitFor": "h1", "delay": 1500, "fullPage": true },
+    { "name": "06-anomalies", "path": "/anomalies", "waitFor": "h1", "delay": 2000 },
+    { "name": "07-prices", "path": "/prices", "waitFor": "table[aria-label='Fuel options']", "delay": 1200 }
+  ],
+  "viewport": { "width": 1440, "height": 900 }
+}

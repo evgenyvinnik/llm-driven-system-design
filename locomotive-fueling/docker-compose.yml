@@ -1,0 +1,37 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: locomotive-fueling-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: fueling
+      POSTGRES_PASSWORD: fueling_password
+      POSTGRES_DB: locomotive_fueling
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fueling -d locomotive_fueling"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Service name "redis" is what the repo's screenshot/triage scripts look for.
+  # Valkey streams stand in for Kafka; AOF so accepted telemetry survives a restart.
+  redis:
+    image: valkey/valkey:7.2-alpine
+    container_name: locomotive-fueling-valkey
+    ports:
+      - "6379:6379"
+    command: valkey-server --appendonly yes
+    volumes:
+      - valkey_data:/data
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  postgres_data:
+  valkey_data:

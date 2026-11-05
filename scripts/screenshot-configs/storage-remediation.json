@@ -1,0 +1,68 @@
+{
+  "name": "storage-remediation",
+  "frontendPort": 5173,
+  "backendRequired": true,
+  "dbName": "storage_remediation",
+  "dbUser": "remediation",
+  "auth": {
+    "enabled": true,
+    "loginUrl": "/login",
+    "credentials": {
+      "username": "alice",
+      "password": "password123"
+    },
+    "usernameSelector": "input[name='username']",
+    "passwordSelector": "input[name='password']",
+    "submitSelector": "button[type='submit']",
+    "successIndicator": "main"
+  },
+  "screens": [
+    {
+      "name": "01-login",
+      "path": "/login",
+      "waitFor": "form",
+      "skipAuth": true,
+      "delay": 500
+    },
+    {
+      "name": "02-posture",
+      "path": "/posture",
+      "waitFor": "text=Controls",
+      "delay": 1500
+    },
+    {
+      "name": "03-findings",
+      "path": "/findings?control=SA-02",
+      "waitFor": "table[aria-label='Findings']",
+      "delay": 1000
+    },
+    {
+      "name": "04-campaigns",
+      "path": "/campaigns",
+      "waitFor": "h1",
+      "delay": 1000
+    },
+    {
+      "name": "05-exceptions",
+      "path": "/exceptions",
+      "waitFor": "h1",
+      "delay": 1000
+    },
+    {
+      "name": "06-controls",
+      "path": "/controls",
+      "waitFor": "h1",
+      "delay": 800
+    },
+    {
+      "name": "07-audit",
+      "path": "/audit",
+      "waitFor": "h1",
+      "delay": 1000
+    }
+  ],
+  "viewport": {
+    "width": 1440,
+    "height": 900
+  }
+}

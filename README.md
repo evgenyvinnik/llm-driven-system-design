@@ -98,6 +98,8 @@ Each folder contains an independent implementation of a system design problem.
 | [Strava](./strava/) | Fitness tracking and social platform | ✅ Implemented |
 | [Apple Maps](./apple-maps/) | Navigation with real-time traffic | ✅ Implemented |
 | [AirTag](./airtag/) | Item tracking and Find My network | ✅ Implemented |
+| [Railcar Health](./railcar-health/) | Wayside detector predictive maintenance: bearing trending, identity resolution, late data, alerts, car holds and yard inspections | ✅ Implemented |
+| [Locomotive Fueling](./locomotive-fueling/) | Fuel-stop recommendations from locomotive telemetry: noisy sensors, DP optimizer, stable plans, idempotent truck orders | ✅ Implemented |
 
 ### Ticketing, Events & Reservations
 
@@ -182,6 +184,7 @@ Each folder contains an independent implementation of a system design problem.
 | [APNs](./apns/) | Apple Push Notification Service | ✅ Implemented |
 | [iCloud Sync](./icloud/) | File and photo synchronization | ✅ Implemented |
 | [Scalable API](./scalable-api/) | API serving millions of users | ✅ Implemented |
+| [Storage Remediation](./storage-remediation/) | Fleet-wide cloud storage security fixes with usage evidence, waves, rollback and exceptions; doubles as an existing-system-review example | ✅ Implemented |
 
 ### UI Components & Patterns
 
@@ -201,7 +204,7 @@ External projects demonstrating system design concepts (with local architecture 
 
 ### Planned Projects
 
-The next round, focused on AI products and developer platforms. See [ROADMAP.md](./ROADMAP.md) for each project's scope, core entities, hard problems and interview follow-ups.
+The next round, focused on AI products and developer platforms, plus a [rail operations track](./ROADMAP.md#rail-operations-track-bnsf) for BNSF Railway loops. See [ROADMAP.md](./ROADMAP.md) for each project's scope, core entities, hard problems and interview follow-ups.
 
 | Project | Description | Status |
 |---------|-------------|--------|
@@ -213,6 +216,9 @@ The next round, focused on AI products and developer platforms. See [ROADMAP.md]
 | [LLM Eval Dashboard](./ROADMAP.md#10-llm-eval-dashboard) | Versioned datasets, async eval runs, and provenance-aware comparisons | 📋 Planned |
 | [CI/CD Platform](./ROADMAP.md#11-cicd-platform) | GitHub Actions-like workflows with job DAGs, runners, and live logs | 📋 Planned |
 | [AI Code Review](./ROADMAP.md#12-ai-code-review) | Design critique and rebuild of an agentic PR auto-approval system | 📋 Planned |
+| [Freight Quote Service](./ROADMAP.md#22-freight-quote-service) | High-traffic quote endpoint over slow pricing and capacity services: budgets, firm vs indicative, shedding | 📋 Planned |
+| [Railcar Trip Plans](./ROADMAP.md#23-railcar-trip-plans-and-etas) | Car tracking against trip plans, missed connections, and dwell-based ETAs for shippers | 📋 Planned |
+| [Yard Switch Lists](./ROADMAP.md#24-yard-switch-lists) | Classification yard planning with replanning, yardmaster overrides and execution feedback | 📋 Planned |
 | [File Cache](./ROADMAP.md#13-file-cache) | Byte-bounded cache for large files with single-flight fills | 📋 Planned |
 | [Model Distribution](./ROADMAP.md#14-model-distribution) | Peer-assisted distribution of a huge file to a fleet, then safe activation | 📋 Planned |
 | [Online Chess](./ROADMAP.md#15-online-chess) | Real-time games with authoritative state, clocks, matchmaking, and spectators | 📋 Planned |

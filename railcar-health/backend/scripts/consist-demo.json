@@ -1,0 +1,19 @@
+{
+  "tripId": "DEMO-CURL-1",
+  "symbol": "X-CURL",
+  "direction": "EB",
+  "originYardId": "HAR",
+  "destinationYardId": "CDJ",
+  "stops": ["CDJ"],
+  "departedAt": "2026-01-01T00:00:00Z",
+  "revision": 1,
+  "units": [
+    { "position": 1, "unitId": "PLNR 4801", "unitType": "locomotive", "axleCount": 6, "leadingEnd": "A" },
+    { "position": 2, "unitId": "HPRX 600001", "unitType": "car", "axleCount": 4, "leadingEnd": "B", "ownerMark": "HPRX", "ownerName": "High Plains Railcar", "carType": "boxcar" },
+    { "position": 3, "unitId": "HPRX 600002", "unitType": "car", "axleCount": 4, "leadingEnd": "B", "ownerMark": "HPRX", "ownerName": "High Plains Railcar", "carType": "boxcar" },
+    { "position": 4, "unitId": "HPRX 600003", "unitType": "car", "axleCount": 4, "leadingEnd": "A", "ownerMark": "HPRX", "ownerName": "High Plains Railcar", "carType": "boxcar" },
+    { "position": 5, "unitId": "HPRX 600004", "unitType": "car", "axleCount": 4, "leadingEnd": "A", "ownerMark": "HPRX", "ownerName": "High Plains Railcar", "carType": "boxcar" },
+    { "position": 6, "unitId": "HPRX 600005", "unitType": "car", "axleCount": 4, "leadingEnd": "B", "ownerMark": "HPRX", "ownerName": "High Plains Railcar", "carType": "boxcar" },
+    { "position": 7, "unitId": "HPRX 600006", "unitType": "car", "axleCount": 4, "leadingEnd": "B", "ownerMark": "HPRX", "ownerName": "High Plains Railcar", "carType": "boxcar" }
+  ]
+}

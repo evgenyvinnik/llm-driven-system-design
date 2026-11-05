@@ -1,0 +1,37 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: railcar-health-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: railcar
+      POSTGRES_PASSWORD: railcar_password
+      POSTGRES_DB: railcar_health
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U railcar -d railcar_health"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Service name "redis" is what the repo's screenshot/triage scripts look for.
+  # Valkey Streams stand in for Kafka (live + backfill lanes); also sessions, pub/sub, the sim clock.
+  redis:
+    image: valkey/valkey:7.2-alpine
+    container_name: railcar-health-valkey
+    ports:
+      - "6379:6379"
+    command: valkey-server --appendonly yes
+    volumes:
+      - valkey_data:/data
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  postgres_data:
+  valkey_data:
