@@ -710,6 +710,21 @@ Signals use the labels in [About the Sources](#about-the-sources). The interview
 
 Most railcars on a Class I network belong to lessors and shippers, not to the railroad. A prompt about "200,000 railcars" therefore also means alerting the cars' owners.
 
+**Rail terms for engineers from outside the industry.** The interviews don't expect rail experience, but the prompts use these words. Ask about anything else.
+
+| Term | Meaning |
+|------|---------|
+| Consist | The ordered list of cars and locomotives in a train. It changes at yards, so version it by time |
+| Axle, wheelset, bearing | Four axles per car, each with two wheels and two bearings. Wheelsets are replaceable parts, so a car is not its components |
+| Wayside detector | A sensor beside the track that measures every passing axle: bearing or wheel temperature, impact load, sound or images |
+| Hot bearing / hot box | An overheating bearing, a derailment risk |
+| Hot or cold wheel | A brake problem: a stuck brake runs hot, a brake that isn't working runs cold |
+| AEI tag | An RFID tag on each car, read at some detector sites |
+| Yard / terminal | Where trains are broken up, sorted and rebuilt, and cars are inspected and repaired |
+| Set-out / bad order | Leaving a defective car on a siding / tagging a car as defective for repair |
+| Dispatcher | Controls train movements over a territory |
+| DTL fueling | Direct-to-locomotive: a fuel truck meets the train, instead of the train going to a fixed fuel pad |
+
 ### 19. Railcar Health Monitoring
 
 **Folder:** [`railcar-health/`](./railcar-health/) · **Signal:** BNSF (candidate report: a phone screen asked for hot-wheel monitoring of 200,000 railcars, with risk alerts and the yard response. A Reddit account from a senior infrastructure candidate describes a close variant: ingest camera, vibration and temperature data, detect track hazards and alert personnel within seconds over intermittent links. Prep guides list real-time sensor systems as a topic) · ✅ Built
