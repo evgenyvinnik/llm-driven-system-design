@@ -1,5 +1,17 @@
 # Design a Storage Misconfiguration Remediation System
 
+## Codebase Stats
+
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 12,131 |
+| Source Files | 165 |
+| .ts | 7,861 |
+| .tsx | 1,979 |
+| .md | 1,662 |
+| .sql | 248 |
+| .json | 177 |
+
 ## Overview
 
 An enterprise runs tens of thousands of cloud storage accounts. Many still allow anonymous blob access, accept shared-key or SAS authentication, accept TLS below 1.2, are reachable from the whole internet, or lack soft delete and diagnostic logs. Finding them is easy. Fixing them is risky: some application, somewhere, depends on every one of those settings, and "just flip the setting" breaks production.
