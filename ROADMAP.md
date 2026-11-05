@@ -77,6 +77,7 @@ These reported questions already have an implementation here, so they don't need
 | Large-scale web crawler (OpenAI candidate report) | [web-crawler](./web-crawler/) | Priority frontier, per-host politeness, robots.txt, URL and content dedup, crawler traps | Recrawl policy: deciding what to revisit first |
 | Payment system with external authorization and batch processing (OpenAI community) | [payment-system](./payment-system/), [stripe](./stripe/), [paypal](./paypal/) | Idempotency keys, double-entry ledger, settlement, reconciliation | An explicit "outcome unknown" state for when the processor times out after receiving a request. Retrying only the unresolved items of a partially failed batch |
 | Notification system (OpenAI, from a technical program manager report) | [notification-system](./notification-system/), [apns](./apns/) | Preferences, quiet hours, dedup, multi-channel delivery | — |
+| Consolidating several notification services into one (BNSF, community attribution) | [notification-system](./notification-system/) | Dedup, retries, preferences | A migration plan: dual-writing, then cutting over each sender, without duplicate or lost messages during the switch |
 | A general product app such as banking (Anthropic community attribution) | [paypal](./paypal/), [venmo](./venmo/), [robinhood](./robinhood/) | Idempotent payment submission, optimistic locking on balances, activity feeds, live quotes with stale-data indicators | — |
 
 ## Frontend Round Map
@@ -684,7 +685,7 @@ You find the highest-leverage growth opportunities and propose one large and one
 
 A second survey (November 2026) covered system design questions reported for BNSF Railway's software, data and platform engineering loops. In early 2025 BNSF created an in-house technology division, bnsf | tech, to build more of its own software. Its public material emphasizes three areas: predictive asset health from wayside sensors, yard and network optimization, and AI. Candidate reports describe a final loop of about four to five hours, with separate rounds for coding, software design, system design, an **existing system review** (presenting a system you built) and behavioral questions. Design prompts in these reports usually have a railroad setting.
 
-Signals use the labels in [About the Sources](#about-the-sources). The interview reports come from Glassdoor, Dataford, Interview Query, PracHub and a Medium write-up. The domain context comes from BNSF's "Eyes on AI" page, its FY2025 10-K, Progressive Railroading, Railway Age, the AAR and Railinc.
+Signals use the labels in [About the Sources](#about-the-sources). The interview reports come from Glassdoor, Dataford, Interview Query, PracHub, Reddit and a Medium write-up. The domain context comes from BNSF's "Eyes on AI" page, its FY2025 10-K, Progressive Railroading, Railway Age, the AAR and Railinc.
 
 **Format notes from the reports.**
 - No drawing tool is provided. Bring your own whiteboard link and share your screen.
@@ -711,21 +712,26 @@ Most railcars on a Class I network belong to lessors and shippers, not to the ra
 
 ### 19. Railcar Health Monitoring
 
-**Folder:** [`railcar-health/`](./railcar-health/) · **Signal:** BNSF (candidate report: a phone screen asked for hot-wheel monitoring of 200,000 railcars, with risk alerts and the yard response; prep guides list real-time sensor systems as a topic) · ✅ Built
+**Folder:** [`railcar-health/`](./railcar-health/) · **Signal:** BNSF (candidate report: a phone screen asked for hot-wheel monitoring of 200,000 railcars, with risk alerts and the yard response. A Reddit account from a senior infrastructure candidate describes a close variant: ingest camera, vibration and temperature data, detect track hazards and alert personnel within seconds over intermittent links. Prep guides list real-time sensor systems as a topic) · ✅ Built
 
 **Problem.** Wayside detectors measure every passing train: bearing and wheel temperatures, wheel impact loads, acoustic bearing signatures and machine vision images. RFID (AEI) readers identify each car. The platform turns those readings into a maintenance decision for each car: stop the train, set the car out, inspect it at the next yard, or schedule it for the shop. It routes each decision to the right people and learns from what inspectors find.
 
 **Hard problems.**
 - **Two safety tiers.** The detector's own alarm stops the train over the radio and never depends on the cloud. The platform adds trending, fusion and the workflow on top.
 - **Trending before thresholds.** Compare each bearing with its own train, and with the same bearing at earlier detectors. A rising bearing is then caught before any single reading crosses an absolute threshold.
-- **Identity.** Map axle readings to car, axle and side using AEI reads and consists. This includes cars turned around on a wye, which swaps left and right.
+- **Two failure modes.** Hot or cold *wheels* mean brake problems: a stuck brake runs a hot wheel, an inoperative brake runs a cold one. Hot *bearings* mean journal bearing failure. Keep them apart in the data model and in the rules.
+- **Identity.** Map axle readings to car, axle and side using AEI reads and consists versioned by time. This includes cars turned around on a wye, which swaps left and right. A railcar is not its components: wheelsets and bearings are replaced, so readings attach to the component installed at that position at the reading's event time.
 - **Late, duplicated and out-of-order data** from detector sites that store and forward. An alert computed late is routed to wherever the train is now.
 - **Detector health.** Detect a biased or silent detector instead of trusting it.
-- **Alert lifecycle.** One alert per bearing per trip, escalated in place. A car hold stops the yard from sending the car out before inspection. Inspection findings become labels.
+- **Alert lifecycle.** One alert per bearing per trip, escalated in place. Delivered, acknowledged, inspected and closed are separate transitions, with an owner, an acknowledgment deadline, escalation and handoff between yards. A car hold stops the yard from sending the car out before inspection. Inspection findings become labels, but only flagged cars get inspected, so labels need random audits to correct the bias.
 
 **Follow-ups the answers must handle.**
 - The cloud is down for two hours. What happens to a train with a burning bearing?
 - How do you catch a bearing that is heating up but hasn't yet crossed the alarm threshold?
+- A detector reconnects and uploads a concerning reading from two hours ago, but that wheelset was replaced an hour ago. What happens to the car's status and its open case?
+- The AEI read is missing, and the train was rebuilt at the last yard. Which consist do you use?
+- The notification was delivered, but nobody acknowledged it, and the train is approaching the next yard. What happens, and who owns the case?
+- A detector that reconnects dumps a backlog. How do new critical readings avoid waiting behind it?
 - Should the stream be partitioned by train trip or by car, and why?
 - Dispatchers ignore most alerts. What do you change?
 - Most of the cars aren't yours. Who gets told?
@@ -778,7 +784,7 @@ Most railcars on a Class I network belong to lessors and shippers, not to the ra
 
 ### 22. Freight Quote Service
 
-**Folder:** `freight-quote/` · **Signal:** BNSF (candidate report: a high-traffic quote endpoint whose dependent services are slow, and what architecture would improve service quality) · **Builds on:** scalable-api, rate-limiter, distributed-cache
+**Folder:** `freight-quote/` · **Signal:** BNSF (candidate report: a high-traffic quote endpoint whose dependent services are slow, and what architecture would improve service quality. A curated PracHub account of a September 2026 screen describes implementing the freight rate inquiry endpoint's service-layer logic first, then discussing heavy traffic and downstream latency, so expect some coding) · **Builds on:** scalable-api, rate-limiter, distributed-cache
 
 **Problem.** Shippers request price quotes for moving freight: origin, destination, commodity, car type and volume. A quote depends on several slow internal services: tariff and contract pricing, network capacity, fuel surcharge and car availability. Traffic is heavy, from customer portals and from API integrations that re-quote often. Design the endpoint so it stays fast and correct while dependencies are slow.
 
@@ -800,6 +806,7 @@ Most railcars on a Class I network belong to lessors and shippers, not to the ra
 - How stale may a cached price be, and who decides?
 - A customer integration re-quotes the same lane 50 times a minute. What happens?
 - A customer books against a quote whose tariff has since changed. Which price applies?
+- A customer disputes last week's quote. Can you reconstruct the inputs and pricing rules it used?
 
 **Trap.** Putting a cache in front of everything without saying which prices may be stale and how a stale price is labeled.
 
@@ -860,6 +867,8 @@ Most railcars on a Class I network belong to lessors and shippers, not to the ra
 - A train arrives three hours late. What does the planner change, and what does it leave alone?
 - The yardmaster disagrees with the plan. How do overrides work?
 - How do you measure whether the planner beats the yardmaster?
+
+**Variant: inspection and repair scheduling.** The same yard, planning maintenance instead of switching. Cars arrive with risk levels (from #19), required work and departure times. Each yard has limited crews, repair bays and parts. The variant raises different follow-ups: two coordinators assigning the same bay at once, a part the plan assumes is in stock that the physical count says isn't, and keeping the yard working while the planner is down, then reconciling actions recorded locally.
 
 **Trap.** Spending the round on the optimization algorithm and ignoring replanning, overrides and execution feedback.
 
