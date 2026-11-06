@@ -98,7 +98,7 @@ Each folder contains an independent implementation of a system design problem.
 | [Strava](./strava/) | Fitness tracking and social platform | ✅ Implemented |
 | [Apple Maps](./apple-maps/) | Navigation with real-time traffic | ✅ Implemented |
 | [AirTag](./airtag/) | Item tracking and Find My network | ✅ Implemented |
-| [Railcar Health](./railcar-health/) | Wayside detector predictive maintenance: bearing trending, identity resolution, late data, alerts, car holds and yard inspections | ✅ Implemented |
+| [Railcar Health](./railcar-health/) | Wayside detector predictive maintenance as an event-driven reference: event-sourced cases and car history, outbox, projections with replay, DLQ and redrive, versioned event schemas, durable-timer process manager | ✅ Implemented |
 | [Freight Quote](./freight-quote/) | Quote API over slow dependencies: deadlines, hedging, coalescing, firm vs indicative, event-driven cache invalidation, async completion; includes a coding exercise | ✅ Implemented |
 | [Locomotive Fueling](./locomotive-fueling/) | Fuel-stop recommendations from locomotive telemetry: noisy sensors, DP optimizer, stable plans, idempotent truck orders | ✅ Implemented |
 

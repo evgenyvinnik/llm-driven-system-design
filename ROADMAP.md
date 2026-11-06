@@ -754,6 +754,8 @@ Most railcars on a Class I network belong to lessors and shippers, not to the ra
 
 **Trap.** Putting the cloud in the path that stops trains, or treating every reading as live.
 
+**Event-driven reference.** The project was reworked into the repository's reference example of an event-driven application. Cases and car component history are event-sourced, and raw readings stay an append-only fact log. The event store doubles as the outbox, and relay streams per event family feed idempotent consumer groups. Projections can be replayed and compared row by row. A dead-letter stream supports redrive, and `InspectionFindingRecorded` v1 is upcast to v2. One process manager runs acknowledgment deadlines on durable timers. See `railcar-health/events.md`.
+
 ### 20. Locomotive Fueling
 
 **Folder:** [`locomotive-fueling/`](./locomotive-fueling/) · **Signal:** BNSF (candidate report: "design a backend system for BNSF locomotives that uses real-time fuel level, GPS location, route information, fuel consumption rate, and fuel prices to recommend where the locomotive should stop for fuel and how much fuel it should purchase"). Two related telemetry prompts are also covered: a candidate report (sensor ingestion from 3,000+ trains) and a prep-guide listing (a location ping receiver for thousands of locomotives) · ✅ Built
