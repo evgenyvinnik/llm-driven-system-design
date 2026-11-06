@@ -18,7 +18,7 @@ function arg(name: string, fallback: number): number {
 const duration = arg('duration', 420)
 const scripted = !process.argv.includes('--background')
 const world = new World(TRAINS.map((t) => ({ ...t })))
-const steps = scripted ? [...SCENARIO] : []
+const steps = scripted ? [...SCENARIO].sort((a, b) => a.at - b.at) : []
 const log = (msg: string) => console.log(`[sim ${world.t().toFixed(1).padStart(6)}s] ${msg}`)
 
 log(`posting to ${config.apiUrl}; ${scripted ? `${steps.length} scripted steps` : 'background only'}; duration ${duration}s`)

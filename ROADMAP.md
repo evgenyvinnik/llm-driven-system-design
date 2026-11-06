@@ -29,7 +29,7 @@ The **Signal** column says how strong the evidence is that a question appears in
 | Guide-reported | A preparation guide summarizes a candidate's experience. The underlying account was not inspected |
 | Practice extension | A recommended exercise. Not known to have been asked |
 
-Sources surveyed: Glassdoor, Aced (formerly Exponent) and Hello Interview. Project 16 also draws on Lodely, PracHub and 1point3acres. The [frontend round map](#frontend-round-map) also draws on PracHub, AceOffer and interviewing.io. Projects 19–24 (the [rail operations track](#rail-operations-track-bnsf)) draw on Glassdoor, Dataford, Interview Query, PracHub and Medium reports of BNSF Railway loops, surveyed in November 2026.
+Sources surveyed: Glassdoor, Aced (formerly Exponent) and Hello Interview. Project 16 also draws on Lodely, PracHub and 1point3acres. The [frontend round map](#frontend-round-map) also draws on PracHub, AceOffer and interviewing.io. Projects 19–25 (the [rail operations track](#rail-operations-track-bnsf)) draw on Glassdoor, Dataford, Interview Query, PracHub and Medium reports of BNSF Railway loops, surveyed in November 2026.
 
 ## Summary
 
@@ -59,6 +59,7 @@ Sources surveyed: Glassdoor, Aced (formerly Exponent) and Hello Interview. Proje
 | 22 | [Freight Quote Service](#22-freight-quote-service) ✅ Built | [`freight-quote/`](./freight-quote/) | Rail | BNSF (candidate report) | scalable-api, rate-limiter, distributed-cache |
 | 23 | [Railcar Trip Plans and ETAs](#23-railcar-trip-plans-and-etas) ✅ Built | [`railcar-trip-plans/`](./railcar-trip-plans/) | Rail | Practice extension | local-delivery, notification-system |
 | 24 | [Yard Switch Lists](#24-yard-switch-lists) | `yard-switch-lists/` | Rail | Practice extension (BNSF describes the system publicly) | job-scheduler, railcar-health |
+| 25 | [Track Hazard Detection](#25-track-hazard-detection) ✅ Built | [`track-hazard-detection/`](./track-hazard-detection/) | Rail | BNSF (candidate report, Reddit) | railcar-health |
 
 - **Tier 1** covers the core product-facing work for AI and full-stack roles. Build these first, in the order listed.
 - **Tier 2** covers variations on tier-1 designs. Each reuses a tier-1 data model or an existing project's patterns.
@@ -697,6 +698,9 @@ Signals use the labels in [About the Sources](#about-the-sources). The interview
 2. [#20 Locomotive Fueling](#20-locomotive-fueling)
 3. [#21 Storage Remediation](#21-storage-remediation): read its `existing-system-review.md` as a template for presenting your own system
 4. [#22 Freight Quote Service](#22-freight-quote-service): a generic reliability question in a rail setting
+5. [#25 Track Hazard Detection](#25-track-hazard-detection): #19's design applied to the track instead of the cars
+
+**Event-driven reference.** All five built rail-track projects except #20 and #21 are explicit event-driven applications. Each has an `events.md` catalog, an outbox, idempotent consumers, a dead-letter stream with redrive, replayable projections and a versioned event schema. Read `railcar-health/events.md` first.
 
 **Public figures worth knowing for estimates.**
 
@@ -890,6 +894,27 @@ Most railcars on a Class I network belong to lessors and shippers, not to the ra
 **Trap.** Spending the round on the optimization algorithm and ignoring replanning, overrides and execution feedback.
 
 **Local scope.** An Express API with a heuristic planner, PostgreSQL, a yard simulator, a yardmaster board with drag-to-override, and a crew handheld view.
+
+### 25. Track Hazard Detection
+
+**Folder:** [`track-hazard-detection/`](./track-hazard-detection/) · ✅ Built · **Signal:** BNSF (candidate report: a Reddit account from a senior infrastructure candidate describes it; not opened or verified for this survey) · **Builds on:** #19
+
+**Problem.** "Design a railroad sensor monitoring and incident detection platform. It ingests camera, vibration and temperature data, identifies track hazards, alerts personnel, and provides an operator dashboard. Connectivity is intermittent, and critical alerts must reach people within seconds." It differs from #19, which monitors *cars* as they pass detectors. This project monitors the *track and right-of-way*: rockfall, crossing obstructions, high water and the risk of rail buckling in heat.
+
+**Hard problems.**
+- **Edge vs cloud.** A broken slide fence turns the signal red in the field by itself. The platform adds correlation, routing, the human workflow and the audit trail.
+- **Correlation in time and space.** A camera detection plus a vibration spike within seconds and half a mile of each other is one confirmed hazard, never two. The design uses event time with watermarks, so late events can upgrade or downgrade a hazard, and the result doesn't depend on arrival order.
+- **A priority lane** keeps a reconnecting gateway's backlog from delaying a new critical event. Detection-to-alert latency is measured.
+- **Hazard lifecycle:** alert, acknowledgment deadline and escalation, speed restriction, warning approaching trains, inspection, then clearing.
+- **Coverage.** A missing sensor heartbeat makes the segment visibly blind, not silently quiet.
+
+**Follow-ups the answers must handle.**
+- Three sensors see the same rockfall. How many alerts go out?
+- A gateway reconnects with 5,000 buffered events just as a fence breaks elsewhere. What gets processed first?
+- A late train-position report shows the vibration spike was a passing train. What happens to the hazard?
+- The cloud is down. What still protects trains?
+
+**Trap.** Treating each sensor reading as its own alert, or putting the cloud in the path that stops trains.
 
 ---
 

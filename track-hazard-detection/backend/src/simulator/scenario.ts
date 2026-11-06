@@ -69,13 +69,6 @@ function backlog(w: World, gw: Gateway, count: number): void {
 }
 
 export const SCENARIO: Step[] = [
-  { at: 20, label: 'GEO-122.0 stops reporting (dead sensor)', run: (w) => w.deadSensors.add('GEO-122.0') },
-  { at: 45, label: 'CAM-136.2 sees debris at the tunnel portal (0.66)', run: (w) => void w.camera(sensor('CAM-136.2'), now(), 'debris', 0.66) },
-  { at: 55, label: 'GW-CAN-4 loses its link', run: (w) => (w.gateway('GW-CAN-4').online = false) },
-  { at: 58, label: 'GEO-135.9 spike (buffered at the edge)', run: (w) => vibration(w, 'GEO-135.9', 36) },
-  { at: 90, label: 'Rockfall MP 147.8: fence wire 2', run: (w) => fence(w, 'FNC-147.8', 2) },
-  { at: 91.5, label: 'Rockfall MP 147.8: GEO-147.9 spike', run: (w) => vibration(w, 'GEO-147.9', 38) },
-  { at: 94, label: 'Rockfall MP 147.8: fence wire 4', run: (w) => fence(w, 'FNC-147.8', 4) },
   {
     // At 0, so the profile is in place before the first rail-temperature sample (a step change would read as a steep trend).
     at: 0,
@@ -85,6 +78,13 @@ export const SCENARIO: Step[] = [
       w.heat.set('PRA-4', (t) => 18 + t * (1.8 / 60))
     },
   },
+  { at: 20, label: 'GEO-122.0 stops reporting (dead sensor)', run: (w) => w.deadSensors.add('GEO-122.0') },
+  { at: 45, label: 'CAM-136.2 sees debris at the tunnel portal (0.66)', run: (w) => void w.camera(sensor('CAM-136.2'), now(), 'debris', 0.66) },
+  { at: 55, label: 'GW-CAN-4 loses its link', run: (w) => (w.gateway('GW-CAN-4').online = false) },
+  { at: 58, label: 'GEO-135.9 spike (buffered at the edge)', run: (w) => vibration(w, 'GEO-135.9', 36) },
+  { at: 90, label: 'Rockfall MP 147.8: fence wire 2', run: (w) => fence(w, 'FNC-147.8', 2) },
+  { at: 91.5, label: 'Rockfall MP 147.8: GEO-147.9 spike', run: (w) => vibration(w, 'GEO-147.9', 38) },
+  { at: 94, label: 'Rockfall MP 147.8: fence wire 4', run: (w) => fence(w, 'FNC-147.8', 4) },
   { at: 150, label: 'GW-PRA-1 uploads a 3,000-event backlog', run: (w) => backlog(w, w.gateway('GW-PRA-1'), 3000) },
   {
     at: 153,

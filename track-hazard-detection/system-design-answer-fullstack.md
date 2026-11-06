@@ -195,7 +195,7 @@ relay ─▶ hazard-events ─▶ process manager ─▶ notifier ─▶ console
 - The notifier records deliveries in its transaction, then sends asynchronously, so a slow radio bulletin never blocks the next alert.
 - The board refetches on an SSE notice published after the projection commits.
 
-**Why it works.** With a 4,300-event bulk backlog outstanding in the local build, the correlator acted on a new fence trip 56 ms after it occurred. Live alerts reach the console in about 0.8 s at p50 (most of it is the gateway's 1-second send cadence).
+**Why it works.** With a 4,300-event bulk backlog outstanding in the local build, the correlator acted on a new fence trip 56 ms after it occurred. Live alerts reach the console in about 1 s at p50 and 1.4 s at p99 (a quarter of it is the gateway's 1-second send cadence), while critical-lane cloud processing stays around 15-30 ms.
 
 **How the alternative breaks.** A single topic with a priority field: Kafka delivers in offset order per partition, so the critical record still waits. A plain FIFO relay: 3,000 bulk outbox rows committed a moment earlier go first. A synchronous notifier: three radio bulletins at ~1 s each delay the next critical page by 3 s.
 

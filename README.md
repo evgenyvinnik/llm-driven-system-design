@@ -100,6 +100,7 @@ Each folder contains an independent implementation of a system design problem.
 | [AirTag](./airtag/) | Item tracking and Find My network | ✅ Implemented |
 | [Railcar Health](./railcar-health/) | Wayside detector predictive maintenance as an event-driven reference: event-sourced cases and car history, outbox, projections with replay, DLQ and redrive, versioned event schemas, durable-timer process manager | ✅ Implemented |
 | [Freight Quote](./freight-quote/) | Quote API over slow dependencies: deadlines, hedging, coalescing, firm vs indicative, event-driven cache invalidation, async completion; includes a coding exercise | ✅ Implemented |
+| [Track Hazard Detection](./track-hazard-detection/) | Event-driven track and right-of-way monitoring: camera, vibration, rail-temperature and water events correlated in time and space, priority lane, hazard lifecycle with slow orders and train warnings | ✅ Implemented |
 | [Railcar Trip Plans](./railcar-trip-plans/) | Event-driven car tracking: car events from many producers, per-car fold tolerant of missed and late reads, replanning saga with compensation, dwell-based ETA bands, batched shipper digests | ✅ Implemented |
 | [Locomotive Fueling](./locomotive-fueling/) | Fuel-stop recommendations from locomotive telemetry: noisy sensors, DP optimizer, stable plans, idempotent truck orders | ✅ Implemented |
 
