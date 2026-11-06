@@ -16,7 +16,7 @@ With the assistance of LLMs like Claude, we can rapidly prototype lightweight ve
 
 ## System Design Challenges
 
-Each folder contains an independent implementation of a system design problem.
+Each folder contains an independent implementation of a system design problem: **99 implemented projects**, 3 design-only write-ups of external projects, and 14 more planned in [ROADMAP.md](./ROADMAP.md).
 
 ### URL Shortening & Web Services
 
@@ -31,7 +31,7 @@ Each folder contains an independent implementation of a system design problem.
 |---------|-------------|--------|
 | [Dropbox](./dropbox/) | Cloud file storage and synchronization | ✅ Implemented |
 | [Distributed Cache](./distributed-cache/) | High-performance caching layer | ✅ Implemented |
-| [File System](./file-system/) | Four-level file store practice, scaled into a namespace service with quotas and restores | ✅ Implemented |
+| [File System](./file-system/) | Four-level online-assessment practice (file store or key-value database), scaled into a namespace service with quotas and restores | ✅ Implemented |
 
 ### Social Media & Content
 
@@ -204,7 +204,7 @@ External projects demonstrating system design concepts (with local architecture 
 
 ### Planned Projects
 
-The next round, focused on AI products and developer platforms, plus a [rail operations track](./ROADMAP.md#rail-operations-track-bnsf) for BNSF Railway loops. See [ROADMAP.md](./ROADMAP.md) for each project's scope, core entities, hard problems and interview follow-ups.
+Two rounds are in progress, and their built projects are listed in the tables above. The AI products and developer platforms round has 7 of 18 built: Prompt Playground, AI Chat Client, LLM Chat Analytics, Multi-Org Dashboard, In-App Assistant, File System and Console Growth. The [rail operations track](./ROADMAP.md#rail-operations-track-bnsf) for BNSF Railway loops has 3 of 6 built: Railcar Health, Locomotive Fueling and Storage Remediation. The rest are below. See [ROADMAP.md](./ROADMAP.md) for each project's scope, core entities, hard problems and interview follow-ups.
 
 | Project | Description | Status |
 |---------|-------------|--------|
@@ -223,6 +223,18 @@ The next round, focused on AI products and developer platforms, plus a [rail ope
 | [Model Distribution](./ROADMAP.md#14-model-distribution) | Peer-assisted distribution of a huge file to a fleet, then safe activation | 📋 Planned |
 | [Online Chess](./ROADMAP.md#15-online-chess) | Real-time games with authoritative state, clocks, matchmaking, and spectators | 📋 Planned |
 
+## Interview Practice
+
+Some projects rehearse a specific interview format, not only a design question:
+
+| Format | Where to practice |
+|--------|-------------------|
+| Frontend system design round | Rehearse in this order: [AI Chat Client](./ai-chat/system-design-answer-frontend.md) (with [In-App Assistant](./in-app-assistant/system-design-answer-frontend.md) for the sidebar variant), then [Multi-Org Dashboard](./multi-org-dashboard/system-design-answer-frontend.md), then [LLM Chat Analytics](./llm-chat-analytics/system-design-answer-frontend.md). The [Frontend Round Map](./ROADMAP.md#frontend-round-map) explains what each one covers |
+| Leveled online coding assessment | [File System](./file-system/README.md#practice-mode): `npm run practice` shows one level at a time and unlocks the next only when the current one's tests pass. There are two problems, a file store and a key-value database |
+| Product engineering take-home | [Console Growth](./console-growth/): find growth opportunities in a metrics snapshot, then ship two instrumented A/B experiments with a readout |
+| Existing system review round | [Storage Remediation](./storage-remediation/existing-system-review.md): a ten-minute walkthrough script, key decisions with alternatives, an incident and a bank of likely probes. Use it as a template for presenting a system you built |
+| Rail-themed loop (BNSF) | Rehearse in this order: [Railcar Health](./railcar-health/), [Locomotive Fueling](./locomotive-fueling/), then [Storage Remediation](./storage-remediation/). The [rail operations track](./ROADMAP.md#rail-operations-track-bnsf) has format notes and figures for estimates |
+
 ## Project Structure
 
 Each project folder contains:
@@ -232,7 +244,9 @@ Each project folder contains:
 | `README.md` | Implementation guide, setup instructions, and testing details |
 | `architecture.md` | System design documentation, architectural decisions, and trade-offs |
 | `system-design-answer-{frontend,backend,fullstack}.md` | Interview-style answers tailored by role (45-minute format) |
-| `claude.md` | LLM collaboration notes and iteration history |
+| `CLAUDE.md` | LLM collaboration notes and iteration history |
+| `screenshots/` | UI captures taken by the screenshot harness |
+| `tests/` | Playwright smoke tests generated from the screenshot config |
 | Source code | Actual implementation (varies by project) |
 
 ## Getting Started
@@ -240,7 +254,7 @@ Each project folder contains:
 1. Choose a system design challenge that interests you
 2. Read the `architecture.md` to understand the design decisions
 3. Follow the `README.md` for setup and implementation details
-4. Review `claude.md` to see how the system evolved through LLM collaboration
+4. Review `CLAUDE.md` to see how the system evolved through LLM collaboration
 
 ## LLM-Assisted Development
 
@@ -255,21 +269,30 @@ See [CLAUDE.md](./CLAUDE.md) for guidelines on collaborating with AI on system d
 
 ## Scripts
 
-Utility scripts for repository management:
+Utility scripts for repository management, run from the repository root:
 
 ```bash
-# Count SLOC for entire repository
-node scripts/sloc.mjs
+# Count SLOC for the whole repository, or one project
+npm run sloc
+npm run sloc scale-ai
 
-# Count SLOC for specific project
-node scripts/sloc.mjs scale-ai
+# Refresh the Codebase Stats table in every project README
+npm run sloc:update
 
-# Output as JSON
-node scripts/sloc.mjs scale-ai --json
+# Screenshots: start Docker, backend and frontend, capture, then stop everything
+node scripts/screenshots.mjs --start instagram
+npm run screenshots:all
 
-# Output summary for README embedding
-node scripts/sloc.mjs scale-ai --summary
+# Smoke tests: generate from screenshot configs, then run against a running stack
+npm run generate-tests instagram
+npm run test:smoke instagram
+
+# Triage: bring a project up (Docker, migrate, seed) and check that it works
+npm run triage instagram
+npm run triage:report
 ```
+
+There is no CI build. Smoke tests need the full Docker stack, so projects are verified locally with `npm run build` / `npm run type-check`, then triage or screenshots, then smoke tests. [CLAUDE.md](./CLAUDE.md#cicd) explains why.
 
 ## Learning Approach
 
