@@ -700,7 +700,7 @@ Signals use the labels in [About the Sources](#about-the-sources). The interview
 4. [#22 Freight Quote Service](#22-freight-quote-service): a generic reliability question in a rail setting
 5. [#25 Track Hazard Detection](#25-track-hazard-detection): #19's design applied to the track instead of the cars
 
-**Event-driven reference.** All five built rail-track projects except #20 and #21 are explicit event-driven applications. Each has an `events.md` catalog, an outbox, idempotent consumers, a dead-letter stream with redrive, replayable projections and a versioned event schema. Read `railcar-health/events.md` first.
+**Event-driven reference.** Four of the built rail projects (#19, #22, #23 and #25) are explicit event-driven applications. Each has an `events.md` catalog, an outbox, idempotent consumers, a dead-letter stream with redrive, replayable projections and a versioned event schema. Read `railcar-health/events.md` first.
 
 **Public figures worth knowing for estimates.**
 
