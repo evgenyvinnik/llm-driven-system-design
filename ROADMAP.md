@@ -57,7 +57,7 @@ Sources surveyed: Glassdoor, Aced (formerly Exponent) and Hello Interview. Proje
 | 20 | [Locomotive Fueling](#20-locomotive-fueling) ✅ Built | [`locomotive-fueling/`](./locomotive-fueling/) | Rail | BNSF (candidate report; telemetry variants guide-listed) | uber, job-scheduler |
 | 21 | [Storage Remediation](#21-storage-remediation) ✅ Built | [`storage-remediation/`](./storage-remediation/) | Rail | BNSF (guide-reported existing system review round); practice extension for the design | job-scheduler, rate-limiter |
 | 22 | [Freight Quote Service](#22-freight-quote-service) ✅ Built | [`freight-quote/`](./freight-quote/) | Rail | BNSF (candidate report) | scalable-api, rate-limiter, distributed-cache |
-| 23 | [Railcar Trip Plans and ETAs](#23-railcar-trip-plans-and-etas) | `railcar-trip-plans/` | Rail | Practice extension | local-delivery, notification-system |
+| 23 | [Railcar Trip Plans and ETAs](#23-railcar-trip-plans-and-etas) ✅ Built | [`railcar-trip-plans/`](./railcar-trip-plans/) | Rail | Practice extension | local-delivery, notification-system |
 | 24 | [Yard Switch Lists](#24-yard-switch-lists) | `yard-switch-lists/` | Rail | Practice extension (BNSF describes the system publicly) | job-scheduler, railcar-health |
 
 - **Tier 1** covers the core product-facing work for AI and full-stack roles. Build these first, in the order listed.
@@ -831,7 +831,7 @@ Most railcars on a Class I network belong to lessors and shippers, not to the ra
 
 ### 23. Railcar Trip Plans and ETAs
 
-**Folder:** `railcar-trip-plans/` · **Signal:** Practice extension (car visibility and trip plans are central to rail service, but the question is not known to have been asked) · **Builds on:** local-delivery, notification-system, #19
+**Folder:** [`railcar-trip-plans/`](./railcar-trip-plans/) · ✅ Built · **Signal:** Practice extension (car visibility and trip plans are central to rail service, but the question is not known to have been asked) · **Builds on:** local-delivery, notification-system, #19
 
 **Problem.** Each loaded car moves through a trip plan: an origin, a sequence of yards and trains, and a destination. AEI readers and yard systems report where cars actually are. Track every car against its plan, detect missed connections early, predict ETAs, and show shippers where their cars are.
 

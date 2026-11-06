@@ -73,7 +73,7 @@ Everything else here (event rates, dwell distributions, digest windows, the netw
 | Event store growth | ~5.5M events/day × ~600 B ≈ 3.3 GB/day ≈ 1.2 TB/year | Monthly partitions, cold tier after 13 months |
 | Shipper accounts | ~10,000; digests ~50,000/day | One per shipper per window, at most hourly |
 
-What this says: the volume is modest (a few hundred events per second); the hard parts are **ordering, lateness, fan-out and correctness**, not throughput. The ETA consumer is the heaviest (a train event becomes ~100 Monte Carlo runs of 200 samples each: ~2 ms per car, ~0.2 s per train event on one core).
+What this says: the volume is modest (a few hundred events per second); the hard parts are **ordering, lateness, fan-out and correctness**, not throughput. The ETA consumer is the heaviest (a train event becomes ~100 timeline reads and Monte Carlo runs of 200 samples each: ~5–10 ms per car including the database round trips, 0.5–1 s per train event in one consumer locally).
 
 ### Local Development Scale
 
@@ -402,7 +402,7 @@ GET  /api/v1/streams/eta-calibration    Share of delivered cars inside their 80%
 
 **Why it works.** Everything about one car lands in one partition in order, and one consumer instance owns it (a lease per partition, like a Kafka assignment), so two instances never interleave a car's updates. Train facts keyed by run keep a train's own sequence (departed, delayed, arrived) in order.
 
-**The hot key.** A 100-car TrainDeparted is one message on one train partition, and it becomes 100 car refolds and 100 ETA recomputes inside one consumer invocation (~0.2–0.5 s). Keying train events by car instead (publishing 100 copies) would spread the work but loses the train's own ordering and multiplies the log. The production path is a **re-key stage**: a small consumer that turns each TrainDeparted into per-car derived events on the car topic, so the expensive per-car work runs in parallel across car partitions while the train topic keeps train order. Locally we fan out in-consumer and accept the latency spike.
+**The hot key.** A 100-car TrainDeparted is one message on one train partition, and it becomes 100 car refolds and 100 ETA recomputes inside one consumer invocation (0.5–1 s locally, against 2–10 ms for a single car's fact). Keying train events by car instead (publishing 100 copies) would spread the work but loses the train's own ordering and multiplies the log. The production path is a **re-key stage**: a small consumer that turns each TrainDeparted into per-car derived events on the car topic, so the expensive per-car work runs in parallel across car partitions while the train topic keeps train order. Locally we fan out in-consumer and accept the latency spike.
 
 **Ordering between the two topics is not guaranteed** (a car's CarDepartedYard and its train's TrainDeparted travel on different partitions). That is fine only because the fold is order-independent; this decision and decision 1 depend on each other.
 
@@ -527,7 +527,7 @@ Structured JSON logs (pino) carry group, consumer, stream, message id, event typ
 
 What breaks first, in order, with the evidence:
 
-1. **The ETA consumer on train fan-out.** Locally one 88-car delay costs ~0.5 s in one consumer; at 5,000 trains a day with several events each it is the largest CPU consumer. Fix: the re-key stage (decision 3), more car partitions, and recomputing on ticks only for cars whose p10 has passed.
+1. **The ETA consumer on train fan-out.** Locally one 88-car train event costs 0.5–1 s in one consumer (the slowest handler calls in the ETA histogram, against a median of a few milliseconds); at 5,000 trains a day with several events each it is the largest CPU consumer. Fix: the re-key stage (decision 3), more car partitions, and recomputing on ticks only for cars whose p10 has passed.
 2. **Event store write and index volume.** EtaUpdated dominates decisions. Fix: emit only material changes (done), hash-partition `events` by stream, monthly time partitions, cold tier.
 3. **The relay.** One active relay per database. Fix: one relay per shard, or Debezium CDC.
 4. **Timeline queries** (union over event_cars and train streams). Fix: snapshot per trip; precomputed timeline projection for the portal.
@@ -559,7 +559,7 @@ What breaks first, in order, with the evidence:
 3. **Failure between two important steps.** Ingest is one transaction (event + indexes). Consumers are one transaction per message, acked after commit. The relay's window yields duplicates. Saga steps are separate transactions that check state first; a sweeper resumes stuck sagas; compensation releases seats when a later step fails.
 4. **Ordering actually required.** Per car, by event time, and that is computed, not trusted: folds sort by event time. Per train run, in append order (departed before delayed before arrived) on the train partition. Nothing across keys. Plan versions are ordered by the aggregate's stream version.
 5. **Access with caches, indexes and async jobs.** Every projection row carries the shipper id, written by the consumer from the plan; shipper reads filter by the session's id; digests are built per shipper; timelines redact consists. Late interchange data stays visible to the shipper because access follows the trip, not the railroad.
-6. **What breaks first at scale.** The ETA consumer's train fan-out (measured: one 88-car delay = 88 Monte Carlo recomputes, ~0.5 s in one consumer), then event store volume (EtaUpdated is the largest stream), then the single relay. Fixes in Scalability Considerations.
+6. **What breaks first at scale.** The ETA consumer's train fan-out (measured: one 88-car delay = 88 Monte Carlo recomputes, 0.5–1 s in one consumer, the slowest handler calls in `tp_consumer_handler_seconds`), then event store volume (EtaUpdated is the largest stream), then the single relay. Fixes in Scalability Considerations.
 
 ---
 

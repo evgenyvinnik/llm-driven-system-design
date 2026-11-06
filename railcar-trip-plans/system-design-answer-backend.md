@@ -268,6 +268,23 @@ POST /api/v1/streams/dlq/:group/:id/redrive
 
 ---
 
+## 🔐 Access Control (~1 min)
+
+> "A shipper sees only its own cars. I enforce that at the read model, not in a gateway or the UI. Every projection row carries the shipper id, copied from the plan when the consumer writes it, so a list query is 'where shipper id equals the session's shipper id'. A request for another shipper's car returns 404, not 403, so it doesn't confirm the car exists. Timelines are redacted on the server: a train departure shows its size and whether this car was aboard, never the other cars. Digests are built per shipper from items already keyed by shipper. And access follows the trip, not the railroad, so a car handed to another railroad stays visible, with the foreign road's late sightings folded in."
+
+## 🗺️ Kafka Mapping (local stand-in)
+
+| Concept | Production | Local |
+|---------|------------|-------|
+| Topics and partitions | car-events (64, key car id), train-events (16, key run), shipper-events (8) | One Valkey stream per partition |
+| Group assignment | Group coordinator | A lease per (group, partition), renewed every few seconds |
+| Offset commit | After the database transaction | XACK after the transaction |
+| Stuck work | Rebalance, re-read from the committed offset | XAUTOCLAIM of entries idle > 3 s |
+| Retry and DLQ | Per-group retry and DLQ topics | `retry:<group>` and `dlq:<group>` streams |
+| Outbox to topic | Debezium CDC | A relay process with `SKIP LOCKED` |
+
+---
+
 ## 📜 Execution Traces (~3 min)
 
 ### Successful trace: a six-hour delay
