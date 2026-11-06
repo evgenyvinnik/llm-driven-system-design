@@ -1,14 +1,19 @@
 /**
  * Non-detector feeds: gateway heartbeats, consists from the transportation
  * system, and departure/arrival events. All idempotent.
+ *
+ * Trips and consists are state with an outbox: the trips / trip_units rows are
+ * the source of truth and ConsistVersionChanged / TripArrived are appended in
+ * the same transaction. Heartbeats are telemetry and produce no event; a
+ * detector's decided status does (DetectorHealthChanged, from the analyzer).
  * @module api/services/feeds
  */
-import type { Redis } from 'ioredis'
 import { z } from 'zod'
-import { pool, withTransaction } from '../../shared/db.js'
+import { pool } from '../../shared/db.js'
 import { HttpError } from '../../shared/errors.js'
 import { yardById } from '../../shared/network.js'
-import { publishAll } from './ingest.js'
+import { streamIds } from '../../events/catalog.js'
+import { withEventTransaction } from '../../events/store.js'
 
 const isoDate = z.string().datetime({ offset: true })
 
@@ -73,9 +78,13 @@ export async function recordHeartbeats(input: z.infer<typeof heartbeatSchema>): 
   return updated
 }
 
-export async function upsertConsist(input: z.infer<typeof consistSchema>, streamClient: Redis): Promise<{ status: 'created' | 'updated' | 'unchanged'; republished: number }> {
+export async function upsertConsist(input: z.infer<typeof consistSchema>): Promise<{ status: 'created' | 'updated' | 'unchanged' }> {
   if (!yardById(input.originYardId) || !yardById(input.destinationYardId)) throw new HttpError(422, 'UNKNOWN_YARD', 'Unknown origin or destination yard')
-  const status = await withTransaction(async (client) => {
+  const ctx = { correlationId: `consist:${input.tripId}:${input.revision}`, actor: 'transportation-system' }
+  const { result } = await withEventTransaction(ctx, async ({ client, batch }) => {
+    // Same per-trip lock as the analyzer: a pass parked for want of this consist is either parked
+    // before we commit (and released by ConsistVersionChanged) or sees the trip after we commit.
+    await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [input.tripId])
     const cars = input.units.filter((u) => u.unitType === 'car')
     if (cars.length > 0) {
       await client.query(
@@ -92,10 +101,11 @@ export async function upsertConsist(input: z.infer<typeof consistSchema>, stream
        RETURNING (xmax = 0) AS inserted`,
       [input.tripId, input.symbol, input.direction, input.originYardId, input.destinationYardId, input.stops, input.departedAt, input.revision],
     )
-    // Revisions are immutable: a repeat of a known revision changes nothing.
+    // Revisions are immutable: a repeat of a known revision changes nothing and emits nothing.
+    const effectiveAt = input.effectiveAt ?? input.departedAt
     const version = await client.query(
       `INSERT INTO trip_consist_versions (trip_id, revision, effective_at) VALUES ($1, $2, $3) ON CONFLICT (trip_id, revision) DO NOTHING`,
-      [input.tripId, input.revision, input.effectiveAt ?? input.departedAt],
+      [input.tripId, input.revision, effectiveAt],
     )
     if (version.rowCount === 0) return 'unchanged' as const
     const u = input.units
@@ -111,22 +121,31 @@ export async function upsertConsist(input: z.infer<typeof consistSchema>, stream
         WHERE n.trip_id = $1 AND n.revision = $2 AND o.trip_id = $1 AND o.revision < $2 AND o.unit_id = n.unit_id AND o.orientation_source = 'aei'`,
       [input.tripId, input.revision],
     )
+    const previous = await client.query<{ unit_id: string }>('SELECT unit_id FROM trip_units WHERE trip_id = $1 AND revision = $2', [input.tripId, input.revision - 1])
+    const before = new Set(previous.rows.map((r) => r.unit_id))
+    const after = new Set(u.map((x) => x.unitId))
+    batch.append(streamIds.trip(input.tripId), 'any', {
+      type: 'ConsistVersionChanged',
+      occurredAt: effectiveAt,
+      tags: [`trip:${input.tripId}`],
+      payload: {
+        tripId: input.tripId, symbol: input.symbol, direction: input.direction, originYardId: input.originYardId, destinationYardId: input.destinationYardId,
+        stops: input.stops, departedAt: input.departedAt, revision: input.revision, effectiveAt,
+        units: u.map((x) => ({ position: x.position, unitId: x.unitId, unitType: x.unitType, axleCount: x.axleCount, leadingEnd: x.leadingEnd })),
+        setOut: input.revision > 1 ? [...before].filter((id) => !after.has(id)) : [],
+        pickedUp: input.revision > 1 ? [...after].filter((id) => !before.has(id)) : [],
+      },
+    })
     return res.rows[0].inserted ? ('created' as const) : ('updated' as const)
   })
-  // Passes that arrived before this consist were parked; send them back through the analyzer.
-  const parked = await pool.query<{ detector_id: string; pass_id: string; lag_seconds: number }>(
-    `UPDATE detector_passes SET identity_status = 'pending' WHERE trip_id = $1 AND identity_status = 'awaiting_consist' RETURNING detector_id, pass_id, lag_seconds`,
-    [input.tripId],
-  )
-  await publishAll(streamClient, parked.rows.map((r) => ({ detectorId: r.detector_id, passId: r.pass_id, lagSeconds: r.lag_seconds })))
-  return { status, republished: parked.rowCount ?? 0 }
+  return { status: result }
 }
 
 export async function recordTripEvent(input: z.infer<typeof tripEventSchema>): Promise<'recorded' | 'duplicate'> {
   const yard = yardById(input.yardId)
   if (!yard) throw new HttpError(422, 'UNKNOWN_YARD', 'Unknown yard')
-  return withTransaction(async (client) => {
-    const trip = await client.query('SELECT 1 FROM trips WHERE trip_id = $1', [input.tripId])
+  const { result } = await withEventTransaction({ correlationId: `trip-event:${input.eventId}`, actor: 'transportation-system' }, async ({ client, batch }) => {
+    const trip = await client.query<{ symbol: string }>('SELECT symbol FROM trips WHERE trip_id = $1', [input.tripId])
     if (trip.rowCount === 0) throw new HttpError(404, 'NOT_FOUND', 'Trip not found')
     const res = await client.query(
       'INSERT INTO trip_events (event_id, trip_id, kind, yard_id, at) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (event_id) DO NOTHING',
@@ -139,33 +158,15 @@ export async function recordTripEvent(input: z.infer<typeof tripEventSchema>): P
           WHERE trip_id = $1`,
         [input.tripId, input.at, input.yardId, yard.subdivisionId],
       )
-      await createAuditInspection(client, input.tripId, input.yardId, input.at)
+      // The random audit inspection is opened by the work-order integration reacting to this event (choreography).
+      batch.append(streamIds.trip(input.tripId), 'any', {
+        type: 'TripArrived',
+        occurredAt: input.at,
+        tags: [`trip:${input.tripId}`],
+        payload: { tripId: input.tripId, symbol: trip.rows[0].symbol, yardId: input.yardId, arrivedAt: new Date(input.at).toISOString() },
+      })
     }
     return 'recorded' as const
   })
-}
-
-/**
- * Label-bias guard: only flagged cars get inspected, so findings alone can't
- * show what the alerts miss. Each arriving train gets one random audit
- * inspection of a car with no open alert. The pick is a hash of the trip id, so
- * a retried arrival event picks the same car (and audit_key makes it a no-op).
- */
-export async function createAuditInspection(client: { query: typeof pool.query }, tripId: string, yardId: string, at: string): Promise<void> {
-  const { rows } = await client.query<{ unit_id: string }>(
-    `SELECT unit_id FROM current_trip_units u
-      WHERE u.trip_id = $1 AND u.unit_type = 'car'
-        AND NOT EXISTS (SELECT 1 FROM alerts a WHERE a.trip_id = $1 AND a.car_id = u.unit_id AND a.status <> 'closed')
-      ORDER BY u.position`,
-    [tripId],
-  )
-  if (rows.length === 0) return
-  let h = 0
-  for (const ch of tripId) h = (h * 31 + ch.charCodeAt(0)) >>> 0
-  const carId = rows[h % rows.length].unit_id
-  await client.query(
-    `INSERT INTO work_orders (alert_id, trip_id, audit_key, car_id, position, kind, yard_id, priority, created_at)
-     VALUES (NULL, $1, $1, $2, 'ALL', 'audit', $3, 0, $4) ON CONFLICT (audit_key) DO NOTHING`,
-    [tripId, carId, yardId, at],
-  )
+  return result
 }

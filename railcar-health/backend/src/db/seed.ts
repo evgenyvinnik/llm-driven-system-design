@@ -3,17 +3,34 @@
  *
  * History is seeded directly (it would take days of simulation to accumulate):
  *  - two earlier trips of NRLX 220187, whose L2 bearing ran warm on both, so the
- *    car view shows a cross-trip trend and the LOW-by-history rule has evidence;
- *  - ~45 closed, inspected alerts across tiers with their features and findings,
- *    plus a few defects found on routine inspection with no alert. These are the
- *    labels behind the admin page's precision/recall and threshold backtest.
+ *    car view shows a cross-trip trend and the LOW-by-history rule has evidence
+ *    (raw facts and the analyzer's per-trip summaries);
+ *  - ~45 closed, inspected alert cases across tiers, 36 random audits and a few
+ *    defects found on routine inspection with no alert: the labels behind the
+ *    admin page's precision/recall and threshold backtest. These are written as
+ *    EVENTS through the same deciders the live system uses, then the projections
+ *    are built from them by catch-up (exactly what replay does). Findings older
+ *    than 30 days are stored as InspectionFindingRecorded v1, as if written before
+ *    the v2 schema shipped, so upcasting is exercised on every read.
  *    They are illustrative demo data, not real-world rates.
+ *
+ * The relay starts after the seeded history: projections are bootstrapped from
+ * the store, and only new events flow through the broker streams.
  */
 import bcrypt from 'bcryptjs'
 import { redis } from '../shared/cache.js'
 import { config } from '../shared/config.js'
 import { pool, withTransaction } from '../shared/db.js'
 import { DEFAULT_THRESHOLDS, TIER_ACTION, type CarEnd, type Direction } from '../shared/domain.js'
+import { uuidFromName } from '../shared/ids.js'
+import { FAULTS_KEY } from '../events/faults.js'
+import { EventBatch, type NewEvent } from '../events/store.js'
+import { applyEvents, eventsFor, writeCheckpoints } from '../events/catchup.js'
+import { GROUPS, projectionSpecs } from '../events/topology.js'
+import { streamKey } from '../shared/stream.js'
+import { decideClose, decideOpenWorkOrder, decidePlaceHold, decideRaise, decideRecordFinding, decideStartWorkOrder, initialCase, type CaseEvent, type CaseState } from '../domain/case.js'
+import { decideCarFinding, initialCar } from '../domain/car.js'
+import { stageCar, stageCase, syncCaseIndex } from '../domain/repository.js'
 import { detectorViewOf } from '../shared/geometry.js'
 import { DESKS, DETECTORS, SUBDIVISIONS, YARDS } from '../shared/network.js'
 import { OWNERS } from '../simulator/fleet.js'
@@ -33,9 +50,11 @@ const USERS = [
 ] as const
 
 async function reset(client: { query: typeof pool.query }): Promise<void> {
-  await client.query(`TRUNCATE component_installs, notifications, findings, work_orders, car_holds, alert_events, alerts, threshold_changes, thresholds,
-    bearing_trip_summary, detector_bias_samples, expected_passes, axle_readings, detector_passes, trip_events, trip_units, trip_consist_versions, trips,
-    railcars, users, detectors, yards, subdivisions, dispatcher_desks RESTART IDENTITY CASCADE`)
+  await client.query(`TRUNCATE events, relay_checkpoint, consumer_checkpoints, processed_events, case_index, ack_timers, mro_tickets,
+    alerts, car_holds, work_orders, findings, notifications, bearing_trends_latest, component_installs, car_trips, detector_health, reliability_facts,
+    threshold_changes, thresholds, bearing_trip_summary, detector_bias_samples, expected_passes, axle_readings, detector_passes, trip_events, trip_units,
+    trip_consist_versions, trips, railcars, users, detectors, yards, subdivisions, dispatcher_desks RESTART IDENTITY CASCADE`)
+  await client.query('INSERT INTO relay_checkpoint (id, last_position) VALUES (1, 0)')
 }
 
 async function seedReference(client: { query: typeof pool.query }): Promise<void> {
@@ -103,8 +122,8 @@ async function seedCarHistory(client: { query: typeof pool.query }): Promise<voi
       const passId = `H${passedAt.toISOString().replace(/[-:.]/g, '').slice(0, 15)}`
       await client.query(
         `INSERT INTO detector_passes (detector_id, pass_id, trip_id, gateway_id, direction, passed_at, sent_at, received_at, speed_mph, ambient_f, axle_count,
-                                      identity_status, median_bearing_n, median_bearing_s, median_wheel_n, median_wheel_s, payload_sha, published_at, processed_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $6, $6, 45, $7, 292, 'resolved', $8, $8, $9, $9, 'seed', now(), now())`,
+                                      identity_status, median_bearing_n, median_bearing_s, median_wheel_n, median_wheel_s, payload_sha, processed_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $6, $6, 45, $7, 292, 'resolved', $8, $8, $9, $9, 'seed', now())`,
         [d.id, passId, t.tripId, d.gatewayId, t.direction, passedAt, ambient, median, round1(ambient + 12)],
       )
       for (const side of ['L', 'R'] as const) {
@@ -158,9 +177,25 @@ function historicalAlerts(): HistAlert[] {
   return out
 }
 
-async function seedLabeledHistory(client: { query: typeof pool.query }): Promise<{ alerts: number; routine: number }> {
+const SEED_ACTOR = (username: string) => ({ username, role: 'admin' as const, yardId: null })
+/** Seeded history happened in the past: its events were recorded when they occurred. */
+const historical = (events: CaseEvent[]): CaseEvent[] => events.map((e) => ({ ...e, recordedAt: e.occurredAt }))
+const V2_CUTOFF_DAYS = 30
+
+/** Stages events for a seeded case, writing findings older than the v2 cutoff at schema v1. */
+function stageHistory(batch: EventBatch, s: CaseState, events: CaseEvent[], daysAgo: number): CaseState {
+  const shaped = historical(events).map((e): NewEvent => {
+    if (e.type !== 'InspectionFindingRecorded' || daysAgo <= V2_CUTOFF_DAYS) return e
+    const { source, supersedesFindingId: _s, ...rest } = e.payload as Record<string, unknown>
+    return { ...e, version: 1, payload: { ...rest, alertId: source === 'alert' ? s.caseId : null } }
+  })
+  return stageCase(batch, s, shaped)
+}
+
+async function seedLabeledHistory(client: { query: typeof pool.query }, batch: EventBatch): Promise<{ alerts: number; routine: number; cases: CaseState[] }> {
   const alerts = historicalAlerts()
   const yards = ['CDJ', 'RDG', 'HAR']
+  const cases: CaseState[] = []
   let carSerial = 0
   for (const [i, a] of alerts.entries()) {
     const owner = OWNERS[i % OWNERS.length]
@@ -171,70 +206,87 @@ async function seedLabeledHistory(client: { query: typeof pool.query }): Promise
     const eb = i % 2 === 0
     const tripId = `HIST-${String(i + 1).padStart(3, '0')}`
     const yardId = yards[i % yards.length]
+    const inspector = yardId === 'CDJ' ? 'bob' : 'erin'
     await insertTrip(client, { tripId, symbol: eb ? 'M-HARRID' : 'M-RIDHAR', direction: eb ? 'EB' : 'WB', origin: eb ? 'HAR' : 'RDG', destination: eb ? 'RDG' : 'HAR', departedAt, arrivedAt: new Date(departedAt.getTime() + 6 * 3_600_000) })
     const position = `${i % 3 === 0 ? 'L' : 'R'}${(i % 4) + 1}`
     const openedAt = new Date(departedAt.getTime() + 2 * 3_600_000)
+    const inspectedAt = new Date(openedAt.getTime() + 2 * 3_600_000)
     const closedAt = new Date(openedAt.getTime() + 3 * 3_600_000)
     const finding = a.defect ? (a.kind === 'hot_wheel' ? 'brake_defect' : 'confirmed_bearing_defect') : 'no_defect_found'
-    const disposition = a.defect ? 'bad_order' : 'release'
-    const { rows } = await client.query<{ id: string }>(
-      `INSERT INTO alerts (trip_id, car_id, kind, position, tier, status, action, routing, yard_id, reasons, features, route_note, data_lag_seconds,
-                           late, opened_at, updated_at, closed_at, outcome, version)
-       VALUES ($1, $2, $3, $4, $5, 'closed', $6, 'yard', $7, $8, $9, 'Seeded history', 60, false, $10, $11, $11, $12, 3) RETURNING id`,
-      [tripId, carId, a.kind, position, a.tier, TIER_ACTION[a.tier], yardId, JSON.stringify(['Seeded historical alert']), a.features, openedAt, closedAt, finding],
-    )
-    const alertId = rows[0].id
-    const wo = await client.query<{ id: string }>(
-      `INSERT INTO work_orders (alert_id, car_id, position, kind, yard_id, priority, status, assigned_to, created_at, completed_at)
-       VALUES ($1, $2, $3, $4, $5, $6, 'completed', $7, $8, $9) RETURNING id`,
-      [alertId, carId, position, a.kind, yardId, a.tier, yardId === 'CDJ' ? 'bob' : 'erin', openedAt, closedAt],
-    )
-    await client.query(
-      `INSERT INTO car_holds (car_id, alert_id, yard_id, status, reason, created_at, released_at, released_by) VALUES ($1, $2, $3, $4, 'Seeded history', $5, $6, 'seed')`,
-      [carId, alertId, yardId, a.defect ? 'bad_ordered' : 'released', openedAt, a.defect ? null : closedAt],
-    )
-    await client.query(
-      `INSERT INTO findings (client_submission_id, work_order_id, alert_id, car_id, position, source, finding, disposition, recorded_by, observed_at, recorded_at)
-       VALUES ($1, $2, $3, $4, $5, 'alert', $6, $7, 'seed', $8, $8)`,
-      [`seed-${i}`, wo.rows[0].id, alertId, carId, position, finding, disposition, closedAt],
-    )
-    await client.query(`INSERT INTO alert_events (alert_id, kind, tier, note, actor, at) VALUES ($1, 'opened', $2, 'Seeded history', 'seed', $3), ($1, 'closed', NULL, $4, 'seed', $5)`, [
-      alertId, a.tier, openedAt, finding, closedAt,
-    ])
+    let s = initialCase(uuidFromName(`seed-alert-${i}`))
+    s = stageHistory(batch, s, decideRaise(s, {
+      tripId, symbol: eb ? 'M-HARRID' : 'M-RIDHAR', carId, ownerMark: owner.mark, kind: a.kind, position, tier: a.tier, action: TIER_ACTION[a.tier], routing: 'yard',
+      deskId: null, territoryId: null, yardId, owner: { role: 'yard', id: yardId }, ackDueAt: null, reasons: ['Seeded historical alert'], features: a.features,
+      routeNote: 'Seeded history', trigger: { detectorId: 'HBD-155', passId: `seed-${i}`, passedAt: openedAt.toISOString(), lagSeconds: 60 }, late: false, at: openedAt,
+    }), daysAgo)
+    s = stageHistory(batch, s, decidePlaceHold(s, yardId, 'Seeded history', openedAt), daysAgo)
+    s = stageHistory(batch, s, decideOpenWorkOrder(s, { caseType: 'alert', tripId, carId, position, kind: a.kind, yardId, priority: a.tier, at: openedAt }), daysAgo)
+    s = stageHistory(batch, s, decideStartWorkOrder(s, { actor: { username: inspector, role: 'admin', yardId: null }, at: new Date(openedAt.getTime() + 3_600_000) }), daysAgo)
+    const recorded = decideRecordFinding(s, {
+      actor: SEED_ACTOR(inspector),
+      input: { clientSubmissionId: `seed-${i}`, finding, disposition: a.defect ? 'bad_order' : 'release', notes: null, observedAt: inspectedAt.toISOString(), replacement: null },
+      at: inspectedAt,
+    })
+    if (recorded.kind === 'recorded') s = stageHistory(batch, s, recorded.events, daysAgo)
+    // Bad-ordered cars were repaired on the repair track later; the case closed then.
+    if (a.defect) s = stageHistory(batch, s, decideClose(s, { reason: 'repaired', outcome: finding, note: 'Repaired on the repair track (seeded history)', by: inspector, at: closedAt }), daysAgo)
+    cases.push(s)
   }
   // Random audit inspections of cars with no alert (the label-bias guard): mostly healthy, one bearing defect found.
-  const audits = 36
-  for (let i = 0; i < audits; i++) {
+  for (let i = 0; i < 36; i++) {
     const tripId = `HIST-${String((i % alerts.length) + 1).padStart(3, '0')}`
     const carId = `HPRX ${(820000 + i * 53).toString()}`
     await insertCar(client, carId)
-    const at = new Date(now - (3 + i * 1.4) * DAY)
+    const daysAgo = 3 + i * 1.4
+    const at = new Date(now - daysAgo * DAY)
     const defect = i === 17
-    const wo = await client.query<{ id: string }>(
-      `INSERT INTO work_orders (alert_id, trip_id, audit_key, car_id, position, kind, yard_id, priority, status, assigned_to, created_at, completed_at)
-       VALUES (NULL, $1, $2, $3, 'ALL', 'audit', $4, 0, 'completed', 'seed', $5, $5) RETURNING id`,
-      [tripId, `seed-audit-${i}`, carId, yards[i % yards.length], at],
-    )
-    await client.query(
-      `INSERT INTO findings (client_submission_id, work_order_id, car_id, position, source, finding, disposition, notes, recorded_by, observed_at, recorded_at)
-       VALUES ($1, $2, $3, 'ALL', 'audit', $4, $5, $6, 'seed', $7, $7)`,
-      [`seed-audit-${i}`, wo.rows[0].id, carId, defect ? 'confirmed_bearing_defect' : 'no_defect_found', defect ? 'bad_order' : 'release',
-        defect ? 'Audit found a bearing with a damaged seal that had not alerted' : null, at],
-    )
+    let s = initialCase(uuidFromName(`seed-audit-${i}`))
+    s = stageHistory(batch, s, decideOpenWorkOrder(s, { caseType: 'audit', tripId, carId, position: 'ALL', kind: 'audit', yardId: yards[i % yards.length], priority: 0, at }), daysAgo)
+    const recorded = decideRecordFinding(s, {
+      actor: SEED_ACTOR('seed'),
+      input: {
+        clientSubmissionId: `seed-audit-${i}`, finding: defect ? 'confirmed_bearing_defect' : 'no_defect_found', disposition: defect ? 'bad_order' : 'release',
+        notes: defect ? 'Audit found a bearing with a damaged seal that had not alerted' : null, observedAt: at.toISOString(), replacement: null,
+      },
+      at,
+    })
+    if (recorded.kind === 'recorded') s = stageHistory(batch, s, recorded.events, daysAgo)
+    cases.push(s)
   }
-  // Defects found on routine inspection with no prior alert: the misses that make recall < 100%.
+  // Defects found on routine inspection with no prior alert: the misses that make recall < 100%. (v2 only: v1 could not say "routine".)
   const routine = 3
   for (let i = 0; i < routine; i++) {
     const carId = `HPRX ${(810000 + i * 77).toString()}`
     await insertCar(client, carId)
     const at = new Date(now - (5 + i * 9) * DAY)
-    await client.query(
-      `INSERT INTO findings (client_submission_id, car_id, position, source, finding, disposition, notes, recorded_by, observed_at, recorded_at)
-       VALUES ($1, $2, 'R2', 'routine', 'confirmed_bearing_defect', 'bad_order', 'Found on routine inspection; no prior alert', 'seed', $3, $3)`,
-      [`seed-routine-${i}`, carId, at],
-    )
+    stageCar(batch, initialCar(carId), historical(decideCarFinding(initialCar(carId), {
+      source: 'routine', position: 'R2', finding: 'confirmed_bearing_defect', disposition: 'bad_order', notes: 'Found on routine inspection; no prior alert',
+      recordedBy: 'seed', observedAt: at.toISOString(), clientSubmissionId: `seed-routine-${i}`,
+    })))
   }
-  return { alerts: alerts.length, routine }
+  return { alerts: alerts.length, routine, cases }
+}
+
+/** Builds every projection from the seeded events (catch-up from the store) and starts the relay after them. */
+async function bootstrapProjections(client: { query: typeof pool.query }): Promise<number> {
+  let applied = 0
+  for (const spec of projectionSpecs()) {
+    const rows = await eventsFor(client, spec.group)
+    applied += await applyEvents(client, spec.group, rows)
+    await writeCheckpoints(client, spec.group, rows)
+  }
+  // Every other group also starts after the history: it was never published, so it is not "behind" on it.
+  const { rows: heads } = await client.query<{ family: string; p: number }>('SELECT family, max(global_position)::bigint AS p FROM events GROUP BY family')
+  for (const g of GROUPS.filter((x) => x.kind !== 'projection')) {
+    for (const h of heads.filter((x) => g.families.includes(x.family as never))) {
+      await client.query(
+        `INSERT INTO consumer_checkpoints (group_name, stream_key, last_position, events_handled) VALUES ($1, $2, $3, 0) ON CONFLICT (group_name, stream_key) DO NOTHING`,
+        [g.group, streamKey(h.family), h.p],
+      )
+    }
+  }
+  await client.query('UPDATE relay_checkpoint SET last_position = (SELECT COALESCE(max(global_position), 0) FROM events), updated_at = now() WHERE id = 1')
+  return applied
 }
 
 async function main(): Promise<void> {
@@ -243,11 +295,19 @@ async function main(): Promise<void> {
       await reset(client)
       await seedReference(client)
       await seedCarHistory(client)
-      return seedLabeledHistory(client)
+      const batch = new EventBatch({ correlationId: 'seed:history', actor: 'seed' })
+      const history = await seedLabeledHistory(client, batch)
+      const events = await batch.commit(client)
+      for (const c of history.cases) await syncCaseIndex(client, c)
+      const applied = await bootstrapProjections(client)
+      return { ...history, events: events.length, applied }
     })
-    // Old stream pointers and the old simulation clock refer to data that no longer exists.
-    await redis.del(config.stream.liveKey, config.stream.backfillKey, config.stream.deadLetterKey, config.clockKey)
-    console.log(`Seeded ${DETECTORS.length} detectors, ${YARDS.length} yards, ${USERS.length} users, NRLX 220187 history, ${counts.alerts} labeled alerts, ${counts.routine} routine findings`)
+    // Old broker streams, faults and the old simulation clock refer to data that no longer exists.
+    const keys = await redis.keys(`${config.stream.prefix}*`)
+    if (keys.length > 0) await redis.del(...keys)
+    await redis.del(config.clockKey, FAULTS_KEY)
+    console.log(`Seeded ${DETECTORS.length} detectors, ${YARDS.length} yards, ${USERS.length} users, NRLX 220187 history, ${counts.alerts} labeled alert cases, 36 audits, ${counts.routine} routine findings`)
+    console.log(`Event store: ${counts.events} events; projections bootstrapped from ${counts.applied} event applications; relay starts after them`)
     console.log('Users (password "password123"): alice, dan (dispatchers), bob (Cedar Jct yard), erin (Ridgeway yard), carol (reliability admin)')
   } catch (err) {
     console.error('Seed failed:', err)

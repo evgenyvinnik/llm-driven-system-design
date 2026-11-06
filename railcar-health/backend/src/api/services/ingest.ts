@@ -3,26 +3,31 @@
  * cellular or satellite links, so delivery is at-least-once, out of order and
  * sometimes hours late. The detector-assigned (detectorId, passId) is the
  * idempotency key: a retried pass is acknowledged as a duplicate and changes
- * nothing. A pass is acknowledged only after its readings are committed.
+ * nothing.
  *
- * Publishing to the stream happens after commit. If the process dies in
- * between, the gateway never got a 2xx and retries: the retry finds the pass
- * stored but unpublished and publishes it. The republisher sweep covers a
- * gateway that gave up.
+ * Raw readings are an append-only fact log (detector_passes + axle_readings),
+ * not an event-sourced aggregate: there is a lot of data and no invariant
+ * between one reading and the next. In the SAME transaction as the fact rows,
+ * ingest appends PassRecorded and AxleReadingsRecorded to the event store, which
+ * is the transactional outbox: no stored pass without its events, no event
+ * without its pass. The relay publishes them; nothing here talks to the broker.
+ * A pass is acknowledged (2xx) only after that transaction commits.
  *
- * Each pass goes to the live or backfill lane by how late it is, so a
- * reconnecting site's backlog never queues ahead of fresh readings.
+ * AxleReadingsRecorded is a claim check: it names the fact-log rows instead of
+ * carrying ~700 readings. Its lane (live or backfill) is chosen here by how late
+ * the pass is, so a reconnecting site's backlog never queues ahead of fresh data.
  * @module api/services/ingest
  */
 import { createHash } from 'node:crypto'
-import type { Redis } from 'ioredis'
 import { z } from 'zod'
 import { config } from '../../shared/config.js'
-import { pool, withTransaction } from '../../shared/db.js'
+import { pool, type Queryable } from '../../shared/db.js'
 import { HttpError } from '../../shared/errors.js'
 import { logger } from '../../shared/logger.js'
 import { ingestLagMinutes, passesIngested } from '../../shared/metrics.js'
-import { laneFor, publishPass, type Lane } from '../../shared/stream.js'
+import { laneFor, type Lane } from '../../shared/stream.js'
+import { streamIds } from '../../events/catalog.js'
+import { withEventTransaction, type EventBatch } from '../../events/store.js'
 
 const isoDate = z.string().datetime({ offset: true })
 
@@ -63,12 +68,6 @@ export interface PassResult {
   lane: Lane
 }
 
-export interface Publishable {
-  detectorId: string
-  passId: string
-  lagSeconds: number
-}
-
 export function payloadSha(pass: PassInput): string {
   return createHash('sha256').update(JSON.stringify([pass.tripId, pass.passedAt, pass.axleCount, pass.axles])).digest('hex')
 }
@@ -77,7 +76,7 @@ export function lagMinutesOf(passedAt: string, receivedAt: Date): number {
   return Math.max(0, (receivedAt.getTime() - new Date(passedAt).getTime()) / 60_000)
 }
 
-async function insertReadings(client: { query: typeof pool.query }, pass: PassInput): Promise<void> {
+async function insertReadings(client: Queryable, pass: PassInput): Promise<void> {
   await client.query(
     `INSERT INTO axle_readings (detector_id, pass_id, axle_seq, rail, bearing_f, wheel_f)
      SELECT $1, $2, a.seq, a.rail, a.bearing, a.wheel FROM unnest($3::int[], $4::text[], $5::numeric[], $6::numeric[]) AS a(seq, rail, bearing, wheel)
@@ -86,15 +85,48 @@ async function insertReadings(client: { query: typeof pool.query }, pass: PassIn
   )
 }
 
-export async function ingestBatch(batch: BatchInput, receivedAt: Date, streamClient: Redis): Promise<{ accepted: number; duplicates: number; conflicts: number; results: PassResult[] }> {
+/** Stages the two outbox events for a newly stored pass. */
+export function stagePassEvents(batch: EventBatch, pass: PassInput, gatewayId: string, receivedAt: Date, lagSeconds: number, sha: string): void {
+  const lane = laneFor(lagSeconds)
+  const streamId = streamIds.pass(pass.detectorId, pass.passId)
+  const correlationId = `pass:${pass.detectorId}/${pass.passId}`
+  const tags = [`trip:${pass.tripId}`, `detector:${pass.detectorId}`]
+  const recorded = batch.append(streamId, 'no_stream', {
+    type: 'PassRecorded',
+    occurredAt: pass.passedAt,
+    recordedAt: receivedAt,
+    correlationId,
+    causationId: null,
+    tags,
+    payload: {
+      detectorId: pass.detectorId, passId: pass.passId, tripId: pass.tripId, gatewayId, direction: pass.direction, passedAt: pass.passedAt,
+      receivedAt: receivedAt.toISOString(), lagSeconds: Math.round(lagSeconds), lane, speedMph: pass.speedMph, ambientF: pass.ambientF,
+      axleCount: pass.axleCount, aeiRead: Boolean(pass.aei?.length), edgeAlarmCount: pass.edgeAlarms?.length ?? 0,
+    },
+  })
+  batch.append(streamId, 'no_stream', {
+    type: 'AxleReadingsRecorded',
+    occurredAt: pass.passedAt,
+    recordedAt: receivedAt,
+    correlationId,
+    causationId: recorded,
+    tags,
+    payload: {
+      detectorId: pass.detectorId, passId: pass.passId, tripId: pass.tripId, lane, axleCount: pass.axleCount, readingCount: pass.axles.length,
+      payloadSha: sha, claimCheck: { store: 'axle_readings', detectorId: pass.detectorId, passId: pass.passId },
+      maxBearingF: Math.max(...pass.axles.map((a) => a.bearingF)), maxWheelF: Math.max(...pass.axles.map((a) => a.wheelF)),
+    },
+  })
+}
+
+export async function ingestBatch(batch: BatchInput, receivedAt: Date): Promise<{ accepted: number; duplicates: number; conflicts: number; results: PassResult[] }> {
   const detectorIds = [...new Set(batch.passes.map((p) => p.detectorId))]
   const known = await pool.query<{ id: string }>('SELECT id FROM detectors WHERE id = ANY($1)', [detectorIds])
   const unknown = detectorIds.filter((id) => !known.rows.some((r) => r.id === id))
   if (unknown.length > 0) throw new HttpError(422, 'UNKNOWN_DETECTOR', `Unknown detector(s): ${unknown.join(', ')}`)
 
-  const results: PassResult[] = []
-  const toPublish: Publishable[] = []
-  await withTransaction(async (client) => {
+  const { result: results } = await withEventTransaction({ correlationId: `gateway:${batch.gatewayId}`, actor: `gateway:${batch.gatewayId}` }, async ({ client, batch: events }) => {
+    const out: PassResult[] = []
     for (const pass of batch.passes) {
       const lagMinutes = lagMinutesOf(pass.passedAt, receivedAt)
       const late = lagMinutes > config.analysis.lateAfterMinutes
@@ -110,48 +142,24 @@ export async function ingestBatch(batch: BatchInput, receivedAt: Date, streamCli
       )
       if (inserted.rowCount === 1) {
         await insertReadings(client, pass)
-        toPublish.push({ detectorId: pass.detectorId, passId: pass.passId, lagSeconds: lagMinutes * 60 })
-        results.push({ detectorId: pass.detectorId, passId: pass.passId, status: 'accepted', lagMinutes: Math.round(lagMinutes), late, lane })
+        stagePassEvents(events, pass, batch.gatewayId, receivedAt, lagMinutes * 60, sha)
+        out.push({ detectorId: pass.detectorId, passId: pass.passId, status: 'accepted', lagMinutes: Math.round(lagMinutes), late, lane })
         ingestLagMinutes.observe(lagMinutes)
         continue
       }
-      const prior = await client.query<{ payload_sha: string; published_at: Date | null }>(
-        'SELECT payload_sha, published_at FROM detector_passes WHERE detector_id = $1 AND pass_id = $2',
-        [pass.detectorId, pass.passId],
-      )
-      const row = prior.rows[0]
-      const conflict = row.payload_sha !== sha
+      // A retry: the pass and its events were committed together the first time, so there is nothing to publish.
+      const prior = await client.query<{ payload_sha: string }>('SELECT payload_sha FROM detector_passes WHERE detector_id = $1 AND pass_id = $2', [pass.detectorId, pass.passId])
+      const conflict = prior.rows[0]?.payload_sha !== sha
       if (conflict) logger.warn({ detectorId: pass.detectorId, passId: pass.passId }, 'pass retried with different readings; keeping the first copy')
-      // A retry after a crash between commit and publish: publish now.
-      if (row.published_at === null) toPublish.push({ detectorId: pass.detectorId, passId: pass.passId, lagSeconds: lagMinutes * 60 })
-      results.push({ detectorId: pass.detectorId, passId: pass.passId, status: conflict ? 'conflict' : 'duplicate', lagMinutes: Math.round(lagMinutes), late, lane })
+      out.push({ detectorId: pass.detectorId, passId: pass.passId, status: conflict ? 'conflict' : 'duplicate', lagMinutes: Math.round(lagMinutes), late, lane })
     }
+    return out
   })
 
-  await publishAll(streamClient, toPublish)
   const accepted = results.filter((r) => r.status === 'accepted').length
   const duplicates = results.filter((r) => r.status === 'duplicate').length
   const conflicts = results.filter((r) => r.status === 'conflict').length
   passesIngested.inc({ outcome: 'accepted' }, accepted)
   passesIngested.inc({ outcome: 'duplicate' }, duplicates + conflicts)
   return { accepted, duplicates, conflicts, results }
-}
-
-export async function publishAll(streamClient: Redis, passes: Publishable[]): Promise<void> {
-  for (const p of passes) {
-    await publishPass(streamClient, laneFor(p.lagSeconds), p.detectorId, p.passId)
-    await pool.query('UPDATE detector_passes SET published_at = now() WHERE detector_id = $1 AND pass_id = $2', [p.detectorId, p.passId])
-  }
-}
-
-/** Publishes committed passes that never reached the stream (the process died before publishing). */
-export async function republishStale(streamClient: Redis): Promise<number> {
-  const { rows } = await pool.query<{ detector_id: string; pass_id: string; lag_seconds: number }>(
-    `SELECT detector_id, pass_id, lag_seconds FROM detector_passes
-      WHERE published_at IS NULL AND inserted_at < now() - ($1 || ' milliseconds')::interval
-      ORDER BY inserted_at LIMIT 200`,
-    [String(config.stream.republishAfterMs)],
-  )
-  await publishAll(streamClient, rows.map((r) => ({ detectorId: r.detector_id, passId: r.pass_id, lagSeconds: r.lag_seconds })))
-  return rows.length
 }

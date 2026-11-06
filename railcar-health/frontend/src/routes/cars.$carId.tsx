@@ -1,6 +1,7 @@
 import { createFileRoute, Link, useNavigate } from '@tanstack/react-router'
 import { useState } from 'react'
 import { BearingPicker } from '@/components/cars/BearingPicker'
+import { HistoryIcon } from '@/components/icons'
 import { CarTrips } from '@/components/cars/CarTrips'
 import { TrendChart, type TrendMode } from '@/components/cars/TrendChart'
 import { HoldBadge } from '@/components/shared/Badges'
@@ -38,7 +39,12 @@ export function CarPage() {
       <PageHeader
         title={<span className="font-mono">{info.carId}</span>}
         subtitle={`${info.carType} · owned by ${info.ownerName} (${info.ownerMark}) · ${info.axleCount} axles`}
-        actions={activeHolds.map((h) => <span key={h.id} className="flex items-center gap-1 text-sm"><HoldBadge status={h.status} /> at {h.yardName}</span>)}
+        actions={
+          <>
+            {activeHolds.map((h) => <span key={h.id} className="flex items-center gap-1 text-sm"><HoldBadge status={h.status} /> at {h.yardName}</span>)}
+            <Link to="/timeline" search={{ car: info.carId }} className="btn-secondary"><HistoryIcon className="h-4 w-4" /> Event timeline</Link>
+          </>
+        }
       />
       <div className="grid grid-cols-3 gap-4">
         <section className="card col-span-2 p-4">

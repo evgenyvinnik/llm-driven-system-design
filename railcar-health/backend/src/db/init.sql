@@ -37,7 +37,9 @@ CREATE TABLE IF NOT EXISTS users (
   created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- One row per wayside site. Health columns are maintained by the analyzer.
+-- One row per wayside site, plus the analyzer's health inputs (heartbeats, bias, missed trains).
+-- The decided status (ok/offline/silent/biased) is an event, DetectorHealthChanged; the
+-- detector_health projection holds the current value for screens.
 CREATE TABLE IF NOT EXISTS detectors (
   id              TEXT PRIMARY KEY,
   name            TEXT NOT NULL,
@@ -46,9 +48,6 @@ CREATE TABLE IF NOT EXISTS detectors (
   has_aei         BOOLEAN NOT NULL DEFAULT false,
   braking_zone    BOOLEAN NOT NULL DEFAULT false,
   gateway_id      TEXT NOT NULL,
-  status          TEXT NOT NULL DEFAULT 'ok' CHECK (status IN ('ok', 'offline', 'silent', 'biased')),
-  status_reason   TEXT,
-  status_since    TIMESTAMPTZ,
   last_heard_at   TIMESTAMPTZ,
   last_pass_at    TIMESTAMPTZ,
   buffered_passes INT NOT NULL DEFAULT 0,
@@ -98,6 +97,7 @@ CREATE TABLE IF NOT EXISTS trip_consist_versions (
   revision     INT NOT NULL,
   effective_at TIMESTAMPTZ NOT NULL,
   received_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  identified_at TIMESTAMPTZ,              -- when the analyzer emitted CarIdentified for this revision's cars
   PRIMARY KEY (trip_id, revision)
 );
 
@@ -131,7 +131,11 @@ CREATE TABLE IF NOT EXISTS trip_events (
   at       TIMESTAMPTZ NOT NULL
 );
 
--- ── Raw detector data (production: a time-series store) ──────────────────────
+-- ── Raw detector data: an append-only FACT LOG, not an event-sourced aggregate ──
+-- Volume (hundreds of readings per pass) and no invariants to protect: nothing about a reading
+-- depends on an earlier one. The ingest transaction appends PassRecorded and AxleReadingsRecorded
+-- to the event store (the outbox); AxleReadingsRecorded carries a claim check to these rows.
+-- (Production: a columnar time-series store.)
 
 -- One train passing one detector. (detector_id, pass_id) is the idempotency key: the
 -- detector assigns pass_id, so a gateway retry of the same pass is a no-op.
@@ -158,12 +162,10 @@ CREATE TABLE IF NOT EXISTS detector_passes (
   median_wheel_n   NUMERIC(5,1),
   median_wheel_s   NUMERIC(5,1),
   inserted_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-  published_at     TIMESTAMPTZ,            -- set once the stream message is written
   processed_at     TIMESTAMPTZ,            -- set in the analyzer's transaction
   PRIMARY KEY (detector_id, pass_id)
 );
 CREATE INDEX IF NOT EXISTS detector_passes_trip_idx ON detector_passes (trip_id, passed_at);
-CREATE INDEX IF NOT EXISTS detector_passes_unpublished_idx ON detector_passes (inserted_at) WHERE published_at IS NULL;
 
 -- Per-axle, per-rail readings. Raw columns never change; the resolved columns
 -- (car, car-relative axle and side) are derived and may be rewritten when an AEI
@@ -235,32 +237,181 @@ CREATE TABLE IF NOT EXISTS threshold_changes (
   changed_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- ── Alerts, holds, work orders, findings ─────────────────────────────────────
+-- ── Upgrade from the pre-event-sourcing schema (runs once; a no-op afterwards) ─
+-- Alerts, holds, work orders, findings, notifications and component installs used to be the
+-- source of truth. They are now projections of the event store, rebuilt by the projectors.
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'events') THEN
+    DROP TABLE IF EXISTS alert_events, notifications, findings, component_installs, work_orders, car_holds, alerts CASCADE;
+  END IF;
+END $$;
+ALTER TABLE detectors DROP COLUMN IF EXISTS status, DROP COLUMN IF EXISTS status_reason, DROP COLUMN IF EXISTS status_since;
+ALTER TABLE detector_passes DROP COLUMN IF EXISTS published_at;
+ALTER TABLE trip_consist_versions ADD COLUMN IF NOT EXISTS identified_at TIMESTAMPTZ;
 
+-- ── Event store ───────────────────────────────────────────────────────────────
+-- One append-only table plays three roles:
+--   * EVENT STORE for the event-sourced aggregates: case-<uuid> (an alert or audit case and its
+--     yard response) and car-<car id> (component history). Their events ARE the state; the
+--     current-state tables below are projections. Appends carry an expected stream version.
+--   * OUTBOX for state-based writes (trips, consists, detector health, raw passes): the state
+--     row and its event commit in one transaction; the event is the integration record.
+--   * LOG the relay publishes, in global_position order, to one broker stream per event family.
+-- global_position is assigned under a short transaction-scoped advisory lock taken just before
+-- the INSERT, so positions become visible in commit order and the relay can never skip one.
+CREATE TABLE IF NOT EXISTS events (
+  global_position BIGSERIAL PRIMARY KEY,
+  event_id        UUID NOT NULL UNIQUE,
+  stream_id       TEXT NOT NULL,             -- case-<uuid>, car-<car id>, trip-<trip id>, pass-<detector>/<pass>, detector-<id>
+  stream_type     TEXT NOT NULL,             -- case | car | trip | pass | detector
+  stream_version  INT NOT NULL,              -- 1, 2, 3... per stream: optimistic concurrency
+  type            TEXT NOT NULL,             -- past tense: AlertRaised, ComponentReplaced, ...
+  version         SMALLINT NOT NULL,         -- schema version of the payload as written (upcast on read)
+  family          TEXT NOT NULL,             -- broker stream (Kafka topic) the relay publishes it to
+  partition_key   TEXT NOT NULL,             -- Kafka message key: trip id, car id, case id, detector id
+  occurred_at     TIMESTAMPTZ NOT NULL,      -- event time (when it happened, domain clock)
+  recorded_at     TIMESTAMPTZ NOT NULL,      -- processing time (when we learned it, domain clock)
+  committed_at    TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),  -- wall clock, for lag and events/sec
+  correlation_id  TEXT NOT NULL,             -- one business flow: a pass, a tablet submission, a timer
+  causation_id    UUID,                      -- the event that directly caused this one
+  actor           TEXT NOT NULL,             -- user name or system component
+  tags            TEXT[] NOT NULL DEFAULT '{}',  -- car:<id>, trip:<id>, case:<id>, detector:<id> for cross-stream timelines
+  payload         JSONB NOT NULL,
+  UNIQUE (stream_id, stream_version)
+);
+CREATE INDEX IF NOT EXISTS events_tags_idx ON events USING GIN (tags);
+CREATE INDEX IF NOT EXISTS events_family_idx ON events (family, global_position);
+CREATE INDEX IF NOT EXISTS events_type_idx ON events (type, global_position);
+CREATE INDEX IF NOT EXISTS events_correlation_idx ON events (correlation_id);
+CREATE INDEX IF NOT EXISTS events_causation_idx ON events (causation_id);
+
+-- Append-only: history is never edited. Schema changes are new versions plus upcasters.
+-- (TRUNCATE, used by the seed to start over, is a statement-level operation and stays allowed.)
+CREATE OR REPLACE FUNCTION events_append_only() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  RAISE EXCEPTION 'events is append-only (% refused)', TG_OP;
+END $$;
+DROP TRIGGER IF EXISTS events_no_update ON events;
+CREATE TRIGGER events_no_update BEFORE UPDATE OR DELETE ON events FOR EACH ROW EXECUTE FUNCTION events_append_only();
+
+-- The relay's position in the log. At-least-once: a crash after publishing but before this
+-- update republishes a few events, which every consumer drops by event id.
+CREATE TABLE IF NOT EXISTS relay_checkpoint (
+  id            INT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+  last_position BIGINT NOT NULL DEFAULT 0,
+  updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+INSERT INTO relay_checkpoint (id, last_position) VALUES (1, 0) ON CONFLICT DO NOTHING;
+
+-- Per consumer group, per broker stream: the highest global position applied and how many.
+-- Updated in the same transaction as the consumer's effects.
+CREATE TABLE IF NOT EXISTS consumer_checkpoints (
+  group_name       TEXT NOT NULL,
+  stream_key       TEXT NOT NULL,
+  last_position    BIGINT NOT NULL DEFAULT 0,
+  last_message_id  TEXT,
+  events_handled   BIGINT NOT NULL DEFAULT 0,
+  updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (group_name, stream_key)
+);
+
+-- Idempotent consumers: an event id is applied at most once per group. The insert happens in the
+-- same transaction as the effects, so a redelivery after a crash (before XACK) is a no-op.
+CREATE TABLE IF NOT EXISTS processed_events (
+  group_name   TEXT NOT NULL,
+  event_id     UUID NOT NULL,
+  processed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (group_name, event_id)
+);
+
+-- ── Write-side indexes for the case aggregate ─────────────────────────────────
+-- Set-based invariants span aggregates, so the event store alone can't enforce them. This lookup
+-- table is written in the same transaction as the case's events (never by a projector) and gives:
+--   * one open alert case per bearing (or per car, for brakes) per trip;
+--   * one audit case per arriving trip;
+--   * the hold index the yard's outbound-build check reads (a stale "clear" would be unsafe,
+--     so that check never reads an asynchronous projection).
+CREATE TABLE IF NOT EXISTS case_index (
+  case_id        UUID PRIMARY KEY,
+  case_type      TEXT NOT NULL CHECK (case_type IN ('alert', 'audit')),
+  trip_id        TEXT NOT NULL,
+  car_id         TEXT NOT NULL,
+  kind           TEXT NOT NULL,
+  position       TEXT NOT NULL,
+  is_open        BOOLEAN NOT NULL DEFAULT true,
+  work_order_id  UUID UNIQUE,
+  hold_yard_id   TEXT,
+  hold_status    TEXT CHECK (hold_status IN ('active', 'bad_ordered', 'released')),
+  version        INT NOT NULL,
+  updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS case_index_one_open_alert ON case_index (trip_id, car_id, kind, position) WHERE is_open AND case_type = 'alert';
+CREATE UNIQUE INDEX IF NOT EXISTS case_index_one_audit ON case_index (trip_id) WHERE case_type = 'audit';
+CREATE INDEX IF NOT EXISTS case_index_trip_idx ON case_index (trip_id) WHERE is_open;
+CREATE INDEX IF NOT EXISTS case_index_car_idx ON case_index (car_id) WHERE is_open;
+CREATE INDEX IF NOT EXISTS case_index_holds_idx ON case_index (car_id) WHERE hold_status IN ('active', 'bad_ordered');
+
+-- ── Process manager: durable timers for acknowledgment deadlines ──────────────
+-- Orchestration, not choreography: deadline -> escalate -> (handoff) needs memory and time.
+-- due_at is domain time. Pollers claim due rows with FOR UPDATE SKIP LOCKED, so two workers never
+-- fire the same timer, and a crash mid-fire leaves the row pending for the next poll.
+CREATE TABLE IF NOT EXISTS ack_timers (
+  case_id       UUID NOT NULL,
+  kind          TEXT NOT NULL CHECK (kind IN ('ack_deadline', 'approach_yard')),
+  due_at        TIMESTAMPTZ NOT NULL,
+  status        TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'fired', 'cancelled')),
+  level         SMALLINT NOT NULL DEFAULT 0,
+  case_version  INT NOT NULL,
+  attempts      INT NOT NULL DEFAULT 0,
+  fired_at      TIMESTAMPTZ,
+  note          TEXT,
+  updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (case_id, kind)
+);
+CREATE INDEX IF NOT EXISTS ack_timers_due_idx ON ack_timers (due_at) WHERE status = 'pending';
+
+-- The work-order integration's record of what it pushed to the yard maintenance system (simulated).
+CREATE TABLE IF NOT EXISTS mro_tickets (
+  work_order_id UUID PRIMARY KEY,
+  case_id       UUID NOT NULL,
+  external_ref  TEXT NOT NULL UNIQUE,
+  yard_id       TEXT NOT NULL,
+  status        TEXT NOT NULL CHECK (status IN ('open', 'closed')),
+  opened_at     TIMESTAMPTZ NOT NULL,
+  closed_at     TIMESTAMPTZ
+);
+
+-- ── Projections (read models) ─────────────────────────────────────────────────
+-- Every table below is derived from events and can be dropped and rebuilt with
+-- `npm run replay -- <projection>`. Projectors write only values found in events (no now(), no
+-- random ids), so a rebuild from position 0 produces identical rows. No foreign keys: projections
+-- consume several broker streams whose relative order is not guaranteed.
+
+-- alert-queue projection: alerts, car_holds, work_orders, findings, notifications, bearing_trends_latest
 CREATE TABLE IF NOT EXISTS alerts (
-  id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  trip_id             TEXT NOT NULL REFERENCES trips(trip_id),
+  id                  UUID PRIMARY KEY,
+  trip_id             TEXT NOT NULL,
   car_id              TEXT NOT NULL,
   -- hot_bearing = journal bearing failure; hot_wheel = stuck or dragging brake; cold_wheel = inoperative brake.
   kind                TEXT NOT NULL CHECK (kind IN ('hot_bearing', 'hot_wheel', 'cold_wheel')),
   position            TEXT NOT NULL,       -- car-relative bearing, e.g. 'R3'; 'CAR' for brake (wheel) alerts
   tier                SMALLINT NOT NULL CHECK (tier BETWEEN 1 AND 4),
-  -- open -> acknowledged (a person owns it) -> inspected (finding recorded) -> closed (car repaired or released).
-  -- Delivery (the notification provider accepted the message) is tracked separately in delivered_at.
-  status              TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'acknowledged', 'inspected', 'closed')),
-  owner_role          TEXT,                -- dispatcher | yard | owner
-  owner_id            TEXT,                -- desk id, yard id or owner mark
-  escalation_level    SMALLINT NOT NULL DEFAULT 0,  -- 0 primary owner, 1 supervisor, 2 operations center
+  -- open -> acknowledged (a person owns it) -> inspected (finding recorded) -> closed (repaired or released).
+  status              TEXT NOT NULL CHECK (status IN ('open', 'acknowledged', 'inspected', 'closed')),
+  owner_role          TEXT,
+  owner_id            TEXT,
+  escalation_level    SMALLINT NOT NULL DEFAULT 0,
   ack_due_at          TIMESTAMPTZ,
   delivered_at        TIMESTAMPTZ,
   inspected_at        TIMESTAMPTZ,
   action              TEXT NOT NULL,
   routing             TEXT NOT NULL,
-  desk_id             TEXT REFERENCES dispatcher_desks(id),
-  territory_id        TEXT REFERENCES subdivisions(id),
-  yard_id             TEXT REFERENCES yards(id),
+  desk_id             TEXT,
+  territory_id        TEXT,
+  yard_id             TEXT,
   reasons             JSONB NOT NULL DEFAULT '[]',
-  features            JSONB NOT NULL DEFAULT '{}',
+  features            JSONB NOT NULL DEFAULT '{}',   -- as of the last decision (raise or escalation)
   route_note          TEXT,
   trigger_detector_id TEXT,
   trigger_pass_id     TEXT,
@@ -276,113 +427,147 @@ CREATE TABLE IF NOT EXISTS alerts (
   ack_note            TEXT,
   closed_at           TIMESTAMPTZ,
   outcome             TEXT,
-  version             INT NOT NULL DEFAULT 1
+  version             INT NOT NULL,        -- the case stream version this row reflects
+  last_position       BIGINT NOT NULL      -- global position of the last case event applied
 );
--- One open alert per bearing per trip: new evidence escalates it in place instead of duplicating it.
-CREATE UNIQUE INDEX IF NOT EXISTS alerts_one_open_per_bearing
-  ON alerts (trip_id, car_id, kind, position) WHERE status <> 'closed';
+CREATE UNIQUE INDEX IF NOT EXISTS alerts_one_open_per_bearing ON alerts (trip_id, car_id, kind, position) WHERE status <> 'closed';
 CREATE INDEX IF NOT EXISTS alerts_queue_idx ON alerts (status, tier DESC, opened_at DESC);
-CREATE INDEX IF NOT EXISTS alerts_ack_due_idx ON alerts (ack_due_at) WHERE status = 'open';
 CREATE INDEX IF NOT EXISTS alerts_car_idx ON alerts (car_id, opened_at DESC);
 
-CREATE TABLE IF NOT EXISTS alert_events (
-  id          BIGSERIAL PRIMARY KEY,
-  alert_id    UUID NOT NULL REFERENCES alerts(id) ON DELETE CASCADE,
-  kind        TEXT NOT NULL,              -- opened, escalated, delivered, acknowledged, ack_overdue, handoff, rerouted, inspected, closed
-  tier        SMALLINT,
-  detector_id TEXT,
-  pass_id     TEXT,
-  note        TEXT,
-  actor       TEXT NOT NULL DEFAULT 'analyzer',
-  at          TIMESTAMPTZ NOT NULL
-);
--- Redelivery backstop: the same transition from the same pass is recorded once.
-CREATE UNIQUE INDEX IF NOT EXISTS alert_events_dedupe
-  ON alert_events (alert_id, kind, COALESCE(tier, 0), COALESCE(pass_id, ''));
-
--- A hold stops the yard from building the car into an outbound train until it is inspected.
 CREATE TABLE IF NOT EXISTS car_holds (
-  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  id          UUID PRIMARY KEY,
   car_id      TEXT NOT NULL,
-  alert_id    UUID NOT NULL UNIQUE REFERENCES alerts(id),
-  yard_id     TEXT NOT NULL REFERENCES yards(id),
-  status      TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'bad_ordered', 'released')),
+  alert_id    UUID NOT NULL,
+  yard_id     TEXT NOT NULL,
+  status      TEXT NOT NULL CHECK (status IN ('active', 'bad_ordered', 'released')),
   reason      TEXT NOT NULL,
   created_at  TIMESTAMPTZ NOT NULL,
   released_at TIMESTAMPTZ,
   released_by TEXT
 );
 CREATE INDEX IF NOT EXISTS car_holds_car_idx ON car_holds (car_id) WHERE status <> 'released';
+CREATE INDEX IF NOT EXISTS car_holds_yard_idx ON car_holds (yard_id, status);
 
--- Alert work orders, plus random audit inspections of unflagged cars (alert_id NULL, kind 'audit'):
--- audits are how the system learns what it misses, since otherwise only flagged cars get inspected.
+-- Alert work orders, plus random audit inspections of unflagged cars (alert_id NULL, kind 'audit').
 CREATE TABLE IF NOT EXISTS work_orders (
-  id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  alert_id     UUID UNIQUE REFERENCES alerts(id),
+  id           UUID PRIMARY KEY,
+  case_id      UUID NOT NULL,
+  alert_id     UUID,                       -- = case_id for alert cases, NULL for audits
   trip_id      TEXT,
-  audit_key    TEXT UNIQUE,                -- one audit per arriving trip
   car_id       TEXT NOT NULL,
   position     TEXT NOT NULL,
   kind         TEXT NOT NULL,
-  yard_id      TEXT NOT NULL REFERENCES yards(id),
-  priority     SMALLINT NOT NULL,          -- mirrors the alert tier; 0 for audits
-  status       TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'in_progress', 'completed', 'cancelled')),
+  yard_id      TEXT NOT NULL,
+  priority     SMALLINT NOT NULL,
+  status       TEXT NOT NULL CHECK (status IN ('open', 'in_progress', 'completed', 'cancelled')),
   assigned_to  TEXT,
   created_at   TIMESTAMPTZ NOT NULL,
   completed_at TIMESTAMPTZ,
-  version      INT NOT NULL DEFAULT 1
+  version      INT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS work_orders_yard_idx ON work_orders (yard_id, status, priority DESC);
 
--- Inspection outcomes: the labels that measure precision and drive threshold calibration.
 CREATE TABLE IF NOT EXISTS findings (
-  id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  client_submission_id TEXT NOT NULL UNIQUE,   -- the tablet's idempotency key
-  work_order_id        UUID UNIQUE REFERENCES work_orders(id),
-  alert_id             UUID REFERENCES alerts(id),
+  id                   UUID PRIMARY KEY,
+  client_submission_id TEXT,
+  case_id              UUID,
+  work_order_id        UUID,
+  alert_id             UUID,
   car_id               TEXT NOT NULL,
   position             TEXT NOT NULL,
-  source               TEXT NOT NULL DEFAULT 'alert' CHECK (source IN ('alert', 'audit', 'routine', 'teardown')),
+  source               TEXT NOT NULL CHECK (source IN ('alert', 'audit', 'routine', 'teardown')),
   finding              TEXT NOT NULL CHECK (finding IN ('confirmed_bearing_defect', 'brake_defect', 'wheel_defect', 'no_defect_found')),
   disposition          TEXT NOT NULL CHECK (disposition IN ('bad_order', 'release', 'repaired')),
   notes                TEXT,
   recorded_by          TEXT NOT NULL,
   observed_at          TIMESTAMPTZ NOT NULL,   -- when the inspector looked (tablet clock, may be offline)
-  recorded_at          TIMESTAMPTZ NOT NULL    -- when the server accepted it
+  recorded_at          TIMESTAMPTZ NOT NULL,   -- when the server accepted it
+  superseded_by        UUID,                   -- a later, more severe finding from another tablet
+  schema_version       SMALLINT NOT NULL       -- version the event was written at (v1 rows were upcast)
 );
+CREATE INDEX IF NOT EXISTS findings_work_order_idx ON findings (work_order_id);
 
--- Notification outbox: who was told what. Production fans these out to dispatcher consoles,
--- yard mechanical systems and car owners (the industry's EHMS-style alert routing).
+-- Who was told what. Delivered means the provider accepted it, not that a person read it.
 CREATE TABLE IF NOT EXISTS notifications (
-  id         BIGSERIAL PRIMARY KEY,
-  alert_id   UUID NOT NULL REFERENCES alerts(id) ON DELETE CASCADE,
-  channel    TEXT NOT NULL CHECK (channel IN ('dispatcher', 'yard', 'car_owner', 'reliability', 'supervisor', 'operations')),
-  target     TEXT NOT NULL,
-  kind       TEXT NOT NULL,
-  message    TEXT NOT NULL,
-  dedupe_key TEXT NOT NULL UNIQUE,
-  created_at TIMESTAMPTZ NOT NULL,
-  delivered_at TIMESTAMPTZ                 -- the provider accepted it; says nothing about a person reading it
+  id           UUID PRIMARY KEY,
+  alert_id     UUID NOT NULL,
+  channel      TEXT NOT NULL,
+  target       TEXT NOT NULL,
+  kind         TEXT NOT NULL,
+  message      TEXT NOT NULL,
+  created_at   TIMESTAMPTZ NOT NULL,
+  delivered_at TIMESTAMPTZ
 );
 CREATE INDEX IF NOT EXISTS notifications_alert_idx ON notifications (alert_id);
-CREATE INDEX IF NOT EXISTS notifications_undelivered_idx ON notifications (created_at) WHERE delivered_at IS NULL;
 
--- ── Component lifecycle ───────────────────────────────────────────────────────
+-- Latest trend features per bearing per trip (telemetry, not decisions). Last-writer-wins by
+-- global position, so it converges whatever order the trends and cases streams are consumed in.
+CREATE TABLE IF NOT EXISTS bearing_trends_latest (
+  trip_id        TEXT NOT NULL,
+  car_id         TEXT NOT NULL,
+  position       TEXT NOT NULL,
+  features       JSONB NOT NULL,
+  tier           SMALLINT NOT NULL,
+  passed_at      TIMESTAMPTZ NOT NULL,
+  last_position  BIGINT NOT NULL,
+  PRIMARY KEY (trip_id, car_id, position)
+);
 
--- A railcar outlives its wheelsets: a wheelset (axle, two wheels, two journal bearings) is changed out
--- at a repair track. Installs are events with an event time (installed_at) and a processing time
--- (recorded_at); the component on an axle at any instant is rebuilt from them. Readings measured
--- before installed_at belong to the previous wheelset and are never evidence against this one.
+-- car-history projection: component_installs, car_trips
 CREATE TABLE IF NOT EXISTS component_installs (
-  id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   car_id               TEXT NOT NULL,
   axle                 INT NOT NULL CHECK (axle BETWEEN 1 AND 12),   -- car-relative, 1 = B-end
   component_id         TEXT NOT NULL,      -- wheelset serial
-  installed_at         TIMESTAMPTZ NOT NULL,
+  installed_at         TIMESTAMPTZ NOT NULL,   -- event time
   removed_at           TIMESTAMPTZ,
-  recorded_at          TIMESTAMPTZ NOT NULL,
+  recorded_at          TIMESTAMPTZ NOT NULL,   -- processing time
   recorded_by          TEXT NOT NULL,
-  finding_id           UUID REFERENCES findings(id),
-  client_submission_id TEXT UNIQUE
+  finding_id           UUID,
+  event_id             UUID NOT NULL,
+  PRIMARY KEY (car_id, axle, installed_at)
 );
-CREATE UNIQUE INDEX IF NOT EXISTS component_installs_current ON component_installs (car_id, axle) WHERE removed_at IS NULL;
+
+-- Which trips a car ran, where it sat and which way it faced, and how that was learned.
+CREATE TABLE IF NOT EXISTS car_trips (
+  trip_id               TEXT NOT NULL,
+  car_id                TEXT NOT NULL,
+  revision              INT NOT NULL,
+  position              INT NOT NULL,
+  leading_end           CHAR(1) NOT NULL,
+  orientation_source    TEXT NOT NULL,
+  corrected_by_detector TEXT,
+  identified_at         TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (trip_id, car_id)
+);
+
+-- detector-health projection
+CREATE TABLE IF NOT EXISTS detector_health (
+  detector_id      TEXT PRIMARY KEY,
+  status           TEXT NOT NULL DEFAULT 'ok' CHECK (status IN ('ok', 'offline', 'silent', 'biased')),
+  status_reason    TEXT,
+  status_since     TIMESTAMPTZ,
+  last_pass_at     TIMESTAMPTZ,
+  last_received_at TIMESTAMPTZ,
+  passes           INT NOT NULL DEFAULT 0,
+  late_passes      INT NOT NULL DEFAULT 0,
+  max_lag_seconds  INT NOT NULL DEFAULT 0
+);
+
+-- reliability projection: one row per case (alert or audit) and per stand-alone finding.
+-- A fact table shaped for the precision/recall queries on the reliability page.
+CREATE TABLE IF NOT EXISTS reliability_facts (
+  fact_id         UUID PRIMARY KEY,        -- case id, or finding id for routine/teardown findings
+  source          TEXT NOT NULL,           -- alert | audit | routine | teardown
+  trip_id         TEXT,
+  car_id          TEXT NOT NULL,
+  alert_kind      TEXT,
+  max_tier        SMALLINT,
+  opened_at       TIMESTAMPTZ NOT NULL,
+  first_ack_at    TIMESTAMPTZ,
+  escalations     INT NOT NULL DEFAULT 0,  -- acknowledgment deadlines missed
+  finding         TEXT,
+  disposition     TEXT,
+  status          TEXT NOT NULL,
+  outcome         TEXT,
+  closed_at       TIMESTAMPTZ
+);

@@ -1,15 +1,32 @@
 /**
- * The pass streams: two Valkey streams (live and backfill lanes) standing in for Kafka topics. Messages are
- * pointers ({ detectorId, passId }); the analyzer reads the pass from
- * PostgreSQL. Production would carry the payload and partition by trip.
+ * Broker streams: one Valkey stream per event family, standing in for Kafka
+ * topics. The relay publishes every event from the store to exactly one of
+ * them. Detector readings are split into a live and a backfill lane at ingest,
+ * by how late they arrived, so a reconnecting site's backlog never queues in
+ * front of fresh readings from other sites.
  * @module shared/stream
  */
-import type { Redis } from 'ioredis'
 import { config } from './config.js'
 
 export type Lane = 'live' | 'backfill'
 
-export const laneKey = (lane: Lane) => (lane === 'live' ? config.stream.liveKey : config.stream.backfillKey)
+/** Every broker stream, in the order the Ops page lists them. */
+export const FAMILIES = [
+  'wayside.passes',
+  'wayside.readings.live',
+  'wayside.readings.backfill',
+  'identity',
+  'trends',
+  'trips.position',
+  'detectors.health',
+  'cases',
+  'cars',
+] as const
+export type Family = (typeof FAMILIES)[number]
+
+export const streamKey = (family: string) => `${config.stream.prefix}${family}`
+export const familyOfKey = (key: string) => key.slice(config.stream.prefix.length)
+export const laneKey = (lane: Lane) => streamKey(lane === 'live' ? 'wayside.readings.live' : 'wayside.readings.backfill')
 
 /**
  * Fresh passes go to the live lane; passes that sat in a gateway buffer go to
@@ -18,21 +35,6 @@ export const laneKey = (lane: Lane) => (lane === 'live' ? config.stream.liveKey 
  */
 export function laneFor(lagSeconds: number, lateAfterMinutes = config.analysis.lateAfterMinutes): Lane {
   return lagSeconds > lateAfterMinutes * 60 ? 'backfill' : 'live'
-}
-
-export async function publishPass(client: Redis, lane: Lane, detectorId: string, passId: string): Promise<string | null> {
-  return client.xadd(laneKey(lane), 'MAXLEN', '~', '200000', '*', 'detectorId', detectorId, 'passId', passId)
-}
-
-/** Creates the consumer groups from the start of each stream, so nothing published before the analyzer started is skipped. */
-export async function ensureGroup(client: Redis): Promise<void> {
-  for (const key of [config.stream.liveKey, config.stream.backfillKey]) {
-    try {
-      await client.xgroup('CREATE', key, config.stream.group, '0', 'MKSTREAM')
-    } catch (err) {
-      if (!(err as Error).message.includes('BUSYGROUP')) throw err
-    }
-  }
 }
 
 export function fieldsToObject(fields: string[]): Record<string, string> {

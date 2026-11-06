@@ -53,8 +53,9 @@ tripsRouter.get(
       ),
       pool.query(
         `SELECT p.detector_id, p.pass_id, p.passed_at, p.received_at, p.lag_seconds, p.ambient_f, p.speed_mph, p.identity_status, p.aei IS NOT NULL AS has_aei,
-                p.edge_alarms, d.name, d.milepost, d.status AS detector_status
-           FROM detector_passes p JOIN detectors d ON d.id = p.detector_id WHERE p.trip_id = $1 ORDER BY p.passed_at`,
+                p.edge_alarms, d.name, d.milepost, COALESCE(h.status, 'ok') AS detector_status
+           FROM detector_passes p JOIN detectors d ON d.id = p.detector_id LEFT JOIN detector_health h ON h.detector_id = d.id
+          WHERE p.trip_id = $1 ORDER BY p.passed_at`,
         [trip.trip_id],
       ),
     ])

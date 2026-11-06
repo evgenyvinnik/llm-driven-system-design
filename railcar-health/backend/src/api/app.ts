@@ -16,9 +16,11 @@ import { adminRouter } from './routes/admin.js'
 import { alertsRouter } from './routes/alerts.js'
 import { authRouter } from './routes/auth.js'
 import { carsRouter } from './routes/cars.js'
+import { eventLogRouter } from './routes/event-log.js'
 import { eventsRouter } from './routes/events.js'
 import { ingestRouter } from './routes/ingest.js'
 import { networkRouter } from './routes/network.js'
+import { opsRouter } from './routes/ops.js'
 import { tripsRouter } from './routes/trips.js'
 import { workOrdersRouter, yardsRouter } from './routes/yards.js'
 
@@ -63,6 +65,8 @@ export function createApp() {
   app.use('/api/v1/network', networkRouter)
   app.use('/api/v1/admin', adminRouter)
   app.use('/api/v1/events', eventsRouter)
+  app.use('/api/v1/event-log', eventLogRouter)
+  app.use('/api/v1/ops', opsRouter)
 
   app.use((_req, _res, next) => next(new HttpError(404, 'NOT_FOUND', 'Route not found')))
   app.use(errorHandler)

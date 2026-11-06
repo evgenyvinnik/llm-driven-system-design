@@ -58,4 +58,18 @@ test.describe('railcar-health Smoke Tests', () => {
     await expect(page.locator("table[aria-label='Precision by tier']")).toBeVisible({ timeout: 10000 });
     await noErrorBoundary(page);
   });
+
+  test('07 car event timeline loads correctly', async ({ page }) => {
+    await login(page, 'carol');
+    await page.goto('/timeline?car=NRLX%20304512');
+    await expect(page.locator("ol[aria-label='Event timeline']")).toBeVisible({ timeout: 10000 });
+    await noErrorBoundary(page);
+  });
+
+  test('08 ops / streams page loads correctly', async ({ page }) => {
+    await login(page, 'carol');
+    await page.goto('/ops');
+    await expect(page.locator("table[aria-label='Consumer groups']")).toBeVisible({ timeout: 10000 });
+    await noErrorBoundary(page);
+  });
 });

@@ -4,7 +4,6 @@
  */
 import { Router } from 'express'
 import { requireIngestToken } from '../../shared/auth.js'
-import { redis } from '../../shared/cache.js'
 import { now } from '../../shared/clock.js'
 import { asyncHandler } from '../../shared/errors.js'
 import { publishEvents } from '../../shared/events.js'
@@ -18,7 +17,7 @@ ingestRouter.post(
   '/passes',
   asyncHandler(async (req, res) => {
     const batch = batchSchema.parse(req.body)
-    const result = await ingestBatch(batch, now(), redis)
+    const result = await ingestBatch(batch, now())
     // 200 for a batch that was entirely duplicates, 201 when something new was stored: both tell the gateway to drop its copy.
     res.status(result.accepted > 0 ? 201 : 200).json(result)
   }),
@@ -36,7 +35,7 @@ ingestRouter.post(
   '/consists',
   asyncHandler(async (req, res) => {
     const input = consistSchema.parse(req.body)
-    const result = await upsertConsist(input, redis)
+    const result = await upsertConsist(input)
     await publishEvents([{ type: 'trip.updated', tripId: input.tripId }])
     res.status(result.status === 'created' ? 201 : 200).json(result)
   }),

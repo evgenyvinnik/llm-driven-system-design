@@ -61,7 +61,7 @@ adminRouter.put(
 
 async function labeledAlerts(): Promise<LabeledAlert[]> {
   const { rows } = await pool.query<{ kind: string; tier: number; features: LabeledAlert['features']; finding: string }>(
-    `SELECT a.kind, a.tier, a.features, f.finding FROM findings f JOIN alerts a ON a.id = f.alert_id WHERE f.source = 'alert'`,
+    `SELECT a.kind, a.tier, a.features, f.finding FROM findings f JOIN alerts a ON a.id = f.alert_id WHERE f.source = 'alert' AND f.superseded_by IS NULL`,
   )
   return rows.map((r) => ({ kind: r.kind, tier: r.tier, features: r.features, defect: r.finding !== 'no_defect_found' }))
 }
@@ -75,22 +75,25 @@ adminRouter.post(
   }),
 )
 
+/**
+ * Reliability metrics from the reliability projection (one fact row per case and per stand-alone
+ * finding) plus the raw fact log for ingest volume.
+ */
 adminRouter.get(
   '/metrics',
   asyncHandler(async (_req, res) => {
     const [byTier, recall, volume, ingest, carPasses, open, outcomes, byKind, audits, lifecycle] = await Promise.all([
       pool.query<{ tier: number; inspected: number; defects: number; ndf: number }>(
-        `SELECT a.tier, count(*)::int AS inspected, count(*) FILTER (WHERE f.finding <> 'no_defect_found')::int AS defects,
-                count(*) FILTER (WHERE f.finding = 'no_defect_found')::int AS ndf
-           FROM findings f JOIN alerts a ON a.id = f.alert_id WHERE f.source = 'alert' GROUP BY a.tier`,
+        `SELECT max_tier AS tier, count(*)::int AS inspected, count(*) FILTER (WHERE finding <> 'no_defect_found')::int AS defects,
+                count(*) FILTER (WHERE finding = 'no_defect_found')::int AS ndf
+           FROM reliability_facts WHERE source = 'alert' AND finding IS NOT NULL GROUP BY max_tier`,
       ),
-      // Recall proxy: of every confirmed defect (alert-driven or found on routine inspection), how many had an actionable alert first.
+      // Recall proxy: of every confirmed defect (alert-driven, audit, routine or teardown), how many had an actionable alert first.
       pool.query<{ defects: number; alerted: number }>(
-        `SELECT count(*)::int AS defects,
-                count(*) FILTER (WHERE f.source = 'alert' AND a.tier >= 2)::int AS alerted
-           FROM findings f LEFT JOIN alerts a ON a.id = f.alert_id WHERE f.finding <> 'no_defect_found'`,
+        `SELECT count(*)::int AS defects, count(*) FILTER (WHERE source = 'alert' AND max_tier >= 2)::int AS alerted
+           FROM reliability_facts WHERE finding IS NOT NULL AND finding <> 'no_defect_found'`,
       ),
-      pool.query<{ tier: number; n: number }>(`SELECT tier, count(*)::int AS n FROM alerts GROUP BY tier`),
+      pool.query<{ tier: number; n: number }>(`SELECT max_tier AS tier, count(*)::int AS n FROM reliability_facts WHERE source = 'alert' GROUP BY max_tier`),
       pool.query<{ passes: number; late: number; unresolved: number; awaiting: number; median_lag: number | null }>(
         `SELECT count(*)::int AS passes, count(*) FILTER (WHERE lag_seconds > $1)::int AS late,
                 count(*) FILTER (WHERE identity_status = 'unresolved')::int AS unresolved,
@@ -105,23 +108,23 @@ adminRouter.get(
                 (SELECT count(*)::int FROM car_holds WHERE status = 'active') AS holds,
                 (SELECT count(*)::int FROM alerts WHERE status <> 'closed') AS alerts`,
       ),
-      pool.query<{ finding: string; n: number }>(`SELECT finding, count(*)::int AS n FROM findings GROUP BY finding`),
+      pool.query<{ finding: string; n: number }>(`SELECT finding, count(*)::int AS n FROM reliability_facts WHERE finding IS NOT NULL GROUP BY finding`),
       // Bearings and brakes are different failure modes; their precision is tracked apart.
       pool.query<{ kind: string; inspected: number; defects: number }>(
-        `SELECT a.kind, count(*)::int AS inspected, count(*) FILTER (WHERE f.finding <> 'no_defect_found')::int AS defects
-           FROM findings f JOIN alerts a ON a.id = f.alert_id WHERE f.source = 'alert' GROUP BY a.kind`,
+        `SELECT alert_kind AS kind, count(*)::int AS inspected, count(*) FILTER (WHERE finding <> 'no_defect_found')::int AS defects
+           FROM reliability_facts WHERE source = 'alert' AND finding IS NOT NULL GROUP BY alert_kind`,
       ),
       // Label bias: only flagged cars get inspected. Random audits of unflagged cars estimate what is missed.
       pool.query<{ audits: number; audit_defects: number; open_audits: number }>(
-        `SELECT count(*) FILTER (WHERE source = 'audit')::int AS audits,
+        `SELECT count(*) FILTER (WHERE source = 'audit' AND finding IS NOT NULL)::int AS audits,
                 count(*) FILTER (WHERE source = 'audit' AND finding <> 'no_defect_found')::int AS audit_defects,
-                (SELECT count(*)::int FROM work_orders WHERE kind = 'audit' AND status IN ('open', 'in_progress')) AS open_audits
-           FROM findings`,
+                count(*) FILTER (WHERE source = 'audit' AND finding IS NULL AND status <> 'closed')::int AS open_audits
+           FROM reliability_facts`,
       ),
       pool.query<{ status: string; n: number; escalated: number; median_ack_min: number | null }>(
-        `SELECT a.status, count(*)::int AS n, count(*) FILTER (WHERE a.escalation_level > 0)::int AS escalated,
-                percentile_cont(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (a.acknowledged_at - a.opened_at)) / 60) AS median_ack_min
-           FROM alerts a WHERE a.trip_id NOT LIKE 'HIST-%' GROUP BY a.status`,
+        `SELECT status, count(*)::int AS n, count(*) FILTER (WHERE escalations > 0)::int AS escalated,
+                percentile_cont(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (first_ack_at - opened_at)) / 60) AS median_ack_min
+           FROM reliability_facts WHERE source = 'alert' AND trip_id NOT LIKE 'HIST-%' GROUP BY status`,
       ),
     ])
     const r = recall.rows[0]

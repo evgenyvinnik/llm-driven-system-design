@@ -65,6 +65,8 @@ export function AlertDrawer({ alertId, onClose }: { alertId: string; onClose: ()
             <Link to="/trains/$tripId" params={{ tripId: alert.tripId }} className="font-mono text-accent-700 hover:underline">{alert.symbol} {alert.direction}</Link>
             {' · '}
             <Link to="/cars/$carId" params={{ carId: alert.carId }} search={{ position: alert.kind === 'hot_bearing' ? alert.position : undefined }} className="text-accent-700 hover:underline">car history</Link>
+            {' · '}
+            <Link to="/timeline" search={{ case: alert.id }} className="text-accent-700 hover:underline">case events</Link>
             {' · owner '}{alert.ownerMark}
           </p>
         </div>
@@ -93,7 +95,7 @@ export function AlertDrawer({ alertId, onClose }: { alertId: string; onClose: ()
           </p>
         )}
         <section>
-          <div className="panel-title mb-1.5">Timeline</div>
+          <div className="mb-1.5 flex items-baseline justify-between"><span className="panel-title">Timeline</span><span className="text-[11px] text-slate-400">from the case's event stream · v{alert.version}</span></div>
           <ol className="space-y-1.5 border-l border-slate-200 pl-3 text-sm">
             {events.map((e, i) => (
               <li key={i}>
