@@ -56,7 +56,7 @@ Sources surveyed: Glassdoor, Aced (formerly Exponent) and Hello Interview. Proje
 | 19 | [Railcar Health Monitoring](#19-railcar-health-monitoring) ✅ Built | [`railcar-health/`](./railcar-health/) | Rail | BNSF (candidate report: phone screen) | ad-click-aggregator, notification-system |
 | 20 | [Locomotive Fueling](#20-locomotive-fueling) ✅ Built | [`locomotive-fueling/`](./locomotive-fueling/) | Rail | BNSF (candidate report; telemetry variants guide-listed) | uber, job-scheduler |
 | 21 | [Storage Remediation](#21-storage-remediation) ✅ Built | [`storage-remediation/`](./storage-remediation/) | Rail | BNSF (guide-reported existing system review round); practice extension for the design | job-scheduler, rate-limiter |
-| 22 | [Freight Quote Service](#22-freight-quote-service) | `freight-quote/` | Rail | BNSF (candidate report) | scalable-api, rate-limiter, distributed-cache |
+| 22 | [Freight Quote Service](#22-freight-quote-service) ✅ Built | [`freight-quote/`](./freight-quote/) | Rail | BNSF (candidate report) | scalable-api, rate-limiter, distributed-cache |
 | 23 | [Railcar Trip Plans and ETAs](#23-railcar-trip-plans-and-etas) | `railcar-trip-plans/` | Rail | Practice extension | local-delivery, notification-system |
 | 24 | [Yard Switch Lists](#24-yard-switch-lists) | `yard-switch-lists/` | Rail | Practice extension (BNSF describes the system publicly) | job-scheduler, railcar-health |
 
@@ -799,7 +799,7 @@ Most railcars on a Class I network belong to lessors and shippers, not to the ra
 
 ### 22. Freight Quote Service
 
-**Folder:** `freight-quote/` · **Signal:** BNSF (candidate report: a high-traffic quote endpoint whose dependent services are slow, and what architecture would improve service quality. A curated PracHub account of a September 2026 screen describes implementing the freight rate inquiry endpoint's service-layer logic first, then discussing heavy traffic and downstream latency, so expect some coding) · **Builds on:** scalable-api, rate-limiter, distributed-cache
+**Folder:** [`freight-quote/`](./freight-quote/) · ✅ Built · **Signal:** BNSF (candidate report: a high-traffic quote endpoint whose dependent services are slow, and what architecture would improve service quality. A curated PracHub account of a September 2026 screen describes implementing the freight rate inquiry endpoint's service-layer logic first, then discussing heavy traffic and downstream latency, so expect some coding) · **Builds on:** scalable-api, rate-limiter, distributed-cache
 
 **Problem.** Shippers request price quotes for moving freight: origin, destination, commodity, car type and volume. A quote depends on several slow internal services: tariff and contract pricing, network capacity, fuel surcharge and car availability. Traffic is heavy, from customer portals and from API integrations that re-quote often. Design the endpoint so it stays fast and correct while dependencies are slow.
 

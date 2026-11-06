@@ -1,0 +1,25 @@
+{
+  "name": "freight-quote",
+  "frontendPort": 5173,
+  "backendRequired": true,
+  "dbName": "freight_quote",
+  "dbUser": "freight",
+  "auth": {
+    "enabled": true,
+    "loginUrl": "/login",
+    "credentials": { "username": "ada", "password": "password123" },
+    "usernameSelector": "input[name='username']",
+    "passwordSelector": "input[name='password']",
+    "submitSelector": "button[type='submit']",
+    "successIndicator": "main"
+  },
+  "screens": [
+    { "name": "01-login", "path": "/login", "waitFor": "form", "skipAuth": true, "delay": 500 },
+    { "name": "02-quotes", "path": "/", "waitFor": "table[aria-label='Quotes']", "delay": 800 },
+    { "name": "03-ops", "path": "/ops", "waitFor": "section[aria-label='Network capacity']", "delay": 1500 },
+    { "name": "04-event-log", "path": "/events", "waitFor": "table[aria-label='Events']", "delay": 800 },
+    { "name": "05-streams-dlq", "path": "/streams", "waitFor": "table[aria-label='Consumer lag']", "delay": 1000 },
+    { "name": "06-analytics", "path": "/analytics", "waitFor": "table[aria-label='Latency by dependency']", "delay": 1000 }
+  ],
+  "viewport": { "width": 1440, "height": 900 }
+}

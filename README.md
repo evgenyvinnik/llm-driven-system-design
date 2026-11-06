@@ -99,6 +99,7 @@ Each folder contains an independent implementation of a system design problem.
 | [Apple Maps](./apple-maps/) | Navigation with real-time traffic | ✅ Implemented |
 | [AirTag](./airtag/) | Item tracking and Find My network | ✅ Implemented |
 | [Railcar Health](./railcar-health/) | Wayside detector predictive maintenance: bearing trending, identity resolution, late data, alerts, car holds and yard inspections | ✅ Implemented |
+| [Freight Quote](./freight-quote/) | Quote API over slow dependencies: deadlines, hedging, coalescing, firm vs indicative, event-driven cache invalidation, async completion; includes a coding exercise | ✅ Implemented |
 | [Locomotive Fueling](./locomotive-fueling/) | Fuel-stop recommendations from locomotive telemetry: noisy sensors, DP optimizer, stable plans, idempotent truck orders | ✅ Implemented |
 
 ### Ticketing, Events & Reservations
@@ -216,7 +217,6 @@ The next round, focused on AI products and developer platforms, plus a [rail ope
 | [LLM Eval Dashboard](./ROADMAP.md#10-llm-eval-dashboard) | Versioned datasets, async eval runs, and provenance-aware comparisons | 📋 Planned |
 | [CI/CD Platform](./ROADMAP.md#11-cicd-platform) | GitHub Actions-like workflows with job DAGs, runners, and live logs | 📋 Planned |
 | [AI Code Review](./ROADMAP.md#12-ai-code-review) | Design critique and rebuild of an agentic PR auto-approval system | 📋 Planned |
-| [Freight Quote Service](./ROADMAP.md#22-freight-quote-service) | High-traffic quote endpoint over slow pricing and capacity services: budgets, firm vs indicative, shedding | 📋 Planned |
 | [Railcar Trip Plans](./ROADMAP.md#23-railcar-trip-plans-and-etas) | Car tracking against trip plans, missed connections, and dwell-based ETAs for shippers | 📋 Planned |
 | [Yard Switch Lists](./ROADMAP.md#24-yard-switch-lists) | Classification yard planning with replanning, yardmaster overrides and execution feedback | 📋 Planned |
 | [File Cache](./ROADMAP.md#13-file-cache) | Byte-bounded cache for large files with single-flight fills | 📋 Planned |
