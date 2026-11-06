@@ -4,13 +4,13 @@
 
 | Metric | Value |
 |--------|-------|
-| Total SLOC | 11,308 |
-| Source Files | 169 |
-| .ts | 7,233 |
-| .tsx | 2,104 |
-| .md | 1,197 |
-| .sql | 356 |
-| .json | 197 |
+| Total SLOC | 16,708 |
+| Source Files | 222 |
+| .ts | 11,087 |
+| .tsx | 2,613 |
+| .md | 2,056 |
+| .sql | 530 |
+| .json | 201 |
 
 ## Overview
 
@@ -22,32 +22,41 @@ Hot-bearing and hot/cold-wheel monitoring and predictive maintenance for a railc
 - **Alerts with owners.** Opened → delivered → acknowledged → inspected → closed, with tier deadlines, escalation (desk → chief dispatcher → operations center), warnings when an unacknowledged car's train is approaching its yard, and handoffs across desks and yards.
 - **The yard response.** Car holds that block outbound builds, work orders, an offline-tolerant tablet finding form, repairs recorded as wheelset installs, random audit inspections against label bias, and precision/recall from findings with a threshold backtest.
 - **Bearings and brakes kept apart.** Hot bearings (journal bearing failure) vs hot wheels (stuck brake) and cold wheels (inoperative brake).
+- **Event-driven throughout.** Alert cases and car component histories are event-sourced streams in a PostgreSQL event store, with expected-version appends and domain rules for conflicts (two offline tablets: the more severe finding wins). Raw readings are a fact log announced through a transactional outbox. A relay publishes every event to one Valkey stream per family (standing in for Kafka topics), consumed by idempotent consumer groups: the analyzer, a notifier, a yard work-order integration, a process manager with durable timers, and four replayable projections. Dead letters can be redriven from the Ops page; `npm run replay` rebuilds any projection from position 0 and compares it with the live table.
 
-See [architecture.md](./architecture.md) for the design and trade-offs, and [CLAUDE.md](./CLAUDE.md) for how it was built, the interview signal and sources, and what broke along the way.
+See [architecture.md](./architecture.md) for the design and trade-offs, [events.md](./events.md) for the event catalog, and [CLAUDE.md](./CLAUDE.md) for how it was built, the interview signal and sources, and what broke along the way.
 
 ## Architecture
 
 ```
-simulator ──HTTP──▶ API (:3000) ──▶ PostgreSQL (passes, readings, consists, alerts, holds, findings, installs)
- 5 trains,           │   └─ XADD ──▶ Valkey streams  rh:passes:live  /  rh:passes:backfill
- faults, 60× clock   │                                │
-                     │                                ▼
- browser (:5173) ◀───┤◀── pub/sub ◀───── analyzer: identity · trends · scoring · alerts
-   SSE + REST        │                    detector health · ack-deadline sweeper · notifier
+simulator ──HTTP──▶ API (:3000) ── one transaction: fact rows + outbox events ──▶ PostgreSQL `events`
+ 5 trains, faults,   │  commands append to case/car streams (expected versions)        │ NOTIFY
+ 60× clock           │                                                                 ▼
+                     │                              workers (:3011): relay ──XADD──▶ Valkey streams rh:ev:<family>
+                     │                                                                 │ consumer groups
+                     │        ┌─────────────────────────┬──────────────────────────────┼──────────────────────┐
+                     │        ▼                         ▼                              ▼                      ▼
+                     │   analyzer (:3010)         notifier · workorder-sync      ack-process +          projections:
+                     │   identity, trends,        (yard maintenance tickets,     durable timers         alert-queue, car-history,
+                     │   scoring, case events     repairs, audit cases)          (deadlines, handoffs)  detector-health, reliability
+ browser (:5173) ◀───┤◀── SSE notices (after a projection commits) ◀──────────────────────────────────────────┘
+   SSE + REST        │    reads projections; timelines read the event store; /ops shows lag and dead letters
 ```
 
 | Process | Path | Role |
 |---------|------|------|
-| API | `backend/src/api/` | Idempotent ingest, read APIs, yard workflow, admin, SSE, republish sweep |
-| Analyzer | `backend/src/analyzer/` | Two-lane consumer group, identity resolution, trend features, risk scoring, alert lifecycle, detector health |
+| API | `backend/src/api/` | Ingest (fact log + outbox), commands on case and car aggregates, read APIs, timelines, ops, SSE |
+| Analyzer | `backend/src/analyzer/` | Consumer group: live lane first, identity, trends, scoring, case decisions; detector-health job |
+| Workers | `backend/src/workers/` | Relay, notifier, work-order integration, ack process manager with durable timers, projections |
+| Replay | `backend/src/replay/` | Rebuild a projection from position 0 and compare; re-derive the wheelset-swap decision |
 | Simulator | `backend/src/simulator/` | The scenario in compressed time; the component-swap demo |
-| Frontend | `frontend/src/` | Alert queue, train heatmap, car trends, yard tablet, detector health, reliability |
+| Frontend | `frontend/src/` | Alert queue, train heatmap, car trends, yard tablet, detector health, reliability, event timelines, Ops / Streams |
 
 ## Tech Stack
 
 - **Frontend:** React 19, TypeScript, Vite, TanStack Router, Zustand, Tailwind CSS, hand-written SVG charts
 - **Backend:** Node.js, Express, TypeScript (tsx), zod, pg, ioredis, Pino, prom-client, bcryptjs
-- **Data:** PostgreSQL 16, Valkey 7 (Streams with consumer groups, pub/sub, sessions)
+- **Data:** PostgreSQL 16 (event store and outbox, fact log, projections), Valkey 7 (Streams with consumer groups and a dead-letter stream, pub/sub, sessions)
 
 ## Getting Started
 
@@ -66,7 +75,7 @@ cd backend
 npm install
 npm run db:migrate
 npm run db:seed                 # rerunnable: wipes and reseeds reference data, users and history
-npm run dev                     # API on :3000 + analyzer
+npm run dev                     # API on :3000 + analyzer + workers (relay, consumers, projections)
 
 # new terminal
 cd frontend
@@ -117,14 +126,18 @@ Password for all: `password123`.
 | `REDIS_URL` | `redis://localhost:6379` | All backend processes |
 | `PORT` | `3000` | API |
 | `ANALYZER_PORT` | `3010` | Analyzer health and metrics |
+| `WORKERS_PORT` | `3011` | Workers health and metrics |
+| `WORKER_ROLES` | `relay,projections,notifier,workorders,process` | Which workers a process runs |
 | `API_URL` | `http://localhost:3000` | Simulator, Vite proxy target |
 | `VITE_PORT` | `5173` | Frontend dev server |
 | `INGEST_TOKEN` | `local-dev-ingest-token` | Gateways (`X-Ingest-Token`) |
-| `ANALYZER_CONSUMER` | `analyzer-<pid>` | Consumer name in the group |
+| `CONSUMER_NAME` | `c-<pid>` | Consumer name within each group (a restart with the same name drains its own pending messages first) |
 | `LATE_AFTER_MINUTES` | `15` | Live vs backfill lane, "late" badge |
 | `OFFLINE_AFTER_MINUTES` | `25` | Detector offline (simulated minutes) |
 | `APPROACH_WINDOW_MINUTES` | `30` | Warn the next yard about unacknowledged alerts |
-| `STREAM_CLAIM_IDLE_MS` | `30000` | Reclaim pending messages from a dead consumer |
+| `STREAM_CLAIM_IDLE_MS` | `10000` | Retry or reclaim a pending message after this idle time |
+| `STREAM_MAX_DELIVERIES` | `5` | Deliveries before a failing message is dead-lettered |
+| `TIMER_POLL_MS` | `1000` | Process-manager timer poll interval |
 
 ### Running more instances
 
@@ -132,6 +145,8 @@ Password for all: `password123`.
 npm run dev:server1        # second API on :3001
 npm run dev:worker1        # analyzer consumer "analyzer-1"
 npm run dev:worker2        # analyzer consumer "analyzer-2": the group splits the lanes, the per-trip lock keeps one writer per trip
+npm run dev:relay          # a relay alone (a second one waits as a hot standby)
+npm run dev:projections    # projectors alone, e.g. to kill and restart them while events flow
 ```
 
 ## The Scenario
@@ -157,6 +172,36 @@ cd backend && npm run demo:component-swap
 # 4. MEDIUM HPRX 555002 L2 ...   HPRX 555001: no alert. The reading predates its new wheelset.
 ```
 
+## Events: replay, redrive, failure drills
+
+Every state change is an event; [events.md](./events.md) lists them all. Useful commands and drills (run from `backend/`, stack up):
+
+```bash
+# Rebuild projections from position 0 and compare them row by row with the live tables
+npm run replay -- alert-queue        # or car-history | detector-health | reliability | all
+npm run replay -- all --keep         # leave the rebuilt tables in the `replay` schema to inspect
+
+# Re-derive the "late reading after a wheelset swap" decision from events alone, in two orders
+npm run demo:component-swap && npm run replay -- swap-case
+```
+
+**Dead letters and redrive** (as carol, or from the Ops / Streams page):
+
+```bash
+curl -s -c /tmp/carol -H 'Content-Type: application/json' -d '{"username":"carol","password":"password123"}' localhost:3000/api/v1/auth/login
+# Make the yard integration fail for Ridgeway ("its maintenance system is down")
+curl -s -b /tmp/carol -X PUT -H 'Content-Type: application/json' \
+  -d '{"match":"\"yardId\":\"RDG\"","mode":"transient"}' localhost:3000/api/v1/ops/faults/workorder-sync
+# ... run the scenario: Ridgeway work orders retry 5 times, then land in the dead-letter stream
+curl -s -b /tmp/carol localhost:3000/api/v1/ops/dlq                          # error, attempts, raw event
+curl -s -b /tmp/carol -X DELETE localhost:3000/api/v1/ops/faults/workorder-sync
+curl -s -b /tmp/carol -X POST localhost:3000/api/v1/ops/dlq/<id>/redrive     # or POST /ops/dlq/redrive-all
+```
+
+**Kill a consumer between commit and ack** (the window at-least-once delivery exists for): set a `crash_after_commit` fault on `analyzer` matching one pass id, post passes, watch the analyzer die after committing, clear the fault, restart it. It drains its own pending messages first, finds the event in `processed_events`, and acks it as a duplicate: `rh_consumer_events_total{group="analyzer",outcome="duplicate"}` goes to 1 and no event is appended twice.
+
+**Concurrent updates.** Acknowledge an alert with an old `version`: if only notifications or deliveries were appended since, the response says `rebasedOver: N`; if it escalated, you get 409 `STALE_ALERT` with `details.changed`. Record two different findings for one work order with two `clientSubmissionId`s: a defect after "no defect" supersedes it; "no defect" after a defect is 409 `FINDING_CONFLICT`.
+
 ## Demo Walkthrough
 
 1. **alice** → **Alerts**: tier tabs, owner and ack-deadline badges, the late-data badge on SVTX 961204. Open NRLX 304512: the lifecycle stepper (delivered, not acknowledged), escalations, the handoff to the East desk, who was notified.
@@ -165,6 +210,8 @@ cd backend && npm run demo:component-swap
 4. **bob** → **Yard**: Cedar Junction's queue. Start the inspection on SVTX 961204 (that acknowledges it), record "journal bearing defect, bad order". The alert becomes *inspected* and the car stays held: try it in **Outbound build check**. Record a repair (finding "wheelset replaced") on another car to see it close.
 5. **alice** → **Detectors**: the strip map, HBD-140 biased with its samples, HBD-170 silent with the trains it missed, coverage per detector.
 6. **carol** → **Reliability**: precision by tier and by failure mode, the recall proxy, the audit defect rate, then change "MEDIUM level" to 45 and **Backtest against findings**.
+7. **carol** → an alert → **case events**: the case's event stream with event time vs recorded time, the causation chain (PassRecorded → AxleReadingsRecorded → AlertRaised → hold, work order, notifications) and each payload. From a car page, **Event timeline** shows everything about the car; HPRX 555001 after the swap demo shows the old reading set aside.
+8. **carol** → **Ops / Streams**: consumer lag and pending per group and topic, projection staleness, events per second, the dead-letter list with Redrive, and the fault injector.
 
 ## API
 
@@ -200,7 +247,7 @@ Full endpoint list: [architecture.md](./architecture.md#api-design).
 ```bash
 # Backend
 cd backend
-npm run type-check && npm run lint && npm test     # 79 vitest tests (pure logic + supertest API tests)
+npm run type-check && npm run lint && npm test     # 113 vitest tests: domain logic, aggregates, upcasting, consumer idempotency and DLQ routing, API
 
 # Frontend
 cd frontend
@@ -218,11 +265,13 @@ npm run test:smoke railcar-health
 | ![Login](screenshots/01-login.png) | ![Alert queue](screenshots/02-alerts.png) |
 | ![Train heatmap](screenshots/03-train-heatmap.png) | ![Car trend](screenshots/04-car-trend.png) |
 | ![Yard inspection](screenshots/05-yard-inspection.png) | ![Detector health](screenshots/06-detectors.png) |
-| ![Reliability](screenshots/07-reliability.png) | |
+| ![Reliability](screenshots/07-reliability.png) | ![Car event timeline](screenshots/08-car-event-timeline.png) |
+| ![Case timeline](screenshots/09-case-timeline.png) | ![Ops / Streams](screenshots/10-ops-streams.png) |
 
 ## Architecture Documentation
 
-- [architecture.md](./architecture.md): production design, trade-offs, implementation notes
+- [architecture.md](./architecture.md): production design, the event-driven design, trade-offs, implementation notes
+- [events.md](./events.md): the event catalog (producers, consumers, keys, fields, versions, ordering, retention)
 - [system-design-answer-backend.md](./system-design-answer-backend.md): backend interview answer
 - [system-design-answer-frontend.md](./system-design-answer-frontend.md): frontend interview answer
 - [system-design-answer-fullstack.md](./system-design-answer-fullstack.md): full-stack interview answer

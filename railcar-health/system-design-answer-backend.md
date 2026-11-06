@@ -2,15 +2,15 @@
 
 *Backend engineer interview · 45 minutes · Requirements → Architecture → Data model → Identity → Trending and risk → Deep dives → Traces → Follow-ups → Scale*
 
-> "The prompt is hot-bearing and hot-wheel monitoring for about 200,000 railcars from wayside detector data, with risk alerts and the yard response. Before drawing anything, I want to say what this system is *not*: it is not the thing that stops a train for a hot bearing. The detector already does that. It compares each bearing to an absolute threshold and announces an alarm to the crew over the radio, and that path has to keep working if my whole cloud is down. What I'm building sits behind it and does what a single detector can't: trend each bearing across successive detectors, keep a stable identity for it through stale consists, turned cars and wheelset changes, route a risk to the person who can act with a deadline, and run the yard workflow whose inspection findings tell me how good my alerts are. Three ideas carry the answer. State is rebuilt from events in event time, so late and duplicated data change nothing. A bearing's identity is car-relative and versioned. An alert has an owner, not just a recipient."
+> "The prompt is hot-bearing and hot-wheel monitoring for about 200,000 railcars from wayside detector data, with risk alerts and the yard response. Before drawing anything, I want to say what this system is *not*: it is not the thing that stops a train for a hot bearing. The detector already does that. It compares each bearing to an absolute threshold and announces an alarm to the crew over the radio, and that path has to keep working if my whole cloud is down. What I'm building sits behind it and does what a single detector can't: trend each bearing across successive detectors, keep a stable identity for it through stale consists, turned cars and wheelset changes, route a risk to the person who can act with a deadline, and run the yard workflow whose inspection findings tell me how good my alerts are. Three ideas carry the answer. State is rebuilt from events in event time, so late and duplicated data change nothing. A bearing's identity is car-relative and versioned. An alert has an owner, not just a recipient. And I'll build it as an event-driven system on purpose: each alert case is an event-sourced aggregate, raw readings are facts announced through a transactional outbox, and every downstream piece is an idempotent consumer group."
 
 | Phase | Time | What the interviewer should leave with |
 |-------|------|----------------------------------------|
 | Requirements | ~5 min | Two-tier alerting; data volume is small, correctness is hard |
-| Architecture | ~6 min | Store-and-forward ingest, two lanes, per-trip processing, PostgreSQL for decisions |
-| Data model and API | ~5 min | Idempotency keys everywhere; consists and components as versioned events |
-| Identity, trending, risk | ~8 min | Car-relative positions; relative features; explainable tiers |
-| Deep dives | ~13 min | Trending vs thresholds; late data and partitioning; ownership and the yard loop |
+| Architecture | ~6 min | Ingest + outbox, event store, relay, topics keyed by trip and by car, consumer groups |
+| Data model and API | ~4 min | Event store vs fact log vs projections; idempotency keys everywhere |
+| Identity, trending, risk | ~6 min | Car-relative positions; relative features; explainable tiers |
+| Deep dives | ~15 min | Trending vs thresholds; late data and partitioning; event sourcing the case vs outbox for readings |
 | Traces, follow-ups, scale | ~8 min | One success, one crash, four follow-ups, what breaks first |
 
 ---
@@ -76,64 +76,60 @@ Public figures (cited, not verified): BNSF says its condition-based maintenance 
              │ store-and-forward: at-least-once, late, out of order
              ▼
 ┌──────────────────────────┐    ┌──────────────────────────┐
-│ Ingest API (stateless)   │──▶ │ Raw store (columnar)     │ passes + axle readings,
+│ Ingest API (stateless)   │──▶ │ Raw store: fact log      │ passes + axle readings,
 │ mTLS · validate · dedupe │    │ key (detector, pass id)  │ immutable
-└──────┬────────────┬──────┘    └──────────────────────────┘
-       │ fresh      │ late (> 15 min)
-       ▼            ▼
-┌────────────┐ ┌────────────┐
-│ Kafka live │ │ Kafka      │   both keyed by trip id
-│            │ │ backfill   │
-└─────┬──────┘ └─────┬──────┘
-      └──────┬───────┘ live drained first
+└────────────┬─────────────┘    └──────────────────────────┘
+             │ same transaction: pass row + PassRecorded + AxleReadingsRecorded (outbox)
              ▼
 ┌───────────────────────────────────────┐   ┌──────────────────────────┐
-│ Stream processor, keyed state per trip│◀─▶│ Consist versions · AEI · │
-│ identity · observation lists · trends │   │ component installs ·     │
-│ rules (+ optional model score)        │   │ detector health          │
+│ EVENT STORE (PostgreSQL `events`)     │──▶│ Projections: alert queue,│──▶ consoles,
+│ case-* · car-* streams = truth        │   │ holds, work orders, car  │    tablets,
+│ pass-* · trip-* rows = outbox         │   │ history, reliability     │    timelines
 └─────────────┬─────────────────────────┘   └──────────────────────────┘
-              │ decisions, one transaction each
+              │ relay / CDC, by global position
               ▼
-┌───────────────────────────────────────┐   ┌──────────────────────────┐
-│ PostgreSQL: alerts · owners · holds · │──▶│ Notifier + deadline      │──▶ desks,
-│ work orders · findings · audit · outbox│   │ sweeper (escalation)     │    yards, owners
-└─────────────┬─────────────────────────┘   └──────────────────────────┘
-              ▼
-   Dispatcher console · yard tablets · reliability dashboard
+┌───────────────────────────────────────┐
+│ Kafka: wayside.readings.live/backfill │   readings keyed by TRIP
+│ (trip) · cases (case) · cars (car) ·  │   component history keyed by CAR
+│ trips.position (compacted) · DLQ      │
+└──┬──────────────┬─────────────┬───────┘
+   ▼              ▼             ▼
+ analyzer      notifier ·     ack process manager
+ (per-trip     yard work-     (durable timers: deadline
+ state; appends order sync    → escalate → hand off)
+ case events)  (choreography) (orchestration)
 ```
 
 **Walking the diagram:**
 
-1. The gateway posts a batch. Ingest writes each pass keyed by the detector's `(detector_id, pass_id)`, commits, then publishes: to the **live** lane if the pass is under 15 minutes old, otherwise to **backfill**. A 2xx means committed.
-2. The processor consumes both lanes, live first. All passes of a trip land on one partition, so one writer owns that trip's state.
-3. For each pass it resolves identity, recomputes the features of every bearing on the train from that trip's observations, scores them, and commits its decisions (alert, hold, work order, outbox rows) in one transaction before acknowledging the message.
-4. The notifier delivers the outbox. A sweeper watches acknowledgment deadlines and escalates.
-5. UIs read PostgreSQL through role-checked APIs and get id-only live notices over SSE.
+1. The gateway posts a batch. Ingest writes each pass keyed by the detector's `(detector_id, pass_id)` and, in the same transaction, appends `PassRecorded` and `AxleReadingsRecorded` (a claim check that names the readings). A 2xx means committed, events included.
+2. The relay tails the store and publishes each event to its family's topic. Readings go to the **live** lane if the pass is under 15 minutes old, otherwise to **backfill**, keyed by trip.
+3. The analyzer group consumes both lanes, live first. One writer per trip. For each pass it resolves identity, recomputes every bearing's features, scores them and appends case events (`AlertRaised`, `CarHoldPlaced`, `WorkOrderOpened`, `NotificationRequested`) with its processed-event mark in one transaction, then acks.
+4. Other groups react: the notifier delivers, the yard integration opens maintenance tickets, a process manager runs the acknowledgment deadlines, and projectors build the read models.
+5. UIs read projections through role-checked APIs and get id-only live notices over SSE after a projection commits.
 
 **Three placement decisions worth saying out loud:**
 
 - **The safety path never crosses the network.** If the cloud is down, crews are still stopped for alarms exactly as today. The cloud's CRITICAL tier mirrors an edge alarm to create the incident record and hold the car. It doesn't decide the stop.
-- **PostgreSQL holds decisions, the columnar store holds evidence.** Alerts, ownership, holds and findings need transactions and unique constraints. Raw readings need cheap append and scan.
-- **The processor is the only writer of alert state.** UIs write acknowledgments, findings and installs through the API. The sweeper writes escalations with guarded updates.
+- **The event store holds decisions, the columnar store holds evidence.** Cases and component histories are event streams with optimistic concurrency. Raw readings need cheap append and scan, and nothing else.
+- **Several writers, one rule.** The analyzer, the process manager, dispatchers and tablets all append to a case stream, each with the version it read. A conflict re-runs the command and a domain rule decides. Nobody overwrites anybody.
 
 ---
 
 ## 💾 Data Model (~4 min)
 
-| Table | Key columns | Constraints | Notes |
-|-------|-------------|-------------|-------|
-| detector_passes | detector_id, pass_id, trip_id, passed_at (event), received_at (processing), axle_count, aei, edge_alarms, payload hash | PK (detector_id, pass_id) | identity_status: resolved, unresolved or awaiting_consist |
-| axle_readings | pass key, axle_seq, rail, bearing_f, wheel_f, then resolved car_id, car_axle, car_side | PK (pass, axle, rail) | Raw columns immutable; resolved columns rewritten on correction |
-| trip_consist_versions | trip_id, revision, effective_at | PK (trip, revision) | A rebuilt train gets a new revision |
-| trip_units | trip, revision, position, unit_id, axle_count, leading_end, orientation_source | PK (trip, revision, position) | orientation_source says consist or AEI |
-| component_installs | car_id, axle, component_id, installed_at (event), removed_at, recorded_at (processing) | one current per (car, axle) | Wheelset carries both bearings of its axle |
-| alerts | trip, car, kind (hot_bearing, hot_wheel, cold_wheel), position, tier, status, owner_role, owner_id, escalation_level, ack_due_at, delivered_at, acknowledged_at, inspected_at, closed_at, version | partial unique (trip, car, kind, position) where not closed | Escalated in place |
-| alert_events | alert, kind, tier, actor, note, at | unique (alert, kind, tier, pass) | The audit trail |
-| car_holds, work_orders | car, alert (unique), yard, status | one per alert; audits keyed by trip | Holds block outbound builds |
-| findings | client_submission_id (unique), work order (unique), source (alert, audit, routine, teardown), finding, disposition | | The labels |
-| notifications | alert, channel, target, dedupe_key (unique), delivered_at | | Outbox; delivered is not acknowledged |
+| Table | Key columns | Constraints | Role |
+|-------|-------------|-------------|------|
+| events | global position, event id, stream id + stream version, type + schema version, occurred_at (event), recorded_at (processing), correlation, causation, tags, payload | unique (stream, version); append-only | Event store for case and car streams; outbox for passes and trips |
+| detector_passes | detector_id, pass_id, trip_id, passed_at, received_at, axle_count, aei, payload hash | PK (detector_id, pass_id) | Fact log; identity_status resolved, unresolved or awaiting_consist |
+| axle_readings | pass key, axle_seq, rail, bearing_f, wheel_f, then resolved car_id, car_axle, car_side | PK (pass, axle, rail) | Fact log; raw columns immutable |
+| trip_consist_versions, trip_units | trip, revision, effective_at; unit, leading_end, orientation_source | PK (trip, revision) | State + outbox (ConsistVersionChanged) |
+| case_index | case id, trip, car, kind, position, is_open, hold status | partial unique (trip, car, kind, position) while open | Set invariants across case streams; the outbound hold check |
+| processed_events, consumer_checkpoints | (group, event id); (group, stream) → position | PK | Exactly-once effects; staleness |
+| ack_timers | (case, kind) → due_at, status | claimed FOR UPDATE SKIP LOCKED | The process manager's durable timers |
+| alerts, car_holds, work_orders, findings, notifications | case id; version = case stream version | projections | Read models for queues and tablets |
 
-> "Two columns on every pass, `passed_at` and `received_at`, are the whole late-data story. Everything that decides an outcome (trend order, the train's position, which consist applies, which wheelset was on the axle) uses event time. Processing time only says how late we are."
+> "Two columns on every event, `occurred_at` and `recorded_at`, are the whole late-data story. Everything that decides an outcome (trend order, the train's position, which consist applies, which wheelset was on the axle) uses event time. Processing time only says how late we are."
 
 ---
 
@@ -151,6 +147,9 @@ POST /api/v1/cars/:id/components      wheelset install with its event time
 POST /api/v1/yards/:id/outbound-check which cars may be built into a train
 GET  /api/v1/network                  detector health, coverage, lane backlog
 GET  /api/v1/events                   SSE, ids only, filtered by role
+GET  /api/v1/event-log/cases/:id      the case stream with causes and effects
+GET  /api/v1/ops/streams              lag, pending, staleness, dead letters
+POST /api/v1/ops/dlq/:id/redrive      re-publish one dead letter for its group
 ```
 
 ---
@@ -161,7 +160,7 @@ The gateway is the hard client here: it buffers on local disk, retries anything 
 
 1. **Validate and authenticate.** mTLS per gateway, and a gateway may only post its own detectors' passes.
 2. **Write with the detector's key.** `(detector_id, pass_id)` is assigned at the site, so a retry of the same pass is recognizably the same. A retry with the same key but a different payload hash is a conflict: keep the first, log it, count it.
-3. **Commit, then publish, then reply.** If I die after commit but before publish, the gateway never got a 2xx and retries. The retry finds the pass stored but unpublished and publishes it. A sweep covers a gateway that gave up.
+3. **Commit the pass and its events together, then reply.** The events go in an outbox (the event store) in the same transaction, so there is no "committed but never published" window. The relay publishes afterwards; if it crashes after publishing and before saving its position, consumers drop the repeats by event id.
 4. **Pick the lane by lateness.** Under 15 minutes old goes to live, older goes to backfill.
 
 | Response | Meaning for the gateway |
@@ -262,19 +261,42 @@ Brakes are a different failure mode and are scored apart. A **hot wheel** (tread
 
 **What I give up.** Recomputation per pass (trivial at ≤16 points), a second topic and its priority policy, and eventually consistent car history. And unresolvable passes are simply unused until an AEI read or consist arrives. I'd rather lose a reading than accuse the wrong car.
 
-### Deep dive 3: Alert lifecycle, ownership, holds and the yard loop
+### Deep dive 3: Event sourcing the case, state plus outbox for the readings
 
-**Decision:** an alert moves through **opened → delivered → acknowledged → inspected → closed**, each with an owner, a deadline and an audit event. A MEDIUM-or-higher alert creates a car hold and a work order. Findings are the labels.
+**Decision:** a *case* (one alert, or one random audit, and the yard's whole response) is an event-sourced aggregate: its state is the fold of its stream, and every append carries the version the writer read. The car's component history is one too. Raw readings are not: they are an append-only fact log announced by outbox events. Everything the UIs read is a projection.
 
-**Why ownership, not notification.** "We sent the page" is not "someone knows". The notifier records *delivered* when the provider accepts the message, but the deadline keeps running until a person *acknowledges*. HIGH and CRITICAL belong to the dispatcher desk for the train's current territory, with 15 and 5 minutes to acknowledge. MEDIUM belongs to the inspectors at the yard that must catch the car, with 60. If the deadline passes, the sweeper escalates to the next role: desk, then chief dispatcher, then the operations center; for a yard, inspectors, then the general foreman, then the operations center. Each escalation is a guarded update (`WHERE escalation_level = what I read`), so two sweepers can't double-escalate.
+```
+ case-7f3…  v1 AlertRaised (MEDIUM, owner CDJ yard)   v2 CarHoldPlaced   v3 WorkOrderOpened
+            v4 NotificationRequested  v5 NotificationDelivered  v6 AckDeadlineMissed (→ foreman)
+            v7 AlertEscalated (HIGH, owner West desk)  v8 CarHoldMoved (→ RDG)  v9 AlertHandedOff (→ East)
+            v10 AlertAcknowledged  v11 WorkOrderStarted  v12 InspectionFindingRecorded  v13 CaseClosed
+```
 
-**Why explicit handoff.** Trains move. When this one crosses from the West desk's territory into the East's, the alert's owner becomes East and East must acknowledge again: West's acknowledgment proves nothing about East. When a held car goes through its yard uninspected, the hold and work order move to the next yard, with an audit event and a notification.
+**Why the case earns it.** Five actors change one case over hours: the analyzer (new evidence), the process manager (deadlines, handoffs), dispatchers, inspectors on tablets that are often offline, and the repair track. With a mutable alert row, two of them writing at once means one silently loses. With a stream, a race is a version conflict, the command re-runs against the new state, and a **domain rule** decides:
 
-**Why holds are separate from work orders.** The work order is a task for an inspector. The hold is a constraint the yard's train-building system checks before adding a car to an outbound train. Without the hold, a busy yard builds the car into the next train and the alert's only effect was a message.
+| Race | Rule |
+|------|------|
+| Dispatcher acks v12; the notifier appended a delivery receipt (v13) | Nothing she decided on changed: rebase, append at v14 |
+| Dispatcher acks v12; the alert escalated to CRITICAL (v13) | 409 with the current case and "AlertEscalated": she reviews and acks the CRITICAL |
+| Two tablets sync "no defect" then "bearing defect" | The more severe finding wins: it supersedes, the car is held again, the case goes back to inspected |
+| The same in the other order | Refused: a defect report is never erased |
+| A timer fires a millisecond after the ack | The process manager re-reads the case: nothing to escalate |
 
-**Inspected is not closed.** A finding of "confirmed bearing defect, bad order" moves the alert to *inspected*. The car sits on the repair track with its hold. The alert closes when the repair is recorded as a wheelset install, which also releases the hold. "No defect found" or "repaired on the spot" closes it immediately. Each finding carries the tablet's client submission id, so a double tap or an offline resend records one finding.
+And the history is the product. The stream *is* the audit trail a regulator or a reviewer asks for, the timeline screen, and the label set behind precision and recall. Set invariants that span cases (one open alert per bearing per trip) live in a small write-side index updated in the same transaction, and the yard's outbound hold check reads that index, never a projection, because a projection half a second stale could let a held car into a train.
 
-**What I give up.** Acknowledging becomes part of two jobs, and I own a sweeper, an escalation chain and an audit trail. The alternative fails exactly where it matters: delivered, unread, and the train arriving at a yard that doesn't know to catch the car.
+**Why the readings don't.** About 26 million values a day at production scale, never revised, and no invariant between one reading and the next. There is nothing to fold and nothing to protect, so event-sourcing them would double the storage for no benefit. They stay facts. The outbox event is a claim check that names them by `(detector, pass)`; in production the readings go to a columnar store first (idempotent by key) and the small pass row and its events commit together after, so an event can never point at missing readings.
+
+**Why not "write the database, then publish".** That dual write has two failure modes: a stored pass that nobody ever processes, or a published pass that was never stored. The outbox removes both. Exactly-once *effects* then come from at-least-once delivery plus idempotent consumers: each group inserts `(group, event id)` into a processed-events table in the same transaction as its effects and acks only after commit, so a redelivery is a no-op.
+
+**What I give up.** Projections are eventually consistent, so commands answer from the aggregate (read-your-writes) and SSE notices wait for the projection's commit. Every schema change is a new version plus an upcaster: findings went from v1, with the source implied by an alert id, to v2 with an explicit source (alert, audit, routine, teardown), and v1 rows are upcast on every read. And there are more moving parts (a relay, checkpoints, dead letters), which is why consumer lag, projection staleness and dead-letter depth are a dashboard and `replay` can rebuild any projection and compare it with the live table.
+
+### Ownership, durable timers and the yard loop (~2 min)
+
+An alert moves **opened → delivered → acknowledged → inspected → closed**. HIGH and CRITICAL belong to the dispatcher desk for the train's current territory (15 and 5 minutes to acknowledge), MEDIUM to the inspectors at the yard that must catch the car (60). Delivered is not acknowledged: the notifier records `NotificationDelivered`, but the deadline keeps running.
+
+This is the one flow I **orchestrate** instead of choreographing. "If nobody acknowledges in 15 minutes, page the chief dispatcher; 15 more, the operations center; warn the yard 30 minutes before arrival; when the train crosses into the East desk's territory, start over with East" needs memory and time, and spreading it across reactive consumers would leave nobody owning the policy. A process manager listens to case events and train positions and keeps **durable timers** in a table (due time, case, kind). A poller claims due rows with `FOR UPDATE SKIP LOCKED`, so two instances never fire the same timer and a crash mid-fire leaves it pending. When one fires it re-reads the case from its stream and appends `AckDeadlineMissed` (or `ApproachingYardWarned`) with the version it read. If an acknowledgment won the race, the append conflicts, the re-read shows an acknowledged case, and nothing happens: no compensation is needed because nothing was done.
+
+A MEDIUM places a **hold** as well as a work order: the work order is a task, the hold is a constraint the train-building system checks. When a held car goes through its yard uninspected, the process manager moves the hold to the next yard. Each finding carries the tablet's client submission id, so an offline resend is a replay.
 
 ---
 
@@ -282,19 +304,20 @@ Brakes are a different failure mode and are scored apart. A **hot wheel** (tread
 
 ### Successful trace: a slowly failing bearing on M-HARRID
 
-1. At HBD-055 the gateway posts the pass. Ingest commits it under `(HBD-055, pass id)`, publishes to the live lane and returns 201.
-2. The processor locks the trip, resolves axle 109 north rail to NRLX 304512 R3 (revision 1, B-end leading), recomputes features and scores **MEDIUM**: steady rise, 7°F per 15 miles over four readings.
-3. One transaction opens the alert (owner: Cedar Junction inspectors, ack due in 60 minutes), places the hold and work order at CDJ, writes outbox rows for CDJ and the owner, and marks the pass processed. Then it acks the message and publishes an id-only SSE notice.
-4. The notifier marks it *delivered*. Nobody acknowledges, so the sweeper escalates to the general foreman and warns CDJ's supervisor 30 minutes before arrival.
-5. At HBD-126 the alert escalates in place to **HIGH**. The owner becomes the West desk with 15 minutes, and since the train went through CDJ uninspected, the hold moves to Ridgeway. At mile 160 it hands off to the East desk.
+1. At HBD-055 the gateway posts the pass. Ingest commits it under `(HBD-055, pass id)` together with `PassRecorded` and `AxleReadingsRecorded`, and returns 201. The relay publishes the readings event to the live lane, keyed by trip.
+2. The analyzer locks the trip, resolves axle 109 north rail to NRLX 304512 R3 (revision 1, B-end leading), recomputes features and scores **MEDIUM**: steady rise, 7°F per 15 miles over four readings.
+3. One transaction marks the event processed and appends `AlertRaised` (owner: Cedar Junction inspectors, ack due in 60 minutes) and, caused by it, `CarHoldPlaced`, `WorkOrderOpened` and `NotificationRequested` for CDJ and the owner. Then it acks. The alert-queue projector applies the events and sends an id-only SSE notice.
+4. The notifier appends `NotificationDelivered`. Nobody acknowledges, so the process manager's timer fires `AckDeadlineMissed` (general foreman), and an approach timer warns CDJ's supervisor 30 minutes before arrival.
+5. At HBD-126, `AlertEscalated` to **HIGH**: the owner becomes the West desk with 15 minutes. The train went through CDJ uninspected, so the next `TripPositionUpdated` makes the process manager append `CarHoldMoved` to Ridgeway; at mile 160, `AlertHandedOff` to the East desk.
 6. At HBD-230 the detector's own alarm fires and is radioed to the crew. The pass carries it, so the alert becomes **CRITICAL**, mirroring an alarm the crew already has. The trend flagged the bearing 175 miles earlier.
 
 ### Failed trace: the processor dies between commit and ack
 
-1. HBD-112's gateway was offline for two hours. On reconnect it posts four buffered passes, newest first. Three are older than 15 minutes and go to the backfill lane.
-2. Analyzer A processes Q-HARCDJ's pass: SVTX 961204 L1 is a +48°F outlier, so a **MEDIUM** opens. The train has already arrived, so it routes `yard_post_arrival` to Cedar Junction with a hold. A commits, setting `processed_at`, and is killed before `XACK`.
-3. The message sits pending on A's consumer. After 30 seconds idle, analyzer B claims it, locks the pass row, sees `processed_at`, and acks without doing anything. A second alert, hold, work order or page would also collide with the partial unique index and the `alert_id` and `dedupe_key` uniques.
-4. The gateway, which lost one reply, re-posts the batch. Ingest answers 200 with four duplicates.
+1. HBD-112's gateway was offline for two hours. On reconnect it posts four buffered passes, newest first. Three are older than 15 minutes, so their readings events go to the backfill lane.
+2. Analyzer A processes Q-HARCDJ's pass: SVTX 961204 L1 is a +48°F outlier, so `AlertRaised` (**MEDIUM**). The train has already arrived, so it routes `yard_post_arrival` to Cedar Junction with a hold. A commits (effects plus the processed-event row) and is killed before `XACK`.
+3. The message sits pending on A's consumer name. A restarted A drains its own pending entries first (or B claims it after the idle timeout), and the processed-events insert finds the row: acked as a duplicate, nothing appended. The case index and the stream's expected version are the backstop.
+4. The gateway, which lost one reply, re-posts the batch. Ingest answers 200 with four duplicates and appends no event.
+5. Meanwhile the yard maintenance system at Ridgeway is down. The integration's `WorkOrderOpened` fails five times and goes to the dead-letter stream with its error; every other group and yard keeps flowing, and the hold is already in force. After recovery an operator redrives it from the Ops page; the ticket is created once.
 
 ---
 
@@ -302,11 +325,11 @@ Brakes are a different failure mode and are scored apart. A **hot wheel** (tread
 
 | Question | Answer |
 |----------|--------|
-| Source of truth; when is a write successful? | Raw store for evidence, PostgreSQL for decisions. Ingest succeeds on commit (then 2xx); a processor decision succeeds on commit (then ack) |
-| Client retries after losing the response? | Gateway: same pass key, duplicate (republished if it never reached the stream). Tablet: same submission id, stored finding. Dispatcher: stale version, 409 with the current alert |
-| Worker fails between two steps? | API between commit and publish: the retry or a sweep republishes. Processor between commit and ack: reclaimed and skipped. Notifier between send and mark: deduplicated by `dedupe_key` |
-| Which ordering is required? | Per-trip by event time, reconstructed from the data. No global order |
-| Access with async jobs? | The processor writes as a system principal; reads are role-checked; SSE carries ids only, filtered per viewer; owners see only their cars |
+| Source of truth; when is a write successful? | Case and car streams for decisions, the fact log for readings, state rows for trips; everything else is a projection. Ingest succeeds when the pass and its events commit (then 2xx); a command when its events append at the expected version; a consumer step when effects, processed mark and checkpoint commit (then ack) |
+| Client retries after losing the response? | Gateway: same pass key, duplicate, nothing appended. Tablet: same submission id, stored finding; a different tablet's finding goes through the severity rule. Dispatcher: stale version rebased over bookkeeping, or 409 if a decision changed |
+| Worker fails between two steps? | No commit-then-publish gap (outbox). Relay between publish and checkpoint: republishes, consumers dedupe. Consumer between commit and ack: redelivered, skipped. Timer between claim and append: stays pending |
+| Which ordering is required? | Per key: trip for readings, case for cases, car for component history. Readings tolerate any order (event time, max over prefixes). No global order |
+| Access with async jobs? | Consumers write as system principals; reads and timelines are role-checked; SSE carries ids only, filtered per viewer, sent after the projection commits; owners see only their cars |
 | What breaks first at scale, and the evidence? | People: holds per yard per shift and pages per desk, shown by alert volume per 1,000 car passes and precision. Then backfill bursts after regional outages, shown by lane backlog |
 
 ---
@@ -319,7 +342,7 @@ Brakes are a different failure mode and are scored apart. A **hot wheel** (tread
 
 **"One detector suddenly flags nearly every train."** That's the detector, not the fleet. Relative features don't move when a scanner drifts, because every bearing on the rail shifts together. So bias detection (this detector's train median against its neighbours' for the same trains) flags it within a few trains. Its absolute-only alerts get quarantined into a maintenance ticket instead of a storm of dispatcher pages, and maintenance is dispatched. The edge alarm on that detector is governed by the railroad's out-of-service rules, which I surface to operations but don't override.
 
-**"The notification provider accepted the message, nobody acknowledged, and the train is approaching the next yard."** Delivered is not acknowledged, so the deadline is still running. The sweeper escalates on the deadline, and separately warns the next yard's supervisor when the train is within 30 minutes of that yard. Because MEDIUM-and-up already placed a hold, the car can't be built into an outbound train even if nobody reads anything, and if it goes through uninspected, the hold moves to the next yard.
+**"The notification provider accepted the message, nobody acknowledged, and the train is approaching the next yard."** Delivered is not acknowledged, so the deadline is still running. The process manager's durable timer escalates on the deadline, and a second timer warns the next yard's supervisor when the train is within 30 minutes of that yard. Because MEDIUM-and-up already placed a hold, the car can't be built into an outbound train even if nobody reads anything, and if it goes through uninspected, the hold moves to the next yard.
 
 ---
 
@@ -328,14 +351,15 @@ Brakes are a different failure mode and are scored apart. A **hot wheel** (tread
 | Failure | Behavior |
 |---------|----------|
 | Cloud or link down | Edge alarms still stop trains; gateways buffer; the backfill lane catches up |
-| Consist arrives after the pass | Pass parked, republished when the consist arrives |
-| Poison message | Dead-lettered after 5 deliveries; the trip continues |
+| Consist arrives after the pass | `IdentityQuarantined`; `ConsistVersionChanged` releases the pass |
+| Poison message | Dead-lettered at once (schema, unknown version) or after 5 deliveries (transient); the group keeps moving; redrive after the fix |
+| Projection bug | Fix, rebuild from position 0, compare with the live table |
 | Silent detector | Coverage gap shown; trends computed per mile, annotated |
 | Model service down | Rules keep alerting; predictions marked unavailable |
 
 ## 📈 What Breaks First and How It Scales (~2 min)
 
-> "At a pass a second, compute is not the constraint. The first thing that breaks is human capacity: if MEDIUM precision falls, a yard spends its shift on healthy cars and starts ignoring holds. I'd watch alert volume per 1,000 car passes and precision by tier, and change thresholds only through the backtest. The second is a regional outage: thousands of sites reconnecting at once. The backfill lane takes it at its own pace while live stays fast, and I'd watch backfill lag. Raw storage grows linearly and slowly; I'd tier it by age."
+> "At a pass a second, compute is not the constraint. The first thing that breaks is human capacity: if MEDIUM precision falls, a yard spends its shift on healthy cars and starts ignoring holds. I'd watch alert volume per 1,000 car passes and precision by tier, and change thresholds only through the backtest. The second is a regional outage: thousands of sites reconnecting at once. The backfill lane takes it at its own pace while live stays fast, and I'd watch backfill consumer lag. Third, if the event store were a single PostgreSQL table, its one short append lock: case and car streams move to Kafka partitions keyed by case and by car, with snapshots for long streams. Raw storage grows linearly and slowly; I'd tier it by age."
 
 ---
 
@@ -351,6 +375,11 @@ Brakes are a different failure mode and are scored apart. A **hot wheel** (tread
 | Identity | Consist by time + AEI, refuse to guess | Current consist | Rebuilt and turned cars stay right |
 | Alerts | Owner, deadline, escalation, handoff | Fire-and-forget | Delivered isn't seen |
 | Labels | Findings + audits + teardowns | Findings only | Selection bias hides misses |
+| Cases | Event-sourced, expected versions | Mutable rows + audit table | Races resolve by rule; history is the product |
+| Readings | Fact log + outbox (claim check) | Event-sourced | Volume, no invariants |
+| Publishing | Transactional outbox + relay | Write, then publish | No dual write |
+| Delivery | At-least-once + processed events | Broker exactly-once | Works across store and broker |
+| Deadlines | Process manager + durable timers | Choreographed reactions | One owner for a time-based policy |
 
 ## 📝 Wrap-up (~1 min)
 
@@ -358,4 +387,4 @@ Brakes are a different failure mode and are scored apart. A **hot wheel** (tread
 
 ### How the local implementation compares
 
-The repository builds this with an Express API, a Valkey-streams analyzer (live and backfill lanes, consumer group, reclaim and dead letters, per-trip advisory lock), PostgreSQL for everything, and a simulator that runs five trains in compressed time with a heating bearing, a turned car, a stale consist, a train rebuilt at a yard, a biased and a silent detector, a gateway outage with out-of-order delivery and retries, a stuck brake and an inoperative one. Rules stand in for the model. `npm run demo:component-swap` reproduces the wheelset follow-up end to end.
+The repository builds this with an Express API whose ingest writes the fact log and the outbox in one transaction; a PostgreSQL event store with case, car and detector streams; a relay to Valkey Streams standing in for Kafka topics; consumer groups for the analyzer (live and backfill lanes, per-trip advisory lock), a notifier, a yard work-order integration, the acknowledgment process manager with durable timers, and four projectors, all with processed-events dedupe, XCLAIM redelivery and a dead-letter stream with redrive. A simulator runs five trains in compressed time with a heating bearing, a turned car, a stale consist, a train rebuilt at a yard, a biased and a silent detector, a gateway outage with out-of-order delivery and retries, a stuck brake and an inoperative one. `npm run replay -- all` rebuilds every projection and compares; `npm run demo:component-swap` and `npm run replay -- swap-case` reproduce and re-derive the wheelset follow-up.

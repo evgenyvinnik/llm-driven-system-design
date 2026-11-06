@@ -1,0 +1,26 @@
+{
+  "name": "track-hazard-detection",
+  "frontendPort": 5173,
+  "backendRequired": true,
+  "dbName": "track_hazard",
+  "dbUser": "hazard",
+  "auth": {
+    "enabled": true,
+    "loginUrl": "/login",
+    "credentials": { "username": "carol", "password": "password123" },
+    "usernameSelector": "input[name='username']",
+    "passwordSelector": "input[name='password']",
+    "submitSelector": "button[type='submit']",
+    "successIndicator": "main"
+  },
+  "screens": [
+    { "name": "01-login", "path": "/login", "waitFor": "form", "skipAuth": true, "delay": 500 },
+    { "name": "02-operator-board", "path": "/board", "waitFor": "section[aria-label='Canyon Subdivision']", "delay": 1500 },
+    { "name": "05-alert-queue", "path": "/alerts", "waitFor": "ul[aria-label='Alerts']", "delay": 800 },
+    { "name": "06-speed-restrictions", "path": "/restrictions", "waitFor": "table[aria-label='Speed restrictions']", "delay": 800 },
+    { "name": "07-latency-budget", "path": "/latency", "waitFor": "table[aria-label='Lane latency']", "delay": 1000 },
+    { "name": "08-streams-dlq", "path": "/ops", "waitFor": "table[aria-label='Consumer groups']", "delay": 1500 },
+    { "name": "09-event-log", "path": "/events", "waitFor": "table[aria-label='Event log']", "delay": 800 }
+  ],
+  "viewport": { "width": 1440, "height": 900 }
+}

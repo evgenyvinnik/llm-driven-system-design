@@ -16,9 +16,12 @@
   "screens": [
     { "name": "01-login", "path": "/login", "waitFor": "form", "skipAuth": true, "delay": 500 },
     { "name": "02-alerts", "path": "/alerts", "waitFor": "ul[aria-label='Alerts']", "delay": 800 },
-    { "name": "03-trains", "path": "/trains", "waitFor": "table[aria-label='Trains']", "delay": 600 },
-    { "name": "04-detectors", "path": "/detectors", "waitFor": "table[aria-label='Detectors']", "delay": 800 },
-    { "name": "05-reliability", "path": "/admin", "waitFor": "text=Precision by tier", "delay": 1000, "fullPage": true }
+    { "name": "04-car-trend", "path": "/cars/NRLX%20304512?position=R3", "waitFor": "main", "delay": 1000 },
+    { "name": "05-yard-inspection", "path": "/yard", "waitFor": "main", "delay": 1000 },
+    { "name": "06-detectors", "path": "/detectors", "waitFor": "table[aria-label='Detectors']", "delay": 800 },
+    { "name": "07-reliability", "path": "/admin", "waitFor": "text=Precision by tier", "delay": 1000 },
+    { "name": "08-car-event-timeline", "path": "/timeline?car=NRLX%20304512", "waitFor": "ol[aria-label='Event timeline']", "delay": 1200 },
+    { "name": "10-ops-streams", "path": "/ops", "waitFor": "table[aria-label='Consumer groups']", "delay": 1500 }
   ],
   "viewport": { "width": 1440, "height": 900 }
 }
