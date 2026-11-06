@@ -7,7 +7,7 @@
  *   55  GW-CAN-4 loses its link and buffers
  *   58  GEO-135.9 spike while GW-CAN-4 is offline (buffered at the edge)
  *   90  rockfall at MP 147.8: two fence wires + a geophone -> one CRITICAL hazard
- *    1  hot afternoon: PRA-3 rail is 22 F over RNT and climbing 2.4 F/min -> elevated
+ *    0  hot afternoon: PRA-3 rail is 22 F over RNT and climbing 2.4 F/min -> elevated
  *       risk (~90 s) and a 40 mph standing heat order, critical (~330 s) and 25 mph;
  *       PRA-4 climbs 1.8 F/min -> elevated (~240 s)
  *  150  GW-PRA-1 uploads a 3,000-event backlog from an outage this morning (bulk lane)
@@ -77,7 +77,8 @@ export const SCENARIO: Step[] = [
   { at: 91.5, label: 'Rockfall MP 147.8: GEO-147.9 spike', run: (w) => vibration(w, 'GEO-147.9', 38) },
   { at: 94, label: 'Rockfall MP 147.8: fence wire 4', run: (w) => fence(w, 'FNC-147.8', 4) },
   {
-    at: 1,
+    // At 0, so the profile is in place before the first rail-temperature sample (a step change would read as a steep trend).
+    at: 0,
     label: 'Hot afternoon: rail temperatures climbing on PRA-3 (2.4 F/min) and PRA-4 (1.8 F/min)',
     run: (w) => {
       w.heat.set('PRA-3', (t) => 22 + t * (2.4 / 60))

@@ -149,7 +149,7 @@ The relay and the timer sweep elect a leader in Valkey, so extra instances are s
 
 | t (s) | What happens | What to look for |
 |-------|--------------|------------------|
-| 1 | Hot afternoon: rail temperature climbs on PRA-3 and PRA-4 | Heat risk elevated → MEDIUM alert + automatic 40 mph order; PRA-3 later critical → 25 mph |
+| 0 | Hot afternoon: rail temperature climbs on PRA-3 and PRA-4 | Heat risk elevated → MEDIUM alert + automatic 40 mph order; PRA-3 later critical → 25 mph |
 | 20 | GEO-122.0 dies | Gateway reports SensorHeartbeatMissed → coverage gap hatched at MP 121-123 |
 | 45 | Tunnel camera sees debris (0.66) | HIGH obstruction, alert to alice |
 | 55-175 | GW-CAN-4 loses its link, buffers a confirming spike | Segment shown "GW SILENT"; on reconnect the spike arrives late and upgrades the hazard to CRITICAL; one batch is delivered twice |
