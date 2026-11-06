@@ -2,7 +2,15 @@
 
 ## Codebase Stats
 
-SLOC_PLACEHOLDER
+| Metric | Value |
+|--------|-------|
+| Total SLOC | 11,788 |
+| Source Files | 167 |
+| .ts | 7,478 |
+| .tsx | 1,945 |
+| .md | 1,668 |
+| .sql | 319 |
+| .json | 181 |
 
 ## Overview
 
