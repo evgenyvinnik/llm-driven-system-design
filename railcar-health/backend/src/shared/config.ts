@@ -20,7 +20,6 @@ export const config = {
 
   apiPort,
   analyzerMetricsPort: int('ANALYZER_PORT', 3010),
-  instanceId: process.env.INSTANCE_ID || `api-${process.pid}`,
   /** Where the simulator posts detector data. */
   apiUrl: process.env.API_URL || `http://localhost:${apiPort}`,
 
@@ -30,19 +29,26 @@ export const config = {
   /** Shared secret detector gateways send in X-Ingest-Token. Production uses per-gateway mTLS. */
   ingestToken: process.env.INGEST_TOKEN || 'local-dev-ingest-token',
 
+  instanceId: process.env.INSTANCE_ID || `api-${process.pid}`,
+  workersPort: int('WORKERS_PORT', 3011),
+
+  /** Broker streams (Valkey Streams standing in for Kafka topics). */
   stream: {
-    liveKey: 'rh:passes:live',
-    backfillKey: 'rh:passes:backfill',
-    deadLetterKey: 'rh:passes:dlq',
+    /** Prefix of every event-family stream: rh:ev:cases, rh:ev:wayside.readings.live, ... */
+    prefix: 'rh:ev:',
+    deadLetterKey: 'rh:ev:dlq',
+    /** Approximate per-stream retention (XADD MAXLEN ~). Production: per-topic retention or compaction. */
+    maxLen: int('STREAM_MAXLEN', 200_000),
     /** Backfill messages handled per loop iteration before the live lane is checked again. */
     backfillBatch: int('BACKFILL_BATCH', 2),
-    group: 'analyzer',
-    consumer: process.env.ANALYZER_CONSUMER || `analyzer-${process.pid}`,
-    /** Pending messages idle this long are claimed by another consumer. */
-    claimIdleMs: int('STREAM_CLAIM_IDLE_MS', 30_000),
+    /** Consumer name within each group; run several analyzers with different names. */
+    consumer: process.env.CONSUMER_NAME || process.env.ANALYZER_CONSUMER || `c-${process.pid}`,
+    /** Pending messages idle this long are claimed by another consumer (or retried by this one). */
+    claimIdleMs: int('STREAM_CLAIM_IDLE_MS', 10_000),
+    /** Deliveries before a message that keeps failing is dead-lettered. */
     maxDeliveries: int('STREAM_MAX_DELIVERIES', 5),
-    /** The API republishes committed-but-unpublished passes older than this. */
-    republishAfterMs: int('REPUBLISH_AFTER_MS', 5_000),
+    /** Relay poll interval; NOTIFY wakes it sooner. */
+    relayPollMs: int('RELAY_POLL_MS', 500),
   },
 
   /** Valkey pub/sub channel the analyzer publishes committed changes to; the API fans it out over SSE. */
@@ -56,8 +62,8 @@ export const config = {
     /** Detectors with no heartbeat for this long (simulated minutes) are offline. */
     offlineAfterMinutes: int('OFFLINE_AFTER_MINUTES', 25),
     healthIntervalMs: int('HEALTH_INTERVAL_MS', 5_000),
-    /** Ack-deadline sweeper and simulated notification delivery. */
-    sweepIntervalMs: int('SWEEP_INTERVAL_MS', 3_000),
+    /** How often the process manager polls its durable timers (real milliseconds). */
+    timerPollMs: int('TIMER_POLL_MS', 1_000),
     /** An unacknowledged alert whose train is this close to the yard escalates (simulated minutes). */
     approachWindowMinutes: int('APPROACH_WINDOW_MINUTES', 30),
   },

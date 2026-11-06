@@ -38,13 +38,13 @@ const detectorDto = (d: Record<string, unknown>) => ({
   coverage: coverageState(String(d.status), Number(d.pending_passes ?? 0)),
 })
 
-/** Unprocessed messages per lane (Valkey 7 reports consumer-group lag). */
+/** Readings not yet handled by the analyzer group, per lane (Valkey 7 reports consumer-group lag). */
 async function laneBacklog(): Promise<Record<Lane, number | null>> {
   const out: Record<Lane, number | null> = { live: null, backfill: null }
   for (const lane of ['live', 'backfill'] as Lane[]) {
     try {
       const groups = (await redis.xinfo('GROUPS', laneKey(lane))) as unknown[][]
-      const fields = groups[0] ?? []
+      const fields = groups.find((g) => g[g.indexOf('name') + 1] === 'analyzer') ?? []
       const get = (name: string) => Number(fields[fields.indexOf(name) + 1] ?? 0)
       out[lane] = get('lag') + get('pending')
     } catch {
@@ -59,10 +59,9 @@ networkRouter.get(
   asyncHandler(async (_req, res) => {
     const { config: t } = await loadThresholds()
     const { rows } = await pool.query(
-      `SELECT d.*,
-              (SELECT count(*)::int FROM detector_passes p WHERE p.detector_id = d.id AND p.processed_at IS NULL AND p.identity_status <> 'awaiting_consist') AS pending_passes,
-              (SELECT max(received_at) FROM detector_passes p WHERE p.detector_id = d.id) AS last_received_at
-         FROM detectors d ORDER BY milepost`,
+      `SELECT d.*, COALESCE(h.status, 'ok') AS status, h.status_reason, h.status_since, h.last_received_at,
+              (SELECT count(*)::int FROM detector_passes p WHERE p.detector_id = d.id AND p.processed_at IS NULL AND p.identity_status <> 'awaiting_consist') AS pending_passes
+         FROM detectors d LEFT JOIN detector_health h ON h.detector_id = d.id ORDER BY milepost`,
     )
     const detectors = rows.map(detectorDto)
     res.json({
@@ -81,7 +80,13 @@ networkRouter.get(
 networkRouter.get(
   '/detectors/:id',
   asyncHandler(async (req, res) => {
-    const d = (await pool.query('SELECT * FROM detectors WHERE id = $1', [req.params.id])).rows[0]
+    const d = (
+      await pool.query(
+        `SELECT d.*, COALESCE(h.status, 'ok') AS status, h.status_reason, h.status_since, h.last_received_at
+           FROM detectors d LEFT JOIN detector_health h ON h.detector_id = d.id WHERE d.id = $1`,
+        [req.params.id],
+      )
+    ).rows[0]
     if (!d) throw notFound('Detector')
     const [passes, samples, missed] = await Promise.all([
       pool.query(

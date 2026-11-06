@@ -29,7 +29,7 @@ The **Signal** column says how strong the evidence is that a question appears in
 | Guide-reported | A preparation guide summarizes a candidate's experience. The underlying account was not inspected |
 | Practice extension | A recommended exercise. Not known to have been asked |
 
-Sources surveyed: Glassdoor, Aced (formerly Exponent) and Hello Interview. Project 16 also draws on Lodely, PracHub and 1point3acres. The [frontend round map](#frontend-round-map) also draws on PracHub, AceOffer and interviewing.io. Projects 19–24 (the [rail operations track](#rail-operations-track-bnsf)) draw on Glassdoor, Dataford, Interview Query, PracHub and Medium reports of BNSF Railway loops, surveyed in November 2026.
+Sources surveyed: Glassdoor, Aced (formerly Exponent) and Hello Interview. Project 16 also draws on Lodely, PracHub and 1point3acres. The [frontend round map](#frontend-round-map) also draws on PracHub, AceOffer and interviewing.io. Projects 19–25 (the [rail operations track](#rail-operations-track-bnsf)) draw on Glassdoor, Dataford, Interview Query, PracHub and Medium reports of BNSF Railway loops, surveyed in November 2026.
 
 ## Summary
 
@@ -56,9 +56,10 @@ Sources surveyed: Glassdoor, Aced (formerly Exponent) and Hello Interview. Proje
 | 19 | [Railcar Health Monitoring](#19-railcar-health-monitoring) ✅ Built | [`railcar-health/`](./railcar-health/) | Rail | BNSF (candidate report: phone screen) | ad-click-aggregator, notification-system |
 | 20 | [Locomotive Fueling](#20-locomotive-fueling) ✅ Built | [`locomotive-fueling/`](./locomotive-fueling/) | Rail | BNSF (candidate report; telemetry variants guide-listed) | uber, job-scheduler |
 | 21 | [Storage Remediation](#21-storage-remediation) ✅ Built | [`storage-remediation/`](./storage-remediation/) | Rail | BNSF (guide-reported existing system review round); practice extension for the design | job-scheduler, rate-limiter |
-| 22 | [Freight Quote Service](#22-freight-quote-service) | `freight-quote/` | Rail | BNSF (candidate report) | scalable-api, rate-limiter, distributed-cache |
-| 23 | [Railcar Trip Plans and ETAs](#23-railcar-trip-plans-and-etas) | `railcar-trip-plans/` | Rail | Practice extension | local-delivery, notification-system |
+| 22 | [Freight Quote Service](#22-freight-quote-service) ✅ Built | [`freight-quote/`](./freight-quote/) | Rail | BNSF (candidate report) | scalable-api, rate-limiter, distributed-cache |
+| 23 | [Railcar Trip Plans and ETAs](#23-railcar-trip-plans-and-etas) ✅ Built | [`railcar-trip-plans/`](./railcar-trip-plans/) | Rail | Practice extension | local-delivery, notification-system |
 | 24 | [Yard Switch Lists](#24-yard-switch-lists) | `yard-switch-lists/` | Rail | Practice extension (BNSF describes the system publicly) | job-scheduler, railcar-health |
+| 25 | [Track Hazard Detection](#25-track-hazard-detection) ✅ Built | [`track-hazard-detection/`](./track-hazard-detection/) | Rail | BNSF (candidate report, Reddit) | railcar-health |
 
 - **Tier 1** covers the core product-facing work for AI and full-stack roles. Build these first, in the order listed.
 - **Tier 2** covers variations on tier-1 designs. Each reuses a tier-1 data model or an existing project's patterns.
@@ -697,6 +698,9 @@ Signals use the labels in [About the Sources](#about-the-sources). The interview
 2. [#20 Locomotive Fueling](#20-locomotive-fueling)
 3. [#21 Storage Remediation](#21-storage-remediation): read its `existing-system-review.md` as a template for presenting your own system
 4. [#22 Freight Quote Service](#22-freight-quote-service): a generic reliability question in a rail setting
+5. [#25 Track Hazard Detection](#25-track-hazard-detection): #19's design applied to the track instead of the cars
+
+**Event-driven reference.** Four of the built rail projects (#19, #22, #23 and #25) are explicit event-driven applications. Each has an `events.md` catalog, an outbox, idempotent consumers, a dead-letter stream with redrive, replayable projections and a versioned event schema. Read `railcar-health/events.md` first.
 
 **Public figures worth knowing for estimates.**
 
@@ -754,6 +758,8 @@ Most railcars on a Class I network belong to lessors and shippers, not to the ra
 
 **Trap.** Putting the cloud in the path that stops trains, or treating every reading as live.
 
+**Event-driven reference.** The project was reworked into the repository's reference example of an event-driven application. Cases and car component history are event-sourced, and raw readings stay an append-only fact log. The event store doubles as the outbox, and relay streams per event family feed idempotent consumer groups. Projections can be replayed and compared row by row. A dead-letter stream supports redrive, and `InspectionFindingRecorded` v1 is upcast to v2. One process manager runs acknowledgment deadlines on durable timers. See `railcar-health/events.md`.
+
 ### 20. Locomotive Fueling
 
 **Folder:** [`locomotive-fueling/`](./locomotive-fueling/) · **Signal:** BNSF (candidate report: "design a backend system for BNSF locomotives that uses real-time fuel level, GPS location, route information, fuel consumption rate, and fuel prices to recommend where the locomotive should stop for fuel and how much fuel it should purchase"). Two related telemetry prompts are also covered: a candidate report (sensor ingestion from 3,000+ trains) and a prep-guide listing (a location ping receiver for thousands of locomotives) · ✅ Built
@@ -799,7 +805,7 @@ Most railcars on a Class I network belong to lessors and shippers, not to the ra
 
 ### 22. Freight Quote Service
 
-**Folder:** `freight-quote/` · **Signal:** BNSF (candidate report: a high-traffic quote endpoint whose dependent services are slow, and what architecture would improve service quality. A curated PracHub account of a September 2026 screen describes implementing the freight rate inquiry endpoint's service-layer logic first, then discussing heavy traffic and downstream latency, so expect some coding) · **Builds on:** scalable-api, rate-limiter, distributed-cache
+**Folder:** [`freight-quote/`](./freight-quote/) · ✅ Built · **Signal:** BNSF (candidate report: a high-traffic quote endpoint whose dependent services are slow, and what architecture would improve service quality. A curated PracHub account of a September 2026 screen describes implementing the freight rate inquiry endpoint's service-layer logic first, then discussing heavy traffic and downstream latency, so expect some coding) · **Builds on:** scalable-api, rate-limiter, distributed-cache
 
 **Problem.** Shippers request price quotes for moving freight: origin, destination, commodity, car type and volume. A quote depends on several slow internal services: tariff and contract pricing, network capacity, fuel surcharge and car availability. Traffic is heavy, from customer portals and from API integrations that re-quote often. Design the endpoint so it stays fast and correct while dependencies are slow.
 
@@ -829,7 +835,7 @@ Most railcars on a Class I network belong to lessors and shippers, not to the ra
 
 ### 23. Railcar Trip Plans and ETAs
 
-**Folder:** `railcar-trip-plans/` · **Signal:** Practice extension (car visibility and trip plans are central to rail service, but the question is not known to have been asked) · **Builds on:** local-delivery, notification-system, #19
+**Folder:** [`railcar-trip-plans/`](./railcar-trip-plans/) · ✅ Built · **Signal:** Practice extension (car visibility and trip plans are central to rail service, but the question is not known to have been asked) · **Builds on:** local-delivery, notification-system, #19
 
 **Problem.** Each loaded car moves through a trip plan: an origin, a sequence of yards and trains, and a destination. AEI readers and yard systems report where cars actually are. Track every car against its plan, detect missed connections early, predict ETAs, and show shippers where their cars are.
 
@@ -888,6 +894,27 @@ Most railcars on a Class I network belong to lessors and shippers, not to the ra
 **Trap.** Spending the round on the optimization algorithm and ignoring replanning, overrides and execution feedback.
 
 **Local scope.** An Express API with a heuristic planner, PostgreSQL, a yard simulator, a yardmaster board with drag-to-override, and a crew handheld view.
+
+### 25. Track Hazard Detection
+
+**Folder:** [`track-hazard-detection/`](./track-hazard-detection/) · ✅ Built · **Signal:** BNSF (candidate report: a Reddit account from a senior infrastructure candidate describes it; not opened or verified for this survey) · **Builds on:** #19
+
+**Problem.** "Design a railroad sensor monitoring and incident detection platform. It ingests camera, vibration and temperature data, identifies track hazards, alerts personnel, and provides an operator dashboard. Connectivity is intermittent, and critical alerts must reach people within seconds." It differs from #19, which monitors *cars* as they pass detectors. This project monitors the *track and right-of-way*: rockfall, crossing obstructions, high water and the risk of rail buckling in heat.
+
+**Hard problems.**
+- **Edge vs cloud.** A broken slide fence turns the signal red in the field by itself. The platform adds correlation, routing, the human workflow and the audit trail.
+- **Correlation in time and space.** A camera detection plus a vibration spike within seconds and half a mile of each other is one confirmed hazard, never two. The design uses event time with watermarks, so late events can upgrade or downgrade a hazard, and the result doesn't depend on arrival order.
+- **A priority lane** keeps a reconnecting gateway's backlog from delaying a new critical event. Detection-to-alert latency is measured.
+- **Hazard lifecycle:** alert, acknowledgment deadline and escalation, speed restriction, warning approaching trains, inspection, then clearing.
+- **Coverage.** A missing sensor heartbeat makes the segment visibly blind, not silently quiet.
+
+**Follow-ups the answers must handle.**
+- Three sensors see the same rockfall. How many alerts go out?
+- A gateway reconnects with 5,000 buffered events just as a fence breaks elsewhere. What gets processed first?
+- A late train-position report shows the vibration spike was a passing train. What happens to the hazard?
+- The cloud is down. What still protects trains?
+
+**Trap.** Treating each sensor reading as its own alert, or putting the cloud in the path that stops trains.
 
 ---
 

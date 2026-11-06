@@ -4,8 +4,8 @@
  * the server could not be reached (offline yard tablet).
  */
 import type {
-  Alert, AlertEvent, AlertNotification, Backtest, CarDetail, Clock, Detector, Heatmap, Hold, Metrics, Network, Thresholds, Trip, TripPass,
-  TripUnit, TrendSeries, User, WorkOrder, Yard,
+  Alert, AlertEvent, AlertNotification, Backtest, CarDetail, Clock, DeadLetter, Detector, EventDetail, Fault, Heatmap, Hold, Metrics, Network, OpsOverview,
+  StoredEvent, Thresholds, TimelineSubject, Trip, TripPass, TripUnit, TrendSeries, User, WorkOrder, Yard,
 } from '@/types'
 
 export class ApiError extends Error {
@@ -105,4 +105,15 @@ export const api = {
   saveThresholds: (version: number, config: Thresholds) => request<{ config: Thresholds; version: number }>('/admin/thresholds', { method: 'PUT', body: { version, config } }),
   previewThresholds: (config: Thresholds) => request<Backtest>('/admin/thresholds/preview', { method: 'POST', body: { config } }),
   metrics: () => request<Metrics>('/admin/metrics'),
+
+  carTimeline: (carId: string) => request<{ subject: TimelineSubject; events: StoredEvent[] }>(`/event-log/cars/${encodeURIComponent(carId)}`),
+  caseTimeline: (caseId: string) => request<{ subject: TimelineSubject; events: StoredEvent[] }>(`/event-log/cases/${caseId}`),
+  event: (eventId: string) => request<EventDetail>(`/event-log/events/${eventId}`),
+
+  opsStreams: () => request<OpsOverview>('/ops/streams'),
+  deadLetters: () => request<{ entries: DeadLetter[] }>('/ops/dlq'),
+  redrive: (id: string) => request<{ redriven: string; newMessageId: string; group: string }>(`/ops/dlq/${id}/redrive`, { method: 'POST' }),
+  redriveAll: () => request<{ redriven: number }>('/ops/dlq/redrive-all', { method: 'POST' }),
+  setFault: (group: string, fault: Fault) => request<{ faults: Record<string, Fault> }>(`/ops/faults/${group}`, { method: 'PUT', body: fault }),
+  clearFault: (group: string) => request<{ faults: Record<string, Fault> }>(`/ops/faults/${group}`, { method: 'DELETE' }),
 }

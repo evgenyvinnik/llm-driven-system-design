@@ -6,9 +6,8 @@ import { Router } from 'express'
 import { z } from 'zod'
 import { requireAuth, requireRole } from '../../shared/auth.js'
 import { clockInfo } from '../../shared/clock.js'
-import { pool, withTransaction } from '../../shared/db.js'
-import { publishEvents } from '../../shared/events.js'
-import { installSchema, recordInstall } from '../services/findings.js'
+import { pool } from '../../shared/db.js'
+import { installSchema, recordInstall } from '../services/commands.js'
 import { asyncHandler, HttpError, notFound } from '../../shared/errors.js'
 import { yardById } from '../../shared/network.js'
 import { alertDto, type AlertRow } from '../dto.js'
@@ -29,9 +28,14 @@ carsRouter.get(
           WHERE a.car_id = $1 ORDER BY a.opened_at DESC LIMIT 20`,
         [carId],
       ),
+      // Identity history comes from the car-history projection (CarIdentified); seeded history trips from the consist.
       pool.query(
-        `SELECT t.trip_id, t.symbol, t.direction, t.departed_at, t.status, u.position, u.leading_end, u.orientation_source, u.corrected_by_detector
-           FROM current_trip_units u JOIN trips t ON t.trip_id = u.trip_id WHERE u.unit_id = $1 ORDER BY t.departed_at DESC LIMIT 10`,
+        `SELECT t.trip_id, t.symbol, t.direction, t.departed_at, t.status,
+                COALESCE(ct.position, u.position) AS position, COALESCE(ct.leading_end, u.leading_end) AS leading_end,
+                COALESCE(ct.orientation_source, u.orientation_source) AS orientation_source, COALESCE(ct.corrected_by_detector, u.corrected_by_detector) AS corrected_by_detector
+           FROM current_trip_units u JOIN trips t ON t.trip_id = u.trip_id
+           LEFT JOIN car_trips ct ON ct.trip_id = u.trip_id AND ct.car_id = u.unit_id
+          WHERE u.unit_id = $1 ORDER BY t.departed_at DESC LIMIT 10`,
         [carId],
       ),
       // Each bearing's delta vs the train-side median on the car's most recent trip with readings.
@@ -114,8 +118,9 @@ carsRouter.get(
 
 /**
  * Repair track: record a wheelset install (event time = when it went on the
- * car). Readings measured before it are never evidence against the new
- * wheelset; any inspected alert for that axle is closed and its hold released.
+ * car) as ComponentReplaced on the car's stream. Readings measured before it are
+ * never evidence against the new wheelset. Closing any inspected case for that
+ * axle is the work-order integration's job, reacting to the event.
  */
 carsRouter.post(
   '/:carId/components',
@@ -124,10 +129,7 @@ carsRouter.post(
     const input = installSchema.parse(req.body)
     const car = await pool.query('SELECT 1 FROM railcars WHERE car_id = $1', [req.params.carId])
     if (car.rowCount === 0) throw notFound('Car')
-    const result = await withTransaction((client) =>
-      recordInstall(client, { carId: req.params.carId, axle: input.axle, componentId: input.componentId, installedAt: input.installedAt, recordedBy: req.user!.username, clientSubmissionId: input.clientSubmissionId }),
-    )
-    await publishEvents([{ type: 'trip.updated', carId: req.params.carId }, ...result.closedAlerts.map((a) => ({ type: 'alert.updated' as const, alertId: a.id, tripId: a.trip_id, yardId: a.yard_id }))])
-    res.status(result.replayed ? 200 : 201).json({ installId: result.installId, replayed: result.replayed, closedAlerts: result.closedAlerts.map((a) => a.id) })
+    const result = await recordInstall(req.params.carId, input, req.user!)
+    res.status(result.replayed ? 200 : 201).json({ eventId: result.eventId, replayed: result.replayed, carVersion: result.version })
   }),
 )

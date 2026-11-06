@@ -90,6 +90,8 @@ export interface AlertEvent {
   note: string | null
   actor: string
   at: string
+  eventId: string
+  streamVersion: number
 }
 
 export interface AlertNotification {
@@ -98,6 +100,113 @@ export interface AlertNotification {
   kind: string
   message: string
   createdAt: string
+  deliveredAt: string | null
+}
+
+/** One event from the event store, with its full envelope. */
+export interface StoredEvent {
+  eventId: string
+  type: string
+  version: number
+  storedVersion: number
+  upcast: boolean
+  streamId: string
+  streamType: 'case' | 'car' | 'trip' | 'pass' | 'detector'
+  streamVersion: number
+  globalPosition: number
+  family: string
+  partitionKey: string
+  occurredAt: string
+  recordedAt: string
+  committedAt: string
+  correlationId: string
+  causationId: string | null
+  actor: string
+  tags: string[]
+  payload: Record<string, unknown>
+  summary: string
+  /** Type of the event that caused this one, wherever it lives. */
+  causeType: string | null
+}
+
+export interface TimelineSubject {
+  kind: 'car' | 'case'
+  id: string
+  streamId: string
+  carId?: string | null
+  tripId?: string | null
+  status?: string
+  tier?: number
+  version?: number
+  caseType?: string | null
+}
+
+export interface EventDetail {
+  event: StoredEvent
+  stored: { version: number; payload: Record<string, unknown> }
+  ancestors: StoredEvent[]
+  children: StoredEvent[]
+  correlatedCount: number
+}
+
+export interface GroupStreamStats {
+  family: string
+  key: string
+  lag: number | null
+  pending: number
+  consumers: number
+  lastDeliveredId: string | null
+  checkpointPosition: number
+  eventsHandled: number
+  stalenessSeconds: number
+  behindEvents: number
+  checkpointAt: string | null
+}
+
+export interface ConsumerGroupStats {
+  group: string
+  kind: 'analyzer' | 'integration' | 'process' | 'projection'
+  description: string
+  handles: string[]
+  tables: string[]
+  streams: GroupStreamStats[]
+  lag: number
+  pending: number
+  stalenessSeconds: number
+  eventsHandled: number
+}
+
+export interface Fault {
+  match: string
+  mode: 'transient' | 'permanent' | 'crash_after_commit'
+  note?: string
+}
+
+export interface OpsOverview {
+  head: { position: number; committedAt: string | null; totalEvents: number }
+  relay: { checkpoint: number; lag: number; updatedAt: string | null }
+  eventsPerSecond: { last10s: number; last60s: number; series: Array<{ t: number; n: number }> }
+  streams: Array<{ family: string; key: string; length: number; lastEventPosition: number }>
+  groups: ConsumerGroupStats[]
+  dlq: { depth: number }
+  timers: { pending: number; overdue: number; fired: number }
+  byType: Array<{ type: string; n: number }>
+  faults: Record<string, Fault>
+  sampledAt: string
+}
+
+export interface DeadLetter {
+  id: string
+  group: string
+  streamKey: string
+  messageId: string
+  eventId: string
+  type: string
+  error: string
+  permanent: boolean
+  attempts: number
+  deadAt: string
+  event: { raw: unknown; upcast: StoredEvent | null }
 }
 
 export interface Trip {

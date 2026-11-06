@@ -16,7 +16,7 @@ With the assistance of LLMs like Claude, we can rapidly prototype lightweight ve
 
 ## System Design Challenges
 
-Each folder contains an independent implementation of a system design problem: **99 implemented projects**, 3 design-only write-ups of external projects, and 14 more planned in [ROADMAP.md](./ROADMAP.md).
+Each folder contains an independent implementation of a system design problem: **102 implemented projects**, 3 design-only write-ups of external projects, and 12 more planned in [ROADMAP.md](./ROADMAP.md).
 
 ### URL Shortening & Web Services
 
@@ -98,7 +98,10 @@ Each folder contains an independent implementation of a system design problem: *
 | [Strava](./strava/) | Fitness tracking and social platform | ✅ Implemented |
 | [Apple Maps](./apple-maps/) | Navigation with real-time traffic | ✅ Implemented |
 | [AirTag](./airtag/) | Item tracking and Find My network | ✅ Implemented |
-| [Railcar Health](./railcar-health/) | Wayside detector predictive maintenance: bearing trending, identity resolution, late data, alerts, car holds and yard inspections | ✅ Implemented |
+| [Railcar Health](./railcar-health/) | Wayside detector predictive maintenance, built as the event-driven reference: event-sourced cases and car history, outbox, projections with replay, DLQ and redrive, versioned event schemas, durable-timer process manager | ✅ Implemented |
+| [Track Hazard Detection](./track-hazard-detection/) | Event-driven track and right-of-way monitoring: camera, vibration, rail-temperature and water events correlated in time and space, priority lane, hazard lifecycle with slow orders and train warnings | ✅ Implemented |
+| [Railcar Trip Plans](./railcar-trip-plans/) | Event-driven car tracking: car events from many producers, per-car fold tolerant of missed and late reads, replanning saga with compensation, dwell-based ETA bands, batched shipper digests | ✅ Implemented |
+| [Freight Quote](./freight-quote/) | Quote API over slow dependencies: deadlines, hedging, coalescing, firm vs indicative, event-driven cache invalidation, async completion; includes a coding exercise | ✅ Implemented |
 | [Locomotive Fueling](./locomotive-fueling/) | Fuel-stop recommendations from locomotive telemetry: noisy sensors, DP optimizer, stable plans, idempotent truck orders | ✅ Implemented |
 
 ### Ticketing, Events & Reservations
@@ -204,7 +207,7 @@ External projects demonstrating system design concepts (with local architecture 
 
 ### Planned Projects
 
-Two rounds are in progress, and their built projects are listed in the tables above. The AI products and developer platforms round has 7 of 18 built: Prompt Playground, AI Chat Client, LLM Chat Analytics, Multi-Org Dashboard, In-App Assistant, File System and Console Growth. The [rail operations track](./ROADMAP.md#rail-operations-track-bnsf) for BNSF Railway loops has 3 of 6 built: Railcar Health, Locomotive Fueling and Storage Remediation. The rest are below. See [ROADMAP.md](./ROADMAP.md) for each project's scope, core entities, hard problems and interview follow-ups.
+Two rounds are in progress, and their built projects are listed in the tables above. The AI products and developer platforms round has 7 of 18 built: Prompt Playground, AI Chat Client, LLM Chat Analytics, Multi-Org Dashboard, In-App Assistant, File System and Console Growth. The [rail operations track](./ROADMAP.md#rail-operations-track-bnsf) for BNSF Railway loops has 6 of 7 built: Railcar Health, Locomotive Fueling, Storage Remediation, Freight Quote, Railcar Trip Plans and Track Hazard Detection. The rest are below. See [ROADMAP.md](./ROADMAP.md) for each project's scope, core entities, hard problems and interview follow-ups.
 
 | Project | Description | Status |
 |---------|-------------|--------|
@@ -216,8 +219,6 @@ Two rounds are in progress, and their built projects are listed in the tables ab
 | [LLM Eval Dashboard](./ROADMAP.md#10-llm-eval-dashboard) | Versioned datasets, async eval runs, and provenance-aware comparisons | 📋 Planned |
 | [CI/CD Platform](./ROADMAP.md#11-cicd-platform) | GitHub Actions-like workflows with job DAGs, runners, and live logs | 📋 Planned |
 | [AI Code Review](./ROADMAP.md#12-ai-code-review) | Design critique and rebuild of an agentic PR auto-approval system | 📋 Planned |
-| [Freight Quote Service](./ROADMAP.md#22-freight-quote-service) | High-traffic quote endpoint over slow pricing and capacity services: budgets, firm vs indicative, shedding | 📋 Planned |
-| [Railcar Trip Plans](./ROADMAP.md#23-railcar-trip-plans-and-etas) | Car tracking against trip plans, missed connections, and dwell-based ETAs for shippers | 📋 Planned |
 | [Yard Switch Lists](./ROADMAP.md#24-yard-switch-lists) | Classification yard planning with replanning, yardmaster overrides and execution feedback | 📋 Planned |
 | [File Cache](./ROADMAP.md#13-file-cache) | Byte-bounded cache for large files with single-flight fills | 📋 Planned |
 | [Model Distribution](./ROADMAP.md#14-model-distribution) | Peer-assisted distribution of a huge file to a fleet, then safe activation | 📋 Planned |
@@ -233,7 +234,9 @@ Some projects rehearse a specific interview format, not only a design question:
 | Leveled online coding assessment | [File System](./file-system/README.md#practice-mode): `npm run practice` shows one level at a time and unlocks the next only when the current one's tests pass. There are two problems, a file store and a key-value database |
 | Product engineering take-home | [Console Growth](./console-growth/): find growth opportunities in a metrics snapshot, then ship two instrumented A/B experiments with a readout |
 | Existing system review round | [Storage Remediation](./storage-remediation/existing-system-review.md): a ten-minute walkthrough script, key decisions with alternatives, an incident and a bank of likely probes. Use it as a template for presenting a system you built |
-| Rail-themed loop (BNSF) | Rehearse in this order: [Railcar Health](./railcar-health/), [Locomotive Fueling](./locomotive-fueling/), then [Storage Remediation](./storage-remediation/). The [rail operations track](./ROADMAP.md#rail-operations-track-bnsf) has format notes and figures for estimates |
+| Rail-themed loop (BNSF) | Rehearse in this order: [Railcar Health](./railcar-health/), [Locomotive Fueling](./locomotive-fueling/), [Storage Remediation](./storage-remediation/), [Freight Quote](./freight-quote/), then [Track Hazard Detection](./track-hazard-detection/). The [rail operations track](./ROADMAP.md#rail-operations-track-bnsf) has format notes, a glossary and figures for estimates |
+| Service-layer coding round | [Freight Quote](./freight-quote/coding-exercise.md): implement a quote endpoint's service layer (parallel calls under a deadline, fallback to cached components, idempotent submit) in 45 minutes; `npm run practice` grades the attempt |
+| Event-driven design | [Railcar Health](./railcar-health/events.md) is the reference: an event catalog, event store as outbox, idempotent consumers, replay, dead letters and schema versions. [Railcar Trip Plans](./railcar-trip-plans/events.md) adds a saga with compensation, and [Track Hazard Detection](./track-hazard-detection/events.md) adds event-time correlation with watermarks |
 
 ## Project Structure
 

@@ -31,3 +31,13 @@ export function useTicker(ms = 5000): void {
     return () => clearInterval(id)
   }, [ms])
 }
+
+/** A counter that increments every `ms`, for pages that poll (the Ops page). */
+export function usePolling(ms = 2000): number {
+  const [n, setN] = useState(0)
+  useEffect(() => {
+    const id = setInterval(() => setN((x) => x + 1), ms)
+    return () => clearInterval(id)
+  }, [ms])
+  return n
+}

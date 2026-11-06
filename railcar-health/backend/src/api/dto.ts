@@ -2,6 +2,7 @@
  * Row-to-JSON mappers. The API speaks camelCase; PostgreSQL speaks snake_case.
  */
 import { TIER_NAMES } from '../shared/domain.js'
+import type { EventEnvelope } from '../events/envelope.js'
 
 const iso = (d: Date | null | undefined) => (d ? d.toISOString() : null)
 
@@ -205,6 +206,55 @@ export function workOrderDto(r: WorkOrderRow) {
     recordedBy: r.recorded_by ?? null,
     holdStatus: r.hold_status ?? null,
   }
+}
+
+const TIMELINE_KIND: Record<string, string> = {
+  AlertRaised: 'opened', AlertEscalated: 'escalated', AlertHandedOff: 'handoff', CarHoldMoved: 'rerouted', AlertAcknowledged: 'acknowledged',
+  AckDeadlineMissed: 'ack_overdue', ApproachingYardWarned: 'approaching_yard', NotificationDelivered: 'delivered', InspectionFindingRecorded: 'inspected',
+  CaseClosed: 'closed', CarHoldPlaced: 'hold_placed', WorkOrderOpened: 'work_order', WorkOrderStarted: 'inspection_started',
+}
+
+type AnyPayload = Record<string, any> // eslint-disable-line @typescript-eslint/no-explicit-any
+
+function timelineNote(e: EventEnvelope): string | null {
+  const p = e.payload as AnyPayload
+  switch (e.type) {
+    case 'AlertRaised':
+    case 'AlertEscalated':
+      return p.routeNote
+    case 'AlertAcknowledged':
+      return `${p.action}${p.note && p.note !== 'Inspection started' ? `: ${p.note}` : ''}`
+    case 'NotificationDelivered':
+      return `Provider accepted the ${p.channel} message for ${p.target} (not yet acknowledged by a person)`
+    case 'InspectionFindingRecorded':
+      return `${String(p.finding).replace(/_/g, ' ')}; ${String(p.disposition).replace('_', ' ')}${p.supersedesFindingId ? ' (supersedes an earlier no-defect finding)' : ''}`
+    case 'CarHoldPlaced':
+      return `Car held at ${p.yardId}`
+    case 'WorkOrderOpened':
+      return `Work order at ${p.yardId}`
+    default:
+      return p.note ?? null
+  }
+}
+
+/** The alert drawer's audit trail, derived from the case stream (notification requests are listed separately). */
+export function caseTimeline(events: EventEnvelope[]) {
+  return events
+    .filter((e) => TIMELINE_KIND[e.type] && !(e.type === 'NotificationDelivered' && !['dispatcher', 'yard'].includes(String(e.payload.channel))))
+    .map((e) => {
+      const p = e.payload as AnyPayload
+      return {
+        kind: TIMELINE_KIND[e.type],
+        tier: e.type === 'AlertRaised' ? p.tier : e.type === 'AlertEscalated' ? p.toTier : null,
+        detectorId: p.trigger?.detectorId ?? null,
+        passId: p.trigger?.passId ?? null,
+        note: timelineNote(e),
+        actor: e.actor,
+        at: e.occurredAt,
+        eventId: e.eventId,
+        streamVersion: e.streamVersion,
+      }
+    })
 }
 
 export { iso }
