@@ -1,0 +1,67 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Surfaces as RGB triplets; the signed-in user's appearance.theme picks the set. */
+:root {
+  --page: 246 247 251;
+  --surface: 255 255 255;
+  --sunken: 241 243 248;
+  --line: 226 229 238;
+  --ink: 17 24 39;
+  --muted: 75 85 99;
+  --faint: 140 148 163;
+  color-scheme: light;
+  /* appearance.font_scale sets this; every rem-based size follows. */
+  font-size: var(--font-scale, 100%);
+}
+
+:root.dark {
+  --page: 14 17 27;
+  --surface: 23 27 40;
+  --sunken: 31 36 52;
+  --line: 48 54 74;
+  --ink: 236 239 246;
+  --muted: 170 178 196;
+  --faint: 118 127 148;
+  color-scheme: dark;
+}
+
+body {
+  @apply bg-page text-ink antialiased;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+}
+
+:root.reduce-motion *,
+:root.reduce-motion *::before,
+:root.reduce-motion *::after {
+  animation-duration: 0s !important;
+  transition-duration: 0s !important;
+}
+
+@layer components {
+  .card {
+    @apply rounded-xl border border-line bg-surface shadow-sm;
+  }
+  .btn {
+    @apply inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-sm font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50;
+  }
+  .btn-primary {
+    @apply btn bg-accent-600 text-white hover:bg-accent-700;
+  }
+  .btn-ghost {
+    @apply btn border border-line bg-surface text-ink hover:bg-sunken;
+  }
+  .field {
+    @apply rounded-lg border border-line bg-surface px-2.5 py-1.5 text-sm text-ink focus:border-accent-500 focus:outline-none focus:ring-2 focus:ring-accent-500/30 disabled:cursor-not-allowed disabled:bg-sunken disabled:text-muted;
+  }
+  .setting-row {
+    @apply flex flex-wrap items-start justify-between gap-x-6 gap-y-2 px-5 py-4;
+  }
+  :root[data-density='compact'] .setting-row {
+    @apply py-2;
+  }
+  .chip {
+    @apply inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-medium;
+  }
+}

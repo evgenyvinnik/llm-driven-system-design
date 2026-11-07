@@ -1,0 +1,64 @@
+{
+  "name": "settings-service",
+  "frontendPort": 5173,
+  "backendRequired": true,
+  "dbName": "settings_service",
+  "dbUser": "settings",
+  "auth": {
+    "enabled": true,
+    "loginUrl": "/login",
+    "credentials": { "username": "alice", "password": "password123" },
+    "usernameSelector": "input[name='username']",
+    "passwordSelector": "input[name='password']",
+    "submitSelector": "button[type='submit']",
+    "successIndicator": "main"
+  },
+  "screens": [
+    { "name": "01-login", "path": "/login", "waitFor": "form", "skipAuth": true, "delay": 500 },
+    { "name": "02-preferences", "path": "/settings", "waitFor": "[data-ready='true']", "delay": 1200, "fullPage": true },
+    {
+      "name": "03-preferences-globex-dark",
+      "path": "/settings",
+      "waitFor": "[data-ready='true']",
+      "delay": 1200,
+      "loginAs": { "username": "dave", "password": "password123" }
+    },
+    { "name": "04-two-devices", "path": "/devices", "waitFor": "[data-device='laptop'] [data-live='live']", "delay": 1200 },
+    {
+      "name": "05-same-key-conflict",
+      "path": "/devices",
+      "waitFor": "[data-device='laptop'] [data-live='live']",
+      "steps": [
+        { "click": "[data-device='laptop'] [data-action='freeze']", "delay": 500 },
+        { "select": "[data-device='phone'] select[name='notifications.email_digest']", "value": "daily", "delay": 1200 },
+        { "select": "[data-device='laptop'] select[name='notifications.email_digest']", "value": "off", "delay": 1500 }
+      ],
+      "delay": 500
+    },
+    {
+      "name": "06-lost-response",
+      "path": "/devices",
+      "waitFor": "[data-device='laptop'] [data-live='live']",
+      "steps": [
+        { "click": "[data-action='arm-chaos']", "delay": 800 },
+        { "select": "[data-device='phone'] select[name='regional.week_start']", "value": "monday", "delay": 3000 }
+      ],
+      "delay": 500
+    },
+    {
+      "name": "07-org-policy",
+      "path": "/admin",
+      "waitFor": "table[aria-label='Org policy']",
+      "delay": 1200,
+      "loginAs": { "username": "admin", "password": "password123" }
+    },
+    {
+      "name": "08-catalog",
+      "path": "/catalog",
+      "waitFor": "table[aria-label='Setting definitions']",
+      "delay": 1200,
+      "loginAs": { "username": "admin", "password": "password123" }
+    }
+  ],
+  "viewport": { "width": 1440, "height": 900 }
+}

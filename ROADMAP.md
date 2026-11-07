@@ -37,10 +37,10 @@ Sources surveyed: Glassdoor, Aced (formerly Exponent) and Hello Interview. Proje
 |---|---------|--------|------|--------|-----------|
 | 1 | [Prompt Playground](#1-prompt-playground) ✅ Built | [`prompt-playground/`](./prompt-playground/) | 1 | OpenAI (candidate report); OpenAI, Anthropic (community) | mcplator |
 | 2 | [AI Chat Client](#2-ai-chat-client) ✅ Built | [`ai-chat/`](./ai-chat/) | 1 | OpenAI (community); Anthropic (candidate reports of frontend design rounds, including a desktop variant) | prompt-playground, imessage, mcplator |
-| 3 | [Settings Service](#3-settings-service) | `settings-service/` | 1 | OpenAI (candidate report) | — |
+| 3 | [Settings Service](#3-settings-service) ✅ Built | [`settings-service/`](./settings-service/) | 1 | OpenAI (candidate report) | — |
 | 4 | [LLM Chat Analytics](#4-llm-chat-analytics) ✅ Built | [`llm-chat-analytics/`](./llm-chat-analytics/) | 1 | Anthropic (community; guide-reported) | ad-click-aggregator, dashboarding |
-| 5 | [LLM Inference API](#5-llm-inference-api) | `llm-inference-api/` | 1 | Anthropic (candidate reports, including batching and routing variants) | rate-limiter, scalable-api |
-| 6 | [Webhook Platform](#6-webhook-platform) | `webhook-platform/` | 1 | OpenAI (community) | payment-system, stripe |
+| 5 | [LLM Inference API](#5-llm-inference-api) ✅ Built | [`llm-inference-api/`](./llm-inference-api/) | 1 | Anthropic (candidate reports, including batching and routing variants) | rate-limiter, scalable-api |
+| 6 | [Webhook Platform](#6-webhook-platform) ✅ Built | [`webhook-platform/`](./webhook-platform/) | 1 | OpenAI (community) | payment-system, stripe |
 | 7 | [Multi-Org Dashboard](#7-multi-org-dashboard) ✅ Built | [`multi-org-dashboard/`](./multi-org-dashboard/) | 2 | Practice extension (frontend practice sheet); Anthropic (candidate report of a prompt-sharing variant) | prompt-playground, slack, notion |
 | 8 | [Document Q&A](#8-document-qa) | `document-qa/` | 2 | Practice extension | dropbox, fb-post-search |
 | 9 | [Experimentation Platform](#9-experimentation-platform) | `experimentation-platform/` | 2 | Practice extension | — |
@@ -61,7 +61,7 @@ Sources surveyed: Glassdoor, Aced (formerly Exponent) and Hello Interview. Proje
 | 24 | [Yard Switch Lists](#24-yard-switch-lists) | `yard-switch-lists/` | Rail | Practice extension (BNSF describes the system publicly) | job-scheduler, railcar-health |
 | 25 | [Track Hazard Detection](#25-track-hazard-detection) ✅ Built | [`track-hazard-detection/`](./track-hazard-detection/) | Rail | BNSF (candidate report, Reddit) | railcar-health |
 
-- **Tier 1** covers the core product-facing work for AI and full-stack roles. Build these first, in the order listed.
+- **Tier 1** covers the core product-facing work for AI and full-stack roles. All six are built.
 - **Tier 2** covers variations on tier-1 designs. Each reuses a tier-1 data model or an existing project's patterns.
 - **Tier 3** covers infrastructure specialties and lower-relevance topics. Build these when a target role calls for them.
 - **Rail** covers prompts reported for BNSF Railway loops and the domain around them. See the [rail operations track](#rail-operations-track-bnsf) for the rehearsal order.
@@ -204,6 +204,8 @@ Each answer should also walk through **one successful and one failed execution t
 
 **Folder:** `settings-service/` · **Signal:** OpenAI (candidate report: a supplied preferences UI, with the task of designing its APIs and server side)
 
+**Status:** ✅ Built. See [settings-service/](./settings-service/) and its [architecture.md](./settings-service/architecture.md). The entry below is kept as the original brief.
+
 **Problem.** An application already has a preferences screen. Design the persistence, APIs, validation and sync it needs to work correctly. Keep the project deliberately small. Its value is a precise contract.
 
 **Core entities.**
@@ -274,6 +276,8 @@ Each answer should also walk through **one successful and one failed execution t
 
 **Folder:** `llm-inference-api/` · **Signal:** Anthropic (candidate reports covering an API-focused exercise on sampling, batching and request orchestration; a batching round; and a routing round with sticky assignment)
 
+**Status:** ✅ Built. See [llm-inference-api/](./llm-inference-api/) and its [architecture.md](./llm-inference-api/architecture.md). The entry below is kept as the original brief.
+
 **Problem.** A multi-tenant developer API that exposes a model. It supports request submission, streamed or asynchronous output, cancellation, usage accounting and overload handling. Two reported variants become deep dives: batching requests onto limited compute, and routing requests across model-serving backends. The batching variant uses one accelerator that processes up to 100 inputs at a time; treat that as an exercise assumption, not a real serving limit.
 
 **Core entities.**
@@ -308,6 +312,8 @@ Each answer should also walk through **one successful and one failed execution t
 ### 6. Webhook Platform
 
 **Folder:** `webhook-platform/` · **Signal:** OpenAI (community attribution)
+
+**Status:** ✅ Built. See [webhook-platform/](./webhook-platform/) and its [architecture.md](./webhook-platform/architecture.md). The entry below is kept as the original brief.
 
 **Problem.** Customers register callback URLs, and the platform sends them HTTP notifications when events occur. It retries failed deliveries, keeps delivery history and supports manual replay. The payment-system and stripe projects deliver webhooks as one component. This project makes delivery the whole product.
 
