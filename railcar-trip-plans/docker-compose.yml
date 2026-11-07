@@ -1,0 +1,38 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: railcar-trip-plans-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: trips
+      POSTGRES_PASSWORD: trips_password
+      POSTGRES_DB: trip_plans
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trips -d trip_plans"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Service name "redis" is what the repo's screenshot/triage scripts look for.
+  # Valkey Streams stand in for Kafka (topic partitions, consumer groups, retry and DLQ streams),
+  # plus sessions, partition leases and the simulation clock.
+  redis:
+    image: valkey/valkey:7.2-alpine
+    container_name: railcar-trip-plans-valkey
+    ports:
+      - "6379:6379"
+    command: valkey-server --appendonly yes
+    volumes:
+      - valkey_data:/data
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  postgres_data:
+  valkey_data:

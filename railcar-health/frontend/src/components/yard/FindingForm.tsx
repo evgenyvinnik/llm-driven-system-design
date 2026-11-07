@@ -55,7 +55,7 @@ export function FindingForm({ workOrder, onDone }: { workOrder: WorkOrder; onDon
       })
       onDone(result)
     } catch (err) {
-      setError(err instanceof ApiError ? `${err.message}${err.code === 'ALREADY_COMPLETED' ? ' (someone else recorded it)' : ''}` : 'Submit failed')
+      setError(err instanceof ApiError ? `${err.message}${err.code === 'ALREADY_COMPLETED' ? ' (someone else recorded it)' : ''}${err.code === 'FINDING_CONFLICT' ? ' (another tablet already recorded a defect for this car)' : ''}` : 'Submit failed')
     } finally {
       setBusy(false)
     }

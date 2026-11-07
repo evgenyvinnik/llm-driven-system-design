@@ -14,6 +14,8 @@ import { Route as AdminRouteImport } from './routes/admin'
 import { Route as AlertsRouteImport } from './routes/alerts'
 import { Route as DetectorsRouteImport } from './routes/detectors'
 import { Route as LoginRouteImport } from './routes/login'
+import { Route as OpsRouteImport } from './routes/ops'
+import { Route as TimelineRouteImport } from './routes/timeline'
 import { Route as YardRouteImport } from './routes/yard'
 import { Route as CarsCarIdRouteImport } from './routes/cars.$carId'
 import { Route as TrainsIndexRouteImport } from './routes/trains.index'
@@ -44,6 +46,16 @@ const LoginRoute = LoginRouteImport.update({
   path: '/login',
   getParentRoute: () => rootRouteImport,
 } as any)
+const OpsRoute = OpsRouteImport.update({
+  id: '/ops',
+  path: '/ops',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const TimelineRoute = TimelineRouteImport.update({
+  id: '/timeline',
+  path: '/timeline',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const YardRoute = YardRouteImport.update({
   id: '/yard',
   path: '/yard',
@@ -71,6 +83,8 @@ export interface FileRoutesByFullPath {
   '/alerts': typeof AlertsRoute
   '/detectors': typeof DetectorsRoute
   '/login': typeof LoginRoute
+  '/ops': typeof OpsRoute
+  '/timeline': typeof TimelineRoute
   '/yard': typeof YardRoute
   '/cars/$carId': typeof CarsCarIdRoute
   '/trains/$tripId': typeof TrainsTripIdRoute
@@ -82,6 +96,8 @@ export interface FileRoutesByTo {
   '/alerts': typeof AlertsRoute
   '/detectors': typeof DetectorsRoute
   '/login': typeof LoginRoute
+  '/ops': typeof OpsRoute
+  '/timeline': typeof TimelineRoute
   '/yard': typeof YardRoute
   '/cars/$carId': typeof CarsCarIdRoute
   '/trains/$tripId': typeof TrainsTripIdRoute
@@ -94,6 +110,8 @@ export interface FileRoutesById {
   '/alerts': typeof AlertsRoute
   '/detectors': typeof DetectorsRoute
   '/login': typeof LoginRoute
+  '/ops': typeof OpsRoute
+  '/timeline': typeof TimelineRoute
   '/yard': typeof YardRoute
   '/cars/$carId': typeof CarsCarIdRoute
   '/trains/$tripId': typeof TrainsTripIdRoute
@@ -107,6 +125,8 @@ export interface FileRouteTypes {
     | '/alerts'
     | '/detectors'
     | '/login'
+    | '/ops'
+    | '/timeline'
     | '/yard'
     | '/cars/$carId'
     | '/trains/$tripId'
@@ -118,6 +138,8 @@ export interface FileRouteTypes {
     | '/alerts'
     | '/detectors'
     | '/login'
+    | '/ops'
+    | '/timeline'
     | '/yard'
     | '/cars/$carId'
     | '/trains/$tripId'
@@ -129,6 +151,8 @@ export interface FileRouteTypes {
     | '/alerts'
     | '/detectors'
     | '/login'
+    | '/ops'
+    | '/timeline'
     | '/yard'
     | '/cars/$carId'
     | '/trains/$tripId'
@@ -141,6 +165,8 @@ export interface RootRouteChildren {
   AlertsRoute: typeof AlertsRoute
   DetectorsRoute: typeof DetectorsRoute
   LoginRoute: typeof LoginRoute
+  OpsRoute: typeof OpsRoute
+  TimelineRoute: typeof TimelineRoute
   YardRoute: typeof YardRoute
   CarsCarIdRoute: typeof CarsCarIdRoute
   TrainsTripIdRoute: typeof TrainsTripIdRoute
@@ -184,6 +210,20 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof LoginRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/ops': {
+      id: '/ops'
+      path: '/ops'
+      fullPath: '/ops'
+      preLoaderRoute: typeof OpsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/timeline': {
+      id: '/timeline'
+      path: '/timeline'
+      fullPath: '/timeline'
+      preLoaderRoute: typeof TimelineRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/yard': {
       id: '/yard'
       path: '/yard'
@@ -221,6 +261,8 @@ const rootRouteChildren: RootRouteChildren = {
   AlertsRoute: AlertsRoute,
   DetectorsRoute: DetectorsRoute,
   LoginRoute: LoginRoute,
+  OpsRoute: OpsRoute,
+  TimelineRoute: TimelineRoute,
   YardRoute: YardRoute,
   CarsCarIdRoute: CarsCarIdRoute,
   TrainsTripIdRoute: TrainsTripIdRoute,

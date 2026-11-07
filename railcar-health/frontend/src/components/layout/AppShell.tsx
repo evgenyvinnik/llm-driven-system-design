@@ -1,6 +1,6 @@
 import { Link } from '@tanstack/react-router'
 import { useEffect, type ReactNode } from 'react'
-import { AlertIcon, GaugeIcon, LogoutIcon, SignalIcon, TrainIcon, WrenchIcon } from '@/components/icons'
+import { AlertIcon, GaugeIcon, LogoutIcon, SignalIcon, StreamIcon, TrainIcon, WrenchIcon } from '@/components/icons'
 import { connectLive } from '@/services/live'
 import { useAuthStore } from '@/stores/auth-store'
 import { useClockStore } from '@/stores/clock-store'
@@ -13,6 +13,7 @@ const NAV: Array<{ to: string; label: string; Icon: typeof AlertIcon; roles: Rol
   { to: '/yard', label: 'Yard', Icon: WrenchIcon, roles: ['yard', 'admin'] },
   { to: '/detectors', label: 'Detectors', Icon: SignalIcon, roles: ['dispatcher', 'admin', 'yard'] },
   { to: '/admin', label: 'Reliability', Icon: GaugeIcon, roles: ['admin'] },
+  { to: '/ops', label: 'Ops / Streams', Icon: StreamIcon, roles: ['admin'] },
 ]
 
 const ROLE_LABEL: Record<Role, string> = { dispatcher: 'Dispatcher', yard: 'Car inspector', admin: 'Reliability engineer' }

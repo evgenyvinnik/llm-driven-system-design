@@ -230,3 +230,5 @@ async function main(): Promise<void> {
 }
 
 await main()
+// The shared Valkey client opened by importing shared/cache keeps the event loop alive: exit explicitly.
+process.exit(0)

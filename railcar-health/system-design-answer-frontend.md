@@ -2,7 +2,7 @@
 
 *Frontend engineer interview · 45 minutes · Users and requirements → Architecture → State and data flow → Alert queue → Heatmap and trends → Yard tablet → Deep dives → Traces → Follow-ups*
 
-> "The prompt is hot-bearing monitoring and the yard response for about 200,000 railcars. On the frontend there are really three products sharing one backend. A dispatcher console: a queue of risk alerts that someone has to triage under pressure, where every false alarm costs trust and every missed one could cost a derailment. A yard tablet: car inspectors walking a yard with patchy coverage, who must record what they found exactly once. And a reliability view: engineers tuning thresholds from inspection outcomes. The detector already radios its own alarm to the crew, so none of these screens is in the safety path. My job is to make early warning usable: show *why* an alert exists, *how old* its evidence is, *who owns it* and *what to do*, and never let a flaky connection lose or duplicate a finding."
+> "The prompt is hot-bearing monitoring and the yard response for about 200,000 railcars. On the frontend there are really three products sharing one backend. A dispatcher console: a queue of risk alerts that someone has to triage under pressure, where every false alarm costs trust and every missed one could cost a derailment. A yard tablet: car inspectors walking a yard with patchy coverage, who must record what they found exactly once. And a reliability view: engineers tuning thresholds from inspection outcomes. The detector already radios its own alarm to the crew, so none of these screens is in the safety path. My job is to make early warning usable: show *why* an alert exists, *how old* its evidence is, *who owns it* and *what to do*, and never let a flaky connection lose or duplicate a finding. The backend is event-driven: each alert case is an event-sourced stream, so I also get to show its history, event by event, and I have to design for read models that trail their events by a moment."
 
 | Phase | Time | What the interviewer should leave with |
 |-------|------|----------------------------------------|
@@ -10,7 +10,8 @@
 | Architecture and state | ~6 min | REST as truth, SSE as invalidation, server clock, small stores |
 | Alert queue and detail | ~6 min | Triage order, badges that carry meaning, the lifecycle stepper |
 | Heatmap and trend chart | ~5 min | One picture that shows a trend across detectors |
-| Deep dives | ~14 min | Triage under fatigue; SSE vs polling vs WebSocket; offline tablet |
+| Event timeline and ops | ~3 min | Every event with its two clocks and its lineage; lag and dead letters as a screen |
+| Deep dives | ~14 min | Triage under fatigue; SSE vs polling vs WebSocket; offline tablets against an event-sourced case |
 | Traces and follow-ups | ~9 min | One success, one failure, four follow-ups |
 
 ---
@@ -64,7 +65,8 @@
 ┌────────────────────────────────────────────────────────────────────────┐
 │ React SPA (Vite, TanStack Router, Zustand, Tailwind)                   │
 │                                                                        │
-│  routes: /alerts  /trains/$id  /cars/$id  /yard  /detectors  /admin    │
+│  routes: /alerts /trains/$id /cars/$id /yard /detectors /admin         │
+│          /timeline?car=|case=   /ops                                   │
 │                                                                        │
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌────────────┐  │
 │  │ auth store   │  │ clock store  │  │ live store   │  │ offline    │  │
@@ -77,13 +79,15 @@
           ▼                                   │ (ids only)     ▼ (same submission id)
 ┌──────────────────────────────────────────────┴────────────────────────┐
 │ API: alerts · trips · cars · yards · work orders · network · admin    │
-│      /events (SSE, filtered per viewer)                                │
+│      reads PROJECTIONS · commands append to CASE STREAMS              │
+│      /event-log (timelines from the event store) · /ops (lag, DLQ)    │
+│      /events (SSE, sent after a projection commits, filtered)         │
 └────────────────────────────────────────────────────────────────────────┘
 ```
 
 **Walking the diagram:**
 
-1. Every screen reads through a typed API client. The server is the source of truth for alerts, owners, holds and findings.
+1. Every screen reads through a typed API client. The server is the source of truth: queues read projections built from events, commands append events to a case stream, and timelines read the event store itself.
 2. One SSE connection per tab carries small notices: "alert X escalated", "work order changed at CDJ", "detector status changed". Each notice bumps a per-topic revision in a Zustand store. Pages list the revisions they care about as effect dependencies and refetch.
 3. Every list response carries the server's clock, which the clock store keeps and extrapolates. Relative ages, ack countdowns and "data 70 min late" all use it.
 4. The yard tablet's finding form goes through an offline queue that persists to local storage and resends with the same submission id.
@@ -99,6 +103,8 @@
 | /yard | — | Their yard only | Any yard |
 | /detectors | Yes | Yes | Yes |
 | /admin | — | — | Yes |
+| /timeline | Any car or case | Cars; cases of their yard only (server-enforced) | Any |
+| /ops | — | — | Yes |
 
 ### State placement
 
@@ -218,6 +224,24 @@ The score is an **inspection priority**: how likely the bearing is defective if 
 
 ---
 
+## 🧾 Event Timeline and Ops / Streams (~3 min)
+
+```
+┌ Event timeline · HPRX 555001 ──────────────────────────────┬ Selected event ──────────────┐
+│ [Identity 1] [Trends 1] [Cars 1]                3 events   │ BearingTrendUpdated  v1      │
+│ #1324 00:27  rec 01:27 · learned 1 h later                 │ stream trip-DEMO… #13        │
+│       ComponentReplaced v1  car-HPRX 555001 #1 · bob       │ occurred 23:27 (event time)  │
+│       Axle 2: wheelset WS-2026-118842 installed            │ recorded 01:27 (2 h later)   │
+│ #1340 23:27  rec 01:27 · learned 2 h later                 │ correlation pass:HBD-100/…   │
+│       BearingTrendUpdated v1  ↳ caused by AxleReadings…    │ CHAIN PassRecorded →         │
+│       L2 reading predates the current wheelset: history    │   AxleReadingsRecorded → this│
+└────────────────────────────────────────────────────────────┴──────────────────────────────┘
+```
+
+- **The timeline** lists every event about a car (its own stream, its cases, its trips) or about a case (its stream plus what caused it and what it caused), in commit order. Each row has the two clocks side by side, event time and recorded time, with a "learned 2 h later" chip when they differ: that one chip explains every late-data question. It shows the type, the schema version ("v1→v2" in amber when an old event was upcast on read), the stream and its version, a colour per correlation id so one business flow reads as one colour down the list, and a "caused by" link. Clicking opens the full envelope, the payload (and the stored payload when it was upcast) and the causation chain from the root event to the events this one caused.
+- **Who it's for.** A dispatcher asking "why is this car held at Ridgeway?" follows `CarHoldMoved` back to the `TripPositionUpdated` that triggered it. A reliability engineer checks that a reading from before a wheelset swap was set aside. And it's the best debugging view the team has.
+- **Ops / Streams** (reliability engineers) shows the pipeline as numbers: events per second as a sparkline, relay lag, consumer lag and pending per group and topic, projection staleness in seconds, durable timers, and the dead-letter list with the error, the attempt count, the raw payload and a Redrive button. It polls every 2 seconds; it is a control room, not a page that needs push.
+
 ## 🧱 Component Structure (~1 min)
 
 | Area | Components | Notes |
@@ -229,6 +253,8 @@ The score is an **inspection priority**: how likely the bearing is defective if 
 | Yard | WorkOrderCard, FindingForm, HoldsPanel, OutboundCheck | Finding form owns its submission id |
 | Detectors | StripMap, DetectorTable, DetectorDetail | Coverage badge per detector |
 | Admin | PrecisionTable, ThresholdForm, BacktestResult | Version-checked save |
+| Events | EventList, EventRow, EventDetailPanel, PayloadView | Family filters; selection in `?event=` |
+| Ops | OpsTiles, Sparkline, GroupTable, DeadLetters, FaultPanel | Polled; redrive and fault injection |
 
 Each component stays under ~150 lines; icons are separate components; API calls live in `services/`.
 
@@ -258,19 +284,23 @@ Each component stays under ~150 lines; icons are separate components; API calls 
 
 **Why a WebSocket with pushed state fails.** A bidirectional socket that pushes alert objects tempts you into a client-side store mutated by deltas. Then reconnects need sequence numbers and replay, multiple tabs diverge, and every permission check has to be duplicated in the push path. None of that buys anything when the client never needs to send on the socket.
 
+**Notices wait for the read model.** Screens read projections that trail their events by tens of milliseconds. If a notice went out when the event was written, the refetch could race the projector and show the old state. So the projector sends the notice after it commits, and a command answers from the aggregate itself (the new version, the new status), so the person who acted sees their own write at once.
+
 **What I give up.** A notice costs a refetch (cheap: queues are small lists), and SSE needs care with proxies that buffer (the server sets no-transform headers and sends keep-alive comments). If the connection is down, the shell shows "Reconnecting…" and the page still works from its last fetch.
 
-### Deep dive 3: The offline-tolerant yard tablet and idempotent findings
+### Deep dive 3: Offline tablets against an event-sourced case
 
-**Decision:** the finding form gets a `clientSubmissionId` when it opens; submissions that fail with no network go into a persistent local queue and are resent with the same id until the server answers.
+**Decision:** the backend models each alert case as an event-sourced stream with versions; readings stay plain facts announced through an outbox. On the tablet, the finding form gets a `clientSubmissionId` when it opens, failed submissions wait in a persistent local queue and are resent with the same id, and any conflict is settled by a domain rule on the server, never by whichever tablet synced last.
 
-**Why it works.** Yards have dead spots, and an inspector standing between two tank cars can't wait for Wi-Fi. When they tap "Record finding", the tablet either gets an answer or keeps the submission locally. A banner says "1 finding waiting to sync", and the queue flushes on the browser's `online` event, on a timer and on demand. The server treats the submission id as the idempotency key: a resend returns the stored finding (`replayed`) instead of recording a second one. So a double tap, a retry after a timeout, or a resend after the app was killed all produce exactly one finding, one closed or inspected alert, one released or bad-ordered hold.
+**Why the case is a stream and the readings aren't, from where I sit.** A case is touched by many hands: the analyzer escalates it, a process manager hands it to another desk, a dispatcher acknowledges it, two inspectors with patchy coverage inspect the same car. Each command carries the version it was looking at, so the server can tell *what changed since you looked*. That turns every conflict into something the UI can explain instead of a silent overwrite. The readings are different: millions of immutable values with no rule between them, nothing anyone edits, so there is nothing to version and nothing to show but the data itself. They stay facts, and my heatmap reads them directly.
 
-**Why "just retry the POST" fails.** Without a client-chosen id, a request that reached the server but whose response was lost is indistinguishable from one that never arrived. Retrying records a second finding. If the two disagree (the inspector changed their mind), the label data is corrupted, and the precision numbers the thresholds are tuned on are wrong. Generating the id on submit instead of on open has its own bug: a double tap generates two ids.
+**How the tablet uses it.** When Bob taps "Record finding" in a dead spot, the tablet keeps the submission and shows "1 finding waiting to sync". Back in coverage it resends with the same id; a lost response followed by a resend comes back `replayed`, the stored finding. If a second inspector already recorded a finding for the same work order, the server compares severity: a later defect supersedes an earlier "no defect" (the car is held again and the case goes back to *inspected*), and a later "no defect" against a recorded defect is refused with 409 `FINDING_CONFLICT` and the stored finding, which the tablet shows to the inspector. The tablet records `observedAt` (when he looked) apart from the server's `recordedAt`, and the case timeline shows both.
 
-**Conflicts are a server decision.** If another inspector recorded a finding for the same work order first, the server answers 409 `ALREADY_COMPLETED` with their finding. The queue drops the local copy and tells the user: the first finding stands, and the second inspector's notes don't silently overwrite it. The tablet also records `observedAt` (when the inspector looked) separately from the server's `recordedAt`, so a finding synced an hour later still shows when the car was actually inspected.
+**Why a mutable row plus "retry the POST" fails.** Without a client-chosen id, a request that reached the server but lost its response is indistinguishable from one that never arrived, so a retry records a second finding. Without versions, two tablets that disagree end with whichever synced last: a "no defect" synced late can erase a "bearing defect", release the hold and send a bad bearing out in the next train. Generating the id on submit instead of on open has its own bug: a double tap makes two ids.
 
-**What I give up.** Local storage can be cleared or blocked; the queue is best-effort for a single device, not a sync engine. A finding queued offline doesn't release the hold until it syncs, which is the safe direction to fail.
+**The same idea on the dispatcher's console.** An acknowledgment carries the version the dispatcher saw. If only bookkeeping happened since (a delivery receipt, a deadline timer re-armed), the server rebases it; if the alert escalated, it answers 409 with the list of changes ("AlertEscalated") and the drawer explains what changed before she acknowledges again.
+
+**What I give up.** Read models trail events, so I rely on the command response for my own writes and on notices sent after the projection commits. Local storage can be cleared or blocked; the queue is best-effort for one device, not a sync engine. A finding queued offline doesn't release the hold until it syncs, which is the safe direction to fail. And the server's rules have to be explained in the UI, or a refused finding just looks like a bug.
 
 ---
 
@@ -281,14 +311,15 @@ Each component stays under ~150 lines; icons are separate components; API calls 
 1. The analyzer escalates NRLX 304512 R3 to HIGH and commits. The owner is the West desk, ack due in 15 minutes. The API instance's subscriber relays the notice to every SSE client allowed to see it.
 2. Alice's tab receives `alert.escalated`. The live store bumps the alerts revision and records the id. The queue refetches, and the row moves to the top and flashes.
 3. She opens it. The URL becomes `/alerts?alert=…`, and the drawer fetches the detail: reasons, lifecycle (opened, delivered), "ack due in 14 min", route note.
-4. She picks "Set-out planned at next siding" and submits with the alert's version. The server updates status, owner acknowledgment and version, and writes an audit event and a notice. Every console refetches, and the row now shows "acknowledged by alice".
+4. She picks "Set-out planned at next siding" and submits with the case version she saw. Only a delivery receipt was appended since, so the server rebases and appends `AlertAcknowledged`, answering with the new version and status straight from the case. The projector applies it and sends the notice; every console refetches, and the row shows "acknowledged by alice". The case timeline gains one row, caused by the event she was looking at.
 
 ### Failed trace: the alert changes under her, then the tablet goes offline
 
-1. While Alice reads the drawer, the next pass escalates the alert to CRITICAL (version 3 → 4). Her acknowledgment carries version 3. The server answers 409 `STALE_ALERT` with the current alert.
+1. While Alice reads the drawer, the next pass escalates the alert to CRITICAL (`AlertEscalated` appended at version 4). Her acknowledgment carries version 3. The server answers 409 `STALE_ALERT` with the current alert and the change list.
 2. The form shows "This alert changed since you opened it" and the drawer refetches: CRITICAL, a new deadline, "Stop and inspect". She acknowledges again, this time knowingly.
 3. At Cedar Junction, Bob records "journal bearing defect, bad order" for SVTX 961204 in a dead spot. The fetch fails with no response; the offline queue stores it under submission id 9da9bcd3 and the banner shows one pending.
 4. Back in coverage, the `online` event flushes the queue. The first resend's response is lost again; the next resend returns 200 `replayed`. One finding, the alert *inspected*, the hold *bad-ordered*, and the dispatcher queue updates via SSE.
+5. A second tablet that was offline syncs "no defect" for the same car. The server refuses it (409 `FINDING_CONFLICT`) because a defect is already recorded; the tablet shows the stored finding and drops its copy.
 
 ---
 
@@ -296,10 +327,10 @@ Each component stays under ~150 lines; icons are separate components; API calls 
 
 | Question | Answer (frontend view) |
 |----------|------------------------|
-| Source of truth; when is a write successful? | The API. A write is successful when the server answers 2xx; the UI never assumes success, except to show "waiting to sync" |
-| Client retries after losing the response? | Findings and installs carry client ids (replayed on resend); acknowledgments carry a version (409 if stale) |
-| Server fails between two steps? | The UI refetches on reconnect; a missed SSE notice only delays a refresh |
-| Ordering required? | None on the client. Notices are invalidations, the refetch returns the current state |
+| Source of truth; when is a write successful? | The case streams behind the API. A write is successful when the server answers 2xx, which means its events were appended; the UI never assumes success, except to show "waiting to sync" |
+| Client retries after losing the response? | Findings and installs carry client ids (replayed on resend); acknowledgments carry a version (rebased over bookkeeping, 409 if a decision changed) |
+| Server fails between two steps? | The UI refetches on reconnect; a missed SSE notice only delays a refresh; a stuck integration shows up on the Ops page as lag or a dead letter |
+| Ordering required? | None on the client. Notices are invalidations, the refetch returns the current state; timelines are in commit order |
 | Access with caches and async jobs? | SSE is filtered per viewer and carries ids only; every read is role-checked; route guards are convenience, not security |
 | What breaks first at scale? | Human attention (queue length, overdue acknowledgments), shown by the tier counts and the reliability page; then SSE connection counts per API instance |
 
@@ -344,6 +375,9 @@ Each component stays under ~150 lines; icons are separate components; API calls 
 | Time | Server clock | Browser clock | Simulated time locally; skew-proof in production |
 | Filters | URL search params | Component state | Shareable, refresh-safe |
 | Data layer | Small fetch hook + revision store | Normalized client cache | Lists are small; invalidation stays trivial |
+| Case model | Event-sourced stream with versions | Mutable row | Conflicts the UI can explain; a timeline for free |
+| Two tablets disagree | Most severe finding wins | Last sync wins | A defect is never erased |
+| Notice timing | After the projection commits | When the event is written | A refetch never races the read model |
 
 ## 📝 Wrap-up (~1 min)
 
@@ -351,4 +385,4 @@ Each component stays under ~150 lines; icons are separate components; API calls 
 
 ### How the local implementation compares
 
-The frontend is React 19 with TanStack Router file routes, Zustand stores for auth, clock and live revisions, Tailwind, and SVG charts without a chart library. Pages: `/alerts` (queue and drawer with lifecycle stepper), `/trains/$tripId` (heatmap), `/cars/$carId` (trend, bearing picker, wheelset history), `/yard` (work orders, offline finding queue, holds, outbound check), `/detectors` (strip map, coverage), `/admin` (precision, audits, thresholds with backtest). Playwright screenshots of each are in `screenshots/`.
+The frontend is React 19 with TanStack Router file routes, Zustand stores for auth, clock and live revisions, Tailwind, and SVG charts without a chart library. Pages: `/alerts` (queue and drawer with lifecycle stepper), `/trains/$tripId` (heatmap), `/cars/$carId` (trend, bearing picker, wheelset history), `/yard` (work orders, offline finding queue, holds, outbound check), `/detectors` (strip map, coverage), `/admin` (precision, audits, thresholds with backtest), `/timeline?car=…|case=…` (event timeline with payloads and causation chains) and `/ops` (consumer lag, staleness, dead letters with redrive). Playwright screenshots of each are in `screenshots/`.

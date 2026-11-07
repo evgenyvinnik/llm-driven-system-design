@@ -1,0 +1,25 @@
+{
+  "name": "railcar-trip-plans",
+  "frontendPort": 5173,
+  "backendRequired": true,
+  "dbName": "trip_plans",
+  "dbUser": "trips",
+  "auth": {
+    "enabled": true,
+    "loginUrl": "/login",
+    "credentials": { "username": "olivia", "password": "password123" },
+    "usernameSelector": "input[name='username']",
+    "passwordSelector": "input[name='password']",
+    "submitSelector": "button[type='submit']",
+    "successIndicator": "main"
+  },
+  "screens": [
+    { "name": "01-login", "path": "/login", "waitFor": "form", "skipAuth": true, "delay": 500 },
+    { "name": "02-cars", "path": "/cars", "waitFor": "table[aria-label='Cars']", "delay": 800 },
+    { "name": "03-exceptions", "path": "/exceptions", "waitFor": "text=Exceptions board", "delay": 800 },
+    { "name": "04-replans", "path": "/replans", "waitFor": "text=Replanning sagas", "delay": 800 },
+    { "name": "05-notifications", "path": "/notifications", "waitFor": "text=Shipper digests", "delay": 800 },
+    { "name": "06-streams", "path": "/streams", "waitFor": "table[aria-label='Consumer groups']", "delay": 1200 }
+  ],
+  "viewport": { "width": 1440, "height": 900 }
+}
