@@ -1,0 +1,35 @@
+{
+  "name": "llm-eval-dashboard",
+  "frontendPort": 5173,
+  "backendRequired": true,
+  "dbName": "llm_eval",
+  "dbUser": "evals",
+  "auth": {
+    "enabled": true,
+    "loginUrl": "/login",
+    "credentials": { "username": "alice", "password": "password123" },
+    "usernameSelector": "input[name='username']",
+    "passwordSelector": "input[name='password']",
+    "submitSelector": "button[type='submit']",
+    "successIndicator": "main"
+  },
+  "screens": [
+    { "name": "01-login", "path": "/login", "waitFor": "form", "skipAuth": true, "delay": 500 },
+    { "name": "02-runs", "path": "/runs", "waitFor": "table[aria-label='Runs']", "delay": 1500, "fullPage": true },
+    { "name": "03-run-errored-rescored", "path": "/runs/run_triage_v1", "waitFor": "table[aria-label='Cases']", "delay": 1500, "fullPage": true },
+    { "name": "04-run-samples", "path": "/runs/run_triage_v2", "waitFor": "table[aria-label='Cases']", "click": "table[aria-label='Cases'] tbody tr:has-text('t-024')", "clickDelay": 1000, "delay": 500, "fullPage": true },
+    { "name": "05-compare-improvement", "path": "/compare?a=run_triage_v1&b=run_triage_v2&scorer=sc_contains", "waitFor": "[aria-label='Verdict']", "delay": 1500, "fullPage": true },
+    { "name": "06-compare-not-significant", "path": "/compare?a=run_triage_v2&b=run_triage_v3&scorer=sc_exact", "waitFor": "[aria-label='Verdict']", "click": "table[aria-label='Case differences'] tbody tr:first-child", "clickDelay": 1000, "delay": 500, "fullPage": true },
+    { "name": "07-compare-mixed-datasets", "path": "/compare?a=run_triage_v2_ds1&b=run_triage_v2&scorer=sc_exact", "waitFor": "[aria-label='Verdict']", "delay": 1500, "fullPage": true },
+    { "name": "08-compare-scorer-mismatch", "path": "/compare?a=run_triage_v2&b=run_triage_v3&scorer=sc_regex", "waitFor": "[aria-label='Verdict']", "delay": 1500, "fullPage": true },
+    { "name": "09-compare-confounded", "path": "/compare?a=run_triage_v2&b=run_triage_v3_large&scorer=sc_exact", "waitFor": "[aria-label='Verdict']", "delay": 1500, "fullPage": true },
+    { "name": "10-rescored-orders", "path": "/runs/run_orders_v1", "waitFor": "table[aria-label='Cases']", "delay": 1500, "fullPage": true },
+    { "name": "11-annotation-queue", "path": "/annotate/run_status_v1", "waitFor": "[aria-label='Agreement']", "delay": 1500, "fullPage": true },
+    { "name": "12-dataset-diff", "path": "/datasets/ds_triage", "waitFor": "[aria-label='Version diff']", "delay": 1500, "fullPage": true },
+    { "name": "13-prompt-versions", "path": "/prompts/pr_triage", "waitFor": "[aria-label='Prompt versions']", "delay": 1000, "fullPage": true },
+    { "name": "14-scorers", "path": "/scorers", "waitFor": "[aria-label='Scorers']", "delay": 1000, "fullPage": true },
+    { "name": "15-mock-model", "path": "/system", "waitFor": "[aria-label='Mock model']", "delay": 1500 },
+    { "name": "16-globex-runs", "path": "/runs", "waitFor": "table[aria-label='Runs']", "delay": 1500, "loginAs": { "username": "bob", "password": "password123" } }
+  ],
+  "viewport": { "width": 1440, "height": 900 }
+}

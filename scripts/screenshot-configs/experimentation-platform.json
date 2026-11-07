@@ -1,0 +1,45 @@
+{
+  "name": "experimentation-platform",
+  "frontendPort": 5173,
+  "backendRequired": true,
+  "backendPort": 3000,
+  "dbName": "experimentation",
+  "dbUser": "experiments",
+  "auth": {
+    "enabled": true,
+    "loginUrl": "/login",
+    "credentials": { "username": "alice", "password": "password123" },
+    "usernameSelector": "input[name='username']",
+    "passwordSelector": "input[name='password']",
+    "submitSelector": "button[type='submit']",
+    "successIndicator": "main"
+  },
+  "screens": [
+    { "name": "01-login", "path": "/login", "waitFor": "form", "skipAuth": true, "delay": 500 },
+    { "name": "02-flags", "path": "/flags", "waitFor": "table[aria-label='Flags and experiments']", "delay": 1200 },
+    { "name": "03-editor", "path": "/flags/checkout_cta", "waitFor": "[data-testid='kill-switch']", "delay": 1500, "fullPage": true },
+    {
+      "name": "04-ramp-preview",
+      "path": "/flags/checkout_cta",
+      "waitFor": "[data-testid='kill-switch']",
+      "steps": [
+        { "fill": "input[name='weight-control']", "value": "40", "delay": 300 },
+        { "fill": "input[name='weight-treatment']", "value": "60", "delay": 800 }
+      ],
+      "delay": 500
+    },
+    { "name": "05-results-lift", "path": "/flags/checkout_cta/results", "waitFor": "table[aria-label='Exposed analysis'] tbody tr:first-child", "delay": 1500, "fullPage": true },
+    { "name": "06-results-srm", "path": "/flags/shipping_banner/results", "waitFor": "[data-testid='srm-warning']", "delay": 1500, "fullPage": true },
+    { "name": "07-results-assigned-vs-exposed", "path": "/flags/rewards_teaser/results", "waitFor": "table[aria-label='Exposed analysis'] tbody tr:first-child", "delay": 1500, "fullPage": true },
+    { "name": "08-live-clients", "path": "/clients", "waitFor": "table[aria-label='SDK clients']", "delay": 1500, "fullPage": true },
+    { "name": "09-audit", "path": "/audit", "waitFor": "table[aria-label='Audit entries']", "delay": 1200 },
+    {
+      "name": "10-viewer-read-only",
+      "path": "/flags/checkout_cta",
+      "waitFor": "[data-testid='kill-switch']",
+      "delay": 1500,
+      "loginAs": { "username": "bob", "password": "password123" }
+    }
+  ],
+  "viewport": { "width": 1440, "height": 900 }
+}
