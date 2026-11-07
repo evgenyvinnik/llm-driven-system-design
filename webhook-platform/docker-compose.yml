@@ -1,0 +1,53 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: webhook-platform-postgres
+    ports:
+      - "${WEBHOOK_PG_PORT:-5432}:5432"
+    environment:
+      POSTGRES_USER: webhooks
+      POSTGRES_PASSWORD: webhooks_password
+      POSTGRES_DB: webhook_platform
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U webhooks -d webhook_platform"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Durable broker for delivery work tickets. The management UI (15672) shows
+  # queue depth, unacked messages and redeliveries; the ops page reads it too.
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: webhook-platform-rabbitmq
+    ports:
+      - "${WEBHOOK_AMQP_PORT:-5672}:5672"
+      - "${WEBHOOK_AMQP_MGMT_PORT:-15672}:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+
+  # Service name "redis" is what the repo's screenshot/triage scripts look for.
+  # Sessions, login rate limits and the per-endpoint concurrency semaphores.
+  redis:
+    image: valkey/valkey:7.2-alpine
+    container_name: webhook-platform-valkey
+    ports:
+      - "${WEBHOOK_VALKEY_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  postgres_data:
+  rabbitmq_data:

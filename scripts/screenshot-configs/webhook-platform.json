@@ -1,0 +1,29 @@
+{
+  "name": "webhook-platform",
+  "frontendPort": 5173,
+  "backendRequired": true,
+  "dbName": "webhook_platform",
+  "dbUser": "webhooks",
+  "auth": {
+    "enabled": true,
+    "loginUrl": "/login",
+    "credentials": { "username": "alice", "password": "password123" },
+    "usernameSelector": "input[name='username']",
+    "passwordSelector": "input[name='password']",
+    "submitSelector": "button[type='submit']",
+    "successIndicator": "main"
+  },
+  "screens": [
+    { "name": "01-login", "path": "/login", "waitFor": "form", "skipAuth": true, "delay": 500 },
+    { "name": "02-endpoints", "path": "/endpoints", "waitFor": "table[aria-label='Endpoints']", "delay": 1500 },
+    { "name": "03-endpoint-disabled", "path": "/endpoints/ep_acme_audit", "waitFor": "table[aria-label='Deliveries']", "delay": 1500, "fullPage": true },
+    { "name": "04-delivery-retries", "path": "/endpoints/ep_acme_billing", "waitFor": "table[aria-label='Deliveries']", "click": "table[aria-label='Deliveries'] tbody tr:has-text('invoice.failed') a", "clickDelay": 2000, "delay": 500, "fullPage": true },
+    { "name": "05-delivery-exhausted", "path": "/endpoints/ep_acme_audit", "waitFor": "table[aria-label='Deliveries']", "click": "table[aria-label='Deliveries'] tbody tr:has-text('invoice.paid') a", "clickDelay": 2000, "delay": 500, "fullPage": true },
+    { "name": "06-events", "path": "/events", "waitFor": "table[aria-label='Events']", "delay": 1500 },
+    { "name": "07-receiver", "path": "/receiver", "waitFor": "table[aria-label='Received requests']", "delay": 1500, "fullPage": true },
+    { "name": "08-notifications", "path": "/notifications", "waitFor": "ul[aria-label='Notifications']", "delay": 1000 },
+    { "name": "09-globex-endpoints", "path": "/endpoints", "waitFor": "table[aria-label='Endpoints']", "delay": 1500, "loginAs": { "username": "bob", "password": "password123" } },
+    { "name": "10-ops", "path": "/ops", "waitFor": "table[aria-label='Endpoints in flight']", "delay": 1500, "loginAs": { "username": "admin", "password": "password123" } }
+  ],
+  "viewport": { "width": 1440, "height": 900 }
+}

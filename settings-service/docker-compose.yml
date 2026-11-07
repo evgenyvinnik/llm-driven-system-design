@@ -1,0 +1,35 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: settings-service-postgres
+    ports:
+      # Host port is overridable so several projects can run side by side.
+      - "${SETTINGS_PG_PORT:-5432}:5432"
+    environment:
+      POSTGRES_USER: settings
+      POSTGRES_PASSWORD: settings_password
+      POSTGRES_DB: settings_service
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U settings -d settings_service"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Service name "redis" is what the repo's screenshot/triage scripts look for.
+  # Valkey holds sessions, the chaos switch and the pub/sub channel that fans
+  # change notifications out across API instances. Nothing in it is a source of truth.
+  redis:
+    image: valkey/valkey:7.2-alpine
+    container_name: settings-service-valkey
+    ports:
+      - "${SETTINGS_VALKEY_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  postgres_data:

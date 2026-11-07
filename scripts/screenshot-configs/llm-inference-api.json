@@ -1,0 +1,34 @@
+{
+  "name": "llm-inference-api",
+  "frontendPort": 5173,
+  "backendRequired": true,
+  "dbName": "llm_inference",
+  "dbUser": "inference",
+  "auth": {
+    "enabled": true,
+    "loginUrl": "/login",
+    "credentials": { "username": "alice", "password": "password123" },
+    "usernameSelector": "input[name='username']",
+    "passwordSelector": "input[name='password']",
+    "submitSelector": "button[type='submit']",
+    "successIndicator": "main"
+  },
+  "screens": [
+    { "name": "01-login", "path": "/login", "waitFor": "form", "skipAuth": true, "delay": 500 },
+    { "name": "02-console", "path": "/console", "waitFor": "table[aria-label='Requests'] tbody tr:first-child", "delay": 1200, "fullPage": true },
+    {
+      "name": "03-console-stream",
+      "path": "/console",
+      "waitFor": "form[aria-label='New request']",
+      "delay": 800,
+      "steps": [
+        { "click": "form[aria-label='New request'] button[type='submit']" },
+        { "wait": 1400 }
+      ]
+    },
+    { "name": "04-request-failed-midstream", "path": "/requests/req_seed_0013", "waitFor": "section[aria-label='Lifecycle']", "delay": 800 },
+    { "name": "05-admin", "path": "/admin", "waitFor": "[data-testid='backend-b1']", "delay": 2500, "fullPage": true, "loginAs": { "username": "admin", "password": "password123" } },
+    { "name": "06-routing", "path": "/routing", "waitFor": "section[aria-label='Ring']", "delay": 1200, "fullPage": true, "loginAs": { "username": "admin", "password": "password123" } }
+  ],
+  "viewport": { "width": 1440, "height": 900 }
+}
