@@ -1,0 +1,29 @@
+import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
+import { TanStackRouterVite } from '@tanstack/router-plugin/vite'
+import { fileURLToPath } from 'node:url'
+
+const fromRoot = (relativePath: string) => fileURLToPath(new URL(relativePath, import.meta.url))
+
+// VITE_PORT and API_TARGET let several projects run side by side; defaults follow the repo conventions.
+// The console talks to api-a (3000) by default; the demo storefront talks to api-b (3001), so a
+// kill switch pulled here has to cross Valkey pub/sub to reach the storefront's stream.
+export default defineConfig({
+  plugins: [TanStackRouterVite(), react()],
+  resolve: {
+    alias: {
+      '@': fromRoot('./src'),
+      '@exp/core': fromRoot('../sdk/src/core/index.ts'),
+    },
+  },
+  server: {
+    allowedHosts: ['host.docker.internal'],
+    port: Number(process.env.VITE_PORT ?? 5173),
+    strictPort: true,
+    fs: { allow: [fromRoot('..')] },
+    proxy: {
+      '/api': { target: process.env.API_TARGET ?? 'http://localhost:3000', changeOrigin: true },
+      '/sdk': { target: process.env.API_TARGET ?? 'http://localhost:3000', changeOrigin: true },
+    },
+  },
+})

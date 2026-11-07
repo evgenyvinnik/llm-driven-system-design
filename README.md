@@ -16,7 +16,7 @@ With the assistance of LLMs like Claude, we can rapidly prototype lightweight ve
 
 ## System Design Challenges
 
-Each folder contains an independent implementation of a system design problem: **105 implemented projects**, 3 design-only write-ups of external projects, and 9 more planned in [ROADMAP.md](./ROADMAP.md).
+Each folder contains an independent implementation of a system design problem: **108 implemented projects**, 3 design-only write-ups of external projects, and 6 more planned in [ROADMAP.md](./ROADMAP.md).
 
 ### URL Shortening & Web Services
 
@@ -174,6 +174,8 @@ Each folder contains an independent implementation of a system design problem: *
 | [Multi-Org Dashboard](./multi-org-dashboard/) | Multi-tenant AI console: per-org roles, feature flags, org switching, revocation on open pages, revocable share links, and background exports | ✅ Implemented |
 | [LLM Chat Analytics](./llm-chat-analytics/) | Near-real-time chat usage, latency and cost dashboards: dedup, late data with watermarks, org-local days, drill-down, role-gated metrics | ✅ Implemented |
 | [LLM Inference API](./llm-inference-api/) | Multi-tenant model API: cost-based admission control, fair queues, batching onto fixed slots, cache-affinity routing with drains, and cancellation races | ✅ Implemented |
+| [Document Q&A](./document-qa/) | Upload, extract, chunk, embed and index documents, then answer with cited spans: idempotent pipeline stages, access re-checked against the source of truth on every answer, versioned updates, and tombstone-then-purge deletion | ✅ Implemented |
+| [LLM Eval Dashboard](./llm-eval-dashboard/) | Versioned datasets, prompts and scorers; async eval runs that finish as "N errored"; multi-sample confidence intervals, paired comparisons with provenance checks, and re-scoring without regeneration | ✅ Implemented |
 
 ### Infrastructure & System Components
 
@@ -191,6 +193,7 @@ Each folder contains an independent implementation of a system design problem: *
 | [Storage Remediation](./storage-remediation/) | Fleet-wide cloud storage security fixes with usage evidence, waves, rollback and exceptions; doubles as an existing-system-review example | ✅ Implemented |
 | [Settings Service](./settings-service/) | Backend for an existing preferences screen: effective values under org policy, per-key PATCH with conflict detection, validation, and live sync across tabs and devices | ✅ Implemented |
 | [Webhook Platform](./webhook-platform/) | Signed, retried, replayable HTTP event delivery: transactional outbox, per-endpoint isolation, secret rotation, SSRF protection, and a fault-injecting mock receiver | ✅ Implemented |
+| [Experimentation Platform](./experimentation-platform/) | Feature flags and A/B tests: deterministic bucketing with stable ranges across ramps, a local-evaluation SDK with pushed snapshots and a seconds-fast kill switch, exposure-only analysis with SRM checks | ✅ Implemented |
 
 ### UI Components & Patterns
 
@@ -210,13 +213,10 @@ External projects demonstrating system design concepts (with local architecture 
 
 ### Planned Projects
 
-Two rounds are in progress, and their built projects are listed in the tables above. The AI products and developer platforms round has 10 of 18 built, including all of tier 1: Prompt Playground, AI Chat Client, Settings Service, LLM Chat Analytics, LLM Inference API, Webhook Platform, Multi-Org Dashboard, In-App Assistant, File System and Console Growth. The [rail operations track](./ROADMAP.md#rail-operations-track-bnsf) for BNSF Railway loops has 6 of 7 built: Railcar Health, Locomotive Fueling, Storage Remediation, Freight Quote, Railcar Trip Plans and Track Hazard Detection. The rest are below. See [ROADMAP.md](./ROADMAP.md) for each project's scope, core entities, hard problems and interview follow-ups.
+Two rounds are in progress, and their built projects are listed in the tables above. The AI products and developer platforms round has 13 of 18 built, including all of tier 1: Prompt Playground, AI Chat Client, Settings Service, LLM Chat Analytics, LLM Inference API, Webhook Platform, Multi-Org Dashboard, Document Q&A, Experimentation Platform, LLM Eval Dashboard, In-App Assistant, File System and Console Growth. The [rail operations track](./ROADMAP.md#rail-operations-track-bnsf) for BNSF Railway loops has 6 of 7 built: Railcar Health, Locomotive Fueling, Storage Remediation, Freight Quote, Railcar Trip Plans and Track Hazard Detection. The rest are below. See [ROADMAP.md](./ROADMAP.md) for each project's scope, core entities, hard problems and interview follow-ups.
 
 | Project | Description | Status |
 |---------|-------------|--------|
-| [Document Q&A](./ROADMAP.md#8-document-qa) | Upload, process, index, retrieve, and delete documents for an assistant | 📋 Planned |
-| [Experimentation Platform](./ROADMAP.md#9-experimentation-platform) | Feature flags, A/B assignment, exposure logging, and kill switches | 📋 Planned |
-| [LLM Eval Dashboard](./ROADMAP.md#10-llm-eval-dashboard) | Versioned datasets, async eval runs, and provenance-aware comparisons | 📋 Planned |
 | [CI/CD Platform](./ROADMAP.md#11-cicd-platform) | GitHub Actions-like workflows with job DAGs, runners, and live logs | 📋 Planned |
 | [AI Code Review](./ROADMAP.md#12-ai-code-review) | Design critique and rebuild of an agentic PR auto-approval system | 📋 Planned |
 | [Yard Switch Lists](./ROADMAP.md#24-yard-switch-lists) | Classification yard planning with replanning, yardmaster overrides and execution feedback | 📋 Planned |

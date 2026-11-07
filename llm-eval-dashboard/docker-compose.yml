@@ -1,0 +1,35 @@
+services:
+  # Source of truth for everything: datasets, prompts, scorers, runs, the task
+  # queue (case_results claimed with FOR UPDATE SKIP LOCKED), scores and labels.
+  postgres:
+    image: postgres:16-alpine
+    container_name: llm-eval-dashboard-postgres
+    ports:
+      - "${EVAL_PG_PORT:-5432}:5432"
+    environment:
+      POSTGRES_USER: evals
+      POSTGRES_PASSWORD: evals_password
+      POSTGRES_DB: llm_eval
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U evals -d llm_eval"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Service name "redis" is what the repo's screenshot/triage scripts look for.
+  # Sessions and the login rate limit only; losing it signs people out.
+  redis:
+    image: valkey/valkey:7-alpine
+    container_name: llm-eval-dashboard-valkey
+    ports:
+      - "${EVAL_VALKEY_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  postgres_data:

@@ -1,0 +1,5 @@
+Office Wi-Fi
+
+The guest Wi-Fi network is AcmeGuest and the password rotates every Monday.
+
+The employee network uses certificate authentication; install the profile from the IT portal.

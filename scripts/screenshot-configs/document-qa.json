@@ -1,0 +1,39 @@
+{
+  "name": "document-qa",
+  "frontendPort": 5173,
+  "backendRequired": true,
+  "dbName": "document_qa",
+  "dbUser": "docqa",
+  "auth": {
+    "enabled": true,
+    "loginUrl": "/login",
+    "credentials": { "username": "alice", "password": "password123" },
+    "usernameSelector": "input[name='username']",
+    "passwordSelector": "input[name='password']",
+    "submitSelector": "button[type='submit']",
+    "successIndicator": "main"
+  },
+  "screens": [
+    { "name": "01-login", "path": "/login", "waitFor": "form", "skipAuth": true, "delay": 500 },
+    { "name": "02-library", "path": "/documents", "waitFor": "table[aria-label='Documents'] tbody tr:first-child", "delay": 1500, "fullPage": true },
+    { "name": "03-ask", "path": "/ask", "waitFor": "ul[aria-label='Answers']", "delay": 1500, "fullPage": true },
+    {
+      "name": "04-ask-streaming",
+      "path": "/ask",
+      "waitFor": "form[aria-label='Ask']",
+      "delay": 300,
+      "steps": [
+        { "fill": "form[aria-label='Ask'] textarea", "value": "What happens if the primary on-call engineer does not acknowledge a page within 5 minutes?" },
+        { "click": "form[aria-label='Ask'] button[type='submit']", "delay": 900 }
+      ]
+    },
+    { "name": "05-citation-highlight", "path": "/ask", "waitFor": "ul[aria-label='Answers']", "click": "ul[aria-label='Answers'] a[href*='start=']", "clickDelay": 2500, "delay": 500, "fullPage": true },
+    { "name": "06-document-versions", "path": "/documents", "waitFor": "table[aria-label='Documents'] tbody tr:first-child", "click": "table[aria-label='Documents'] tbody tr:has-text('Backup retention') a", "clickDelay": 2500, "delay": 500, "fullPage": true },
+    { "name": "07-document-failed", "path": "/documents", "waitFor": "table[aria-label='Documents'] tbody tr:first-child", "click": "table[aria-label='Documents'] tbody tr:has-text('Scanned report') a", "clickDelay": 2500, "delay": 500, "fullPage": true },
+    { "name": "08-carol-not-found", "path": "/ask", "waitFor": "ul[aria-label='Answers']", "delay": 1500, "fullPage": true, "loginAs": { "username": "carol", "password": "password123" } },
+    { "name": "09-groups", "path": "/groups", "waitFor": "section[aria-label='Groups']", "delay": 1000 },
+    { "name": "10-globex-library", "path": "/documents", "waitFor": "table[aria-label='Documents'] tbody tr:first-child", "delay": 1500, "loginAs": { "username": "bob", "password": "password123" } },
+    { "name": "11-ops", "path": "/ops", "waitFor": "table[aria-label='Jobs by stage']", "delay": 2000, "fullPage": true, "loginAs": { "username": "admin", "password": "password123" } }
+  ],
+  "viewport": { "width": 1440, "height": 900 }
+}

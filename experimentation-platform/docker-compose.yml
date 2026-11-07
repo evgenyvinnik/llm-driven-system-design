@@ -1,0 +1,72 @@
+# Infrastructure only: the API, ingest worker and both frontends run from source.
+# Every host port is overridable so several stacks can run side by side, e.g.
+#   EXP_PG_PORT=5452 EXP_VALKEY_PORT=6399 EXP_CH_HTTP_PORT=8133 EXP_CH_NATIVE_PORT=9031 docker-compose up -d
+services:
+  # Source of truth: flag definitions, per-environment configs and their version
+  # history, the audit log, compiled ruleset snapshots, identity aliases, users.
+  postgres:
+    image: postgres:16-alpine
+    container_name: experimentation-platform-postgres
+    ports:
+      - "${EXP_PG_PORT:-5432}:5432"
+    environment:
+      POSTGRES_USER: experiments
+      POSTGRES_PASSWORD: experiments_password
+      POSTGRES_DB: experimentation
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U experiments -d experimentation"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Service name "redis" is what the repo's screenshot/triage scripts look for.
+  # Valkey holds sessions, the latest-snapshot cache, the pub/sub channel that
+  # pushes new snapshot versions to every API instance, the event stream the
+  # ingest worker drains, ingest batch dedup keys and the live SDK client registry.
+  # AOF is on because the event stream is the only copy of accepted-but-not-yet-
+  # inserted events.
+  redis:
+    image: valkey/valkey:7-alpine
+    container_name: experimentation-platform-valkey
+    command: valkey-server --appendonly yes --appendfsync everysec
+    ports:
+      - "${EXP_VALKEY_PORT:-6379}:6379"
+    volumes:
+      - valkey_data:/data
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Exposures, assignments and conversions (ReplacingMergeTree on event_id).
+  # The app uses the HTTP interface; the native port is published for clickhouse-client.
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    container_name: experimentation-platform-clickhouse
+    ports:
+      - "${EXP_CH_HTTP_PORT:-8123}:8123"
+      - "${EXP_CH_NATIVE_PORT:-9000}:9000"
+    environment:
+      CLICKHOUSE_DB: experimentation
+      CLICKHOUSE_USER: experiments
+      CLICKHOUSE_PASSWORD: experiments_password
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+
+volumes:
+  postgres_data:
+  valkey_data:
+  clickhouse_data:

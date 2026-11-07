@@ -1,0 +1,76 @@
+services:
+  postgres:
+    # pgvector adds the VECTOR type and the HNSW index that holds the retrieval index.
+    image: pgvector/pgvector:pg16
+    container_name: document-qa-postgres
+    ports:
+      - "${DOCQA_PG_PORT:-5432}:5432"
+    environment:
+      POSTGRES_USER: docqa
+      POSTGRES_PASSWORD: docqa_password
+      POSTGRES_DB: document_qa
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U docqa -d document_qa"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Durable broker for pipeline tickets (extract, chunk, embed, index, retire,
+  # sync_acl, purge). The management UI (15672) shows queue depth and unacked
+  # messages; the ops page reads the same numbers from its HTTP API.
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: document-qa-rabbitmq
+    ports:
+      - "${DOCQA_AMQP_PORT:-5672}:5672"
+      - "${DOCQA_AMQP_MGMT_PORT:-15672}:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+
+  # Service name "redis" is what the repo's screenshot/triage scripts look for.
+  # Sessions, the answer cache (validated on every read), run event streams and
+  # the cancel channel. Nothing in it is a source of truth.
+  redis:
+    image: valkey/valkey:7-alpine
+    container_name: document-qa-valkey
+    ports:
+      - "${DOCQA_VALKEY_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # S3-compatible object storage for original uploads (one object per version).
+  minio:
+    image: minio/minio:latest
+    container_name: document-qa-minio
+    command: server /data --console-address ":9001"
+    ports:
+      - "${DOCQA_MINIO_PORT:-9000}:9000"
+      - "${DOCQA_MINIO_CONSOLE_PORT:-9001}:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  postgres_data:
+  rabbitmq_data:
+  minio_data:

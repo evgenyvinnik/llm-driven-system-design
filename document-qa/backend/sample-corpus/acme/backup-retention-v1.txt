@@ -1,0 +1,11 @@
+Backup and Retention Standard
+
+Database backups run every night at 02:00 UTC. Full snapshots are taken weekly on Sunday.
+
+Retention
+
+The retention period for nightly backups is 30 days. Weekly snapshots are kept for 6 months. Backups are encrypted at rest with keys managed by the security team.
+
+Restore testing
+
+The platform team performs a restore test once per quarter and records the restore time.
