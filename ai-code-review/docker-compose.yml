@@ -1,0 +1,36 @@
+services:
+  # Source of truth for everything: review runs (also the work queue, claimed with
+  # FOR UPDATE SKIP LOCKED), decisions, post intents, escalations and the audit chain.
+  # The fixture Git host keeps its own state in a separate `githost` schema.
+  postgres:
+    image: postgres:16-alpine
+    container_name: ai-code-review-postgres
+    ports:
+      - "${CODEREVIEW_PG_PORT:-5432}:5432"
+    environment:
+      POSTGRES_USER: review
+      POSTGRES_PASSWORD: review_password
+      POSTGRES_DB: ai_code_review
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U review -d ai_code_review"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Service name "redis" is what the repo's screenshot/triage scripts look for.
+  # Sessions and the login rate limit only; losing it signs people out, nothing else.
+  redis:
+    image: valkey/valkey:7-alpine
+    container_name: ai-code-review-valkey
+    ports:
+      - "${CODEREVIEW_VALKEY_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  postgres_data:

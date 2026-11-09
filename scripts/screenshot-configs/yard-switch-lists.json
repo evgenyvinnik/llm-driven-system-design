@@ -1,0 +1,28 @@
+{
+  "name": "yard-switch-lists",
+  "frontendPort": 5173,
+  "backendRequired": true,
+  "dbName": "yard_switch_lists",
+  "dbUser": "yard",
+  "auth": {
+    "enabled": true,
+    "loginUrl": "/login",
+    "credentials": { "username": "alice", "password": "password123" },
+    "usernameSelector": "input[name='username']",
+    "passwordSelector": "input[name='password']",
+    "submitSelector": "button[type='submit']",
+    "successIndicator": "main"
+  },
+  "screens": [
+    { "name": "01-login", "path": "/login", "waitFor": "form", "skipAuth": true, "delay": 500 },
+    { "name": "02-board", "path": "/board", "waitFor": "[data-testid='board']", "delay": 2000, "fullPage": true },
+    { "name": "03-replan-diff", "path": "/plans/latest-replan", "waitFor": "[data-testid='plan-diff']", "delay": 1500, "fullPage": true },
+    { "name": "04-plans-overrides", "path": "/plans", "waitFor": "table[aria-label='Plan versions'] tbody tr:first-child", "delay": 1500, "fullPage": true },
+    { "name": "05-compare", "path": "/compare", "waitFor": "table[aria-label='Small instances'] tbody tr:first-child", "delay": 1500, "fullPage": true },
+    { "name": "06-metrics", "path": "/metrics", "waitFor": "table[aria-label='Shift metrics'] tbody tr:first-child", "delay": 1500, "fullPage": true },
+    { "name": "07-holds", "path": "/holds", "waitFor": "table[aria-label='Holds'] tbody tr:first-child", "delay": 1500, "fullPage": true },
+    { "name": "08-simulator", "path": "/simulator", "waitFor": "[data-testid='sim-clock']", "delay": 1500 },
+    { "name": "09-crew", "path": "/crew", "waitFor": "[data-testid='crew-view']", "delay": 1500, "fullPage": true, "loginAs": { "username": "dave", "password": "password123" } }
+  ],
+  "viewport": { "width": 1440, "height": 900 }
+}

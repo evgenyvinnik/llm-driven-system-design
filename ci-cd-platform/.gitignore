@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.env
+.env.*
+playwright-report/
+test-results/
+frontend/node_modules/.tmp/
+*.tsbuildinfo
+.tanstack/
