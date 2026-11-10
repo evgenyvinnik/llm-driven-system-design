@@ -16,7 +16,7 @@ With the assistance of LLMs like Claude, we can rapidly prototype lightweight ve
 
 ## System Design Challenges
 
-Each folder contains an independent implementation of a system design problem: **102 implemented projects**, 3 design-only write-ups of external projects, and 12 more planned in [ROADMAP.md](./ROADMAP.md).
+Each folder contains an independent implementation of a system design problem: **105 implemented projects**, 3 design-only write-ups of external projects, and 9 more planned in [ROADMAP.md](./ROADMAP.md).
 
 ### URL Shortening & Web Services
 
@@ -173,6 +173,7 @@ Each folder contains an independent implementation of a system design problem: *
 | [AI Chat Client](./ai-chat/) | Streaming chat with branching history, resumable answers, Stop, multi-device sync, and offline reading | ✅ Implemented |
 | [Multi-Org Dashboard](./multi-org-dashboard/) | Multi-tenant AI console: per-org roles, feature flags, org switching, revocation on open pages, revocable share links, and background exports | ✅ Implemented |
 | [LLM Chat Analytics](./llm-chat-analytics/) | Near-real-time chat usage, latency and cost dashboards: dedup, late data with watermarks, org-local days, drill-down, role-gated metrics | ✅ Implemented |
+| [LLM Inference API](./llm-inference-api/) | Multi-tenant model API: cost-based admission control, fair queues, batching onto fixed slots, cache-affinity routing with drains, and cancellation races | ✅ Implemented |
 
 ### Infrastructure & System Components
 
@@ -188,6 +189,8 @@ Each folder contains an independent implementation of a system design problem: *
 | [iCloud Sync](./icloud/) | File and photo synchronization | ✅ Implemented |
 | [Scalable API](./scalable-api/) | API serving millions of users | ✅ Implemented |
 | [Storage Remediation](./storage-remediation/) | Fleet-wide cloud storage security fixes with usage evidence, waves, rollback and exceptions; doubles as an existing-system-review example | ✅ Implemented |
+| [Settings Service](./settings-service/) | Backend for an existing preferences screen: effective values under org policy, per-key PATCH with conflict detection, validation, and live sync across tabs and devices | ✅ Implemented |
+| [Webhook Platform](./webhook-platform/) | Signed, retried, replayable HTTP event delivery: transactional outbox, per-endpoint isolation, secret rotation, SSRF protection, and a fault-injecting mock receiver | ✅ Implemented |
 
 ### UI Components & Patterns
 
@@ -207,13 +210,10 @@ External projects demonstrating system design concepts (with local architecture 
 
 ### Planned Projects
 
-Two rounds are in progress, and their built projects are listed in the tables above. The AI products and developer platforms round has 7 of 18 built: Prompt Playground, AI Chat Client, LLM Chat Analytics, Multi-Org Dashboard, In-App Assistant, File System and Console Growth. The [rail operations track](./ROADMAP.md#rail-operations-track-bnsf) for BNSF Railway loops has 6 of 7 built: Railcar Health, Locomotive Fueling, Storage Remediation, Freight Quote, Railcar Trip Plans and Track Hazard Detection. The rest are below. See [ROADMAP.md](./ROADMAP.md) for each project's scope, core entities, hard problems and interview follow-ups.
+Two rounds are in progress, and their built projects are listed in the tables above. The AI products and developer platforms round has 10 of 18 built, including all of tier 1: Prompt Playground, AI Chat Client, Settings Service, LLM Chat Analytics, LLM Inference API, Webhook Platform, Multi-Org Dashboard, In-App Assistant, File System and Console Growth. The [rail operations track](./ROADMAP.md#rail-operations-track-bnsf) for BNSF Railway loops has 6 of 7 built: Railcar Health, Locomotive Fueling, Storage Remediation, Freight Quote, Railcar Trip Plans and Track Hazard Detection. The rest are below. See [ROADMAP.md](./ROADMAP.md) for each project's scope, core entities, hard problems and interview follow-ups.
 
 | Project | Description | Status |
 |---------|-------------|--------|
-| [Settings Service](./ROADMAP.md#3-settings-service) | Backend for an existing preferences UI: precise APIs, concurrency, and org policies | 📋 Planned |
-| [LLM Inference API](./ROADMAP.md#5-llm-inference-api) | Multi-tenant model API with admission control, batching, and backend routing | 📋 Planned |
-| [Webhook Platform](./ROADMAP.md#6-webhook-platform) | Signed, retried, replayable HTTP event delivery with per-endpoint isolation | 📋 Planned |
 | [Document Q&A](./ROADMAP.md#8-document-qa) | Upload, process, index, retrieve, and delete documents for an assistant | 📋 Planned |
 | [Experimentation Platform](./ROADMAP.md#9-experimentation-platform) | Feature flags, A/B assignment, exposure logging, and kill switches | 📋 Planned |
 | [LLM Eval Dashboard](./ROADMAP.md#10-llm-eval-dashboard) | Versioned datasets, async eval runs, and provenance-aware comparisons | 📋 Planned |
