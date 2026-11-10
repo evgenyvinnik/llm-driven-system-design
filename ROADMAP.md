@@ -42,9 +42,9 @@ Sources surveyed: Glassdoor, Aced (formerly Exponent) and Hello Interview. Proje
 | 5 | [LLM Inference API](#5-llm-inference-api) ✅ Built | [`llm-inference-api/`](./llm-inference-api/) | 1 | Anthropic (candidate reports, including batching and routing variants) | rate-limiter, scalable-api |
 | 6 | [Webhook Platform](#6-webhook-platform) ✅ Built | [`webhook-platform/`](./webhook-platform/) | 1 | OpenAI (community) | payment-system, stripe |
 | 7 | [Multi-Org Dashboard](#7-multi-org-dashboard) ✅ Built | [`multi-org-dashboard/`](./multi-org-dashboard/) | 2 | Practice extension (frontend practice sheet); Anthropic (candidate report of a prompt-sharing variant) | prompt-playground, slack, notion |
-| 8 | [Document Q&A](#8-document-qa) | `document-qa/` | 2 | Practice extension | dropbox, fb-post-search |
-| 9 | [Experimentation Platform](#9-experimentation-platform) | `experimentation-platform/` | 2 | Practice extension | — |
-| 10 | [LLM Eval Dashboard](#10-llm-eval-dashboard) | `llm-eval-dashboard/` | 2 | Practice extension | prompt-playground, job-scheduler |
+| 8 | [Document Q&A](#8-document-qa) ✅ Built | [`document-qa/`](./document-qa/) | 2 | Practice extension | dropbox, fb-post-search |
+| 9 | [Experimentation Platform](#9-experimentation-platform) ✅ Built | [`experimentation-platform/`](./experimentation-platform/) | 2 | Practice extension | — |
+| 10 | [LLM Eval Dashboard](#10-llm-eval-dashboard) ✅ Built | [`llm-eval-dashboard/`](./llm-eval-dashboard/) | 2 | Practice extension | prompt-playground, job-scheduler |
 | 11 | [CI/CD Platform](#11-cicd-platform) | `ci-cd-platform/` | 2 | OpenAI (community) | job-scheduler, github |
 | 12 | [AI Code Review](#12-ai-code-review) | `ai-code-review/` | 2 | Anthropic (guide-reported) | github, ai-code-assistant |
 | 13 | [File Cache](#13-file-cache) | `file-cache/` | 3 | Anthropic (candidate report) | distributed-cache |
@@ -62,7 +62,7 @@ Sources surveyed: Glassdoor, Aced (formerly Exponent) and Hello Interview. Proje
 | 25 | [Track Hazard Detection](#25-track-hazard-detection) ✅ Built | [`track-hazard-detection/`](./track-hazard-detection/) | Rail | BNSF (candidate report, Reddit) | railcar-health |
 
 - **Tier 1** covers the core product-facing work for AI and full-stack roles. All six are built.
-- **Tier 2** covers variations on tier-1 designs. Each reuses a tier-1 data model or an existing project's patterns.
+- **Tier 2** covers variations on tier-1 designs. Each reuses a tier-1 data model or an existing project's patterns. CI/CD Platform and AI Code Review are the two left.
 - **Tier 3** covers infrastructure specialties and lower-relevance topics. Build these when a target role calls for them.
 - **Rail** covers prompts reported for BNSF Railway loops and the domain around them. See the [rail operations track](#rail-operations-track-bnsf) for the rehearsal order.
 - **Builds on** lists existing projects whose patterns can be reused. Read their `architecture.md` before starting.
@@ -393,6 +393,8 @@ Each answer should also walk through **one successful and one failed execution t
 
 **Folder:** `document-qa/` · **Signal:** Practice extension
 
+**Status:** ✅ Built. See [document-qa/](./document-qa/) and its [architecture.md](./document-qa/architecture.md). The entry below is kept as the original brief.
+
 **Problem.** Users upload documents to an assistant. The system extracts, chunks, embeds and indexes them, uses them to answer questions with citations, and supports deletion.
 
 **Core entities.**
@@ -417,6 +419,8 @@ Each answer should also walk through **one successful and one failed execution t
 
 **Folder:** `experimentation-platform/` · **Signal:** Practice extension. It is especially useful for growth roles.
 
+**Status:** ✅ Built. See [experimentation-platform/](./experimentation-platform/) and its [architecture.md](./experimentation-platform/architecture.md). The entry below is kept as the original brief.
+
 **Problem.** Feature flags and A/B experiments: assigning variants, delivering config, logging exposure, attributing conversions and a kill switch.
 
 **Core entities.**
@@ -439,6 +443,8 @@ Each answer should also walk through **one successful and one failed execution t
 ### 10. LLM Eval Dashboard
 
 **Folder:** `llm-eval-dashboard/` · **Signal:** Practice extension. It reuses the prompt playground's data model.
+
+**Status:** ✅ Built. See [llm-eval-dashboard/](./llm-eval-dashboard/) and its [architecture.md](./llm-eval-dashboard/architecture.md). The entry below is kept as the original brief.
 
 **Problem.** Versioned test datasets, prompt and model configurations, asynchronous evaluation runs, inspection of results and comparisons between runs.
 
