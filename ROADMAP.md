@@ -45,8 +45,8 @@ Sources surveyed: Glassdoor, Aced (formerly Exponent) and Hello Interview. Proje
 | 8 | [Document Q&A](#8-document-qa) ✅ Built | [`document-qa/`](./document-qa/) | 2 | Practice extension | dropbox, fb-post-search |
 | 9 | [Experimentation Platform](#9-experimentation-platform) ✅ Built | [`experimentation-platform/`](./experimentation-platform/) | 2 | Practice extension | — |
 | 10 | [LLM Eval Dashboard](#10-llm-eval-dashboard) ✅ Built | [`llm-eval-dashboard/`](./llm-eval-dashboard/) | 2 | Practice extension | prompt-playground, job-scheduler |
-| 11 | [CI/CD Platform](#11-cicd-platform) | `ci-cd-platform/` | 2 | OpenAI (community) | job-scheduler, github |
-| 12 | [AI Code Review](#12-ai-code-review) | `ai-code-review/` | 2 | Anthropic (guide-reported) | github, ai-code-assistant |
+| 11 | [CI/CD Platform](#11-cicd-platform) ✅ Built | [`ci-cd-platform/`](./ci-cd-platform/) | 2 | OpenAI (community) | job-scheduler, github |
+| 12 | [AI Code Review](#12-ai-code-review) ✅ Built | [`ai-code-review/`](./ai-code-review/) | 2 | Anthropic (guide-reported) | github, ai-code-assistant |
 | 13 | [File Cache](#13-file-cache) | `file-cache/` | 3 | Anthropic (candidate report) | distributed-cache |
 | 14 | [Model Distribution](#14-model-distribution) | `model-distribution/` | 3 | Anthropic (candidate report) | — |
 | 15 | [Online Chess](#15-online-chess) | `online-chess/` | 3 | OpenAI (community) | r-place, online-auction |
@@ -58,11 +58,11 @@ Sources surveyed: Glassdoor, Aced (formerly Exponent) and Hello Interview. Proje
 | 21 | [Storage Remediation](#21-storage-remediation) ✅ Built | [`storage-remediation/`](./storage-remediation/) | Rail | BNSF (guide-reported existing system review round); practice extension for the design | job-scheduler, rate-limiter |
 | 22 | [Freight Quote Service](#22-freight-quote-service) ✅ Built | [`freight-quote/`](./freight-quote/) | Rail | BNSF (candidate report) | scalable-api, rate-limiter, distributed-cache |
 | 23 | [Railcar Trip Plans and ETAs](#23-railcar-trip-plans-and-etas) ✅ Built | [`railcar-trip-plans/`](./railcar-trip-plans/) | Rail | Practice extension | local-delivery, notification-system |
-| 24 | [Yard Switch Lists](#24-yard-switch-lists) | `yard-switch-lists/` | Rail | Practice extension (BNSF describes the system publicly) | job-scheduler, railcar-health |
+| 24 | [Yard Switch Lists](#24-yard-switch-lists) ✅ Built | [`yard-switch-lists/`](./yard-switch-lists/) | Rail | Practice extension (BNSF describes the system publicly) | job-scheduler, railcar-health |
 | 25 | [Track Hazard Detection](#25-track-hazard-detection) ✅ Built | [`track-hazard-detection/`](./track-hazard-detection/) | Rail | BNSF (candidate report, Reddit) | railcar-health |
 
 - **Tier 1** covers the core product-facing work for AI and full-stack roles. All six are built.
-- **Tier 2** covers variations on tier-1 designs. Each reuses a tier-1 data model or an existing project's patterns. CI/CD Platform and AI Code Review are the two left.
+- **Tier 2** covers variations on tier-1 designs. Each reuses a tier-1 data model or an existing project's patterns. All seven are built.
 - **Tier 3** covers infrastructure specialties and lower-relevance topics. Build these when a target role calls for them.
 - **Rail** covers prompts reported for BNSF Railway loops and the domain around them. See the [rail operations track](#rail-operations-track-bnsf) for the rehearsal order.
 - **Builds on** lists existing projects whose patterns can be reused. Read their `architecture.md` before starting.
@@ -470,6 +470,8 @@ Each answer should also walk through **one successful and one failed execution t
 
 **Folder:** `ci-cd-platform/` · **Signal:** OpenAI (community attribution). It extends the [job-scheduler](./job-scheduler/) project.
 
+**Status:** ✅ Built. See [ci-cd-platform/](./ci-cd-platform/) and its [architecture.md](./ci-cd-platform/architecture.md). The entry below is kept as the original brief.
+
 **Problem.** Repository events trigger workflows made of dependent jobs. Users inspect status, live logs and artifacts. The system has to handle bursts of events.
 
 **Core entities.**
@@ -503,6 +505,8 @@ Each answer should also walk through **one successful and one failed execution t
 ### 12. AI Code Review
 
 **Folder:** `ai-code-review/` · **Signal:** Anthropic (guide-reported: the candidate critiqued an existing design document instead of designing from scratch)
+
+**Status:** ✅ Built. See [ai-code-review/](./ai-code-review/) and its [architecture.md](./ai-code-review/architecture.md). The entry below is kept as the original brief.
 
 **Problem.** A proposed system fetches a pull request's diff, asks a model to assess it and automatically approves the changes it judges acceptable. Find the consequential omissions, then build the corrected design.
 
@@ -877,6 +881,8 @@ Most railcars on a Class I network belong to lessors and shippers, not to the ra
 ### 24. Yard Switch Lists
 
 **Folder:** `yard-switch-lists/` · **Signal:** Practice extension (BNSF publicly describes generating optimized switch lists with AI at its Alliance yard; not known to have been asked in interviews) · **Builds on:** job-scheduler, #19
+
+**Status:** ✅ Built. See [yard-switch-lists/](./yard-switch-lists/) and its [architecture.md](./yard-switch-lists/architecture.md). The entry below is kept as the original brief.
 
 **Problem.** A classification yard receives inbound trains, sorts their cars into blocks on classification tracks, and assembles outbound trains. Design the service that produces each shift's switch list (the ordered moves), and replans it when trains run late.
 

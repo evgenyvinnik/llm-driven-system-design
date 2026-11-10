@@ -1,0 +1,36 @@
+{
+  "name": "ai-code-review",
+  "frontendPort": 5173,
+  "backendRequired": true,
+  "dbName": "ai_code_review",
+  "dbUser": "review",
+  "auth": {
+    "enabled": true,
+    "loginUrl": "/login",
+    "credentials": { "username": "alice", "password": "password123" },
+    "usernameSelector": "input[name='username']",
+    "passwordSelector": "input[name='password']",
+    "submitSelector": "button[type='submit']",
+    "successIndicator": "main"
+  },
+  "screens": [
+    { "name": "01-login", "path": "/login", "waitFor": "form", "skipAuth": true, "delay": 500 },
+    { "name": "02-pr-queue", "path": "/prs", "waitFor": "table[aria-label='Pull requests']", "delay": 1500, "fullPage": true },
+    { "name": "03-injection-refused", "path": "/prs/acme/web-app/23", "waitFor": "[aria-label='Gate checklist']", "delay": 1500, "fullPage": true },
+    { "name": "04-approval-invalidated-by-push", "path": "/prs/acme/web-app/30", "waitFor": "[aria-label='Timeline']", "delay": 1500, "fullPage": true },
+    { "name": "05-rename-evades-path-check", "path": "/prs/acme/web-app/13", "waitFor": "[aria-label='Gate checklist']", "delay": 1500, "fullPage": true },
+    { "name": "06-safe-docs-approved", "path": "/prs/acme/web-app/7", "waitFor": "[aria-label='Gate checklist']", "delay": 1500, "fullPage": true },
+    { "name": "07-secret-read-denied", "path": "/prs/acme/web-app/27", "waitFor": "[aria-label='Tool requests']", "delay": 1500, "fullPage": true },
+    { "name": "08-malformed-fails-closed", "path": "/prs/acme/web-app/32", "waitFor": "[aria-label='Gate checklist']", "delay": 1500, "fullPage": true },
+    { "name": "09-human-approval-invalidated", "path": "/prs/acme/web-app/37", "waitFor": "[aria-label='Timeline']", "delay": 1500, "fullPage": true },
+    { "name": "10-observe-shadow", "path": "/prs/acme/payments-api/3", "waitFor": "[aria-label='Gate checklist']", "delay": 1500, "fullPage": true },
+    { "name": "11-escalation-queue", "path": "/escalations", "waitFor": "[aria-label='Escalations']", "delay": 1500, "fullPage": true },
+    { "name": "12-audit-log", "path": "/audit", "waitFor": "table[aria-label='Audit log']", "delay": 2000, "fullPage": true },
+    { "name": "13-evaluation", "path": "/evaluation", "waitFor": "[aria-label='Model only']", "delay": 2000, "fullPage": true },
+    { "name": "14-settings-promoted", "path": "/settings?repo=repo_web", "waitFor": "table[aria-label='Promotion checks']", "delay": 1500, "fullPage": true, "loginAs": { "username": "carol", "password": "password123" } },
+    { "name": "15-settings-demoted", "path": "/settings?repo=repo_mob", "waitFor": "table[aria-label='Promotion checks']", "delay": 1500, "fullPage": true, "loginAs": { "username": "carol", "password": "password123" } },
+    { "name": "16-fixture-panel", "path": "/fixtures", "waitFor": "[aria-label='Mock model']", "delay": 1500, "fullPage": true, "loginAs": { "username": "carol", "password": "password123" } },
+    { "name": "17-other-org", "path": "/prs", "waitFor": "table[aria-label='Pull requests']", "delay": 1500, "fullPage": true, "loginAs": { "username": "bob", "password": "password123" } }
+  ],
+  "viewport": { "width": 1440, "height": 900 }
+}

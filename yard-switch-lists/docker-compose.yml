@@ -1,0 +1,37 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: yard-switch-lists-postgres
+    ports:
+      - "${YARD_PG_PORT:-5432}:5432"
+    environment:
+      POSTGRES_USER: yard
+      POSTGRES_PASSWORD: yard_password
+      POSTGRES_DB: yard_switch_lists
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U yard -d yard_switch_lists"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Service name "redis" is what the repo's screenshot/triage scripts look for.
+  # Sessions, the holds feed (a Kafka stand-in) and the board's short-lived cache.
+  redis:
+    image: valkey/valkey:7-alpine
+    container_name: yard-switch-lists-valkey
+    ports:
+      - "${YARD_VALKEY_PORT:-6379}:6379"
+    command: valkey-server --appendonly yes
+    volumes:
+      - valkey_data:/data
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  postgres_data:
+  valkey_data:

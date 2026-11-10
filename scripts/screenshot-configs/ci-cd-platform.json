@@ -1,0 +1,42 @@
+{
+  "name": "ci-cd-platform",
+  "frontendPort": 5173,
+  "backendRequired": true,
+  "dbName": "ci_cd_platform",
+  "dbUser": "cicd",
+  "auth": {
+    "enabled": true,
+    "loginUrl": "/login",
+    "credentials": { "username": "alice", "password": "password123" },
+    "usernameSelector": "input[name='username']",
+    "passwordSelector": "input[name='password']",
+    "submitSelector": "button[type='submit']",
+    "successIndicator": "main"
+  },
+  "screens": [
+    { "name": "01-login", "path": "/login", "waitFor": "form", "skipAuth": true, "delay": 500 },
+    { "name": "02-repositories", "path": "/repos", "waitFor": "table[aria-label='Repositories']", "delay": 1000 },
+    { "name": "03-runs", "path": "/repos/repo_webapp", "waitFor": "table[aria-label='Runs']", "delay": 1000, "fullPage": true },
+    { "name": "04-run-success-dag", "path": "/runs/run_demo_success", "waitFor": "svg[aria-label='Job graph']", "delay": 1000, "fullPage": true },
+    { "name": "05-run-failed-skipped", "path": "/runs/run_demo_failed", "waitFor": "svg[aria-label='Job graph']", "delay": 1000, "fullPage": true },
+    { "name": "06-run-rerun-attempts", "path": "/runs/run_demo_rerun", "waitFor": "svg[aria-label='Job graph']", "delay": 1000, "fullPage": true },
+    { "name": "07-job-attempt-history", "path": "/runs/run_demo_rerun/jobs/job_run_demo_rerun_test", "waitFor": "[aria-label='Attempts']", "delay": 2000, "fullPage": true },
+    { "name": "08-run-waiting-approval", "path": "/runs/run_demo_waiting", "waitFor": "[data-approval='true']", "delay": 1000, "fullPage": true },
+    { "name": "09-run-needs-attention", "path": "/runs/run_demo_attention", "waitFor": "[data-attention='true']", "delay": 1000, "fullPage": true },
+    { "name": "10-job-needs-attention", "path": "/runs/run_demo_attention/jobs/job_run_demo_attention_deploy", "waitFor": "[data-attention='true']", "delay": 2000, "fullPage": true },
+    { "name": "11-job-lease-expired", "path": "/runs/run_demo_lease/jobs/job_run_demo_lease_long-build", "waitFor": "[aria-label='Attempts']", "delay": 2000, "fullPage": true },
+    { "name": "12-run-fork-withheld", "path": "/runs/run_demo_fork", "waitFor": "[aria-label='Fork notice']", "delay": 1000, "fullPage": true },
+    { "name": "13-job-fork-logs", "path": "/runs/run_demo_fork/jobs/job_run_demo_fork_test", "waitFor": "[aria-label='Attempts']", "delay": 2000, "fullPage": true },
+    { "name": "14-job-masked-logs", "path": "/runs/run_demo_secrets/jobs/job_run_demo_secrets_print", "waitFor": "[aria-label='Attempts']", "delay": 2000, "fullPage": true },
+    { "name": "15-run-invalid", "path": "/runs/run_demo_invalid", "waitFor": "[aria-label='Workflow errors']", "delay": 1000 },
+    { "name": "16-secrets", "path": "/repos/repo_webapp/secrets", "waitFor": "table[aria-label='Secrets']", "delay": 1000, "fullPage": true },
+    { "name": "17-environments", "path": "/repos/repo_webapp/environments", "waitFor": "[aria-label='Environments']", "delay": 1000 },
+    { "name": "18-runners", "path": "/runners", "waitFor": "table[aria-label='Runners']", "delay": 1500 },
+    { "name": "19-ops", "path": "/ops", "waitFor": "table[aria-label='Repository concurrency']", "delay": 1500, "fullPage": true },
+    { "name": "20-fixture-panel", "path": "/fixtures", "waitFor": "table[aria-label='Deliveries']", "delay": 1500, "fullPage": true },
+    { "name": "21-carol-read-only", "path": "/runs/run_demo_attention", "waitFor": "[data-attention='true']", "delay": 1000, "loginAs": { "username": "carol", "password": "password123" } },
+    { "name": "22-bob-other-org", "path": "/repos", "waitFor": "table[aria-label='Repositories']", "delay": 1000, "loginAs": { "username": "bob", "password": "password123" } },
+    { "name": "23-admin-ops", "path": "/ops", "waitFor": "table[aria-label='Repository concurrency']", "delay": 1500, "fullPage": true, "loginAs": { "username": "admin", "password": "password123" } }
+  ],
+  "viewport": { "width": 1440, "height": 900 }
+}
