@@ -216,7 +216,7 @@ External projects demonstrating system design concepts (with local architecture 
 
 ### Planned Projects
 
-Built projects from both recent rounds are listed in the tables above. The AI products and developer platforms round has 15 of 18 built, including all of tiers 1 and 2: Prompt Playground, AI Chat Client, Settings Service, LLM Chat Analytics, LLM Inference API, Webhook Platform, Multi-Org Dashboard, Document Q&A, Experimentation Platform, LLM Eval Dashboard, CI/CD Platform, AI Code Review, In-App Assistant, File System and Console Growth. The [rail operations track](./ROADMAP.md#rail-operations-track-bnsf) for BNSF Railway loops is complete, with all 7 built: Railcar Health, Locomotive Fueling, Storage Remediation, Freight Quote, Railcar Trip Plans, Track Hazard Detection and Yard Switch Lists. The rest are below. See [ROADMAP.md](./ROADMAP.md) for each project's scope, core entities, hard problems and interview follow-ups.
+[ROADMAP.md](./ROADMAP.md) came from two surveys of reported interview questions, and both are nearly done. The [rail operations track](./ROADMAP.md#rail-operations-track-bnsf) for BNSF Railway loops is complete, with all 7 projects built. The AI products and developer platforms round has 15 of 18 built, including every tier 1 and tier 2 project. The three left are tier 3 infrastructure specialties. See [ROADMAP.md](./ROADMAP.md) for each project's scope, core entities, hard problems and interview follow-ups.
 
 | Project | Description | Status |
 |---------|-------------|--------|
@@ -249,6 +249,7 @@ Each project folder contains:
 | `architecture.md` | System design documentation, architectural decisions, and trade-offs |
 | `system-design-answer-{frontend,backend,fullstack}.md` | Interview-style answers tailored by role (45-minute format) |
 | `CLAUDE.md` | LLM collaboration notes and iteration history |
+| Format-specific documents (some projects) | `events.md` event catalogs in the event-driven rail projects, `existing-system-review.md` in Storage Remediation, `coding-exercise.md` in Freight Quote, and `proposed-design.md` with `design-review.md` in AI Code Review |
 | `screenshots/` | UI captures taken by the screenshot harness |
 | `tests/` | Playwright smoke tests generated from the screenshot config |
 | Source code | Actual implementation (varies by project) |
