@@ -15,8 +15,10 @@
  * @module routes/Domains
  */
 
-import { useEffect, useState } from 'react';
+import { Fragment, useEffect, useState } from 'react';
 import { useCrawlerStore } from '../stores/crawlerStore';
+import { useAuthStore } from '../stores/authStore';
+import { DomainSettingsPanel } from '../components/DomainSettingsPanel';
 import { api } from '../services/api';
 
 /**
@@ -32,7 +34,9 @@ import { api } from '../services/api';
  * @returns Paginated domains browser with robots.txt viewer
  */
 export function Domains() {
-  const { domains, domainsTotal, domainsLoading, fetchDomains } = useCrawlerStore();
+  const { domains, domainsTotal, domainsLoading, fetchDomains, replaceDomain } = useCrawlerStore();
+  const isAdmin = useAuthStore((s) => s.user?.role === 'admin');
+  const [settingsDomain, setSettingsDomain] = useState<string | null>(null);
   const [offset, setOffset] = useState(0);
   const [selectedDomain, setSelectedDomain] = useState<string | null>(null);
   const [robotsTxt, setRobotsTxt] = useState<string | null>(null);
@@ -112,8 +116,8 @@ export function Domains() {
                     </tr>
                   ) : (
                     domains.map((domain) => (
-                      <>
-                        <tr key={domain.domain} className="hover:bg-gray-50">
+                      <Fragment key={domain.domain}>
+                        <tr className="hover:bg-gray-50">
                           <td className="px-4 py-2">
                             <a
                               href={`https://${domain.domain}`}
@@ -128,7 +132,10 @@ export function Domains() {
                             {domain.pageCount.toLocaleString()}
                           </td>
                           <td className="px-4 py-2 text-sm text-gray-600">
-                            {domain.crawlDelay}s
+                            {domain.effectiveCrawlDelay ?? domain.crawlDelay}s
+                            {domain.crawlDelayOverride != null && (
+                              <span className="ml-1 text-xs text-gray-500">(override)</span>
+                            )}
                           </td>
                           <td className="px-4 py-2">
                             <span
@@ -141,15 +148,34 @@ export function Domains() {
                               {domain.isAllowed ? 'Allowed' : 'Blocked'}
                             </span>
                           </td>
-                          <td className="px-4 py-2">
+                          <td className="px-4 py-2 space-x-3 whitespace-nowrap">
                             <button
                               onClick={() => handleViewRobots(domain.domain)}
                               className="text-sm text-primary-600 hover:text-primary-800"
                             >
                               {selectedDomain === domain.domain ? 'Hide' : 'View'} robots.txt
                             </button>
+                            {isAdmin && (
+                              <button
+                                onClick={() =>
+                                  setSettingsDomain(
+                                    settingsDomain === domain.domain ? null : domain.domain
+                                  )
+                                }
+                                className="text-sm text-primary-600 hover:text-primary-800"
+                              >
+                                {settingsDomain === domain.domain ? 'Close' : 'Settings'}
+                              </button>
+                            )}
                           </td>
                         </tr>
+                        {isAdmin && settingsDomain === domain.domain && (
+                          <tr>
+                            <td colSpan={5} className="px-4 py-3 bg-gray-50">
+                              <DomainSettingsPanel domain={domain} onSaved={replaceDomain} />
+                            </td>
+                          </tr>
+                        )}
                         {selectedDomain === domain.domain && (
                           <tr>
                             <td colSpan={5} className="px-4 py-2 bg-gray-50">
@@ -159,7 +185,7 @@ export function Domains() {
                             </td>
                           </tr>
                         )}
-                      </>
+                      </Fragment>
                     ))
                   )}
                 </tbody>

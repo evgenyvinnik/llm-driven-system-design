@@ -135,7 +135,13 @@ function generateSmokeTests(config) {
     // Wait for the app to actually leave the login path instead. A login form served
     // at "/" can't be detected from the URL, so those keep the previous behavior.
     const loginPath = (config.auth.loginUrl || '/login').split(/[?#]/)[0];
-    if (loginPath !== '/') {
+    if (config.auth.inPlace) {
+      // Apps that sign in without navigating (the form is replaced by the page it
+      // guards) opt in with auth.inPlace: wait for the credential field to go away,
+      // the same success signal the screenshot harness uses.
+      lines.push(`  // Signs in in place: wait until the password field is gone`);
+      lines.push(`  await expect(page.locator("${passwordSelector}")).toHaveCount(0, { timeout: 15000 });`);
+    } else if (loginPath !== '/') {
       lines.push(`  // Wait until the app leaves the login page, i.e. the sign-in request completed`);
       lines.push(`  await page.waitForURL((url) => url.pathname !== '${loginPath}', { timeout: 15000 });`);
     } else {

@@ -188,6 +188,15 @@ export const config = {
     maxLinksPerPage: parseInt(process.env.CRAWLER_MAX_LINKS_PER_PAGE || '500', 10),
 
     /**
+     * Maximum URLs enqueued per domain (seeds are exempt). Bounds crawler
+     * traps that generate infinite *shallow* URLs, which the depth limit
+     * doesn't catch, and keeps one big site from crowding out breadth.
+     * 0 disables the budget.
+     * @default 10000
+     */
+    maxPagesPerDomain: parseInt(process.env.CRAWLER_MAX_PAGES_PER_DOMAIN || '10000', 10),
+
+    /**
      * How many times a URL that failed with a transient error (timeout,
      * connection reset, 5xx, 429) is rescheduled before being marked failed.
      * @default 3

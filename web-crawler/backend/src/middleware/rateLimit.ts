@@ -41,7 +41,10 @@ export interface RateLimitConfig {
  */
 export const RATE_LIMIT_TIERS: Record<string, RateLimitConfig> = {
   anonymous: {
-    limit: 10,
+    // The dashboard is publicly readable and polls /api/stats every 5s (12/min)
+    // plus page-level queries. The old limit of 10/min rate-limited an
+    // anonymous viewer within the first minute.
+    limit: 120,
     windowSeconds: 60,
     message: 'Rate limit exceeded. Please authenticate for higher limits.',
   },
@@ -54,6 +57,12 @@ export const RATE_LIMIT_TIERS: Record<string, RateLimitConfig> = {
     limit: 500,
     windowSeconds: 60,
     message: 'Rate limit exceeded.',
+  },
+  login: {
+    // Brute-force protection: keyed by IP (no session yet), counts every attempt
+    limit: 10,
+    windowSeconds: 15 * 60,
+    message: 'Too many login attempts. Try again in 15 minutes.',
   },
   seed: {
     limit: 10,
@@ -260,6 +269,11 @@ export function createTieredRateLimiter() {
  * 3. Gives admins time to verify seeds are working as expected
  */
 export const seedInjectionLimiter = createRateLimiter('seed');
+
+/**
+ * Login rate limiter (10 attempts per 15 minutes per client).
+ */
+export const loginLimiter = createRateLimiter('login');
 
 /**
  * Clears rate limit for a specific key.

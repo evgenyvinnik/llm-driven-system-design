@@ -13,6 +13,7 @@
  */
 
 import { Router, Request, Response } from 'express';
+import { requireAdmin } from '../middleware/auth.js';
 import { frontierService } from '../services/frontier.js';
 import { pool } from '../models/database.js';
 
@@ -69,7 +70,7 @@ router.get('/urls', async (req: Request, res: Response) => {
  * @body priority - Optional priority level (1-3, default: calculated)
  * @returns Object with count of added URLs and total submitted
  */
-router.post('/add', async (req: Request, res: Response) => {
+router.post('/add', requireAdmin, async (req: Request, res: Response) => {
   try {
     const { urls, priority } = req.body;
 
@@ -99,7 +100,7 @@ router.post('/add', async (req: Request, res: Response) => {
  * @body priority - Priority level (default: 3 - high)
  * @returns Object with count of added URLs and total submitted
  */
-router.post('/seed', async (req: Request, res: Response) => {
+router.post('/seed', requireAdmin, async (req: Request, res: Response) => {
   try {
     const { urls, priority = 3 } = req.body;
 
@@ -138,7 +139,7 @@ router.post('/seed', async (req: Request, res: Response) => {
  * @query minutes - Age threshold in minutes (default: 10)
  * @returns Object with count of recovered URLs
  */
-router.post('/recover', async (req: Request, res: Response) => {
+router.post('/recover', requireAdmin, async (req: Request, res: Response) => {
   try {
     const minutes = parseInt(req.query.minutes as string) || 10;
     const recovered = await frontierService.recoverStaleUrls(minutes);
@@ -162,7 +163,7 @@ router.post('/recover', async (req: Request, res: Response) => {
  *
  * @returns Success message
  */
-router.delete('/clear', async (_req: Request, res: Response) => {
+router.delete('/clear', requireAdmin, async (_req: Request, res: Response) => {
   try {
     await frontierService.clear();
     res.json({ message: 'Frontier cleared' });

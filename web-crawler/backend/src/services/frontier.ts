@@ -200,20 +200,26 @@ export class FrontierService {
     // Fast-path dedup against already-crawled URLs
     const hashes = [...candidates.keys()];
     const visitedFlags = await redis.smismember(REDIS_KEYS.VISITED_URLS, ...hashes);
-    const fresh = hashes.filter((_, i) => visitedFlags[i] !== 1);
-    let duplicates = hashes.length - fresh.length;
+    const unvisited = hashes.filter((_, i) => visitedFlags[i] !== 1);
 
-    let inserted: { url_hash: string; priority: number }[] = [];
+    // Per-domain budget. Seeds (depth 0) are explicit operator intent and bypass it.
+    const { allowed: fresh, skipped: overBudget } =
+      options.depth === 0
+        ? { allowed: unvisited, skipped: 0 }
+        : await this.applyDomainBudget(unvisited, candidates);
+    let duplicates = hashes.length - unvisited.length;
+
+    let inserted: { url_hash: string; priority: number; domain: string }[] = [];
     if (fresh.length > 0) {
       const rows = fresh.map((h) => candidates.get(h)!);
       try {
-        const result = await pool.query<{ url_hash: string; priority: number }>(
+        const result = await pool.query<{ url_hash: string; priority: number; domain: string }>(
           `INSERT INTO url_frontier (url, url_hash, domain, priority, depth, status, scheduled_at)
            SELECT u.url, u.url_hash, u.domain, u.priority, u.depth, 'pending', NOW()
            FROM unnest($1::text[], $2::text[], $3::text[], $4::int[], $5::int[])
              AS u(url, url_hash, domain, priority, depth)
            ON CONFLICT (url_hash) DO NOTHING
-           RETURNING url_hash, priority`,
+           RETURNING url_hash, priority, domain`,
           [
             rows.map((r) => r.url),
             fresh,
@@ -242,9 +248,78 @@ export class FrontierService {
     if (duplicates > 0) {
       pipeline.incrby(REDIS_KEYS.STATS_DUPLICATES_SKIPPED, duplicates);
     }
+    if (overBudget > 0) {
+      pipeline.incrby(REDIS_KEYS.STATS_BUDGET_SKIPPED, overBudget);
+    }
+    if (config.crawler.maxPagesPerDomain > 0) {
+      const perDomain = new Map<string, number>();
+      for (const row of inserted) {
+        perDomain.set(row.domain, (perDomain.get(row.domain) ?? 0) + 1);
+      }
+      for (const [domain, n] of perDomain) {
+        pipeline.hincrby(REDIS_KEYS.DOMAIN_ENQUEUED, domain, n);
+      }
+    }
     await pipeline.exec();
 
     return inserted.length;
+  }
+
+  /**
+   * Enforces `maxPagesPerDomain`: drops URLs for domains whose frontier
+   * already holds that many URLs.
+   *
+   * This bounds the damage of crawler traps that the depth limit doesn't catch
+   * (a site generating infinite shallow URLs) and stops one large site from
+   * crowding out breadth. Counts live in one Redis hash (`HMGET` per batch);
+   * a domain missing from the hash is initialized from Postgres with HSETNX, so
+   * a Redis restart doesn't reset budgets.
+   *
+   * The budget is soft: concurrent batches for one domain can overshoot by at
+   * most one batch, which is acceptable for a trap defense.
+   */
+  private async applyDomainBudget(
+    hashes: string[],
+    candidates: Map<string, { domain: string }>
+  ): Promise<{ allowed: string[]; skipped: number }> {
+    const budget = config.crawler.maxPagesPerDomain;
+    if (budget <= 0 || hashes.length === 0) return { allowed: hashes, skipped: 0 };
+
+    const domains = [...new Set(hashes.map((h) => candidates.get(h)!.domain))];
+    const counts = await redis.hmget(REDIS_KEYS.DOMAIN_ENQUEUED, ...domains);
+    const used = new Map<string, number>();
+    const missing: string[] = [];
+    domains.forEach((d, i) => {
+      if (counts[i] === null) missing.push(d);
+      else used.set(d, parseInt(counts[i]!, 10) || 0);
+    });
+
+    if (missing.length > 0) {
+      const result = await pool.query<{ domain: string; count: string }>(
+        `SELECT domain, COUNT(*) AS count FROM url_frontier
+         WHERE domain = ANY($1::text[]) GROUP BY domain`,
+        [missing]
+      );
+      const fromDb = new Map(result.rows.map((r) => [r.domain, parseInt(r.count, 10)]));
+      const pipeline = redis.pipeline();
+      for (const d of missing) {
+        const n = fromDb.get(d) ?? 0;
+        used.set(d, n);
+        pipeline.hsetnx(REDIS_KEYS.DOMAIN_ENQUEUED, d, n);
+      }
+      await pipeline.exec();
+    }
+
+    const allowed: string[] = [];
+    for (const h of hashes) {
+      const d = candidates.get(h)!.domain;
+      const n = used.get(d) ?? 0;
+      if (n < budget) {
+        allowed.push(h);
+        used.set(d, n + 1);
+      }
+    }
+    return { allowed, skipped: hashes.length - allowed.length };
   }
 
   /**
@@ -609,7 +684,7 @@ export class FrontierService {
    */
   async clear(): Promise<void> {
     await pool.query('DELETE FROM url_frontier');
-    await redis.del(...PRIORITY_QUEUES);
+    await redis.del(...PRIORITY_QUEUES, REDIS_KEYS.DOMAIN_ENQUEUED);
   }
 }
 

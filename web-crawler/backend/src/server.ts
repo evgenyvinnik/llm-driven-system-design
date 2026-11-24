@@ -25,7 +25,7 @@ import compression from 'compression';
 
 import { config } from './config.js';
 import { initDatabase, pool } from './models/database.js';
-import { redis } from './models/redis.js';
+import { redis, REDIS_KEYS } from './models/redis.js';
 import frontierRoutes from './routes/frontier.js';
 import statsRoutes from './routes/stats.js';
 import pagesRoutes from './routes/pages.js';
@@ -43,7 +43,11 @@ import {
   getCurrentUser,
   UserRole,
 } from './middleware/auth.js';
-import { createTieredRateLimiter, seedInjectionLimiter } from './middleware/rateLimit.js';
+import {
+  createTieredRateLimiter,
+  seedInjectionLimiter,
+  loginLimiter,
+} from './middleware/rateLimit.js';
 import { cleanupService } from './services/cleanup.js';
 import { maintenanceService } from './services/maintenance.js';
 import { frontierService } from './services/frontier.js';
@@ -54,6 +58,13 @@ import { frontierService } from './services/frontier.js';
  */
 const app = express();
 
+// Behind a TLS-terminating proxy (nginx, a load balancer), trust X-Forwarded-*
+// so req.secure / req.ip reflect the client: needed for Secure session cookies
+// and for per-client rate-limit keys.
+if (process.env.TRUST_PROXY) {
+  app.set('trust proxy', Number(process.env.TRUST_PROXY) || process.env.TRUST_PROXY);
+}
+
 // ============================================================================
 // SECURITY MIDDLEWARE
 // ============================================================================
@@ -62,9 +73,16 @@ const app = express();
 app.use(helmet());
 
 // Enable CORS for frontend access
+// The SPA normally reaches the API through the Vite proxy (same origin), so
+// CORS only matters for direct cross-origin calls. Reflecting *any* origin
+// with credentials is unsafe; allow an explicit list instead.
+const allowedOrigins = (process.env.CORS_ORIGINS || 'http://localhost:5173')
+  .split(',')
+  .map((o) => o.trim())
+  .filter(Boolean);
 app.use(
   cors({
-    origin: config.nodeEnv === 'production' ? false : true,
+    origin: config.nodeEnv === 'production' ? false : allowedOrigins,
     credentials: true, // Required for session cookies
   })
 );
@@ -73,7 +91,7 @@ app.use(
 app.use(compression());
 
 // Parse JSON request bodies
-app.use(express.json());
+app.use(express.json({ limit: '1mb' }));
 
 // ============================================================================
 // LOGGING MIDDLEWARE
@@ -119,7 +137,8 @@ app.use(createSessionMiddleware());
  * Verifies connectivity to PostgreSQL and Redis with detailed status.
  * Returns 200 if healthy, 503 if any service is unavailable.
  */
-app.get('/health', async (_req: Request, res: Response) => {
+// /api/health too, so the SPA can reach it through the /api proxy
+app.get(['/health', '/api/health'], async (_req: Request, res: Response) => {
   const checks: Record<string, { status: string; latencyMs?: number; error?: string }> = {};
 
   // Check database connection
@@ -224,7 +243,7 @@ app.get('/', (_req: Request, res: Response) => {
  *
  * Authenticate user and create session.
  */
-app.post('/api/auth/login', loginHandler);
+app.post('/api/auth/login', loginLimiter, loginHandler);
 
 /**
  * POST /api/auth/logout
@@ -412,8 +431,8 @@ app.post(
         [domain]
       );
 
-      // Clear circuit breaker state in Redis
-      await redis.del(`crawler:circuit:${domain}`);
+      // Clear circuit breaker state and the operator block that workers read
+      await redis.del(`crawler:circuit:${domain}`, REDIS_KEYS.DOMAIN_BLOCKED(domain));
 
       logger.info({ userId: req.session?.userId, domain }, 'Domain reset');
 
@@ -442,6 +461,12 @@ app.use(
     _next: express.NextFunction
   ) => {
     logger.error({ err }, 'Unhandled error');
+    // e.g. a session-store write failing after the handler already responded:
+    // let Express close the connection instead of throwing ERR_HTTP_HEADERS_SENT
+    if (res.headersSent) {
+      _next(err);
+      return;
+    }
     res.status(500).json({
       error: 'Internal server error',
       message: config.nodeEnv === 'development' ? err.message : undefined,
@@ -495,11 +520,10 @@ async function start() {
 // ============================================================================
 
 /**
- * SIGTERM handler for graceful shutdown.
- * Closes database and Redis connections, stops cleanup service before exiting.
+ * Graceful shutdown on SIGTERM / SIGINT: stop background jobs, close pools.
  */
-process.on('SIGTERM', async () => {
-  logger.info('SIGTERM received, shutting down gracefully');
+async function shutdown(signal: string) {
+  logger.info(`${signal} received, shutting down gracefully`);
 
   cleanupService.stop();
   maintenanceService.stop();
@@ -509,23 +533,14 @@ process.on('SIGTERM', async () => {
 
   logger.info('Server shutdown complete');
   process.exit(0);
-});
+}
 
-/**
- * SIGINT handler for graceful shutdown (Ctrl+C).
- * Closes database and Redis connections, stops cleanup service before exiting.
- */
-process.on('SIGINT', async () => {
-  logger.info('SIGINT received, shutting down gracefully');
+// Tests import `app` directly and must not start a listener, background jobs,
+// or signal handlers (vitest sets VITEST in the environment).
+if (!process.env.VITEST) {
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  start();
+}
 
-  cleanupService.stop();
-  maintenanceService.stop();
-
-  await pool.end();
-  await redis.quit();
-
-  logger.info('Server shutdown complete');
-  process.exit(0);
-});
-
-start();
+export { app };

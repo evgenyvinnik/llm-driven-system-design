@@ -8,6 +8,7 @@ CREATE TABLE IF NOT EXISTS domains (
   robots_txt TEXT,
   robots_fetched_at TIMESTAMP,
   crawl_delay FLOAT DEFAULT 1.0,
+  crawl_delay_override FLOAT,              -- operator override (seconds); effective = max(override, crawl_delay)
   page_count INTEGER DEFAULT 0,
   is_allowed BOOLEAN DEFAULT true,
   created_at TIMESTAMP DEFAULT NOW(),

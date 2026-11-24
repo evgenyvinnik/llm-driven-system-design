@@ -1,204 +1,210 @@
 /**
  * @fileoverview Admin route component for crawler administration.
  *
- * The Admin panel provides administrative controls for the web crawler:
- * - Add seed URLs to start crawling new sites
- * - Recover stale URLs stuck in "in_progress" state
+ * Shows a sign-in form until an admin session exists (every action here hits a
+ * route the server protects with `requireAdmin`). Once signed in:
+ * - Add seed URLs (validated client-side before submitting)
+ * - Recover stale URLs stuck in "in_progress"
  * - Reset statistics counters
- * - Clear the entire URL frontier (danger zone)
- * - Check system health (database and Redis connectivity)
- *
- * This page is intended for operators who need to manage crawler behavior
- * and recover from error conditions.
+ * - Clear the frontier (typed confirmation)
+ * - Check system health
  *
  * @module routes/Admin
  */
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { api } from '../services/api';
+import { useAuthStore } from '../stores/authStore';
+import { useCrawlerStore } from '../stores/crawlerStore';
+import { LoginForm } from '../components/LoginForm';
+import { ClearFrontierPanel } from '../components/ClearFrontierPanel';
+
+type Result = { message: string; ok: boolean } | null;
 
 /**
- * Admin route component for crawler administration tasks.
- *
- * Provides four main sections:
- * 1. Seed URLs - Add high-priority URLs to start crawling new domains
- * 2. Recovery Actions - Recover stale URLs that got stuck
- * 3. Statistics - Reset crawl counters
- * 4. Danger Zone - Destructive operations like clearing the frontier
- *
- * All actions show loading state and result feedback.
- *
- * @returns Admin panel with crawler management controls
+ * Splits pasted text into valid http(s) URLs and the lines that aren't.
  */
-export function Admin() {
-  const [loading, setLoading] = useState<string | null>(null);
-  const [result, setResult] = useState<string | null>(null);
-  const [seedUrls, setSeedUrls] = useState('');
+function parseSeedUrls(text: string): { valid: string[]; invalid: string[] } {
+  const valid: string[] = [];
+  const invalid: string[] = [];
+  for (const line of text.split('\n').map((l) => l.trim()).filter(Boolean)) {
+    try {
+      const u = new URL(line);
+      if (u.protocol === 'http:' || u.protocol === 'https:') valid.push(line);
+      else invalid.push(line);
+    } catch {
+      invalid.push(line);
+    }
+  }
+  return { valid, invalid };
+}
 
-  /**
-   * Generic action handler with loading state and result feedback.
-   * Wraps any async action with consistent error handling.
-   *
-   * @param action - Identifier for the action (used for loading state)
-   * @param fn - Async function to execute
-   */
-  const handleAction = async (action: string, fn: () => Promise<unknown>) => {
+export function Admin() {
+  const user = useAuthStore((s) => s.user);
+  const checking = useAuthStore((s) => s.checking);
+  const { stats, fetchStats } = useCrawlerStore();
+  const [loading, setLoading] = useState<string | null>(null);
+  const [result, setResult] = useState<Result>(null);
+  const [seedText, setSeedText] = useState('');
+
+  const isAdmin = user?.role === 'admin';
+
+  // The danger zone shows how many URLs a clear would delete
+  useEffect(() => {
+    if (isAdmin && !stats) fetchStats();
+  }, [isAdmin, stats, fetchStats]);
+
+  const run = async (action: string, fn: () => Promise<string>) => {
     setLoading(action);
     setResult(null);
     try {
-      const res = await fn();
-      setResult(`Success: ${JSON.stringify(res)}`);
+      setResult({ message: await fn(), ok: true });
     } catch (error) {
-      setResult(`Error: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      setResult({ message: error instanceof Error ? error.message : 'Unknown error', ok: false });
     } finally {
       setLoading(null);
+      fetchStats(); // counts shown here (e.g. the danger zone) must reflect the action
     }
   };
 
-  /**
-   * Handles adding seed URLs from the textarea.
-   * Parses the textarea content, filters valid URLs, and submits to API.
-   * Seed URLs are added with high priority (3) by default.
-   */
-  const handleAddSeeds = async () => {
-    const urls = seedUrls
-      .split('\n')
-      .map((u) => u.trim())
-      .filter((u) => u.startsWith('http'));
-    if (urls.length === 0) {
-      setResult('Error: No valid URLs provided');
-      return;
-    }
-    await handleAction('addSeeds', () => api.addSeedUrls(urls, 3));
-    setSeedUrls('');
-  };
+  const { valid: seedUrls, invalid: invalidSeeds } = parseSeedUrls(seedText);
+
+  if (checking) {
+    return <div className="p-6 text-sm text-gray-500">Checking session…</div>;
+  }
+
+  if (!isAdmin) {
+    return (
+      <div className="p-6 space-y-6">
+        <h1 className="text-2xl font-bold text-gray-900">Admin Panel</h1>
+        <LoginForm />
+      </div>
+    );
+  }
+
+  const card = 'bg-white rounded-lg shadow-sm border border-gray-200 p-4';
+  const button =
+    'px-4 py-2 text-white rounded-md text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed';
 
   return (
     <div className="p-6 space-y-6">
       <h1 className="text-2xl font-bold text-gray-900">Admin Panel</h1>
 
-      {/* Result Message */}
       {result && (
         <div
-          className={`p-4 rounded-lg ${
-            result.startsWith('Success')
-              ? 'bg-green-50 text-green-800 border border-green-200'
-              : 'bg-red-50 text-red-800 border border-red-200'
+          role={result.ok ? 'status' : 'alert'}
+          className={`p-4 rounded-lg border ${
+            result.ok
+              ? 'bg-green-50 text-green-800 border-green-200'
+              : 'bg-red-50 text-red-800 border-red-200'
           }`}
         >
-          {result}
+          {result.message}
         </div>
       )}
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        {/* Seed URLs */}
-        <div className="bg-white rounded-lg shadow-sm border border-gray-200 p-4">
-          <h2 className="text-lg font-medium text-gray-900 mb-4">Add Seed URLs</h2>
-          <p className="text-sm text-gray-600 mb-4">
-            Add high-priority seed URLs to start crawling new sites.
+        <div className={card}>
+          <h2 className="text-lg font-medium text-gray-900 mb-2">Add Seed URLs</h2>
+          <p className="text-sm text-gray-600 mb-3">
+            One URL per line. Seeds are queued at high priority, depth 0.
           </p>
           <textarea
-            value={seedUrls}
-            onChange={(e) => setSeedUrls(e.target.value)}
+            value={seedText}
+            onChange={(e) => setSeedText(e.target.value)}
             rows={5}
-            className="w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:ring-primary-500 focus:border-primary-500 text-sm mb-4"
-            placeholder="https://example.com&#10;https://another-site.com"
+            className="w-full px-3 py-2 border border-gray-300 rounded-md text-sm mb-2"
+            placeholder={'https://example.com\nhttps://another-site.com'}
+            aria-label="Seed URLs, one per line"
           />
+          {invalidSeeds.length > 0 && (
+            <p className="text-sm text-amber-800 mb-2">
+              {invalidSeeds.length} line(s) aren't valid http(s) URLs and will be skipped:{' '}
+              <span className="font-mono">{invalidSeeds.slice(0, 3).join(', ')}</span>
+              {invalidSeeds.length > 3 && '…'}
+            </p>
+          )}
           <button
-            onClick={handleAddSeeds}
-            disabled={loading === 'addSeeds'}
-            className="px-4 py-2 bg-primary-600 text-white rounded-md text-sm font-medium hover:bg-primary-700 disabled:opacity-50"
+            onClick={() =>
+              run('seed', async () => {
+                const res = await api.addSeedUrls(seedUrls, 3);
+                setSeedText('');
+                const skipped = res.total - res.added;
+                return `Added ${res.added} of ${res.total} URLs${
+                  skipped ? ` (${skipped} already known or filtered)` : ''
+                }.`;
+              })
+            }
+            disabled={loading === 'seed' || seedUrls.length === 0}
+            className={`${button} bg-primary-600 hover:bg-primary-700`}
           >
-            {loading === 'addSeeds' ? 'Adding...' : 'Add Seed URLs'}
+            {loading === 'seed'
+              ? 'Adding…'
+              : seedUrls.length > 0
+                ? `Add ${seedUrls.length} Seed URL${seedUrls.length === 1 ? '' : 's'}`
+                : 'Add Seed URLs'}
           </button>
         </div>
 
-        {/* Recovery Actions */}
-        <div className="bg-white rounded-lg shadow-sm border border-gray-200 p-4">
-          <h2 className="text-lg font-medium text-gray-900 mb-4">Recovery Actions</h2>
-          <div className="space-y-4">
-            <div>
-              <p className="text-sm text-gray-600 mb-2">
-                Recover stale URLs that have been in progress for too long.
-              </p>
-              <button
-                onClick={() => handleAction('recover', () => api.recoverStaleUrls(10))}
-                disabled={loading === 'recover'}
-                className="px-4 py-2 bg-yellow-500 text-white rounded-md text-sm font-medium hover:bg-yellow-600 disabled:opacity-50"
-              >
-                {loading === 'recover' ? 'Recovering...' : 'Recover Stale URLs'}
-              </button>
-            </div>
-          </div>
-        </div>
-
-        {/* Statistics Actions */}
-        <div className="bg-white rounded-lg shadow-sm border border-gray-200 p-4">
-          <h2 className="text-lg font-medium text-gray-900 mb-4">Statistics</h2>
-          <div className="space-y-4">
-            <div>
-              <p className="text-sm text-gray-600 mb-2">Reset all crawl statistics counters.</p>
-              <button
-                onClick={() => handleAction('resetStats', api.resetStats)}
-                disabled={loading === 'resetStats'}
-                className="px-4 py-2 bg-gray-500 text-white rounded-md text-sm font-medium hover:bg-gray-600 disabled:opacity-50"
-              >
-                {loading === 'resetStats' ? 'Resetting...' : 'Reset Statistics'}
-              </button>
-            </div>
-          </div>
-        </div>
-
-        {/* Danger Zone */}
-        <div className="bg-white rounded-lg shadow-sm border border-red-200 p-4">
-          <h2 className="text-lg font-medium text-red-700 mb-4">Danger Zone</h2>
-          <div className="space-y-4">
-            <div>
-              <p className="text-sm text-red-600 mb-2">
-                Clear the entire URL frontier. This action cannot be undone.
-              </p>
-              <button
-                onClick={() => {
-                  if (
-                    window.confirm(
-                      'Are you sure you want to clear the frontier? This cannot be undone.'
-                    )
-                  ) {
-                    handleAction('clearFrontier', api.clearFrontier);
+        <div className={card}>
+          <h2 className="text-lg font-medium text-gray-900 mb-2">Recovery &amp; Statistics</h2>
+          <p className="text-sm text-gray-600 mb-3">
+            Stale leases are recovered automatically every minute; this forces a sweep now for
+            URLs in progress longer than 10 minutes.
+          </p>
+          <div className="flex flex-wrap gap-3">
+            <button
+              onClick={() =>
+                run('recover', async () => {
+                  const res = await api.recoverStaleUrls(10);
+                  return `Recovered ${res.recovered} stale URL(s).`;
+                })
+              }
+              disabled={loading === 'recover'}
+              className={`${button} bg-yellow-600 hover:bg-yellow-700`}
+            >
+              {loading === 'recover' ? 'Recovering…' : 'Recover Stale URLs'}
+            </button>
+            <button
+              onClick={() =>
+                run('reset', async () => {
+                  if (!window.confirm('Reset all crawl counters to zero? Crawl data is kept.')) {
+                    return 'Reset cancelled.';
                   }
-                }}
-                disabled={loading === 'clearFrontier'}
-                className="px-4 py-2 bg-red-600 text-white rounded-md text-sm font-medium hover:bg-red-700 disabled:opacity-50"
-              >
-                {loading === 'clearFrontier' ? 'Clearing...' : 'Clear Frontier'}
-              </button>
-            </div>
+                  await api.resetStats();
+                  return 'Statistics counters reset.';
+                })
+              }
+              disabled={loading === 'reset'}
+              className={`${button} bg-gray-600 hover:bg-gray-700`}
+            >
+              {loading === 'reset' ? 'Resetting…' : 'Reset Statistics'}
+            </button>
+            <button
+              onClick={() =>
+                run('health', async () => {
+                  const h = await api.getHealth();
+                  const services = Object.entries(h.services)
+                    .map(([name, svc]) => `${name}: ${svc.status}${svc.latencyMs !== undefined ? ` (${svc.latencyMs}ms)` : ''}`)
+                    .join(' · ');
+                  return `System ${h.status} — ${services} · workers: ${h.workers ?? 0}`;
+                })
+              }
+              disabled={loading === 'health'}
+              className={`${button} bg-primary-600 hover:bg-primary-700`}
+            >
+              {loading === 'health' ? 'Checking…' : 'Check Health'}
+            </button>
           </div>
         </div>
-      </div>
 
-      {/* System Health */}
-      <div className="bg-white rounded-lg shadow-sm border border-gray-200 p-4">
-        <h2 className="text-lg font-medium text-gray-900 mb-4">System Health</h2>
-        <button
-          onClick={async () => {
-            setLoading('health');
-            try {
-              const health = await api.getHealth();
-              setResult(
-                `Health: ${health.status} | Database: ${health.services.database} | Redis: ${health.services.redis}`
-              );
-            } catch (error) {
-              setResult(`Error: ${error instanceof Error ? error.message : 'Failed to check health'}`);
-            } finally {
-              setLoading(null);
-            }
+        <ClearFrontierPanel
+          queuedCount={stats ? stats.frontierPending + stats.frontierInProgress : null}
+          onResult={(message, ok) => {
+            setResult({ message, ok });
+            fetchStats();
           }}
-          disabled={loading === 'health'}
-          className="px-4 py-2 bg-primary-600 text-white rounded-md text-sm font-medium hover:bg-primary-700 disabled:opacity-50"
-        >
-          {loading === 'health' ? 'Checking...' : 'Check Health'}
-        </button>
+        />
       </div>
     </div>
   );

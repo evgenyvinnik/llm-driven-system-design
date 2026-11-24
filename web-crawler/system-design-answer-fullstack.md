@@ -157,7 +157,7 @@ Three properties of *this* data make polling fit:
 
 ### What polling costs, honestly
 
-Up to 5 seconds of staleness, and a request every 5 seconds per open tab whether or not anything changed. At operator scale that is negligible. It also means the "Live" indicator in the corner is a claim about the polling loop being healthy, not about the data being current to the instant — a distinction worth being honest about in the UI.
+Up to 5 seconds of staleness, and a request every 5 seconds per open tab whether or not anything changed. At operator scale that is negligible. It also means a "Live" indicator is a claim about data age, so it should be computed from data age: the header shows "updated 3s ago" and turns to "Stale · retrying in 20s" when polls fail, while the last snapshot stays on screen. Polling is scheduled after each response settles (not on a fixed timer, which stacks requests behind a slow backend), pauses in background tabs, and backs off exponentially while the API is down.
 
 The place it genuinely breaks down: if this dashboard ever became customer-facing with thousands of concurrent viewers, the polling load would scale linearly with viewers *and* be almost entirely redundant, because they would all be requesting the same global aggregate. That is the moment to switch — and the right switch is **SSE, not WebSocket**.
 
@@ -226,10 +226,11 @@ When an operator changes a domain's crawl delay from the dashboard, workers need
 Dashboard              API Server              PostgreSQL             Redis
     │                      │                        │                   │
     │ PUT /domains/foo/    │                        │                   │
-    │   settings           │                        │                   │
+    │   settings (admin)   │                        │                   │
     │ {crawlDelay: 2}      │                        │                   │
     │─────────────────────▶│  validate (0 < d ≤ 3600)                   │
-    │                      │  UPDATE domains ...    │                   │
+    │                      │  UPDATE domains SET    │                   │
+    │                      │  crawl_delay_override  │                   │
     │                      │───────────────────────▶│ (durable, 1st)    │
     │                      │  404 if no row         │                   │
     │                      │  SET delay_override:foo 2                  │
@@ -266,26 +267,29 @@ The version that avoids the choice is an outbox — write the setting and an eve
 | Scenario | Handling |
 |----------|----------|
 | PostgreSQL write fails | Return 500; nothing changed anywhere — the operator retries |
-| PostgreSQL succeeds, Redis fails | Return 500; the operator re-submits, and because the write is idempotent the second attempt simply applies it |
+| PostgreSQL succeeds, Redis fails | Return 500; the maintenance loop republishes blocks and overrides from Postgres within a minute (re-submitting also works — the write is idempotent) |
+| Redis loses everything (restart) | Same republish restores every block and override; without it, a Redis restart would silently unblock every domain an operator blocked |
 | Both succeed | Effective on the next claim for that host |
 
-"We accept that a failed request can leave a setting saved but not yet in force, because the fix is a refresh, not an investigation: re-submitting converges, and a job that republishes settings from Postgres would close the gap automatically if this ever needed to be hands-off."
+"The republish job is what turns 'Postgres is the truth' from a slogan into a property. It only touches domains with a non-default setting, so it's cheap to run every minute. The one direction it doesn't sweep is an *un*-block whose Redis delete failed — finding stray keys would mean scanning every domain's keys — so that case still relies on the API returning an error and the operator re-submitting."
 
 ---
 
 ## 🧯 Operating It: What the Dashboard Is Actually For (4 minutes)
 
-The admin surface looks like CRUD and isn't — each control exists because of a specific way crawls go wrong.
+The admin surface looks like CRUD and isn't — each control exists because of a specific way crawls go wrong. **Reading is public; every control below requires an admin session**, enforced on the server by one `requireAdmin` middleware on each mutating route. The frontend hides the controls when signed out, but that's courtesy — a hidden button is not access control. One lesson from building it: the session store adapter was written for a different Redis client than the one the app passed in, so every session write failed silently *after* the login response said 200. Login 'worked' and nothing was ever authenticated. Auth needs an end-to-end test (log in, then call a protected route) — a unit test of the login handler would have passed.
 
 **Add seed URLs** is the entry point for the whole system; a crawler with an empty frontier does nothing, and there is no other way in.
 
 **Recover stale URLs** is the manual trigger for the lease sweep described above. The automatic sweep runs every minute but only reclaims leases older than ten, and an operator who just killed three workers doesn't want to wait for it.
 
-**Clear frontier** is genuinely dangerous and is presented that way — it's the escape hatch for the situation where a crawl has gone somewhere it shouldn't (a calendar generating infinite URLs, a session-ID parameter defeating dedup) and the fastest fix is to stop and reseed.
+**Clear frontier** is genuinely dangerous and is presented that way — typed confirmation plus the count of URLs it will delete. It's the escape hatch for when a crawl has gone somewhere it shouldn't (a calendar generating infinite URLs, a session-ID parameter defeating dedup) and the fastest fix is to stop and reseed. The per-domain page budget makes that rarer: a trap that mints infinite shallow URLs stops at 10,000 per domain instead of filling the frontier.
 
 **The stats themselves are the diagnostic.** Pending versus in-progress versus completed is how you tell the difference between the three ways a crawl stalls: pending high with in-progress at zero means workers are dead or every domain is politeness-locked; in-progress stuck non-zero with completed flat means workers are hung mid-fetch and the lease sweep hasn't fired; pending at zero means the crawl is genuinely finished and needs new seeds. Those three states look identical if you only watch "pages crawled," which is why the dashboard breaks the frontier out by status rather than showing a single progress number.
 
-> "The number I'd add first is per-worker last-heartbeat. 'No active workers' currently means the crawl produces nothing and the dashboard looks calm — a stalled system and an idle one are indistinguishable, and that's the failure I'd most want alerted on."
+The dashboard now says this out loud instead of leaving it to interpretation: a banner turns red when pending > 0 and no workers are running, amber when workers are alive but nothing is in progress (everything politeness-locked or in backoff), and neutral when the frontier is simply empty. Worker heartbeat age is computed on the server and sent as an age, because subtracting a worker's timestamp from the browser's clock makes every worker look dead on a laptop whose clock runs fast.
+
+> "A stalled system and an idle one look identical on a counter. The first thing I'd want alerted on is the red banner's condition: work queued, nothing doing it."
 
 ---
 

@@ -153,7 +153,10 @@ npm run dev
 
 #### 5. Access Dashboard
 
-Open http://localhost:5173 in your browser.
+Open http://localhost:5173 in your browser. Reading the dashboard needs no login.
+To seed URLs, recover leases, change domain settings or clear the frontier, sign in on
+the **Admin** page (default dev credentials: `admin` / `password123`; override with
+`ADMIN_USERNAME` / `ADMIN_PASSWORD`).
 
 ### Running Distributed Crawlers
 
@@ -180,10 +183,33 @@ npm run start:worker
 
 ## API Documentation
 
+### Authentication
+
+Read endpoints are public. Every endpoint that changes crawler state is **admin-only**
+(marked *admin* below) and requires the `crawler.sid` session cookie from a login:
+
+```
+POST /api/auth/login   {"username": "admin", "password": "password123"}
+POST /api/auth/logout
+GET  /api/auth/me
+```
+
+Login is rate-limited to 10 attempts per 15 minutes per client. Sessions live in
+Redis (`connect-redis` v7, which supports ioredis) for 24 hours and are regenerated on
+login. Unauthenticated calls to admin endpoints return 401.
+
+```bash
+# curl example
+curl -c jar -H 'content-type: application/json' \
+  -d '{"username":"admin","password":"password123"}' localhost:3001/api/auth/login
+curl -b jar -H 'content-type: application/json' \
+  -d '{"urls":["https://example.com"]}' localhost:3001/api/frontier/seed
+```
+
 ### Health Check
 
 ```
-GET /health
+GET /health          (also /api/health, reachable through the frontend proxy)
 ```
 
 Returns the health status of the API and connected services.
@@ -233,7 +259,7 @@ Content-Type: application/json
 }
 ```
 
-Adds URLs to the frontier. Priority: 1 (low), 2 (medium), 3 (high).
+*admin* — Adds URLs to the frontier. Priority: 1 (low), 2 (medium), 3 (high).
 
 ```
 POST /api/frontier/seed
@@ -245,19 +271,19 @@ Content-Type: application/json
 }
 ```
 
-Adds seed URLs with high priority.
+*admin* — Adds seed URLs with high priority (seeds bypass the per-domain page budget).
 
 ```
 POST /api/frontier/recover?minutes=10
 ```
 
-Recovers stale in-progress URLs (useful after worker crashes).
+*admin* — Recovers stale in-progress URLs now (the API also does this automatically every minute).
 
 ```
 DELETE /api/frontier/clear
 ```
 
-Clears the entire frontier (use with caution).
+*admin* — Clears the entire frontier and its Redis queues and page-budget counters (use with caution).
 
 ### Crawled Pages
 
@@ -303,7 +329,7 @@ Returns the cached robots.txt for a domain.
 POST /api/domains/:domain/refresh-robots
 ```
 
-Forces a refresh of the robots.txt cache.
+*admin* — Forces a refresh of the robots.txt cache (makes an outbound request).
 
 ```
 PUT /api/domains/:domain/settings
@@ -315,7 +341,10 @@ Content-Type: application/json
 }
 ```
 
-Updates domain-specific settings.
+*admin* — Updates operator settings and returns the domain. `crawlDelay` is an override
+in seconds (or `null` to remove it); workers use `max(override, robots.txt delay)`, so an
+override can only slow a domain down. `isAllowed: false` blocks the domain. Settings are
+stored in Postgres and republished to Redis every minute, so they survive a Redis restart.
 
 ## Configuration
 
@@ -334,6 +363,12 @@ Updates domain-specific settings.
 | `POSTGRES_PASSWORD` | `postgres` | Database password |
 | `REDIS_HOST` | `localhost` | Redis host |
 | `REDIS_PORT` | `6379` | Redis port |
+| `ADMIN_USERNAME` | `admin` | Admin login |
+| `ADMIN_PASSWORD` | `password123` | Admin password — **required** when `NODE_ENV=production` |
+| `SESSION_SECRET` | dev placeholder | Session cookie signing secret — **required** when `NODE_ENV=production` |
+| `COOKIE_SECURE` | `true` in production | Set `false` for plain-HTTP setups (the compose file does) |
+| `TRUST_PROXY` | unset | Set (e.g. `1`) behind a TLS-terminating proxy so Secure cookies and client IPs work |
+| `CORS_ORIGINS` | `http://localhost:5173` | Comma-separated origins allowed to make credentialed cross-origin calls |
 
 #### Crawler Workers
 
@@ -349,6 +384,7 @@ Updates domain-specific settings.
 | `CRAWLER_MAX_DEPTH` | `6` | Max link hops from a seed (crawler-trap defense) |
 | `CRAWLER_MAX_URL_LENGTH` | `2048` | URLs longer than this are dropped |
 | `CRAWLER_MAX_LINKS_PER_PAGE` | `500` | Max outbound links enqueued per page |
+| `CRAWLER_MAX_PAGES_PER_DOMAIN` | `10000` | Max URLs enqueued per domain (seeds exempt; `0` = unlimited) |
 | `CRAWLER_MAX_RETRIES` | `3` | Frontier-level retries for transient failures (timeout, 5xx, 429) |
 | `CRAWLER_RETRY_BASE_DELAY` | `60000` | Base retry backoff (ms), doubled per attempt with jitter |
 | `CRAWLER_STALE_LEASE_MINUTES` | `10` | `in_progress` URLs older than this are returned to the queue |
@@ -427,16 +463,23 @@ npm run lint
 npm run type-check
 npm test                    # unit tests (vitest)
 
-# End-to-end crawl against real Postgres + Redis (docker-compose up -d first).
-# Spins up a local fixture site and runs three workers against it, asserting
-# dedup, politeness spacing, retries, redirects and robots.txt handling.
+# Integration tests against real Postgres + Redis (docker-compose up -d first):
+# - crawl: a local fixture site crawled by three workers (dedup, politeness
+#   spacing, retries, redirects, robots.txt handling)
+# - api: admin-only routes, login/logout + rate limit, domain settings surviving
+#   Redis loss, per-domain page budget
 # WARNING: flushes the Redis DB and truncates the crawler tables.
+# Stop any running API server/workers first - they share the same stores.
 npm run test:integration
 
 # Frontend
 cd frontend
 npm run lint
 npm run build
+
+# UI smoke tests (frontend + backend running; signs in as admin first)
+cd ..
+npm run test:e2e
 ```
 
 ## Future Enhancements
@@ -446,8 +489,8 @@ npm run build
 - [ ] Distributed work stealing for load balancing
 - [ ] Sitemap.xml parsing
 - [ ] JavaScript rendering (Puppeteer integration)
-- [ ] Require admin auth on the dashboard's mutating routes (`/api/frontier/*`, `/api/domains/*/settings`, `/api/stats/reset`) — today only the `/api/admin/*` variants are protected
-- [ ] Per-domain page budgets and IP-level politeness for shared hosts
+- [ ] IP-level politeness for many domains behind one shared host
+- [ ] Multiple operator accounts (today there is one admin from env vars)
 
 ## License
 

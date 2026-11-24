@@ -36,6 +36,8 @@ export interface CrawlStats {
   duplicatesSkipped: number;
   /** Pages whose content exactly duplicated an earlier page (from Redis) */
   duplicateContent: number;
+  /** Discovered URLs dropped because their domain hit its page budget (from Redis) */
+  budgetSkipped: number;
 
   /** URLs waiting to be crawled (from PostgreSQL) */
   frontierPending: number;
@@ -50,8 +52,14 @@ export interface CrawlStats {
 
   /** List of active worker IDs (from Redis) */
   activeWorkers: string[];
-  /** Worker heartbeat timestamps for health monitoring */
-  workerHeartbeats: { workerId: string; lastHeartbeat: number }[];
+  /**
+   * Worker heartbeats. `ageMs` is computed with the server's clock so the
+   * dashboard never mixes the browser's clock with the workers' (a laptop
+   * whose clock runs 40s fast would otherwise show every worker as stale).
+   */
+  workerHeartbeats: { workerId: string; lastHeartbeat: number; ageMs: number | null }[];
+  /** Server time when this snapshot was produced (epoch ms) */
+  generatedAt: number;
 
   /** Most recently crawled pages (from PostgreSQL) */
   recentPages: RecentPage[];
@@ -126,6 +134,7 @@ export class StatsService {
       linksDiscovered,
       duplicatesSkipped,
       duplicateContent,
+      budgetSkipped,
       activeWorkers,
     ] = await Promise.all([
       redis.get(REDIS_KEYS.STATS_PAGES_CRAWLED),
@@ -134,6 +143,7 @@ export class StatsService {
       redis.get(REDIS_KEYS.STATS_LINKS_DISCOVERED),
       redis.get(REDIS_KEYS.STATS_DUPLICATES_SKIPPED),
       redis.get(REDIS_KEYS.STATS_DUPLICATE_CONTENT),
+      redis.get(REDIS_KEYS.STATS_BUDGET_SKIPPED),
       redis.smembers(REDIS_KEYS.ACTIVE_WORKERS),
     ]);
 
@@ -141,9 +151,11 @@ export class StatsService {
     const workerHeartbeats = await Promise.all(
       activeWorkers.map(async (workerId) => {
         const heartbeat = await redis.get(REDIS_KEYS.WORKER_HEARTBEAT(workerId));
+        const lastHeartbeat = heartbeat ? parseInt(heartbeat) : 0;
         return {
           workerId,
-          lastHeartbeat: heartbeat ? parseInt(heartbeat) : 0,
+          lastHeartbeat,
+          ageMs: lastHeartbeat ? Math.max(0, Date.now() - lastHeartbeat) : null,
         };
       })
     );
@@ -203,6 +215,7 @@ export class StatsService {
       linksDiscovered: parseInt(linksDiscovered || '0'),
       duplicatesSkipped: parseInt(duplicatesSkipped || '0'),
       duplicateContent: parseInt(duplicateContent || '0'),
+      budgetSkipped: parseInt(budgetSkipped || '0'),
 
       frontierPending: frontierByStatus['pending'] || 0,
       frontierInProgress: frontierByStatus['in_progress'] || 0,
@@ -215,6 +228,7 @@ export class StatsService {
 
       recentPages,
       topDomains,
+      generatedAt: Date.now(),
     };
   }
 
@@ -268,6 +282,7 @@ export class StatsService {
       redis.set(REDIS_KEYS.STATS_LINKS_DISCOVERED, '0'),
       redis.set(REDIS_KEYS.STATS_DUPLICATES_SKIPPED, '0'),
       redis.set(REDIS_KEYS.STATS_DUPLICATE_CONTENT, '0'),
+      redis.set(REDIS_KEYS.STATS_BUDGET_SKIPPED, '0'),
     ]);
   }
 }

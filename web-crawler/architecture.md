@@ -259,6 +259,14 @@ crawler:domain:{domain}:blocked         -> STRING (operator block; workers fail 
 # Maintenance (one API instance per interval)
 crawler:maintenance:lock          -> SET NX PX
 
+# Per-domain page budget (CRAWLER_MAX_PAGES_PER_DOMAIN)
+crawler:domain_enqueued           -> HASH domain -> URLs enqueued (HMGET per batch, HINCRBY on insert;
+                                     a missing field is initialized from Postgres with HSETNX)
+crawler:stats:budget_skipped      -> Counter of URLs dropped by the budget
+
+# Sessions (connect-redis)
+crawler:session:{sid}             -> JSON session (userId, username, role, createdAt), 24h TTL
+
 # Robots.txt cache
 crawler:domain:{domain}:robots    -> STRING (cached robots.txt content, 1h TTL)
 
@@ -314,18 +322,22 @@ The **domain** key is the URL's `host` — hostname plus any non-default port �
 
 | Role | Permissions | Endpoints |
 |------|-------------|-----------|
-| anonymous | Read public stats | `GET /health`, `GET /api/stats` |
-| user | View dashboard, read all data | `GET /api/*` |
-| admin | Full access, seed URLs, clear frontier | `POST /api/frontier/*`, `DELETE /api/*` |
+| anonymous | Read everything the dashboard shows | `GET /health`, `GET /api/*` |
+| admin | Change crawler state | `POST /api/frontier/{add,seed,recover}`, `DELETE /api/frontier/clear`, `POST /api/stats/reset`, `PUT /api/domains/:d/settings`, `POST /api/domains/:d/refresh-robots`, `/api/admin/*` |
+
+Reads are public by design: the dashboard is an observability surface, and gating it adds friction without protecting anything sensitive. Every route that changes state goes through `requireAdmin` (`backend/src/middleware/auth.ts`); the frontend hides admin controls for signed-out viewers, but that is UX, not access control.
+
+**Session handling:** login regenerates the session ID (no session fixation); cookies are `httpOnly`, `SameSite=Strict`, and `Secure` in production (`COOKIE_SECURE`, `TRUST_PROXY` for TLS-terminating proxies); sessions live in Redis via `connect-redis` **v7**. (v9 targets node-redis v5's `set(key, val, { EX })` call shape; with this project's ioredis client every session write failed with `ERR syntax error`, so until this was fixed no admin session was ever persisted.) Passwords are PBKDF2-SHA512 with 210k iterations, compared with `timingSafeEqual`, and unknown usernames burn the same hashing time. In production the API refuses to start without `SESSION_SECRET` and `ADMIN_PASSWORD`. CORS is an explicit allowlist (`CORS_ORIGINS`), not "reflect any origin with credentials".
 
 ### API Rate Limiting
 
 | Tier | Limit | Window | Applies To |
 |------|-------|--------|------------|
-| Anonymous | 10 req | 1 min | Unauthenticated requests |
+| Anonymous | 120 req | 1 min | Unauthenticated requests (the dashboard polls `/api/stats` every 5s = 12/min, so the old 10/min limit 429'd anonymous viewers within a minute) |
 | User | 100 req | 1 min | Regular authenticated users |
 | Admin | 500 req | 1 min | Admin operations |
-| Seed injection | 10 req | 1 min | `POST /api/frontier/seed` |
+| Login | 10 attempts | 15 min | `POST /api/auth/login`, per client IP |
+| Seed injection | 10 req | 1 min | `POST /api/admin/frontier/seed` |
 
 Rate limiting uses Redis sliding window: ZREMRANGEBYSCORE to remove old entries, ZADD to add current request, ZCARD to count requests in window.
 
@@ -391,9 +403,11 @@ Crawl operations are inherently idempotent: fetching the same URL multiple times
 | Request timeouts | 30s timeout prevents hanging on unresponsive servers |
 | Page size limit | 10MB max to prevent memory exhaustion |
 | Dangerous URL schemes | Skip `file://`, `javascript:`, `tel:`, `mailto:` |
-| Dashboard auth | Session-based with Redis; admin-only destructive operations |
+| Dashboard auth | Public reads; every state-changing route requires an admin session (see Authentication and RBAC) |
+| Brute force | Login limited to 10 attempts / 15 min per client |
+| Credentials in production | API refuses to start without `SESSION_SECRET` and `ADMIN_PASSWORD` |
 | API rate limiting | Tiered limits (anonymous/user/admin) via Redis sliding window |
-| Input sanitization | Helmet middleware, compression, CORS |
+| Input sanitization | Helmet, 1 MB JSON body limit, CORS allowlist, validated settings payloads |
 
 ## Observability
 
@@ -422,7 +436,14 @@ Crawl operations are inherently idempotent: fetching the same URL multiple times
 
 ### Dashboard Updates
 
-The React dashboard polls the API every 5 seconds for real-time charts showing crawl rate, success rate, HTTP status distribution, frontier depth, and active workers.
+The React dashboard polls `GET /api/stats` every 5 seconds (`frontend/src/stores/crawlerStore.ts`), written to be trustworthy rather than merely periodic:
+
+- **Settle-then-schedule** instead of `setInterval`, so a slow backend can't stack requests; each request carries a sequence number and an older response never overwrites a newer snapshot
+- **Paused while the tab is hidden** (Page Visibility API), with an immediate poll on return
+- **Exponential backoff** while the backend fails (5s → 10s → … ≤ 60s); the last snapshot stays on screen
+- **Data age, not a decorative dot:** the header shows "Live · updated 3s ago" and flips to "Stale · updated 47s ago · retrying in 20s" (`FreshnessIndicator.tsx`)
+- **Server-computed heartbeat age** (`ageMs`), so worker health never mixes the browser's clock with the workers'
+- **Stalled vs idle banner** (`CrawlHealthBanner.tsx`): pending > 0 with no workers is red; workers alive but nothing in progress is amber; an empty frontier is a neutral "idle"
 
 ## Failure Handling
 
@@ -471,7 +492,8 @@ RETURNING url_hash, priority   -- each is re-ZADDed (NX) to its priority queue
 ```
 
 2. **Queue rehydration** — if the Redis queues hold fewer entries than there are pending rows (Redis restarted without persistence, was flushed), pending rows are walked by keyset pagination and re-added with `ZADD NX`, preserving existing retry delays.
-3. **Stale worker cleanup** — workers whose heartbeat is older than 5 minutes are removed from the active set.
+3. **Operator settings republish** — domain blocks and crawl-delay overrides are re-published from Postgres (`domains.is_allowed`, `domains.crawl_delay_override`) to Redis (`services/domainSettings.ts`). Workers read these from Redis on every claim, so without this a Redis restart would silently unblock every blocked domain. (An un-block whose Redis delete failed isn't swept — that would need a SCAN over every domain key; the API returns an error and re-submitting fixes it.)
+4. **Stale worker cleanup** — workers whose heartbeat is older than 5 minutes are removed from the active set.
 
 **Graceful shutdown:** on SIGTERM a worker stops claiming, waits (up to 45s) for its in-flight crawl to finish recording its outcome, then closes connections — so a deploy doesn't strand one URL per worker until the lease expires.
 
@@ -484,7 +506,7 @@ RETURNING url_hash, priority   -- each is re-ZADDed (NX) to its priority queue
 | Single worker crash | Other workers continue; stale URLs recovered automatically |
 | All workers crash | API server continues serving dashboard; no crawling |
 | robots.txt 5xx / timeout | Domain's URLs deferred as transient failures; outage negative-cached for 60s |
-| Redis data loss | Pending URLs re-queued from PostgreSQL by the maintenance loop |
+| Redis data loss | Pending URLs re-queued, operator blocks/overrides republished, page budgets recomputed — all from PostgreSQL |
 
 ### Crawler Trap Defenses
 
@@ -498,8 +520,9 @@ Infinite URL spaces (calendars, faceted search, session IDs in paths) are bounde
 | Tracking-param stripping | utm_*, gclid, fbclid, ... | — |
 | `rel="nofollow\|sponsored\|ugc"` and `<meta name="robots" content="nofollow">` | honored | — |
 | Duplicate content (exact hash) | links not re-enqueued | — |
+| Per-domain page budget (seeds exempt) | 10,000 URLs | `CRAWLER_MAX_PAGES_PER_DOMAIN` |
 
-A per-domain page budget is the next defense to add (not yet implemented).
+The page budget catches traps the depth limit can't — a site generating infinite *shallow* URLs — and keeps one large site from crowding out breadth. It is soft: concurrent batches for one domain can overshoot by at most one batch.
 
 ## Scalability Considerations
 
@@ -600,7 +623,7 @@ The polling mechanism uses a module-level `setInterval` reference stored outside
 
 ### Data Fetching
 
-All API communication is centralized in `frontend/src/services/api.ts`, which provides a typed `api` object wrapping a generic `fetchApi<T>()` helper. The helper automatically sets `Content-Type: application/json`, parses responses, and throws errors for non-2xx status codes. The frontend uses the Vite dev server proxy to forward `/api` requests to the backend on port 3001.
+All API communication is centralized in `frontend/src/services/api.ts`, which provides a typed `api` object wrapping a generic `fetchApi<T>()` helper. The helper sets `Content-Type: application/json`, sends the session cookie, and throws an `ApiError` carrying the HTTP status. A 401 notifies the auth store (`stores/authStore.ts`), which drops the UI to signed-out state; admin controls (seed form, domain settings, typed-confirmation frontier clear) render only for an admin session. The frontend uses the Vite dev server proxy to forward `/api` requests to the backend on port 3001.
 
 ### Key UI Patterns
 
@@ -737,7 +760,8 @@ This section maps the production architecture above to the actual local implemen
 | Tests | Vitest | `backend/src/**/*.test.ts`, `backend/src/integration/` | Unit tests plus an opt-in end-to-end crawl of a local fixture site against real Postgres/Redis (dedup, politeness spacing, retries, redirects, robots) |
 | Data cleanup | Custom cron jobs | `backend/src/services/cleanup.ts` | Removes completed frontier entries (7d), failed entries (30d), old page metadata (90d) |
 | Health checks | Custom | `backend/src/routes/` | `/health` checks PostgreSQL and Redis; Docker healthcheck integration |
-| Session auth + RBAC | express-session + Redis | `backend/src/middleware/` | Session-based auth with role-based access control for admin operations |
+| Session auth + RBAC | express-session + connect-redis v7 | `backend/src/middleware/auth.ts` | Public reads, admin-only mutations (`requireAdmin`); session regeneration on login, login rate limit, timing-safe PBKDF2 |
+| Durable operator settings | Postgres → Redis publish | `backend/src/services/domainSettings.ts` | Blocks/overrides survive Redis loss; republished every maintenance interval |
 | API rate limiting | express-rate-limit | `backend/src/middleware/` | Tiered rate limits for anonymous/user/admin |
 | Request security | Helmet + compression | `backend/src/server.ts` | Security headers and response compression |
 

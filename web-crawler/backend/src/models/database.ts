@@ -131,6 +131,7 @@ export async function initDatabase() {
         robots_txt TEXT,
         robots_fetched_at TIMESTAMP,
         crawl_delay FLOAT DEFAULT 1.0,
+        crawl_delay_override FLOAT,              -- operator override (seconds); effective = max(override, crawl_delay)
         page_count INTEGER DEFAULT 0,
         is_allowed BOOLEAN DEFAULT true,
         created_at TIMESTAMP DEFAULT NOW(),
@@ -213,6 +214,7 @@ export async function initDatabase() {
       -- Idempotent upgrades for databases created before these columns existed
       ALTER TABLE url_frontier ADD COLUMN IF NOT EXISTS retry_count INTEGER DEFAULT 0;
       ALTER TABLE url_frontier ADD COLUMN IF NOT EXISTS last_error TEXT;
+      ALTER TABLE domains ADD COLUMN IF NOT EXISTS crawl_delay_override FLOAT;
     `);
 
     console.log('Database initialized successfully');

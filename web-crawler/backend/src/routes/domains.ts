@@ -10,11 +10,48 @@
  */
 
 import { Router, Request, Response } from 'express';
+import { requireAdmin } from '../middleware/auth.js';
 import { pool } from '../models/database.js';
-import { redis, REDIS_KEYS } from '../models/redis.js';
+import * as domainSettings from '../services/domainSettings.js';
+import { config } from '../config.js';
 import { robotsService } from '../services/robots.js';
 
 const router = Router();
+
+/** Columns selected for the Domain DTO (keep in sync with toDomainDto). */
+const DOMAIN_COLUMNS =
+  'domain, page_count, crawl_delay, crawl_delay_override, is_allowed, robots_fetched_at, created_at';
+
+interface DomainRow {
+  domain: string;
+  page_count: number;
+  crawl_delay: number | null;
+  crawl_delay_override: number | null;
+  is_allowed: boolean | null;
+  robots_fetched_at: Date | null;
+  created_at: Date;
+}
+
+/**
+ * Maps a domains row to the camelCase DTO the frontend's `Domain` type declares.
+ * `effectiveCrawlDelay` mirrors the worker rule: max(override, robots delay).
+ */
+function toDomainDto(row: DomainRow) {
+  const robotsDelay = row.crawl_delay ?? config.crawler.defaultDelay / 1000;
+  return {
+    domain: row.domain,
+    pageCount: row.page_count,
+    crawlDelay: row.crawl_delay,
+    crawlDelayOverride: row.crawl_delay_override,
+    effectiveCrawlDelay:
+      row.crawl_delay_override !== null
+        ? Math.max(row.crawl_delay_override, robotsDelay)
+        : robotsDelay,
+    isAllowed: row.is_allowed !== false,
+    robotsFetchedAt: row.robots_fetched_at,
+    createdAt: row.created_at,
+  };
+}
 
 /**
  * GET /api/domains
@@ -38,8 +75,8 @@ router.get('/', async (req: Request, res: Response) => {
     const validSortColumns = ['domain', 'page_count', 'crawl_delay', 'created_at'];
     const sortColumn = validSortColumns.includes(sortBy) ? sortBy : 'page_count';
 
-    const result = await pool.query(
-      `SELECT domain, page_count, crawl_delay, is_allowed, robots_fetched_at, created_at
+    const result = await pool.query<DomainRow>(
+      `SELECT ${DOMAIN_COLUMNS}
        FROM domains
        ORDER BY ${sortColumn} ${order}
        LIMIT $1 OFFSET $2`,
@@ -51,14 +88,7 @@ router.get('/', async (req: Request, res: Response) => {
     // camelCase to match the `Domain` type the frontend declares; raw rows would
     // leave pageCount/crawlDelay/isAllowed undefined in the table.
     res.json({
-      domains: result.rows.map((row) => ({
-        domain: row.domain,
-        pageCount: row.page_count,
-        crawlDelay: row.crawl_delay,
-        isAllowed: row.is_allowed,
-        robotsFetchedAt: row.robots_fetched_at,
-        createdAt: row.created_at,
-      })),
+      domains: result.rows.map(toDomainDto),
       total: parseInt(countResult.rows[0].count),
       limit,
       offset,
@@ -82,8 +112,8 @@ router.get('/:domain', async (req: Request, res: Response) => {
   try {
     const { domain } = req.params;
 
-    const result = await pool.query(
-      `SELECT * FROM domains WHERE domain = $1`,
+    const result = await pool.query<DomainRow & { robots_txt: string | null }>(
+      `SELECT ${DOMAIN_COLUMNS}, robots_txt FROM domains WHERE domain = $1`,
       [domain]
     );
 
@@ -92,7 +122,8 @@ router.get('/:domain', async (req: Request, res: Response) => {
       return;
     }
 
-    res.json(result.rows[0]);
+    // Same DTO as the list endpoint (raw rows leak snake_case to the client)
+    res.json({ ...toDomainDto(result.rows[0]), robotsTxt: result.rows[0].robots_txt });
   } catch (error) {
     console.error('Error getting domain:', error);
     res.status(500).json({ error: 'Failed to get domain' });
@@ -147,7 +178,7 @@ router.get('/:domain/robots', async (req: Request, res: Response) => {
  * @param domain - Domain hostname
  * @returns Updated robots.txt info including new content and crawl delay
  */
-router.post('/:domain/refresh-robots', async (req: Request, res: Response) => {
+router.post('/:domain/refresh-robots', requireAdmin, async (req: Request, res: Response) => {
   try {
     const { domain } = req.params;
 
@@ -172,33 +203,39 @@ router.post('/:domain/refresh-robots', async (req: Request, res: Response) => {
 });
 
 /**
- * PUT /api/domains/:domain/settings
+ * PUT /api/domains/:domain/settings  (admin)
  *
- * Updates crawl settings for a specific domain.
- * Allows overriding the auto-detected crawl delay and
- * allowing/blocking a domain entirely.
+ * Updates operator settings for a domain:
+ * - `crawlDelay`: override in seconds, or null to remove the override. Workers
+ *   use max(override, robots.txt delay), so an override can only slow a
+ *   domain down.
+ * - `isAllowed`: false blocks the domain; workers fail its URLs permanently.
  *
- * @param domain - Domain hostname
- * @body crawlDelay - Custom crawl delay in seconds
- * @body isAllowed - Whether crawling is allowed for this domain
- * @returns Success message
+ * Written to PostgreSQL first (durable), then published to Redis (what workers
+ * read). If the publish fails the request errors; the maintenance loop also
+ * republishes blocks/overrides from Postgres every interval.
+ *
+ * @returns The updated domain DTO
  */
-router.put('/:domain/settings', async (req: Request, res: Response) => {
+router.put('/:domain/settings', requireAdmin, async (req: Request, res: Response) => {
   try {
     const { domain } = req.params;
-    const { crawlDelay, isAllowed } = req.body;
+    const { crawlDelay, isAllowed } = req.body ?? {};
 
     const updates: string[] = [];
-    const params: (string | number | boolean)[] = [domain];
+    const params: (string | number | boolean | null)[] = [domain];
 
     if (crawlDelay !== undefined) {
-      const delay = Number(crawlDelay);
-      if (!Number.isFinite(delay) || delay <= 0 || delay > 3600) {
-        res.status(400).json({ error: 'crawlDelay must be a number of seconds in (0, 3600]' });
-        return;
+      let override: number | null = null;
+      if (crawlDelay !== null) {
+        override = Number(crawlDelay);
+        if (!Number.isFinite(override) || override <= 0 || override > 3600) {
+          res.status(400).json({ error: 'crawlDelay must be null or a number of seconds in (0, 3600]' });
+          return;
+        }
       }
-      updates.push(`crawl_delay = $${params.length + 1}`);
-      params.push(delay);
+      updates.push(`crawl_delay_override = $${params.length + 1}`);
+      params.push(override);
     }
 
     if (isAllowed !== undefined) {
@@ -217,8 +254,9 @@ router.put('/:domain/settings', async (req: Request, res: Response) => {
 
     updates.push('updated_at = NOW()');
 
-    const result = await pool.query(
-      `UPDATE domains SET ${updates.join(', ')} WHERE domain = $1`,
+    const result = await pool.query<DomainRow>(
+      `UPDATE domains SET ${updates.join(', ')} WHERE domain = $1
+       RETURNING ${DOMAIN_COLUMNS}`,
       params
     );
     if (result.rowCount === 0) {
@@ -226,19 +264,13 @@ router.put('/:domain/settings', async (req: Request, res: Response) => {
       return;
     }
 
-    // Workers read politeness settings from Redis, not Postgres - publish them.
-    // The override key is separate from the robots.txt delay so a robots
-    // refresh can't silently undo an operator's choice.
-    if (crawlDelay !== undefined) {
-      await redis.set(REDIS_KEYS.DOMAIN_DELAY_OVERRIDE(domain), String(Number(crawlDelay)));
-    }
-    if (isAllowed === false) {
-      await redis.set(REDIS_KEYS.DOMAIN_BLOCKED(domain), '1');
-    } else if (isAllowed === true) {
-      await redis.del(REDIS_KEYS.DOMAIN_BLOCKED(domain));
-    }
+    const row = result.rows[0];
+    await domainSettings.publish(domain, {
+      crawlDelayOverride: row.crawl_delay_override,
+      isAllowed: row.is_allowed !== false,
+    });
 
-    res.json({ message: 'Domain settings updated' });
+    res.json(toDomainDto(row));
   } catch (error) {
     console.error('Error updating domain settings:', error);
     res.status(500).json({ error: 'Failed to update domain settings' });

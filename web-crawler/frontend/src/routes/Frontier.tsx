@@ -16,6 +16,8 @@
 import { useEffect, useState } from 'react';
 import { useCrawlerStore } from '../stores/crawlerStore';
 import { AddUrlsForm } from '../components/AddUrlsForm';
+import { useAuthStore } from '../stores/authStore';
+import { Link } from '@tanstack/react-router';
 
 /**
  * Frontier route component for managing the URL crawl queue.
@@ -32,6 +34,7 @@ import { AddUrlsForm } from '../components/AddUrlsForm';
  */
 export function Frontier() {
   const { frontierUrls, frontierLoading, fetchFrontierUrls, addUrls } = useCrawlerStore();
+  const isAdmin = useAuthStore((s) => s.user?.role === 'admin');
   const [filter, setFilter] = useState<string>('pending');
 
   useEffect(() => {
@@ -99,7 +102,16 @@ export function Frontier() {
         {/* Add URLs Form */}
         <div className="bg-white rounded-lg shadow-sm border border-gray-200 p-4">
           <h2 className="text-lg font-medium text-gray-900 mb-4">Add URLs</h2>
-          <AddUrlsForm onSubmit={handleAddUrls} />
+          {isAdmin ? (
+            <AddUrlsForm onSubmit={handleAddUrls} />
+          ) : (
+            <div className="bg-white rounded-lg shadow-sm border border-gray-200 p-4 text-sm text-gray-600">
+              <Link to="/admin" className="text-primary-600 hover:text-primary-800 font-medium">
+                Sign in
+              </Link>{' '}
+              to add URLs to the frontier.
+            </div>
+          )}
         </div>
 
         {/* URL List */}

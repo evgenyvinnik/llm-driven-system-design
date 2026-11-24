@@ -14,6 +14,7 @@
  */
 
 import { Link, useLocation } from '@tanstack/react-router';
+import { useAuthStore } from '../stores/authStore';
 
 /**
  * Navigation header with links to all dashboard views.
@@ -39,6 +40,8 @@ import { Link, useLocation } from '@tanstack/react-router';
  */
 export function Header() {
   const location = useLocation();
+  const user = useAuthStore((s) => s.user);
+  const logout = useAuthStore((s) => s.logout);
 
   /**
    * Navigation items with path and label.
@@ -90,6 +93,29 @@ export function Header() {
               );
             })}
           </nav>
+
+          <div className="flex items-center space-x-3 text-sm">
+            {user ? (
+              <>
+                <span className="text-gray-600">
+                  Signed in as <span className="font-medium text-gray-900">{user.username}</span>
+                </span>
+                <button
+                  onClick={() => logout()}
+                  className="px-3 py-1.5 rounded-md text-gray-600 hover:text-gray-900 hover:bg-gray-100"
+                >
+                  Sign out
+                </button>
+              </>
+            ) : (
+              <Link
+                to="/admin"
+                className="px-3 py-1.5 rounded-md text-primary-700 hover:bg-primary-50 font-medium"
+              >
+                Sign in
+              </Link>
+            )}
+          </div>
         </div>
       </div>
     </header>

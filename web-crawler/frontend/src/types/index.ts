@@ -30,6 +30,8 @@ export interface CrawlStats {
   duplicatesSkipped: number;
   /** Pages whose body exactly duplicated an earlier page (links not re-enqueued) */
   duplicateContent?: number;
+  /** Discovered URLs dropped because their domain hit its page budget */
+  budgetSkipped?: number;
 
   /** URLs waiting to be crawled */
   frontierPending: number;
@@ -51,6 +53,8 @@ export interface CrawlStats {
   recentPages: RecentPage[];
   /** Top domains by page count */
   topDomains: DomainStats[];
+  /** Server time (epoch ms) when the snapshot was produced */
+  generatedAt?: number;
 }
 
 /**
@@ -61,6 +65,8 @@ export interface WorkerHeartbeat {
   workerId: string;
   /** Unix timestamp of last heartbeat */
   lastHeartbeat: number;
+  /** Heartbeat age computed with the server's clock (null if never seen) */
+  ageMs?: number | null;
 }
 
 /**
@@ -160,6 +166,10 @@ export interface Domain {
   pageCount: number;
   /** Crawl delay in seconds (from robots.txt or default) */
   crawlDelay: number;
+  /** Operator override in seconds (null = none); can only slow a domain down */
+  crawlDelayOverride?: number | null;
+  /** Delay workers actually use: max(override, robots.txt delay) */
+  effectiveCrawlDelay?: number;
   /** Whether crawling is allowed for this domain */
   isAllowed: boolean;
   /** When robots.txt was last fetched (null if never) */
@@ -183,4 +193,22 @@ export interface FrontierStats {
   failed: number;
   /** Total unique domains in the frontier */
   totalDomains: number;
+}
+
+/**
+ * The signed-in operator, as returned by GET /api/auth/me.
+ */
+export interface AuthUser {
+  username: string;
+  role: 'admin' | 'user' | 'anonymous';
+}
+
+/**
+ * Response of GET /api/health.
+ */
+export interface HealthStatus {
+  status: 'healthy' | 'unhealthy';
+  timestamp: string;
+  services: Record<string, { status: string; latencyMs?: number; error?: string }>;
+  workers?: number;
 }

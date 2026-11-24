@@ -197,6 +197,15 @@ export const REDIS_KEYS = {
   /** Present when an operator has blocked a domain (domains.is_allowed = false) */
   DOMAIN_BLOCKED: (domain: string) => `crawler:domain:${domain}:blocked`,
 
+  /**
+   * Hash: domain -> number of URLs enqueued in the frontier. Backs the
+   * per-domain page budget (CRAWLER_MAX_PAGES_PER_DOMAIN).
+   */
+  DOMAIN_ENQUEUED: 'crawler:domain_enqueued',
+
+  /** Counter: discovered URLs dropped because their domain hit its page budget */
+  STATS_BUDGET_SKIPPED: 'crawler:stats:budget_skipped',
+
   /** Lock ensuring only one API instance runs frontier maintenance at a time */
   MAINTENANCE_LOCK: 'crawler:maintenance:lock',
 };

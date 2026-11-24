@@ -2,20 +2,21 @@
  * @fileoverview Zustand store for crawler state management.
  *
  * This store manages the global state for the web crawler dashboard:
- * - Crawler statistics (fetched from /api/stats)
+ * - Crawler statistics (polled from /api/stats)
  * - Frontier URLs (fetched from /api/frontier/urls)
  * - Crawled pages (fetched from /api/pages)
  * - Domains (fetched from /api/domains)
  *
- * The store provides:
- * - Async actions for fetching data from the API
- * - Loading and error states for each data type
- * - Auto-polling for real-time dashboard updates
- *
- * Zustand was chosen over Redux for its:
- * - Minimal boilerplate
- * - Built-in TypeScript support
- * - Simple API without providers/context
+ * Stats polling is written to be trustworthy rather than merely periodic:
+ * - **Settle-then-schedule** (not setInterval): the next poll is scheduled only
+ *   after the current one finishes, so a slow backend can't stack requests
+ * - **Out-of-order protection**: each request gets a sequence number and an
+ *   older response never overwrites a newer snapshot
+ * - **Visibility pause**: no polling while the tab is hidden; an immediate
+ *   poll when it becomes visible again
+ * - **Backoff**: 5s → 10s → 20s → … capped at 60s while the backend is failing
+ * - **Data age**: `statsFetchedAt` lets the UI show "updated 3s ago" and flip
+ *   to a stale state instead of presenting old numbers as live
  *
  * @module stores/crawlerStore
  */
@@ -24,87 +25,80 @@ import { create } from 'zustand';
 import type { CrawlStats, FrontierUrl, CrawledPage, Domain } from '../types';
 import { api } from '../services/api';
 
+/** Normal polling interval. */
+export const POLL_INTERVAL_MS = 5000;
+/** Backoff ceiling while the backend is unreachable. */
+const MAX_POLL_INTERVAL_MS = 60000;
+
 /**
  * State shape for the crawler store.
- * Includes data, loading/error states, and action methods.
  */
 interface CrawlerStore {
   // Stats
-  /** Comprehensive crawler statistics for the dashboard */
+  /** Latest stats snapshot (kept on screen through failed polls) */
   stats: CrawlStats | null;
-  /** Whether stats are currently being fetched */
+  /** Whether a stats request is in flight */
   statsLoading: boolean;
-  /** Error message if stats fetch failed */
+  /** Error message from the most recent failed poll, if any */
   statsError: string | null;
-  /** Fetches comprehensive stats from the API */
+  /** Browser time (ms) when the current snapshot arrived */
+  statsFetchedAt: number | null;
+  /** Consecutive failed polls; drives backoff and the stale indicator */
+  consecutiveErrors: number;
+  /** Fetches stats once */
   fetchStats: () => Promise<void>;
 
   // Frontier
-  /** URLs in the frontier (filtered by current view) */
   frontierUrls: FrontierUrl[];
-  /** Whether frontier URLs are being fetched */
   frontierLoading: boolean;
-  /** Fetches frontier URLs with optional status filter */
   fetchFrontierUrls: (status?: string) => Promise<void>;
-  /** Adds URLs to the frontier and refreshes data */
   addUrls: (urls: string[], priority?: number) => Promise<{ added: number; total: number }>;
 
   // Pages
-  /** Paginated list of crawled pages */
   pages: CrawledPage[];
-  /** Total count of pages (for pagination) */
   pagesTotal: number;
-  /** Whether pages are being fetched */
   pagesLoading: boolean;
-  /** Fetches paginated pages with optional filters */
   fetchPages: (limit?: number, offset?: number, domain?: string, search?: string) => Promise<void>;
 
   // Domains
-  /** Paginated list of domains */
   domains: Domain[];
-  /** Total count of domains (for pagination) */
   domainsTotal: number;
-  /** Whether domains are being fetched */
   domainsLoading: boolean;
-  /** Fetches paginated domains */
   fetchDomains: (limit?: number, offset?: number) => Promise<void>;
+  /** Replaces one domain in the list after a confirmed settings update */
+  replaceDomain: (domain: Domain) => void;
 
   // Polling
-  /** Whether auto-polling is active */
   isPolling: boolean;
-  /** Starts auto-polling for stats (every 5 seconds) */
+  /** Delay before the next poll (grows with consecutive errors) */
+  nextPollInMs: number;
   startPolling: () => void;
-  /** Stops auto-polling */
   stopPolling: () => void;
 }
 
-/**
- * Module-level polling interval reference.
- * Stored outside the store to persist across renders.
- */
-let pollInterval: ReturnType<typeof setInterval> | null = null;
+let pollTimer: ReturnType<typeof setTimeout> | null = null;
+/** Monotonic id of the latest stats request; older responses are discarded. */
+let statsRequestSeq = 0;
+let visibilityListener: (() => void) | null = null;
 
 /**
- * Zustand store for crawler state.
- *
- * Provides centralized state management for all dashboard components.
- * Components can subscribe to specific slices of state to minimize re-renders.
+ * Poll delay for a given number of consecutive failures.
+ */
+export function pollDelay(consecutiveErrors: number): number {
+  return Math.min(POLL_INTERVAL_MS * 2 ** consecutiveErrors, MAX_POLL_INTERVAL_MS);
+}
+
+/**
+ * Global crawler store hook.
  *
  * @example
- * ```typescript
- * import { useCrawlerStore } from './stores/crawlerStore';
- *
+ * ```tsx
  * function Dashboard() {
- *   const { stats, statsLoading, fetchStats, startPolling, stopPolling } = useCrawlerStore();
- *
+ *   const { stats, startPolling, stopPolling } = useCrawlerStore();
  *   useEffect(() => {
- *     fetchStats();
  *     startPolling();
  *     return () => stopPolling();
- *   }, [fetchStats, startPolling, stopPolling]);
- *
- *   if (statsLoading) return <Spinner />;
- *   return <StatsDisplay stats={stats} />;
+ *   }, [startPolling, stopPolling]);
  * }
  * ```
  */
@@ -113,21 +107,31 @@ export const useCrawlerStore = create<CrawlerStore>((set, get) => ({
   stats: null,
   statsLoading: false,
   statsError: null,
+  statsFetchedAt: null,
+  consecutiveErrors: 0,
 
-  /**
-   * Fetches comprehensive crawler statistics.
-   * Sets loading state and error state appropriately.
-   */
   fetchStats: async () => {
-    set({ statsLoading: true, statsError: null });
+    const seq = ++statsRequestSeq;
+    set({ statsLoading: true });
     try {
       const stats = await api.getStats();
-      set({ stats, statsLoading: false });
-    } catch (error) {
+      // A slower, older request must not overwrite a newer snapshot
+      if (seq !== statsRequestSeq) return;
       set({
+        stats,
+        statsLoading: false,
+        statsError: null,
+        statsFetchedAt: Date.now(),
+        consecutiveErrors: 0,
+      });
+    } catch (error) {
+      if (seq !== statsRequestSeq) return;
+      // Keep the last snapshot; the UI marks it stale by its age
+      set((state) => ({
         statsError: error instanceof Error ? error.message : 'Failed to fetch stats',
         statsLoading: false,
-      });
+        consecutiveErrors: state.consecutiveErrors + 1,
+      }));
     }
   },
 
@@ -135,12 +139,6 @@ export const useCrawlerStore = create<CrawlerStore>((set, get) => ({
   frontierUrls: [],
   frontierLoading: false,
 
-  /**
-   * Fetches frontier URLs with optional status filter.
-   * Used by the Frontier view to display queue contents.
-   *
-   * @param status - Optional status filter (pending, in_progress, completed, failed)
-   */
   fetchFrontierUrls: async (status?: string) => {
     set({ frontierLoading: true });
     try {
@@ -152,14 +150,6 @@ export const useCrawlerStore = create<CrawlerStore>((set, get) => ({
     }
   },
 
-  /**
-   * Adds URLs to the frontier and refreshes the list.
-   * Returns the result with added count.
-   *
-   * @param urls - Array of URLs to add
-   * @param priority - Optional priority level (1-3)
-   * @returns Object with added and total counts
-   */
   addUrls: async (urls: string[], priority?: number) => {
     const result = await api.addUrls(urls, priority);
     await get().fetchFrontierUrls();
@@ -171,15 +161,6 @@ export const useCrawlerStore = create<CrawlerStore>((set, get) => ({
   pagesTotal: 0,
   pagesLoading: false,
 
-  /**
-   * Fetches paginated crawled pages with optional filters.
-   * Used by the Pages view for browsing crawled content.
-   *
-   * @param limit - Maximum pages to return (default: 50)
-   * @param offset - Number of pages to skip (default: 0)
-   * @param domain - Optional domain filter
-   * @param search - Optional search term for URL/title
-   */
   fetchPages: async (limit = 50, offset = 0, domain?: string, search?: string) => {
     set({ pagesLoading: true });
     try {
@@ -196,13 +177,6 @@ export const useCrawlerStore = create<CrawlerStore>((set, get) => ({
   domainsTotal: 0,
   domainsLoading: false,
 
-  /**
-   * Fetches paginated domains.
-   * Used by the Domains view.
-   *
-   * @param limit - Maximum domains to return (default: 50)
-   * @param offset - Number of domains to skip (default: 0)
-   */
   fetchDomains: async (limit = 50, offset = 0) => {
     set({ domainsLoading: true });
     try {
@@ -214,31 +188,54 @@ export const useCrawlerStore = create<CrawlerStore>((set, get) => ({
     }
   },
 
-  // Polling
-  isPolling: false,
-
-  /**
-   * Starts auto-polling for stats.
-   * Fetches stats every 5 seconds for real-time dashboard updates.
-   * Only one polling interval is active at a time.
-   */
-  startPolling: () => {
-    if (pollInterval) return;
-    set({ isPolling: true });
-    get().fetchStats();
-    pollInterval = setInterval(() => {
-      get().fetchStats();
-    }, 5000);
+  replaceDomain: (updated: Domain) => {
+    set((state) => ({
+      domains: state.domains.map((d) => (d.domain === updated.domain ? updated : d)),
+    }));
   },
 
-  /**
-   * Stops auto-polling.
-   * Should be called when the dashboard is unmounted.
-   */
+  // Polling
+  isPolling: false,
+  nextPollInMs: POLL_INTERVAL_MS,
+
+  startPolling: () => {
+    if (get().isPolling) return;
+    set({ isPolling: true });
+
+    const tick = async () => {
+      pollTimer = null;
+      if (!get().isPolling) return;
+      if (document.hidden) return; // resumed by the visibility listener
+      await get().fetchStats();
+      if (!get().isPolling || pollTimer) return;
+      const delay = pollDelay(get().consecutiveErrors);
+      set({ nextPollInMs: delay });
+      pollTimer = setTimeout(tick, delay);
+    };
+
+    visibilityListener = () => {
+      if (document.hidden) {
+        if (pollTimer) {
+          clearTimeout(pollTimer);
+          pollTimer = null;
+        }
+      } else if (get().isPolling && !pollTimer) {
+        tick();
+      }
+    };
+    document.addEventListener('visibilitychange', visibilityListener);
+
+    tick();
+  },
+
   stopPolling: () => {
-    if (pollInterval) {
-      clearInterval(pollInterval);
-      pollInterval = null;
+    if (pollTimer) {
+      clearTimeout(pollTimer);
+      pollTimer = null;
+    }
+    if (visibilityListener) {
+      document.removeEventListener('visibilitychange', visibilityListener);
+      visibilityListener = null;
     }
     set({ isPolling: false });
   },

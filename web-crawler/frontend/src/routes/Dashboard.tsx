@@ -19,6 +19,8 @@ import { useCrawlerStore } from '../stores/crawlerStore';
 import { StatCard } from '../components/StatCard';
 import { RecentPagesTable } from '../components/RecentPagesTable';
 import { WorkerStatus } from '../components/WorkerStatus';
+import { FreshnessIndicator } from '../components/FreshnessIndicator';
+import { CrawlHealthBanner } from '../components/CrawlHealthBanner';
 
 /**
  * Dashboard route component displaying real-time crawler statistics.
@@ -34,13 +36,14 @@ import { WorkerStatus } from '../components/WorkerStatus';
  * @returns Dashboard page with live crawler metrics
  */
 export function Dashboard() {
-  const { stats, statsLoading, fetchStats, startPolling, stopPolling } = useCrawlerStore();
+  const { stats, statsLoading, statsFetchedAt, startPolling, stopPolling } = useCrawlerStore();
 
+  // startPolling fetches immediately; a separate fetchStats() here would fire
+  // a duplicate request on every mount.
   useEffect(() => {
-    fetchStats();
     startPolling();
     return () => stopPolling();
-  }, [fetchStats, startPolling, stopPolling]);
+  }, [startPolling, stopPolling]);
 
   /**
    * Formats byte count into human-readable string.
@@ -56,7 +59,7 @@ export function Dashboard() {
     return `${bytes} B`;
   };
 
-  if (statsLoading && !stats) {
+  if (!stats && statsFetchedAt === null && statsLoading) {
     return (
       <div className="p-8">
         <div className="animate-pulse space-y-4">
@@ -75,11 +78,10 @@ export function Dashboard() {
     <div className="p-6 space-y-6">
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-bold text-gray-900">Crawler Dashboard</h1>
-        <div className="flex items-center space-x-2">
-          <span className="w-2 h-2 bg-green-500 rounded-full animate-pulse"></span>
-          <span className="text-sm text-gray-600">Live</span>
-        </div>
+        <FreshnessIndicator />
       </div>
+
+      <CrawlHealthBanner stats={stats} />
 
       {/* Crawl Stats */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">

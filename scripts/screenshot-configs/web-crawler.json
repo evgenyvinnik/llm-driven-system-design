@@ -5,7 +5,16 @@
   "dbName": "webcrawler",
   "dbUser": "postgres",
   "auth": {
-    "enabled": false
+    "enabled": true,
+    "loginUrl": "/admin",
+    "credentials": {
+      "username": "admin",
+      "password": "password123"
+    },
+    "usernameSelector": "input[name='username']",
+    "passwordSelector": "input[name='password']",
+    "submitSelector": "button[type='submit']",
+    "inPlace": true
   },
   "screens": [
     {

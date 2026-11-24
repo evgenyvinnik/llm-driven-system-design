@@ -51,6 +51,15 @@ export function WorkerStatus({ workers, heartbeats }: WorkerStatusProps) {
   const now = Date.now();
 
   /**
+   * Heartbeat age. Prefers the server-computed `ageMs`: subtracting a worker
+   * timestamp from the *browser's* clock mixes two clocks, so a laptop running
+   * 40s fast would show every worker as dead. Falls back to local math only
+   * for older API responses.
+   */
+  const heartbeatAgeMs = (h: { lastHeartbeat: number; ageMs?: number | null }) =>
+    h.ageMs ?? now - h.lastHeartbeat;
+
+  /**
    * Determines the health status of a worker based on its last heartbeat.
    *
    * @param workerId - The worker ID to check
@@ -60,7 +69,7 @@ export function WorkerStatus({ workers, heartbeats }: WorkerStatusProps) {
     const heartbeat = heartbeats.find((h) => h.workerId === workerId);
     if (!heartbeat) return 'unknown';
 
-    const secondsAgo = (now - heartbeat.lastHeartbeat) / 1000;
+    const secondsAgo = heartbeatAgeMs(heartbeat) / 1000;
     if (secondsAgo < 10) return 'active';
     if (secondsAgo < 30) return 'stale';
     return 'dead';
@@ -88,7 +97,7 @@ export function WorkerStatus({ workers, heartbeats }: WorkerStatusProps) {
             const status = getWorkerStatus(workerId);
             const heartbeat = heartbeats.find((h) => h.workerId === workerId);
             const lastSeen = heartbeat
-              ? `${Math.floor((now - heartbeat.lastHeartbeat) / 1000)}s ago`
+              ? `${Math.floor(heartbeatAgeMs(heartbeat) / 1000)}s ago`
               : 'Never';
 
             return (

@@ -22,7 +22,33 @@ import type {
   CrawledPage,
   Domain,
   FrontierStats,
+  AuthUser,
+  HealthStatus,
 } from '../types';
+
+/**
+ * Error thrown for non-2xx responses. Carries the HTTP status so callers can
+ * tell "you need to sign in" (401) from "you may not" (403) from a server fault.
+ */
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    public readonly status: number
+  ) {
+    super(message);
+    this.name = 'ApiError';
+  }
+}
+
+/**
+ * Called whenever the API answers 401, i.e. the session expired or was never
+ * there. The auth store registers itself here (rather than api.ts importing the
+ * store) to avoid a circular import.
+ */
+let onUnauthorized: (() => void) | null = null;
+export function setUnauthorizedHandler(handler: () => void): void {
+  onUnauthorized = handler;
+}
 
 /**
  * Base URL for API requests.
@@ -47,16 +73,19 @@ async function fetchApi<T>(
   options: RequestInit = {}
 ): Promise<T> {
   const response = await fetch(`${API_BASE}${endpoint}`, {
+    ...options,
+    // Send the session cookie (same origin via the Vite proxy / nginx)
+    credentials: 'same-origin',
     headers: {
       'Content-Type': 'application/json',
       ...options.headers,
     },
-    ...options,
   });
 
   if (!response.ok) {
-    const error = await response.json().catch(() => ({}));
-    throw new Error(error.error || `HTTP ${response.status}`);
+    const body = await response.json().catch(() => ({}));
+    if (response.status === 401) onUnauthorized?.();
+    throw new ApiError(body.message || body.error || `HTTP ${response.status}`, response.status);
   }
 
   return response.json();
@@ -278,8 +307,11 @@ export const api = {
    * @param settings - Settings to update (crawlDelay, isAllowed)
    * @returns Promise resolving to success message
    */
-  updateDomainSettings: (domain: string, settings: { crawlDelay?: number; isAllowed?: boolean }) =>
-    fetchApi<{ message: string }>(`/domains/${encodeURIComponent(domain)}/settings`, {
+  updateDomainSettings: (
+    domain: string,
+    settings: { crawlDelay?: number | null; isAllowed?: boolean }
+  ) =>
+    fetchApi<Domain>(`/domains/${encodeURIComponent(domain)}/settings`, {
       method: 'PUT',
       body: JSON.stringify(settings),
     }),
@@ -294,6 +326,20 @@ export const api = {
    *
    * @returns Promise resolving to health status object
    */
-  getHealth: () =>
-    fetchApi<{ status: string; timestamp: string; services: Record<string, string> }>('/health'),
+  getHealth: () => fetchApi<HealthStatus>('/health'),
+
+  // ============================================
+  // Auth endpoints (session cookie)
+  // ============================================
+
+  getCurrentUser: () =>
+    fetchApi<{ authenticated: boolean; user: AuthUser | null }>('/auth/me'),
+
+  login: (username: string, password: string) =>
+    fetchApi<{ message: string; user: AuthUser }>('/auth/login', {
+      method: 'POST',
+      body: JSON.stringify({ username, password }),
+    }),
+
+  logout: () => fetchApi<{ message: string }>('/auth/logout', { method: 'POST' }),
 };

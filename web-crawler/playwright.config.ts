@@ -8,7 +8,8 @@ export default defineConfig({
   workers: process.env.CI ? 1 : undefined,
   reporter: 'html',
   use: {
-    baseURL: 'http://localhost:5173',
+    // SMOKE_BASE_URL points the tests at a frontend on another port (e.g. when 5173 is taken).
+    baseURL: process.env.SMOKE_BASE_URL || 'http://localhost:5173',
     trace: 'on-first-retry',
     headless: true,
     viewport: { width: 1440, height: 900 },

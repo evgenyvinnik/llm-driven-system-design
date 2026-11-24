@@ -57,6 +57,14 @@ services:
     environment:
       NODE_ENV: production
       PORT: 3001
+      # Local-only values: production mode refuses to start without these.
+      # Use real secrets anywhere this is reachable by others.
+      SESSION_SECRET: local-compose-session-secret-change-me
+      ADMIN_USERNAME: admin
+      ADMIN_PASSWORD: password123
+      # nginx -> api is plain HTTP locally; Secure cookies would never be set
+      COOKIE_SECURE: "false"
+      TRUST_PROXY: "1"
       POSTGRES_HOST: postgres
       POSTGRES_PORT: 5432
       POSTGRES_DB: webcrawler

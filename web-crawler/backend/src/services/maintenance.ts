@@ -10,7 +10,10 @@
  * 2. **Queue rehydration** - if Redis lost queue entries (restart without
  *    persistence, FLUSHALL, manual key deletion), pending rows are re-queued
  *    from Postgres, the source of truth.
- * 3. **Stale worker cleanup** - workers whose heartbeat stopped are removed
+ * 3. **Operator settings republish** - domain blocks and crawl-delay
+ *    overrides are re-published from Postgres to Redis, so a Redis restart
+ *    can't silently unblock a domain an operator blocked.
+ * 4. **Stale worker cleanup** - workers whose heartbeat stopped are removed
  *    from the active-workers set so the dashboard is accurate.
  *
  * Runs inside the API server. Several API instances may run; a Redis
@@ -22,6 +25,7 @@
 import { redis, REDIS_KEYS } from '../models/redis.js';
 import { frontierService } from './frontier.js';
 import { cleanupService } from './cleanup.js';
+import * as domainSettings from './domainSettings.js';
 import { config } from '../config.js';
 import { logger } from '../shared/logger.js';
 
@@ -29,6 +33,7 @@ export interface MaintenanceResult {
   ran: boolean;
   recovered: number;
   rehydrated: number;
+  settingsRepublished: number;
   staleWorkers: number;
 }
 
@@ -42,18 +47,19 @@ export class MaintenanceService {
     const lockTtl = Math.max(5000, config.crawler.maintenanceIntervalMs - 1000);
     const acquired = await redis.set(REDIS_KEYS.MAINTENANCE_LOCK, process.pid.toString(), 'PX', lockTtl, 'NX');
     if (acquired !== 'OK') {
-      return { ran: false, recovered: 0, rehydrated: 0, staleWorkers: 0 };
+      return { ran: false, recovered: 0, rehydrated: 0, settingsRepublished: 0, staleWorkers: 0 };
     }
 
     const recovered = await frontierService.recoverStaleUrls(config.crawler.staleLeaseMinutes);
     const rehydrated = await frontierService.rehydrateQueues();
+    const settingsRepublished = await domainSettings.republishAll();
     const staleWorkers = await cleanupService.cleanupRedis();
 
     if (recovered > 0 || rehydrated > 0 || staleWorkers > 0) {
       logger.info({ recovered, rehydrated, staleWorkers }, 'Frontier maintenance repaired state');
     }
 
-    return { ran: true, recovered, rehydrated, staleWorkers };
+    return { ran: true, recovered, rehydrated, settingsRepublished, staleWorkers };
   }
 
   start(): void {

@@ -30,7 +30,7 @@
     "cheerio": "^1.0.0-rc.12",
     "cockatiel": "^3.2.1",
     "compression": "^1.7.4",
-    "connect-redis": "^9.0.0",
+    "connect-redis": "^7.1.1",
     "cors": "^2.8.5",
     "express": "^4.18.2",
     "express-rate-limit": "^7.1.5",
