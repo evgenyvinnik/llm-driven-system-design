@@ -342,7 +342,7 @@ The frontier API returns `retryCount` and `lastError` per URL, and the Frontier 
 | Operator settings in Redis | ✅ One SET + one HASH, rebuilt atomically | ❌ A key per domain | Rebuild can remove stale entries without scanning every key |
 | Session revocation | ✅ `session_version` checked per protected request, from a version-guarded Redis cache | ❌ Stateless JWT | Disable / demote / password reset takes effect on the next request, without a Postgres query |
 | Audit trail | ✅ Append-only table (UPDATE trigger), no FK to users | ❌ Log lines only | Queryable who-did-what that survives user deletion |
-| Shared-host politeness | ✅ Second lock on resolved IP, CDN ranges exempt | ❌ Per-domain only | Many domains on one server would otherwise be hit in parallel; CDN IPs front unrelated sites |
+| Shared-host politeness | ✅ Second lock on resolved IP; CDN ranges get a looser ceiling | ❌ Per-domain only / ❌ CDNs fully exempt | Shared hosts need protection; CDN edges front unrelated sites but still deserve a ceiling |
 | Local dev topology | ✅ Compose profiles | ❌ Everything on by default | The app containers published the same port the source-run backend needs |
 
 ---
@@ -353,7 +353,7 @@ The frontier API returns `retryCount` and `lastError` per URL, and the Frontier 
 2. **SSE stats stream** if the dashboard ever becomes multi-tenant
 3. **Generated types from the schema**, so the row→DTO mapping is checked rather than reviewed
 4. **A Puppeteer lane** for URLs whose extraction comes back suspiciously empty — likely JS-rendered
-5. **A reduced (not zero) per-IP rate for CDN ranges** — today they're fully exempt from the IP lock and rely on per-domain politeness alone
+5. **Adaptive per-IP rates** — derive each IP's ceiling from observed latency and 429s instead of two static tiers (ordinary vs CDN)
 
 ---
 

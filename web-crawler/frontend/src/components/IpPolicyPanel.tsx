@@ -1,7 +1,7 @@
 /**
  * @fileoverview Per-IP politeness and CDN exemptions (admins only).
  *
- * Shows the per-IP delay, statically configured exempt ranges, and the status
+ * Shows the per-IP delay, the reduced delay for CDN ranges, statically configured ranges, and the status
  * of each published-list source (count, last fetch, last error). Ranges are
  * configured with CRAWLER_IP_EXEMPT_CIDRS / CRAWLER_IP_EXEMPT_SOURCES; this
  * panel is read-only apart from "Refresh now".
@@ -53,8 +53,17 @@ export function IpPolicyPanel() {
             ) : (
               <>Per-IP limit disabled (per-domain politeness only).</>
             )}{' '}
-            <strong>{policy.effectiveCount}</strong> exempt range{policy.effectiveCount === 1 ? '' : 's'} (CDNs
-            serve unrelated sites from shared IPs; they keep per-domain limits).
+            <strong>{policy.effectiveCount}</strong> CDN range{policy.effectiveCount === 1 ? '' : 's'}
+            {policy.ipDelayMs > 0 &&
+              (policy.cdnIpDelayMs > 0 ? (
+                <>
+                  {' '}
+                  get a reduced limit of one request every <strong>{policy.cdnIpDelayMs}ms</strong> per IP
+                </>
+              ) : (
+                <> are fully exempt from the per-IP limit</>
+              ))}{' '}
+            (CDNs serve unrelated sites from shared IPs; per-domain limits still apply).
           </p>
 
           {policy.staticCidrs.length > 0 && (

@@ -42,7 +42,7 @@ import {
 } from '../utils/url.js';
 import { config } from '../config.js';
 import { logger } from '../shared/logger.js';
-import { isIpExempt } from './ipPolicy.js';
+import { getIpDelayMs } from './ipPolicy.js';
 
 /**
  * Represents a URL entry in the frontier queue.
@@ -484,7 +484,8 @@ export class FrontierService {
   /**
    * Acquires everything a worker needs before sending a request to `domain`:
    * the domain lock (spaced by crawl delay) and the IP lock (spaced by
-   * `ipDelayMs`, shared by every domain on that server). If the IP lock is
+   * `ipDelayMs`, or the reduced `cdnIpDelayMs` for CDN ranges; shared by every
+   * domain on that server). If the IP lock is
    * taken, the domain lock is released so the domain's slot isn't burned.
    *
    * @param knownLockedIps - IPs already found locked in this scan (skipped
@@ -495,11 +496,11 @@ export class FrontierService {
     workerId: string,
     knownLockedIps?: Set<string>
   ): Promise<{ ok: boolean; ip: string | null; lockedIp?: string }> {
-    const ipDelayMs = config.crawler.ipDelayMs;
-    let ip = ipDelayMs > 0 ? await this.resolveDomainIp(domain) : null;
-    // CDN ranges: unrelated sites share anycast IPs, so skip the IP lock
-    // (per-domain politeness still applies)
-    if (ip && (await isIpExempt(ip))) ip = null;
+    let ip = config.crawler.ipDelayMs > 0 ? await this.resolveDomainIp(domain) : null;
+    // CDN ranges get a reduced per-IP spacing (or none, if cdnIpDelayMs = 0):
+    // unrelated sites share their anycast IPs. Per-domain politeness still applies.
+    const ipDelayMs = ip ? await getIpDelayMs(ip) : 0;
+    if (ipDelayMs === 0) ip = null;
     if (ip && knownLockedIps?.has(ip)) return { ok: false, ip, lockedIp: ip };
 
     if (!(await this.acquireDomainLock(domain, workerId))) return { ok: false, ip };

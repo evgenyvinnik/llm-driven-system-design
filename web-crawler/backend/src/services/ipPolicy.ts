@@ -2,9 +2,13 @@
  * @fileoverview Per-IP politeness exemptions (CDN ranges).
  *
  * The per-IP lock protects a shared host serving many domains. But large CDNs
- * serve thousands of *unrelated* sites from shared anycast IPs, and a per-IP
- * limit would throttle all of them as though they were one server. IPs in an
- * exempt range skip the per-IP lock; per-domain politeness still applies.
+ * serve thousands of *unrelated* sites from shared anycast IPs, and the normal
+ * per-IP limit would throttle all of them as though they were one server. IPs
+ * in a CDN range get a *reduced* per-IP rate instead (`cdnIpDelayMs`, default
+ * 50ms vs 250ms) - looser, but still a ceiling, so a crawler bug or burst
+ * can't hammer one edge. `cdnIpDelayMs = 0` exempts them fully. Per-domain
+ * politeness applies either way. (The env names say "exempt" for history;
+ * they define the CDN ranges.)
  *
  * Exempt ranges come from two places:
  * - `CRAWLER_IP_EXEMPT_CIDRS`: a static list in the environment
@@ -127,6 +131,31 @@ export async function isIpExempt(ip: string): Promise<boolean> {
   return localCache.list.check(ip, family === 4 ? 'ipv4' : 'ipv6');
 }
 
+/**
+ * Pure rule for the per-IP spacing that applies to one IP.
+ *
+ * - per-IP limit disabled (`ipDelayMs <= 0`) -> 0 for everyone
+ * - CDN IP -> `cdnIpDelayMs`, capped at `ipDelayMs` (never stricter than an
+ *   ordinary IP); 0 means fully exempt
+ * - otherwise -> `ipDelayMs`
+ *
+ * @returns spacing in ms; 0 means "take no IP lock"
+ */
+export function chooseIpDelayMs(ipDelayMs: number, cdnIpDelayMs: number, isCdn: boolean): number {
+  if (!(ipDelayMs > 0)) return 0;
+  if (!isCdn) return ipDelayMs;
+  return Math.max(0, Math.min(cdnIpDelayMs, ipDelayMs));
+}
+
+/**
+ * The per-IP spacing for `ip` under the current configuration and CDN ranges.
+ */
+export async function getIpDelayMs(ip: string): Promise<number> {
+  const { ipDelayMs, cdnIpDelayMs } = config.crawler;
+  if (!(ipDelayMs > 0)) return 0;
+  return chooseIpDelayMs(ipDelayMs, cdnIpDelayMs, await isIpExempt(ip));
+}
+
 /** Drops the per-process cache (tests, or after an admin-triggered refresh). */
 export function invalidateLocalCache(): void {
   localCache = null;
@@ -205,6 +234,8 @@ async function getSourceStatus(url: string): Promise<SourceStatus> {
  */
 export async function getPolicy(): Promise<{
   ipDelayMs: number;
+  /** Effective spacing for CDN IPs (after capping); 0 = fully exempt */
+  cdnIpDelayMs: number;
   staticCidrs: string[];
   sources: SourceStatus[];
   effectiveCount: number;
@@ -213,6 +244,7 @@ export async function getPolicy(): Promise<{
   const { cidrs } = await loadEffective();
   return {
     ipDelayMs: config.crawler.ipDelayMs,
+    cdnIpDelayMs: chooseIpDelayMs(config.crawler.ipDelayMs, config.crawler.cdnIpDelayMs, true),
     staticCidrs: config.crawler.ipExemptCidrs,
     sources: await Promise.all(config.crawler.ipExemptSources.map(getSourceStatus)),
     effectiveCount: cidrs.length,

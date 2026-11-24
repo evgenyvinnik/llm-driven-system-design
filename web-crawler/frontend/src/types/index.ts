@@ -247,6 +247,8 @@ export interface AuditEntry {
  */
 export interface IpPolicy {
   ipDelayMs: number;
+  /** Spacing for IPs in CDN ranges (already capped at ipDelayMs); 0 = fully exempt */
+  cdnIpDelayMs: number;
   staticCidrs: string[];
   sources: {
     url: string;

@@ -2,7 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 
 vi.mock('../models/redis.js', () => ({ redis: {}, REDIS_KEYS: {} }));
 
-import { parseCidr, parseCidrList, buildBlockList } from './ipPolicy.js';
+import { parseCidr, parseCidrList, buildBlockList, chooseIpDelayMs } from './ipPolicy.js';
 
 describe('parseCidr', () => {
   it('accepts IPv4 and IPv6 ranges and bare addresses', () => {
@@ -44,5 +44,32 @@ describe('buildBlockList', () => {
     expect(list.check('192.0.3.1', 'ipv4')).toBe(false);
     expect(list.check('2001:db8:abcd::1', 'ipv6')).toBe(true);
     expect(list.check('2001:db9::1', 'ipv6')).toBe(false);
+  });
+});
+
+describe('chooseIpDelayMs', () => {
+  it('uses the normal per-IP delay for non-CDN IPs', () => {
+    expect(chooseIpDelayMs(250, 50, false)).toBe(250);
+  });
+
+  it('uses the reduced delay for CDN IPs', () => {
+    expect(chooseIpDelayMs(250, 50, true)).toBe(50);
+  });
+
+  it('treats a CDN delay of 0 as full exemption', () => {
+    expect(chooseIpDelayMs(250, 0, true)).toBe(0);
+  });
+
+  it('never limits a CDN IP more strictly than an ordinary one', () => {
+    expect(chooseIpDelayMs(250, 1000, true)).toBe(250);
+  });
+
+  it('turns everything off when the per-IP limit is disabled', () => {
+    expect(chooseIpDelayMs(0, 50, true)).toBe(0);
+    expect(chooseIpDelayMs(0, 50, false)).toBe(0);
+  });
+
+  it('ignores a negative CDN delay', () => {
+    expect(chooseIpDelayMs(250, -5, true)).toBe(0);
   });
 });

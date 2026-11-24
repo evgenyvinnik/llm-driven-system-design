@@ -16,6 +16,7 @@ const enabled = process.env.INTEGRATION === '1';
 process.env.CRAWLER_IP_DELAY_MS = '1000';
 process.env.CRAWLER_MAX_PAGES_PER_DOMAIN = '1000';
 process.env.CRAWLER_IP_EXEMPT_CIDRS = '127.0.0.3/32';
+process.env.CRAWLER_CDN_IP_DELAY_MS = '300'; // reduced, vs 1000ms for ordinary IPs
 process.env.CRAWLER_IP_EXEMPT_SOURCES = [
   'http://127.0.0.1:18121/ips-v4',
   'http://127.0.0.1:18122/public-ip-list',
@@ -256,20 +257,42 @@ describe.skipIf(!enabled)('operations end-to-end', () => {
   // CDN exemptions from the per-IP lock
   // -------------------------------------------------------------------------
 
-  it('exempts statically configured ranges from the per-IP lock', async () => {
+  it('gives CDN ranges a reduced per-IP rate, not an exemption', async () => {
     await m.frontier.addUrls(
       ['http://127.0.0.3:18131/a', 'http://127.0.0.3:18132/b', 'http://127.0.0.1:18133/c', 'http://127.0.0.1:18134/d'],
       { depth: 0, priority: 3 }
     );
-    const claimed: string[] = [];
-    for (let i = 0; i < 4; i++) {
-      const next = await m.frontier.getNextUrl(`cdn-w${i}`);
-      if (next) claimed.push(next.domain);
-    }
-    // Both exempt domains on 127.0.0.3 are claimable at once; only one of the
-    // two non-exempt domains on 127.0.0.1 gets through the IP lock
-    expect(claimed.filter((d) => d.startsWith('127.0.0.3'))).toHaveLength(2);
-    expect(claimed.filter((d) => d.startsWith('127.0.0.1'))).toHaveLength(1);
+    const claimAll = async (tag: string) => {
+      const got: string[] = [];
+      for (let i = 0; i < 4; i++) {
+        const next = await m.frontier.getNextUrl(`${tag}-${i}`);
+        if (next) got.push(next.domain);
+      }
+      return got;
+    };
+    const onCdn = (ds: string[]) => ds.filter((d) => d.startsWith('127.0.0.3')).length;
+    const onOrigin = (ds: string[]) => ds.filter((d) => d.startsWith('127.0.0.1')).length;
+
+    // t=0: one domain per IP gets through - the CDN IP is still rate-limited
+    const first = await claimAll('t0');
+    expect([onCdn(first), onOrigin(first)]).toEqual([1, 1]);
+
+    // t≈400ms: the CDN IP's 300ms window has passed, the origin's 1000ms hasn't
+    await new Promise((r) => setTimeout(r, 400));
+    const second = await claimAll('t400');
+    expect([onCdn(second), onOrigin(second)]).toEqual([1, 0]);
+
+    // t≈1100ms: the origin IP opens too
+    await new Promise((r) => setTimeout(r, 700));
+    const third = await claimAll('t1100');
+    expect([onCdn(third), onOrigin(third)]).toEqual([0, 1]);
+
+    // The CDN IP's lock carried the reduced TTL
+    const ttl = await m.redis.pttl(m.REDIS_KEYS.IP_LOCK('127.0.0.3'));
+    expect(ttl).toBeLessThanOrEqual(300);
+
+    const policy = await call('GET', '/api/admin/ip-policy', undefined, admin);
+    expect(policy.json).toMatchObject({ ipDelayMs: 1000, cdnIpDelayMs: 300 });
     await m.frontier.clear();
   });
 

@@ -240,6 +240,18 @@ export const config = {
     ipExemptRefreshHours: parseFloat(process.env.CRAWLER_IP_EXEMPT_REFRESH_HOURS || '24'),
 
     /**
+     * Per-IP spacing (ms) for IPs in CDN ranges (CRAWLER_IP_EXEMPT_CIDRS /
+     * _SOURCES), used instead of `ipDelayMs`. CDN edges are built for heavy
+     * shared traffic, so the normal per-IP limit would throttle every site
+     * behind one anycast IP as though it were a single small server - but no
+     * limit at all leaves a crawler bug or burst free to hammer one edge.
+     * Capped at `ipDelayMs` (a CDN IP is never limited more strictly than an
+     * ordinary one). 0 = fully exempt (per-domain politeness only).
+     * @default 50 (at most ~20 requests/second per CDN edge IP)
+     */
+    cdnIpDelayMs: parseInt(process.env.CRAWLER_CDN_IP_DELAY_MS || '50', 10),
+
+    /**
      * Maximum URLs enqueued per domain (seeds are exempt). Bounds crawler
      * traps that generate infinite *shallow* URLs, which the depth limit
      * doesn't catch, and keeps one big site from crowding out breadth.

@@ -440,9 +440,10 @@ stored in Postgres and republished to Redis every minute, so they survive a Redi
 | `CRAWLER_MAX_PAGES_PER_DOMAIN` | `10000` | Max URLs enqueued per domain (seeds exempt; `0` = unlimited) |
 | `CRAWLER_IP_DELAY_MS` | `250` | Min spacing between requests to one IP across all its domains (`0` disables) |
 | `CRAWLER_DNS_CACHE_TTL` | `300` | Seconds a resolved domain IP is cached |
-| `CRAWLER_IP_EXEMPT_CIDRS` | none | Comma-separated CIDRs exempt from the per-IP lock (e.g. CDN ranges) |
+| `CRAWLER_IP_EXEMPT_CIDRS` | none | Comma-separated CDN ranges: these IPs get `CRAWLER_CDN_IP_DELAY_MS` instead of the normal per-IP limit |
 | `CRAWLER_IP_EXEMPT_SOURCES` | none | Comma-separated URLs of published CDN range lists (text or JSON), refreshed by the API |
 | `CRAWLER_IP_EXEMPT_REFRESH_HOURS` | `24` | How often exempt-range sources are re-fetched |
+| `CRAWLER_CDN_IP_DELAY_MS` | `50` | Per-IP spacing for CDN ranges (capped at `CRAWLER_IP_DELAY_MS`; `0` = fully exempt) |
 | `CRAWLER_MAX_RETRIES` | `3` | Frontier-level retries for transient failures (timeout, 5xx, 429) |
 | `CRAWLER_RETRY_BASE_DELAY` | `60000` | Base retry backoff (ms), doubled per attempt with jitter |
 | `CRAWLER_STALE_LEASE_MINUTES` | `10` | `in_progress` URLs older than this are returned to the queue |
@@ -508,7 +509,7 @@ web-crawler/
 2. **Crawl-Delay**: Honors robots.txt Crawl-delay (capped at 60s). An operator override from the Domains page can only slow a domain down, never go below robots.txt
 3. **Per-Domain Rate Limiting**: A Redis lock with TTL = crawl delay spaces every request start to a domain across all workers — including in-process retries
 4. **Per-IP Rate Limiting**: a second, looser lock on the domain's resolved IP (default 250ms) protects shared hosts where many domains live on one server. Measured on a two-domain, one-IP fixture with two workers: with the IP lock off, 12 of 25 request gaps were under 100ms (min 0ms); with it on at 1500ms, the min gap was 1505ms
-5. **CDN exemptions**: CDNs serve unrelated sites from shared anycast IPs, so a per-IP limit would throttle all of them as one server. IPs in exempt ranges skip the IP lock but keep per-domain politeness. No ranges ship by default (they change, and a wrong range removes protection from real servers); point `CRAWLER_IP_EXEMPT_SOURCES` at the providers' own lists, e.g. `https://www.cloudflare.com/ips-v4,https://www.cloudflare.com/ips-v6,https://api.fastly.com/public-ip-list`. Use CDN-only lists — exempting a whole cloud provider would unprotect single-tenant servers. A failed fetch keeps the last good list
+5. **CDN ranges get a reduced per-IP rate**: CDNs serve unrelated sites from shared anycast IPs, so the normal per-IP limit would throttle all of them as one server — but no limit at all would let a crawler bug or burst hammer one edge. IPs in CDN ranges get `CRAWLER_CDN_IP_DELAY_MS` (default 50ms, ~20 req/s per edge IP) instead of 250ms, never stricter than ordinary IPs; `0` exempts them fully. Per-domain politeness always applies. Measured with two workers on two domains sharing one IP, per-IP limit 1500ms: ordinary IP → min gap 1519ms; CDN range at 700ms → 1008ms (the 700ms window rounds up to the workers' 500ms idle-poll tick); CDN range at 0 → 0ms. No ranges ship by default (they change, and a wrong range removes protection from real servers); point `CRAWLER_IP_EXEMPT_SOURCES` at the providers' own lists, e.g. `https://www.cloudflare.com/ips-v4,https://www.cloudflare.com/ips-v6,https://api.fastly.com/public-ip-list`. Use CDN-only lists — exempting a whole cloud provider would unprotect single-tenant servers. A failed fetch keeps the last good list
 6. **Redirects via the frontier**: 3xx targets are enqueued as new URLs, so the target domain gets its own robots.txt check and politeness lock
 7. **nofollow**: `rel="nofollow|sponsored|ugc"` links and `<meta name="robots" content="nofollow">` pages are not followed
 8. **Retry-After**: 429/408 responses are rescheduled no earlier than the server asks
@@ -553,7 +554,6 @@ npm run test:e2e
 - [ ] Sitemap.xml parsing
 - [ ] JavaScript rendering (Puppeteer integration)
 - [ ] Ship audit entries to an external append-only sink (today: an append-only Postgres table, best-effort writes)
-- [ ] A higher per-IP rate for CDN ranges instead of a full exemption
 
 ## License
 
