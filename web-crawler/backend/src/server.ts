@@ -25,7 +25,7 @@ import compression from 'compression';
 
 import { config } from './config.js';
 import { initDatabase, pool } from './models/database.js';
-import { redis, REDIS_KEYS } from './models/redis.js';
+import { redis } from './models/redis.js';
 import frontierRoutes from './routes/frontier.js';
 import statsRoutes from './routes/stats.js';
 import pagesRoutes from './routes/pages.js';
@@ -36,13 +36,16 @@ import { logger, requestLogger } from './shared/logger.js';
 import { getMetrics, getMetricsContentType, updateFrontierMetrics } from './shared/metrics.js';
 import {
   createSessionMiddleware,
-  initializeDefaultAdmin,
   requireRole,
+  requireAuth,
   loginHandler,
   logoutHandler,
   getCurrentUser,
+  changePasswordHandler,
   UserRole,
 } from './middleware/auth.js';
+import usersRoutes from './routes/users.js';
+import { ensureBootstrapAdmin } from './services/users.js';
 import {
   createTieredRateLimiter,
   seedInjectionLimiter,
@@ -50,6 +53,7 @@ import {
 } from './middleware/rateLimit.js';
 import { cleanupService } from './services/cleanup.js';
 import { maintenanceService } from './services/maintenance.js';
+import * as domainSettings from './services/domainSettings.js';
 import { frontierService } from './services/frontier.js';
 
 /**
@@ -245,6 +249,10 @@ app.get('/', (_req: Request, res: Response) => {
  */
 app.post('/api/auth/login', loginLimiter, loginHandler);
 
+// Change your own password. Shares the login limiter: it also verifies a
+// password, so it must not become a brute-force oracle.
+app.post('/api/auth/password', loginLimiter, requireAuth, changePasswordHandler);
+
 /**
  * POST /api/auth/logout
  *
@@ -271,6 +279,9 @@ app.use('/api/frontier', frontierRoutes);
 app.use('/api/stats', statsRoutes);
 app.use('/api/pages', pagesRoutes);
 app.use('/api/domains', domainsRoutes);
+
+// Operator accounts (admin only; see routes/users.ts)
+app.use('/api/admin/users', usersRoutes);
 
 // ============================================================================
 // ADMIN ENDPOINTS (Requires Authentication)
@@ -425,14 +436,23 @@ app.post(
     try {
       const { domain } = req.params;
 
-      // Reset domain in database
-      await pool.query(
-        `UPDATE domains SET is_allowed = true, updated_at = NOW() WHERE domain = $1`,
+      // Reset domain in database (unblock), then publish to what workers read
+      const reset = await pool.query<{ crawl_delay_override: number | null }>(
+        `UPDATE domains SET is_allowed = true, updated_at = NOW() WHERE domain = $1
+         RETURNING crawl_delay_override`,
         [domain]
       );
+      if (reset.rowCount === 0) {
+        res.status(404).json({ error: 'Domain not found' });
+        return;
+      }
+      await domainSettings.publish(domain, {
+        crawlDelayOverride: reset.rows[0].crawl_delay_override,
+        isAllowed: true,
+      });
 
-      // Clear circuit breaker state and the operator block that workers read
-      await redis.del(`crawler:circuit:${domain}`, REDIS_KEYS.DOMAIN_BLOCKED(domain));
+      // Clear circuit breaker state
+      await redis.del(`crawler:circuit:${domain}`);
 
       logger.info({ userId: req.session?.userId, domain }, 'Domain reset');
 
@@ -492,7 +512,7 @@ async function start() {
     logger.info('Database initialized');
 
     // Initialize default admin user
-    initializeDefaultAdmin();
+    await ensureBootstrapAdmin();
 
     // Start cleanup service
     cleanupService.start();

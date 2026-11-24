@@ -199,8 +199,21 @@ export interface FrontierStats {
  * The signed-in operator, as returned by GET /api/auth/me.
  */
 export interface AuthUser {
+  id: number;
   username: string;
-  role: 'admin' | 'user' | 'anonymous';
+  role: 'admin' | 'user';
+}
+
+/**
+ * An operator account as listed by GET /api/admin/users.
+ */
+export interface ManagedUser {
+  id: number;
+  username: string;
+  role: 'admin' | 'user';
+  disabled: boolean;
+  createdAt: string;
+  lastLoginAt: string | null;
 }
 
 /**

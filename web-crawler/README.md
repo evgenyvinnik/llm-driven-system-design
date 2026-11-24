@@ -155,8 +155,8 @@ npm run dev
 
 Open http://localhost:5173 in your browser. Reading the dashboard needs no login.
 To seed URLs, recover leases, change domain settings or clear the frontier, sign in on
-the **Admin** page (default dev credentials: `admin` / `password123`; override with
-`ADMIN_USERNAME` / `ADMIN_PASSWORD`).
+the **Admin** page (default dev credentials: `admin` / `password123`). Admins can add
+more accounts — admins, or read-only users — from the Admin page.
 
 ### Running Distributed Crawlers
 
@@ -189,14 +189,34 @@ Read endpoints are public. Every endpoint that changes crawler state is **admin-
 (marked *admin* below) and requires the `crawler.sid` session cookie from a login:
 
 ```
-POST /api/auth/login   {"username": "admin", "password": "password123"}
+POST /api/auth/login      {"username": "admin", "password": "password123"}
 POST /api/auth/logout
 GET  /api/auth/me
+POST /api/auth/password   {"currentPassword": "...", "newPassword": "..."}   (any signed-in user)
 ```
 
-Login is rate-limited to 10 attempts per 15 minutes per client. Sessions live in
-Redis (`connect-redis` v7, which supports ioredis) for 24 hours and are regenerated on
-login. Unauthenticated calls to admin endpoints return 401.
+Accounts live in the `users` table with two roles: `admin` (changes crawler state,
+manages accounts) and `user` (read-only). On startup, if no active admin exists, one is
+created — or restored — from `ADMIN_USERNAME` / `ADMIN_PASSWORD`, so restarting the API
+with those set is the way back in if every admin is lost.
+
+Login and password change are rate-limited to 10 attempts per 15 minutes per client.
+Sessions live in Redis (`connect-redis` v7, which supports ioredis) for 24 hours and
+are regenerated on login. Disabling a user, changing their role, or changing their
+password **revokes their existing sessions immediately**. Unauthenticated calls to admin
+endpoints return 401; signed-in non-admins get 403.
+
+### User Management (admin)
+
+```
+GET    /api/admin/users
+POST   /api/admin/users         {"username": "ops", "password": "at-least-8", "role": "user"}
+PATCH  /api/admin/users/:id     {"role"?: "admin"|"user", "disabled"?: true, "password"?: "..."}
+DELETE /api/admin/users/:id
+```
+
+Usernames are case-insensitive. The last active admin can't be demoted, disabled, or
+deleted (409), and admins can't change their own role or delete themselves (400).
 
 ```bash
 # curl example
@@ -363,8 +383,8 @@ stored in Postgres and republished to Redis every minute, so they survive a Redi
 | `POSTGRES_PASSWORD` | `postgres` | Database password |
 | `REDIS_HOST` | `localhost` | Redis host |
 | `REDIS_PORT` | `6379` | Redis port |
-| `ADMIN_USERNAME` | `admin` | Admin login |
-| `ADMIN_PASSWORD` | `password123` | Admin password — **required** when `NODE_ENV=production` |
+| `ADMIN_USERNAME` | `admin` | Bootstrap admin, created/restored only when no active admin exists |
+| `ADMIN_PASSWORD` | `password123` | Bootstrap admin password — **required** in production when no active admin exists |
 | `SESSION_SECRET` | dev placeholder | Session cookie signing secret — **required** when `NODE_ENV=production` |
 | `COOKIE_SECURE` | `true` in production | Set `false` for plain-HTTP setups (the compose file does) |
 | `TRUST_PROXY` | unset | Set (e.g. `1`) behind a TLS-terminating proxy so Secure cookies and client IPs work |
@@ -385,6 +405,8 @@ stored in Postgres and republished to Redis every minute, so they survive a Redi
 | `CRAWLER_MAX_URL_LENGTH` | `2048` | URLs longer than this are dropped |
 | `CRAWLER_MAX_LINKS_PER_PAGE` | `500` | Max outbound links enqueued per page |
 | `CRAWLER_MAX_PAGES_PER_DOMAIN` | `10000` | Max URLs enqueued per domain (seeds exempt; `0` = unlimited) |
+| `CRAWLER_IP_DELAY_MS` | `250` | Min spacing between requests to one IP across all its domains (`0` disables) |
+| `CRAWLER_DNS_CACHE_TTL` | `300` | Seconds a resolved domain IP is cached |
 | `CRAWLER_MAX_RETRIES` | `3` | Frontier-level retries for transient failures (timeout, 5xx, 429) |
 | `CRAWLER_RETRY_BASE_DELAY` | `60000` | Base retry backoff (ms), doubled per attempt with jitter |
 | `CRAWLER_STALE_LEASE_MINUTES` | `10` | `in_progress` URLs older than this are returned to the queue |
@@ -449,10 +471,11 @@ web-crawler/
 1. **robots.txt Compliance**: Fetched and cached per origin (scheme + host + port). 4xx means no restrictions; 5xx or unreachable means "don't crawl yet" — URLs are retried later rather than crawled blind (RFC 9309)
 2. **Crawl-Delay**: Honors robots.txt Crawl-delay (capped at 60s). An operator override from the Domains page can only slow a domain down, never go below robots.txt
 3. **Per-Domain Rate Limiting**: A Redis lock with TTL = crawl delay spaces every request start to a domain across all workers — including in-process retries
-4. **Redirects via the frontier**: 3xx targets are enqueued as new URLs, so the target domain gets its own robots.txt check and politeness lock
-5. **nofollow**: `rel="nofollow|sponsored|ugc"` links and `<meta name="robots" content="nofollow">` pages are not followed
-6. **Retry-After**: 429/408 responses are rescheduled no earlier than the server asks
-7. **User-Agent**: Sends a proper User-Agent string identifying the crawler
+4. **Per-IP Rate Limiting**: a second, looser lock on the domain's resolved IP (default 250ms) protects shared hosts where many domains live on one server. Measured on a two-domain, one-IP fixture with two workers: with the IP lock off, 12 of 25 request gaps were under 100ms (min 0ms); with it on at 1500ms, the min gap was 1505ms
+5. **Redirects via the frontier**: 3xx targets are enqueued as new URLs, so the target domain gets its own robots.txt check and politeness lock
+6. **nofollow**: `rel="nofollow|sponsored|ugc"` links and `<meta name="robots" content="nofollow">` pages are not followed
+7. **Retry-After**: 429/408 responses are rescheduled no earlier than the server asks
+8. **User-Agent**: Sends a proper User-Agent string identifying the crawler
 
 ## Testing
 
@@ -489,8 +512,8 @@ npm run test:e2e
 - [ ] Distributed work stealing for load balancing
 - [ ] Sitemap.xml parsing
 - [ ] JavaScript rendering (Puppeteer integration)
-- [ ] IP-level politeness for many domains behind one shared host
-- [ ] Multiple operator accounts (today there is one admin from env vars)
+- [ ] Per-IP limits that understand CDNs (shared anycast IPs serve unrelated sites; a strict per-IP limit throttles all of them)
+- [ ] Audit log table for admin actions (today they're structured log lines)
 
 ## License
 

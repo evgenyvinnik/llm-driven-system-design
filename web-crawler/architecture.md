@@ -222,11 +222,32 @@ CREATE TABLE domains (
     domain VARCHAR(255) NOT NULL UNIQUE,
     robots_txt TEXT,
     robots_fetched_at TIMESTAMP,
-    crawl_delay FLOAT DEFAULT 1.0,            -- Seconds between requests
+    crawl_delay FLOAT DEFAULT 1.0,            -- robots.txt Crawl-delay (seconds), rewritten on refresh
+    crawl_delay_override FLOAT,               -- operator override; effective = max(override, crawl_delay)
     page_count INTEGER DEFAULT 0,
-    is_allowed BOOLEAN DEFAULT true            -- Whether crawling is permitted
+    is_allowed BOOLEAN DEFAULT true            -- false = operator block
 );
 ```
+
+### Users
+
+Operator accounts. Two roles: `admin` (changes crawler state, manages accounts) and `user` (read-only).
+
+```sql
+CREATE TABLE users (
+    id SERIAL PRIMARY KEY,
+    username VARCHAR(64) NOT NULL UNIQUE,     -- stored lowercase
+    password_hash TEXT NOT NULL,              -- pbkdf2_sha512$<iterations>$<salt>$<hash>
+    role VARCHAR(20) NOT NULL DEFAULT 'user' CHECK (role IN ('admin', 'user')),
+    disabled BOOLEAN NOT NULL DEFAULT false,
+    session_version INTEGER NOT NULL DEFAULT 1, -- bumped to revoke existing sessions
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW(),
+    last_login_at TIMESTAMP
+);
+```
+
+The iteration count is part of the stored hash so it can be raised without invalidating existing passwords.
 
 ### Priority Signals
 
@@ -253,8 +274,13 @@ crawler:domain:{domain}:lock      -> SET NX PX; released early only via compare-
 
 # Per-domain crawl delay
 crawler:domain:{domain}:delay           -> STRING (robots.txt Crawl-delay or default, seconds)
-crawler:domain:{domain}:delay_override  -> STRING (operator override; effective = max(override, delay))
-crawler:domain:{domain}:blocked         -> STRING (operator block; workers fail URLs permanently)
+crawler:delay_overrides                 -> HASH domain -> operator override (effective = max(override, delay))
+crawler:blocked_domains                 -> SET of operator-blocked domains (workers fail their URLs permanently)
+crawler:domain_settings:version         -> Counter bumped by every settings publish (WATCHed by the rebuild)
+
+# Per-IP politeness
+crawler:dns:{hostname}            -> STRING resolved IP ('' = lookup failed), TTL CRAWLER_DNS_CACHE_TTL (60s if failed)
+crawler:ip:{ip}:lock              -> SET NX PX CRAWLER_IP_DELAY_MS (shared by every domain on that IP)
 
 # Maintenance (one API instance per interval)
 crawler:maintenance:lock          -> SET NX PX
@@ -323,11 +349,14 @@ The **domain** key is the URL's `host` — hostname plus any non-default port �
 | Role | Permissions | Endpoints |
 |------|-------------|-----------|
 | anonymous | Read everything the dashboard shows | `GET /health`, `GET /api/*` |
-| admin | Change crawler state | `POST /api/frontier/{add,seed,recover}`, `DELETE /api/frontier/clear`, `POST /api/stats/reset`, `PUT /api/domains/:d/settings`, `POST /api/domains/:d/refresh-robots`, `/api/admin/*` |
+| user | Same reads, a higher rate limit, and their own account | `POST /api/auth/password` |
+| admin | Change crawler state and manage accounts | `POST /api/frontier/{add,seed,recover}`, `DELETE /api/frontier/clear`, `POST /api/stats/reset`, `PUT /api/domains/:d/settings`, `POST /api/domains/:d/refresh-robots`, `/api/admin/*` (incl. `/api/admin/users`) |
+
+**Accounts** live in PostgreSQL (`users`, `services/users.ts`). Every request to a protected route re-reads the user by primary key and rejects the session if the user was deleted or disabled, or if their `session_version` no longer matches the one stored in the session — disabling, changing a role, or changing a password bumps it, so revocation is immediate without a token denylist. The **last active admin** can't be demoted, disabled, or deleted; the check runs in a transaction that row-locks every active admin, so two admins demoting each other concurrently can't both succeed (covered by a test that fires both requests at once). Admins can't change their own role or delete themselves. **Bootstrap / break-glass:** on startup, if no active admin exists, the `ADMIN_USERNAME` account is created or restored from `ADMIN_PASSWORD`.
 
 Reads are public by design: the dashboard is an observability surface, and gating it adds friction without protecting anything sensitive. Every route that changes state goes through `requireAdmin` (`backend/src/middleware/auth.ts`); the frontend hides admin controls for signed-out viewers, but that is UX, not access control.
 
-**Session handling:** login regenerates the session ID (no session fixation); cookies are `httpOnly`, `SameSite=Strict`, and `Secure` in production (`COOKIE_SECURE`, `TRUST_PROXY` for TLS-terminating proxies); sessions live in Redis via `connect-redis` **v7**. (v9 targets node-redis v5's `set(key, val, { EX })` call shape; with this project's ioredis client every session write failed with `ERR syntax error`, so until this was fixed no admin session was ever persisted.) Passwords are PBKDF2-SHA512 with 210k iterations, compared with `timingSafeEqual`, and unknown usernames burn the same hashing time. In production the API refuses to start without `SESSION_SECRET` and `ADMIN_PASSWORD`. CORS is an explicit allowlist (`CORS_ORIGINS`), not "reflect any origin with credentials".
+**Session handling:** login regenerates the session ID (no session fixation); cookies are `httpOnly`, `SameSite=Strict`, and `Secure` in production (`COOKIE_SECURE`, `TRUST_PROXY` for TLS-terminating proxies); sessions live in Redis via `connect-redis` **v7**. (v9 targets node-redis v5's `set(key, val, { EX })` call shape; with this project's ioredis client every session write failed with `ERR syntax error`, so until this was fixed no admin session was ever persisted.) Passwords are PBKDF2-SHA512 with 210k iterations via the async `crypto.pbkdf2` (the sync call would block the event loop ~150–200ms per login), compared with `timingSafeEqual`; unknown and disabled usernames burn the same hashing time. In production the API refuses to start without `SESSION_SECRET`, and without `ADMIN_PASSWORD` when no active admin exists. CORS is an explicit allowlist (`CORS_ORIGINS`), not "reflect any origin with credentials".
 
 ### API Rate Limiting
 
@@ -364,6 +393,8 @@ Rate limiting uses Redis sliding window: ZREMRANGEBYSCORE to remove old entries,
 **The lock is politeness, not exclusivity.** It expires after one crawl delay while a fetch can take 30s, so exclusivity comes from the conditional claim, not the lock. **Every request passes the gate:** an in-process retry re-acquires the lock before re-fetching, and redirects are not auto-followed (axios `maxRedirects: 0`) — the target is enqueued so it gets its own robots.txt check and lock. **Effective delay** = max(operator override, robots.txt Crawl-delay or default); an override can slow a domain down but never speed it past robots.txt. Crawl-delay is capped at 60s.
 
 **robots.txt failure semantics (RFC 9309):** 2xx → obey; 4xx → no restrictions; 5xx/unreachable → treat as disallowed for now and retry the URL later (negative-cached in memory for 60s). The robots parser is built per scheme, because robots-parser returns `undefined` (previously read as "allowed") for URLs on a different origin than the robots.txt URL it was built with.
+
+**Per-IP politeness:** per-domain locks alone let the crawler hit one server with many simultaneous requests when many domains live on it (shared hosting, multi-tenant SaaS). A worker therefore also takes `crawler:ip:{ip}:lock` (`SET NX PX CRAWLER_IP_DELAY_MS`, default 250ms) for the domain's resolved IP (`dns.lookup`, cached in Redis). If the IP lock is taken, the domain lock is released so that domain's slot isn't burned, and the scan skips other domains on the same IP without touching Redis. In-process retries take both locks. Measured on a two-domain, one-IP fixture with two workers: IP lock off → 12 of 25 request gaps under 100ms (min 0ms); on at 1500ms → min gap 1505ms. **Trade-off:** large CDNs serve unrelated sites from shared anycast IPs, so a strict per-IP limit throttles all of them — the default is deliberately looser than the 1s per-domain default, and a CDN-aware exemption is future work.
 
 **Trade-off acknowledged:** This is domain-level, not path-level granularity. A domain with crawl-delay=1s allows only 1 req/sec regardless of how many workers exist. Token bucket would allow smoother rate distribution (e.g., 10 req/10s instead of 1 req/s), but adds implementation complexity for marginal benefit. The lock approach also wastes worker cycles when all available domains are locked -- production would use a work-stealing queue per domain shard.
 
@@ -405,7 +436,8 @@ Crawl operations are inherently idempotent: fetching the same URL multiple times
 | Dangerous URL schemes | Skip `file://`, `javascript:`, `tel:`, `mailto:` |
 | Dashboard auth | Public reads; every state-changing route requires an admin session (see Authentication and RBAC) |
 | Brute force | Login limited to 10 attempts / 15 min per client |
-| Credentials in production | API refuses to start without `SESSION_SECRET` and `ADMIN_PASSWORD` |
+| Credentials in production | API refuses to start without `SESSION_SECRET` (and `ADMIN_PASSWORD` when no active admin exists) |
+| Account compromise / offboarding | Disable, role change, or password reset revokes all of that user's sessions on their next request |
 | API rate limiting | Tiered limits (anonymous/user/admin) via Redis sliding window |
 | Input sanitization | Helmet, 1 MB JSON body limit, CORS allowlist, validated settings payloads |
 
@@ -492,7 +524,7 @@ RETURNING url_hash, priority   -- each is re-ZADDed (NX) to its priority queue
 ```
 
 2. **Queue rehydration** — if the Redis queues hold fewer entries than there are pending rows (Redis restarted without persistence, was flushed), pending rows are walked by keyset pagination and re-added with `ZADD NX`, preserving existing retry delays.
-3. **Operator settings republish** — domain blocks and crawl-delay overrides are re-published from Postgres (`domains.is_allowed`, `domains.crawl_delay_override`) to Redis (`services/domainSettings.ts`). Workers read these from Redis on every claim, so without this a Redis restart would silently unblock every blocked domain. (An un-block whose Redis delete failed isn't swept — that would need a SCAN over every domain key; the API returns an error and re-submitting fixes it.)
+3. **Operator settings rebuild** — the blocked-domain SET and delay-override HASH are rebuilt from Postgres (`domains.is_allowed`, `domains.crawl_delay_override`) in one `MULTI/EXEC` (`services/domainSettings.ts`). Because they're two keys rather than one key per domain, the rebuild fixes drift in **both** directions: a block lost from Redis comes back, and a stale block left by a failed un-block is removed. A rebuild reads a Postgres snapshot before writing Redis, so a concurrent operator change could otherwise be overwritten by older data; every publish bumps `crawler:domain_settings:version`, and the rebuild `WATCH`es it on a dedicated connection, so it aborts and retries next interval instead.
 4. **Stale worker cleanup** — workers whose heartbeat is older than 5 minutes are removed from the active set.
 
 **Graceful shutdown:** on SIGTERM a worker stops claiming, waits (up to 45s) for its in-flight crawl to finish recording its outcome, then closes connections — so a deploy doesn't strand one URL per worker until the lease expires.
@@ -760,8 +792,10 @@ This section maps the production architecture above to the actual local implemen
 | Tests | Vitest | `backend/src/**/*.test.ts`, `backend/src/integration/` | Unit tests plus an opt-in end-to-end crawl of a local fixture site against real Postgres/Redis (dedup, politeness spacing, retries, redirects, robots) |
 | Data cleanup | Custom cron jobs | `backend/src/services/cleanup.ts` | Removes completed frontier entries (7d), failed entries (30d), old page metadata (90d) |
 | Health checks | Custom | `backend/src/routes/` | `/health` checks PostgreSQL and Redis; Docker healthcheck integration |
-| Session auth + RBAC | express-session + connect-redis v7 | `backend/src/middleware/auth.ts` | Public reads, admin-only mutations (`requireAdmin`); session regeneration on login, login rate limit, timing-safe PBKDF2 |
-| Durable operator settings | Postgres → Redis publish | `backend/src/services/domainSettings.ts` | Blocks/overrides survive Redis loss; republished every maintenance interval |
+| Session auth + RBAC | express-session + connect-redis v7 | `backend/src/middleware/auth.ts` | Public reads, admin-only mutations (`requireAdmin`, role read from the DB per request); session regeneration on login, login rate limit, timing-safe async PBKDF2 |
+| Durable operator settings | Postgres → Redis, atomic rebuild | `backend/src/services/domainSettings.ts` | Blocks/overrides survive Redis loss and stale entries are swept; WATCH guards against overwriting a concurrent change |
+| Operator accounts | PostgreSQL `users` | `backend/src/services/users.ts`, `backend/src/routes/users.ts` | Roles, immediate session revocation via `session_version`, race-safe last-admin guard, break-glass bootstrap |
+| Per-IP politeness | Redis IP lock + DNS cache | `backend/src/services/frontier.ts` | Shared hosts protected across all their domains |
 | API rate limiting | express-rate-limit | `backend/src/middleware/` | Tiered rate limits for anonymous/user/admin |
 | Request security | Helmet + compression | `backend/src/server.ts` | Security headers and response compression |
 

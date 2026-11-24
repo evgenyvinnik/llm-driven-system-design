@@ -16,6 +16,7 @@ process.env.CRAWLER_RETRY_BASE_DELAY = '200';
 process.env.CRAWLER_MAX_RETRIES = '2';
 process.env.CRAWLER_MAX_DEPTH = '3';
 process.env.CRAWLER_MAX_PAGES_PER_DOMAIN = '1000';
+process.env.CRAWLER_IP_DELAY_MS = '250';
 
 type Mods = {
   pool: typeof import('../models/database.js').pool;

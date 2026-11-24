@@ -439,3 +439,19 @@ export function resolveUrl(baseUrl: string, href: string): string | null {
     return null;
   }
 }
+
+/**
+ * Hostname part of a domain key ("host" or "host:port"; IPv6 literals come
+ * back without brackets), for DNS lookups and per-IP politeness.
+ *
+ * @example
+ * hostnameOf('example.com:8080') // 'example.com'
+ * hostnameOf('[::1]:3000')       // '::1'
+ */
+export function hostnameOf(domain: string): string | null {
+  try {
+    return new URL(`http://${domain}`).hostname.replace(/^\[|\]$/g, '') || null;
+  } catch {
+    return null;
+  }
+}

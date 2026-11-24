@@ -10,9 +10,9 @@
  * 2. **Queue rehydration** - if Redis lost queue entries (restart without
  *    persistence, FLUSHALL, manual key deletion), pending rows are re-queued
  *    from Postgres, the source of truth.
- * 3. **Operator settings republish** - domain blocks and crawl-delay
- *    overrides are re-published from Postgres to Redis, so a Redis restart
- *    can't silently unblock a domain an operator blocked.
+ * 3. **Operator settings rebuild** - the blocked-domain set and delay-override
+ *    hash are rebuilt from Postgres, so a Redis restart can't silently unblock
+ *    a domain, and a stale block left by a failed un-block is removed.
  * 4. **Stale worker cleanup** - workers whose heartbeat stopped are removed
  *    from the active-workers set so the dashboard is accurate.
  *
@@ -52,7 +52,11 @@ export class MaintenanceService {
 
     const recovered = await frontierService.recoverStaleUrls(config.crawler.staleLeaseMinutes);
     const rehydrated = await frontierService.rehydrateQueues();
-    const settingsRepublished = await domainSettings.republishAll();
+    const republish = await domainSettings.republishAll();
+    if (!republish.applied) {
+      logger.debug('Domain settings changed during republish; retrying next interval');
+    }
+    const settingsRepublished = republish.applied ? republish.blocked + republish.overrides : 0;
     const staleWorkers = await cleanupService.cleanupRedis();
 
     if (recovered > 0 || rehydrated > 0 || staleWorkers > 0) {

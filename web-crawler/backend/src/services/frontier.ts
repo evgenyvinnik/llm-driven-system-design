@@ -22,6 +22,8 @@
  * @module services/frontier
  */
 
+import { lookup } from 'node:dns/promises';
+import net from 'node:net';
 import { pool } from '../models/database.js';
 import {
   redis,
@@ -36,6 +38,7 @@ import {
   calculateDepth,
   calculatePriority,
   shouldCrawl,
+  hostnameOf,
 } from '../utils/url.js';
 import { config } from '../config.js';
 import { logger } from '../shared/logger.js';
@@ -340,6 +343,7 @@ export class FrontierService {
   async getNextUrl(workerId: string): Promise<FrontierUrl | null> {
     const now = Date.now();
     const lockedDomains = new Set<string>();
+    const lockedIps = new Set<string>();
 
     for (const queueKey of PRIORITY_QUEUES) {
       const urlHashes = await redis.zrangebyscore(
@@ -369,9 +373,10 @@ export class FrontierService {
         const row = rowsByHash.get(urlHash);
         if (!row || lockedDomains.has(row.domain)) continue;
 
-        const gotLock = await this.acquireDomainLock(row.domain, workerId);
-        if (!gotLock) {
+        const slot = await this.acquirePolitenessSlot(row.domain, workerId, lockedIps);
+        if (!slot.ok) {
           lockedDomains.add(row.domain);
+          if (slot.lockedIp) lockedIps.add(slot.lockedIp);
           continue;
         }
 
@@ -386,7 +391,7 @@ export class FrontierService {
 
         if (claim.rowCount === 0) {
           // Another worker claimed it between our SELECT and UPDATE
-          await this.releaseDomainLock(row.domain, workerId);
+          await this.releasePolitenessSlot(row.domain, slot.ip, workerId);
           continue;
         }
 
@@ -407,10 +412,11 @@ export class FrontierService {
    * violate robots.txt.
    */
   async getEffectiveDelaySeconds(domain: string): Promise<number> {
-    const [override, robotsDelay] = await redis.mget(
-      REDIS_KEYS.DOMAIN_DELAY_OVERRIDE(domain),
-      REDIS_KEYS.DOMAIN_DELAY(domain)
-    );
+    const [[, override], [, robotsDelay]] = ((await redis
+      .pipeline()
+      .hget(REDIS_KEYS.DELAY_OVERRIDES, domain)
+      .get(REDIS_KEYS.DOMAIN_DELAY(domain))
+      .exec()) ?? [[null, null], [null, null]]) as [unknown, string | null][];
     const positive = (v: string | null) => {
       const n = parseFloat(v ?? '');
       return Number.isFinite(n) && n > 0 ? n : undefined;
@@ -441,6 +447,77 @@ export class FrontierService {
    */
   async releaseDomainLock(domain: string, workerId: string): Promise<void> {
     await redis.eval(RELEASE_LOCK_SCRIPT, 1, REDIS_KEYS.DOMAIN_LOCK(domain), workerId);
+  }
+
+  /**
+   * Resolves the IP a domain's requests will go to, cached in Redis.
+   *
+   * Per-domain politeness alone lets a crawler hit one server with many
+   * requests at once when many domains live on it (shared hosting, a
+   * multi-tenant SaaS). Keying a second lock on the resolved IP closes that.
+   * Lookups use the OS resolver (`dns.lookup`, honors /etc/hosts) and are
+   * cached for `dnsCacheTtlSeconds`; failures are negatively cached for 60s.
+   *
+   * @returns The IP, or null if it can't be resolved (the fetch will then
+   *          fail with ENOTFOUND and be retried, so no IP lock is needed)
+   */
+  async resolveDomainIp(domain: string): Promise<string | null> {
+    const hostname = hostnameOf(domain);
+    if (!hostname) return null;
+    if (net.isIP(hostname)) return hostname;
+
+    const key = REDIS_KEYS.DNS_CACHE(hostname);
+    const cached = await redis.get(key);
+    if (cached !== null) return cached || null;
+
+    try {
+      const { address } = await lookup(hostname);
+      await redis.set(key, address, 'EX', config.crawler.dnsCacheTtlSeconds);
+      return address;
+    } catch {
+      await redis.set(key, '', 'EX', 60);
+      return null;
+    }
+  }
+
+  /**
+   * Acquires everything a worker needs before sending a request to `domain`:
+   * the domain lock (spaced by crawl delay) and the IP lock (spaced by
+   * `ipDelayMs`, shared by every domain on that server). If the IP lock is
+   * taken, the domain lock is released so the domain's slot isn't burned.
+   *
+   * @param knownLockedIps - IPs already found locked in this scan (skipped
+   *                         without touching Redis)
+   */
+  async acquirePolitenessSlot(
+    domain: string,
+    workerId: string,
+    knownLockedIps?: Set<string>
+  ): Promise<{ ok: boolean; ip: string | null; lockedIp?: string }> {
+    const ipDelayMs = config.crawler.ipDelayMs;
+    const ip = ipDelayMs > 0 ? await this.resolveDomainIp(domain) : null;
+    if (ip && knownLockedIps?.has(ip)) return { ok: false, ip, lockedIp: ip };
+
+    if (!(await this.acquireDomainLock(domain, workerId))) return { ok: false, ip };
+
+    if (ip) {
+      const got = await redis.set(REDIS_KEYS.IP_LOCK(ip), workerId, 'PX', ipDelayMs, 'NX');
+      if (got !== 'OK') {
+        await this.releaseDomainLock(domain, workerId);
+        return { ok: false, ip, lockedIp: ip };
+      }
+    }
+    return { ok: true, ip };
+  }
+
+  /**
+   * Releases both politeness locks early (only if this worker still holds them).
+   */
+  async releasePolitenessSlot(domain: string, ip: string | null, workerId: string): Promise<void> {
+    await this.releaseDomainLock(domain, workerId);
+    if (ip) {
+      await redis.eval(RELEASE_LOCK_SCRIPT, 1, REDIS_KEYS.IP_LOCK(ip), workerId);
+    }
   }
 
   /**

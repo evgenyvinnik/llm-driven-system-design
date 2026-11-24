@@ -18,6 +18,8 @@ import { useAuthStore } from '../stores/authStore';
 import { useCrawlerStore } from '../stores/crawlerStore';
 import { LoginForm } from '../components/LoginForm';
 import { ClearFrontierPanel } from '../components/ClearFrontierPanel';
+import { UsersPanel } from '../components/UsersPanel';
+import { ChangePasswordForm } from '../components/ChangePasswordForm';
 
 type Result = { message: string; ok: boolean } | null;
 
@@ -73,11 +75,27 @@ export function Admin() {
     return <div className="p-6 text-sm text-gray-500">Checking session…</div>;
   }
 
-  if (!isAdmin) {
+  if (!user) {
     return (
       <div className="p-6 space-y-6">
         <h1 className="text-2xl font-bold text-gray-900">Admin Panel</h1>
         <LoginForm />
+      </div>
+    );
+  }
+
+  if (!isAdmin) {
+    // Signed in with a read-only account
+    return (
+      <div className="p-6 space-y-6">
+        <h1 className="text-2xl font-bold text-gray-900">Account</h1>
+        <p className="text-sm text-gray-700 max-w-xl">
+          You're signed in as <strong>{user.username}</strong> with a read-only account. You can
+          view everything on the dashboard; changing crawler state requires an admin.
+        </p>
+        <div className="max-w-md">
+          <ChangePasswordForm />
+        </div>
       </div>
     );
   }
@@ -205,6 +223,10 @@ export function Admin() {
             fetchStats();
           }}
         />
+
+        <ChangePasswordForm />
+
+        <UsersPanel />
       </div>
     </div>
   );

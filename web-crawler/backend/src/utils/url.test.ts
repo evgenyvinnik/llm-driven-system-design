@@ -75,3 +75,14 @@ describe('calculatePriority', () => {
     expect(calculatePriority('https://example.com/a/b/c/d/page/2', 5)).toBe(1);
   });
 });
+
+describe('hostnameOf', () => {
+  it('strips ports and IPv6 brackets', async () => {
+    const { hostnameOf } = await import('./url.js');
+    expect(hostnameOf('example.com')).toBe('example.com');
+    expect(hostnameOf('example.com:8080')).toBe('example.com');
+    expect(hostnameOf('127.0.0.1:3000')).toBe('127.0.0.1');
+    expect(hostnameOf('[::1]:3000')).toBe('::1');
+    expect(hostnameOf('')).toBeNull();
+  });
+});

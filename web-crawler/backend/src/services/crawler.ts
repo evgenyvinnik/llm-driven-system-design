@@ -36,6 +36,7 @@ import { pool } from '../models/database.js';
 import { redis, REDIS_KEYS } from '../models/redis.js';
 import { frontierService, FrontierUrl } from './frontier.js';
 import { robotsService } from './robots.js';
+import * as domainSettings from './domainSettings.js';
 import {
   extractDomain,
   resolveUrl,
@@ -438,7 +439,7 @@ export class CrawlerService {
       ...extra,
     });
 
-    if (await redis.exists(REDIS_KEYS.DOMAIN_BLOCKED(domain))) {
+    if (await domainSettings.isBlocked(domain)) {
       return fail('Blocked by operator');
     }
 
@@ -668,7 +669,7 @@ export class CrawlerService {
    */
   private async waitForDomainSlot(domain: string): Promise<void> {
     const deadline = Date.now() + POLITENESS_WAIT_MS;
-    while (!(await frontierService.acquireDomainLock(domain, this.workerId))) {
+    while (!(await frontierService.acquirePolitenessSlot(domain, this.workerId)).ok) {
       if (Date.now() > deadline) {
         throw Object.assign(new Error(`Politeness wait timed out for ${domain}`), {
           code: 'EPOLITENESS',

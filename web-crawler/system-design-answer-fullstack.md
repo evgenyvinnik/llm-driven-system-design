@@ -267,17 +267,22 @@ The version that avoids the choice is an outbox — write the setting and an eve
 | Scenario | Handling |
 |----------|----------|
 | PostgreSQL write fails | Return 500; nothing changed anywhere — the operator retries |
-| PostgreSQL succeeds, Redis fails | Return 500; the maintenance loop republishes blocks and overrides from Postgres within a minute (re-submitting also works — the write is idempotent) |
-| Redis loses everything (restart) | Same republish restores every block and override; without it, a Redis restart would silently unblock every domain an operator blocked |
+| PostgreSQL succeeds, Redis fails | Return 500; the maintenance loop rebuilds the Redis copy from Postgres within a minute (re-submitting also works — the write is idempotent) |
+| Redis loses everything (restart) | Same rebuild restores every block and override; without it, a Redis restart would silently unblock every domain an operator blocked |
+| An un-block's Redis write fails (stale block left behind) | Same rebuild removes it |
 | Both succeed | Effective on the next claim for that host |
 
-"The republish job is what turns 'Postgres is the truth' from a slogan into a property. It only touches domains with a non-default setting, so it's cheap to run every minute. The one direction it doesn't sweep is an *un*-block whose Redis delete failed — finding stray keys would mean scanning every domain's keys — so that case still relies on the API returning an error and the operator re-submitting."
+"The rebuild is what turns 'Postgres is the truth' from a slogan into a property, and one data-structure choice makes it work in both directions. If every domain had its own `blocked` key, restoring missing blocks is easy but finding *stale* ones means scanning every domain's keys. So blocks live in one Redis set and overrides in one hash, and the rebuild replaces both in a single MULTI/EXEC — stale entries vanish along with missing ones coming back.
+
+The rebuild has its own race: it reads Postgres, then writes Redis, so an operator change landing in between would be overwritten by the older snapshot. Every publish bumps a version counter, and the rebuild WATCHes it — if the version moved, EXEC aborts and the next interval tries again. That's optimistic concurrency at the cache layer, the same idea as the frontier's conditional claim."
 
 ---
 
 ## 🧯 Operating It: What the Dashboard Is Actually For (4 minutes)
 
 The admin surface looks like CRUD and isn't — each control exists because of a specific way crawls go wrong. **Reading is public; every control below requires an admin session**, enforced on the server by one `requireAdmin` middleware on each mutating route. The frontend hides the controls when signed out, but that's courtesy — a hidden button is not access control. One lesson from building it: the session store adapter was written for a different Redis client than the one the app passed in, so every session write failed silently *after* the login response said 200. Login 'worked' and nothing was ever authenticated. Auth needs an end-to-end test (log in, then call a protected route) — a unit test of the login handler would have passed.
+
+**Accounts** are rows in a `users` table with two roles — admins change things, users only look. The interesting part is revocation: a session records the user's `session_version` at login, and every protected request re-reads the user by primary key. Disabling someone, changing their role, or resetting their password bumps the version, so their open sessions die on the next click rather than at cookie expiry — the property stateless JWTs make expensive. One rule needs a lock: "never zero admins." Two admins demoting each other at the same instant would both pass a naive check, so the update runs in a transaction that row-locks every active admin first.
 
 **Add seed URLs** is the entry point for the whole system; a crawler with an empty frontier does nothing, and there is no other way in.
 
@@ -334,6 +339,9 @@ The frontier API returns `retryCount` and `lastError` per URL, and the Frontier 
 | Domain updates | ✅ Dual-write, Postgres first, then Redis | ❌ Redis first | Postgres-first failures converge on retry; override can only slow a host |
 | robots.txt 5xx | ✅ Defer as transient (fail closed) | ❌ Assume allowed | Don't crawl a struggling site blind |
 | Crash recovery | ✅ Lease reset + Redis re-enqueue, every minute | ❌ Long transaction per fetch | A hung HTTP request must not hold a DB lock |
+| Operator settings in Redis | ✅ One SET + one HASH, rebuilt atomically | ❌ A key per domain | Rebuild can remove stale entries without scanning every key |
+| Session revocation | ✅ `session_version` checked per protected request | ❌ Stateless JWT | Disable / demote / password reset takes effect on the next request |
+| Shared-host politeness | ✅ Second lock on resolved IP (looser than per-domain) | ❌ Per-domain only | Many domains on one server would otherwise be hit in parallel |
 | Local dev topology | ✅ Compose profiles | ❌ Everything on by default | The app containers published the same port the source-run backend needs |
 
 ---
@@ -344,7 +352,7 @@ The frontier API returns `retryCount` and `lastError` per URL, and the Frontier 
 2. **SSE stats stream** if the dashboard ever becomes multi-tenant
 3. **Generated types from the schema**, so the row→DTO mapping is checked rather than reviewed
 4. **A Puppeteer lane** for URLs whose extraction comes back suspiciously empty — likely JS-rendered
-5. **IP-level politeness**, since per-domain throttling still lets a shared host behind one IP get hammered
+5. **CDN-aware per-IP limits**: the per-IP lock protects shared hosts, but large CDNs serve unrelated sites from shared anycast IPs, where a strict per-IP limit throttles all of them
 
 ---
 

@@ -188,6 +188,25 @@ export const config = {
     maxLinksPerPage: parseInt(process.env.CRAWLER_MAX_LINKS_PER_PAGE || '500', 10),
 
     /**
+     * Minimum spacing (ms) between request starts to one IP address, across
+     * every domain hosted on it. Per-domain politeness alone lets the crawler
+     * hit a shared host with many simultaneous requests when hundreds of small
+     * domains resolve to the same server. 0 disables the IP lock.
+     *
+     * Trade-off: large CDNs serve unrelated sites from shared anycast IPs, so a
+     * strict per-IP limit throttles every site behind them. The default is
+     * deliberately looser than the 1s per-domain default.
+     * @default 250 (at most ~4 requests/second per IP)
+     */
+    ipDelayMs: parseInt(process.env.CRAWLER_IP_DELAY_MS || '250', 10),
+
+    /**
+     * How long resolved domain IPs are cached (seconds).
+     * @default 300
+     */
+    dnsCacheTtlSeconds: parseInt(process.env.CRAWLER_DNS_CACHE_TTL || '300', 10),
+
+    /**
      * Maximum URLs enqueued per domain (seeds are exempt). Bounds crawler
      * traps that generate infinite *shallow* URLs, which the depth limit
      * doesn't catch, and keeps one big site from crowding out breadth.

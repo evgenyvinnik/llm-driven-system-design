@@ -87,3 +87,18 @@ CREATE TABLE IF NOT EXISTS seed_urls (
   added_at TIMESTAMP DEFAULT NOW(),
   is_active BOOLEAN DEFAULT true
 );
+
+-- Operator accounts. Passwords: pbkdf2_sha512$<iterations>$<salt>$<hash>.
+-- session_version is bumped on disable / role change / password change to
+-- revoke existing sessions (sessions store the version they were issued with).
+CREATE TABLE IF NOT EXISTS users (
+  id SERIAL PRIMARY KEY,
+  username VARCHAR(64) NOT NULL UNIQUE,
+  password_hash TEXT NOT NULL,
+  role VARCHAR(20) NOT NULL DEFAULT 'user' CHECK (role IN ('admin', 'user')),
+  disabled BOOLEAN NOT NULL DEFAULT false,
+  session_version INTEGER NOT NULL DEFAULT 1,
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW(),
+  last_login_at TIMESTAMP
+);

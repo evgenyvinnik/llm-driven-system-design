@@ -189,13 +189,30 @@ export const REDIS_KEYS = {
   STATS_DUPLICATE_CONTENT: 'crawler:stats:duplicate_content',
 
   /**
-   * Operator override of the crawl delay (seconds). Takes precedence over the
-   * robots.txt Crawl-delay value stored under DOMAIN_DELAY.
+   * SET of domains an operator has blocked (domains.is_allowed = false).
+   * One key rather than one per domain so the maintenance loop can rebuild it
+   * from Postgres atomically, removing stale entries as well as adding missing ones.
    */
-  DOMAIN_DELAY_OVERRIDE: (domain: string) => `crawler:domain:${domain}:delay_override`,
+  BLOCKED_DOMAINS: 'crawler:blocked_domains',
 
-  /** Present when an operator has blocked a domain (domains.is_allowed = false) */
-  DOMAIN_BLOCKED: (domain: string) => `crawler:domain:${domain}:blocked`,
+  /**
+   * HASH domain -> operator crawl-delay override (seconds). Workers use
+   * max(override, DOMAIN_DELAY), so an override can only slow a domain down.
+   */
+  DELAY_OVERRIDES: 'crawler:delay_overrides',
+
+  /**
+   * Counter bumped by every settings publish. The maintenance rebuild WATCHes
+   * it, so a rebuild computed from a Postgres snapshot taken before a
+   * concurrent publish aborts instead of overwriting the newer settings.
+   */
+  DOMAIN_SETTINGS_VERSION: 'crawler:domain_settings:version',
+
+  /** Cached DNS resolution for a hostname (string IP, '' = lookup failed) */
+  DNS_CACHE: (hostname: string) => `crawler:dns:${hostname}`,
+
+  /** Per-IP politeness lock: caps request rate to one server across all its domains */
+  IP_LOCK: (ip: string) => `crawler:ip:${ip}:lock`,
 
   /**
    * Hash: domain -> number of URLs enqueued in the frontier. Backs the

@@ -24,6 +24,7 @@ import type {
   FrontierStats,
   AuthUser,
   HealthStatus,
+  ManagedUser,
 } from '../types';
 
 /**
@@ -342,4 +343,44 @@ export const api = {
     }),
 
   logout: () => fetchApi<{ message: string }>('/auth/logout', { method: 'POST' }),
+
+  changePassword: (currentPassword: string, newPassword: string) =>
+    fetchApi<{ message: string }>('/auth/password', {
+      method: 'POST',
+      body: JSON.stringify({ currentPassword, newPassword }),
+    }),
+
+  // ============================================
+  // User management (admin)
+  // ============================================
+
+  listUsers: () => fetchApi<{ users: ManagedUser[] }>('/admin/users'),
+
+  createUser: (username: string, password: string, role: 'admin' | 'user') =>
+    fetchApi<ManagedUser>('/admin/users', {
+      method: 'POST',
+      body: JSON.stringify({ username, password, role }),
+    }),
+
+  updateUser: (
+    id: number,
+    changes: { role?: 'admin' | 'user'; disabled?: boolean; password?: string }
+  ) =>
+    fetchApi<ManagedUser>(`/admin/users/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify(changes),
+    }),
+
+  deleteUser: async (id: number) => {
+    // 204 No Content: no JSON body to parse
+    const res = await fetch(`${API_BASE}/admin/users/${id}`, {
+      method: 'DELETE',
+      credentials: 'same-origin',
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      if (res.status === 401) onUnauthorized?.();
+      throw new ApiError(body.error || `HTTP ${res.status}`, res.status);
+    }
+  },
 };
