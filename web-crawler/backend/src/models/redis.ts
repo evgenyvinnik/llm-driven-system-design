@@ -178,7 +178,44 @@ export const REDIS_KEYS = {
    * Sorted set for low-priority URLs (priority 1).
    */
   PRIORITY_QUEUE_LOW: 'crawler:queue:low',
+
+  /**
+   * Set of content hashes already seen. A page whose body hash is already in
+   * this set is a duplicate (mirror, URL alias); its links are not re-enqueued.
+   */
+  CONTENT_HASHES: 'crawler:content_hashes',
+
+  /** Counter: pages whose content duplicated an earlier page */
+  STATS_DUPLICATE_CONTENT: 'crawler:stats:duplicate_content',
+
+  /**
+   * Operator override of the crawl delay (seconds). Takes precedence over the
+   * robots.txt Crawl-delay value stored under DOMAIN_DELAY.
+   */
+  DOMAIN_DELAY_OVERRIDE: (domain: string) => `crawler:domain:${domain}:delay_override`,
+
+  /** Present when an operator has blocked a domain (domains.is_allowed = false) */
+  DOMAIN_BLOCKED: (domain: string) => `crawler:domain:${domain}:blocked`,
+
+  /** Lock ensuring only one API instance runs frontier maintenance at a time */
+  MAINTENANCE_LOCK: 'crawler:maintenance:lock',
 };
+
+/** The three priority queues, highest priority first. */
+export const PRIORITY_QUEUES = [
+  REDIS_KEYS.PRIORITY_QUEUE_HIGH,
+  REDIS_KEYS.PRIORITY_QUEUE_MEDIUM,
+  REDIS_KEYS.PRIORITY_QUEUE_LOW,
+] as const;
+
+/**
+ * Maps a numeric priority (1-3) to its Redis queue key.
+ */
+export function queueKeyForPriority(priority: number): string {
+  if (priority >= 3) return REDIS_KEYS.PRIORITY_QUEUE_HIGH;
+  if (priority >= 2) return REDIS_KEYS.PRIORITY_QUEUE_MEDIUM;
+  return REDIS_KEYS.PRIORITY_QUEUE_LOW;
+}
 
 /**
  * Closes the Redis connection gracefully.

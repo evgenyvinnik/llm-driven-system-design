@@ -164,7 +164,7 @@ router.post('/recover', async (req: Request, res: Response) => {
  */
 router.delete('/clear', async (_req: Request, res: Response) => {
   try {
-    await pool.query('DELETE FROM url_frontier');
+    await frontierService.clear();
     res.json({ message: 'Frontier cleared' });
   } catch (error) {
     console.error('Error clearing frontier:', error);

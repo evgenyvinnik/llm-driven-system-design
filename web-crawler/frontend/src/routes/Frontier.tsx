@@ -173,7 +173,14 @@ export function Frontier() {
                         <td className="px-4 py-2 text-sm text-gray-600">{url.domain}</td>
                         <td className="px-4 py-2">{getPriorityBadge(url.priority)}</td>
                         <td className="px-4 py-2 text-sm text-gray-600">{url.depth}</td>
-                        <td className="px-4 py-2">{getStatusBadge(url.status)}</td>
+                        <td className="px-4 py-2" title={url.lastError ?? undefined}>
+                          {getStatusBadge(url.status)}
+                          {url.retryCount ? (
+                            <span className="ml-2 text-xs text-gray-500">
+                              retry {url.retryCount}
+                            </span>
+                          ) : null}
+                        </td>
                       </tr>
                     ))
                   )}

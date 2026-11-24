@@ -67,10 +67,12 @@ export function normalizeUrl(url: string): string {
     }
     normalized += path;
 
-    // Sort query parameters
+    // Sort query parameters and drop tracking parameters (utm_*, gclid, ...)
+    // that create unbounded URL aliases for the same page
     if (parsed.search) {
       const params = new URLSearchParams(parsed.search);
-      const sortedParams = new URLSearchParams([...params.entries()].sort());
+      const kept = [...params.entries()].filter(([key]) => !isTrackingParam(key));
+      const sortedParams = new URLSearchParams(kept.sort());
       const queryString = sortedParams.toString();
       if (queryString) {
         normalized += `?${queryString}`;
@@ -83,6 +85,17 @@ export function normalizeUrl(url: string): string {
   } catch {
     return url;
   }
+}
+
+const TRACKING_PARAMS = new Set(['gclid', 'fbclid', 'msclkid', 'mc_cid', 'mc_eid', '_ga']);
+
+/**
+ * True for query parameters that only carry attribution and never change the
+ * page content. Stripping them is a big dedup win on link-heavy sites.
+ */
+export function isTrackingParam(key: string): boolean {
+  const k = key.toLowerCase();
+  return k.startsWith('utm_') || TRACKING_PARAMS.has(k);
 }
 
 /**
@@ -147,7 +160,7 @@ export function hashContent(content: string): string {
  * - Grouping URLs by site for batch processing
  *
  * @param url - The URL to extract the domain from
- * @returns The lowercase hostname, or empty string if parsing fails
+ * @returns The lowercase host (hostname plus any non-default port), or empty string if parsing fails
  *
  * @example
  * ```typescript
@@ -161,7 +174,10 @@ export function hashContent(content: string): string {
 export function extractDomain(url: string): string {
   try {
     const parsed = new URL(url);
-    return parsed.hostname.toLowerCase();
+    // `host` (not `hostname`) keeps a non-default port: robots.txt and
+    // politeness are per origin, so example.com:8080 is a different site from
+    // example.com. Default ports are already omitted by the URL parser.
+    return parsed.host.toLowerCase();
   } catch {
     return '';
   }

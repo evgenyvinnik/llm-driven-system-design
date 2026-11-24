@@ -34,6 +34,8 @@ export interface CrawlStats {
   linksDiscovered: number;
   /** Number of duplicate URLs skipped (from Redis) */
   duplicatesSkipped: number;
+  /** Pages whose content exactly duplicated an earlier page (from Redis) */
+  duplicateContent: number;
 
   /** URLs waiting to be crawled (from PostgreSQL) */
   frontierPending: number;
@@ -123,6 +125,7 @@ export class StatsService {
       bytesDownloaded,
       linksDiscovered,
       duplicatesSkipped,
+      duplicateContent,
       activeWorkers,
     ] = await Promise.all([
       redis.get(REDIS_KEYS.STATS_PAGES_CRAWLED),
@@ -130,6 +133,7 @@ export class StatsService {
       redis.get(REDIS_KEYS.STATS_BYTES_DOWNLOADED),
       redis.get(REDIS_KEYS.STATS_LINKS_DISCOVERED),
       redis.get(REDIS_KEYS.STATS_DUPLICATES_SKIPPED),
+      redis.get(REDIS_KEYS.STATS_DUPLICATE_CONTENT),
       redis.smembers(REDIS_KEYS.ACTIVE_WORKERS),
     ]);
 
@@ -198,6 +202,7 @@ export class StatsService {
       bytesDownloaded: parseInt(bytesDownloaded || '0'),
       linksDiscovered: parseInt(linksDiscovered || '0'),
       duplicatesSkipped: parseInt(duplicatesSkipped || '0'),
+      duplicateContent: parseInt(duplicateContent || '0'),
 
       frontierPending: frontierByStatus['pending'] || 0,
       frontierInProgress: frontierByStatus['in_progress'] || 0,
@@ -262,6 +267,7 @@ export class StatsService {
       redis.set(REDIS_KEYS.STATS_BYTES_DOWNLOADED, '0'),
       redis.set(REDIS_KEYS.STATS_LINKS_DISCOVERED, '0'),
       redis.set(REDIS_KEYS.STATS_DUPLICATES_SKIPPED, '0'),
+      redis.set(REDIS_KEYS.STATS_DUPLICATE_CONTENT, '0'),
     ]);
   }
 }

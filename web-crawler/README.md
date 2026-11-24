@@ -346,6 +346,14 @@ Updates domain-specific settings.
 | `REQUEST_TIMEOUT` | `30000` | Request timeout (ms) |
 | `MAX_PAGE_SIZE` | `10485760` | Max page size to download (10MB) |
 | `ROBOTS_CACHE_TTL` | `3600` | Robots.txt cache TTL (seconds) |
+| `CRAWLER_MAX_DEPTH` | `6` | Max link hops from a seed (crawler-trap defense) |
+| `CRAWLER_MAX_URL_LENGTH` | `2048` | URLs longer than this are dropped |
+| `CRAWLER_MAX_LINKS_PER_PAGE` | `500` | Max outbound links enqueued per page |
+| `CRAWLER_MAX_RETRIES` | `3` | Frontier-level retries for transient failures (timeout, 5xx, 429) |
+| `CRAWLER_RETRY_BASE_DELAY` | `60000` | Base retry backoff (ms), doubled per attempt with jitter |
+| `CRAWLER_STALE_LEASE_MINUTES` | `10` | `in_progress` URLs older than this are returned to the queue |
+| `CRAWLER_MAINTENANCE_INTERVAL` | `60000` | How often the API runs lease recovery + queue rehydration (ms) |
+| `LOG_LEVEL` | `debug` (dev) / `info` (prod) | Pino log level |
 
 ## Project Structure
 
@@ -402,11 +410,13 @@ web-crawler/
 
 ## Politeness Features
 
-1. **robots.txt Compliance**: Fetches and caches robots.txt for each domain, respects Disallow directives
-2. **Crawl-Delay**: Honors the Crawl-delay directive from robots.txt
-3. **Per-Domain Rate Limiting**: Uses Redis locks to ensure only one request per domain at a time
-4. **User-Agent**: Sends a proper User-Agent string identifying the crawler
-5. **Request Timeout**: Limits time spent on slow servers
+1. **robots.txt Compliance**: Fetched and cached per origin (scheme + host + port). 4xx means no restrictions; 5xx or unreachable means "don't crawl yet" — URLs are retried later rather than crawled blind (RFC 9309)
+2. **Crawl-Delay**: Honors robots.txt Crawl-delay (capped at 60s). An operator override from the Domains page can only slow a domain down, never go below robots.txt
+3. **Per-Domain Rate Limiting**: A Redis lock with TTL = crawl delay spaces every request start to a domain across all workers — including in-process retries
+4. **Redirects via the frontier**: 3xx targets are enqueued as new URLs, so the target domain gets its own robots.txt check and politeness lock
+5. **nofollow**: `rel="nofollow|sponsored|ugc"` links and `<meta name="robots" content="nofollow">` pages are not followed
+6. **Retry-After**: 429/408 responses are rescheduled no earlier than the server asks
+7. **User-Agent**: Sends a proper User-Agent string identifying the crawler
 
 ## Testing
 
@@ -415,11 +425,18 @@ web-crawler/
 cd backend
 npm run lint
 npm run type-check
+npm test                    # unit tests (vitest)
+
+# End-to-end crawl against real Postgres + Redis (docker-compose up -d first).
+# Spins up a local fixture site and runs three workers against it, asserting
+# dedup, politeness spacing, retries, redirects and robots.txt handling.
+# WARNING: flushes the Redis DB and truncates the crawler tables.
+npm run test:integration
 
 # Frontend
 cd frontend
 npm run lint
-npm run type-check
+npm run build
 ```
 
 ## Future Enhancements
@@ -427,10 +444,10 @@ npm run type-check
 - [ ] Content storage (S3/local filesystem)
 - [ ] Near-duplicate detection (SimHash)
 - [ ] Distributed work stealing for load balancing
-- [ ] Prometheus metrics integration
 - [ ] Sitemap.xml parsing
 - [ ] JavaScript rendering (Puppeteer integration)
-- [ ] API authentication and rate limiting
+- [ ] Require admin auth on the dashboard's mutating routes (`/api/frontier/*`, `/api/domains/*/settings`, `/api/stats/reset`) — today only the `/api/admin/*` variants are protected
+- [ ] Per-domain page budgets and IP-level politeness for shared hosts
 
 ## License
 
@@ -440,7 +457,7 @@ MIT
 
 - [architecture.md](./architecture.md) - System design documentation
 - [system-design-answer-fullstack.md](./system-design-answer-fullstack.md) - Detailed system design interview answer
-- [claude.md](./claude.md) - Development notes and iteration history
+- [CLAUDE.md](./CLAUDE.md) - Development notes and iteration history
 
 ## References & Inspiration
 

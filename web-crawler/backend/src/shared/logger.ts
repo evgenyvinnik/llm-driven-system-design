@@ -26,7 +26,7 @@ import { config } from '../config.js';
  * Pretty printing in development, JSON in production.
  */
 const loggerOptions: pino.LoggerOptions = {
-  level: config.nodeEnv === 'production' ? 'info' : 'debug',
+  level: process.env.LOG_LEVEL || (config.nodeEnv === 'production' ? 'info' : 'debug'),
   // Base fields included in every log entry
   base: {
     service: 'web-crawler',

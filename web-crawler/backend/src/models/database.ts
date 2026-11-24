@@ -148,6 +148,8 @@ export async function initDatabase() {
         priority INTEGER DEFAULT 1,
         depth INTEGER DEFAULT 0,
         status VARCHAR(20) DEFAULT 'pending',
+        retry_count INTEGER DEFAULT 0,
+        last_error TEXT,
         scheduled_at TIMESTAMP DEFAULT NOW(),
         created_at TIMESTAMP DEFAULT NOW(),
         updated_at TIMESTAMP DEFAULT NOW()
@@ -182,6 +184,7 @@ export async function initDatabase() {
       CREATE INDEX IF NOT EXISTS idx_crawled_url_hash ON crawled_pages(url_hash);
       CREATE INDEX IF NOT EXISTS idx_crawled_domain ON crawled_pages(domain);
       CREATE INDEX IF NOT EXISTS idx_crawled_at ON crawled_pages(crawled_at);
+      CREATE INDEX IF NOT EXISTS idx_crawled_content_hash ON crawled_pages(content_hash);
 
       -- Crawl statistics: aggregated stats for monitoring
       CREATE TABLE IF NOT EXISTS crawl_stats (
@@ -206,6 +209,10 @@ export async function initDatabase() {
         added_at TIMESTAMP DEFAULT NOW(),
         is_active BOOLEAN DEFAULT true
       );
+
+      -- Idempotent upgrades for databases created before these columns existed
+      ALTER TABLE url_frontier ADD COLUMN IF NOT EXISTS retry_count INTEGER DEFAULT 0;
+      ALTER TABLE url_frontier ADD COLUMN IF NOT EXISTS last_error TEXT;
     `);
 
     console.log('Database initialized successfully');

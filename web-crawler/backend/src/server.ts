@@ -45,6 +45,7 @@ import {
 } from './middleware/auth.js';
 import { createTieredRateLimiter, seedInjectionLimiter } from './middleware/rateLimit.js';
 import { cleanupService } from './services/cleanup.js';
+import { maintenanceService } from './services/maintenance.js';
 import { frontierService } from './services/frontier.js';
 
 /**
@@ -354,7 +355,7 @@ app.delete(
   requireRole([UserRole.ADMIN]),
   async (req: Request, res: Response) => {
     try {
-      await pool.query('DELETE FROM url_frontier');
+      await frontierService.clear();
 
       logger.warn({ userId: req.session?.userId }, 'Frontier cleared');
 
@@ -472,6 +473,10 @@ async function start() {
     cleanupService.start();
     logger.info('Cleanup service started');
 
+    // Start frontier maintenance (lease recovery, Redis queue rehydration)
+    maintenanceService.start();
+    logger.info('Frontier maintenance started');
+
     // Start server
     app.listen(config.port, () => {
       logger.info(
@@ -497,6 +502,7 @@ process.on('SIGTERM', async () => {
   logger.info('SIGTERM received, shutting down gracefully');
 
   cleanupService.stop();
+  maintenanceService.stop();
 
   await pool.end();
   await redis.quit();
@@ -513,6 +519,7 @@ process.on('SIGINT', async () => {
   logger.info('SIGINT received, shutting down gracefully');
 
   cleanupService.stop();
+  maintenanceService.stop();
 
   await pool.end();
   await redis.quit();

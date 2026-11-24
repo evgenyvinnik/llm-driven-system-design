@@ -28,6 +28,8 @@ export interface CrawlStats {
   linksDiscovered: number;
   /** Number of duplicate URLs skipped */
   duplicatesSkipped: number;
+  /** Pages whose body exactly duplicated an earlier page (links not re-enqueued) */
+  duplicateContent?: number;
 
   /** URLs waiting to be crawled */
   frontierPending: number;
@@ -110,7 +112,11 @@ export interface FrontierUrl {
   depth: number;
   /** Current status: pending, in_progress, completed, failed */
   status: string;
-  /** ISO timestamp when this URL was scheduled */
+  /** Number of transient failures so far (retried with exponential backoff) */
+  retryCount?: number;
+  /** Most recent error message, if any */
+  lastError?: string | null;
+  /** ISO timestamp when this URL is next eligible to be crawled */
   scheduledAt: string;
 }
 

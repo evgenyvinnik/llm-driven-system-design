@@ -131,16 +131,26 @@ A distributed web crawling system that discovers, fetches, and extracts content 
 ### Data Flow
 
 ```
-1. Seed URLs inserted into url_frontier with high priority
-2. Worker claims a URL: UPDATE url_frontier SET status='in_progress' WHERE ...
-3. Worker checks robots.txt (Redis cache -> PostgreSQL -> fetch if missing)
-4. Worker checks per-domain rate limit (Redis SET NX EX)
-5. Worker fetches page via HTTP with circuit breaker protection
-6. Parser extracts title, description, links from HTML
-7. Discovered links normalized, deduplicated (Redis SISMEMBER), and enqueued
-8. Page metadata stored in crawled_pages
-9. Worker updates url_frontier status to 'completed' or 'failed'
-10. Dashboard polls API for real-time statistics
+1. Seed URLs inserted into url_frontier (priority 3, depth 0); hash ZADDed to
+   crawler:queue:high with score = now (score = earliest eligible time, ms)
+2. Worker reads eligible hashes (ZRANGEBYSCORE -inf now) high -> medium -> low,
+   loads their rows in one query, drops hashes whose row is no longer pending
+3. Worker wins the per-domain politeness lock (SET lock NX PX crawlDelayMs),
+   then claims the row atomically:
+     UPDATE url_frontier SET status='in_progress' WHERE id=$1 AND status='pending'
+   If 0 rows changed, another worker won: release the lock, try the next hash
+4. Operator block? robots.txt (memory -> Redis -> fetch, per origin)?
+   robots.txt 5xx/unreachable => transient failure, retried later (fail closed)
+5. HTTP GET with circuit breaker, maxRedirects: 0; an in-process retry first
+   waits for the domain's politeness slot again
+6. 3xx => Location enqueued as a new URL (same depth), source marked completed
+7. 2xx HTML => Cheerio extracts title/description/links (<base>, nofollow)
+8. Content hash already seen => duplicate content; links not re-enqueued
+9. Links batch-inserted: SMISMEMBER + multi-row INSERT ... RETURNING + ZADD NX
+   for newly inserted rows only (depth/length/fan-out limits applied)
+10. Outcome: completed | failed (permanent) | rescheduled with backoff (transient)
+11. API server maintenance loop (1/min): lease recovery + Redis queue rehydration
+12. Dashboard polls GET /api/stats every 5s
 ```
 
 ## Database Schema
@@ -159,7 +169,9 @@ CREATE TABLE url_frontier (
     priority INTEGER DEFAULT 1,               -- 1=low, 2=medium, 3=high
     depth INTEGER DEFAULT 0,                  -- Crawl depth from seed
     status VARCHAR(20) DEFAULT 'pending',     -- pending, in_progress, completed, failed
-    scheduled_at TIMESTAMP DEFAULT NOW(),
+    retry_count INTEGER DEFAULT 0,            -- transient failures so far
+    last_error TEXT,                          -- most recent failure reason
+    scheduled_at TIMESTAMP DEFAULT NOW(),     -- earliest eligible time (retry backoff)
     created_at TIMESTAMP DEFAULT NOW(),
     updated_at TIMESTAMP DEFAULT NOW()
 );
@@ -196,6 +208,7 @@ CREATE TABLE crawled_pages (
 
 CREATE INDEX idx_pages_domain ON crawled_pages (domain);
 CREATE INDEX idx_pages_crawled_at ON crawled_pages (crawled_at DESC);
+CREATE INDEX idx_crawled_content_hash ON crawled_pages (content_hash);
 ```
 
 ### Domains
@@ -229,20 +242,31 @@ CREATE TABLE domains (
 # URL deduplication (visited URLs set)
 crawler:visited_urls              -> SET of URL hashes (SADD, SISMEMBER)
 
-# Per-domain rate limiting locks
-crawler:domain:{domain}:lock      -> SET NX EX (distributed lock with TTL)
+# Priority queues: member = url_hash, score = earliest eligible time (ms)
+crawler:queue:{high,medium,low}   -> ZSET (ZADD NX, ZRANGEBYSCORE -inf now)
+
+# Content dedup (exact)
+crawler:content_hashes            -> SET of page body SHA-256 hashes
+
+# Per-domain politeness lock (TTL = effective crawl delay)
+crawler:domain:{domain}:lock      -> SET NX PX; released early only via compare-and-delete
 
 # Per-domain crawl delay
-crawler:domain:{domain}:delay     -> STRING (crawl delay in seconds)
+crawler:domain:{domain}:delay           -> STRING (robots.txt Crawl-delay or default, seconds)
+crawler:domain:{domain}:delay_override  -> STRING (operator override; effective = max(override, delay))
+crawler:domain:{domain}:blocked         -> STRING (operator block; workers fail URLs permanently)
+
+# Maintenance (one API instance per interval)
+crawler:maintenance:lock          -> SET NX PX
 
 # Robots.txt cache
 crawler:domain:{domain}:robots    -> STRING (cached robots.txt content, 1h TTL)
 
 # Circuit breaker state per domain
-crawler:circuit:{domain}          -> STRING (closed/open/half-open, 1h TTL)
+crawler:circuit:{domain}          -> STRING (open/half-open; TTL = break duration; deleted on close)
 
 # Worker heartbeats
-crawler:worker:{id}               -> HASH (lastHeartbeat, status, currentUrl)
+crawler:worker:{id}:heartbeat     -> STRING (epoch ms, updated every 5s)
 
 # Active workers set
 crawler:active_workers            -> SET of worker IDs
@@ -264,9 +288,10 @@ Before hashing, URLs are normalized to prevent duplicate crawling:
 2. Remove fragment (`#...`)
 3. Normalize default ports (`:80` for HTTP, `:443` for HTTPS)
 4. Sort query parameters alphabetically
-5. Remove known tracking params (`utm_source`, `utm_medium`, `utm_campaign`, `ref`)
-6. Remove trailing slashes
-7. Decode percent-encoded characters where safe
+5. Remove tracking params (`utm_*`, `gclid`, `fbclid`, `msclkid`, `mc_cid`, `mc_eid`, `_ga`)
+6. Remove trailing slashes (except root)
+
+The **domain** key is the URL's `host` — hostname plus any non-default port — because robots.txt and politeness are per origin: `example.com:8080` is a different site from `example.com`.
 
 ## API Design
 
@@ -308,9 +333,9 @@ Rate limiting uses Redis sliding window: ZREMRANGEBYSCORE to remove old entries,
 
 ### 1. URL Frontier: hybrid Redis queue + PostgreSQL state (vs Kafka)
 
-**Chosen: Redis priority sorted-sets for the hot dequeue path, PostgreSQL for durable, queryable frontier state.** The frontier needs three things: fast "get the next highest-priority URL" (Redis), durable status tracking that survives a restart and is inspectable (PostgreSQL), and idempotent enqueue. The implementation splits them: `addUrl` inserts into `url_frontier` with `ON CONFLICT (url_hash) DO NOTHING` *and* pushes the URL hash onto one of three Redis sorted-sets (high/medium/low) keyed by insert time. `getNextUrl` pops candidates from Redis high→medium→low, loads the row from PostgreSQL, and flips its status to `in_progress`. Kafka would give higher throughput but loses queryability -- you cannot inspect, reprioritize, or recover stale URLs from a topic, and frontier management needs random access.
+**Chosen: Redis priority sorted-sets for the hot dequeue path, PostgreSQL for durable, queryable frontier state.** The frontier needs three things: fast "get the next highest-priority URL" (Redis), durable status tracking that survives a restart and is inspectable (PostgreSQL), and idempotent enqueue. The implementation splits them: `addUrl` inserts into `url_frontier` with `ON CONFLICT (url_hash) DO NOTHING` *and* pushes the URL hash onto one of three Redis sorted-sets (high/medium/low) keyed by insert time. `getNextUrl` reads *eligible* candidates from Redis high→medium→low (the score is the earliest time a URL may be crawled, so retry backoff is just a future score), loads their rows from PostgreSQL in one query, wins the domain lock, and claims the row with a conditional `UPDATE ... WHERE status = 'pending'`. Kafka would give higher throughput but loses queryability -- you cannot inspect, reprioritize, or recover stale URLs from a topic, and frontier management needs random access.
 
-**Why not pure PostgreSQL with `FOR UPDATE SKIP LOCKED`?** That's the textbook single-store answer and it works, but every dequeue then contends on the priority index under all workers at once. Putting the priority ordering in Redis sorted-sets keeps the hot path off the PostgreSQL index; PostgreSQL is consulted per-URL by primary/unique key (`url_hash`), which is cheap. The cost is that Redis and PostgreSQL can briefly disagree — a URL hash can sit in a Redis queue after its row already moved on — so `getNextUrl` re-checks `status = 'pending'` in PostgreSQL and drops stale queue entries.
+**Why not pure PostgreSQL with `FOR UPDATE SKIP LOCKED`?** That's the textbook single-store answer and it works, but every dequeue then contends on the priority index under all workers at once. Putting the priority ordering in Redis sorted-sets keeps the hot path off the PostgreSQL index; PostgreSQL is consulted per-URL by primary/unique key (`url_hash`), which is cheap. The cost is that Redis and PostgreSQL can disagree, so three repair paths exist: `getNextUrl` drops hashes whose rows are no longer pending (and the conditional claim makes a stale entry harmless); `recoverStaleUrls` re-adds recovered leases to Redis, not just Postgres; and `rehydrateQueues` re-populates Redis from pending rows when Redis lost entries (restart, flush). Redis is a cache of the frontier, never its authority.
 
 **Trade-off acknowledged:** the two stores are eventually consistent, and Redis is the volatile half — if Redis is flushed, the priority queues must be rebuilt from `url_frontier` (the durable source of truth). Worker exclusivity is *not* provided by a database row lock here; it comes from the per-domain Redis lock in Decision 3. Production would partition the frontier by domain across multiple queue shards.
 
@@ -322,7 +347,11 @@ Rate limiting uses Redis sliding window: ZREMRANGEBYSCORE to remove old entries,
 
 ### 3. Per-Domain Rate Limiting: Redis Locks vs Token Bucket
 
-**Chosen: Redis SET NX EX (distributed lock with TTL).** When a worker wants to crawl a domain, it attempts `SET crawler:domain:{domain}:lock {workerId} NX EX {crawlDelay}`. If successful, it proceeds; otherwise, it skips this domain and picks another URL. The TTL equals the domain's crawl-delay (from robots.txt or default 1s), ensuring automatic lock expiry.
+**Chosen: Redis SET NX PX (distributed lock with TTL).** When a worker wants to crawl a domain, it attempts `SET crawler:domain:{domain}:lock {workerId} NX PX {crawlDelayMs}`. If successful, it proceeds; otherwise, it skips this domain (and every other URL of that domain in the same scan) and picks another URL. The TTL equals the effective crawl delay, so lock acquisitions — request starts — for a domain are spaced at least one delay apart across all workers. Milliseconds, so `Crawl-delay: 0.5` isn't rounded up.
+
+**The lock is politeness, not exclusivity.** It expires after one crawl delay while a fetch can take 30s, so exclusivity comes from the conditional claim, not the lock. **Every request passes the gate:** an in-process retry re-acquires the lock before re-fetching, and redirects are not auto-followed (axios `maxRedirects: 0`) — the target is enqueued so it gets its own robots.txt check and lock. **Effective delay** = max(operator override, robots.txt Crawl-delay or default); an override can slow a domain down but never speed it past robots.txt. Crawl-delay is capped at 60s.
+
+**robots.txt failure semantics (RFC 9309):** 2xx → obey; 4xx → no restrictions; 5xx/unreachable → treat as disallowed for now and retry the URL later (negative-cached in memory for 60s). The robots parser is built per scheme, because robots-parser returns `undefined` (previously read as "allowed") for URLs on a different origin than the robots.txt URL it was built with.
 
 **Trade-off acknowledged:** This is domain-level, not path-level granularity. A domain with crawl-delay=1s allows only 1 req/sec regardless of how many workers exist. Token bucket would allow smoother rate distribution (e.g., 10 req/10s instead of 1 req/s), but adds implementation complexity for marginal benefit. The lock approach also wastes worker cycles when all available domains are locked -- production would use a work-stealing queue per domain shard.
 
@@ -340,13 +369,14 @@ Crawl operations are inherently idempotent: fetching the same URL multiple times
 
 - **URL ingestion**: The `url_hash UNIQUE` constraint on url_frontier prevents duplicate URL insertions. `INSERT ... ON CONFLICT (url_hash) DO NOTHING` makes ingestion idempotent.
 - **Page metadata**: `url_hash UNIQUE` on crawled_pages with `ON CONFLICT DO UPDATE` ensures re-crawls update rather than duplicate.
-- **Worker claim**: exactly-once claiming is enforced by the per-domain Redis lock (`SET domain:lock NX EX crawlDelay`), not a database row lock. A worker only crawls a domain if it wins that lock; it then marks the specific URL `in_progress` in `url_frontier`. Two workers can't hold the same domain's lock, so they can't crawl the same URL concurrently.
+- **Worker claim**: exactly-once claiming is enforced by a conditional update — `UPDATE url_frontier SET status='in_progress' WHERE id=$1 AND status='pending'` — and the worker proceeds only if one row changed. The per-domain Redis lock provides politeness spacing, not exclusivity (it expires after the crawl delay, long before a slow fetch finishes).
+- **Link ingestion**: batched; only rows actually inserted (`RETURNING`) are pushed to Redis, with `ZADD NX`, so rediscovering a queued URL never resets its position.
 
 ### Consistency Model
 
 | Entity | Consistency | Rationale |
 |--------|-------------|-----------|
-| URL frontier state | Durable in PostgreSQL; exclusivity via per-domain Redis lock | Worker claims must be exclusive; the domain lock (not a row lock) guarantees one crawler per domain |
+| URL frontier state | Strong in PostgreSQL (conditional claim); Redis queues eventually consistent | Postgres arbitrates claims; Redis entries are hints, repaired by lease recovery and rehydration |
 | Visited URLs (Redis SET) | Eventual (small duplicate window) | Brief period where two workers may crawl the same URL before SET is updated |
 | robots.txt cache | Eventual (1h TTL) | Stale robots.txt is acceptable; re-fetch hourly |
 | Circuit breaker state | Eventual (Redis, distributed) | Workers share domain failure state with seconds delay |
@@ -404,31 +434,46 @@ Each domain gets its own circuit breaker to isolate failures:
 - **Open**: After 5 consecutive failures; immediately reject requests for 60 seconds
 - **Half-open**: After cooldown, allow 1 test request; close on success, reopen on failure
 
-Circuit breaker state is stored in Redis (`crawler:circuit:{domain}`) so all workers share failure awareness. When a domain's circuit is open, workers skip URLs from that domain and pick another URL, preventing resource waste on failing domains.
+Circuit breaker state is stored in Redis (`crawler:circuit:{domain}`) so all workers share failure awareness. When a domain's circuit is open, workers **defer** its URLs (back to pending, eligible after the break duration, no attempt counted) instead of failing them. The Redis flag's TTL equals the break duration and it is deleted when the breaker closes: with a longer TTL, every worker would skip the domain, no worker would ever send the half-open probe, and the domain would stay blocked for the full TTL. Only transient errors (network errors, 5xx) count toward opening the breaker.
 
-Implementation uses Cockatiel library with retry (exponential backoff: 1s, 2s, 4s) wrapping the circuit breaker. Retries happen within a closed circuit; if the circuit opens, retries stop immediately (fail fast).
+Implementation uses Cockatiel with one in-process retry wrapping the breaker; longer outages are handled by frontier-level retries (below), which free the worker between attempts.
 
 ### Retry Strategy
 
-| Operation | Max Retries | Backoff | Timeout |
-|-----------|-------------|---------|---------|
-| HTTP fetch | 3 | Exponential (1s, 2s, 4s) + jitter | 30s |
-| robots.txt fetch | 2 | Linear (2s, 4s) | 10s |
-| Database write | 3 | Exponential (100ms, 200ms, 400ms) | 5s |
-| Redis operation | 3 | Fixed (100ms) | 1s |
+Crawl outcomes are classified, and only transient ones are retried:
 
-Retryable errors: ECONNRESET, ETIMEDOUT, ECONNREFUSED, ENOTFOUND, EAI_AGAIN, EPIPE, EHOSTUNREACH, ENETUNREACH, and HTTP 5xx responses.
+| Outcome | Examples | Action |
+|---------|----------|--------|
+| Success | 2xx HTML | `completed`, links enqueued |
+| Redirect | 301/302/307/308 | Target enqueued at same depth; source `completed` |
+| Permanent | 404, robots disallow, operator block, non-HTML, oversized | `failed` + `last_error`; added to visited set |
+| Transient | Timeout (ECONNABORTED/ETIMEDOUT), ECONNRESET, ENOTFOUND, 5xx, 408, 429, robots.txt unavailable | `retry_count + 1`; back to pending with score = now + 60s × 2^(n-1) ± 20% (≥ Retry-After); `failed` after 3 retries |
+| Not attempted | Circuit open | Deferred; attempt not counted |
+
+| Layer | Retries | Backoff | Timeout |
+|-------|---------|---------|---------|
+| In-process HTTP retry (Cockatiel) | 1 | Exponential from 1s, then waits for the domain lock | 30s per request |
+| Frontier-level retry | 3 (`CRAWLER_MAX_RETRIES`) | 60s base, doubling, ±20% jitter, ≤ 6h | — |
+| robots.txt fetch | HTTPS, then HTTP only if HTTPS can't connect | — | 10s, 512 KiB max |
 
 ### Worker Failure Recovery
 
-Workers send heartbeats every 30 seconds (`crawler:worker:{id}` with 2-minute TTL). A recovery job runs every 5 minutes to find URLs stuck in `in_progress` state for >5 minutes and reset them to `pending`:
+Workers write a heartbeat every 5 seconds (`crawler:worker:{id}:heartbeat`). The API server runs `services/maintenance.ts` every minute (guarded by a Redis lock so only one API instance does it):
+
+1. **Lease recovery** — `in_progress` rows older than 10 minutes go back to `pending` *and* back into their Redis queue:
 
 ```sql
 UPDATE url_frontier
-SET status = 'pending', scheduled_at = NOW()
+SET status = 'pending', updated_at = NOW()
 WHERE status = 'in_progress'
-AND updated_at < NOW() - INTERVAL '5 minutes'
+AND updated_at < NOW() - INTERVAL '1 minute' * $1
+RETURNING url_hash, priority   -- each is re-ZADDed (NX) to its priority queue
 ```
+
+2. **Queue rehydration** — if the Redis queues hold fewer entries than there are pending rows (Redis restarted without persistence, was flushed), pending rows are walked by keyset pagination and re-added with `ZADD NX`, preserving existing retry delays.
+3. **Stale worker cleanup** — workers whose heartbeat is older than 5 minutes are removed from the active set.
+
+**Graceful shutdown:** on SIGTERM a worker stops claiming, waits (up to 45s) for its in-flight crawl to finish recording its outcome, then closes connections — so a deploy doesn't strand one URL per worker until the lease expires.
 
 ### Graceful Degradation
 
@@ -438,7 +483,23 @@ AND updated_at < NOW() - INTERVAL '5 minutes'
 | Redis down | Use PostgreSQL for dedup (slower); skip rate limiting |
 | Single worker crash | Other workers continue; stale URLs recovered automatically |
 | All workers crash | API server continues serving dashboard; no crawling |
-| robots.txt timeout | Skip domain for 1 hour; mark as potentially blocked |
+| robots.txt 5xx / timeout | Domain's URLs deferred as transient failures; outage negative-cached for 60s |
+| Redis data loss | Pending URLs re-queued from PostgreSQL by the maintenance loop |
+
+### Crawler Trap Defenses
+
+Infinite URL spaces (calendars, faceted search, session IDs in paths) are bounded in layers, all configurable in `config.ts`:
+
+| Defense | Default | Env var |
+|---------|---------|---------|
+| Max hop depth from seed | 6 | `CRAWLER_MAX_DEPTH` |
+| Max URL length | 2,048 | `CRAWLER_MAX_URL_LENGTH` |
+| Max links enqueued per page | 500 | `CRAWLER_MAX_LINKS_PER_PAGE` |
+| Tracking-param stripping | utm_*, gclid, fbclid, ... | — |
+| `rel="nofollow\|sponsored\|ugc"` and `<meta name="robots" content="nofollow">` | honored | — |
+| Duplicate content (exact hash) | links not re-enqueued | — |
+
+A per-domain page budget is the next defense to add (not yet implemented).
 
 ## Scalability Considerations
 
@@ -452,10 +513,10 @@ AND updated_at < NOW() - INTERVAL '5 minutes'
 
 ### What Breaks First
 
-At ~1,000 pages/second, the PostgreSQL frontier dequeue becomes the bottleneck. The `SELECT ... FOR UPDATE SKIP LOCKED` contends on the priority index. Solutions:
-1. Partition by domain (workers claim a domain shard, not individual URLs)
-2. Use Redis sorted sets as a fast frontier layer, with PostgreSQL as durable backing store
-3. Batch dequeue (claim 10-50 URLs at once)
+Link ingestion goes first: ~50 links per page means dedup and frontier inserts run ~50× more often than fetches (already batched to a constant number of round trips per page). Next is the single PostgreSQL frontier, then **breadth** — at one request per domain per crawl delay, throughput is capped by how many distinct domains are eligible at once, not by worker count. Solutions:
+1. Partition the frontier by domain hash so politeness becomes shard-local (no distributed lock)
+2. Replace the URL scan with a ready-domain heap keyed by next-allowed time
+3. Bloom filter in front of the visited set once it outgrows memory
 
 ### Data Lifecycle
 
@@ -476,9 +537,11 @@ At ~1,000 pages/second, the PostgreSQL frontier dequeue becomes the bottleneck. 
 
 | Decision | Chosen | Alternative | Rationale |
 |----------|--------|-------------|-----------|
-| Frontier storage | PostgreSQL | Kafka | Queryable, inspectable, manageable; Kafka for >1K pages/sec |
+| Frontier storage | Redis ZSETs (eligible-at score) + PostgreSQL | Kafka / pure SKIP LOCKED | Queryable and durable, hot dequeue in memory; delayed retries are just scores |
+| URL claim | Domain lock + conditional UPDATE | Domain lock alone | Lock TTL (crawl delay) is shorter than a fetch, so it can't guarantee exclusivity |
+| robots.txt 5xx | Treat as disallow, retry later | Assume allowed | Don't crawl a failing site blind (RFC 9309) |
 | URL deduplication | Redis SET (exact) | Bloom Filter | Zero false positives; memory acceptable at learning scale |
-| Rate limiting | Redis SET NX EX | Token Bucket | Simpler; domain-level granularity sufficient |
+| Rate limiting | Redis SET NX PX, covering retries and redirects | Token Bucket | Simpler; domain-level granularity sufficient |
 | HTML parsing | Cheerio | Puppeteer | 100x faster, 50x less memory; no JS rendering needed for v1 |
 | Priority queue | 3-level (high/med/low) | Redis ZSET with continuous scores | Simpler to understand, debug, and reason about |
 | Circuit breaker | Cockatiel (per-domain) | No circuit breaker | Prevents cascade failures; shared state via Redis |
@@ -666,10 +729,12 @@ This section maps the production architecture above to the actual local implemen
 | Retry with exponential backoff | Cockatiel | `backend/src/shared/resilience.ts` | Handles transient failures (ECONNRESET, 5xx) with jitter to prevent thundering herd |
 | Prometheus metrics | prom-client | `backend/src/shared/metrics.ts` | 15+ metrics: crawl throughput, latency, errors, frontier depth, circuit breaker state, cleanup activity |
 | Structured logging | Pino | `backend/src/shared/logger.ts` | JSON logs with component loggers (http, crawler, database, redis, circuit-breaker); worker ID context |
-| URL frontier | PostgreSQL + Redis | `backend/src/services/frontier.ts` | Priority-based scheduling with politeness; `FOR UPDATE SKIP LOCKED` for concurrent access |
+| URL frontier | PostgreSQL + Redis | `backend/src/services/frontier.ts` | Eligible-at sorted sets, batched ingestion, conditional claim, retry backoff, lease recovery and queue rehydration |
+| Frontier maintenance | Custom (Redis-locked interval) | `backend/src/services/maintenance.ts` | Self-healing frontier: crashed-worker leases and Redis data loss repaired without an operator |
 | robots.txt compliance | robots-parser | `backend/src/services/robots.ts` | Fetches, parses, and caches robots.txt; respects crawl-delay and disallow directives |
-| URL deduplication | Redis SET | `backend/src/services/crawler.ts` | O(1) membership check via SISMEMBER on SHA-256 hashes |
-| Per-domain rate limiting | Redis SET NX EX | `backend/src/services/crawler.ts` | Distributed lock with TTL matching domain crawl-delay |
+| URL deduplication | Redis SET | `backend/src/services/frontier.ts` | Batched SMISMEMBER on SHA-256 hashes, Postgres unique index as backstop; exact content-hash dedup in `crawler.ts` |
+| Per-domain rate limiting | Redis SET NX PX | `backend/src/services/frontier.ts` | Distributed lock with TTL matching the effective crawl delay; in-process retries re-acquire it |
+| Tests | Vitest | `backend/src/**/*.test.ts`, `backend/src/integration/` | Unit tests plus an opt-in end-to-end crawl of a local fixture site against real Postgres/Redis (dedup, politeness spacing, retries, redirects, robots) |
 | Data cleanup | Custom cron jobs | `backend/src/services/cleanup.ts` | Removes completed frontier entries (7d), failed entries (30d), old page metadata (90d) |
 | Health checks | Custom | `backend/src/routes/` | `/health` checks PostgreSQL and Redis; Docker healthcheck integration |
 | Session auth + RBAC | express-session + Redis | `backend/src/middleware/` | Session-based auth with role-based access control for admin operations |

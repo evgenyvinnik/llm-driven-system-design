@@ -29,13 +29,14 @@ import {
   CircuitBreakerPolicy,
   circuitBreaker,
   retry,
-  handleAll,
+  handleWhen,
   ExponentialBackoff,
   ConsecutiveBreaker,
   wrap,
   IPolicy,
   RetryPolicy,
   CircuitState as CockatielCircuitState,
+  BrokenCircuitError,
 } from 'cockatiel';
 import { redis } from '../models/redis.js';
 import { circuitBreakerLogger } from './logger.js';
@@ -123,7 +124,9 @@ export function getCircuitBreaker(
   let cb = domainCircuitBreakers.get(domain);
 
   if (!cb) {
-    cb = circuitBreaker(handleAll, {
+    // Only transient failures (network errors, 5xx) count toward opening the
+    // circuit; a 404 or an oversized page says nothing about the host's health.
+    cb = circuitBreaker(handleWhen(isRetryableError), {
       halfOpenAfter: config.resetTimeoutMs,
       breaker: new ConsecutiveBreaker(config.failureThreshold),
     });
@@ -135,12 +138,12 @@ export function getCircuitBreaker(
       circuitBreakerStateGauge.labels(domain).set(stateValue);
 
       circuitBreakerLogger.info(
-        { domain, state: state.toString() },
+        { domain, state: toCircuitState(state) },
         `Circuit breaker state changed to ${state}`
       );
 
       // Store state in Redis for distributed awareness
-      storeCircuitState(domain, state.toString()).catch((err) => {
+      storeCircuitState(domain, toCircuitState(state), config.resetTimeoutMs).catch((err) => {
         circuitBreakerLogger.error({ err, domain }, 'Failed to store circuit state');
       });
     });
@@ -171,17 +174,43 @@ export function getCircuitBreaker(
  * Stores circuit breaker state in Redis for distributed coordination.
  * Other workers can check this before attempting requests.
  */
-async function storeCircuitState(domain: string, state: string): Promise<void> {
+async function storeCircuitState(
+  domain: string,
+  state: CircuitState,
+  resetTimeoutMs: number
+): Promise<void> {
   const key = `crawler:circuit:${domain}`;
-  const redisState =
-    state === 'closed'
-      ? CircuitState.CLOSED
-      : state === 'halfOpen'
-        ? CircuitState.HALF_OPEN
-        : CircuitState.OPEN;
 
-  // Store with TTL so stale states are cleaned up
-  await redis.set(key, redisState, 'EX', 3600); // 1 hour TTL
+  if (state === CircuitState.CLOSED) {
+    await redis.del(key);
+    return;
+  }
+
+  // The shared OPEN flag lives exactly as long as the break duration. Other
+  // workers skip the domain while it exists; once it expires, the next worker
+  // to fetch acts as the half-open probe. (Previously this used a 1h TTL, and
+  // since every worker skipped the domain without fetching, no breaker ever
+  // reached half-open to clear it - the domain stayed blocked for the hour.)
+  await redis.set(key, state, 'PX', Math.max(1000, resetTimeoutMs));
+}
+
+/**
+ * Maps cockatiel's numeric CircuitState enum to our string enum.
+ *
+ * cockatiel's enum is numeric (Closed = 0, Open = 1, HalfOpen = 2, Isolated = 3).
+ * The original code compared `state.toString()` against 'closed' / 'halfOpen',
+ * which never matched ('0', '2'), so EVERY transition - including a reset back
+ * to closed - was published to Redis as OPEN.
+ */
+export function toCircuitState(state: CockatielCircuitState): CircuitState {
+  switch (state) {
+    case CockatielCircuitState.Closed:
+      return CircuitState.CLOSED;
+    case CockatielCircuitState.HalfOpen:
+      return CircuitState.HALF_OPEN;
+    default:
+      return CircuitState.OPEN;
+  }
 }
 
 /**
@@ -208,7 +237,9 @@ export async function isCircuitOpen(domain: string): Promise<boolean> {
 export function createRetryPolicy(
   config: RetryConfig = DEFAULT_RETRY_CONFIG
 ): RetryPolicy {
-  return retry(handleAll, {
+  // Retry only transient errors; retrying a DNS-valid 'maxContentLength exceeded'
+  // or a malformed URL just triples the load for the same outcome.
+  return retry(handleWhen(isRetryableError), {
     maxAttempts: config.maxAttempts,
     backoff: new ExponentialBackoff({
       initialDelay: config.initialDelayMs,
@@ -313,10 +344,12 @@ export class CircuitOpenError extends Error {
 }
 
 /**
- * Utility to check if an error is a circuit open error.
+ * Utility to check if an error is a circuit open error - either our own
+ * CircuitOpenError or cockatiel's BrokenCircuitError (thrown by the policy
+ * when the in-process breaker is open).
  */
-export function isCircuitOpenError(error: unknown): error is CircuitOpenError {
-  return error instanceof CircuitOpenError;
+export function isCircuitOpenError(error: unknown): boolean {
+  return error instanceof CircuitOpenError || error instanceof BrokenCircuitError;
 }
 
 /**
@@ -332,6 +365,7 @@ export function isRetryableError(error: unknown): boolean {
   const errorObj = error as { code?: string; response?: { status?: number } };
 
   const retryableCodes = [
+    'ECONNABORTED', // axios request timeout
     'ECONNRESET',
     'ETIMEDOUT',
     'ECONNREFUSED',

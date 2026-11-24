@@ -63,7 +63,11 @@ async function start() {
  * Stops the crawler (allowing current operation to complete),
  * closes database and Redis connections, then exits.
  */
+let shuttingDown = false;
+
 async function shutdown() {
+  if (shuttingDown) return; // a second Ctrl+C shouldn't close pools twice
+  shuttingDown = true;
   console.log(`Worker ${workerId} shutting down...`);
 
   if (crawler) {

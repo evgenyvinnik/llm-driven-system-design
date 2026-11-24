@@ -5,18 +5,30 @@
  * to be crawled with priority-based scheduling. This implementation uses a hybrid
  * approach with PostgreSQL for durability and Redis for fast access patterns.
  *
- * Key responsibilities:
- * - Adding new URLs with deduplication (via Redis visited set)
- * - Priority-based URL scheduling (high/medium/low queues)
- * - Per-domain rate limiting (via Redis distributed locks)
- * - Status tracking (pending, in_progress, completed, failed)
- * - Recovery of stale in-progress URLs after worker crashes
+ * Data model:
+ * - PostgreSQL `url_frontier` is the source of truth (status, retry_count, ...).
+ * - Redis holds three sorted sets (high/medium/low). The member is the URL hash
+ *   and the score is the **earliest time (ms) the URL may be crawled**. New URLs
+ *   get `now`; retries get `now + backoff`. Dequeue reads only members whose
+ *   score is <= now, so delayed retries need no separate timer queue.
+ *
+ * Invariants:
+ * - A URL is claimed by exactly one worker: the pending -> in_progress transition
+ *   is a conditional UPDATE (`WHERE status = 'pending'`), so two workers racing
+ *   for the same hash cannot both win, even if politeness locks expire.
+ * - Redis is a cache of Postgres: anything lost from Redis (restart, flush,
+ *   lease recovery) is restored by `rehydrateQueues` / `recoverStaleUrls`.
  *
  * @module services/frontier
  */
 
 import { pool } from '../models/database.js';
-import { redis, REDIS_KEYS } from '../models/redis.js';
+import {
+  redis,
+  REDIS_KEYS,
+  PRIORITY_QUEUES,
+  queueKeyForPriority,
+} from '../models/redis.js';
 import {
   normalizeUrl,
   hashUrl,
@@ -26,6 +38,7 @@ import {
   shouldCrawl,
 } from '../utils/url.js';
 import { config } from '../config.js';
+import { logger } from '../shared/logger.js';
 
 /**
  * Represents a URL entry in the frontier queue.
@@ -45,6 +58,10 @@ export interface FrontierUrl {
   depth: number;
   /** Current status: pending, in_progress, completed, failed */
   status: string;
+  /** Number of transient failures so far */
+  retryCount?: number;
+  /** Last error message, if any */
+  lastError?: string | null;
   /** When this URL was scheduled for crawling */
   scheduledAt: Date;
 }
@@ -61,209 +78,244 @@ export interface AddUrlOptions {
   parentUrl?: string;
 }
 
+/** How many queue heads to inspect per priority level on each dequeue. */
+const DEQUEUE_SCAN_SIZE = 100;
+
+/**
+ * Compare-and-delete: only release the domain lock if this worker still owns it.
+ * Prevents a worker from deleting a lock that expired and was re-acquired by
+ * another worker.
+ */
+const RELEASE_LOCK_SCRIPT = `
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('DEL', KEYS[1])
+end
+return 0
+`;
+
+interface FrontierRow {
+  id: number;
+  url: string;
+  url_hash: string;
+  domain: string;
+  priority: number;
+  depth: number;
+  status: string;
+  retry_count: number | null;
+  last_error: string | null;
+  scheduled_at: Date;
+}
+
+function rowToFrontierUrl(row: FrontierRow): FrontierUrl {
+  return {
+    id: row.id,
+    url: row.url,
+    urlHash: row.url_hash,
+    domain: row.domain,
+    priority: row.priority,
+    depth: row.depth,
+    status: row.status,
+    retryCount: row.retry_count ?? 0,
+    lastError: row.last_error,
+    scheduledAt: row.scheduled_at,
+  };
+}
+
+/**
+ * Computes the frontier-level retry delay for the n-th attempt (1-based),
+ * using exponential backoff with +/-20% jitter so that a batch of URLs that
+ * failed together (e.g. a domain outage) doesn't come back as a thundering herd.
+ */
+export function retryDelayMs(attempt: number, baseMs = config.crawler.retryBaseDelayMs): number {
+  const exp = baseMs * Math.pow(2, Math.max(0, attempt - 1));
+  const capped = Math.min(exp, 6 * 60 * 60 * 1000); // never more than 6h
+  const jitter = 0.8 + Math.random() * 0.4;
+  return Math.round(capped * jitter);
+}
+
 /**
  * URL Frontier Service - manages the queue of URLs to be crawled.
- *
- * This service provides the core scheduling logic for the distributed crawler.
- * It ensures URLs are crawled in priority order while respecting rate limits
- * and avoiding duplicate work.
- *
- * @example
- * ```typescript
- * import { frontierService } from './services/frontier';
- *
- * // Add seed URLs with high priority
- * await frontierService.addUrls(['https://example.com'], { priority: 3, depth: 0 });
- *
- * // Get next URL to crawl
- * const url = await frontierService.getNextUrl('worker-1');
- * if (url) {
- *   // Crawl the URL...
- *   await frontierService.markCompleted(url.urlHash);
- * }
- * ```
  */
 export class FrontierService {
   /**
    * Adds a single URL to the frontier if not already visited or queued.
    *
-   * This method performs several checks before adding:
-   * 1. Normalizes the URL for consistent deduplication
-   * 2. Checks if URL should be crawled (HTTP/HTTPS, not a binary file)
-   * 3. Checks Redis visited set for duplicates (O(1) lookup)
-   * 4. Inserts into PostgreSQL with ON CONFLICT DO NOTHING
-   * 5. Adds to Redis priority queue for fast retrieval
-   *
-   * @param url - The URL to add to the frontier
-   * @param options - Optional priority, depth, and parent URL
-   * @returns true if URL was added, false if skipped (duplicate or filtered)
-   *
-   * @example
-   * ```typescript
-   * const added = await frontierService.addUrl('https://example.com/page', {
-   *   priority: 2,
-   *   depth: 1,
-   * });
-   * console.log(added ? 'URL queued' : 'URL skipped');
-   * ```
+   * @returns true if URL was newly added, false if skipped (duplicate or filtered)
    */
   async addUrl(url: string, options: AddUrlOptions = {}): Promise<boolean> {
-    const normalized = normalizeUrl(url);
-    const urlHash = hashUrl(normalized);
-
-    // Check if URL should be crawled
-    if (!shouldCrawl(normalized)) {
-      return false;
-    }
-
-    // Check if already visited (using Redis set for fast lookup)
-    const isVisited = await redis.sismember(REDIS_KEYS.VISITED_URLS, urlHash);
-    if (isVisited) {
-      await redis.incr(REDIS_KEYS.STATS_DUPLICATES_SKIPPED);
-      return false;
-    }
-
-    const domain = extractDomain(normalized);
-    const depth = options.depth ?? calculateDepth(normalized);
-    const isHomepage = depth === 0;
-    const priority = options.priority ?? calculatePriority(normalized, depth, isHomepage);
-
-    // Add to database frontier
-    try {
-      await pool.query(
-        `INSERT INTO url_frontier (url, url_hash, domain, priority, depth, status, scheduled_at)
-         VALUES ($1, $2, $3, $4, $5, 'pending', NOW())
-         ON CONFLICT (url_hash) DO NOTHING`,
-        [normalized, urlHash, domain, priority, depth]
-      );
-
-      // Also add to Redis priority queue for fast access
-      const queueKey =
-        priority >= 3
-          ? REDIS_KEYS.PRIORITY_QUEUE_HIGH
-          : priority >= 2
-            ? REDIS_KEYS.PRIORITY_QUEUE_MEDIUM
-            : REDIS_KEYS.PRIORITY_QUEUE_LOW;
-
-      await redis.zadd(queueKey, Date.now(), urlHash);
-
-      // Increment discovery stats
-      await redis.incr(REDIS_KEYS.STATS_LINKS_DISCOVERED);
-
-      return true;
-    } catch (error) {
-      console.error('Error adding URL to frontier:', error);
-      return false;
-    }
+    return (await this.addUrls([url], options)) > 0;
   }
 
   /**
-   * Adds multiple URLs to the frontier in batch.
+   * Adds multiple URLs to the frontier in one batch.
    *
-   * Processes URLs sequentially to ensure proper deduplication.
-   * For better performance with large batches, consider parallel processing
-   * with a controlled concurrency limit.
+   * A page commonly yields hundreds of links, so this is written to cost a
+   * constant number of round trips regardless of batch size:
+   * 1. Normalize, filter (scheme, extension, length, max depth) and de-dup in memory
+   * 2. One SMISMEMBER against the visited set
+   * 3. One multi-row INSERT ... ON CONFLICT DO NOTHING RETURNING (Postgres dedup)
+   * 4. One pipeline that ZADDs **only the rows that were actually inserted**
    *
-   * @param urls - Array of URLs to add
-   * @param options - Options applied to all URLs
-   * @returns Number of URLs successfully added (excluding duplicates)
+   * Step 4 matters: re-adding a hash that is already queued would reset its
+   * score to "now", pushing frequently-linked pages to the back of the queue
+   * forever, and would inflate the links-discovered counter.
    *
-   * @example
-   * ```typescript
-   * const extractedLinks = ['https://example.com/a', 'https://example.com/b'];
-   * const added = await frontierService.addUrls(extractedLinks, { depth: 2 });
-   * console.log(`Added ${added} of ${extractedLinks.length} links`);
-   * ```
+   * @returns Number of URLs newly added (excluding duplicates and filtered URLs)
    */
   async addUrls(urls: string[], options: AddUrlOptions = {}): Promise<number> {
-    let added = 0;
-    for (const url of urls) {
-      const result = await this.addUrl(url, options);
-      if (result) added++;
+    if (urls.length === 0) return 0;
+
+    // Depth check applies to the whole batch (all links from one page share a depth)
+    if (options.depth !== undefined && options.depth > config.crawler.maxDepth) {
+      return 0;
     }
-    return added;
+
+    const candidates = new Map<
+      string,
+      { url: string; domain: string; priority: number; depth: number }
+    >();
+
+    for (const raw of urls) {
+      if (typeof raw !== 'string') continue;
+      const normalized = normalizeUrl(raw.trim());
+      if (normalized.length > config.crawler.maxUrlLength) continue;
+      if (!shouldCrawl(normalized)) continue;
+
+      const domain = extractDomain(normalized);
+      if (!domain) continue;
+
+      const urlHash = hashUrl(normalized);
+      if (candidates.has(urlHash)) continue;
+
+      const depth = options.depth ?? calculateDepth(normalized);
+      const isHomepage = depth === 0;
+      const priority = clampPriority(
+        options.priority ?? calculatePriority(normalized, depth, isHomepage)
+      );
+      candidates.set(urlHash, { url: normalized, domain, priority, depth });
+    }
+
+    if (candidates.size === 0) return 0;
+
+    // Fast-path dedup against already-crawled URLs
+    const hashes = [...candidates.keys()];
+    const visitedFlags = await redis.smismember(REDIS_KEYS.VISITED_URLS, ...hashes);
+    const fresh = hashes.filter((_, i) => visitedFlags[i] !== 1);
+    let duplicates = hashes.length - fresh.length;
+
+    let inserted: { url_hash: string; priority: number }[] = [];
+    if (fresh.length > 0) {
+      const rows = fresh.map((h) => candidates.get(h)!);
+      try {
+        const result = await pool.query<{ url_hash: string; priority: number }>(
+          `INSERT INTO url_frontier (url, url_hash, domain, priority, depth, status, scheduled_at)
+           SELECT u.url, u.url_hash, u.domain, u.priority, u.depth, 'pending', NOW()
+           FROM unnest($1::text[], $2::text[], $3::text[], $4::int[], $5::int[])
+             AS u(url, url_hash, domain, priority, depth)
+           ON CONFLICT (url_hash) DO NOTHING
+           RETURNING url_hash, priority`,
+          [
+            rows.map((r) => r.url),
+            fresh,
+            rows.map((r) => r.domain),
+            rows.map((r) => r.priority),
+            rows.map((r) => r.depth),
+          ]
+        );
+        inserted = result.rows;
+      } catch (error) {
+        logger.error({ err: error, count: fresh.length }, 'Error adding URLs to frontier');
+        return 0;
+      }
+      duplicates += fresh.length - inserted.length;
+    }
+
+    const now = Date.now();
+    const pipeline = redis.pipeline();
+    for (const row of inserted) {
+      // NX: never move an existing member (it may carry a retry delay)
+      pipeline.zadd(queueKeyForPriority(row.priority), 'NX', now, row.url_hash);
+    }
+    if (inserted.length > 0) {
+      pipeline.incrby(REDIS_KEYS.STATS_LINKS_DISCOVERED, inserted.length);
+    }
+    if (duplicates > 0) {
+      pipeline.incrby(REDIS_KEYS.STATS_DUPLICATES_SKIPPED, duplicates);
+    }
+    await pipeline.exec();
+
+    return inserted.length;
   }
 
   /**
    * Gets the next URL to crawl for a worker.
    *
-   * This method implements the core scheduling logic:
-   * 1. Checks priority queues in order (high -> medium -> low)
-   * 2. For each URL, attempts to acquire a domain lock for rate limiting
-   * 3. Marks the URL as in_progress and removes from Redis queue
-   * 4. Returns the URL if lock acquired, continues to next if not
+   * 1. For each priority queue (high -> medium -> low), read up to 100 hashes
+   *    whose eligible-at score is <= now.
+   * 2. Load all of their rows in ONE query; drop hashes whose row is no longer
+   *    pending (stale queue entries) from Redis in one ZREM.
+   * 3. Walk candidates in queue order, skipping any domain we already found
+   *    locked in this pass (so one hot domain doesn't cost 100 lock attempts).
+   * 4. Acquire the per-domain politeness lock, then atomically claim the row
+   *    with a conditional UPDATE. If another worker claimed it first, release
+   *    our lock and keep looking.
    *
-   * The domain lock ensures only one worker crawls a domain at a time,
-   * respecting the crawl delay from robots.txt or the default delay.
-   *
-   * @param workerId - Unique identifier of the requesting worker
-   * @returns The next URL to crawl, or null if no URLs available
-   *
-   * @example
-   * ```typescript
-   * const frontierUrl = await frontierService.getNextUrl('worker-1');
-   * if (frontierUrl) {
-   *   console.log(`Crawling: ${frontierUrl.url} (priority: ${frontierUrl.priority})`);
-   * } else {
-   *   console.log('No URLs available');
-   * }
-   * ```
+   * @returns The claimed URL, or null if nothing is eligible right now
    */
   async getNextUrl(workerId: string): Promise<FrontierUrl | null> {
-    // Try to get from high priority first, then medium, then low
-    const queues = [
-      REDIS_KEYS.PRIORITY_QUEUE_HIGH,
-      REDIS_KEYS.PRIORITY_QUEUE_MEDIUM,
-      REDIS_KEYS.PRIORITY_QUEUE_LOW,
-    ];
+    const now = Date.now();
+    const lockedDomains = new Set<string>();
 
-    for (const queueKey of queues) {
-      // Get oldest entries from queue
-      const urlHashes = await redis.zrange(queueKey, 0, 100);
+    for (const queueKey of PRIORITY_QUEUES) {
+      const urlHashes = await redis.zrangebyscore(
+        queueKey,
+        '-inf',
+        now,
+        'LIMIT',
+        0,
+        DEQUEUE_SCAN_SIZE
+      );
+      if (urlHashes.length === 0) continue;
+
+      const result = await pool.query<FrontierRow>(
+        `SELECT id, url, url_hash, domain, priority, depth, status, retry_count, last_error, scheduled_at
+         FROM url_frontier
+         WHERE url_hash = ANY($1::text[]) AND status = 'pending'`,
+        [urlHashes]
+      );
+      const rowsByHash = new Map(result.rows.map((r) => [r.url_hash, r]));
+
+      const stale = urlHashes.filter((h) => !rowsByHash.has(h));
+      if (stale.length > 0) {
+        await redis.zrem(queueKey, ...stale);
+      }
 
       for (const urlHash of urlHashes) {
-        // Get URL from database
-        const result = await pool.query(
-          `SELECT id, url, url_hash, domain, priority, depth, status, scheduled_at
-           FROM url_frontier
-           WHERE url_hash = $1 AND status = 'pending'`,
-          [urlHash]
-        );
+        const row = rowsByHash.get(urlHash);
+        if (!row || lockedDomains.has(row.domain)) continue;
 
-        if (result.rows.length === 0) {
-          // URL not in frontier or already processed, remove from Redis queue
-          await redis.zrem(queueKey, urlHash);
+        const gotLock = await this.acquireDomainLock(row.domain, workerId);
+        if (!gotLock) {
+          lockedDomains.add(row.domain);
           continue;
         }
 
-        const row = result.rows[0];
-        const domain = row.domain;
-
-        // Check if we can crawl this domain (rate limiting)
-        const canCrawl = await this.acquireDomainLock(domain, workerId);
-        if (!canCrawl) {
-          continue;
-        }
-
-        // Mark as in-progress
-        await pool.query(
-          `UPDATE url_frontier SET status = 'in_progress', updated_at = NOW() WHERE id = $1`,
+        const claim = await pool.query<FrontierRow>(
+          `UPDATE url_frontier
+           SET status = 'in_progress', updated_at = NOW()
+           WHERE id = $1 AND status = 'pending'
+           RETURNING id, url, url_hash, domain, priority, depth, status, retry_count, last_error, scheduled_at`,
           [row.id]
         );
-
-        // Remove from Redis queue
         await redis.zrem(queueKey, urlHash);
 
-        return {
-          id: row.id,
-          url: row.url,
-          urlHash: row.url_hash,
-          domain: row.domain,
-          priority: row.priority,
-          depth: row.depth,
-          status: 'in_progress',
-          scheduledAt: row.scheduled_at,
-        };
+        if (claim.rowCount === 0) {
+          // Another worker claimed it between our SELECT and UPDATE
+          await this.releaseDomainLock(row.domain, workerId);
+          continue;
+        }
+
+        return rowToFrontierUrl(claim.rows[0]);
       }
     }
 
@@ -271,78 +323,129 @@ export class FrontierService {
   }
 
   /**
+   * Resolves the effective crawl delay (seconds) for a domain.
+   *
+   * Base = robots.txt Crawl-delay (stored by the robots service, which falls
+   * back to the configured default). An operator override can only make the
+   * crawler *slower*: effective = max(override, base). Letting an override go
+   * below what the site asked for would turn a dashboard slider into a way to
+   * violate robots.txt.
+   */
+  async getEffectiveDelaySeconds(domain: string): Promise<number> {
+    const [override, robotsDelay] = await redis.mget(
+      REDIS_KEYS.DOMAIN_DELAY_OVERRIDE(domain),
+      REDIS_KEYS.DOMAIN_DELAY(domain)
+    );
+    const positive = (v: string | null) => {
+      const n = parseFloat(v ?? '');
+      return Number.isFinite(n) && n > 0 ? n : undefined;
+    };
+    const base = positive(robotsDelay) ?? config.crawler.defaultDelay / 1000;
+    const operator = positive(override);
+    return operator !== undefined ? Math.max(operator, base) : base;
+  }
+
+  /**
    * Acquires a distributed lock for a domain to enforce rate limiting.
    *
-   * Uses Redis SET with NX (only if not exists) and EX (expiry) to create
-   * an atomic, self-expiring lock. This ensures:
-   * - Only one worker can crawl a domain at any time
-   * - Lock auto-releases after the crawl delay period
-   * - No deadlocks even if worker crashes
-   *
-   * @param domain - The domain to acquire lock for
-   * @param workerId - ID of the worker requesting the lock
-   * @returns true if lock acquired, false if domain is locked by another worker
+   * `SET key worker NX PX delay`: the lock self-expires after the crawl delay,
+   * so lock acquisitions (and therefore request starts) for one domain are
+   * spaced at least `delay` apart across the whole worker fleet, and a crashed
+   * worker can never deadlock a domain. PX (milliseconds) honors fractional
+   * delays such as `Crawl-delay: 0.5` that EX would round up.
    */
   async acquireDomainLock(domain: string, workerId: string): Promise<boolean> {
-    const lockKey = REDIS_KEYS.DOMAIN_LOCK(domain);
-    const delayKey = REDIS_KEYS.DOMAIN_DELAY(domain);
-
-    // Get domain-specific delay (from robots.txt crawl-delay or default)
-    const delayStr = await redis.get(delayKey);
-    const delayMs = delayStr ? parseFloat(delayStr) * 1000 : config.crawler.defaultDelay;
-    const delaySeconds = Math.ceil(delayMs / 1000);
-
-    // Try to acquire lock with NX (only if not exists) and EX (expiry)
-    const result = await redis.set(lockKey, workerId, 'EX', delaySeconds, 'NX');
-
+    const delaySeconds = await this.getEffectiveDelaySeconds(domain);
+    const delayMs = Math.max(100, Math.round(delaySeconds * 1000));
+    const result = await redis.set(REDIS_KEYS.DOMAIN_LOCK(domain), workerId, 'PX', delayMs, 'NX');
     return result === 'OK';
   }
 
   /**
-   * Marks a URL as successfully completed.
-   *
-   * Updates the frontier status to 'completed' and adds the URL hash
-   * to the visited set to prevent re-crawling.
-   *
-   * @param urlHash - SHA-256 hash of the URL to mark complete
+   * Releases a domain lock early, only if this worker still holds it.
+   */
+  async releaseDomainLock(domain: string, workerId: string): Promise<void> {
+    await redis.eval(RELEASE_LOCK_SCRIPT, 1, REDIS_KEYS.DOMAIN_LOCK(domain), workerId);
+  }
+
+  /**
+   * Marks a URL as successfully completed and records it in the visited set.
    */
   async markCompleted(urlHash: string): Promise<void> {
     await pool.query(
-      `UPDATE url_frontier SET status = 'completed', updated_at = NOW() WHERE url_hash = $1`,
+      `UPDATE url_frontier SET status = 'completed', last_error = NULL, updated_at = NOW()
+       WHERE url_hash = $1`,
       [urlHash]
     );
-
-    // Add to visited set
     await redis.sadd(REDIS_KEYS.VISITED_URLS, urlHash);
   }
 
   /**
-   * Marks a URL as failed.
-   *
-   * Updates the frontier status to 'failed' and adds to visited set
-   * to prevent immediate retry. Future enhancement: implement retry logic
-   * with exponential backoff.
-   *
-   * @param urlHash - SHA-256 hash of the URL that failed
-   * @param error - Optional error message for debugging
+   * Marks a URL as permanently failed (404, robots-disallowed, non-HTML,
+   * retries exhausted). It is added to the visited set so it is never re-queued.
    */
-  async markFailed(urlHash: string, _error?: string): Promise<void> {
+  async markFailed(urlHash: string, error?: string): Promise<void> {
     await pool.query(
-      `UPDATE url_frontier SET status = 'failed', updated_at = NOW() WHERE url_hash = $1`,
-      [urlHash]
+      `UPDATE url_frontier SET status = 'failed', last_error = $2, updated_at = NOW()
+       WHERE url_hash = $1`,
+      [urlHash, error?.substring(0, 1000) ?? null]
     );
-
-    // Still add to visited set to prevent retrying immediately
     await redis.sadd(REDIS_KEYS.VISITED_URLS, urlHash);
+  }
+
+  /**
+   * Handles a transient failure (timeout, connection reset, 5xx, 429).
+   *
+   * Increments retry_count; if it is still within `maxRetries`, the URL goes
+   * back to pending with an exponentially growing eligible-at time. Otherwise
+   * it is marked failed permanently.
+   *
+   * @param minDelayMs - Lower bound for the delay (e.g. from a Retry-After header)
+   * @returns 'retry' if rescheduled, 'failed' if retries are exhausted
+   */
+  async scheduleRetry(
+    urlHash: string,
+    error: string,
+    minDelayMs = 0
+  ): Promise<'retry' | 'failed'> {
+    const result = await pool.query<{ retry_count: number; priority: number }>(
+      `UPDATE url_frontier
+       SET retry_count = COALESCE(retry_count, 0) + 1, last_error = $2, updated_at = NOW()
+       WHERE url_hash = $1
+       RETURNING retry_count, priority`,
+      [urlHash, error.substring(0, 1000)]
+    );
+    if (result.rowCount === 0) return 'failed';
+
+    const { retry_count: attempts, priority } = result.rows[0];
+    if (attempts > config.crawler.maxRetries) {
+      await this.markFailed(urlHash, `${error} (gave up after ${attempts - 1} retries)`);
+      return 'failed';
+    }
+
+    await this.deferUrl(urlHash, priority, Math.max(minDelayMs, retryDelayMs(attempts)));
+    return 'retry';
+  }
+
+  /**
+   * Returns a claimed URL to the queue without counting a failed attempt,
+   * eligible again after `delayMs`. Used when the crawl never started (e.g.
+   * the domain's circuit breaker is open).
+   */
+  async deferUrl(urlHash: string, priority: number, delayMs: number): Promise<void> {
+    await pool.query(
+      `UPDATE url_frontier
+       SET status = 'pending',
+           scheduled_at = NOW() + ($2::int * INTERVAL '1 millisecond'),
+           updated_at = NOW()
+       WHERE url_hash = $1`,
+      [urlHash, Math.round(delayMs)]
+    );
+    await redis.zadd(queueKeyForPriority(priority), Date.now() + delayMs, urlHash);
   }
 
   /**
    * Gets aggregated statistics about the frontier.
-   *
-   * Queries the database to count URLs by status and total unique domains.
-   * Used by the dashboard to display crawler progress.
-   *
-   * @returns Object containing counts for each status and total domains
    */
   async getStats(): Promise<{
     pending: number;
@@ -384,21 +487,21 @@ export class FrontierService {
   }
 
   /**
-   * Gets recently updated URLs from the frontier.
-   *
-   * Useful for the dashboard to show current crawl activity.
-   * Can be filtered by status to show only pending, in_progress, etc.
-   *
-   * @param limit - Maximum number of URLs to return (default: 50)
-   * @param status - Optional status filter
-   * @returns Array of recent frontier URLs sorted by update time
+   * Returns the number of hashes in each Redis priority queue.
    */
-  async getRecentUrls(
-    limit: number = 50,
-    status?: string
-  ): Promise<FrontierUrl[]> {
+  async getQueueDepths(): Promise<{ high: number; medium: number; low: number }> {
+    const [high, medium, low] = await Promise.all(
+      PRIORITY_QUEUES.map((key) => redis.zcard(key))
+    );
+    return { high, medium, low };
+  }
+
+  /**
+   * Gets recently updated URLs from the frontier.
+   */
+  async getRecentUrls(limit: number = 50, status?: string): Promise<FrontierUrl[]> {
     let query = `
-      SELECT id, url, url_hash, domain, priority, depth, status, scheduled_at
+      SELECT id, url, url_hash, domain, priority, depth, status, retry_count, last_error, scheduled_at
       FROM url_frontier
     `;
     const params: (string | number)[] = [];
@@ -411,54 +514,112 @@ export class FrontierService {
     query += ' ORDER BY updated_at DESC LIMIT $' + (params.length + 1);
     params.push(limit);
 
-    const result = await pool.query(query, params);
-
-    return result.rows.map((row) => ({
-      id: row.id,
-      url: row.url,
-      urlHash: row.url_hash,
-      domain: row.domain,
-      priority: row.priority,
-      depth: row.depth,
-      status: row.status,
-      scheduledAt: row.scheduled_at,
-    }));
+    const result = await pool.query<FrontierRow>(query, params);
+    return result.rows.map(rowToFrontierUrl);
   }
 
   /**
-   * Recovers stale in-progress URLs after worker crashes.
+   * Recovers URLs whose lease expired (worker crashed mid-crawl).
    *
-   * When a worker crashes, URLs it was processing remain in 'in_progress'
-   * state forever. This method resets them to 'pending' so they can be
-   * picked up by other workers.
+   * Resets `in_progress` rows older than the threshold back to `pending` **and
+   * re-adds them to their Redis priority queue** - workers only dequeue from
+   * Redis, so a row reset only in Postgres would never be crawled again.
    *
-   * Should be called periodically by a cleanup job or on server startup.
-   *
-   * @param olderThanMinutes - Reset URLs that have been in_progress longer than this
    * @returns Number of URLs recovered
-   *
-   * @example
-   * ```typescript
-   * // Recover URLs stuck for more than 10 minutes
-   * const recovered = await frontierService.recoverStaleUrls(10);
-   * console.log(`Recovered ${recovered} stale URLs`);
-   * ```
    */
-  async recoverStaleUrls(olderThanMinutes: number = 10): Promise<number> {
-    const result = await pool.query(
+  async recoverStaleUrls(
+    olderThanMinutes: number = config.crawler.staleLeaseMinutes
+  ): Promise<number> {
+    const result = await pool.query<{ url_hash: string; priority: number }>(
       `UPDATE url_frontier
        SET status = 'pending', updated_at = NOW()
        WHERE status = 'in_progress'
-       AND updated_at < NOW() - INTERVAL '1 minute' * $1`,
+       AND updated_at < NOW() - INTERVAL '1 minute' * $1
+       RETURNING url_hash, priority`,
       [olderThanMinutes]
     );
 
-    return result.rowCount ?? 0;
+    if (result.rows.length > 0) {
+      const now = Date.now();
+      const pipeline = redis.pipeline();
+      for (const row of result.rows) {
+        pipeline.zadd(queueKeyForPriority(row.priority), 'NX', now, row.url_hash);
+      }
+      await pipeline.exec();
+    }
+
+    return result.rows.length;
   }
+
+  /**
+   * Re-populates the Redis priority queues from Postgres.
+   *
+   * Redis is a cache of the durable frontier. If Redis restarts without
+   * persistence, is flushed, or a queue key is deleted, every pending URL
+   * would be orphaned: present in Postgres but invisible to workers. This
+   * compares the queued count with the pending count and, only if Redis is
+   * missing entries, walks pending rows by keyset pagination and ZADDs them
+   * with NX (existing members keep their retry delays).
+   *
+   * @returns Number of hashes re-added to Redis
+   */
+  async rehydrateQueues(batchSize = 1000): Promise<number> {
+    const depths = await this.getQueueDepths();
+    const queued = depths.high + depths.medium + depths.low;
+    const pendingResult = await pool.query(
+      `SELECT COUNT(*) AS count FROM url_frontier WHERE status = 'pending'`
+    );
+    const pending = parseInt(pendingResult.rows[0].count);
+    if (queued >= pending) return 0;
+
+    let lastId = 0;
+    let added = 0;
+    for (;;) {
+      const result = await pool.query<{
+        id: number;
+        url_hash: string;
+        priority: number;
+        scheduled_at: Date;
+      }>(
+        `SELECT id, url_hash, priority, scheduled_at FROM url_frontier
+         WHERE status = 'pending' AND id > $1
+         ORDER BY id LIMIT $2`,
+        [lastId, batchSize]
+      );
+      if (result.rows.length === 0) break;
+
+      const now = Date.now();
+      const pipeline = redis.pipeline();
+      for (const row of result.rows) {
+        const eligibleAt = Math.max(now, new Date(row.scheduled_at).getTime() || now);
+        pipeline.zadd(queueKeyForPriority(row.priority), 'NX', eligibleAt, row.url_hash);
+      }
+      const replies = (await pipeline.exec()) ?? [];
+      for (const [err, count] of replies) {
+        if (!err) added += Number(count) || 0;
+      }
+      lastId = result.rows[result.rows.length - 1].id;
+    }
+
+    return added;
+  }
+
+  /**
+   * Deletes every frontier row and empties the Redis priority queues.
+   */
+  async clear(): Promise<void> {
+    await pool.query('DELETE FROM url_frontier');
+    await redis.del(...PRIORITY_QUEUES);
+  }
+}
+
+function clampPriority(priority: number): number {
+  const p = Math.round(Number(priority));
+  if (!Number.isFinite(p)) return config.priorities.medium;
+  return Math.min(config.priorities.high, Math.max(config.priorities.low, p));
 }
 
 /**
  * Singleton instance of the FrontierService.
- * Use this export for all frontier operations to ensure consistent state.
  */
 export const frontierService = new FrontierService();

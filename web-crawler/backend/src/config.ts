@@ -164,6 +164,55 @@ export const config = {
      * @default 3600 (1 hour)
      */
     robotsTxtCacheTtl: parseInt(process.env.ROBOTS_CACHE_TTL || '3600', 10),
+
+    /**
+     * Maximum link-hop depth from a seed. Links discovered beyond this depth
+     * are dropped. This is the primary defense against crawler traps
+     * (infinite calendars, session-id URL spaces, faceted search).
+     * @default 6
+     */
+    maxDepth: parseInt(process.env.CRAWLER_MAX_DEPTH || '6', 10),
+
+    /**
+     * URLs longer than this are dropped. Extremely long URLs are almost
+     * always generated (tracking params, recursive paths) rather than content.
+     * @default 2048
+     */
+    maxUrlLength: parseInt(process.env.CRAWLER_MAX_URL_LENGTH || '2048', 10),
+
+    /**
+     * Maximum number of outbound links enqueued from a single page.
+     * Bounds the fan-out of link farms and giant sitemaps-as-HTML pages.
+     * @default 500
+     */
+    maxLinksPerPage: parseInt(process.env.CRAWLER_MAX_LINKS_PER_PAGE || '500', 10),
+
+    /**
+     * How many times a URL that failed with a transient error (timeout,
+     * connection reset, 5xx, 429) is rescheduled before being marked failed.
+     * @default 3
+     */
+    maxRetries: parseInt(process.env.CRAWLER_MAX_RETRIES || '3', 10),
+
+    /**
+     * Base delay for frontier-level retry backoff (doubles per attempt).
+     * @default 60000 (1 minute)
+     */
+    retryBaseDelayMs: parseInt(process.env.CRAWLER_RETRY_BASE_DELAY || '60000', 10),
+
+    /**
+     * A URL that has been in_progress longer than this is assumed to belong to
+     * a crashed worker and is returned to the queue (lease expiry).
+     * @default 10
+     */
+    staleLeaseMinutes: parseInt(process.env.CRAWLER_STALE_LEASE_MINUTES || '10', 10),
+
+    /**
+     * How often the API server runs frontier maintenance (lease recovery,
+     * Redis queue rehydration, stale-worker cleanup).
+     * @default 60000 (1 minute)
+     */
+    maintenanceIntervalMs: parseInt(process.env.CRAWLER_MAINTENANCE_INTERVAL || '60000', 10),
   },
 
   /**

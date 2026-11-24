@@ -11,6 +11,7 @@
 
 import { Router, Request, Response } from 'express';
 import { pool } from '../models/database.js';
+import { redis, REDIS_KEYS } from '../models/redis.js';
 import { robotsService } from '../services/robots.js';
 
 const router = Router();
@@ -150,7 +151,7 @@ router.post('/:domain/refresh-robots', async (req: Request, res: Response) => {
   try {
     const { domain } = req.params;
 
-    robotsService.clearCache(domain);
+    await robotsService.clearCache(domain);
     await robotsService.getParser(domain);
 
     const result = await pool.query(
@@ -191,11 +192,20 @@ router.put('/:domain/settings', async (req: Request, res: Response) => {
     const params: (string | number | boolean)[] = [domain];
 
     if (crawlDelay !== undefined) {
+      const delay = Number(crawlDelay);
+      if (!Number.isFinite(delay) || delay <= 0 || delay > 3600) {
+        res.status(400).json({ error: 'crawlDelay must be a number of seconds in (0, 3600]' });
+        return;
+      }
       updates.push(`crawl_delay = $${params.length + 1}`);
-      params.push(crawlDelay);
+      params.push(delay);
     }
 
     if (isAllowed !== undefined) {
+      if (typeof isAllowed !== 'boolean') {
+        res.status(400).json({ error: 'isAllowed must be a boolean' });
+        return;
+      }
       updates.push(`is_allowed = $${params.length + 1}`);
       params.push(isAllowed);
     }
@@ -207,10 +217,26 @@ router.put('/:domain/settings', async (req: Request, res: Response) => {
 
     updates.push('updated_at = NOW()');
 
-    await pool.query(
+    const result = await pool.query(
       `UPDATE domains SET ${updates.join(', ')} WHERE domain = $1`,
       params
     );
+    if (result.rowCount === 0) {
+      res.status(404).json({ error: 'Domain not found' });
+      return;
+    }
+
+    // Workers read politeness settings from Redis, not Postgres - publish them.
+    // The override key is separate from the robots.txt delay so a robots
+    // refresh can't silently undo an operator's choice.
+    if (crawlDelay !== undefined) {
+      await redis.set(REDIS_KEYS.DOMAIN_DELAY_OVERRIDE(domain), String(Number(crawlDelay)));
+    }
+    if (isAllowed === false) {
+      await redis.set(REDIS_KEYS.DOMAIN_BLOCKED(domain), '1');
+    } else if (isAllowed === true) {
+      await redis.del(REDIS_KEYS.DOMAIN_BLOCKED(domain));
+    }
 
     res.json({ message: 'Domain settings updated' });
   } catch (error) {

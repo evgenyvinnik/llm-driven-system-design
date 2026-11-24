@@ -26,6 +26,20 @@ import { redis, REDIS_KEYS } from '../models/redis.js';
 import { pool } from '../models/database.js';
 import { config } from '../config.js';
 
+/** RFC 9309 requires parsing at least 500 KiB; anything larger is truncated/ignored. */
+const MAX_ROBOTS_BYTES = 512 * 1024;
+/** How long an unreachable robots.txt is negatively cached in memory. */
+const UNREACHABLE_CACHE_MS = 60 * 1000;
+/** Upper bound on honored Crawl-delay values (seconds). */
+const MAX_CRAWL_DELAY_SECONDS = 60;
+
+export type RobotsFetchResult =
+  | { kind: 'ok'; body: string }
+  | { kind: 'missing' }
+  | { kind: 'unreachable' };
+
+export type RobotsAccess = 'allowed' | 'disallowed' | 'unavailable';
+
 /**
  * Robots.txt Service - fetches, parses, and caches robots.txt for domains.
  *
@@ -56,120 +70,123 @@ export class RobotsService {
   private cache: Map<
     string,
     {
-      parser: ReturnType<typeof robotsParser>;
-      fetchedAt: number;
+      /** Raw robots.txt body; null = unreachable (negative cache entry) */
+      content: string | null;
+      /** Parsers built from `content`, keyed by URL scheme (see parserFor) */
+      parsers: Map<string, ReturnType<typeof robotsParser>>;
+      expiresAt: number;
     }
   > = new Map();
 
   /**
-   * Fetches robots.txt content from a domain.
+   * Fetches robots.txt for a domain, following RFC 9309 status semantics.
    *
-   * Attempts HTTPS first, then falls back to HTTP if HTTPS fails.
-   * This handles both modern HTTPS-only sites and legacy HTTP sites.
+   * - 2xx: rules apply                         -> { kind: 'ok', body }
+   * - 4xx (incl. 404): no restrictions         -> { kind: 'missing' }
+   * - 5xx / network error on both schemes:     -> { kind: 'unreachable' }
    *
-   * @param domain - The domain hostname (e.g., 'example.com')
-   * @returns The robots.txt content as a string, or null if not found/failed
+   * "Unreachable" must NOT be treated as "allow everything": a server that
+   * is erroring is exactly the one we should not be hammering. The crawler
+   * defers URLs for such domains and retries later.
+   *
+   * HTTPS is tried first; HTTP is tried only if HTTPS could not be reached at
+   * all (connection error), not when HTTPS answered with a status code.
    */
-  async fetchRobotsTxt(domain: string): Promise<string | null> {
-    try {
-      const url = `https://${domain}/robots.txt`;
-      const response = await axios.get(url, {
-        timeout: 10000,
-        headers: {
-          'User-Agent': config.crawler.userAgent,
-        },
-        validateStatus: (status) => status < 500,
-      });
-
-      if (response.status === 200) {
-        return response.data;
-      }
-
-      // Try HTTP if HTTPS fails
+  async fetchRobotsTxt(domain: string): Promise<RobotsFetchResult> {
+    const attempt = async (scheme: 'https' | 'http'): Promise<RobotsFetchResult | null> => {
       try {
-        const httpUrl = `http://${domain}/robots.txt`;
-        const httpResponse = await axios.get(httpUrl, {
+        const response = await axios.get(`${scheme}://${domain}/robots.txt`, {
           timeout: 10000,
-          headers: {
-            'User-Agent': config.crawler.userAgent,
-          },
-          validateStatus: (status) => status < 500,
+          maxRedirects: 5,
+          maxContentLength: MAX_ROBOTS_BYTES,
+          responseType: 'text',
+          headers: { 'User-Agent': config.crawler.userAgent },
+          validateStatus: () => true,
         });
-
-        if (httpResponse.status === 200) {
-          return httpResponse.data;
+        if (response.status >= 200 && response.status < 300) {
+          const body = typeof response.data === 'string' ? response.data : '';
+          return { kind: 'ok', body };
         }
+        if (response.status >= 400 && response.status < 500) {
+          return { kind: 'missing' };
+        }
+        return { kind: 'unreachable' };
       } catch {
-        // HTTP also failed, continue with null
+        return null; // could not connect on this scheme
       }
+    };
 
-      return null;
-    } catch (error) {
-      console.error(`Failed to fetch robots.txt for ${domain}:`, error);
-      return null;
-    }
+    return (await attempt('https')) ?? (await attempt('http')) ?? { kind: 'unreachable' };
   }
 
   /**
    * Gets or fetches a robots.txt parser for a domain.
    *
-   * Implements a three-level cache hierarchy:
-   * 1. In-memory cache (checked first, fastest)
-   * 2. Redis cache (shared across workers)
-   * 3. Network fetch (only if both caches miss)
+   * Cache hierarchy: in-memory (per worker) -> Redis (shared, TTL) -> network.
+   * On a successful or 4xx fetch the result is cached for `robotsTxtCacheTtl`,
+   * persisted to PostgreSQL, and the Crawl-delay is published to Redis for
+   * the frontier's politeness lock.
    *
-   * After fetching, the robots.txt is:
-   * - Parsed to create a reusable parser object
-   * - Cached in memory and Redis with TTL
-   * - Stored in PostgreSQL for durability
-   * - Crawl delay is extracted and cached separately
-   *
-   * @param domain - The domain to get robots.txt parser for
-   * @returns Robots parser instance, or null if fetch failed
+   * @returns Parser, or null if robots.txt is currently unreachable (5xx/network)
    */
   async getParser(
-    domain: string
+    domain: string,
+    scheme: 'http' | 'https' = 'https'
   ): Promise<ReturnType<typeof robotsParser> | null> {
     const now = Date.now();
 
-    // Check in-memory cache first
     const cached = this.cache.get(domain);
-    if (cached && now - cached.fetchedAt < config.crawler.robotsTxtCacheTtl * 1000) {
-      return cached.parser;
+    if (cached && now < cached.expiresAt) {
+      return cached.content === null ? null : this.parserFor(cached, domain, scheme);
     }
 
-    // Check Redis cache
     const redisCached = await redis.get(REDIS_KEYS.DOMAIN_ROBOTS(domain));
-    if (redisCached) {
-      const parser = robotsParser(`https://${domain}/robots.txt`, redisCached);
-      this.cache.set(domain, { parser, fetchedAt: now });
-      return parser;
+    if (redisCached !== null) {
+      const entry = {
+        content: redisCached,
+        parsers: new Map(),
+        expiresAt: now + config.crawler.robotsTxtCacheTtl * 1000,
+      };
+      this.cache.set(domain, entry);
+      return this.parserFor(entry, domain, scheme);
     }
 
-    // Fetch from network
-    const robotsTxt = await this.fetchRobotsTxt(domain);
-    const robotsContent = robotsTxt || '';
+    const fetched = await this.fetchRobotsTxt(domain);
+    if (fetched.kind === 'unreachable') {
+      // Negative-cache briefly so every URL of a down domain doesn't trigger
+      // its own robots.txt fetch.
+      this.cache.set(domain, {
+        content: null,
+        parsers: new Map(),
+        expiresAt: now + UNREACHABLE_CACHE_MS,
+      });
+      return null;
+    }
 
-    const parser = robotsParser(
-      `https://${domain}/robots.txt`,
-      robotsContent
-    );
+    const robotsContent = fetched.kind === 'ok' ? fetched.body : '';
+    const entry = {
+      content: robotsContent,
+      parsers: new Map(),
+      expiresAt: now + config.crawler.robotsTxtCacheTtl * 1000,
+    };
+    const parser = this.parserFor(entry, domain, scheme);
 
-    // Cache in Redis
     await redis.setex(
       REDIS_KEYS.DOMAIN_ROBOTS(domain),
       config.crawler.robotsTxtCacheTtl,
       robotsContent
     );
+    this.cache.set(domain, entry);
 
-    // Cache in memory
-    this.cache.set(domain, { parser, fetchedAt: now });
-
-    // Extract crawl delay and store
-    const crawlDelay = parser.getCrawlDelay(config.crawler.userAgent) || 1.0;
+    // Crawl-delay from robots.txt, falling back to the configured default.
+    // Capped so a hostile/mistaken "Crawl-delay: 86400" can't pin a worker lock for a day.
+    const declared = parser.getCrawlDelay(config.crawler.userAgent);
+    const crawlDelay = Math.min(
+      MAX_CRAWL_DELAY_SECONDS,
+      declared && declared > 0 ? declared : config.crawler.defaultDelay / 1000
+    );
     await redis.set(REDIS_KEYS.DOMAIN_DELAY(domain), crawlDelay.toString());
 
-    // Update database
     await pool.query(
       `INSERT INTO domains (domain, robots_txt, robots_fetched_at, crawl_delay)
        VALUES ($1, $2, NOW(), $3)
@@ -185,38 +202,50 @@ export class RobotsService {
   }
 
   /**
-   * Checks if a URL is allowed to be crawled according to robots.txt.
+   * Returns (and memoizes) a parser for one scheme.
    *
-   * This should be called for every URL before crawling. If robots.txt
-   * cannot be fetched, we assume the URL is allowed (fail-open behavior).
+   * robots-parser only answers for URLs on the same origin as the robots.txt
+   * URL it was constructed with - for any other origin `isAllowed()` returns
+   * undefined. The original code always constructed it with `https://`, so
+   * every `http://` page got `undefined`, which was treated as "allowed":
+   * robots.txt was silently ignored for all plain-HTTP sites.
+   */
+  private parserFor(
+    entry: { content: string | null; parsers: Map<string, ReturnType<typeof robotsParser>> },
+    domain: string,
+    scheme: 'http' | 'https'
+  ): ReturnType<typeof robotsParser> {
+    let parser = entry.parsers.get(scheme);
+    if (!parser) {
+      parser = robotsParser(`${scheme}://${domain}/robots.txt`, entry.content ?? '');
+      entry.parsers.set(scheme, parser);
+    }
+    return parser;
+  }
+
+  /**
+   * Three-way robots.txt check used by the crawler.
    *
-   * @param url - The full URL to check
-   * @param domain - The domain hostname of the URL
-   * @returns true if crawling is allowed, false if disallowed by robots.txt
-   *
-   * @example
-   * ```typescript
-   * const allowed = await robotsService.isAllowed(
-   *   'https://example.com/private/data',
-   *   'example.com'
-   * );
-   * if (!allowed) {
-   *   console.log('Blocked by robots.txt');
-   * }
-   * ```
+   * @returns 'allowed', 'disallowed', or 'unavailable' (robots.txt could not
+   *          be fetched due to 5xx/network errors - caller should retry later)
+   */
+  async checkAccess(url: string, domain: string): Promise<RobotsAccess> {
+    const scheme = url.startsWith('http:') ? 'http' : 'https';
+    const parser = await this.getParser(domain, scheme);
+    if (!parser) return 'unavailable';
+    return parser.isAllowed(url, config.crawler.userAgent) === false ? 'disallowed' : 'allowed';
+  }
+
+  /**
+   * Boolean convenience wrapper: true only if robots.txt was fetched and
+   * allows the URL. Unavailable robots.txt counts as not allowed (fail closed).
    */
   async isAllowed(url: string, domain: string): Promise<boolean> {
     try {
-      const parser = await this.getParser(domain);
-      if (!parser) {
-        // If we can't get robots.txt, assume allowed
-        return true;
-      }
-
-      return parser.isAllowed(url, config.crawler.userAgent) ?? true;
+      return (await this.checkAccess(url, domain)) === 'allowed';
     } catch (error) {
       console.error(`Error checking robots.txt for ${url}:`, error);
-      return true;
+      return false;
     }
   }
 
@@ -291,10 +320,10 @@ export class RobotsService {
    *
    * @param domain - The domain to clear cache for
    */
-  clearCache(domain: string): void {
+  async clearCache(domain: string): Promise<void> {
     this.cache.delete(domain);
-    redis.del(REDIS_KEYS.DOMAIN_ROBOTS(domain));
-    redis.del(REDIS_KEYS.DOMAIN_DELAY(domain));
+    // Awaited so a getParser() call right after this cannot read the old Redis copy
+    await redis.del(REDIS_KEYS.DOMAIN_ROBOTS(domain), REDIS_KEYS.DOMAIN_DELAY(domain));
   }
 }
 

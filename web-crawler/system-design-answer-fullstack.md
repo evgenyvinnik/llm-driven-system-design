@@ -33,10 +33,15 @@ I'll focus on end-to-end data flow and technology choices for the integration la
 
 | Requirement | Target | Implication |
 |-------------|--------|-------------|
-| Scale | 10,000 pages/second | Need efficient data propagation |
-| Dashboard Latency | < 2 seconds | Real-time protocol required |
-| Type Safety | End-to-end | Shared contracts between FE/BE |
-| Operator Control | Immediate effect | Dual-write to cache + DB |
+| Scale | 10,000 pages/second | Dedup and frontier on the hot path; dashboard reads aggregates, never events |
+| Politeness | ≤ 1 req/s/host, robots.txt honored | A correctness rule, enforced in the frontier, not the UI |
+| Dashboard freshness | ≤ 5 seconds | Snapshot polling is sufficient — no push channel required |
+| API contract | No silent drift | Explicit row→DTO mapping at every handler |
+| Operator control | Effective on the next fetch | Settings published to the store workers actually read |
+
+### Back-of-Envelope
+
+"10K pages/s at ~50 links per page is ~500K dedup checks per second — the seen-set, not the fetcher, is the hot path. And at one request per host per second, 10K pages/s means at least 10K distinct hosts must be ready at every instant, so the frontier has to optimize for *breadth*. On the frontend side, the same numbers say the dashboard can never show individual crawl events: 10K rows a second is unreadable and unrenderable, so the API serves aggregates and a short recent-pages list."
 
 ---
 
@@ -45,38 +50,34 @@ I'll focus on end-to-end data flow and technology choices for the integration la
 ### End-to-End Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         Admin Dashboard (React)                          │
-│   Real-time stats │ URL frontier │ Domain mgmt │ Worker monitoring      │
-└─────────────────────────────────────────────────────────────────────────┘
-                    │                           │
-                    │ REST API                  │ WebSocket
-                    ▼                           ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                          API Server (Express)                            │
-│   Routes: /api/urls, /api/domains, /api/workers, /api/stats             │
-│   WebSocket: /ws/stats (real-time updates)                              │
-└─────────────────────────────────────────────────────────────────────────┘
-                    │                           │
-        ┌───────────┴───────────┐               │
-        ▼                       ▼               ▼
-┌───────────────┐      ┌───────────────┐  ┌──────────────┐
-│  Coordinator  │      │    Workers    │  │ Stats Agg    │
-│               │◄────►│   (1...N)     │  │              │
-│ - Assignment  │      │ - Fetch pages │  │ - Metrics    │
-│ - Scheduling  │      │ - Extract     │  │ - Broadcast  │
-└───────────────┘      └───────────────┘  └──────────────┘
-        │                       │                 │
-        └───────────────────────┴─────────────────┘
-                                │
-        ┌───────────────────────┼───────────────────────┐
-        ▼                       ▼                       ▼
-┌───────────────┐      ┌───────────────┐      ┌───────────────┐
-│  PostgreSQL   │      │     Redis     │      │ Object Store  │
-│ - URL frontier│      │ - Rate limits │      │ - Page content│
-│ - Domain meta │      │ - Pub/Sub     │      │ - robots.txt  │
-└───────────────┘      └───────────────┘      └───────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                      Admin Dashboard (React SPA)                    │
+│  Dashboard │ Frontier │ Domains │ Pages │ Admin (seeds, recovery)   │
+│  Zustand store ── polls GET /api/stats every 5s                     │
+└──────────────────────────────┬──────────────────────────────────────┘
+                               │ REST (JSON DTOs, session cookie)
+                               ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                          API Server (Express)                       │
+│  /api/stats · /api/frontier · /api/domains · /api/pages · /metrics  │
+│  Frontier maintenance loop: lease recovery · queue rehydration      │
+└───────────────┬───────────────────────────────────┬─────────────────┘
+                │                                   │
+                ▼                                   ▼
+┌───────────────────────────────┐   ┌───────────────────────────────┐
+│          PostgreSQL           │   │         Redis / Valkey        │
+│ url_frontier (truth: status,  │   │ priority queues (eligible-at) │
+│   retry_count, last_error)    │   │ domain locks · seen-set       │
+│ crawled_pages · domains       │   │ robots cache · counters       │
+└───────────────▲───────────────┘   └───────────────▲───────────────┘
+                │                                   │
+        ┌───────┴───────────────────────────────────┴───────┐
+        │        Crawler workers 1..N (stateless)           │
+        │  claim → robots → fetch → parse → dedup → enqueue │
+        └───────────────────────────────────────────────────┘
 ```
+
+"There is no coordinator and no push channel. Workers coordinate only through the frontier — a host lock in Redis and a conditional status update in Postgres — and the dashboard is a read-mostly client of the same two stores via the API. Each of those absences is a choice I'll defend in a deep dive."
 
 ---
 
@@ -88,7 +89,7 @@ The **frontend is straightforward**: five read-mostly pages, a polling store, an
 
 The **backend is where every hard decision is**, and almost all of them are about one thing: which store owns which fact, and what happens when they disagree. Postgres owns the frontier's truth; Redis owns its ordering. Postgres owns domain settings; Redis owns the copy workers actually read. Postgres owns crawled-page records; Redis owns the visited-set membership test. Each pairing is a deliberate split of durability from speed, and each one needs an answer to "what if the fast side is wrong?"
 
-The three answers this system gives are worth stating together, because they're the same answer: **re-check against Postgres on dequeue**, **rebuild the cache from Postgres on boot**, and **let the durable write win when a dual write is interrupted**. Different mechanisms, one principle — the fast store may be stale or missing, never authoritative.
+The three answers this system gives are worth stating together, because they're the same answer: **arbitrate every claim with a conditional update in Postgres**, **rebuild the Redis queues from Postgres when they go missing**, and **let the durable write win when a dual write is interrupted**. Different mechanisms, one principle — the fast store may be stale or missing, never authoritative.
 
 ---
 
@@ -100,9 +101,13 @@ Everything else in a crawler is plumbing around one data structure. The frontier
 
 Postgres holds `url_frontier` — the durable record, with a status per URL. Redis holds three sorted sets, one per priority level, containing URL hashes.
 
-Adding a URL writes to both: an `INSERT ... ON CONFLICT (url_hash) DO NOTHING` into Postgres, and a push onto the sorted set matching its priority. Taking work pops from Redis high→medium→low, loads the row from Postgres, **re-checks that its status is still `pending`**, and marks it `in_progress`.
+Adding a batch of links costs a constant number of round trips: one membership check against the seen-set, one multi-row `INSERT ... ON CONFLICT (url_hash) DO NOTHING RETURNING`, and one pipelined push of **only the rows that were actually inserted**. The sorted-set score is the time the URL becomes *eligible*, not when it was found — new URLs score "now", retries score "now + backoff" — so delayed retries need no separate timer queue.
 
-That re-check is the load-bearing line. The two stores are eventually consistent — a hash can linger in Redis after its Postgres row has moved on — so the Redis queue is treated as a *hint about what to look at*, never as the truth about what needs doing. Postgres is the arbiter. Without the re-check, two workers popping near-simultaneously could both proceed on the same URL.
+Taking work reads eligible hashes from Redis high→medium→low, loads their rows from Postgres in one query, and drops hashes whose rows are no longer pending. Then the claim: win the host's politeness lock, and flip the row with a **conditional update** (`status = 'in_progress' WHERE status = 'pending'`), proceeding only if exactly one row changed.
+
+That conditional update is the load-bearing line. The two stores are eventually consistent — a hash can linger in Redis after its row has moved on — so the Redis queue is a *hint about what to look at*, never the truth about what needs doing. Postgres is the arbiter, and the arbitration has to be atomic: a read-then-write re-check still lets two workers both see `pending` and both proceed.
+
+One detail that sounds cosmetic and isn't: re-adding an already-queued URL must not reset its score. If it did, every new inbound link would push a page to the back of the queue — so the most-linked pages on the web, the ones you want first, would starve.
 
 **Why not pure Postgres with `FOR UPDATE SKIP LOCKED`?** It's a genuinely good pattern and it would work: one store, one source of truth, no consistency seam at all. What it costs is that every dequeue becomes a write-locking scan against the priority index — the hottest query in the system contending with the inserts that new link discoveries are constantly producing. Redis moves the hot path onto a data structure built for it. The price is exactly the seam described above, and the re-check is what makes that price safe rather than dangerous.
 
@@ -112,19 +117,25 @@ Each URL is normalized (lowercase host, strip default ports and fragments, sort 
 
 **Normalization is where the real bugs live**, not hashing. `example.com/page`, `example.com/page#section`, and `EXAMPLE.com/page?` are one page; if normalization disagrees with itself across code paths, dedup silently fails and the crawler re-fetches forever. Doing it once, in one function, before hashing is the whole defense.
 
-Exact dedup means zero false negatives — a real page is never skipped. The cost is unbounded memory: roughly 64 bytes per hash, so 10 billion URLs is about 640GB, which is not a Redis instance. A Bloom filter is the production answer at ~10× less memory for ~0.1% false positives, and the trade is acceptable because a false positive means one page never gets crawled out of billions. What makes the migration awkward is that a Bloom filter can't be built incrementally from nothing without a full pass over history — which is the honest reason a learning-scale system starts exact.
+Normalization also strips tracking parameters (`utm_*`, `gclid`, `fbclid`): one email campaign can otherwise mint a thousand aliases of every page on a site.
+
+Exact dedup means zero false positives — a real page is never wrongly skipped. The cost is unbounded memory: the hashes are stored as 64-character hex, so 10 billion URLs is about 640GB, which is not a Redis instance. A Bloom filter is the production answer — about 18GB for 10B URLs at a 0.1% false-positive rate — but the false positive is worth stating precisely: it's *deterministic*. The same URL sets the same bits every time, so a wrongly-"seen" URL is never crawled that cycle; rediscovering it doesn't help. That's tolerable for 1 in 1,000 ordinary links, which is why seeds and sitemap URLs should bypass the filter and go straight to the exact database check.
 
 ### Politeness as a lock, not a rate limiter
 
-Before fetching, a worker runs `SET crawler:domain:{d}:lock {workerId} NX EX {crawlDelay}`. Winning the key is permission to crawl that domain right now.
+Before fetching, a worker runs `SET crawler:domain:{d}:lock {workerId} NX PX {crawlDelayMs}`. Winning the key is permission to start a request to that host right now.
 
-This one primitive does two jobs at once, which is why it's the nice part of the design. The **TTL is the crawl delay** — the key self-releases exactly when the next fetch becomes permissible, so no scheduler tracks "when may I next hit this host." And `NX` gives **worker exclusivity** for free: two workers cannot hold one domain's lock, so they cannot double-crawl it, with no coordination between them.
+The nice part is that the **TTL is the crawl delay** — the key self-releases exactly when the next request becomes permissible, so no scheduler tracks "when may I next hit this host," and a crashed worker can never deadlock a host. (Milliseconds rather than seconds, so a `Crawl-delay: 0.5` isn't rounded up to a full second.)
+
+What the lock is *not* is worker exclusivity, and it's tempting to think it is. It expires after one crawl delay, while a fetch can take thirty seconds — so a second worker can legitimately win the same host's lock while the first is still downloading. That's correct for politeness (request *starts* stay spaced), which is exactly why exclusivity has to come from the conditional update above rather than from the lock.
+
+The gate also has to cover every request, not just the main fetch. Two leaks: an in-process retry is a new request and must wait for the host's slot like any other; and an HTTP client that auto-follows redirects will hop to a different host without consulting its robots.txt or lock. So redirects are disabled in the client and the target is enqueued as a new URL.
 
 What it gives up is throughput shape. Politeness is per-domain, so one large site is a single-lane road no matter how many workers exist, and workers spin when every eligible domain is locked. A token bucket would let short bursts through while holding the average — closer to how a human browses — at the cost of losing the elegant equivalence between "the lock" and "the delay."
 
 ### Crash safety by lease
 
-A worker marks a URL `in_progress` and then fetches it *outside* any transaction. If it dies, the row is stranded — so a periodic sweep resets `in_progress` rows older than N minutes back to `pending`.
+A worker marks a URL `in_progress` and then fetches it *outside* any transaction. If it dies, the row is stranded — so a sweep every minute resets `in_progress` rows older than ten minutes back to `pending` **and re-adds them to their Redis queue**. That second half is the easy one to forget: workers only dequeue from Redis, so a row that's pending in Postgres but absent from Redis is invisible forever. The same loop rehydrates the queues wholesale if Redis comes back empty after a restart — compare queued count to pending count, and if Redis is short, re-add pending rows with ZADD NX so existing retry delays survive.
 
 The alternative is holding a database transaction for the duration of the fetch, which makes crash recovery automatic via rollback. It's wrong here: a slow page holds a connection for its entire timeout, and the pool is exhausted by exactly the hosts you least want to be blocked on. Leasing accepts at-least-once delivery instead — a crashed worker's URL gets crawled twice — which is harmless because crawling is idempotent. **That's the general shape: pick at-least-once whenever the work is idempotent, because the machinery for exactly-once costs more than the duplicate does.**
 
@@ -212,22 +223,23 @@ When an operator changes a domain's crawl delay from the dashboard, workers need
 ### Solution: Write to Both Redis and PostgreSQL
 
 ```
-Dashboard                API Server               Redis              PostgreSQL
-    │                        │                      │                     │
-    │  PATCH /domains/foo    │                      │                     │
-    │  {crawlDelayMs: 2000}  │                      │                     │
-    │───────────────────────►│                      │                     │
-    │                        │                      │                     │
-    │                        │  SET crawldelay:foo  │                     │
-    │                        │───────────────────►  │  (immediate effect) │
-    │                        │                      │                     │
-    │                        │  UPDATE domains...   │                     │
-    │                        │──────────────────────────────────────────► │
-    │                        │                      │  (durable storage)  │
-    │                        │                      │                     │
-    │  200 OK                │                      │                     │
-    │◄───────────────────────│                      │                     │
+Dashboard              API Server              PostgreSQL             Redis
+    │                      │                        │                   │
+    │ PUT /domains/foo/    │                        │                   │
+    │   settings           │                        │                   │
+    │ {crawlDelay: 2}      │                        │                   │
+    │─────────────────────▶│  validate (0 < d ≤ 3600)                   │
+    │                      │  UPDATE domains ...    │                   │
+    │                      │───────────────────────▶│ (durable, 1st)    │
+    │                      │  404 if no row         │                   │
+    │                      │  SET delay_override:foo 2                  │
+    │                      │───────────────────────────────────────────▶│
+    │                      │                        │ (workers read     │
+    │  200 OK              │                        │  this on claim)   │
+    │◀─────────────────────│                        │                   │
 ```
+
+"The override lives in its own key, separate from the robots.txt delay, for two reasons. A robots.txt refresh rewrites the robots key, and it must not silently erase an operator's choice. And workers compute the effective delay as **max(override, robots delay)** — the slider can slow a host down but never speed it past what the site asked for. A control that could set a delay below robots.txt would be a one-click way to violate it."
 
 ### Why Not Just PostgreSQL?
 
@@ -245,19 +257,19 @@ Dashboard                API Server               Redis              PostgreSQL
 
 A dual write has an order, and the order determines the failure mode. Writing **Redis first, then Postgres** means a crash between them leaves workers honoring a delay that won't survive a restart — the setting silently reverts, and the operator who set it has no idea. Writing **Postgres first, then Redis** means a crash leaves the setting durable but not yet in effect — the operator's change appears saved and workers ignore it until something repopulates the cache.
 
-Neither is "safe"; they fail in opposite directions. Postgres-first is the better default because the divergence is *self-correcting* — any process that repopulates the cache from the database converges on the right answer, whereas Redis-first requires someone to notice the loss and redo the change. That's the same principle as the frontier's status re-check and the geo/index backfills elsewhere in this system: **make the durable store authoritative and the fast store rebuildable, so recovery is a refresh rather than an investigation.**
+Neither is "safe"; they fail in opposite directions. Postgres-first is the better default because the divergence is *self-correcting* — any process that repopulates the cache from the database converges on the right answer, whereas Redis-first requires someone to notice the loss and redo the change. That's the same principle as the frontier's conditional claim, lease re-enqueue, and queue rehydration: **make the durable store authoritative and the fast store rebuildable, so recovery is a refresh rather than an investigation.**
 
 The version that avoids the choice is an outbox — write the setting and an event in one transaction, and let a relay update Redis — which buys real atomicity for the cost of a relay process and end-to-end latency measured in the relay's poll interval, not milliseconds.
 
-### Handling Dual-Write Failures
+### Handling Dual-Write Failures (Postgres first)
 
 | Scenario | Handling |
 |----------|----------|
-| Redis write fails | Return error, don't update PostgreSQL |
-| PostgreSQL write fails | Redis already updated, log for reconciliation |
-| Both succeed | Ideal path |
+| PostgreSQL write fails | Return 500; nothing changed anywhere — the operator retries |
+| PostgreSQL succeeds, Redis fails | Return 500; the operator re-submits, and because the write is idempotent the second attempt simply applies it |
+| Both succeed | Effective on the next claim for that host |
 
-"We accept eventual consistency. If PostgreSQL fails after Redis succeeds, the worker has the new rate limit but it won't survive a restart. A background job can reconcile periodically."
+"We accept that a failed request can leave a setting saved but not yet in force, because the fix is a refresh, not an investigation: re-submitting converges, and a job that republishes settings from Postgres would close the gap automatically if this ever needed to be hands-off."
 
 ---
 
@@ -267,7 +279,7 @@ The admin surface looks like CRUD and isn't — each control exists because of a
 
 **Add seed URLs** is the entry point for the whole system; a crawler with an empty frontier does nothing, and there is no other way in.
 
-**Recover stale URLs** is the manual trigger for the lease sweep described above. It exists because the automatic sweep runs on a timer measured in minutes, and an operator who just restarted three workers doesn't want to wait for it.
+**Recover stale URLs** is the manual trigger for the lease sweep described above. The automatic sweep runs every minute but only reclaims leases older than ten, and an operator who just killed three workers doesn't want to wait for it.
 
 **Clear frontier** is genuinely dangerous and is presented that way — it's the escape hatch for the situation where a crawl has gone somewhere it shouldn't (a calendar generating infinite URLs, a session-ID parameter defeating dedup) and the fastest fix is to stop and reseed.
 
@@ -277,42 +289,29 @@ The admin surface looks like CRUD and isn't — each control exists because of a
 
 ---
 
-## ⚠️ Error Handling Philosophy (4 minutes)
+## ⚠️ Failure Semantics, End to End (5 minutes)
 
-### Backend: Typed Error Classes
+The error handling that matters in a crawler isn't the API's 400s and 500s — it's what happens to a URL when the open web misbehaves, and whether an operator can see it.
 
-| Error Type | HTTP Status | When Used |
-|------------|-------------|-----------|
-| ValidationError | 400 | Invalid input (Zod failure) |
-| NotFoundError | 404 | Domain/URL doesn't exist |
-| RateLimitError | 429 | Too many requests |
-| InternalError | 500 | Unexpected failures |
+### Classify every crawl outcome
 
-### Why Custom Classes Over HTTP Problem Details?
+| Outcome | Examples | Frontier action | What the dashboard shows |
+|---------|----------|-----------------|--------------------------|
+| Success | 200 text/html | completed; enqueue links unless the body is duplicate content | Row in Crawled Pages |
+| Redirect | 301/302/307/308 | completed; target enqueued as a new URL at the same depth | Target appears as its own row |
+| Permanent | 404, robots disallow, non-HTML, operator block | failed with `last_error`; added to seen-set; never retried | "failed" badge, reason on hover |
+| Transient | Timeout, reset, 5xx, 429, robots.txt unreachable | `retry_count + 1`; back to pending with score now + base × 2ⁿ (± jitter); failed after N | "pending · retry 2", reason on hover |
+| Not attempted | Host circuit breaker open | Deferred; no attempt counted | Stays pending |
 
-| Approach | Pros | Cons |
-|----------|------|------|
-| ✅ Custom error classes | Simple, TypeScript-native | Non-standard |
-| RFC 7807 Problem Details | Standard format | More verbose |
-| Plain objects | Flexible | No structure |
+"Getting this table wrong produces two opposite bugs. Treat transient as permanent and one network blip deletes a page from the crawl. Treat permanent as transient and a 404 retries forever. The jitter matters because failures are correlated: when a host dies, its thousand URLs fail together and would otherwise all return at the same second."
 
-**Decision: ✅ Custom classes**
+**robots.txt failures fail closed.** A 404 for robots.txt means "no rules — crawl freely," but a 5xx or timeout means "assume disallowed for now." The naive version — couldn't fetch, so assume allowed — starts crawling a site blind at exactly the moment it is struggling.
 
-"For an internal API, custom error classes with `code` and `message` fields are simpler. Problem Details adds value for public APIs where clients need standardization."
+### Making failure visible
 
-### Frontend: Layered Error Handling
+The frontier API returns `retryCount` and `lastError` per URL, and the Frontier page shows the retry count next to the status badge with the error as a tooltip. That's a small UI change with a large operational effect: "pending" alone can't distinguish a URL waiting its turn from one that has failed three times against a dying host. An operator who sees a column of "retry 3 · robots.txt unavailable" for one domain knows to look at that site, not at the workers.
 
-```
-┌─────────────────────────────────────────┐
-│         Error Boundary (React)          │  ← Catches render crashes
-├─────────────────────────────────────────┤
-│         Toast Notifications             │  ← Shows API errors
-├─────────────────────────────────────────┤
-│         API Client Layer                │  ← Parses error responses
-└─────────────────────────────────────────┘
-```
-
-"Three layers: Error Boundary catches React crashes, Toasts show API errors to users, API client layer parses and types the errors. Each layer has a specific job."
+> "Every new failure mode should be answerable from the dashboard without opening a log: what failed, how many times, and why."
 
 ---
 
@@ -324,10 +323,13 @@ The admin surface looks like CRUD and isn't — each control exists because of a
 | The upgrade path | ✅ SSE, if push is ever needed | ❌ WebSocket | One-way traffic over plain HTTP, with automatic browser reconnect |
 | API contract | ✅ Explicit row→DTO mapping | ❌ Returning `result.rows` | A raw row makes the DB schema the public contract |
 | Frontier storage | ✅ Redis queue + PG durability | ❌ Pure Postgres `SKIP LOCKED` | Keeps the hot dequeue off the priority index |
-| Dedup | ✅ Exact Redis SET | ❌ Bloom filter | Zero false negatives at this scale; Bloom is the answer past ~1B URLs |
-| Politeness | ✅ Per-domain `SET NX EX` lock | ❌ Global rate limiter | Lock TTL *is* the crawl delay, and it doubles as worker exclusivity |
-| Domain updates | ✅ Dual-write Redis + PG | ❌ Postgres only | Workers check rate limits on every fetch; a DB read per URL is not affordable |
-| Crash recovery | ✅ Lease + stale-URL reset | ❌ Long transaction per fetch | A hung HTTP request must not hold a DB lock |
+| Claiming a URL | ✅ Host lock + conditional `UPDATE ... WHERE status='pending'` | ❌ Host lock alone | Lock TTL is the crawl delay, shorter than a fetch — it can't guarantee exclusivity |
+| Retries | ✅ Eligible-at scores in the same queue | ❌ Separate delay queue / cron | Backoff and Retry-After become just a future score |
+| Dedup | ✅ Exact Redis SET | ❌ Bloom filter | No false positives at this scale; Bloom (with deterministic misses) past ~1B URLs |
+| Politeness | ✅ Per-domain `SET NX PX` lock covering retries and redirects | ❌ Global rate limiter | Lock TTL *is* the crawl delay; every request to a host passes the same gate |
+| Domain updates | ✅ Dual-write, Postgres first, then Redis | ❌ Redis first | Postgres-first failures converge on retry; override can only slow a host |
+| robots.txt 5xx | ✅ Defer as transient (fail closed) | ❌ Assume allowed | Don't crawl a struggling site blind |
+| Crash recovery | ✅ Lease reset + Redis re-enqueue, every minute | ❌ Long transaction per fetch | A hung HTTP request must not hold a DB lock |
 | Local dev topology | ✅ Compose profiles | ❌ Everything on by default | The app containers published the same port the source-run backend needs |
 
 ---
