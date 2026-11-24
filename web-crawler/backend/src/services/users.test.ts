@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 
 vi.mock('../models/database.js', () => ({ pool: { query: vi.fn(), connect: vi.fn() } }));
+vi.mock('../models/redis.js', () => ({ redis: {}, REDIS_KEYS: { AUTH_USER: (id: number) => `auth:${id}` } }));
 
 import {
   hashPassword,

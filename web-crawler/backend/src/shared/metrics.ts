@@ -184,6 +184,17 @@ export const rateLimitHitsCounter = new client.Counter({
 /**
  * Counter: Records cleaned up by the cleanup job.
  */
+/**
+ * Counter: auth-state lookups on protected requests, by result (hit = served
+ * from Redis, miss = fell back to Postgres).
+ */
+export const authCacheCounter = new client.Counter({
+  name: 'crawler_auth_cache_lookups_total',
+  help: 'Auth-state lookups for protected requests, by cache result',
+  labelNames: ['result'] as const,
+  registers: [metricsRegistry],
+});
+
 export const cleanupRecordsCounter = new client.Counter({
   name: 'crawler_cleanup_records_total',
   help: 'Number of records cleaned up',

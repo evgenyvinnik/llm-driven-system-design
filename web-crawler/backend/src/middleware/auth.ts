@@ -5,12 +5,18 @@
  * - Accounts live in the PostgreSQL `users` table (`services/users.ts`)
  * - Sessions live in Redis (connect-redis) and record the user's id, role and
  *   the `session_version` they were issued with
- * - Every route that needs auth re-reads the user by primary key and rejects
- *   the session if the user was deleted, disabled, or their version changed
- *   (role change, password change), so revocation is immediate
+ * - Every route that needs auth checks the user's current auth state - from a
+ *   version-guarded Redis cache that user mutations write through to, falling
+ *   back to Postgres - and rejects the session if the user was deleted,
+ *   disabled, or their version changed (role change, password change,
+ *   "sign out everywhere"), so revocation is immediate
  *
- * Simpler than JWT/OAuth for a learning project, and unlike stateless tokens,
- * revocation needs no denylist.
+ * Why sessions and not JWT: the requirement that matters here is immediate
+ * revocation (offboarding, a leaked cookie). A stateless JWT is valid until it
+ * expires; revoking one early needs a server-side denylist checked on every
+ * request - i.e. the same per-request lookup, plus token-rotation machinery.
+ * Sessions give revocation for free, and the Redis auth cache removes the
+ * Postgres lookup that made them cost more than a JWT check.
  *
  * @module middleware/auth
  */
@@ -25,6 +31,7 @@ import { redis } from '../models/redis.js';
 import { config } from '../config.js';
 import { logger } from '../shared/logger.js';
 import * as users from '../services/users.js';
+import { audit, record as recordAudit } from '../services/audit.js';
 
 /**
  * User roles for RBAC.
@@ -53,7 +60,7 @@ declare module 'express-session' {
 declare module 'express-serve-static-core' {
   interface Request {
     /** The verified current user, set by requireAuth / requireRole */
-    user?: users.User;
+    user?: users.AuthState;
   }
 }
 
@@ -102,11 +109,11 @@ export function createSessionMiddleware() {
  * Loads and verifies the session's user. Returns null (and destroys the
  * session) if the user is gone, disabled, or the session was revoked.
  */
-async function loadSessionUser(req: Request): Promise<users.User | null> {
+async function loadSessionUser(req: Request): Promise<users.AuthState | null> {
   const id = Number(req.session?.userId);
   if (!id) return null;
 
-  const user = await users.getUserById(id);
+  const user = await users.getAuthState(id);
   if (!user || user.disabled || user.sessionVersion !== req.session.sessionVersion) {
     logger.info({ userId: id }, 'Rejected revoked or stale session');
     await new Promise<void>((resolve) => req.session.destroy(() => resolve()));
@@ -175,7 +182,7 @@ export const requireAdmin = requireRole([UserRole.ADMIN]);
 /**
  * Writes the authenticated user into a freshly regenerated session.
  */
-function startSession(req: Request, user: users.User): Promise<void> {
+function startSession(req: Request, user: users.AuthState): Promise<void> {
   return new Promise((resolve, reject) => {
     // A fresh session ID on privilege change, so a session ID planted before
     // login (session fixation) can't be used to ride the new session.
@@ -191,7 +198,7 @@ function startSession(req: Request, user: users.User): Promise<void> {
   });
 }
 
-function publicUser(user: users.User) {
+function publicUser(user: users.AuthState) {
   return { id: user.id, username: user.username, role: user.role };
 }
 
@@ -210,6 +217,12 @@ export async function loginHandler(req: Request, res: Response): Promise<void> {
     const user = await users.authenticate(username, password);
     if (!user) {
       logger.warn({ username }, 'Failed login attempt');
+      await recordAudit({
+        action: 'auth.login.failure',
+        actorUsername: username,
+        ip: req.ip ?? null,
+        userAgent: req.get('user-agent') ?? null,
+      });
       res.status(401).json({
         error: 'Invalid credentials',
         message: 'Username or password is incorrect',
@@ -219,6 +232,8 @@ export async function loginHandler(req: Request, res: Response): Promise<void> {
 
     await startSession(req, user);
     logger.info({ userId: user.id, role: user.role }, 'User logged in');
+    req.user = user;
+    await audit(req, 'auth.login.success', { type: 'user', id: user.id });
     res.json({ message: 'Login successful', user: publicUser(user) });
   } catch (error) {
     logger.error({ err: error }, 'Login failed');
@@ -231,6 +246,14 @@ export async function loginHandler(req: Request, res: Response): Promise<void> {
  */
 export async function logoutHandler(req: Request, res: Response): Promise<void> {
   const userId = req.session?.userId;
+  if (userId) {
+    await recordAudit({
+      action: 'auth.logout',
+      actor: { id: Number(userId), username: req.session.username ?? '' },
+      ip: req.ip ?? null,
+      userAgent: req.get('user-agent') ?? null,
+    });
+  }
 
   req.session.destroy((err) => {
     if (err) {
@@ -270,6 +293,7 @@ export async function changePasswordHandler(req: Request, res: Response): Promis
     const updated = await users.changeOwnPassword(req.user!.id, currentPassword, newPassword);
     await startSession(req, updated);
     logger.info({ userId: updated.id }, 'Password changed');
+    await audit(req, 'auth.password.change', { type: 'user', id: updated.id });
     res.json({ message: 'Password changed. Other sessions were signed out.' });
   } catch (error) {
     if (error instanceof users.UserError) {
@@ -278,5 +302,21 @@ export async function changePasswordHandler(req: Request, res: Response): Promis
     }
     logger.error({ err: error }, 'Password change failed');
     res.status(500).json({ error: 'Password change failed' });
+  }
+}
+
+/**
+ * POST /api/auth/logout-others - sign out every other session of the caller
+ * (requireAuth first). Bumps session_version and re-issues this session.
+ */
+export async function logoutOthersHandler(req: Request, res: Response): Promise<void> {
+  try {
+    const updated = await users.revokeSessions(req.user!.id);
+    await startSession(req, updated);
+    await audit(req, 'auth.sessions.revoke_others', { type: 'user', id: updated.id });
+    res.json({ message: 'Signed out of all other sessions.' });
+  } catch (error) {
+    logger.error({ err: error }, 'Revoke other sessions failed');
+    res.status(500).json({ error: 'Failed to sign out other sessions' });
   }
 }

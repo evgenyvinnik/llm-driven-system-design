@@ -14,6 +14,7 @@
 
 import { Router, Request, Response } from 'express';
 import { requireAdmin } from '../middleware/auth.js';
+import { audit } from '../services/audit.js';
 import { frontierService } from '../services/frontier.js';
 import { pool } from '../models/database.js';
 
@@ -80,6 +81,7 @@ router.post('/add', requireAdmin, async (req: Request, res: Response) => {
     }
 
     const added = await frontierService.addUrls(urls, { priority });
+    await audit(req, 'frontier.add', undefined, { submitted: urls.length, added, priority, sample: urls.slice(0, 5) });
     res.json({ added, total: urls.length });
   } catch (error) {
     console.error('Error adding URLs to frontier:', error);
@@ -120,6 +122,7 @@ router.post('/seed', requireAdmin, async (req: Request, res: Response) => {
 
     // Add to frontier
     const added = await frontierService.addUrls(urls, { priority, depth: 0 });
+    await audit(req, 'frontier.seed', undefined, { submitted: urls.length, added, priority, sample: urls.slice(0, 5) });
     res.json({ added, total: urls.length });
   } catch (error) {
     console.error('Error adding seed URLs:', error);
@@ -143,6 +146,7 @@ router.post('/recover', requireAdmin, async (req: Request, res: Response) => {
   try {
     const minutes = parseInt(req.query.minutes as string) || 10;
     const recovered = await frontierService.recoverStaleUrls(minutes);
+    await audit(req, 'frontier.recover', undefined, { olderThanMinutes: minutes, recovered });
     res.json({ recovered });
   } catch (error) {
     console.error('Error recovering URLs:', error);
@@ -163,9 +167,14 @@ router.post('/recover', requireAdmin, async (req: Request, res: Response) => {
  *
  * @returns Success message
  */
-router.delete('/clear', requireAdmin, async (_req: Request, res: Response) => {
+router.delete('/clear', requireAdmin, async (req: Request, res: Response) => {
   try {
+    const before = await frontierService.getStats();
     await frontierService.clear();
+    await audit(req, 'frontier.clear', undefined, {
+      deleted: before.pending + before.inProgress + before.completed + before.failed,
+      pending: before.pending,
+    });
     res.json({ message: 'Frontier cleared' });
   } catch (error) {
     console.error('Error clearing frontier:', error);

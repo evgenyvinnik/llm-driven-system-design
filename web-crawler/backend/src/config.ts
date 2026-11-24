@@ -207,6 +207,39 @@ export const config = {
     dnsCacheTtlSeconds: parseInt(process.env.CRAWLER_DNS_CACHE_TTL || '300', 10),
 
     /**
+     * CIDR ranges exempt from the per-IP lock (comma-separated), e.g. CDN
+     * ranges. CDNs serve thousands of unrelated sites from shared anycast IPs;
+     * a per-IP limit would throttle all of them as if they were one server.
+     * Exempt IPs still get per-domain politeness.
+     * @default '' (none)
+     */
+    ipExemptCidrs: (process.env.CRAWLER_IP_EXEMPT_CIDRS || '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean),
+
+    /**
+     * URLs of published CIDR lists to exempt (comma-separated), refreshed by
+     * the API's maintenance loop. Plain-text lists (one CIDR per line) and
+     * JSON documents (any CIDR-shaped strings are extracted) are accepted.
+     * Use CDN-only lists: exempting a whole cloud provider would remove
+     * protection from single-tenant servers.
+     * Examples: https://www.cloudflare.com/ips-v4, https://www.cloudflare.com/ips-v6,
+     * https://api.fastly.com/public-ip-list
+     * @default '' (none)
+     */
+    ipExemptSources: (process.env.CRAWLER_IP_EXEMPT_SOURCES || '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean),
+
+    /**
+     * How often exempt-range sources are re-fetched (hours).
+     * @default 24
+     */
+    ipExemptRefreshHours: parseFloat(process.env.CRAWLER_IP_EXEMPT_REFRESH_HOURS || '24'),
+
+    /**
      * Maximum URLs enqueued per domain (seeds are exempt). Bounds crawler
      * traps that generate infinite *shallow* URLs, which the depth limit
      * doesn't catch, and keeps one big site from crowding out breadth.

@@ -225,3 +225,36 @@ export interface HealthStatus {
   services: Record<string, { status: string; latencyMs?: number; error?: string }>;
   workers?: number;
 }
+
+/**
+ * One audit-log entry (GET /api/admin/audit).
+ */
+export interface AuditEntry {
+  id: number;
+  at: string;
+  actorId: number | null;
+  actorUsername: string | null;
+  action: string;
+  targetType: string | null;
+  targetId: string | null;
+  details: Record<string, unknown>;
+  ip: string | null;
+  userAgent: string | null;
+}
+
+/**
+ * Per-IP politeness settings and CDN exempt ranges (GET /api/admin/ip-policy).
+ */
+export interface IpPolicy {
+  ipDelayMs: number;
+  staticCidrs: string[];
+  sources: {
+    url: string;
+    count: number;
+    fetchedAt: string | null;
+    lastError: string | null;
+    lastErrorAt: string | null;
+  }[];
+  effectiveCount: number;
+  refreshHours: number;
+}

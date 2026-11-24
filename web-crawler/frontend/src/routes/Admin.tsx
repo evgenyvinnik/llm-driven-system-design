@@ -20,6 +20,8 @@ import { LoginForm } from '../components/LoginForm';
 import { ClearFrontierPanel } from '../components/ClearFrontierPanel';
 import { UsersPanel } from '../components/UsersPanel';
 import { ChangePasswordForm } from '../components/ChangePasswordForm';
+import { AuditLogPanel } from '../components/AuditLogPanel';
+import { IpPolicyPanel } from '../components/IpPolicyPanel';
 
 type Result = { message: string; ok: boolean } | null;
 
@@ -226,7 +228,11 @@ export function Admin() {
 
         <ChangePasswordForm />
 
+        <IpPolicyPanel />
+
         <UsersPanel />
+
+        <AuditLogPanel />
       </div>
     </div>
   );

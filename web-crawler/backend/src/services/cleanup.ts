@@ -24,6 +24,7 @@ import { pool } from '../models/database.js';
 import { redis } from '../models/redis.js';
 import { logger } from '../shared/logger.js';
 import { cleanupRecordsCounter, lastCleanupTimestampGauge } from '../shared/metrics.js';
+import { prune as pruneAuditLog } from './audit.js';
 
 /**
  * Cleanup configuration for different data types.
@@ -37,6 +38,8 @@ export interface CleanupConfig {
   crawledPagesTtlDays: number;
   /** TTL for stats records (days) */
   statsTtlDays: number;
+  /** Audit log retention in days */
+  auditLogTtlDays: number;
   /** Batch size for deletion to avoid long transactions */
   batchSize: number;
   /** Interval between cleanup runs (minutes) */
@@ -52,6 +55,7 @@ export const DEFAULT_CLEANUP_CONFIG: CleanupConfig = {
   failedUrlTtlDays: 30,      // Keep failed URLs for 1 month (debugging)
   crawledPagesTtlDays: 90,   // Keep page metadata for 3 months
   statsTtlDays: 7,           // Keep detailed stats for 1 week
+  auditLogTtlDays: parseInt(process.env.AUDIT_RETENTION_DAYS || '365', 10), // Keep the audit trail for a year
   batchSize: 1000,           // Delete 1000 records at a time
   intervalMinutes: 60,       // Run cleanup every hour
 };
@@ -64,6 +68,7 @@ export interface CleanupResult {
   failedUrlsDeleted: number;
   crawledPagesDeleted: number;
   statsDeleted: number;
+  auditDeleted: number;
   durationMs: number;
 }
 
@@ -132,6 +137,7 @@ export class CleanupService {
         failedUrlsDeleted: 0,
         crawledPagesDeleted: 0,
         statsDeleted: 0,
+        auditDeleted: 0,
         durationMs: 0,
       };
     }
@@ -146,6 +152,7 @@ export class CleanupService {
         this.cleanupFailedUrls(),
         this.cleanupCrawledPages(),
         this.cleanupStats(),
+        this.cleanupAuditLog(),
       ]);
 
       const result: CleanupResult = {
@@ -153,6 +160,7 @@ export class CleanupService {
         failedUrlsDeleted: results[1],
         crawledPagesDeleted: results[2],
         statsDeleted: results[3],
+        auditDeleted: results[4],
         durationMs: Date.now() - startTime,
       };
 
@@ -286,6 +294,19 @@ export class CleanupService {
   /**
    * Cleans up old stats records.
    */
+  /**
+   * Removes audit entries past retention. The only path that deletes from
+   * audit_log (an UPDATE trigger makes rows otherwise immutable).
+   */
+  private async cleanupAuditLog(): Promise<number> {
+    const deleted = await pruneAuditLog(this.config.auditLogTtlDays);
+    if (deleted > 0) {
+      cleanupRecordsCounter.labels('audit_log').inc(deleted);
+      logger.info({ deleted }, 'Pruned audit log');
+    }
+    return deleted;
+  }
+
   private async cleanupStats(): Promise<number> {
     const cutoffDate = new Date();
     cutoffDate.setDate(cutoffDate.getDate() - this.config.statsTtlDays);

@@ -218,6 +218,38 @@ DELETE /api/admin/users/:id
 Usernames are case-insensitive. The last active admin can't be demoted, disabled, or
 deleted (409), and admins can't change their own role or delete themselves (400).
 
+```
+POST /api/admin/users/:id/revoke-sessions   Sign a user out everywhere
+POST /api/auth/logout-others                Sign out your other sessions (keeps this one)
+```
+
+**Why sessions, not JWT:** the requirement here is *immediate* revocation (offboarding,
+a leaked cookie). A JWT stays valid until it expires unless every request checks a
+denylist — the same per-request lookup sessions need, plus rotation machinery. Session
+checks read a small Redis record of each user's role / disabled flag / session version
+(written through on every account change, with a Lua guard so a stale write can't undo a
+revocation), so protected requests don't query Postgres. Change accounts through the API
+or Admin page: a raw SQL `UPDATE users` isn't seen until the 10-minute cache entry expires.
+
+### Audit Log (admin)
+
+```
+GET /api/admin/audit?limit=50&before=<id>&action=<prefix>&actor=<username>
+```
+
+Every sign-in attempt (including failures) and every change to crawler state or accounts
+is recorded in `audit_log`: who, when, from which IP / user agent, what it targeted, and
+details (never secrets — a password reset is recorded as `passwordReset: true`). Newest
+first; page with `before=<nextBefore>`; `action=user.` filters by prefix. The table is
+append-only (an UPDATE trigger rejects edits) and pruned after `AUDIT_RETENTION_DAYS`.
+
+### IP Policy (admin)
+
+```
+GET  /api/admin/ip-policy           Per-IP delay, exempt ranges, source status
+POST /api/admin/ip-policy/refresh   Re-fetch exempt-range sources now
+```
+
 ```bash
 # curl example
 curl -c jar -H 'content-type: application/json' \
@@ -388,6 +420,7 @@ stored in Postgres and republished to Redis every minute, so they survive a Redi
 | `SESSION_SECRET` | dev placeholder | Session cookie signing secret — **required** when `NODE_ENV=production` |
 | `COOKIE_SECURE` | `true` in production | Set `false` for plain-HTTP setups (the compose file does) |
 | `TRUST_PROXY` | unset | Set (e.g. `1`) behind a TLS-terminating proxy so Secure cookies and client IPs work |
+| `AUDIT_RETENTION_DAYS` | `365` | Audit log entries older than this are pruned by the cleanup job |
 | `CORS_ORIGINS` | `http://localhost:5173` | Comma-separated origins allowed to make credentialed cross-origin calls |
 
 #### Crawler Workers
@@ -407,6 +440,9 @@ stored in Postgres and republished to Redis every minute, so they survive a Redi
 | `CRAWLER_MAX_PAGES_PER_DOMAIN` | `10000` | Max URLs enqueued per domain (seeds exempt; `0` = unlimited) |
 | `CRAWLER_IP_DELAY_MS` | `250` | Min spacing between requests to one IP across all its domains (`0` disables) |
 | `CRAWLER_DNS_CACHE_TTL` | `300` | Seconds a resolved domain IP is cached |
+| `CRAWLER_IP_EXEMPT_CIDRS` | none | Comma-separated CIDRs exempt from the per-IP lock (e.g. CDN ranges) |
+| `CRAWLER_IP_EXEMPT_SOURCES` | none | Comma-separated URLs of published CDN range lists (text or JSON), refreshed by the API |
+| `CRAWLER_IP_EXEMPT_REFRESH_HOURS` | `24` | How often exempt-range sources are re-fetched |
 | `CRAWLER_MAX_RETRIES` | `3` | Frontier-level retries for transient failures (timeout, 5xx, 429) |
 | `CRAWLER_RETRY_BASE_DELAY` | `60000` | Base retry backoff (ms), doubled per attempt with jitter |
 | `CRAWLER_STALE_LEASE_MINUTES` | `10` | `in_progress` URLs older than this are returned to the queue |
@@ -472,10 +508,11 @@ web-crawler/
 2. **Crawl-Delay**: Honors robots.txt Crawl-delay (capped at 60s). An operator override from the Domains page can only slow a domain down, never go below robots.txt
 3. **Per-Domain Rate Limiting**: A Redis lock with TTL = crawl delay spaces every request start to a domain across all workers — including in-process retries
 4. **Per-IP Rate Limiting**: a second, looser lock on the domain's resolved IP (default 250ms) protects shared hosts where many domains live on one server. Measured on a two-domain, one-IP fixture with two workers: with the IP lock off, 12 of 25 request gaps were under 100ms (min 0ms); with it on at 1500ms, the min gap was 1505ms
-5. **Redirects via the frontier**: 3xx targets are enqueued as new URLs, so the target domain gets its own robots.txt check and politeness lock
-6. **nofollow**: `rel="nofollow|sponsored|ugc"` links and `<meta name="robots" content="nofollow">` pages are not followed
-7. **Retry-After**: 429/408 responses are rescheduled no earlier than the server asks
-8. **User-Agent**: Sends a proper User-Agent string identifying the crawler
+5. **CDN exemptions**: CDNs serve unrelated sites from shared anycast IPs, so a per-IP limit would throttle all of them as one server. IPs in exempt ranges skip the IP lock but keep per-domain politeness. No ranges ship by default (they change, and a wrong range removes protection from real servers); point `CRAWLER_IP_EXEMPT_SOURCES` at the providers' own lists, e.g. `https://www.cloudflare.com/ips-v4,https://www.cloudflare.com/ips-v6,https://api.fastly.com/public-ip-list`. Use CDN-only lists — exempting a whole cloud provider would unprotect single-tenant servers. A failed fetch keeps the last good list
+6. **Redirects via the frontier**: 3xx targets are enqueued as new URLs, so the target domain gets its own robots.txt check and politeness lock
+7. **nofollow**: `rel="nofollow|sponsored|ugc"` links and `<meta name="robots" content="nofollow">` pages are not followed
+8. **Retry-After**: 429/408 responses are rescheduled no earlier than the server asks
+9. **User-Agent**: Sends a proper User-Agent string identifying the crawler
 
 ## Testing
 
@@ -489,8 +526,11 @@ npm test                    # unit tests (vitest)
 # Integration tests against real Postgres + Redis (docker-compose up -d first):
 # - crawl: a local fixture site crawled by three workers (dedup, politeness
 #   spacing, retries, redirects, robots.txt handling)
-# - api: admin-only routes, login/logout + rate limit, domain settings surviving
-#   Redis loss, per-domain page budget
+# - api: admin-only routes, login/logout + rate limit, user accounts and session
+#   revocation, domain settings surviving Redis loss, per-IP locking, page budget
+# - ops: audit trail (append-only, filters, keyset paging), auth cache (no
+#   Postgres query per request, stale writes can't undo revocation), CDN
+#   exemptions from static config and published lists
 # WARNING: flushes the Redis DB and truncates the crawler tables.
 # Stop any running API server/workers first - they share the same stores.
 npm run test:integration
@@ -512,8 +552,8 @@ npm run test:e2e
 - [ ] Distributed work stealing for load balancing
 - [ ] Sitemap.xml parsing
 - [ ] JavaScript rendering (Puppeteer integration)
-- [ ] Per-IP limits that understand CDNs (shared anycast IPs serve unrelated sites; a strict per-IP limit throttles all of them)
-- [ ] Audit log table for admin actions (today they're structured log lines)
+- [ ] Ship audit entries to an external append-only sink (today: an append-only Postgres table, best-effort writes)
+- [ ] A higher per-IP rate for CDN ranges instead of a full exemption
 
 ## License
 

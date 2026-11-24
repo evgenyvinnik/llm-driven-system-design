@@ -42,10 +42,14 @@ import {
   logoutHandler,
   getCurrentUser,
   changePasswordHandler,
+  logoutOthersHandler,
   UserRole,
 } from './middleware/auth.js';
 import usersRoutes from './routes/users.js';
 import { ensureBootstrapAdmin } from './services/users.js';
+import * as auditLog from './services/audit.js';
+import { audit } from './services/audit.js';
+import * as ipPolicy from './services/ipPolicy.js';
 import {
   createTieredRateLimiter,
   seedInjectionLimiter,
@@ -253,6 +257,9 @@ app.post('/api/auth/login', loginLimiter, loginHandler);
 // password, so it must not become a brute-force oracle.
 app.post('/api/auth/password', loginLimiter, requireAuth, changePasswordHandler);
 
+// Sign out every other session of the current user
+app.post('/api/auth/logout-others', requireAuth, logoutOthersHandler);
+
 /**
  * POST /api/auth/logout
  *
@@ -283,6 +290,53 @@ app.use('/api/domains', domainsRoutes);
 // Operator accounts (admin only; see routes/users.ts)
 app.use('/api/admin/users', usersRoutes);
 
+/**
+ * GET /api/admin/audit?limit=50&before=<id>&action=<prefix>&actor=<username>
+ *
+ * Audit trail, newest first, keyset-paginated: pass `nextBefore` from the
+ * previous page as `before`.
+ */
+app.get('/api/admin/audit', requireRole([UserRole.ADMIN]), async (req: Request, res: Response) => {
+  try {
+    const before = Number(req.query.before) || undefined;
+    const limit = Number(req.query.limit) || undefined;
+    const action = typeof req.query.action === 'string' && req.query.action ? req.query.action : undefined;
+    const actor = typeof req.query.actor === 'string' && req.query.actor ? req.query.actor : undefined;
+    res.json(await auditLog.list({ before, limit, action, actor }));
+  } catch (error) {
+    logger.error({ err: error }, 'Failed to read audit log');
+    res.status(500).json({ error: 'Failed to read audit log' });
+  }
+});
+
+/**
+ * GET /api/admin/ip-policy - per-IP politeness settings and exempt ranges.
+ */
+app.get('/api/admin/ip-policy', requireRole([UserRole.ADMIN]), async (_req: Request, res: Response) => {
+  try {
+    res.json(await ipPolicy.getPolicy());
+  } catch (error) {
+    logger.error({ err: error }, 'Failed to read IP policy');
+    res.status(500).json({ error: 'Failed to read IP policy' });
+  }
+});
+
+/**
+ * POST /api/admin/ip-policy/refresh - re-fetch exempt-range sources now.
+ */
+app.post('/api/admin/ip-policy/refresh', requireRole([UserRole.ADMIN]), async (req: Request, res: Response) => {
+  try {
+    const sources = await ipPolicy.refreshSources();
+    await audit(req, 'ip_policy.refresh', undefined, {
+      sources: sources.map((s) => ({ url: s.url, count: s.count, error: s.lastError })),
+    });
+    res.json(await ipPolicy.getPolicy());
+  } catch (error) {
+    logger.error({ err: error }, 'Failed to refresh IP policy');
+    res.status(500).json({ error: 'Failed to refresh IP policy' });
+  }
+});
+
 // ============================================================================
 // ADMIN ENDPOINTS (Requires Authentication)
 // ============================================================================
@@ -296,9 +350,10 @@ app.use('/api/admin/users', usersRoutes);
 app.post(
   '/api/admin/cleanup',
   requireRole([UserRole.ADMIN]),
-  async (_req: Request, res: Response) => {
+  async (req: Request, res: Response) => {
     try {
       const result = await cleanupService.runCleanup();
+      await audit(req, 'maintenance.cleanup', undefined, { ...result });
       res.json({
         message: 'Cleanup completed',
         result,
@@ -365,6 +420,13 @@ app.post(
         { userId: req.session?.userId, urls: urls.length, added },
         'Seed URLs injected'
       );
+      await audit(req, 'frontier.seed', undefined, {
+        submitted: urls.length,
+        added,
+        priority,
+        sample: urls.slice(0, 5),
+        via: 'admin',
+      });
 
       res.json({ added, total: urls.length });
     } catch (error) {
@@ -385,9 +447,14 @@ app.delete(
   requireRole([UserRole.ADMIN]),
   async (req: Request, res: Response) => {
     try {
+      const before = await frontierService.getStats();
       await frontierService.clear();
 
       logger.warn({ userId: req.session?.userId }, 'Frontier cleared');
+      await audit(req, 'frontier.clear', undefined, {
+        deleted: before.pending + before.inProgress + before.completed + before.failed,
+        via: 'admin',
+      });
 
       res.json({ message: 'Frontier cleared' });
     } catch (error) {
@@ -414,6 +481,7 @@ app.delete(
         { userId: req.session?.userId, deleted: result.rowCount },
         'Crawled pages purged'
       );
+      await audit(req, 'pages.purge', undefined, { deleted: result.rowCount });
 
       res.json({ message: 'Pages purged', deleted: result.rowCount });
     } catch (error) {
@@ -455,6 +523,7 @@ app.post(
       await redis.del(`crawler:circuit:${domain}`);
 
       logger.info({ userId: req.session?.userId, domain }, 'Domain reset');
+      await audit(req, 'domain.reset', { type: 'domain', id: domain });
 
       res.json({ message: `Domain ${domain} reset`, domain });
     } catch (error) {

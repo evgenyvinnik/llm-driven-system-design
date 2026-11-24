@@ -211,6 +211,22 @@ export const REDIS_KEYS = {
   /** Cached DNS resolution for a hostname (string IP, '' = lookup failed) */
   DNS_CACHE: (hostname: string) => `crawler:dns:${hostname}`,
 
+  /** SET of CIDRs fetched from one exempt-range source (id = sha1(url) prefix) */
+  IP_EXEMPT_SOURCE: (id: string) => `crawler:ip_exempt:src:${id}`,
+
+  /** HASH: url, count, fetchedAt, lastError, lastErrorAt for one source */
+  IP_EXEMPT_META: (id: string) => `crawler:ip_exempt:meta:${id}`,
+
+  /** Epoch ms of the last exempt-range source refresh */
+  IP_EXEMPT_REFRESHED_AT: 'crawler:ip_exempt:refreshed_at',
+
+  /**
+   * Cached authorization state for a user (JSON: username, role, disabled,
+   * session_version), written through by services/users.ts. Lets every
+   * protected request skip the Postgres lookup.
+   */
+  AUTH_USER: (id: number) => `crawler:auth:user:${id}`,
+
   /** Per-IP politeness lock: caps request rate to one server across all its domains */
   IP_LOCK: (ip: string) => `crawler:ip:${ip}:lock`,
 

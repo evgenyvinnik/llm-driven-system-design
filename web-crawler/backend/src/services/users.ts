@@ -11,8 +11,17 @@
  *   blocks the API's event loop for ~150-200ms per login.
  * - **Session revocation:** each user has a `session_version`. Sessions store
  *   the version they were issued with; disabling a user, changing their role,
- *   or changing their password bumps it, and every authenticated request
- *   re-checks it, so existing sessions die immediately.
+ *   changing their password, or an explicit "sign out everywhere" bumps it,
+ *   and every authenticated request re-checks it, so existing sessions die
+ *   immediately.
+ * - **Auth-state cache:** that per-request check reads a small Redis record
+ *   (`crawler:auth:user:{id}`: username, role, disabled, version) instead of
+ *   Postgres. Every mutation here writes the new state through to Redis after
+ *   its commit, using a Lua script that only overwrites an *older* version -
+ *   `session_version` increases on every change, so a slow reader that loaded
+ *   stale data from Postgres can't clobber a fresher revocation. Deletes write
+ *   a tombstone for the same reason. Edit users through this module (or the
+ *   API), not raw SQL: a direct UPDATE isn't seen until the cache entry expires.
  * - **Last-admin guard:** demoting, disabling, or deleting the last active
  *   admin is refused. The check runs in a transaction that row-locks every
  *   active admin, so two concurrent demotions can't both pass it.
@@ -26,8 +35,11 @@ import crypto from 'crypto';
 import { promisify } from 'util';
 import type { PoolClient } from 'pg';
 import { pool } from '../models/database.js';
+import { redis, REDIS_KEYS } from '../models/redis.js';
 import { config } from '../config.js';
 import { logger } from '../shared/logger.js';
+import { authCacheCounter } from '../shared/metrics.js';
+import { record as recordAudit } from './audit.js';
 
 const pbkdf2 = promisify(crypto.pbkdf2);
 
@@ -78,6 +90,88 @@ function toUser(row: UserRow): User {
     sessionVersion: row.session_version,
     createdAt: row.created_at,
     lastLoginAt: row.last_login_at,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Auth-state cache (what every protected request checks)
+// ---------------------------------------------------------------------------
+
+/** The subset of a user that authorization needs. */
+export interface AuthState {
+  id: number;
+  username: string;
+  role: Role;
+  disabled: boolean;
+  sessionVersion: number;
+}
+
+const AUTH_CACHE_TTL_SECONDS = 600;
+/** Version used for tombstones: newer than any real session_version. */
+const TOMBSTONE_VERSION = Number.MAX_SAFE_INTEGER;
+
+/**
+ * SET key value EX ttl, unless the cached entry already has an equal or newer
+ * version. ARGV: [json, version, ttl]. Returns 1 if written.
+ */
+const SET_IF_NEWER = `
+local current = redis.call('GET', KEYS[1])
+if current then
+  local ok, decoded = pcall(cjson.decode, current)
+  if ok and decoded.v and tonumber(decoded.v) >= tonumber(ARGV[2]) then
+    return 0
+  end
+end
+redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[3])
+return 1
+`;
+
+async function writeAuthState(id: number, state: Omit<AuthState, 'id'> | null, version: number): Promise<void> {
+  const payload = state
+    ? JSON.stringify({ u: state.username, r: state.role, d: state.disabled, v: version })
+    : JSON.stringify({ deleted: true, v: version });
+  await redis.eval(SET_IF_NEWER, 1, REDIS_KEYS.AUTH_USER(id), payload, version, AUTH_CACHE_TTL_SECONDS);
+}
+
+/** Write-through after a committed change (or a DB read on cache miss). */
+export async function cacheAuthState(user: AuthState | User): Promise<void> {
+  try {
+    await writeAuthState(user.id, user, user.sessionVersion);
+  } catch (error) {
+    // If this fails the entry may be stale until TTL; drop it so the next
+    // request falls back to Postgres instead.
+    logger.error({ err: error, userId: user.id }, 'Auth cache write failed; evicting');
+    await redis.del(REDIS_KEYS.AUTH_USER(user.id)).catch(() => undefined);
+  }
+}
+
+/**
+ * Authorization state for a session's user: Redis first, Postgres on miss.
+ * Returns null if the user doesn't exist (or was deleted).
+ */
+export async function getAuthState(id: number): Promise<AuthState | null> {
+  try {
+    const cached = await redis.get(REDIS_KEYS.AUTH_USER(id));
+    if (cached) {
+      const c = JSON.parse(cached);
+      authCacheCounter.labels('hit').inc();
+      if (c.deleted) return null;
+      return { id, username: c.u, role: c.r, disabled: c.d, sessionVersion: Number(c.v) };
+    }
+  } catch (error) {
+    logger.warn({ err: error, userId: id }, 'Auth cache read failed; using Postgres');
+  }
+
+  authCacheCounter.labels('miss').inc();
+  const user = await getUserById(id);
+  if (!user) return null;
+  await cacheAuthState(user);
+  return {
+    id: user.id,
+    username: user.username,
+    role: user.role,
+    disabled: user.disabled,
+    sessionVersion: user.sessionVersion,
   };
 }
 
@@ -170,7 +264,9 @@ export async function authenticate(username: unknown, password: unknown): Promis
   if (!row || !ok || row.disabled) return null;
 
   await pool.query('UPDATE users SET last_login_at = NOW() WHERE id = $1', [row.id]);
-  return toUser(row);
+  const user = toUser(row);
+  await cacheAuthState(user); // warm: the next request is authorized from Redis
+  return user;
 }
 
 export async function createUser(input: {
@@ -245,7 +341,7 @@ export async function updateUser(
     throw new UserError('No changes provided', 400);
   }
 
-  return withAdminLock(async (client, activeAdminIds) => {
+  const updated = await withAdminLock(async (client, activeAdminIds) => {
     if ((role !== undefined && role !== 'admin') || disabled === true) {
       assertNotLastAdmin(id, activeAdminIds, role !== undefined && role !== 'admin' ? 'demote' : 'disable');
     }
@@ -263,6 +359,9 @@ export async function updateUser(
     if (result.rowCount === 0) throw new UserError('User not found', 404);
     return toUser(result.rows[0]);
   });
+  // After COMMIT: publishing before it could expose a change that rolls back
+  await cacheAuthState(updated);
+  return updated;
 }
 
 export async function deleteUser(id: number): Promise<void> {
@@ -271,6 +370,28 @@ export async function deleteUser(id: number): Promise<void> {
     const result = await client.query('DELETE FROM users WHERE id = $1', [id]);
     if (result.rowCount === 0) throw new UserError('User not found', 404);
   });
+  // Tombstone, not DEL: a reader that loaded the row just before the delete
+  // could otherwise re-cache it.
+  await writeAuthState(id, null, TOMBSTONE_VERSION).catch(async (error) => {
+    logger.error({ err: error, userId: id }, 'Auth tombstone write failed; evicting');
+    await redis.del(REDIS_KEYS.AUTH_USER(id)).catch(() => undefined);
+  });
+}
+
+/**
+ * Signs a user out everywhere (bumps session_version).
+ * @returns The updated user
+ */
+export async function revokeSessions(id: number): Promise<User> {
+  const result = await pool.query<UserRow>(
+    `UPDATE users SET session_version = session_version + 1, updated_at = NOW()
+     WHERE id = $1 RETURNING ${USER_COLUMNS}`,
+    [id]
+  );
+  if (result.rowCount === 0) throw new UserError('User not found', 404);
+  const user = toUser(result.rows[0]);
+  await cacheAuthState(user);
+  return user;
 }
 
 /**
@@ -294,7 +415,9 @@ export async function changeOwnPassword(
      WHERE id = $1 RETURNING ${USER_COLUMNS}`,
     [id, await hashPassword(next)]
   );
-  return toUser(updated.rows[0]);
+  const user = toUser(updated.rows[0]);
+  await cacheAuthState(user);
+  return user;
 }
 
 /**
@@ -317,15 +440,24 @@ export async function ensureBootstrapAdmin(): Promise<void> {
   const username = normalizeUsername(process.env.ADMIN_USERNAME || 'admin');
   const passwordHash = await hashPassword(process.env.ADMIN_PASSWORD || 'password123');
 
-  await pool.query(
+  const result = await pool.query<UserRow>(
     `INSERT INTO users (username, password_hash, role) VALUES ($1, $2, 'admin')
      ON CONFLICT (username) DO UPDATE SET
        password_hash = EXCLUDED.password_hash,
        role = 'admin',
        disabled = false,
        session_version = users.session_version + 1,
-       updated_at = NOW()`,
+       updated_at = NOW()
+     RETURNING ${USER_COLUMNS}`,
     [username, passwordHash]
   );
+  const user = toUser(result.rows[0]);
+  await cacheAuthState(user);
   logger.warn({ username }, 'No active admin found; bootstrapped admin account from environment');
+  await recordAudit({
+    action: 'system.admin.bootstrap',
+    targetType: 'user',
+    targetId: user.id,
+    details: { username, restored: user.sessionVersion > 1 },
+  });
 }

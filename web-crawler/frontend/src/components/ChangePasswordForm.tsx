@@ -16,6 +16,19 @@ export function ChangePasswordForm() {
   const [confirm, setConfirm] = useState('');
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<{ text: string; ok: boolean } | null>(null);
+  const [signingOut, setSigningOut] = useState(false);
+
+  const signOutOthers = async () => {
+    setSigningOut(true);
+    setMessage(null);
+    try {
+      setMessage({ text: (await api.logoutOthers()).message, ok: true });
+    } catch (error) {
+      setMessage({ text: error instanceof Error ? error.message : 'Failed', ok: false });
+    } finally {
+      setSigningOut(false);
+    }
+  };
 
   const mismatch = confirm.length > 0 && next !== confirm;
 
@@ -41,7 +54,7 @@ export function ChangePasswordForm() {
 
   return (
     <form onSubmit={handleSubmit} className="bg-white rounded-lg shadow-sm border border-gray-200 p-4 space-y-3">
-      <h2 className="text-lg font-medium text-gray-900">Change your password</h2>
+      <h2 className="text-lg font-medium text-gray-900">Your account</h2>
       <label className="block text-sm text-gray-700">
         Current password
         <input type="password" autoComplete="current-password" value={current} onChange={(e) => setCurrent(e.target.value)} required className={input} />
@@ -60,13 +73,24 @@ export function ChangePasswordForm() {
           {message.text}
         </p>
       )}
-      <button
-        type="submit"
-        disabled={busy || mismatch || next.length < 8}
-        className="px-4 py-2 bg-primary-600 text-white rounded-md text-sm font-medium hover:bg-primary-700 disabled:opacity-50 disabled:cursor-not-allowed"
-      >
-        {busy ? 'Saving…' : 'Change password'}
-      </button>
+      <div className="flex flex-wrap gap-2">
+        <button
+          type="submit"
+          disabled={busy || mismatch || next.length < 8}
+          className="px-4 py-2 bg-primary-600 text-white rounded-md text-sm font-medium hover:bg-primary-700 disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          {busy ? 'Saving…' : 'Change password'}
+        </button>
+        <button
+          type="button"
+          onClick={signOutOthers}
+          disabled={signingOut}
+          title="End every session of yours except this one (e.g. a forgotten laptop)"
+          className="px-4 py-2 border border-gray-300 text-gray-700 rounded-md text-sm hover:bg-gray-50 disabled:opacity-50"
+        >
+          {signingOut ? 'Signing out…' : 'Sign out other sessions'}
+        </button>
+      </div>
     </form>
   );
 }

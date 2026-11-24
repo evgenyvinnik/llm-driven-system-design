@@ -26,6 +26,7 @@ import { redis, REDIS_KEYS } from '../models/redis.js';
 import { frontierService } from './frontier.js';
 import { cleanupService } from './cleanup.js';
 import * as domainSettings from './domainSettings.js';
+import { refreshSourcesIfDue } from './ipPolicy.js';
 import { config } from '../config.js';
 import { logger } from '../shared/logger.js';
 
@@ -58,6 +59,10 @@ export class MaintenanceService {
     }
     const settingsRepublished = republish.applied ? republish.blocked + republish.overrides : 0;
     const staleWorkers = await cleanupService.cleanupRedis();
+    // CDN exempt-range lists: only fetched when due (default daily)
+    await refreshSourcesIfDue().catch((err) =>
+      logger.warn({ err }, 'Exempt-range refresh failed')
+    );
 
     if (recovered > 0 || rehydrated > 0 || staleWorkers > 0) {
       logger.info({ recovered, rehydrated, staleWorkers }, 'Frontier maintenance repaired state');

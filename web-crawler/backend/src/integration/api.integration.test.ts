@@ -67,7 +67,7 @@ describe.skipIf(!enabled)('API end-to-end', () => {
     const db = await import('../models/database.js');
     const r = await import('../models/redis.js');
     await db.initDatabase();
-    await db.pool.query('TRUNCATE url_frontier, crawled_pages, domains, users RESTART IDENTITY');
+    await db.pool.query('TRUNCATE url_frontier, crawled_pages, domains, audit_log, users RESTART IDENTITY');
     await r.redis.flushdb();
 
     const users = await import('../services/users.js');

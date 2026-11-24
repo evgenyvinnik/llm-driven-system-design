@@ -10,6 +10,7 @@
 
 import { Router, Request, Response } from 'express';
 import { requireAdmin } from '../middleware/auth.js';
+import { audit } from '../services/audit.js';
 import { statsService } from '../services/stats.js';
 
 const router = Router();
@@ -70,9 +71,10 @@ router.get('/timeseries', async (req: Request, res: Response) => {
  *
  * @returns Success message
  */
-router.post('/reset', requireAdmin, async (_req: Request, res: Response) => {
+router.post('/reset', requireAdmin, async (req: Request, res: Response) => {
   try {
     await statsService.resetStats();
+    await audit(req, 'stats.reset');
     res.json({ message: 'Stats reset successfully' });
   } catch (error) {
     console.error('Error resetting stats:', error);

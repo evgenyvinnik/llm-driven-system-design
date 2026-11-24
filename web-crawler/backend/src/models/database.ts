@@ -226,10 +226,43 @@ export async function initDatabase() {
         last_login_at TIMESTAMP
       );
 
+      -- Audit trail of operator actions. Append-only: an UPDATE trigger rejects
+      -- edits; rows are only removed by the retention job (AUDIT_RETENTION_DAYS).
+      -- actor_id deliberately has no foreign key: ON DELETE SET NULL would UPDATE
+-- old rows (blocked by the trigger), and history must survive user deletion.
+-- actor_username is denormalized so entries stay readable after a user is deleted.
+      CREATE TABLE IF NOT EXISTS audit_log (
+        id BIGSERIAL PRIMARY KEY,
+        at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        actor_id INTEGER,                -- no FK: deleting a user must not rewrite history
+        actor_username VARCHAR(64),
+        action VARCHAR(64) NOT NULL,
+        target_type VARCHAR(32),
+        target_id TEXT,
+        details JSONB NOT NULL DEFAULT '{}'::jsonb,
+        ip VARCHAR(64),
+        user_agent TEXT
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_audit_at ON audit_log (at DESC);
+      CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_log (action, id DESC);
+      CREATE INDEX IF NOT EXISTS idx_audit_actor ON audit_log (actor_id, id DESC);
+
+      CREATE OR REPLACE FUNCTION audit_log_immutable() RETURNS trigger AS $$
+      BEGIN
+        RAISE EXCEPTION 'audit_log is append-only';
+      END;
+      $$ LANGUAGE plpgsql;
+
+      CREATE OR REPLACE TRIGGER audit_log_no_update
+        BEFORE UPDATE ON audit_log
+        FOR EACH ROW EXECUTE FUNCTION audit_log_immutable();
+
       -- Idempotent upgrades for databases created before these columns existed
       ALTER TABLE url_frontier ADD COLUMN IF NOT EXISTS retry_count INTEGER DEFAULT 0;
       ALTER TABLE url_frontier ADD COLUMN IF NOT EXISTS last_error TEXT;
       ALTER TABLE domains ADD COLUMN IF NOT EXISTS crawl_delay_override FLOAT;
+      ALTER TABLE audit_log DROP CONSTRAINT IF EXISTS audit_log_actor_id_fkey;
     `);
 
     console.log('Database initialized successfully');

@@ -157,6 +157,16 @@ export function UsersPanel() {
                         Reset password
                       </button>
                     )}
+                    {!isSelf && (
+                      <button
+                        className={`${small} border-gray-300 text-gray-700 hover:bg-gray-50`}
+                        disabled={busy}
+                        title="End all of this user's sessions now"
+                        onClick={() => act(u.id, () => api.revokeUserSessions(u.id), `${u.username} was signed out everywhere.`)}
+                      >
+                        Sign out
+                      </button>
+                    )}
                     <button
                       className={`${small} border-red-200 text-red-700 hover:bg-red-50`}
                       disabled={locked || busy}

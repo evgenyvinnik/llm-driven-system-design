@@ -25,6 +25,8 @@ import type {
   AuthUser,
   HealthStatus,
   ManagedUser,
+  AuditEntry,
+  IpPolicy,
 } from '../types';
 
 /**
@@ -355,6 +357,28 @@ export const api = {
   // ============================================
 
   listUsers: () => fetchApi<{ users: ManagedUser[] }>('/admin/users'),
+
+  revokeUserSessions: (id: number) =>
+    fetchApi<{ message: string }>(`/admin/users/${id}/revoke-sessions`, { method: 'POST' }),
+
+  logoutOthers: () => fetchApi<{ message: string }>('/auth/logout-others', { method: 'POST' }),
+
+  // ============================================
+  // Audit log + IP policy (admin)
+  // ============================================
+
+  getAuditLog: (params: { before?: number; action?: string; actor?: string; limit?: number } = {}) => {
+    const q = new URLSearchParams();
+    if (params.before) q.set('before', String(params.before));
+    if (params.action) q.set('action', params.action);
+    if (params.actor) q.set('actor', params.actor);
+    q.set('limit', String(params.limit ?? 25));
+    return fetchApi<{ entries: AuditEntry[]; nextBefore: number | null }>(`/admin/audit?${q}`);
+  },
+
+  getIpPolicy: () => fetchApi<IpPolicy>('/admin/ip-policy'),
+
+  refreshIpPolicy: () => fetchApi<IpPolicy>('/admin/ip-policy/refresh', { method: 'POST' }),
 
   createUser: (username: string, password: string, role: 'admin' | 'user') =>
     fetchApi<ManagedUser>('/admin/users', {

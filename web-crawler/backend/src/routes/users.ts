@@ -13,6 +13,7 @@
 
 import { Router, Request, Response } from 'express';
 import { requireAdmin } from '../middleware/auth.js';
+import { audit } from '../services/audit.js';
 import * as users from '../services/users.js';
 import { logger } from '../shared/logger.js';
 
@@ -64,6 +65,7 @@ router.post('/', async (req: Request, res: Response) => {
     const { username, password, role } = req.body ?? {};
     const user = await users.createUser({ username, password, role });
     logger.info({ by: req.user!.id, userId: user.id, role: user.role }, 'User created');
+    await audit(req, 'user.create', { type: 'user', id: user.id }, { username: user.username, role: user.role });
     res.status(201).json(toDto(user));
   } catch (error) {
     handleError(res, error, 'create user');
@@ -85,6 +87,13 @@ router.patch('/:id', async (req: Request, res: Response) => {
       { by: req.user!.id, userId: id, role, disabled, passwordReset: password !== undefined },
       'User updated'
     );
+    // Never the password itself
+    await audit(req, 'user.update', { type: 'user', id }, {
+      username: user.username,
+      ...(role !== undefined && { role }),
+      ...(disabled !== undefined && { disabled }),
+      ...(password !== undefined && { passwordReset: true }),
+    });
     res.json(toDto(user));
   } catch (error) {
     handleError(res, error, 'update user');
@@ -100,11 +109,33 @@ router.delete('/:id', async (req: Request, res: Response) => {
     return;
   }
   try {
+    const target = await users.getUserById(id);
     await users.deleteUser(id);
     logger.info({ by: req.user!.id, userId: id }, 'User deleted');
+    await audit(req, 'user.delete', { type: 'user', id }, { username: target?.username });
     res.status(204).end();
   } catch (error) {
     handleError(res, error, 'delete user');
+  }
+});
+
+/**
+ * POST /api/admin/users/:id/revoke-sessions - sign a user out everywhere.
+ * For your own other sessions use POST /api/auth/logout-others.
+ */
+router.post('/:id/revoke-sessions', async (req: Request, res: Response) => {
+  const id = parseId(req, res);
+  if (id === null) return;
+  if (id === req.user!.id) {
+    res.status(400).json({ error: 'Use "sign out other sessions" for your own account' });
+    return;
+  }
+  try {
+    const user = await users.revokeSessions(id);
+    await audit(req, 'user.sessions.revoke', { type: 'user', id }, { username: user.username });
+    res.json({ message: `Signed ${user.username} out of all sessions` });
+  } catch (error) {
+    handleError(res, error, 'revoke sessions');
   }
 });
 

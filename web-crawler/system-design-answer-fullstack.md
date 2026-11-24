@@ -282,7 +282,7 @@ The rebuild has its own race: it reads Postgres, then writes Redis, so an operat
 
 The admin surface looks like CRUD and isn't — each control exists because of a specific way crawls go wrong. **Reading is public; every control below requires an admin session**, enforced on the server by one `requireAdmin` middleware on each mutating route. The frontend hides the controls when signed out, but that's courtesy — a hidden button is not access control. One lesson from building it: the session store adapter was written for a different Redis client than the one the app passed in, so every session write failed silently *after* the login response said 200. Login 'worked' and nothing was ever authenticated. Auth needs an end-to-end test (log in, then call a protected route) — a unit test of the login handler would have passed.
 
-**Accounts** are rows in a `users` table with two roles — admins change things, users only look. The interesting part is revocation: a session records the user's `session_version` at login, and every protected request re-reads the user by primary key. Disabling someone, changing their role, or resetting their password bumps the version, so their open sessions die on the next click rather than at cookie expiry — the property stateless JWTs make expensive. One rule needs a lock: "never zero admins." Two admins demoting each other at the same instant would both pass a naive check, so the update runs in a transaction that row-locks every active admin first.
+**Accounts** are rows in a `users` table with two roles — admins change things, users only look. The interesting part is revocation: a session records the user's `session_version` at login, and every protected request checks it. Disabling someone, changing their role, or resetting their password bumps the version, so their open sessions die on the next click rather than at cookie expiry — the property stateless JWTs make expensive, since revoking a JWT early needs a denylist checked on every request anyway. The check reads a small Redis record per user rather than Postgres. Every account change writes it through after commit, with a Lua guard that only replaces an *older* version, so a slow reader can't overwrite a fresh revocation with stale data. Every sign-in attempt and every change lands in an append-only `audit_log`: a trigger rejects UPDATEs. Its first draft had a foreign key with `ON DELETE SET NULL`, which meant deleting a user tried to UPDATE history and the trigger refused. History shouldn't depend on the user table, so the FK went. One rule needs a lock: "never zero admins." Two admins demoting each other at the same instant would both pass a naive check, so the update runs in a transaction that row-locks every active admin first.
 
 **Add seed URLs** is the entry point for the whole system; a crawler with an empty frontier does nothing, and there is no other way in.
 
@@ -340,8 +340,9 @@ The frontier API returns `retryCount` and `lastError` per URL, and the Frontier 
 | robots.txt 5xx | ✅ Defer as transient (fail closed) | ❌ Assume allowed | Don't crawl a struggling site blind |
 | Crash recovery | ✅ Lease reset + Redis re-enqueue, every minute | ❌ Long transaction per fetch | A hung HTTP request must not hold a DB lock |
 | Operator settings in Redis | ✅ One SET + one HASH, rebuilt atomically | ❌ A key per domain | Rebuild can remove stale entries without scanning every key |
-| Session revocation | ✅ `session_version` checked per protected request | ❌ Stateless JWT | Disable / demote / password reset takes effect on the next request |
-| Shared-host politeness | ✅ Second lock on resolved IP (looser than per-domain) | ❌ Per-domain only | Many domains on one server would otherwise be hit in parallel |
+| Session revocation | ✅ `session_version` checked per protected request, from a version-guarded Redis cache | ❌ Stateless JWT | Disable / demote / password reset takes effect on the next request, without a Postgres query |
+| Audit trail | ✅ Append-only table (UPDATE trigger), no FK to users | ❌ Log lines only | Queryable who-did-what that survives user deletion |
+| Shared-host politeness | ✅ Second lock on resolved IP, CDN ranges exempt | ❌ Per-domain only | Many domains on one server would otherwise be hit in parallel; CDN IPs front unrelated sites |
 | Local dev topology | ✅ Compose profiles | ❌ Everything on by default | The app containers published the same port the source-run backend needs |
 
 ---
@@ -352,7 +353,7 @@ The frontier API returns `retryCount` and `lastError` per URL, and the Frontier 
 2. **SSE stats stream** if the dashboard ever becomes multi-tenant
 3. **Generated types from the schema**, so the row→DTO mapping is checked rather than reviewed
 4. **A Puppeteer lane** for URLs whose extraction comes back suspiciously empty — likely JS-rendered
-5. **CDN-aware per-IP limits**: the per-IP lock protects shared hosts, but large CDNs serve unrelated sites from shared anycast IPs, where a strict per-IP limit throttles all of them
+5. **A reduced (not zero) per-IP rate for CDN ranges** — today they're fully exempt from the IP lock and rely on per-domain politeness alone
 
 ---
 

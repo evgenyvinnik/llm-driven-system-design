@@ -11,6 +11,7 @@
 
 import { Router, Request, Response } from 'express';
 import { requireAdmin } from '../middleware/auth.js';
+import { audit } from '../services/audit.js';
 import { pool } from '../models/database.js';
 import * as domainSettings from '../services/domainSettings.js';
 import { config } from '../config.js';
@@ -184,6 +185,7 @@ router.post('/:domain/refresh-robots', requireAdmin, async (req: Request, res: R
 
     await robotsService.clearCache(domain);
     await robotsService.getParser(domain);
+    await audit(req, 'domain.robots.refresh', { type: 'domain', id: domain });
 
     const result = await pool.query(
       `SELECT robots_txt, robots_fetched_at, crawl_delay FROM domains WHERE domain = $1`,
@@ -268,6 +270,10 @@ router.put('/:domain/settings', requireAdmin, async (req: Request, res: Response
     await domainSettings.publish(domain, {
       crawlDelayOverride: row.crawl_delay_override,
       isAllowed: row.is_allowed !== false,
+    });
+    await audit(req, 'domain.settings.update', { type: 'domain', id: domain }, {
+      changes: { crawlDelay, isAllowed },
+      result: { crawlDelayOverride: row.crawl_delay_override, isAllowed: row.is_allowed !== false },
     });
 
     res.json(toDomainDto(row));

@@ -249,6 +249,34 @@ CREATE TABLE users (
 
 The iteration count is part of the stored hash so it can be raised without invalidating existing passwords.
 
+### Audit Log
+
+Append-only record of operator actions and sign-in attempts.
+
+```sql
+CREATE TABLE audit_log (
+    id BIGSERIAL PRIMARY KEY,
+    at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    actor_id INTEGER,                         -- no FK: deleting a user must not rewrite history
+    actor_username VARCHAR(64),               -- denormalized: readable after the user is deleted
+    action VARCHAR(64) NOT NULL,              -- e.g. auth.login.failure, user.update, frontier.clear
+    target_type VARCHAR(32),
+    target_id TEXT,
+    details JSONB NOT NULL DEFAULT '{}',      -- never secrets
+    ip VARCHAR(64),
+    user_agent TEXT
+);
+CREATE INDEX idx_audit_at ON audit_log (at DESC);
+CREATE INDEX idx_audit_action ON audit_log (action, id DESC);
+CREATE INDEX idx_audit_actor ON audit_log (actor_id, id DESC);
+
+-- Rows are immutable; only the retention job deletes
+CREATE TRIGGER audit_log_no_update BEFORE UPDATE ON audit_log
+    FOR EACH ROW EXECUTE FUNCTION audit_log_immutable();  -- RAISE EXCEPTION
+```
+
+The first version had `actor_id REFERENCES users ON DELETE SET NULL`. Its integration test caught the conflict: deleting a user made Postgres UPDATE old audit rows, which the immutability trigger rejected, so user deletion returned 500. History shouldn't depend on the users table, so the FK is gone (and dropped on upgrade).
+
 ### Priority Signals
 
 | Level | Score | Criteria |
@@ -281,6 +309,13 @@ crawler:domain_settings:version         -> Counter bumped by every settings publ
 # Per-IP politeness
 crawler:dns:{hostname}            -> STRING resolved IP ('' = lookup failed), TTL CRAWLER_DNS_CACHE_TTL (60s if failed)
 crawler:ip:{ip}:lock              -> SET NX PX CRAWLER_IP_DELAY_MS (shared by every domain on that IP)
+crawler:ip_exempt:src:{id}        -> SET of CIDRs from one exempt-range source (last good fetch)
+crawler:ip_exempt:meta:{id}       -> HASH url, count, fetchedAt, lastError, lastErrorAt
+crawler:ip_exempt:refreshed_at    -> epoch ms of the last source refresh
+
+# Auth-state cache (what every protected request checks)
+crawler:auth:user:{id}            -> JSON {u, r, d, v} (username, role, disabled, session_version), 10 min TTL;
+                                     written only if v is newer (Lua); {deleted, v: MAX} tombstone on delete
 
 # Maintenance (one API instance per interval)
 crawler:maintenance:lock          -> SET NX PX
@@ -349,10 +384,12 @@ The **domain** key is the URL's `host` — hostname plus any non-default port �
 | Role | Permissions | Endpoints |
 |------|-------------|-----------|
 | anonymous | Read everything the dashboard shows | `GET /health`, `GET /api/*` |
-| user | Same reads, a higher rate limit, and their own account | `POST /api/auth/password` |
+| user | Same reads, a higher rate limit, and their own account | `POST /api/auth/password`, `POST /api/auth/logout-others` |
 | admin | Change crawler state and manage accounts | `POST /api/frontier/{add,seed,recover}`, `DELETE /api/frontier/clear`, `POST /api/stats/reset`, `PUT /api/domains/:d/settings`, `POST /api/domains/:d/refresh-robots`, `/api/admin/*` (incl. `/api/admin/users`) |
 
-**Accounts** live in PostgreSQL (`users`, `services/users.ts`). Every request to a protected route re-reads the user by primary key and rejects the session if the user was deleted or disabled, or if their `session_version` no longer matches the one stored in the session — disabling, changing a role, or changing a password bumps it, so revocation is immediate without a token denylist. The **last active admin** can't be demoted, disabled, or deleted; the check runs in a transaction that row-locks every active admin, so two admins demoting each other concurrently can't both succeed (covered by a test that fires both requests at once). Admins can't change their own role or delete themselves. **Bootstrap / break-glass:** on startup, if no active admin exists, the `ADMIN_USERNAME` account is created or restored from `ADMIN_PASSWORD`.
+**Accounts** live in PostgreSQL (`users`, `services/users.ts`). Every request to a protected route checks the user's current auth state and rejects the session if the user was deleted or disabled, or if their `session_version` no longer matches the one stored in the session — disabling, changing a role, changing a password, or an explicit "sign out everywhere" bumps it, so revocation is immediate without a token denylist.
+
+**Auth-state cache — and why not JWT.** The check reads `crawler:auth:user:{id}` from Redis, not Postgres (Prometheus: `crawler_auth_cache_lookups_total{result}`; the ops integration test asserts zero `users` queries across 10 protected requests). Every account mutation writes the new state through *after* its transaction commits, via a Lua script that only replaces an entry with an **older** `session_version`. Because the version increases on every change, a slow reader that loaded the row from Postgres just before a revocation can't overwrite the newer, revoked state, and a delete writes a max-version tombstone for the same reason. JWT was considered and rejected: the requirement is immediate revocation (offboarding, a leaked cookie), and a stateless token stays valid until expiry unless every request checks a denylist — the same per-request lookup, plus rotation machinery. Sessions with this cache keep revocation instant at Redis-lookup cost. Caveat: a raw SQL `UPDATE users` bypasses the write-through and isn't seen until the entry's 10-minute TTL, so accounts are changed through the service/API only. The **last active admin** can't be demoted, disabled, or deleted; the check runs in a transaction that row-locks every active admin, so two admins demoting each other concurrently can't both succeed (covered by a test that fires both requests at once). Admins can't change their own role or delete themselves. **Bootstrap / break-glass:** on startup, if no active admin exists, the `ADMIN_USERNAME` account is created or restored from `ADMIN_PASSWORD`.
 
 Reads are public by design: the dashboard is an observability surface, and gating it adds friction without protecting anything sensitive. Every route that changes state goes through `requireAdmin` (`backend/src/middleware/auth.ts`); the frontend hides admin controls for signed-out viewers, but that is UX, not access control.
 
@@ -394,7 +431,9 @@ Rate limiting uses Redis sliding window: ZREMRANGEBYSCORE to remove old entries,
 
 **robots.txt failure semantics (RFC 9309):** 2xx → obey; 4xx → no restrictions; 5xx/unreachable → treat as disallowed for now and retry the URL later (negative-cached in memory for 60s). The robots parser is built per scheme, because robots-parser returns `undefined` (previously read as "allowed") for URLs on a different origin than the robots.txt URL it was built with.
 
-**Per-IP politeness:** per-domain locks alone let the crawler hit one server with many simultaneous requests when many domains live on it (shared hosting, multi-tenant SaaS). A worker therefore also takes `crawler:ip:{ip}:lock` (`SET NX PX CRAWLER_IP_DELAY_MS`, default 250ms) for the domain's resolved IP (`dns.lookup`, cached in Redis). If the IP lock is taken, the domain lock is released so that domain's slot isn't burned, and the scan skips other domains on the same IP without touching Redis. In-process retries take both locks. Measured on a two-domain, one-IP fixture with two workers: IP lock off → 12 of 25 request gaps under 100ms (min 0ms); on at 1500ms → min gap 1505ms. **Trade-off:** large CDNs serve unrelated sites from shared anycast IPs, so a strict per-IP limit throttles all of them — the default is deliberately looser than the 1s per-domain default, and a CDN-aware exemption is future work.
+**Per-IP politeness:** per-domain locks alone let the crawler hit one server with many simultaneous requests when many domains live on it (shared hosting, multi-tenant SaaS). A worker therefore also takes `crawler:ip:{ip}:lock` (`SET NX PX CRAWLER_IP_DELAY_MS`, default 250ms) for the domain's resolved IP (`dns.lookup`, cached in Redis). If the IP lock is taken, the domain lock is released so that domain's slot isn't burned, and the scan skips other domains on the same IP without touching Redis. In-process retries take both locks. Measured on a two-domain, one-IP fixture with two workers: IP lock off → 12 of 25 request gaps under 100ms (min 0ms); on at 1500ms → min gap 1505ms.
+
+**CDN exemptions** (`services/ipPolicy.ts`): large CDNs serve unrelated sites from shared anycast IPs, so a per-IP limit would throttle all of them as though they were one server. IPs in exempt ranges skip the IP lock (per-domain politeness still applies). Ranges come from `CRAWLER_IP_EXEMPT_CIDRS` and from `CRAWLER_IP_EXEMPT_SOURCES` — URLs of the providers' published lists (plain text or JSON; CIDR-shaped tokens are extracted and validated). The maintenance loop fetches sources every `CRAWLER_IP_EXEMPT_REFRESH_HOURS` into one Redis SET per source; a failed fetch keeps that source's last good list, so a CDN's endpoint being down doesn't suddenly re-throttle every site behind it. Workers match with Node's built-in `net.BlockList`, rebuilt at most every 60s. **No ranges ship as defaults:** CDN ranges change, and a stale or wrong range silently removes protection from real servers; the lists couldn't be fetched to verify from the development sandbox either. Use CDN-only lists — exempting a whole cloud provider's ranges would unprotect single-tenant servers.
 
 **Trade-off acknowledged:** This is domain-level, not path-level granularity. A domain with crawl-delay=1s allows only 1 req/sec regardless of how many workers exist. Token bucket would allow smoother rate distribution (e.g., 10 req/10s instead of 1 req/s), but adds implementation complexity for marginal benefit. The lock approach also wastes worker cycles when all available domains are locked -- production would use a work-stealing queue per domain shard.
 
@@ -437,7 +476,8 @@ Crawl operations are inherently idempotent: fetching the same URL multiple times
 | Dashboard auth | Public reads; every state-changing route requires an admin session (see Authentication and RBAC) |
 | Brute force | Login limited to 10 attempts / 15 min per client |
 | Credentials in production | API refuses to start without `SESSION_SECRET` (and `ADMIN_PASSWORD` when no active admin exists) |
-| Account compromise / offboarding | Disable, role change, or password reset revokes all of that user's sessions on their next request |
+| Account compromise / offboarding | Disable, role change, password reset, or "sign out everywhere" revokes all of that user's sessions on their next request |
+| Accountability | Append-only `audit_log` of sign-ins (incl. failures) and every state change; secrets never recorded |
 | API rate limiting | Tiered limits (anonymous/user/admin) via Redis sliding window |
 | Input sanitization | Helmet, 1 MB JSON body limit, CORS allowlist, validated settings payloads |
 
@@ -526,6 +566,7 @@ RETURNING url_hash, priority   -- each is re-ZADDed (NX) to its priority queue
 2. **Queue rehydration** — if the Redis queues hold fewer entries than there are pending rows (Redis restarted without persistence, was flushed), pending rows are walked by keyset pagination and re-added with `ZADD NX`, preserving existing retry delays.
 3. **Operator settings rebuild** — the blocked-domain SET and delay-override HASH are rebuilt from Postgres (`domains.is_allowed`, `domains.crawl_delay_override`) in one `MULTI/EXEC` (`services/domainSettings.ts`). Because they're two keys rather than one key per domain, the rebuild fixes drift in **both** directions: a block lost from Redis comes back, and a stale block left by a failed un-block is removed. A rebuild reads a Postgres snapshot before writing Redis, so a concurrent operator change could otherwise be overwritten by older data; every publish bumps `crawler:domain_settings:version`, and the rebuild `WATCH`es it on a dedicated connection, so it aborts and retries next interval instead.
 4. **Stale worker cleanup** — workers whose heartbeat is older than 5 minutes are removed from the active set.
+5. **Exempt-range refresh** — CDN range sources are re-fetched when due (default daily).
 
 **Graceful shutdown:** on SIGTERM a worker stops claiming, waits (up to 45s) for its in-flight crawl to finish recording its outcome, then closes connections — so a deploy doesn't strand one URL per worker until the lease expires.
 
@@ -795,7 +836,10 @@ This section maps the production architecture above to the actual local implemen
 | Session auth + RBAC | express-session + connect-redis v7 | `backend/src/middleware/auth.ts` | Public reads, admin-only mutations (`requireAdmin`, role read from the DB per request); session regeneration on login, login rate limit, timing-safe async PBKDF2 |
 | Durable operator settings | Postgres → Redis, atomic rebuild | `backend/src/services/domainSettings.ts` | Blocks/overrides survive Redis loss and stale entries are swept; WATCH guards against overwriting a concurrent change |
 | Operator accounts | PostgreSQL `users` | `backend/src/services/users.ts`, `backend/src/routes/users.ts` | Roles, immediate session revocation via `session_version`, race-safe last-admin guard, break-glass bootstrap |
+| Auth-state cache | Redis + Lua set-if-newer | `backend/src/services/users.ts` | Session checks without a Postgres query, without weakening revocation |
+| Audit trail | PostgreSQL `audit_log` | `backend/src/services/audit.ts` | Append-only, keyset-paginated, retention-pruned record of who changed what |
 | Per-IP politeness | Redis IP lock + DNS cache | `backend/src/services/frontier.ts` | Shared hosts protected across all their domains |
+| CDN exemptions | `net.BlockList` + refreshed published lists | `backend/src/services/ipPolicy.ts` | Per-IP limit doesn't throttle every site behind a shared CDN IP |
 | API rate limiting | express-rate-limit | `backend/src/middleware/` | Tiered rate limits for anonymous/user/admin |
 | Request security | Helmet + compression | `backend/src/server.ts` | Security headers and response compression |
 
